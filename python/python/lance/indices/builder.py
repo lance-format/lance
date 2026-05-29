@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import numpy as np
 import pyarrow as pa
 
+from lance.cuvs import is_cuvs_accelerator, prepare_global_ivf_pq_on_cuvs
 from lance.indices.ivf import IvfModel
 from lance.indices.pq import PqModel
 
@@ -115,6 +116,11 @@ class IndicesBuilder:
         self._verify_ivf_sample_rate(sample_rate, num_partitions, num_rows)
         distance_type = self._normalize_distance_type(distance_type)
         self._verify_ivf_params(num_partitions)
+        if is_cuvs_accelerator(accelerator):
+            raise NotImplementedError(
+                "IndicesBuilder.train_ivf does not support accelerator='cuvs'; "
+                "use prepare_global_ivf_pq instead"
+            )
 
         if accelerator is None:
             from lance.lance import indices
@@ -250,6 +256,26 @@ class IndicesBuilder:
         `IndicesBuilder.train_pq` (indices.train_pq_model). No public method
         names elsewhere are changed.
         """
+        if is_cuvs_accelerator(accelerator):
+            if fragment_ids is not None:
+                raise NotImplementedError(
+                    "fragment_ids is not supported with accelerator='cuvs'"
+                )
+            num_rows = self._count_rows()
+            num_partitions = self._determine_num_partitions(num_partitions, num_rows)
+            num_subvectors = self._normalize_pq_params(num_subvectors, self.dimension)
+            return prepare_global_ivf_pq_on_cuvs(
+                self.dataset,
+                self.column[0],
+                num_partitions,
+                num_subvectors,
+                distance_type=distance_type,
+                accelerator=accelerator,
+                sample_rate=sample_rate,
+                max_iters=max_iters,
+                storage_options=self.dataset.latest_storage_options(),
+            )
+
         # Global IVF training
         ivf_model = self.train_ivf(
             num_partitions,
