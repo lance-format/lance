@@ -4186,8 +4186,11 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "datafusion-common",
+ "datafusion-physical-plan",
  "futures",
  "lance",
+ "lance-arrow",
  "lance-core",
  "lance-index",
  "lance-io",
@@ -4198,12 +4201,14 @@ dependencies = [
  "object_store",
  "rand 0.9.4",
  "reqwest 0.12.28",
+ "roaring",
  "serde",
  "serde_json",
  "tokio",
  "tower",
  "tower-http 0.5.2",
  "url",
+ "uuid",
 ]
 
 [[package]]

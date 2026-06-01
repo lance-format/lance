@@ -921,6 +921,7 @@ pub(crate) async fn commit_transaction(
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
+    replacement_indices: Option<Vec<IndexMetadata>>,
 ) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
@@ -933,6 +934,11 @@ pub(crate) async fn commit_transaction(
     // Strict overwrites are not subject to any sort of automatic conflict resolution.
     let strict_overwrite = matches!(transaction.operation, Operation::Overwrite { .. })
         && commit_config.num_retries == 0;
+    if replacement_indices.is_some() && !strict_overwrite {
+        return Err(Error::invalid_input(
+            "replacement indices require a strict overwrite transaction",
+        ));
+    }
     let mut dataset =
         if dataset.manifest.version != read_version && (read_version != 0 || strict_overwrite) {
             // If the dataset version is not the same as the read version, we need to
@@ -1018,6 +1024,13 @@ pub(crate) async fn commit_transaction(
         };
 
         manifest.version = target_version;
+
+        if let Some(replacement_indices) = replacement_indices.as_ref() {
+            indices = replacement_indices.clone();
+            for index in &mut indices {
+                index.dataset_version = target_version;
+            }
+        }
 
         let previous_writer_version = &dataset.manifest.writer_version;
         // The versions of Lance prior to when we started writing the writer version

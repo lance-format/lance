@@ -13,8 +13,8 @@ rust-version.workspace = true
 
 [features]
 default = ["dir-aws", "dir-azure", "dir-gcp", "dir-oss", "dir-huggingface"]
-rest = ["dep:reqwest", "dep:serde"]
-rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
+rest = ["dep:reqwest"]
+rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http"]
 # Cloud storage features for directory implementation - align with lance-io
 dir-gcp = ["lance-io/gcp", "lance/gcp"]
 dir-aws = ["lance-io/aws", "lance/aws"]
@@ -23,8 +23,8 @@ dir-oss = ["lance-io/oss", "lance/oss"]
 dir-huggingface = ["lance-io/huggingface", "lance/huggingface"]
 # Credential vending features
 credential-vendor-aws = ["dep:aws-sdk-sts", "dep:aws-config", "dep:sha2", "dep:base64"]
-credential-vendor-gcp = ["dep:reqwest", "dep:serde", "dep:sha2", "dep:base64", "dep:ring", "dep:rustls-pki-types"]
-credential-vendor-azure = ["dep:reqwest", "dep:serde", "dep:sha2", "dep:base64", "dep:chrono", "dep:hmac", "dep:quick-xml"]
+credential-vendor-gcp = ["dep:reqwest", "dep:sha2", "dep:base64", "dep:ring", "dep:rustls-pki-types"]
+credential-vendor-azure = ["dep:reqwest", "dep:sha2", "dep:base64", "dep:chrono", "dep:hmac", "dep:quick-xml"]
 
 [dependencies]
 lance-namespace.workspace = true
@@ -42,6 +42,7 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 # Directory implementation dependencies (always enabled)
 url = { workspace = true }
 lance = { workspace = true }
+lance-arrow = { workspace = true }
 lance-index = { workspace = true }
 lance-linalg = { workspace = true }
 lance-io = { workspace = true }
@@ -50,12 +51,14 @@ object_store = { workspace = true }
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-physical-plan = { workspace = true }
 
 # REST adapter implementation dependencies (optional, enabled by "rest-adapter" feature)
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true, features = ["trace", "cors", "normalize-path"] }
-serde = { workspace = true, optional = true }
+serde = { workspace = true }
 
 # Common dependencies
 async-trait.workspace = true
@@ -65,6 +68,8 @@ serde_json = { workspace = true }
 futures.workspace = true
 log.workspace = true
 rand.workspace = true
+roaring.workspace = true
+uuid.workspace = true
 
 # Shared credential vending dependencies
 sha2 = { version = "0.10", optional = true }
@@ -91,6 +96,7 @@ arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 rstest.workspace = true
 lance-table.workspace = true
+env_logger = "0.11"
 
 [lints]
 workspace = true

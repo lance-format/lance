@@ -8,7 +8,7 @@ use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
-    format::{DataStorageFormat, is_detached_version},
+    format::{DataStorageFormat, IndexMetadata, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
@@ -47,6 +47,7 @@ pub struct CommitBuilder<'a> {
     commit_config: CommitConfig,
     affected_rows: Option<RowAddrTreeMap>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    replacement_indices: Option<Vec<IndexMetadata>>,
 }
 
 impl<'a> CommitBuilder<'a> {
@@ -64,6 +65,7 @@ impl<'a> CommitBuilder<'a> {
             commit_config: Default::default(),
             affected_rows: None,
             transaction_properties: None,
+            replacement_indices: None,
         }
     }
 
@@ -169,6 +171,16 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Replace the dataset's index metadata as part of a strict overwrite commit.
+    ///
+    /// This is intended for callers that have already rewritten all data and
+    /// rebuilt replacement index files. The commit path stamps the indices with
+    /// the committed dataset version.
+    pub fn with_replacement_indices(mut self, replacement_indices: Vec<IndexMetadata>) -> Self {
+        self.replacement_indices = Some(replacement_indices);
+        self
+    }
+
     /// provide Configuration key-value pairs associated with this transaction.
     /// This is used to store metadata about the transaction, such as commit messages, engine information, etc.
     /// this properties map will be persisted as a part of the transaction object
@@ -267,6 +279,29 @@ impl<'a> CommitBuilder<'a> {
             validate_operation(None, &transaction.operation)?;
         }
 
+        if self.replacement_indices.is_some() {
+            if self.detached {
+                return Err(Error::invalid_input(
+                    "replacement indices are not supported for detached commits",
+                ));
+            }
+            if dest.dataset().is_none() {
+                return Err(Error::invalid_input(
+                    "replacement indices require an existing dataset",
+                ));
+            }
+            if !matches!(transaction.operation, Operation::Overwrite { .. }) {
+                return Err(Error::invalid_input(
+                    "replacement indices are only supported for overwrite commits",
+                ));
+            }
+            if self.commit_config.num_retries != 0 {
+                return Err(Error::invalid_input(
+                    "replacement indices require a strict overwrite commit with max_retries=0",
+                ));
+            }
+        }
+
         let (metadata_cache, index_cache) = match &dest {
             WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
             WriteDestination::Uri(uri) => (
@@ -337,6 +372,7 @@ impl<'a> CommitBuilder<'a> {
                     &self.commit_config,
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
+                    self.replacement_indices.clone(),
                 )
                 .await?
             }

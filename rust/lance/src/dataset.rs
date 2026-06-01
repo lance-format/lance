@@ -965,6 +965,10 @@ impl Dataset {
         &self.manifest_location
     }
 
+    pub fn commit_handler(&self) -> &dyn CommitHandler {
+        self.commit_handler.as_ref()
+    }
+
     /// Create a [`delta::DatasetDeltaBuilder`] to explore changes between dataset versions.
     ///
     /// # Example
@@ -1343,6 +1347,7 @@ impl Dataset {
             write_config,
             commit_config,
             self.manifest_location.naming_scheme,
+            None,
             None,
         )
         .await?;
@@ -3306,7 +3311,7 @@ impl DatasetTakeRows for Dataset {
 }
 
 #[derive(Debug)]
-pub(crate) struct ManifestWriteConfig {
+pub struct ManifestWriteConfig {
     auto_set_feature_flags: bool,              // default true
     timestamp: Option<SystemTime>,             // default None
     use_stable_row_ids: bool,                  // default false
@@ -3336,7 +3341,7 @@ impl ManifestWriteConfig {
 
 /// Commit a manifest file and create a copy at the latest manifest path.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn write_manifest_file(
+pub async fn write_manifest_file(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
