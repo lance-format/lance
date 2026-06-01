@@ -12,6 +12,8 @@
 //! For more details please refer to the
 //! [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 
+pub mod action;
+
 use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
@@ -28,217 +30,32 @@ use lance_index::mem_wal::MergedGeneration;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
-use lance_table::rowids::read_row_ids;
+pub use lance_table::transaction::rewrite::{
+    DataReplacementGroup, RewriteGroup, RewrittenIndex, recalculate_fragment_bitmap,
+};
+pub use lance_table::transaction::row_ids::assign_row_ids;
+pub use lance_table::transaction::row_version::{
+    is_pure_rewrite_fragment, resolve_update_version_metadata,
+};
+pub use lance_table::transaction::update_map::{
+    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, apply_update_map,
+    translate_config_updates, translate_schema_metadata_updates,
+};
 use lance_table::{
-    format::{
-        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta, pb,
-    },
+    format::{BasePath, DataStorageFormat, Fragment, IndexMetadata, Manifest, pb},
     io::{
         commit::CommitHandler,
         manifest::{read_manifest, read_manifest_indexes},
     },
-    rowids::{RowIdSequence, segment::U64Segment, version::build_version_meta, write_row_ids},
+    rowids::version::build_version_meta,
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
-use std::cmp::Ordering;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 use uuid::Uuid;
-
-/// Fallback version for rows whose original creation version cannot be determined.
-/// Version 1 is the initial dataset version in the Lance format.
-const UNKNOWN_CREATED_AT_VERSION: u64 = 1;
-
-/// Look up the `created_at` version for a single UPDATE-branch row ID.
-///
-/// Callers must only call this for row IDs that are confirmed to be present in
-/// `row_id_to_source` (i.e. UPDATE branch rows whose source exists in an existing
-/// fragment).  INSERT branch rows (no source) must use `new_version` directly and
-/// must not call this function.
-///
-/// Uses `row_id_to_source` to find the originating fragment and row offset, then
-/// performs a O(K) random-access lookup via [`RowDatasetVersionSequence::version_at`]
-/// on the pre-decoded sequence in `version_cache` (keyed by fragment ID).
-///
-/// Returns [`UNKNOWN_CREATED_AT_VERSION`] if the source fragment has no
-/// `created_at_version_meta` (missing or failed to decode) or the offset is
-/// out of range.
-fn resolve_created_at_version(
-    row_id: u64,
-    row_id_to_source: &HashMap<u64, (&Fragment, usize)>,
-    version_cache: &HashMap<u64, RowDatasetVersionSequence>,
-) -> u64 {
-    let Some((orig_frag, row_offset)) = row_id_to_source.get(&row_id) else {
-        return UNKNOWN_CREATED_AT_VERSION;
-    };
-    let Some(seq) = version_cache.get(&orig_frag.id) else {
-        return UNKNOWN_CREATED_AT_VERSION;
-    };
-    seq.version_at(*row_offset)
-        .unwrap_or(UNKNOWN_CREATED_AT_VERSION)
-}
-
-/// For each new fragment produced by an update, set `created_at_version_meta`
-/// (preserved from the original rows) and `last_updated_at_version_meta`.
-fn resolve_update_version_metadata(
-    existing_fragments: &[Fragment],
-    new_fragments: &mut [Fragment],
-    new_version: u64,
-) -> Result<()> {
-    // Collect only the row IDs we actually need to resolve, those appearing in new_fragments
-    // with inline metadata. This bounds the lookup map to O(updated rows) instead of O(all dataset rows)
-    let needed_row_ids: HashSet<u64> = new_fragments
-        .iter()
-        .filter_map(|f| match &f.row_id_meta {
-            Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok(),
-            _ => None,
-        })
-        .flat_map(|seq| seq.iter().collect::<Vec<_>>())
-        .collect();
-
-    let mut row_id_to_source: HashMap<u64, (&Fragment, usize)> = HashMap::new();
-
-    if !needed_row_ids.is_empty() {
-        // Compute the bounding range of the needed set once.  Any fragment whose
-        // entire row-id range lies outside [needed_min, needed_max] cannot contain
-        // any needed ID and can be skipped before the inner per-row loop.
-        let needed_min = *needed_row_ids.iter().min().unwrap();
-        let needed_max = *needed_row_ids.iter().max().unwrap();
-
-        // Stable row IDs must be globally unique among *live* rows, but after a rewrite-style
-        // update the same stable ID can appear twice in `existing_fragments`: once in an older
-        // fragment's inline `row_id_meta` at the original row offset (rows may be soft-deleted
-        // via a deletion vector) and again in a newer fragment holding rewritten data. For
-        // `created_at` we need the mapping from the original fragment/offset; that is always the
-        // first occurrence when fragments are processed in ascending `id` order.
-        let mut sorted_frags: Vec<&Fragment> = existing_fragments.iter().collect();
-        sorted_frags.sort_by_key(|f| f.id);
-        for frag in sorted_frags {
-            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta
-                && let Ok(seq) = read_row_ids(data)
-            {
-                // Range pre-filter: skip the per-row inner loop when the fragment's
-                // bounding row-id range has no overlap with [needed_min, needed_max].
-                // row_id_range() returns None for empty sequences, which are also skipped.
-                // This is a conservative check (may produce false positives for sparse
-                // segments) but never skips a fragment that actually contains a needed ID.
-                if seq
-                    .row_id_range()
-                    .is_none_or(|r| *r.end() < needed_min || *r.start() > needed_max)
-                {
-                    continue;
-                }
-
-                for (offset, rid) in seq.iter().enumerate() {
-                    if needed_row_ids.contains(&rid) {
-                        row_id_to_source.entry(rid).or_insert((frag, offset));
-                    }
-                }
-            }
-        }
-    }
-
-    // Pre-decode the `created_at` version sequence for each source fragment exactly
-    // once.  Without this cache, resolve_created_at_version would call load_sequence()
-    // (a protobuf decode) for every single updated row, even when many rows originate
-    // from the same fragment.
-    let source_frag_ids: HashSet<u64> = row_id_to_source.values().map(|(f, _)| f.id).collect();
-    let version_cache: HashMap<u64, RowDatasetVersionSequence> = existing_fragments
-        .iter()
-        .filter(|f| source_frag_ids.contains(&f.id))
-        .filter_map(|frag| {
-            let seq = frag
-                .created_at_version_meta
-                .as_ref()?
-                .load_sequence()
-                .ok()?;
-            Some((frag.id, seq))
-        })
-        .collect();
-
-    for fragment in new_fragments.iter_mut() {
-        let row_ids = match &fragment.row_id_meta {
-            Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok(),
-            Some(RowIdMeta::External(_)) => {
-                log::warn!(
-                    "Fragment {} has external row ID metadata; \
-                     version tracking will use defaults",
-                    fragment.id,
-                );
-                None
-            }
-            None => None,
-        };
-
-        if let Some(row_ids) = row_ids {
-            let physical_rows = fragment.physical_rows.unwrap_or(0);
-            let created_at_versions: Vec<u64> = row_ids
-                .iter()
-                .map(|rid| {
-                    if row_id_to_source.contains_key(&rid) {
-                        // UPDATE branch: stable row ID resolves to a source row in an
-                        // existing fragment.  Copy created_at from the original row so
-                        // the row's first-appearance version is preserved across rewrites.
-                        resolve_created_at_version(rid, &row_id_to_source, &version_cache)
-                    } else {
-                        // INSERT branch: stable row ID has no source in existing fragments
-                        // (e.g. NOT MATCHED arm of MERGE INTO).  The row first appears in
-                        // this commit, so created_at equals the new commit version.
-                        new_version
-                    }
-                })
-                .collect();
-            debug_assert_eq!(created_at_versions.len(), physical_rows);
-
-            let runs = encode_version_runs(&created_at_versions);
-            let created_at_seq = RowDatasetVersionSequence { runs };
-            fragment.created_at_version_meta = Some(
-                RowDatasetVersionMeta::from_sequence(&created_at_seq).map_err(|e| {
-                    Error::internal(format!(
-                        "Failed to create created_at version metadata: {}",
-                        e
-                    ))
-                })?,
-            );
-
-            fragment.last_updated_at_version_meta = build_version_meta(fragment, new_version);
-        } else {
-            let version_meta = build_version_meta(fragment, new_version);
-            fragment.last_updated_at_version_meta = version_meta.clone();
-            fragment.created_at_version_meta = version_meta;
-        }
-    }
-    Ok(())
-}
-
-/// Run-length encode a sequence of per-row versions into [`RowDatasetVersionRun`]s.
-fn encode_version_runs(versions: &[u64]) -> Vec<RowDatasetVersionRun> {
-    if versions.is_empty() {
-        return Vec::new();
-    }
-    let mut runs = Vec::new();
-    let mut current_version = versions[0];
-    let mut run_start = 0u64;
-    for (i, &version) in versions.iter().enumerate().skip(1) {
-        if version != current_version {
-            runs.push(RowDatasetVersionRun {
-                span: U64Segment::Range(run_start..i as u64),
-                version: current_version,
-            });
-            current_version = version;
-            run_start = i as u64;
-        }
-    }
-    runs.push(RowDatasetVersionRun {
-        span: U64Segment::Range(run_start..versions.len() as u64),
-        version: current_version,
-    });
-    runs
-}
 
 /// A change to a dataset that can be retried
 ///
@@ -253,54 +70,6 @@ pub struct Transaction {
     pub operation: Operation,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
-}
-
-#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
-pub struct DataReplacementGroup(pub u64, pub DataFile);
-
-/// An entry for a map update. If value is None, the key will be removed from the map.
-#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
-pub struct UpdateMapEntry {
-    /// The key of the map entry to update.
-    pub key: String,
-    /// The value to set for the key.
-    pub value: Option<String>,
-}
-
-impl From<(String, Option<String>)> for UpdateMapEntry {
-    fn from((key, value): (String, Option<String>)) -> Self {
-        Self { key, value }
-    }
-}
-
-impl From<(String, String)> for UpdateMapEntry {
-    fn from((key, value): (String, String)) -> Self {
-        Self::from((key, Some(value)))
-    }
-}
-
-impl From<(&str, Option<&str>)> for UpdateMapEntry {
-    fn from((key, value): (&str, Option<&str>)) -> Self {
-        Self {
-            key: key.to_string(),
-            value: value.map(str::to_owned),
-        }
-    }
-}
-
-impl From<(&str, &str)> for UpdateMapEntry {
-    fn from((key, value): (&str, &str)) -> Self {
-        Self::from((key, Some(value)))
-    }
-}
-
-/// Represents updates to a map (either incremental or replacement)
-#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
-pub struct UpdateMap {
-    pub update_entries: Vec<UpdateMapEntry>,
-    /// If true, the map will be replaced entirely with the new entries.
-    /// If false, the new entries will be merged with the existing map.
-    pub replace: bool,
 }
 
 /// An operation on a dataset.
@@ -453,35 +222,6 @@ pub enum Operation {
         /// The new base paths to add to the manifest.
         new_bases: Vec<BasePath>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub enum UpdateMode {
-    /// rows are deleted in current fragments and rewritten in new fragments.
-    /// This is most optimal when the majority of columns are being rewritten
-    /// or only a few rows are being updated.
-    RewriteRows,
-
-    /// within each fragment, columns are fully rewritten and inserted as new data files.
-    /// Old versions of columns are tombstoned. This is most optimal when most rows are affected
-    /// but a small subset of columns are affected.
-    RewriteColumns,
-}
-
-/// Matched physical row offsets per fragment for a partial [`UpdateMode::RewriteColumns`] update.
-///
-/// Used with stable row IDs so `build_manifest` can refresh row-level version
-/// metadata only for rows that were rewritten.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct UpdatedFragmentOffsets(pub HashMap<u64, RoaringBitmap>);
-
-impl DeepSizeOf for UpdatedFragmentOffsets {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.0.iter().fold(0_usize, |acc, (frag_id, bitmap)| {
-            acc + frag_id.deep_size_of_children(context)
-                + (bitmap.len() as usize).saturating_mul(std::mem::size_of::<u32>())
-        })
-    }
 }
 
 impl std::fmt::Display for Operation {
@@ -1349,44 +1089,28 @@ impl PartialEq for Operation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct RewrittenIndex {
-    pub old_id: Uuid,
-    pub new_id: Uuid,
-    pub new_index_details: prost_types::Any,
-    pub new_index_version: u32,
-    /// Files in the new index with their sizes.
-    /// Empty list from older writers that didn't persist this field.
-    pub new_index_files: Option<Vec<IndexFile>>,
-}
-
-impl DeepSizeOf for RewrittenIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.new_index_details
-            .type_url
-            .deep_size_of_children(context)
-            + self.new_index_details.value.deep_size_of_children(context)
-    }
-}
-
-#[derive(Debug, Clone, DeepSizeOf)]
-pub struct RewriteGroup {
-    pub old_fragments: Vec<Fragment>,
-    pub new_fragments: Vec<Fragment>,
-}
-
-impl PartialEq for RewriteGroup {
-    fn eq(&self, other: &Self) -> bool {
-        fn compare_vec<T: PartialEq>(a: &[T], b: &[T]) -> bool {
-            a.len() == b.len() && a.iter().all(|f| b.contains(f))
-        }
-        compare_vec(&self.old_fragments, &other.old_fragments)
-            && compare_vec(&self.new_fragments, &other.new_fragments)
-    }
-}
-
 impl Operation {
-    /// Returns the config keys that have been upserted by this operation.
+    pub(crate) fn update_maps_conflict(
+        left: Option<&UpdateMap>,
+        right: Option<&UpdateMap>,
+    ) -> bool {
+        let (Some(left), Some(right)) = (left, right) else {
+            return false;
+        };
+        if left.replace || right.replace {
+            return true;
+        }
+        let left_keys = left
+            .update_entries
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<HashSet<_>>();
+        right
+            .update_entries
+            .iter()
+            .any(|entry| left_keys.contains(entry.key.as_str()))
+    }
+
     fn get_upsert_config_keys(&self) -> Vec<String> {
         match self {
             Self::Overwrite {
@@ -1435,6 +1159,8 @@ impl Operation {
         }
     }
 
+    /// Check whether two operations modify the same metadata fields/keys
+    /// (used by the legacy conflict resolver to detect UpdateConfig clashes).
     pub(crate) fn modifies_same_metadata(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -1473,24 +1199,6 @@ impl Operation {
         }
     }
 
-    fn update_maps_conflict(left: Option<&UpdateMap>, right: Option<&UpdateMap>) -> bool {
-        let (Some(left), Some(right)) = (left, right) else {
-            return false;
-        };
-        if left.replace || right.replace {
-            return true;
-        }
-        let left_keys = left
-            .update_entries
-            .iter()
-            .map(|entry| entry.key.as_str())
-            .collect::<HashSet<_>>();
-        right
-            .update_entries
-            .iter()
-            .any(|entry| left_keys.contains(entry.key.as_str()))
-    }
-
     /// Check whether another operation upserts a key that is referenced by another operation
     pub(crate) fn upsert_key_conflict(&self, other: &Self) -> bool {
         let self_upsert_keys = self.get_upsert_config_keys();
@@ -1524,110 +1232,6 @@ impl Operation {
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",
-        }
-    }
-}
-
-/// Helper function to apply UpdateMap changes to a HashMap<String, String>
-fn apply_update_map(
-    target: &mut std::collections::HashMap<String, String>,
-    update_map: &UpdateMap,
-) {
-    if update_map.replace {
-        // Full replacement - clear existing and replace with new entries that have values
-        target.clear();
-        for entry in &update_map.update_entries {
-            if let Some(value) = &entry.value {
-                target.insert(entry.key.clone(), value.clone());
-            }
-        }
-    } else {
-        // Incremental update - merge entries
-        for entry in &update_map.update_entries {
-            if let Some(value) = &entry.value {
-                target.insert(entry.key.clone(), value.clone());
-            } else {
-                target.remove(&entry.key);
-            }
-        }
-    }
-}
-
-/// Helper function to translate old-style config updates to new UpdateMap format
-pub fn translate_config_updates(
-    upsert_values: &std::collections::HashMap<String, String>,
-    delete_keys: &[String],
-) -> UpdateMap {
-    let mut update_entries = Vec::new();
-
-    // Add upsert entries (with values)
-    for (key, value) in upsert_values {
-        update_entries.push(UpdateMapEntry {
-            key: key.clone(),
-            value: Some(value.clone()),
-        });
-    }
-
-    // Add delete entries (without values)
-    for key in delete_keys {
-        update_entries.push(UpdateMapEntry {
-            key: key.clone(),
-            value: None,
-        });
-    }
-
-    UpdateMap {
-        update_entries,
-        replace: false, // Old style was always incremental
-    }
-}
-
-/// Helper function to translate old-style schema metadata to new UpdateMap format
-pub fn translate_schema_metadata_updates(
-    schema_metadata: &std::collections::HashMap<String, String>,
-) -> UpdateMap {
-    let update_entries = schema_metadata
-        .iter()
-        .map(|(key, value)| UpdateMapEntry {
-            key: key.clone(),
-            value: Some(value.clone()),
-        })
-        .collect();
-
-    UpdateMap {
-        update_entries,
-        replace: true, // Old style schema metadata was full replacement
-    }
-}
-
-impl From<&UpdateMap> for pb::transaction::UpdateMap {
-    fn from(update_map: &UpdateMap) -> Self {
-        Self {
-            update_entries: update_map
-                .update_entries
-                .iter()
-                .map(|entry| pb::transaction::UpdateMapEntry {
-                    key: entry.key.clone(),
-                    value: entry.value.clone(),
-                })
-                .collect(),
-            replace: update_map.replace,
-        }
-    }
-}
-
-impl From<&pb::transaction::UpdateMap> for UpdateMap {
-    fn from(pb_update_map: &pb::transaction::UpdateMap) -> Self {
-        Self {
-            update_entries: pb_update_map
-                .update_entries
-                .iter()
-                .map(|entry| UpdateMapEntry {
-                    key: entry.key.clone(),
-                    value: entry.value.clone(),
-                })
-                .collect(),
-            replace: pb_update_map.replace,
         }
     }
 }
@@ -1757,6 +1361,181 @@ impl Transaction {
         Ok((manifest, indices))
     }
 
+    /// Build the result manifest for an operation that has been ported to the
+    /// [`Action`](action::Action) vocabulary.
+    ///
+    /// The operation's actions are applied to a scratch clone of the current
+    /// manifest, so schema, fragments, config, schema metadata, base paths,
+    /// and the fragment-id high-water mark all flow from the mutated clone
+    /// rather than being reconstructed by the legacy per-Operation arms of
+    /// [`Self::build_manifest`].
+    ///
+    /// Returns `None` when the operation does not route through actions —
+    /// either because its variant still has a legacy arm, or because
+    /// [`action::actions_from_operation_with_manifest`] declined the
+    /// translation (e.g. an `UpdateConfig` carrying per-field metadata
+    /// updates, a `CreateIndex` whose new index has no fragment bitmap, a
+    /// `Delete` whose updated fragment carries no deletion file, a `Merge`
+    /// that is not a pure column add or runs on a stable-row-id dataset, or
+    /// an `Update` on a stable-row-id dataset). The caller then falls back to
+    /// the legacy path.
+    fn build_manifest_via_actions(
+        &self,
+        current_manifest: Option<&Manifest>,
+        current_indices: &[IndexMetadata],
+        transaction_file_path: &str,
+        config: &ManifestWriteConfig,
+    ) -> Result<Option<(Manifest, Vec<IndexMetadata>)>> {
+        // Operations routed through `Action::apply`. `Rewrite`, `Update`, and
+        // `Merge` translations may decline an operation the action vocabulary
+        // cannot express (see `rewrite_to_actions`/`update_to_actions`/
+        // `merge_to_add_fields`), in which case the legacy arm runs.
+        if !matches!(
+            self.operation,
+            Operation::Append { .. }
+                | Operation::CreateIndex { .. }
+                | Operation::UpdateMemWalState { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::UpdateBases { .. }
+                | Operation::UpdateConfig { .. }
+                | Operation::Delete { .. }
+                | Operation::Project { .. }
+                | Operation::Merge { .. }
+                | Operation::DataReplacement { .. }
+                | Operation::Overwrite { .. }
+                | Operation::Rewrite { .. }
+                | Operation::Update { .. }
+        ) {
+            return Ok(None);
+        }
+
+        // Every action-routed operation here mutates an existing dataset, so a
+        // missing current manifest is an internal error — except a CREATE-mode
+        // `Overwrite`, which has no `new_from_previous` baseline and stays on
+        // the legacy `build_manifest` path.
+        let Some(current_manifest) = current_manifest else {
+            if matches!(self.operation, Operation::Overwrite { .. }) {
+                return Ok(None);
+            }
+            return Err(Error::internal(format!(
+                "No current manifest was provided while building manifest for operation {}",
+                self.operation.name()
+            )));
+        };
+
+        // `Merge` carries the *final* schema and fragments, so its translation
+        // needs the prior manifest to recover the added fields/files; the
+        // other routed operations ignore the manifest argument.
+        let Some(user_action) = action::actions_from_operation_with_manifest(
+            &self.operation,
+            current_manifest,
+            current_indices,
+        ) else {
+            return Ok(None);
+        };
+
+        let mut scratch = current_manifest.clone();
+        let mut indices = current_indices.to_vec();
+        for act in &user_action.actions {
+            act.apply(&mut scratch, &mut indices)?;
+        }
+
+        // A `RewriteFragments` splices fragments carrying reserved ids in
+        // place, so the result may not be id-sorted; restore the
+        // sorted-by-id invariant the legacy `build_manifest` maintains and
+        // compaction planning relies on. A no-op for the other routed
+        // operations, which never reorder fragments.
+        if scratch.fragments.windows(2).any(|w| w[0].id > w[1].id) {
+            let mut sorted_fragments = (*scratch.fragments).clone();
+            sorted_fragments.sort_by_key(|frag| frag.id);
+            scratch.fragments = Arc::new(sorted_fragments);
+        }
+
+        // Drop indices left dangling by a schema narrowing or a fragment
+        // removal — the post-processing the legacy Delete/Project arms perform.
+        // Index-only and metadata-only actions cannot orphan an index, so they
+        // skip this; a pure column-add `Merge` likewise cannot, which is why
+        // `AddFields` is intentionally absent from this set.
+        let prunes_indices = user_action.actions.iter().any(|act| {
+            let any = act.as_any();
+            any.is::<action::RemoveFragments>()
+                || any.is::<action::DropFields>()
+                || any.is::<action::ChangeSchema>()
+        });
+        if prunes_indices {
+            Self::retain_relevant_indices(&mut indices, &scratch.schema, &scratch.fragments);
+        }
+
+        // Fragments added by this transaction need stable row ids assigned
+        // and version metadata stamped — the work the legacy
+        // `Append`/`Overwrite` arms perform inline. A freshly written fragment
+        // carries no `row_id_meta`; a fragment carried over from the current
+        // manifest always does (the dataset uses stable row ids), so the
+        // presence of `row_id_meta` distinguishes the two. An id-based check
+        // would misfire here: `Overwrite` restarts fragment ids from 0, so a
+        // new fragment can reuse an id the removed manifest also held. Only
+        // `Overwrite` adds new fragments among the routed operations today.
+        if current_manifest.uses_stable_row_ids() {
+            let mut next_row_id = current_manifest.next_row_id;
+            let new_version = current_manifest.version + 1;
+            let mut new_fragments = (*scratch.fragments).clone();
+            for fragment in new_fragments.iter_mut().filter(|f| f.row_id_meta.is_none()) {
+                assign_row_ids(&mut next_row_id, std::slice::from_mut(fragment))?;
+                let version_meta = build_version_meta(fragment, new_version);
+                fragment.last_updated_at_version_meta = version_meta.clone();
+                fragment.created_at_version_meta = version_meta;
+            }
+            scratch.fragments = Arc::new(new_fragments);
+            scratch.next_row_id = next_row_id;
+        }
+
+        // Rebuild the manifest as the next version, sourcing schema,
+        // fragments, config, base paths, and the fragment-id high-water mark
+        // from the mutated clone.
+        let mut manifest = Manifest::new_from_previous(
+            &scratch,
+            scratch.schema.clone(),
+            scratch.fragments.clone(),
+        );
+
+        manifest.tag.clone_from(&self.tag);
+
+        // An `Overwrite` may switch the on-disk data storage format. When the
+        // user requested a specific version, it overrides the format inherited
+        // from the previous manifest; otherwise the inherited format stands.
+        // No other routed operation changes the storage format.
+        if matches!(self.operation, Operation::Overwrite { .. }) {
+            let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
+                (Some(storage_format), _) => Some(storage_format.lance_file_version()?),
+                (None, Some(true)) => Some(LanceFileVersion::Legacy),
+                (None, Some(false)) => Some(LanceFileVersion::V2_0),
+                (None, None) => None,
+            };
+            if let Some(user_requested_version) = user_requested_version {
+                manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
+            }
+        }
+
+        if config.auto_set_feature_flags {
+            // Internal operations (e.g. CreateIndex) use
+            // `ManifestWriteConfig::default()` with `use_stable_row_ids =
+            // false`; inherit the flag from the previous manifest so
+            // `apply_feature_flags` does not clear `FLAG_STABLE_ROW_IDS`.
+            let use_stable_row_ids =
+                config.use_stable_row_ids || current_manifest.uses_stable_row_ids();
+            apply_feature_flags(
+                &mut manifest,
+                use_stable_row_ids,
+                config.disable_transaction_file,
+            )?;
+        }
+        manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
+        manifest.update_max_fragment_id();
+        manifest.transaction_file = Some(transaction_file_path.to_string());
+
+        Ok(Some((manifest, indices)))
+    }
+
     /// Create a new manifest from the current manifest and the transaction.
     ///
     /// `current_manifest` should only be None if the dataset does not yet exist.
@@ -1776,6 +1555,19 @@ impl Transaction {
                 "Cannot enable stable row ids on existing dataset".into(),
             ));
         }
+
+        // Operations ported to the Action vocabulary build their manifest by
+        // applying actions to a scratch clone; the legacy per-Operation arms
+        // below only run for variants that have not been ported.
+        if let Some(result) = self.build_manifest_via_actions(
+            current_manifest,
+            &current_indices,
+            transaction_file_path,
+            config,
+        )? {
+            return Ok(result);
+        }
+
         let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
             None => HashMap::new(),
@@ -1867,23 +1659,17 @@ impl Transaction {
                     "Clone operation should not enter build_manifest.".to_string(),
                 ));
             }
-            Operation::Append { fragments } => {
-                final_fragments.extend(maybe_existing_fragments?.clone());
-                let mut new_fragments =
-                    Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
-                if let Some(next_row_id) = &mut next_row_id {
-                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
-                    // Add version metadata for all new fragments
-                    let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
-                    for fragment in new_fragments.iter_mut() {
-                        let version_meta = build_version_meta(fragment, new_version);
-                        fragment.last_updated_at_version_meta = version_meta.clone();
-                        fragment.created_at_version_meta = version_meta;
-                    }
-                }
-                final_fragments.extend(new_fragments);
+            // `Append` always routes through `build_manifest_via_actions`;
+            // reaching it means the router was bypassed.
+            Operation::Append { .. } => {
+                return Err(Error::internal(
+                    "Operation Append must be routed through Action::apply".to_string(),
+                ));
             }
+            // A `Delete` normally routes through `build_manifest_via_actions`;
+            // this arm is the fallback for the malformed case where an updated
+            // fragment carries no deletion file, which has no action
+            // representation.
             Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
@@ -1901,6 +1687,11 @@ impl Transaction {
                 });
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
+            // An `Update` normally routes through `build_manifest_via_actions`;
+            // this arm is the fallback for the cases `update_to_actions`
+            // declines — a `RewriteRows` whose updated fragment carries no
+            // deletion file, or a `RewriteColumns` whose per-fragment data-file
+            // diff cannot be expressed as a column swap.
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
@@ -1984,7 +1775,7 @@ impl Transaction {
                 // Assign row IDs to any fragments that don't have them yet
                 // (e.g., inserted rows from merge_insert operations)
                 if let Some(next_row_id) = &mut next_row_id {
-                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
 
                 if next_row_id.is_some() {
@@ -2019,7 +1810,7 @@ impl Transaction {
                 }
 
                 if let Some(next_row_id) = &mut next_row_id {
-                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Note: Version metadata is already set above (lines 1627-1755)
                     // for Update operations, preserving created_at from original fragments.
                     // Don't overwrite it here.
@@ -2038,12 +1829,16 @@ impl Transaction {
                     )?;
                 }
             }
+            // An `Overwrite` on an existing dataset routes through
+            // `build_manifest_via_actions`; this arm is the CREATE-mode
+            // fallback — the first write of a brand-new dataset, which has no
+            // previous manifest for `new_from_previous` to build on.
             Operation::Overwrite { fragments, .. } => {
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
                 if let Some(next_row_id) = &mut next_row_id {
-                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
                     let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
                     for fragment in new_fragments.iter_mut() {
@@ -2055,6 +1850,12 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
                 final_indices = Vec::new();
             }
+            // A `Rewrite` normally routes through `build_manifest_via_actions`;
+            // this arm is the fallback for a rewrite `rewrite_to_actions`
+            // declines — one whose stable-row-id index remap cannot be
+            // expressed as cardinality-preserving `(old, new)` fragment-id
+            // pairs (a group that empties or grows the fragment count), or a
+            // rewritten index with no stored coverage bitmap.
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
@@ -2076,7 +1877,7 @@ impl Transaction {
                     for index in final_indices.iter_mut() {
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                             *fragment_bitmap =
-                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?;
+                                recalculate_fragment_bitmap(fragment_bitmap, groups)?;
                         }
                     }
                 } else {
@@ -2107,9 +1908,32 @@ impl Transaction {
                 });
                 final_indices.extend(new_indices.clone());
             }
-            Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
+            // A `CreateIndex` whose new indices carry no fragment bitmap, and an
+            // `UpdateConfig` carrying per-field metadata, have no action
+            // representation yet, so they still build through the legacy path.
+            Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
+            // `ReserveFragments`, `UpdateBases`, `UpdateMemWalState`,
+            // `Project`, and `DataReplacement` always translate to actions and
+            // are handled by `build_manifest_via_actions` before this match;
+            // reaching it means the router was bypassed.
+            Operation::ReserveFragments { .. }
+            | Operation::UpdateBases { .. }
+            | Operation::UpdateMemWalState { .. }
+            | Operation::Project { .. }
+            | Operation::DataReplacement { .. } => {
+                return Err(Error::internal(format!(
+                    "Operation {} must be routed through Action::apply",
+                    self.operation.name()
+                )));
+            }
+            // A pure column-add `Merge` and the `alter_columns` type-cast
+            // `Merge` both route through `build_manifest_via_actions`
+            // (`merge_to_add_fields`); this arm is the fallback only for a
+            // `Merge` shape neither translation expresses. Stable-row-id
+            // datasets translate too — `RefreshRowVersionMetadata` reproduces
+            // the per-row version-metadata refresh below.
             Operation::Merge { fragments, .. } => {
                 let mut merged_fragments = fragments.clone();
                 if next_row_id.is_some() {
@@ -2148,169 +1972,8 @@ impl Transaction {
                 // remove those indices as well.
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
-            Operation::Project { .. } => {
-                final_fragments.extend(maybe_existing_fragments?.clone());
-
-                // We might have removed all fields for certain data files, so
-                // we should remove the data files that are no longer relevant.
-                let remaining_field_ids = schema
-                    .fields_pre_order()
-                    .map(|f| f.id)
-                    .collect::<HashSet<_>>();
-                for fragment in final_fragments.iter_mut() {
-                    fragment.files.retain(|file| {
-                        file.fields
-                            .iter()
-                            .any(|field_id| remaining_field_ids.contains(field_id))
-                    });
-                }
-
-                // Some fields that have indices may have been removed, so we should
-                // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
-            }
             Operation::Restore { .. } => {
                 unreachable!()
-            }
-            Operation::DataReplacement { replacements } => {
-                log::warn!(
-                    "Building manifest with DataReplacement operation. This operation is not stable yet, please use with caution."
-                );
-
-                let (old_fragment_ids, new_datafiles): (Vec<&u64>, Vec<&DataFile>) = replacements
-                    .iter()
-                    .map(|DataReplacementGroup(fragment_id, new_file)| (fragment_id, new_file))
-                    .unzip();
-
-                // 1. make sure the new files all have the same fields / or empty
-                // NOTE: arguably this requirement could be relaxed in the future
-                // for the sake of simplicity, we require the new files to have the same fields
-                if new_datafiles
-                    .iter()
-                    .map(|f| f.fields.clone())
-                    .collect::<HashSet<_>>()
-                    .len()
-                    > 1
-                {
-                    let field_info = new_datafiles
-                        .iter()
-                        .enumerate()
-                        .map(|(id, f)| (id, f.fields.clone()))
-                        .fold("".to_string(), |acc, (id, fields)| {
-                            format!("{}File {}: {:?}\n", acc, id, fields)
-                        });
-
-                    return Err(Error::invalid_input(format!(
-                        "All new data files must have the same fields, but found different fields:\n{field_info}"
-                    )));
-                }
-
-                let existing_fragments = maybe_existing_fragments?;
-
-                // Collect replaced field IDs before consuming new_datafiles
-                let replaced_fields: Vec<u32> = new_datafiles
-                    .first()
-                    .map(|f| {
-                        f.fields
-                            .iter()
-                            .filter(|&&id| id >= 0)
-                            .map(|&id| id as u32)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                // 2. check that the fragments being modified have isomorphic layouts along the columns being replaced
-                // 3. add modified fragments to final_fragments
-                for (frag_id, new_file) in old_fragment_ids.iter().zip(new_datafiles) {
-                    let frag = existing_fragments
-                        .iter()
-                        .find(|f| f.id == **frag_id)
-                        .ok_or_else(|| {
-                            Error::invalid_input(
-                                "Fragment being replaced not found in existing fragments",
-                            )
-                        })?;
-                    let mut new_frag = frag.clone();
-
-                    // TODO(rmeng): check new file and fragment are the same length
-
-                    let mut columns_covered = HashSet::new();
-                    for file in &mut new_frag.files {
-                        if file.fields == new_file.fields
-                            && file.file_major_version == new_file.file_major_version
-                            && file.file_minor_version == new_file.file_minor_version
-                        {
-                            // assign the new file path / size to the fragment
-                            file.path = new_file.path.clone();
-                            file.file_size_bytes = new_file.file_size_bytes.clone();
-                        }
-                        columns_covered.extend(file.fields.iter());
-                    }
-                    // SPECIAL CASE: if the column(s) being replaced are not covered by the fragment
-                    // Then it means it's a all-NULL column that is being replaced with real data
-                    // just add it to the final fragments
-                    if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
-                        new_frag.add_file(
-                            new_file.path.clone(),
-                            new_file.fields.to_vec(),
-                            new_file.column_indices.to_vec(),
-                            &LanceFileVersion::try_from_major_minor(
-                                new_file.file_major_version,
-                                new_file.file_minor_version,
-                            )
-                            .expect("Expected valid file version"),
-                            new_file.file_size_bytes.get(),
-                        );
-                    }
-
-                    // Nothing changed in the current fragment, which is not expected -- error out
-                    if &new_frag == frag {
-                        return Err(Error::invalid_input(
-                            "Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions",
-                        ));
-                    }
-                    final_fragments.push(new_frag);
-                }
-
-                let fragments_changed = old_fragment_ids
-                    .iter()
-                    .cloned()
-                    .cloned()
-                    .collect::<HashSet<_>>();
-
-                // 4. push fragments that didn't change back to final_fragments
-                let unmodified_fragments = existing_fragments
-                    .iter()
-                    .filter(|f| !fragments_changed.contains(&f.id))
-                    .cloned()
-                    .collect::<Vec<_>>();
-
-                final_fragments.extend(unmodified_fragments);
-
-                // 5. Invalidate index bitmaps for replaced fields
-                let modified_fragments: Vec<Fragment> = final_fragments
-                    .iter()
-                    .filter(|f| fragments_changed.contains(&f.id))
-                    .cloned()
-                    .collect();
-
-                Self::prune_updated_fields_from_indices(
-                    &mut final_indices,
-                    &modified_fragments,
-                    &replaced_fields,
-                );
-            }
-            Operation::UpdateMemWalState { merged_generations } => {
-                update_mem_wal_index_merged_generations(
-                    &mut final_indices,
-                    current_manifest.map_or(1, |m| m.version + 1),
-                    merged_generations.clone(),
-                )?;
-            }
-            Operation::UpdateBases { .. } => {
-                // UpdateBases operation doesn't modify fragments or indices
-                // Base paths are handled in the manifest creation section below
-                final_fragments.extend(maybe_existing_fragments?.clone());
             }
         };
 
@@ -2437,20 +2100,9 @@ impl Transaction {
                 for (field_id, field_metadata_update) in field_metadata_updates {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
                         apply_update_map(&mut field.metadata, field_metadata_update);
-                        // Also set unenforced primary key based on updated field metadata.
-                        field.unenforced_primary_key_position = field
-                            .metadata
-                            .get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .or_else(|| {
-                                field
-                                    .metadata
-                                    .get(LANCE_UNENFORCED_PRIMARY_KEY)
-                                    .filter(|s| {
-                                        matches!(s.to_lowercase().as_str(), "true" | "1" | "yes")
-                                    })
-                                    .map(|_| 0)
-                            });
+                        // Keep the derived unenforced-primary-key flag in sync
+                        // with the updated field metadata.
+                        field.refresh_unenforced_primary_key_position();
                         // Also set unenforced clustering key based on updated
                         // field metadata.
                         field.unenforced_clustering_key_position = field
@@ -2509,42 +2161,6 @@ impl Transaction {
                 }
             }
             _ => {}
-        }
-
-        // Handle UpdateBases operation to update manifest base_paths
-        if let Operation::UpdateBases { new_bases } = &self.operation {
-            // Validate and add new base paths to the manifest
-            for new_base in new_bases {
-                // Check for conflicts with existing base paths
-                if let Some(existing_base) = manifest
-                    .base_paths
-                    .values()
-                    .find(|bp| bp.name == new_base.name || bp.path == new_base.path)
-                {
-                    return Err(Error::invalid_input(format!(
-                        "Conflict detected: Base path with name '{:?}' or path '{}' already exists. Existing: name='{:?}', path='{}'",
-                        new_base.name, new_base.path, existing_base.name, existing_base.path
-                    )));
-                }
-
-                // Assign a new ID if not already assigned
-                let mut base_to_add = new_base.clone();
-                if base_to_add.id == 0 {
-                    let next_id = manifest
-                        .base_paths
-                        .keys()
-                        .max()
-                        .map(|&id| id + 1)
-                        .unwrap_or(1);
-                    base_to_add.id = next_id;
-                }
-
-                manifest.base_paths.insert(base_to_add.id, base_to_add);
-            }
-        }
-
-        if let Operation::ReserveFragments { num_fragments } = self.operation {
-            manifest.max_fragment_id = Some(manifest.max_fragment_id.unwrap_or(0) + num_fragments);
         }
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
@@ -2741,40 +2357,6 @@ impl Transaction {
         });
     }
 
-    fn recalculate_fragment_bitmap(
-        old: &RoaringBitmap,
-        groups: &[RewriteGroup],
-    ) -> Result<RoaringBitmap> {
-        let mut new_bitmap = old.clone();
-        for group in groups {
-            let any_in_index = group
-                .old_fragments
-                .iter()
-                .any(|frag| old.contains(frag.id as u32));
-            let all_in_index = group
-                .old_fragments
-                .iter()
-                .all(|frag| old.contains(frag.id as u32));
-            // Any rewrite group may or may not be covered by the index.  However, if any fragment
-            // in a rewrite group was previously covered by the index then all fragments in the rewrite
-            // group must have been previously covered by the index.  plan_compaction takes care of
-            // this for us so this should be safe to assume.
-            if any_in_index {
-                if all_in_index {
-                    for frag_id in group.old_fragments.iter().map(|frag| frag.id as u32) {
-                        new_bitmap.remove(frag_id);
-                    }
-                    new_bitmap.extend(group.new_fragments.iter().map(|frag| frag.id as u32));
-                } else {
-                    return Err(Error::invalid_input(
-                        "The compaction plan included a rewrite group that was a split of indexed and non-indexed data",
-                    ));
-                }
-            }
-        }
-        Ok(new_bitmap)
-    }
-
     fn handle_rewrite_indices(
         indices: &mut [IndexMetadata],
         rewritten_indices: &[RewrittenIndex],
@@ -2798,7 +2380,7 @@ impl Transaction {
                 continue;
             };
 
-            index.fragment_bitmap = Some(Self::recalculate_fragment_bitmap(
+            index.fragment_bitmap = Some(recalculate_fragment_bitmap(
                 index.fragment_bitmap.as_ref().ok_or_else(|| {
                     Error::invalid_input(format!(
                         "Cannot rewrite index {} which did not store fragment bitmap",
@@ -2879,131 +2461,12 @@ impl Transaction {
     /// collect the pure(the num of row IDs are equal to the physical rows) "rewrite rows" updated fragment ids
     fn collect_pure_rewrite_row_update_frags_ids(fragments: &[Fragment]) -> Result<Vec<u64>> {
         let mut pure_update_frag_ids = Vec::new();
-
         for fragment in fragments {
-            let physical_rows = fragment
-                .physical_rows
-                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
-                as u64;
-
-            if let Some(row_id_meta) = &fragment.row_id_meta {
-                let existing_row_count = match row_id_meta {
-                    RowIdMeta::Inline(data) => {
-                        let sequence = read_row_ids(data)?;
-                        sequence.len() as u64
-                    }
-                    _ => 0,
-                };
-
-                // only filter the fragments that match: all the rows have row id,
-                // which means it does not contain inserted rows in this fragment
-                if existing_row_count == physical_rows {
-                    pure_update_frag_ids.push(fragment.id);
-                }
+            if is_pure_rewrite_fragment(fragment)? {
+                pure_update_frag_ids.push(fragment.id);
             }
         }
-
         Ok(pure_update_frag_ids)
-    }
-
-    fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
-        for fragment in fragments {
-            let physical_rows = fragment
-                .physical_rows
-                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
-                as u64;
-
-            if fragment.row_id_meta.is_some() {
-                // we may meet merge insert case, it only has partial row ids.
-                // so here, we need to check if the row ids match the physical rows
-                // if yes, continue
-                // if not, fill the remaining row ids to the physical rows, then update row_id_meta
-
-                // Check if existing row IDs match the physical rows count
-                let existing_row_count = match &fragment.row_id_meta {
-                    Some(RowIdMeta::Inline(data)) => {
-                        // Parse the serialized row ID sequence to get the count
-                        let sequence = read_row_ids(data)?;
-                        sequence.len() as u64
-                    }
-                    _ => 0,
-                };
-
-                match existing_row_count.cmp(&physical_rows) {
-                    Ordering::Equal => {
-                        // Row IDs already match physical rows, continue to next fragment
-                        continue;
-                    }
-                    Ordering::Less => {
-                        // Partial row IDs - need to fill the remaining ones
-                        let remaining_rows = physical_rows - existing_row_count;
-                        let new_row_ids = *next_row_id..(*next_row_id + remaining_rows);
-
-                        // Merge existing and new row IDs
-                        let combined_sequence = match &fragment.row_id_meta {
-                            Some(RowIdMeta::Inline(data)) => read_row_ids(data)?,
-                            _ => {
-                                return Err(Error::internal(
-                                    "Failed to deserialize existing row ID sequence",
-                                ));
-                            }
-                        };
-
-                        let mut row_ids: Vec<u64> = combined_sequence.iter().collect();
-                        for row_id in new_row_ids {
-                            row_ids.push(row_id);
-                        }
-                        let combined_sequence = RowIdSequence::from(row_ids.as_slice());
-
-                        let serialized = write_row_ids(&combined_sequence);
-                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
-                        *next_row_id += remaining_rows;
-                    }
-                    Ordering::Greater => {
-                        // More row IDs than physical rows - this shouldn't happen
-                        return Err(Error::internal(format!(
-                            "Fragment has more row IDs ({}) than physical rows ({})",
-                            existing_row_count, physical_rows
-                        )));
-                    }
-                }
-            } else {
-                let row_ids = *next_row_id..(*next_row_id + physical_rows);
-                let sequence = RowIdSequence::from(row_ids);
-                // TODO: write to a separate file if large. Possibly share a file with other fragments.
-                let serialized = write_row_ids(&sequence);
-                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
-                *next_row_id += physical_rows;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl From<&DataReplacementGroup> for pb::transaction::DataReplacementGroup {
-    fn from(DataReplacementGroup(fragment_id, new_file): &DataReplacementGroup) -> Self {
-        Self {
-            fragment_id: *fragment_id,
-            new_file: Some(new_file.into()),
-        }
-    }
-}
-
-/// Convert a protobug DataReplacementGroup to a rust native DataReplacementGroup
-/// this is unfortunately TryFrom instead of From because of the Option in the pb::DataReplacementGroup
-impl TryFrom<pb::transaction::DataReplacementGroup> for DataReplacementGroup {
-    type Error = Error;
-
-    fn try_from(message: pb::transaction::DataReplacementGroup) -> Result<Self> {
-        Ok(Self(
-            message.fragment_id,
-            message
-                .new_file
-                .ok_or(Error::invalid_input(
-                    "DataReplacementGroup must have a new_file",
-                ))?
-                .try_into()?,
-        ))
     }
 }
 
@@ -3313,70 +2776,6 @@ impl TryFrom<pb::Transaction> for Transaction {
     }
 }
 
-impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
-    type Error = Error;
-
-    fn try_from(message: &pb::transaction::rewrite::RewrittenIndex) -> Result<Self> {
-        Ok(Self {
-            old_id: message
-                .old_id
-                .as_ref()
-                .map(Uuid::try_from)
-                .ok_or_else(|| {
-                    Error::invalid_input("required field (old_id) missing from message".to_string())
-                })??,
-            new_id: message
-                .new_id
-                .as_ref()
-                .map(Uuid::try_from)
-                .ok_or_else(|| {
-                    Error::invalid_input("required field (new_id) missing from message".to_string())
-                })??,
-            new_index_details: message
-                .new_index_details
-                .as_ref()
-                .ok_or_else(|| {
-                    Error::invalid_input("new_index_details is a required field".to_string())
-                })?
-                .clone(),
-            new_index_version: message.new_index_version,
-            new_index_files: if message.new_index_files.is_empty() {
-                None
-            } else {
-                Some(
-                    message
-                        .new_index_files
-                        .iter()
-                        .map(|f| IndexFile {
-                            path: f.path.clone(),
-                            size_bytes: f.size_bytes,
-                        })
-                        .collect(),
-                )
-            },
-        })
-    }
-}
-
-impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
-    type Error = Error;
-
-    fn try_from(message: pb::transaction::rewrite::RewriteGroup) -> Result<Self> {
-        Ok(Self {
-            old_fragments: message
-                .old_fragments
-                .into_iter()
-                .map(Fragment::try_from)
-                .collect::<Result<Vec<_>>>()?,
-            new_fragments: message
-                .new_fragments
-                .into_iter()
-                .map(Fragment::try_from)
-                .collect::<Result<Vec<_>>>()?,
-        })
-    }
-}
-
 impl From<&Transaction> for pb::Transaction {
     fn from(value: &Transaction) -> Self {
         let operation = match &value.operation {
@@ -3593,47 +2992,6 @@ impl From<&Transaction> for pb::Transaction {
     }
 }
 
-impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
-    fn from(value: &RewrittenIndex) -> Self {
-        Self {
-            old_id: Some((&value.old_id).into()),
-            new_id: Some((&value.new_id).into()),
-            new_index_details: Some(value.new_index_details.clone()),
-            new_index_version: value.new_index_version,
-            new_index_files: value
-                .new_index_files
-                .as_ref()
-                .map(|files| {
-                    files
-                        .iter()
-                        .map(|f| pb::IndexFile {
-                            path: f.path.clone(),
-                            size_bytes: f.size_bytes,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        }
-    }
-}
-
-impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
-    fn from(value: &RewriteGroup) -> Self {
-        Self {
-            old_fragments: value
-                .old_fragments
-                .iter()
-                .map(pb::DataFragment::from)
-                .collect(),
-            new_fragments: value
-                .new_fragments
-                .iter()
-                .map(pb::DataFragment::from)
-                .collect(),
-        }
-    }
-}
-
 /// Validate the operation is valid for the given manifest.
 pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) -> Result<()> {
     let manifest = match (manifest, operation) {
@@ -3838,10 +3196,12 @@ mod tests {
     use lance_file::version::LanceFileVersion;
     use lance_io::utils::CachedFileSize;
     use lance_table::format::{
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+        DataFile, DeletionFile, DeletionFileType, RowDatasetVersionMeta, RowDatasetVersionRun,
+        RowDatasetVersionSequence, RowIdMeta,
     };
     use lance_table::rowids::segment::U64Segment;
-    use lance_table::rowids::write_row_ids;
+    use lance_table::rowids::{RowIdSequence, read_row_ids, write_row_ids};
+    use rstest::rstest;
     use std::collections::HashMap;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -4081,6 +3441,518 @@ mod tests {
     }
 
     #[test]
+    fn test_update_config_build_manifest_via_actions() {
+        let mut manifest = sample_manifest();
+        manifest
+            .config
+            .insert("keep".to_string(), "old".to_string());
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::UpdateConfig {
+                config_updates: Some(UpdateMap {
+                    update_entries: vec![("added", "value").into()],
+                    replace: false,
+                }),
+                table_metadata_updates: None,
+                schema_metadata_updates: Some(UpdateMap {
+                    update_entries: vec![("schema_key", "schema_value").into()],
+                    replace: false,
+                }),
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            new_manifest.config.get("keep").map(String::as_str),
+            Some("old")
+        );
+        assert_eq!(
+            new_manifest.config.get("added").map(String::as_str),
+            Some("value")
+        );
+        assert_eq!(
+            new_manifest
+                .schema
+                .metadata
+                .get("schema_key")
+                .map(String::as_str),
+            Some("schema_value")
+        );
+        assert_eq!(new_manifest.version, manifest.version + 1);
+    }
+
+    #[test]
+    fn test_update_bases_build_manifest_via_actions() {
+        let manifest = sample_manifest();
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::UpdateBases {
+                new_bases: vec![BasePath::new(
+                    0,
+                    "s3://example/base".to_string(),
+                    Some("extra".to_string()),
+                    false,
+                )],
+            },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert!(
+            new_manifest
+                .base_paths
+                .values()
+                .any(|bp| bp.path == "s3://example/base"),
+            "new base path should be registered: {:?}",
+            new_manifest.base_paths
+        );
+    }
+
+    #[test]
+    fn test_reserve_fragments_build_manifest_via_actions() {
+        let mut manifest = sample_manifest();
+        manifest.update_max_fragment_id();
+        let before = manifest.max_fragment_id().unwrap_or(0);
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::ReserveFragments { num_fragments: 7 },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(new_manifest.max_fragment_id, Some(before as u32 + 7));
+    }
+
+    #[test]
+    fn test_delete_build_manifest_via_actions() {
+        // A Delete that removes a whole fragment routes through
+        // `RemoveFragments`; `retain_relevant_indices` then prunes the now-empty
+        // vector index that covered only the removed fragment.
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let mut manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![Fragment::new(0), Fragment::new(1)]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.update_max_fragment_id();
+
+        let vector_index =
+            create_test_index("vec_idx", 0, 0, Some(RoaringBitmap::from_iter([1])), true);
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Delete {
+                updated_fragments: vec![],
+                deleted_fragment_ids: vec![1],
+                predicate: "id = 1".to_string(),
+            },
+            None,
+        );
+
+        let (new_manifest, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![vector_index],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let frag_ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(frag_ids, vec![0]);
+        assert!(
+            final_indices.is_empty(),
+            "empty vector index should be pruned: {final_indices:?}"
+        );
+    }
+
+    #[test]
+    fn test_project_build_manifest_via_actions() {
+        // A Project narrows the schema via `ChangeSchema`;
+        // `retain_relevant_indices` then drops the index on the removed field.
+        let full = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("name", DataType::Utf8, false),
+        ]);
+        let manifest = Manifest::new(
+            LanceSchema::try_from(&full).unwrap(),
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let projected = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+
+        // Index covers field id 1 ("name"), which the projection removes.
+        let name_index =
+            create_test_index("name_idx", 1, 0, Some(RoaringBitmap::from_iter([0])), false);
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Project { schema: projected },
+            None,
+        );
+
+        let (new_manifest, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![name_index],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(new_manifest.schema.fields.len(), 1);
+        assert_eq!(new_manifest.schema.fields[0].name, "id");
+        assert!(
+            final_indices.is_empty(),
+            "index on dropped field should be pruned: {final_indices:?}"
+        );
+    }
+
+    #[test]
+    fn test_merge_build_manifest_via_actions() {
+        use lance_file::version::LanceFileVersion;
+
+        // A pure column-add Merge on a non-stable-row-id dataset routes
+        // through `AddFields`: the schema gains a field and the new data file
+        // is appended to the existing fragment.
+        let (major, minor) = LanceFileVersion::Stable.to_numbers();
+        let id_file = DataFile::new("a.lance", vec![0], vec![0], major, minor, None, None);
+        let name_file = DataFile::new("b.lance", vec![1], vec![1], major, minor, None, None);
+
+        let prior_schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+        let merged_schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("name", DataType::Utf8, false),
+        ]))
+        .unwrap();
+
+        let prior_fragment = Fragment {
+            id: 0,
+            files: vec![id_file.clone()],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let manifest = Manifest::new(
+            prior_schema,
+            Arc::new(vec![prior_fragment.clone()]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let merged_fragment = Fragment {
+            files: vec![id_file, name_file],
+            ..prior_fragment
+        };
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Merge {
+                fragments: vec![merged_fragment],
+                schema: merged_schema.clone(),
+            },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(new_manifest.schema, merged_schema);
+        assert_eq!(new_manifest.fragments.len(), 1);
+        let frag = &new_manifest.fragments[0];
+        assert_eq!(frag.files.len(), 2);
+        assert_eq!(frag.files[1].path, "b.lance");
+    }
+
+    #[test]
+    fn test_rewrite_build_manifest_via_actions() {
+        // A non-stable-row-id Rewrite routes through `RewriteFragments` +
+        // `RewriteIndex`: the rewrite group splices old fragments [1, 2] into
+        // the reserved fragment 10, and the rewritten index gets a new UUID
+        // plus a coverage bitmap recalculated against the group.
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let mut manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new((0..6).map(Fragment::new).collect()),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.update_max_fragment_id();
+
+        let index = create_test_index(
+            "vec_idx",
+            0,
+            0,
+            Some(RoaringBitmap::from_iter([0, 1, 2])),
+            true,
+        );
+        let new_uuid = uuid::Uuid::new_v4();
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(1), Fragment::new(2)],
+                    new_fragments: vec![Fragment::new(10)],
+                }],
+                rewritten_indices: vec![RewrittenIndex {
+                    old_id: index.uuid,
+                    new_id: new_uuid,
+                    new_index_details: prost_types::Any {
+                        type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+                        value: vec![],
+                    },
+                    new_index_version: 1,
+                    new_index_files: None,
+                }],
+                frag_reuse_index: None,
+            },
+            None,
+        );
+
+        // The translation must route — `build_manifest_via_actions` returns
+        // `Some` rather than deferring to the legacy `Rewrite` arm.
+        assert!(
+            transaction
+                .build_manifest_via_actions(
+                    Some(&manifest),
+                    std::slice::from_ref(&index),
+                    "txn",
+                    &ManifestWriteConfig::default(),
+                )
+                .unwrap()
+                .is_some()
+        );
+
+        let (new_manifest, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![index],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        // The reserved id 10 sorts after the surviving fragments — the
+        // sorted-by-id invariant `build_manifest` restores.
+        let frag_ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(frag_ids, vec![0, 3, 4, 5, 10]);
+        assert_eq!(final_indices.len(), 1);
+        assert_eq!(final_indices[0].uuid, new_uuid);
+        assert_eq!(
+            final_indices[0].fragment_bitmap,
+            Some(RoaringBitmap::from_iter([0, 10])),
+        );
+    }
+
+    #[test]
+    fn test_update_build_manifest_via_actions() {
+        // A non-stable-row-id `RewriteRows` update routes through
+        // `RemoveFragments` + `UpdateDeletionVector` + `AddFragments` +
+        // `InvalidateIndexCoverage`: fragment 1 is fully removed, fragment 0
+        // takes a partial-delete deletion vector, a freshly written fragment
+        // is appended, and the index over the modified field drops the
+        // updated fragment from its coverage.
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let mut manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new((0..3).map(Fragment::new).collect()),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.update_max_fragment_id();
+
+        let index = create_test_index(
+            "id_idx",
+            0,
+            0,
+            Some(RoaringBitmap::from_iter([0, 1, 2])),
+            false,
+        );
+
+        let mut updated_fragment = Fragment::new(0);
+        updated_fragment.deletion_file = Some(DeletionFile {
+            read_version: manifest.version,
+            id: 1,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(2),
+            base_id: None,
+        });
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Update {
+                removed_fragment_ids: vec![1],
+                updated_fragments: vec![updated_fragment],
+                new_fragments: vec![Fragment::new(0)],
+                fields_modified: vec![0],
+                merged_generations: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+
+        // The translation must route — `build_manifest_via_actions` returns
+        // `Some` rather than deferring to the legacy `Update` arm.
+        assert!(
+            transaction
+                .build_manifest_via_actions(
+                    Some(&manifest),
+                    std::slice::from_ref(&index),
+                    "txn",
+                    &ManifestWriteConfig::default(),
+                )
+                .unwrap()
+                .is_some()
+        );
+
+        let (new_manifest, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![index],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        // Fragment 1 removed; the new fragment takes the next free id (3).
+        let frag_ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(frag_ids, vec![0, 2, 3]);
+        let updated = new_manifest.fragments.iter().find(|f| f.id == 0).unwrap();
+        assert!(updated.deletion_file.is_some());
+        // The index over the modified field drops the updated fragment 0; the
+        // removed fragment 1 is cleaned up by query-time bitmap intersection.
+        assert_eq!(final_indices.len(), 1);
+        assert_eq!(
+            final_indices[0].fragment_bitmap,
+            Some(RoaringBitmap::from_iter([1, 2])),
+        );
+    }
+
+    #[rstest]
+    #[case::reserve_fragments(Operation::ReserveFragments { num_fragments: 3 })]
+    #[case::update_bases(Operation::UpdateBases {
+        new_bases: vec![BasePath::new(0, "s3://example/base".to_string(), None, false)],
+    })]
+    #[case::update_mem_wal_state(Operation::UpdateMemWalState {
+        merged_generations: vec![],
+    })]
+    #[case::project(Operation::Project {
+        schema: LanceSchema::try_from(
+            &ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]),
+        )
+        .unwrap(),
+    })]
+    #[case::merge(Operation::Merge {
+        schema: LanceSchema::try_from(
+            &ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]),
+        )
+        .unwrap(),
+        fragments: vec![],
+    })]
+    fn test_routed_operation_rejects_missing_current_manifest(#[case] operation: Operation) {
+        // These operations always translate to actions, so building their
+        // manifest without a current manifest is an internal error rather than
+        // a silent fall-through to the legacy path.
+        let transaction = Transaction::new(0, operation, None);
+        let err = transaction
+            .build_manifest(None, vec![], "txn", &ManifestWriteConfig::default())
+            .expect_err("routed operations require a current manifest");
+        assert!(
+            matches!(err, Error::Internal { .. }),
+            "expected an internal error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_append_build_manifest_assigns_fragment_ids_via_action_apply() {
+        // Existing manifest has fragments 0..=2; new appended fragments carry the
+        // sentinel id 0 and should be assigned 3, 4 by AddFragments::apply.
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let mut manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![Fragment::new(0), Fragment::new(1), Fragment::new(2)]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.update_max_fragment_id();
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Append {
+                fragments: vec![Fragment::new(0), Fragment::new(0)],
+            },
+            None,
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let ids: Vec<u64> = new_manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+        assert_eq!(new_manifest.max_fragment_id, Some(4));
+    }
+
+    #[test]
     fn test_remove_tombstoned_data_files() {
         // Create a fragment with mixed data files: some normal, some fully tombstoned
         let mut fragment = Fragment::new(1);
@@ -4154,7 +4026,7 @@ mod tests {
         }];
         let mut next_row_id = 0;
 
-        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+        assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
 
         assert_eq!(next_row_id, 100);
         assert!(fragments[0].row_id_meta.is_some());
@@ -4186,7 +4058,7 @@ mod tests {
         }];
         let mut next_row_id = 100;
 
-        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+        assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
 
         // next_row_id should not change
         assert_eq!(next_row_id, 100);
@@ -4218,7 +4090,7 @@ mod tests {
         }];
         let mut next_row_id = 100;
 
-        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+        assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
 
         // next_row_id should advance by 20 (50 - 30)
         assert_eq!(next_row_id, 120);
@@ -4253,7 +4125,7 @@ mod tests {
         }];
         let mut next_row_id = 100;
 
-        let result = Transaction::assign_row_ids(&mut next_row_id, &mut fragments);
+        let result = assign_row_ids(&mut next_row_id, &mut fragments);
 
         assert!(result.is_err());
         if let Err(Error::Internal { message, .. }) = result {
@@ -4291,7 +4163,7 @@ mod tests {
         ];
         let mut next_row_id = 1000;
 
-        Transaction::assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
+        assign_row_ids(&mut next_row_id, &mut fragments).unwrap();
 
         // Should advance by 30 (first fragment) + 5 (second fragment partial)
         assert_eq!(next_row_id, 1035);
@@ -4334,7 +4206,7 @@ mod tests {
         }];
         let mut next_row_id = 0;
 
-        let result = Transaction::assign_row_ids(&mut next_row_id, &mut fragments);
+        let result = assign_row_ids(&mut next_row_id, &mut fragments);
 
         assert!(result.is_err());
         if let Err(Error::Internal { message, .. }) = result {
@@ -6079,52 +5951,5 @@ mod tests {
 
         // Row 12 → frag A offset 2 → version 2; row 20 → frag B offset 0 → version 8
         assert_eq!(created_at_versions(&result, 10), vec![2, 8]);
-    }
-
-    #[test]
-    fn test_encode_version_runs_empty() {
-        let runs = encode_version_runs(&[]);
-        assert!(runs.is_empty());
-    }
-
-    #[test]
-    fn test_encode_version_runs_single_run() {
-        let runs = encode_version_runs(&[3, 3, 3]);
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].version, 3);
-    }
-
-    #[test]
-    fn test_encode_version_runs_alternating() {
-        let runs = encode_version_runs(&[1, 2, 1, 2]);
-        assert_eq!(runs.len(), 4);
-        assert_eq!(runs[0].version, 1);
-        assert_eq!(runs[1].version, 2);
-        assert_eq!(runs[2].version, 1);
-        assert_eq!(runs[3].version, 2);
-    }
-
-    fn table_metadata_update(entries: Vec<(&str, Option<&str>)>, replace: bool) -> Operation {
-        Operation::UpdateConfig {
-            config_updates: None,
-            table_metadata_updates: Some(UpdateMap {
-                update_entries: entries.into_iter().map(UpdateMapEntry::from).collect(),
-                replace,
-            }),
-            schema_metadata_updates: None,
-            field_metadata_updates: HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn test_table_metadata_conflicts_on_same_key() {
-        let left = table_metadata_update(vec![("key", Some("1"))], false);
-        let same_key = table_metadata_update(vec![("key", Some("2"))], false);
-        let different_key = table_metadata_update(vec![("other", Some("2"))], false);
-        let replace = table_metadata_update(vec![("other", Some("2"))], true);
-
-        assert!(left.modifies_same_metadata(&same_key));
-        assert!(!left.modifies_same_metadata(&different_key));
-        assert!(left.modifies_same_metadata(&replace));
     }
 }

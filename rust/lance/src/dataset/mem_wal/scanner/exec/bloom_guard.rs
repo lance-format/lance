@@ -21,7 +21,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use futures::Stream;
-use lance_index::scalar::bloomfilter::sbbf::Sbbf;
+use lance_core::utils::bloomfilter::sbbf::Sbbf;
 
 /// Guards a child execution node with a bloom filter check.
 ///

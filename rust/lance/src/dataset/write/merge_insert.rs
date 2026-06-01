@@ -36,7 +36,7 @@ const MERGE_ACTION_COLUMN: &str = "__action";
 // `prepare_stream_schema` and never written to the dataset.
 pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
 
-pub mod inserted_rows;
+pub use lance_table::transaction::inserted_rows;
 
 use assign_action::merge_insert_action;
 use inserted_rows::KeyExistenceFilter;

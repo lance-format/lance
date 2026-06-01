@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use crate::format::pb;
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, RecordBatch,
@@ -15,8 +16,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
 use lance_core::Result;
-use lance_index::scalar::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
-use lance_table::format::pb;
+use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 
 // Default bloom filter config: 8192 items @ 0.00057 fpp -> 16KiB filter
 pub const BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS: u64 = 8192;

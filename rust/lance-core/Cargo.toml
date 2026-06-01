@@ -25,6 +25,7 @@ deepsize.workspace = true
 futures.workspace = true
 itertools.workspace = true
 libc.workspace = true
+libm.workspace = true
 moka.workspace = true
 num_cpus = "1.0"
 object_store = { workspace = true }
@@ -39,6 +40,7 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+twox-hash = "2.0"
 url.workspace = true
 log.workspace = true
 

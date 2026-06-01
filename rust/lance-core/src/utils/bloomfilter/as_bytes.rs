@@ -7,7 +7,7 @@
 //! similar to parquet::data_type::AsBytes but without the external dependency.
 
 /// Trait to convert primitive types to byte slices
-/// Reference: https://arrow.apache.org/rust/src/parquet/data_type.rs.html
+/// Reference: <https://arrow.apache.org/rust/src/parquet/data_type.rs.html>
 pub trait AsBytes {
     /// Convert the value to a byte slice
     fn as_bytes(&self) -> impl AsRef<[u8]>;

@@ -64,6 +64,7 @@ protobuf-src = { version = "2.1", optional = true }
 [features]
 dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-credential-types", "lance-io/aws"]
 protoc = ["dep:protobuf-src"]
+test-util = []
 
 [package.metadata.docs.rs]
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version

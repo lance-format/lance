@@ -13,7 +13,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::prelude::Expr;
 use lance_core::Result;
-use lance_index::scalar::bloomfilter::sbbf::Sbbf;
+use lance_core::utils::bloomfilter::sbbf::Sbbf;
 use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;

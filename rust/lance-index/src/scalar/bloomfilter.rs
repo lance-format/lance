@@ -7,7 +7,6 @@
 //! It is a space-efficient data structure that can be used to test whether an element is a member of a set.
 //! It's an inexact filter - they may include false positives that require rechecking.
 
-use crate::scalar::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -17,10 +16,10 @@ use crate::scalar::{
 };
 use crate::{Any, pb};
 use arrow_array::{Array, UInt64Array};
-mod as_bytes;
-pub mod sbbf;
 use arrow_schema::{DataType, Field};
 use lance_arrow_stats::StatisticsAccumulator;
+use lance_core::utils::bloomfilter::as_bytes;
+use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use serde::{Deserialize, Serialize};
 
 use std::sync::LazyLock;

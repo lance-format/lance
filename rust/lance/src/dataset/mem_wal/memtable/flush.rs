@@ -310,7 +310,7 @@ impl MemTableFlusher {
     async fn write_bloom_filter(
         &self,
         path: &Path,
-        bloom: &lance_index::scalar::bloomfilter::sbbf::Sbbf,
+        bloom: &lance_core::utils::bloomfilter::sbbf::Sbbf,
     ) -> Result<()> {
         let data = bloom.to_bytes();
         self.object_store

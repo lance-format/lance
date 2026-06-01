@@ -264,7 +264,7 @@ async fn test_add_bases() {
         result
             .unwrap_err()
             .to_string()
-            .contains("Conflict detected")
+            .contains("conflicts with an existing base path")
     );
 
     // Test conflict detection - try to add a base with the same path
@@ -281,7 +281,7 @@ async fn test_add_bases() {
         result
             .unwrap_err()
             .to_string()
-            .contains("Conflict detected")
+            .contains("conflicts with an existing base path")
     );
 }
 
@@ -401,11 +401,15 @@ async fn test_concurrent_add_bases_name_conflict() {
 
     let result = dataset_clone.add_bases(new_bases2, None).await;
     assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    // Legacy resolver rejects in check_*_txn ("incompatible with concurrent
+    // transaction"); the action resolver lets the rebase commute and rejects
+    // at materialisation in AddBases::apply ("conflicts with an existing base
+    // path"). Both wordings represent the same correct outcome.
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible with concurrent transaction")
+        err_msg.contains("incompatible with concurrent transaction")
+            || err_msg.contains("conflicts with an existing base path"),
+        "unexpected error message: {err_msg}"
     );
 }
 
@@ -457,11 +461,12 @@ async fn test_concurrent_add_bases_path_conflict() {
 
     let result = dataset_clone.add_bases(new_bases2, None).await;
     assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    // See test_concurrent_add_bases_name_conflict — same dual-wording rationale.
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible with concurrent transaction")
+        err_msg.contains("incompatible with concurrent transaction")
+            || err_msg.contains("conflicts with an existing base path"),
+        "unexpected error message: {err_msg}"
     );
 }
 

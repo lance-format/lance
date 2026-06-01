@@ -1050,6 +1050,26 @@ impl Field {
     pub fn is_unenforced_clustering_key(&self) -> bool {
         self.unenforced_clustering_key_position.is_some()
     }
+
+    /// Recompute [`Self::unenforced_primary_key_position`] from the current
+    /// `metadata`, applying the same rule as field construction: the
+    /// `LANCE_UNENFORCED_PRIMARY_KEY_POSITION` key wins, falling back to the
+    /// legacy boolean `LANCE_UNENFORCED_PRIMARY_KEY` flag at position 0.
+    ///
+    /// Call after mutating `metadata` so the derived flag stays consistent.
+    pub fn refresh_unenforced_primary_key_position(&mut self) {
+        self.unenforced_primary_key_position = self
+            .metadata
+            .get(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+            .and_then(|s| s.parse::<u32>().ok())
+            .or_else(|| {
+                // Backward compatibility: use 0 for the legacy boolean flag.
+                self.metadata
+                    .get(LANCE_UNENFORCED_PRIMARY_KEY)
+                    .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
+                    .map(|_| 0)
+            });
+    }
 }
 
 impl fmt::Display for Field {

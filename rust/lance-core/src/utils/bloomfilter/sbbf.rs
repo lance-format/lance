@@ -28,7 +28,7 @@
 //! removed from Lance.
 //! <https://github.com/apache/arrow-rs/issues/8277>
 
-use crate::scalar::bloomfilter::as_bytes::AsBytes;
+use super::as_bytes::AsBytes;
 use libm::lgamma;
 use std::error::Error;
 use std::fmt;
