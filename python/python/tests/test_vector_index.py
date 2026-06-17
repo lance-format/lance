@@ -136,20 +136,21 @@ def indexed_multivec_dataset(multivec_dataset):
 def run(ds, q=None, assert_func=None):
     if q is None:
         q = np.random.randn(128)
-    project = [None, ["price"], ["vector", "price"], ["vector", "meta", "price"]]
+    project = [
+        None,
+        ["price", "_distance"],
+        ["vector", "price", "_distance"],
+        ["vector", "meta", "price", "_distance"],
+    ]
     refine = [None, 1, 2]
     filters = [None, pc.field("price") > 50.0]
     times = []
 
     for columns in project:
-        expected_columns = []
         if columns is None:
-            expected_columns.extend(ds.schema.names)
+            expected_columns = list(ds.schema.names) + ["_distance"]
         else:
-            expected_columns.extend(columns)
-        # TODO: _distance shouldn't be returned by default either
-        if "_distance" not in expected_columns:
-            expected_columns.append("_distance")
+            expected_columns = list(columns)
 
         for filter_ in filters:
             for rf in refine:
@@ -197,7 +198,7 @@ def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
     query_count = queries.shape[0]
 
     batch = dataset.to_table(
-        columns=["id"],
+        columns=["id", "_distance"],
         nearest={
             "column": "vector",
             "q": queries,
@@ -224,7 +225,7 @@ def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
 
 def _assert_batch_matches_single_queries(ds, queries, k, nearest_kwargs):
     batch = ds.to_table(
-        columns=["id"],
+        columns=["id", "_distance"],
         nearest={
             "column": "vector",
             "q": queries,
@@ -238,7 +239,7 @@ def _assert_batch_matches_single_queries(ds, queries, k, nearest_kwargs):
 
     for query_index, query in enumerate(queries):
         single = ds.to_table(
-            columns=["id"],
+            columns=["id", "_distance"],
             nearest={
                 "column": "vector",
                 "q": query,
@@ -420,7 +421,7 @@ def test_distributed_vector(
 
 def test_rowid_order(indexed_dataset):
     rs = indexed_dataset.to_table(
-        columns=["meta"],
+        columns=["meta", "_distance"],
         with_row_id=True,
         nearest={
             "column": "vector",
@@ -1742,8 +1743,7 @@ def test_dynamic_projection_with_vectors_index(tmp_path: Path):
         },
     )
 
-    # TODO: _distance shouldn't be returned by default
-    assert res.column_names == ["vec", "vec_f16", "_distance"]
+    assert res.column_names == ["vec", "vec_f16"]
 
     original = np.stack(res["vec"].to_numpy())
     casted = np.stack(res["vec_f16"].to_numpy())
@@ -2358,7 +2358,7 @@ def test_vector_index_distance_range(tmp_path):
     # Brute force baseline (exact):
     # get full distance distribution and build expected in-range ids.
     all_results = indexed.to_table(
-        columns=["id"],
+        columns=["id", "_distance"],
         nearest={
             "column": "vector",
             "q": q,
@@ -2382,7 +2382,7 @@ def test_vector_index_distance_range(tmp_path):
     # Compare distance_range results:
     # brute-force vs index path should match exactly for IVF_FLAT
     brute_results = indexed.to_table(
-        columns=["id"],
+        columns=["id", "_distance"],
         nearest={
             "column": "vector",
             "q": q,
@@ -2393,7 +2393,7 @@ def test_vector_index_distance_range(tmp_path):
     )
 
     index_results = indexed.to_table(
-        columns=["id"],
+        columns=["id", "_distance"],
         nearest={
             "column": "vector",
             "q": q,

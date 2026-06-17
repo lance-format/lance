@@ -562,7 +562,7 @@ class LanceFragment(pa.dataset.Fragment):
             "_scan_stats_callback": None,
             "_strict_batch_size": False,
             "_orderings": tuple(order_by) if order_by is not None else None,
-            "_disable_scoring_autoprojection": False,
+            "_disable_scoring_autoprojection": None,
             "_substrait_aggregate": None,
         }
         return LanceScanner(s, self._ds, snapshot=snapshot)

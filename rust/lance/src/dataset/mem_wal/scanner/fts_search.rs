@@ -287,7 +287,13 @@ impl LsmFtsSearchPlanner {
         match source {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
-                let cols = self.fts_scanner_projection(projection);
+                let mut cols = self.fts_scanner_projection(projection);
+                // fts_scanner_projection strips _score; add it back since the
+                // dataset scanner no longer auto-projects scoring columns for
+                // explicit projections.
+                if !cols.iter().any(|c| c == SCORE_COLUMN) {
+                    cols.push(SCORE_COLUMN.to_string());
+                }
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 let bound_query = query
                     .clone()
@@ -301,7 +307,10 @@ impl LsmFtsSearchPlanner {
                     open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
                         .await?;
                 let mut scanner = dataset.scan();
-                let cols = self.fts_scanner_projection(projection);
+                let mut cols = self.fts_scanner_projection(projection);
+                if !cols.iter().any(|c| c == SCORE_COLUMN) {
+                    cols.push(SCORE_COLUMN.to_string());
+                }
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 let bound_query = query
                     .clone()

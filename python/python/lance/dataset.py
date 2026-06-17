@@ -1226,15 +1226,8 @@ class LanceDataset(pa.dataset.Dataset):
             if scan_in_order is true. Otherwise it will fellow as a random order.
             If specified, the return rows will follow the orderings. If a string is
             specified, it will assume ascending and nulls last ordering.
-        disable_scoring_autoprojection: bool, default False
-            Currently, when a search (vector or full text) is performed, the scoring
-            column (_distance, _score) is added to the end of the output even when a
-            projection is specified.  In the future, this will change.  The columns will
-            only be present if there is no projection or if they are explicitly
-            specified in the projection.
-
-            This parameter allows you to opt-in to the new behavior early, to avoid
-            being subject to breaking changes in the future.
+        disable_scoring_autoprojection: bool, optional
+            Deprecated. Scoring autoprojection has been removed.
 
 
         .. note::
@@ -1481,15 +1474,8 @@ class LanceDataset(pa.dataset.Dataset):
             if scan_in_order is true. Otherwise it will fellow as a random order.
             If specified, the return rows will follow the orderings. If a string is
             specified, it will assume ascending and nulls last ordering.
-        disable_scoring_autoprojection: bool, default False
-            Currently, when a search (vector or full text) is performed, the scoring
-            column (_distance, _score) is added to the end of the output even when a
-            projection is specified.  In the future, this will change.  The columns will
-            only be present if there is no projection or if they are explicitly
-            specified in the projection.
-
-            This parameter allows you to opt-in to the new behavior early, to avoid
-            being subject to breaking changes in the future.
+        disable_scoring_autoprojection: bool, optional
+            Deprecated. Scoring autoprojection has been removed.
 
         Notes
         -----
@@ -5985,7 +5971,7 @@ class ScannerBuilder:
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
         self._orderings = None
-        self._disable_scoring_autoprojection = False
+        self._disable_scoring_autoprojection = None
         self._substrait_aggregate = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:

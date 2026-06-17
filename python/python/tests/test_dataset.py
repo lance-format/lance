@@ -3855,30 +3855,26 @@ def test_scoring_columns(tmp_path: Path):
     assert tbl.schema.names == ["vec", "_distance", "_rowid", "_rowaddr"]
 
     # If _rowid or _rowaddr are specified via projection, they stay in the specified
-    # order
+    # order; _distance must be explicitly included
     tbl = dataset.scanner(
-        columns=["_rowid", "vec"], nearest=nearest, disable_scoring_autoprojection=False
+        columns=["_rowid", "vec", "_distance"], nearest=nearest
     ).to_table()
     assert tbl.schema.names == ["_rowid", "vec", "_distance"]
     tbl = dataset.scanner(
-        columns=["vec", "_rowaddr"],
+        columns=["vec", "_rowaddr", "_distance"],
         nearest=nearest,
-        disable_scoring_autoprojection=False,
     ).to_table()
     assert tbl.schema.names == ["vec", "_rowaddr", "_distance"]
 
-    # Legacy behavior
-    # Even though projection happens, the distance column is still added to the end
-    tbl = dataset.scanner(
-        columns=["vec"], nearest=nearest, disable_scoring_autoprojection=False
-    ).to_table()
-    assert tbl.schema.names == ["vec", "_distance"]
-
-    # If we disable scoring autoprojection, the distance column is not added
-    tbl = dataset.scanner(
-        columns=["vec"], nearest=nearest, disable_scoring_autoprojection=True
-    ).to_table()
+    # With an explicit projection, _distance is NOT added automatically
+    tbl = dataset.scanner(columns=["vec"], nearest=nearest).to_table()
     assert tbl.schema.names == ["vec"]
+
+    # disable_scoring_autoprojection=False raises an error
+    with pytest.raises(Exception, match="no longer supported"):
+        dataset.scanner(
+            columns=["vec"], nearest=nearest, disable_scoring_autoprojection=False
+        ).to_table()
 
 
 def test_scanner_schemas(tmp_path: Path):

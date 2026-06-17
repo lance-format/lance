@@ -1002,9 +1002,14 @@ impl Dataset {
             scanner.with_row_address();
         }
 
-        if let Some(true) = disable_scoring_autoprojection {
-            scanner.disable_scoring_autoprojection();
+        if let Some(false) = disable_scoring_autoprojection {
+            return Err(PyValueError::new_err(
+                "disable_scoring_autoprojection=False is no longer supported. \
+                Scoring autoprojection has been removed. \
+                Please include `_distance` or `_score` explicitly in your projection.",
+            ));
         }
+        // True or None: ignore — no autoprojection is now always the default
 
         match (columns, columns_with_transform) {
             (Some(_), Some(_)) => {

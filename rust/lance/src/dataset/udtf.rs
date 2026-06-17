@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{DataFusionError, ScalarValue};
@@ -24,6 +24,7 @@ struct FtsTableProvider {
     dataset: Arc<Dataset>,
     fts_query: FullTextSearchQuery,
     full_schema: Arc<Schema>,
+    score_idx: usize,
     row_id_idx: Option<usize>,
     row_addr_idx: Option<usize>,
     ordered: bool,
@@ -38,6 +39,10 @@ impl FtsTableProvider {
         ordered: bool,
     ) -> Self {
         let mut full_schema = Schema::from(dataset.schema());
+        // _score is always produced by FTS; expose it as a selectable virtual column.
+        let score_field = Field::new("_score", DataType::Float32, true);
+        full_schema = full_schema.try_with_column(score_field).unwrap();
+        let score_idx = full_schema.fields().len() - 1;
         let mut row_id_idx = None;
         let mut row_addr_idx = None;
         if with_row_id {
@@ -52,6 +57,7 @@ impl FtsTableProvider {
             dataset,
             fts_query,
             full_schema: Arc::new(full_schema),
+            score_idx,
             row_id_idx,
             row_addr_idx,
             ordered,
@@ -94,6 +100,9 @@ impl TableProvider for FtsTableProvider {
                         scan.with_row_id();
                     } else if Some(*field_idx) == self.row_addr_idx {
                         scan.with_row_address();
+                    } else if *field_idx == self.score_idx {
+                        // _score is a virtual column produced by FTS search
+                        columns.push("_score");
                     } else {
                         columns.push(self.full_schema.field(*field_idx).name());
                     }

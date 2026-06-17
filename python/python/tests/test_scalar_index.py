@@ -552,7 +552,7 @@ def test_indexed_vector_scan(indexed_dataset: lance.LanceDataset, data_table: pa
 
     def check_result(table: pa.Table):
         assert table.num_rows == 1
-        assert table.num_columns == 2
+        assert table.num_columns == 1
 
         actual_price = table["price"][0]
         assert actual_price == expected_price
@@ -871,7 +871,7 @@ def test_fts_custom_stop_words(tmp_path):
 def test_rowid_order(dataset):
     dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
     results = dataset.scanner(
-        columns=["doc"],
+        columns=["doc", "_score"],
         full_text_query="hello",
         with_row_id=True,
     ).to_table()

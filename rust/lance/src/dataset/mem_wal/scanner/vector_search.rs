@@ -402,8 +402,14 @@ impl LsmVectorSearchPlanner {
         match source {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
-                let cols =
+                let mut cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+                // build_scanner_projection strips _distance; add it back so the
+                // dataset scanner emits it (no longer auto-projected for explicit
+                // projections since autoprojection was removed).
+                if !cols.iter().any(|c| c == DISTANCE_COLUMN) {
+                    cols.push(DISTANCE_COLUMN.to_string());
+                }
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 // Only the base produces a meaningful `_rowid`. `_rowaddr`
                 // can't be combined with `fast_search()` — the IVF index
@@ -430,8 +436,11 @@ impl LsmVectorSearchPlanner {
                     open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
                         .await?;
                 let mut scanner = dataset.scan();
-                let cols =
+                let mut cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+                if !cols.iter().any(|c| c == DISTANCE_COLUMN) {
+                    cols.push(DISTANCE_COLUMN.to_string());
+                }
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 // No `with_row_id/address`: per-source IDs would collide with base.
                 let query_arr = single_query_array(query_vector);
