@@ -912,8 +912,9 @@ impl ScalarQueryParser for TextQueryParser {
             return None;
         }
         // A non-string pattern cannot be handled.
-        let (ScalarValue::Utf8(Some(pattern)) | ScalarValue::LargeUtf8(Some(pattern))) =
-            maybe_scalar(&args[1], data_type)?
+        let (ScalarValue::Utf8(Some(pattern))
+        | ScalarValue::LargeUtf8(Some(pattern))
+        | ScalarValue::Utf8View(Some(pattern))) = maybe_scalar(&args[1], data_type)?
         else {
             return None;
         };
@@ -969,7 +970,9 @@ impl ScalarQueryParser for TextQueryParser {
             return None;
         }
         let pattern_str = match pattern {
-            ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.as_str(),
+            ScalarValue::Utf8(Some(s))
+            | ScalarValue::LargeUtf8(Some(s))
+            | ScalarValue::Utf8View(Some(s)) => s.as_str(),
             _ => return None,
         };
         // Translate the LIKE pattern into a loose regex used only for candidate
@@ -1045,7 +1048,8 @@ fn like_to_regex(pattern: &str, escape: Option<char>) -> Option<String> {
 /// predicate to a full recheck rather than risk changing its semantics.
 fn apply_regex_flags(pattern: &str, flags_expr: &Expr) -> Option<String> {
     let (Expr::Literal(ScalarValue::Utf8(Some(flags)), _)
-    | Expr::Literal(ScalarValue::LargeUtf8(Some(flags)), _)) = flags_expr
+    | Expr::Literal(ScalarValue::LargeUtf8(Some(flags)), _)
+    | Expr::Literal(ScalarValue::Utf8View(Some(flags)), _)) = flags_expr
     else {
         return None;
     };
@@ -3484,6 +3488,15 @@ mod tests {
             apply_regex_flags("foo", &flags("is")).as_deref(),
             Some("(?is)foo")
         );
+        // A `Utf8View` flags literal is folded just like `Utf8` / `LargeUtf8`.
+        assert_eq!(
+            apply_regex_flags(
+                "foo",
+                &Expr::Literal(ScalarValue::Utf8View(Some("i".to_string())), None)
+            )
+            .as_deref(),
+            Some("(?i)foo")
+        );
         // An unrecognized flag bails out so the caller leaves the predicate to a
         // full recheck rather than risk changing its semantics.
         assert_eq!(apply_regex_flags("foo", &flags("g")), None);
@@ -3492,6 +3505,84 @@ mod tests {
             apply_regex_flags("foo", &Expr::Literal(ScalarValue::Int32(Some(1)), None)),
             None
         );
+    }
+
+    #[test]
+    fn test_text_query_parser_utf8view() {
+        // Regression test for the follow-up to PR #7139: the ngram `TextQueryParser`
+        // must accept `Utf8View` patterns/flags, not only `Utf8` / `LargeUtf8`. When
+        // the indexed column is `Utf8View`, `safe_coerce_scalar` coerces the literal
+        // to a `ScalarValue::Utf8View`, so the parser has to match that variant or the
+        // index is silently skipped. The mock index declares `Utf8View` to drive that
+        // coercion regardless of the planner's schema type.
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8View,
+                Box::new(TextQueryParser::new(
+                    "color_idx".to_string(),
+                    "NGram".to_string(),
+                    true,
+                    true,
+                )),
+            ),
+        )]);
+
+        // `contains` over a `Utf8View`-typed index routes to a StringContains query.
+        check(
+            &index_info,
+            "contains(color, 'foobar')",
+            Some(IndexedExpression::index_query_with_recheck(
+                "color".to_string(),
+                "color_idx".to_string(),
+                "NGram".to_string(),
+                Arc::new(TextQuery::StringContains("foobar".to_string())),
+                true,
+            )),
+            false,
+        );
+
+        // `regexp_like` likewise routes to a Regex query. With `optimize` false the
+        // plain-literal regexp_like is not rewritten to LIKE, so it reaches the parser
+        // intact.
+        check(
+            &index_info,
+            "regexp_like(color, 'foobar')",
+            Some(IndexedExpression::index_query_with_recheck(
+                "color".to_string(),
+                "color_idx".to_string(),
+                "NGram".to_string(),
+                Arc::new(TextQuery::Regex("foobar".to_string())),
+                true,
+            )),
+            false,
+        );
+
+        // Infix LIKE with a `Utf8View` pattern is accelerated too. `visit_like` is
+        // exercised directly so the test does not depend on DataFusion's LIKE type
+        // coercion choosing `Utf8View` for the pattern literal. The `Utf8` case is a
+        // parity control: the pre-existing path must keep behaving identically.
+        let parser = TextQueryParser::new("color_idx".to_string(), "NGram".to_string(), true, true);
+        let like = Like::new(
+            false,
+            Box::new(Expr::Column(Column::new_unqualified("color"))),
+            Box::new(Expr::Literal(
+                ScalarValue::Utf8View(Some("%foobar%".to_string())),
+                None,
+            )),
+            None,
+            false,
+        );
+        for pattern in [
+            ScalarValue::Utf8View(Some("%foobar%".to_string())),
+            ScalarValue::Utf8(Some("%foobar%".to_string())),
+        ] {
+            let indexed = parser
+                .visit_like("color", &like, &pattern)
+                .expect("infix LIKE should use the ngram index");
+            assert!(indexed.scalar_query.is_some(), "index query missing");
+            assert!(indexed.refine_expr.is_some(), "LIKE recheck missing");
+        }
     }
 
     #[test]
