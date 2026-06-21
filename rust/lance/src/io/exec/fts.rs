@@ -51,7 +51,9 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
-use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
+use lance_index::scalar::inverted::document_tokenizer::{
+    DocType, JsonTokenizer, JsonTokenizerMode, LanceTokenizer,
+};
 use lance_index::scalar::inverted::query::{
     BoostQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens,
     collect_query_tokens, has_query_token, uses_fuzzy_expansion,
@@ -2052,7 +2054,17 @@ fn tokenizer_for_match_query(
     let analyzer = TextAnalyzer::from(SimpleTokenizer::default());
     match index.tokenizer().doc_type() {
         DocType::Text => Box::new(TextTokenizer::new(analyzer)),
-        DocType::Json => Box::new(JsonTokenizer::new(analyzer)),
+        DocType::Json => {
+            let index_tokenizer = index.tokenizer();
+            let mode = index_tokenizer
+                .json_tokenizer_mode()
+                .unwrap_or(JsonTokenizerMode::SingleDocument);
+            Box::new(JsonTokenizer::new(
+                analyzer,
+                mode,
+                index_tokenizer.disable_cross_array_unnest(),
+            ))
+        }
     }
 }
 
@@ -2406,6 +2418,28 @@ impl FtsSegmentSelection {
         }
         Ok(segments)
     }
+}
+
+fn query_has_concrete_json_array_index(query: &str) -> bool {
+    query.split(';').any(|triple| {
+        let path = triple
+            .split_once(',')
+            .map(|(path, _)| path)
+            .unwrap_or(triple);
+        let mut remaining = path;
+        while let Some(left_bracket) = remaining.find('[') {
+            let after_left = &remaining[left_bracket + 1..];
+            let Some(right_bracket) = after_left.find(']') else {
+                return false;
+            };
+            let array_index = &after_left[..right_bracket];
+            if !array_index.is_empty() && array_index != "*" {
+                return true;
+            }
+            remaining = &after_left[right_bracket + 1..];
+        }
+        false
+    })
 }
 
 pub struct FtsIndexMetrics {
@@ -2927,13 +2961,21 @@ impl ExecutionPlan for MatchQueryExec {
                 column
             )))?;
             let mut tokenizer = tokenizer_for_match_query(first_index, query.fuzziness);
+            let force_and_operator = tokenizer.json_tokenizer_mode()
+                == Some(JsonTokenizerMode::FlattenedSubDocs)
+                && query_has_concrete_json_array_index(&query.terms);
+            let operator = if force_and_operator {
+                Operator::And
+            } else {
+                query.operator
+            };
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
             record_tokenized_query(&tokenized_query, &tokens);
             let prepared = if let Some(prepared_query) = preset_prepared_query {
                 Arc::new(PreparedMatch {
                     query: prepared_query,
                     params: Arc::new(params),
-                    operator: query.operator,
+                    operator,
                 })
             } else {
                 let base_scorer = match (preset_base_scorer, shared_scorer) {
@@ -2954,7 +2996,7 @@ impl ExecutionPlan for MatchQueryExec {
                         &indices,
                         tokens,
                         params,
-                        query.operator,
+                        operator,
                         metrics.as_ref(),
                         base_scorer,
                     )

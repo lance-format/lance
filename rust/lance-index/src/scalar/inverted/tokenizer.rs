@@ -3,7 +3,7 @@
 
 use lance_core::{Error, Result};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, str::FromStr};
 
 #[cfg(feature = "tokenizer-jieba")]
 mod jieba;
@@ -21,7 +21,7 @@ use lindera::LinderaTokenizerBuilder;
 use crate::pbold;
 use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
 use crate::scalar::inverted::tokenizer::document_tokenizer::{
-    JsonTokenizer, LanceTokenizer, TextTokenizer,
+    JsonTokenizer, JsonTokenizerMode, LanceTokenizer, TextTokenizer,
 };
 use crate::scalar::inverted::{
     InvertedListFormatVersion, default_fts_format_version_for_block_size,
@@ -196,6 +196,19 @@ pub struct InvertedIndexParams {
     /// Index code operators such as `::`, `->`, and `!=`.
     pub(crate) index_operators: bool,
 
+    /// JSON tokenization mode. `None` means the caller did not provide a mode.
+    /// Existing JSON indexes without this field are interpreted as `SingleDocument`;
+    /// new JSON indexes default this to `FlattenedSubDocs` during index build.
+    #[serde(default)]
+    pub(crate) json_tokenizer_mode: Option<JsonTokenizerMode>,
+
+    /// If true, flattened JSON tokenization avoids cross-array unnesting.
+    /// This reduces sub-doc explosion for JSON records with multiple sibling
+    /// arrays by indexing each array independently instead of producing their
+    /// Cartesian product. Default is false for exact query semantics.
+    #[serde(default)]
+    pub(crate) disable_cross_array_unnest: bool,
+
     /// Total memory limit in MiB for the build stage.
     ///
     /// This is split evenly across FTS workers at build time. By default Lance
@@ -261,6 +274,9 @@ struct RawInvertedIndexParams {
     split_on_numerics: Option<bool>,
     preserve_original: Option<bool>,
     index_operators: Option<bool>,
+    json_tokenizer_mode: Option<JsonTokenizerMode>,
+    #[serde(default)]
+    disable_cross_array_unnest: bool,
     #[serde(rename = "memory_limit", alias = "worker_memory_limit_mb")]
     memory_limit_mb: Option<u64>,
     #[serde(rename = "num_workers")]
@@ -392,6 +408,10 @@ impl RawInvertedIndexParams {
         if let Some(index_operators) = self.index_operators {
             params.index_operators = index_operators;
         }
+        if let Some(json_tokenizer_mode) = self.json_tokenizer_mode {
+            params.json_tokenizer_mode = Some(json_tokenizer_mode);
+        }
+        params.disable_cross_array_unnest = self.disable_cross_array_unnest;
         params.memory_limit_mb = self.memory_limit_mb;
         params.num_workers = self.num_workers;
         params.format_version = self.format_version;
@@ -427,6 +447,11 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             ),
             document_granularity: PbDocumentGranularity::from(params.document_granularity) as i32,
             posting_format_version: Some(params.resolved_format_version().index_version()),
+            json_tokenizer_mode: params
+                .json_tokenizer_mode
+                .filter(|mode| *mode == JsonTokenizerMode::FlattenedSubDocs)
+                .map(|mode| mode.as_ref().to_string()),
+            disable_cross_array_unnest: params.disable_cross_array_unnest,
         })
     }
 }
@@ -446,6 +471,12 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
                     Some(block_size) => validate_block_size(block_size as usize)?,
                     None => LEGACY_BLOCK_SIZE,
                 },
+                json_tokenizer_mode: details
+                    .json_tokenizer_mode
+                    .as_deref()
+                    .map(JsonTokenizerMode::from_str)
+                    .transpose()?,
+                disable_cross_array_unnest: details.disable_cross_array_unnest,
                 ..Self::default()
             };
             params.document_granularity = details.document_granularity.try_into()?;
@@ -498,6 +529,12 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             .posting_format_version
             .map(|version| resolve_fts_format_version(Some(&version.to_string())))
             .transpose()?;
+        params.json_tokenizer_mode = details
+            .json_tokenizer_mode
+            .as_deref()
+            .map(JsonTokenizerMode::from_str)
+            .transpose()?;
+        params.disable_cross_array_unnest = details.disable_cross_array_unnest;
         params.validate()?;
         Ok(params)
     }
@@ -652,6 +689,8 @@ impl InvertedIndexParams {
             split_on_numerics: false,
             preserve_original: false,
             index_operators: false,
+            json_tokenizer_mode: None,
+            disable_cross_array_unnest: false,
             memory_limit_mb: None,
             num_workers: None,
             format_version: None,
@@ -747,6 +786,18 @@ impl InvertedIndexParams {
     /// Return the logical FTS document boundary.
     pub fn get_document_granularity(&self) -> DocumentGranularity {
         self.document_granularity
+    }
+
+    /// Set how JSON documents are tokenized by the Lance JSON tokenizer.
+    pub fn json_tokenizer_mode(mut self, mode: JsonTokenizerMode) -> Self {
+        self.json_tokenizer_mode = Some(mode);
+        self
+    }
+
+    /// Set whether flattened JSON tokenization avoids cross-array unnesting.
+    pub fn disable_cross_array_unnest(mut self, disable_cross_array_unnest: bool) -> Self {
+        self.disable_cross_array_unnest = disable_cross_array_unnest;
+        self
     }
 
     /// Set the lexical tokenizer implementation.
@@ -1039,7 +1090,12 @@ impl InvertedIndexParams {
 
         match self.lance_tokenizer {
             Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
-            Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
+            Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(
+                tokenizer,
+                self.json_tokenizer_mode
+                    .unwrap_or(JsonTokenizerMode::SingleDocument),
+                self.disable_cross_array_unnest,
+            ))),
             None => Ok(Box::new(TextTokenizer::new(tokenizer))),
             _ => Err(Error::invalid_input(format!(
                 "unknown lance tokenizer {}",
@@ -1587,6 +1643,8 @@ mod tests {
             code_config: None,
             document_granularity: PbDocumentGranularity::Row as i32,
             posting_format_version: None,
+            json_tokenizer_mode: None,
+            disable_cross_array_unnest: false,
         };
         let params = InvertedIndexParams::try_from(&old_details).unwrap();
         assert_eq!(params.block_size, 128);

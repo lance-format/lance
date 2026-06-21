@@ -6458,6 +6458,86 @@ async fn prepare_json_dataset() -> (Dataset, String) {
 }
 
 #[tokio::test]
+async fn test_json_inverted_flattened_sub_doc_array_paths() {
+    let ids = Arc::new(UInt64Array::from(vec![0, 1]));
+    let json_col = "json_field".to_string();
+    let json_values = Arc::new(StringArray::from(vec![
+        r#"{"foo":[{"bar":["x","y"]},{"bar":["a","b"]}],"foo2":["u"]}"#,
+        r#"{"foo":[{"bar":["y","z"]}],"foo2":["u"]}"#,
+    ]));
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata),
+        ])
+        .into(),
+        vec![ids as ArrayRef, json_values as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(stream, "memory://test/flattened_json_array_paths", None)
+        .await
+        .unwrap();
+
+    dataset
+        .create_index(
+            &[&json_col],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .lance_tokenizer("json".to_string())
+                .stem(false)
+                .remove_stop_words(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let exact_query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("foo[0].bar[0],str,y".to_string()).with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let exact_batch = dataset
+        .scan()
+        .full_text_search(exact_query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let exact_ids = exact_batch["id"].as_primitive::<UInt64Type>().values();
+    assert_eq!(exact_ids, &[1]);
+
+    let wildcard_query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new("foo[0].bar[*],str,y".to_string()).with_column(Some(json_col.clone())),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let wildcard_batch = dataset
+        .scan()
+        .full_text_search(wildcard_query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let wildcard_ids = wildcard_batch["id"].as_primitive::<UInt64Type>().values();
+    assert_eq!(wildcard_batch.num_rows(), 2, "ids={wildcard_ids:?}");
+    assert!(wildcard_ids.contains(&0), "ids={wildcard_ids:?}");
+    assert!(wildcard_ids.contains(&1), "ids={wildcard_ids:?}");
+}
+
+#[tokio::test]
 async fn test_json_inverted_fuzziness_query() {
     let (mut dataset, json_col) = prepare_json_dataset().await;
 
@@ -6817,7 +6897,7 @@ async fn test_json_inverted_multimatch_query() {
             match_queries: vec![
                 MatchQuery::new("Title,str,harrypotter".to_string())
                     .with_column(Some(json_col.clone())),
-                MatchQuery::new("Language,str,english".to_string())
+                MatchQuery::new("Language[*],str,english".to_string())
                     .with_column(Some(json_col.clone())),
             ],
         }),
@@ -6859,7 +6939,7 @@ async fn test_json_inverted_boolean_query() {
             should: vec![],
             must: vec![
                 FtsQuery::Match(
-                    MatchQuery::new("Language,str,english".to_string())
+                    MatchQuery::new("Language[*],str,english".to_string())
                         .with_column(Some(json_col.clone())),
                 ),
                 FtsQuery::Match(

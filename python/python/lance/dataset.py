@@ -3720,6 +3720,12 @@ class LanceDataset(pa.dataset.Dataset):
             ``[1, num_compute_cpus]``. If unset, Lance uses ``num_compute_cpus``
             workers unless ``LANCE_FTS_NUM_SHARDS`` is set. This parameter is
             only used for the current build and is not persisted with the index.
+        disable_cross_array_unnest: bool, default False
+            This is for the ``INVERTED`` index on JSON columns. If True, flattened
+            JSON tokenization indexes sibling arrays independently instead of
+            producing their Cartesian product. This reduces index build memory for
+            records with multiple arrays but can sacrifice result accuracy for
+            queries that constrain values across those arrays.
         base_tokenizer: str, default "simple"
             This is for the ``INVERTED`` index. The base tokenizer to use. The
             value can be:

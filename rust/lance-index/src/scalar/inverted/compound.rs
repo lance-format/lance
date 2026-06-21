@@ -17,7 +17,7 @@ use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 
 use super::{
     InvertedIndex, PreparedBm25Query,
-    document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer},
+    document_tokenizer::{DocType, JsonTokenizer, JsonTokenizerMode, LanceTokenizer},
     documents::{
         CachedRowAddressOrder, DocId, DocLengths, DocVisibility, OrderedRowAddressProjection,
         PartitionDocuments, ResidentAddressProjection, RowAddressProjectionOrderError,
@@ -3791,9 +3791,16 @@ pub(super) fn tokenize_leaf(
         && matches!(params.fuzziness, Some(distance) if distance > 0);
     let mut tokenizer = if is_explicit_fuzzy_match {
         let analyzer = TextAnalyzer::from(SimpleTokenizer::default());
-        match index.tokenizer().doc_type() {
+        let index_tokenizer = index.tokenizer();
+        match index_tokenizer.doc_type() {
             DocType::Text => Box::new(TextTokenizer::new(analyzer)) as Box<dyn LanceTokenizer>,
-            DocType::Json => Box::new(JsonTokenizer::new(analyzer)) as Box<dyn LanceTokenizer>,
+            DocType::Json => Box::new(JsonTokenizer::new(
+                analyzer,
+                index_tokenizer
+                    .json_tokenizer_mode()
+                    .unwrap_or(JsonTokenizerMode::SingleDocument),
+                index_tokenizer.disable_cross_array_unnest(),
+            )) as Box<dyn LanceTokenizer>,
         }
     } else {
         index.tokenizer()

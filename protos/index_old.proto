@@ -115,4 +115,10 @@ message InvertedIndexDetails {
    * which identifies the overall inverted-index layout.
    */
   optional uint32 posting_format_version = 15;
+  // JSON document tokenization mode. Absent means SingleDocument JSON tokenization,
+  // which is how indexes written before flattened JSON sub-docs are interpreted.
+  optional string json_tokenizer_mode = 16;
+  // If true, avoid cross-array unnesting during flattened JSON tokenization.
+  // The default false value preserves exact Cartesian-product semantics.
+  bool disable_cross_array_unnest = 17;
 }

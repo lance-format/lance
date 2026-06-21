@@ -904,13 +904,19 @@ pub fn has_query_token(
     tokenizer: &mut Box<dyn LanceTokenizer>,
     query_tokens: &Tokens,
 ) -> bool {
-    let mut stream = tokenizer.token_stream_for_doc(text);
-    while let Some(token) = stream.next() {
-        if query_tokens.contains(&token.text) {
-            return true;
+    match tokenizer.token_streams_for_doc(text) {
+        Ok(sub_docs) => {
+            for tokens in sub_docs {
+                for token in tokens {
+                    if query_tokens.contains(&token.text) {
+                        return true;
+                    }
+                }
+            }
+            false
         }
+        Err(_) => false,
     }
-    false
 }
 
 fn fill_match_query_columns(

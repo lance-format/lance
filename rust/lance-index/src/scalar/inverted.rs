@@ -428,11 +428,11 @@ impl InvertedIndexPlugin {
         params.validate_format_version()?;
         let format_version = params.resolved_format_version();
         let is_element_document = params.get_document_granularity().is_list_element();
-        let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
                 .with_progress(progress);
         let files = inverted_index.update(data, index_store, None).await?;
+        let details = pbold::InvertedIndexDetails::try_from(inverted_index.params())?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: if is_element_document {
