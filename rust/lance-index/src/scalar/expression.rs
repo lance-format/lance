@@ -911,10 +911,12 @@ impl ScalarQueryParser for TextQueryParser {
         if args.len() < 2 {
             return None;
         }
-        // A non-string pattern cannot be handled.
-        let (ScalarValue::Utf8(Some(pattern))
-        | ScalarValue::LargeUtf8(Some(pattern))
-        | ScalarValue::Utf8View(Some(pattern))) = maybe_scalar(&args[1], data_type)?
+        // A non-string pattern cannot be handled. `maybe_scalar` coerces the
+        // literal to the indexed column's type, which for an ngram index is
+        // always `Utf8` (Lance normalizes `Utf8View` columns to `Utf8` at write
+        // time), so the coerced value here is never `Utf8View`.
+        let (ScalarValue::Utf8(Some(pattern)) | ScalarValue::LargeUtf8(Some(pattern))) =
+            maybe_scalar(&args[1], data_type)?
         else {
             return None;
         };
@@ -969,6 +971,10 @@ impl ScalarQueryParser for TextQueryParser {
         if !self.supports_regex || like.case_insensitive {
             return None;
         }
+        // Unlike the `contains` / `regexp_like` pattern, the LIKE pattern reaches
+        // us uncoerced (verbatim from the `Expr`), so a programmatically-built
+        // filter passed through `scan.filter_expr` can carry any string variant
+        // here, including `Utf8View`.
         let pattern_str = match pattern {
             ScalarValue::Utf8(Some(s))
             | ScalarValue::LargeUtf8(Some(s))
@@ -3509,59 +3515,19 @@ mod tests {
 
     #[test]
     fn test_text_query_parser_utf8view() {
-        // Regression test for the follow-up to PR #7139: the ngram `TextQueryParser`
-        // must accept `Utf8View` patterns/flags, not only `Utf8` / `LargeUtf8`. When
-        // the indexed column is `Utf8View`, `safe_coerce_scalar` coerces the literal
-        // to a `ScalarValue::Utf8View`, so the parser has to match that variant or the
-        // index is silently skipped. The mock index declares `Utf8View` to drive that
-        // coercion regardless of the planner's schema type.
-        let index_info = MockIndexInfoProvider::new(vec![(
-            "color",
-            ColInfo::new(
-                DataType::Utf8View,
-                Box::new(TextQueryParser::new(
-                    "color_idx".to_string(),
-                    "NGram".to_string(),
-                    true,
-                    true,
-                )),
-            ),
-        )]);
-
-        // `contains` over a `Utf8View`-typed index routes to a StringContains query.
-        check(
-            &index_info,
-            "contains(color, 'foobar')",
-            Some(IndexedExpression::index_query_with_recheck(
-                "color".to_string(),
-                "color_idx".to_string(),
-                "NGram".to_string(),
-                Arc::new(TextQuery::StringContains("foobar".to_string())),
-                true,
-            )),
-            false,
-        );
-
-        // `regexp_like` likewise routes to a Regex query. With `optimize` false the
-        // plain-literal regexp_like is not rewritten to LIKE, so it reaches the parser
-        // intact.
-        check(
-            &index_info,
-            "regexp_like(color, 'foobar')",
-            Some(IndexedExpression::index_query_with_recheck(
-                "color".to_string(),
-                "color_idx".to_string(),
-                "NGram".to_string(),
-                Arc::new(TextQuery::Regex("foobar".to_string())),
-                true,
-            )),
-            false,
-        );
-
-        // Infix LIKE with a `Utf8View` pattern is accelerated too. `visit_like` is
-        // exercised directly so the test does not depend on DataFusion's LIKE type
-        // coercion choosing `Utf8View` for the pattern literal. The `Utf8` case is a
-        // parity control: the pre-existing path must keep behaving identically.
+        // The infix-LIKE pattern reaches `visit_like` uncoerced (verbatim from the
+        // `Expr`), so a programmatically-built filter passed through
+        // `scan.filter_expr` can carry a `Utf8View` literal that the parser must
+        // still match - the same defensive contract #7139 / #7351 established for
+        // the BTree `SargableQueryParser`. (A `contains` / `regexp_like` pattern is
+        // coerced to the indexed column's `Utf8` type first, so it never reaches the
+        // parser as `Utf8View`; an ngram-indexed column is never `Utf8View` either,
+        // because Lance normalizes it to `Utf8` at write time.)
+        //
+        // `visit_like` is exercised directly so the test does not depend on
+        // DataFusion's LIKE type coercion choosing `Utf8View` for the pattern. The
+        // `Utf8` case is a parity control: the pre-existing path must keep behaving
+        // identically.
         let parser = TextQueryParser::new("color_idx".to_string(), "NGram".to_string(), true, true);
         let like = Like::new(
             false,
