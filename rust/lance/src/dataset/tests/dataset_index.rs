@@ -6538,6 +6538,75 @@ async fn test_json_inverted_flattened_sub_doc_array_paths() {
 }
 
 #[tokio::test]
+async fn test_json_inverted_flattened_sub_doc_prevents_cross_object_match() {
+    let ids = Arc::new(UInt64Array::from(vec![0, 1]));
+    let json_col = "json_field".to_string();
+    let json_values = Arc::new(StringArray::from(vec![
+        r#"{"cart_id":3234234,"cart":[{"product_type":"sneakers","attributes":{"color":"white"}},{"product_type":"t-shirt","attributes":{"color":"red"}}]}"#,
+        r#"{"cart_id":3234235,"cart":[{"product_type":"sneakers","attributes":{"color":"red"}}]}"#,
+    ]));
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata),
+        ])
+        .into(),
+        vec![ids as ArrayRef, json_values as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(
+        stream,
+        "memory://test/flattened_json_cross_object_match",
+        None,
+    )
+    .await
+    .unwrap();
+
+    dataset
+        .create_index(
+            &[&json_col],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .lance_tokenizer("json".to_string())
+                .stem(false)
+                .remove_stop_words(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = FullTextSearchQuery {
+        query: FtsQuery::Match(
+            MatchQuery::new(
+                "cart[*].product_type,str,sneakers;cart[*].attributes.color,str,red".to_string(),
+            )
+            .with_column(Some(json_col.clone()))
+            .with_operator(Operator::And),
+        ),
+        limit: None,
+        wand_factor: None,
+    };
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = batch["id"].as_primitive::<UInt64Type>().values();
+    assert_eq!(ids, &[1]);
+}
+
+#[tokio::test]
 async fn test_json_inverted_fuzziness_query() {
     let (mut dataset, json_col) = prepare_json_dataset().await;
 
