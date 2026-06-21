@@ -3518,11 +3518,10 @@ mod tests {
         // The infix-LIKE pattern reaches `visit_like` uncoerced (verbatim from the
         // `Expr`), so a programmatically-built filter passed through
         // `scan.filter_expr` can carry a `Utf8View` literal that the parser must
-        // still match - the same defensive contract #7139 / #7351 established for
-        // the BTree `SargableQueryParser`. (A `contains` / `regexp_like` pattern is
-        // coerced to the indexed column's `Utf8` type first, so it never reaches the
-        // parser as `Utf8View`; an ngram-indexed column is never `Utf8View` either,
-        // because Lance normalizes it to `Utf8` at write time.)
+        // still match. (A `contains` / `regexp_like` pattern is coerced to the
+        // indexed column's `Utf8` type first, so it never reaches the parser as
+        // `Utf8View`; an ngram-indexed column is never `Utf8View` either, because
+        // Lance normalizes it to `Utf8` at write time.)
         //
         // `visit_like` is exercised directly so the test does not depend on
         // DataFusion's LIKE type coercion choosing `Utf8View` for the pattern. The
