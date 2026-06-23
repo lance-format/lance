@@ -65,8 +65,9 @@ use lance_index::{
     MIN_PARTITION_SIZE_PERCENT,
 };
 use lance_io::local::to_local_path;
+use lance_io::object_store::ObjectStore;
 use lance_io::stream::RecordBatchStream;
-use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
+use lance_io::stream::RecordBatchStreamAdapter;
 use lance_linalg::distance::{DistanceType, Dot, L2, Normalize};
 use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::IndexFile;
@@ -84,6 +85,7 @@ use crate::index::vector::utils::infer_vector_dim;
 use super::v2::IVFIndex;
 use super::{
     ivf::load_precomputed_partitions_if_available,
+    partition_artifact::PartitionArtifactShuffleReader,
     utils::{self, get_vector_type},
 };
 
@@ -178,6 +180,19 @@ pub struct VectorIndexBuildSummary {
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
+    async fn try_open_precomputed_partition_artifact_reader(
+        &self,
+        uri: &str,
+    ) -> Result<Arc<dyn ShuffleReader>> {
+        let storage_options = self
+            .ivf_params
+            .as_ref()
+            .and_then(|params| params.storage_options.as_ref());
+        Ok(Arc::new(
+            PartitionArtifactShuffleReader::try_open(uri, storage_options).await?,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataset: Dataset,
@@ -574,6 +589,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             return Err(Error::invalid_input("dataset not set before shuffling"));
         };
 
+        if let Some(uri) = self
+            .ivf_params
+            .as_ref()
+            .and_then(|params| params.precomputed_partition_artifact_uri.as_deref())
+        {
+            log::info!("shuffle with precomputed partition artifact from {}", uri);
+            self.shuffle_reader = Some(
+                self.try_open_precomputed_partition_artifact_reader(uri)
+                    .await?,
+            );
+            return Ok(());
+        }
+
         let stream = match self
             .ivf_params
             .as_ref()
@@ -581,8 +609,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         {
             Some((uri, _)) => {
                 let uri = to_local_path(uri);
-                // the uri points to data directory,
-                // so need to trim the "data" suffix for reading the dataset
                 let uri = uri.trim_end_matches("data");
                 log::info!("shuffle with precomputed shuffle buffers from {}", uri);
                 let ds = Dataset::open(uri).await?;

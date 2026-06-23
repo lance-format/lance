@@ -3728,6 +3728,14 @@ class LanceDataset(pa.dataset.Dataset):
                 "Temporary shuffle buffers stored at %s, you may want to delete it.",
                 kwargs["precomputed_shuffle_buffers_path"],
             )
+        if "precomputed_partition_artifact_uri" in kwargs.keys() and os.path.exists(
+            kwargs["precomputed_partition_artifact_uri"]
+        ):
+            LOGGER.info(
+                "Temporary precomputed partition artifact stored at %s; "
+                "you may want to delete it.",
+                kwargs["precomputed_partition_artifact_uri"],
+            )
         return index
 
     def create_index(
@@ -3900,6 +3908,11 @@ class LanceDataset(pa.dataset.Dataset):
                 Only 4, 8 are supported.
             - index_file_version
                 The version of the index file. Default is "V3".
+            - precomputed_partition_artifact_uri
+                An advanced input produced by an external backend. When set,
+                Lance skips its own partition assignment and consumes the
+                precomputed partition-local artifact during finalization.
+                Requires `ivf_centroids` and `pq_codebook`.
 
         Optional parameters for `IVF_RQ`:
 

@@ -1394,9 +1394,31 @@ fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
         ));
     }
 
+    if ivf.precomputed_partition_artifact_uri.is_some() && ivf.centroids.is_none() {
+        return Err(Error::index(
+            "precomputed_partition_artifact_uri requires centroids to be set".to_string(),
+        ));
+    }
+
     if ivf.precomputed_shuffle_buffers.is_some() && ivf.precomputed_partitions_file.is_some() {
         return Err(Error::index(
             "precomputed_shuffle_buffers and precomputed_partitions_file are mutually exclusive"
+                .to_string(),
+        ));
+    }
+
+    if ivf.precomputed_partition_artifact_uri.is_some() && ivf.precomputed_partitions_file.is_some()
+    {
+        return Err(Error::index(
+            "precomputed_partition_artifact_uri and precomputed_partitions_file are mutually exclusive"
+                .to_string(),
+        ));
+    }
+
+    if ivf.precomputed_partition_artifact_uri.is_some() && ivf.precomputed_shuffle_buffers.is_some()
+    {
+        return Err(Error::index(
+            "precomputed_partition_artifact_uri and precomputed_shuffle_buffers are mutually exclusive"
                 .to_string(),
         ));
     }
@@ -1409,6 +1431,12 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
     if ivf.precomputed_shuffle_buffers.is_some() && pq.codebook.is_none() {
         return Err(Error::index(
             "precomputed_shuffle_buffers requires codebooks to be set".to_string(),
+        ));
+    }
+
+    if ivf.precomputed_partition_artifact_uri.is_some() && pq.codebook.is_none() {
+        return Err(Error::index(
+            "precomputed_partition_artifact_uri requires codebooks to be set".to_string(),
         ));
     }
 

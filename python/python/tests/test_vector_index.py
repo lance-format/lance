@@ -708,6 +708,23 @@ def test_create_index_accelerator_fallback(tmp_path, caplog):
     )
 
 
+def test_create_index_rejects_missing_precomputed_partition_artifact(tmp_path):
+    dataset = lance.write_dataset(
+        create_table(nvec=64, ndim=128), tmp_path / "artifact_src"
+    )
+
+    with pytest.raises(Exception):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=16,
+            ivf_centroids=np.random.randn(4, 128).astype(np.float32),
+            pq_codebook=np.random.randn(16, 256, 8).astype(np.float32),
+            precomputed_partition_artifact_uri=str(tmp_path / "missing_artifact"),
+        )
+
+
 def test_use_index(dataset, tmp_path):
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(

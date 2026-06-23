@@ -544,7 +544,6 @@ impl Shuffler for TwoFileShuffler {
         offsets_writer.finish().await?;
 
         let num_batches = num_batches.load(std::sync::atomic::Ordering::Relaxed);
-
         let total_loss_val = *total_loss.lock().unwrap();
 
         TwoFileShuffleReader::try_new(
