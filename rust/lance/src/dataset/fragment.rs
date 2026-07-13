@@ -1711,21 +1711,40 @@ impl FileFragment {
         Ok(num_physical_rows - num_deleted_rows)
     }
 
-    /// Get the number of physical rows in the fragment. This includes deleted rows.
+    /// Get the number of physical rows in this [`FileFragment`].
     ///
-    /// If there are no deleted rows, this is equal to the number of rows in the
-    /// fragment.
+    /// Physical rows include deleted rows. If there are no deleted rows, this is
+    /// equal to the number of logical rows in the fragment.
+    ///
+    /// When the dataset manifest contains writer-version metadata, this method
+    /// trusts [`Fragment::physical_rows`] when it is present. This includes
+    /// file-less fragments, which can represent rows whose columns are all null.
+    /// Use [`Self::metadata`] to inspect the persisted [`Fragment`] metadata.
+    ///
+    /// Legacy manifests without writer-version metadata may contain an incorrect
+    /// cached count, so this method ignores it and reads the count from a data
+    /// file. If such a fragment has no data files, this method returns
+    /// [`Error::NotFound`]. See [`Self::validate`] for the corresponding metadata
+    /// checks.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// for fragment in dataset.get_fragments() {
+    ///     let physical_rows = fragment.physical_rows().await?;
+    ///     if fragment.num_data_files() == 0 {
+    ///         assert_eq!(fragment.metadata().physical_rows, Some(physical_rows));
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn physical_rows(&self) -> Result<usize> {
-        if self.metadata.files.is_empty() {
-            return Err(Error::not_found(format!(
-                "Fragment {} does not contain any data",
-                self.id()
-            )));
-        };
-
         // Early versions that did not write the writer version also could write
-        // incorrect `physical_row` values. So if we don't have a writer version,
-        // we should not used the cached value. On write, we update the values
+        // incorrect `physical_rows` values. So if we don't have a writer version,
+        // we should not use the cached value. On write, we update the values
         // in the manifest, fixing the issue for future reads.
         // See: https://github.com/lance-format/lance/issues/1531
         if self.dataset.manifest.writer_version.is_some()
@@ -1733,6 +1752,14 @@ impl FileFragment {
         {
             return Ok(physical_rows);
         }
+
+        // File-less fragments can occur; guard before indexing files[0] to avoid a panic.
+        if self.metadata.files.is_empty() {
+            return Err(Error::not_found(format!(
+                "Fragment {} does not contain any data",
+                self.id()
+            )));
+        };
 
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
@@ -1749,19 +1776,41 @@ impl FileFragment {
         Ok(reader.len() as usize)
     }
 
-    /// Validate the fragment
+    /// Validate this [`FileFragment`] and its persisted [`Fragment`] metadata.
     ///
     /// Verifies:
-    /// * All field ids in the fragment are distinct
-    /// * Within each data file, field ids are in increasing order
+    /// * All field ids in the fragment are distinct.
+    /// * Within each data file, field ids are in increasing order.
     /// * All data files holding user data exist and have the same length. A
     ///   file kept only for the spilled row lineage it carries is not opened;
-    ///   [`Dataset::validate`] reads that lineage back, which checks its
-    ///   length.
+    ///   [`Dataset::validate`] reads that lineage back, which checks its length.
     /// * Field ids are distinct between data files.
-    /// * Deletion file exists and has rowids in the correct range
-    /// * `Fragment.physical_rows` matches length of file
-    /// * `DeletionFile.num_deleted_rows` matches length of deletion vector
+    /// * The deletion file exists and has row offsets in the correct range.
+    /// * [`Fragment::physical_rows`], when present, matches the data-file length.
+    /// * [`DeletionFile::num_deleted_rows`], when present, matches the deletion-vector length.
+    ///
+    /// When no file holds user data, the fragment is accepted if the manifest contains
+    /// writer-version metadata, [`Fragment::physical_rows`] is present, and the
+    /// remaining metadata is valid. The cached count supplies the expected length
+    /// for deletion metadata validation. A missing count returns
+    /// [`Error::CorruptFile`].
+    ///
+    /// For legacy manifests without writer-version metadata, a file-less fragment
+    /// returns [`Error::CorruptFile`] even when [`Fragment::physical_rows`] is
+    /// present, because the cached count cannot be trusted. See
+    /// [`Self::physical_rows`] for the corresponding row-count lookup behavior.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// for fragment in dataset.get_fragments() {
+    ///     fragment.validate().await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate(&self) -> Result<()> {
         let mut seen_fields = HashSet::new();
         for data_file in &self.metadata.files {
@@ -1866,35 +1915,55 @@ impl FileFragment {
         let (get_lengths, deletion_vector) = join!(get_lengths, deletion_vector);
 
         let get_lengths = get_lengths?;
-        let expected_length = get_lengths.first().unwrap_or(&0);
-        for (length, data_file) in get_lengths.iter().zip(user_data_files) {
-            if length != expected_length {
-                let path = self
-                    .dataset
-                    .data_file_dir(data_file)?
-                    .join(data_file.path.as_str());
+        let expected_length = if let Some(first_length) = get_lengths.first() {
+            for (length, data_file) in get_lengths.iter().zip(user_data_files) {
+                if length != first_length {
+                    let path = self
+                        .dataset
+                        .data_file_dir(data_file)?
+                        .join(data_file.path.as_str());
+                    return Err(Error::corrupt_file(
+                        path,
+                        format!(
+                            "data file has incorrect length. Expected: {} Got: {}",
+                            first_length, length
+                        ),
+                    ));
+                }
+            }
+            if let Some(physical_rows) = self.metadata.physical_rows
+                && physical_rows != *first_length
+            {
                 return Err(Error::corrupt_file(
-                    path,
+                    self.dataset.base.clone(),
                     format!(
-                        "data file has incorrect length. Expected: {} Got: {}",
-                        expected_length, length
+                        "Fragment metadata has incorrect physical_rows. Fragment: {} Actual: {} Metadata: {}",
+                        self.id(), first_length, physical_rows
                     ),
                 ));
             }
-        }
-        if let Some(physical_rows) = self.metadata.physical_rows
-            && physical_rows != *expected_length
-        {
-            return Err(Error::corrupt_file(
-                self.dataset
-                    .data_file_dir(&self.metadata.files[0])?
-                    .join(self.metadata.files[0].path.as_str()),
-                format!(
-                    "Fragment metadata has incorrect physical_rows. Actual: {} Metadata: {}",
-                    expected_length, physical_rows
-                ),
-            ));
-        }
+            *first_length
+        } else {
+            if self.dataset.manifest.writer_version.is_none() {
+                return Err(Error::corrupt_file(
+                    self.dataset.base.clone(),
+                    format!(
+                        "Fragment {} has no user data files; physical_rows={:?} cannot be trusted because manifest.writer_version is missing",
+                        self.id(),
+                        self.metadata.physical_rows
+                    ),
+                ));
+            }
+            self.metadata.physical_rows.ok_or_else(|| {
+                Error::corrupt_file(
+                    self.dataset.base.clone(),
+                    format!(
+                        "Fragment {} has no user data files and is missing physical_rows",
+                        self.id()
+                    ),
+                )
+            })?
+        };
 
         if let Some(deletion_vector) = deletion_vector? {
             if let Some(num_deletions) = self
@@ -1920,7 +1989,7 @@ impl FileFragment {
             }
 
             for offset in deletion_vector.iter() {
-                if offset >= *expected_length as u32 {
+                if offset as usize >= expected_length {
                     let deletion_file_meta = self.metadata.deletion_file.as_ref().unwrap();
                     return Err(Error::corrupt_file(
                         deletion_file_path(
@@ -4067,6 +4136,13 @@ mod tests {
             .unwrap();
 
         Dataset::open(test_uri).await.unwrap()
+    }
+
+    fn assert_error_contains(err: Error, expected: &str) {
+        assert!(
+            err.to_string().contains(expected),
+            "expected error to contain {expected:?}, got {err:?}"
+        );
     }
 
     async fn create_dataset_v2(test_uri: &str) -> Dataset {
@@ -6713,6 +6789,117 @@ mod tests {
         assert_eq!(
             fragment.metadata.deletion_file.unwrap().num_deleted_rows,
             Some(13)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_less_fragment_physical_rows_uses_cached_value() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        assert!(dataset.manifest.writer_version.is_some());
+
+        let fragment = FileFragment::new(
+            Arc::new(dataset.clone()),
+            Fragment::new(99).with_physical_rows(7),
+        );
+        assert_eq!(fragment.physical_rows().await.unwrap(), 7);
+
+        Arc::make_mut(&mut dataset.manifest).writer_version = None;
+        let fragment =
+            FileFragment::new(Arc::new(dataset), Fragment::new(99).with_physical_rows(7));
+        let err = fragment.physical_rows().await.unwrap_err();
+        assert!(matches!(err, Error::NotFound { .. }));
+        assert_error_contains(err, "Fragment 99 does not contain any data");
+
+        let err = fragment.validate().await.unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert_error_contains(
+            err,
+            "physical_rows=Some(7) cannot be trusted because manifest.writer_version is missing",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_less_fragment_validate_requires_physical_rows() {
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
+        let fragment = FileFragment::new(dataset, Fragment::new(99));
+
+        let err = fragment.validate().await.unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert_error_contains(
+            err,
+            "Fragment 99 has no user data files and is missing physical_rows",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_less_fragment_validate_checks_deletion_metadata() {
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
+
+        let deletion_vector = DeletionVector::from_iter([2, 9]);
+        let deletion_file = write_deletion_file(
+            &dataset.base,
+            99,
+            dataset.version().version,
+            &deletion_vector,
+            &dataset.object_store,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut metadata = Fragment::new(99).with_physical_rows(10);
+        metadata.deletion_file = Some(deletion_file.clone());
+        FileFragment::new(dataset.clone(), metadata)
+            .validate()
+            .await
+            .unwrap();
+
+        let mut metadata = Fragment::new(99).with_physical_rows(10);
+        metadata.deletion_file = Some(DeletionFile {
+            num_deleted_rows: Some(3),
+            ..deletion_file
+        });
+        let err = FileFragment::new(dataset, metadata)
+            .validate()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert_error_contains(
+            err,
+            "deletion vector length does not match metadata. Metadata: 3 Deletion vector: 2",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_less_fragment_validate_rejects_out_of_range_deletions() {
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
+
+        let deletion_vector = DeletionVector::from_iter([2, 10]);
+        let deletion_file = write_deletion_file(
+            &dataset.base,
+            99,
+            dataset.version().version,
+            &deletion_vector,
+            &dataset.object_store,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let mut metadata = Fragment::new(99).with_physical_rows(10);
+        metadata.deletion_file = Some(deletion_file);
+        let err = FileFragment::new(dataset, metadata)
+            .validate()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert_error_contains(
+            err,
+            "deletion vector contains an offset that is out of range. Offset: 10 Fragment length: 10",
         );
     }
 
