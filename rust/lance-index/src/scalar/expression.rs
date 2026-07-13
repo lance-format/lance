@@ -913,8 +913,9 @@ impl ScalarQueryParser for TextQueryParser {
         }
         // A non-string pattern cannot be handled. `maybe_scalar` coerces the
         // literal to the indexed column's type, which for an ngram index is
-        // always `Utf8` (Lance normalizes `Utf8View` columns to `Utf8` at write
-        // time), so the coerced value here is never `Utf8View`.
+        // `Utf8` or `LargeUtf8` (the plugin rejects any other type at creation,
+        // and Lance normalizes a `Utf8View` column to `Utf8` at write time), so
+        // the coerced value here is never `Utf8View`.
         let (ScalarValue::Utf8(Some(pattern)) | ScalarValue::LargeUtf8(Some(pattern))) =
             maybe_scalar(&args[1], data_type)?
         else {
@@ -3519,34 +3520,41 @@ mod tests {
         // `Expr`), so a programmatically-built filter passed through
         // `scan.filter_expr` can carry a `Utf8View` literal that the parser must
         // still match. (A `contains` / `regexp_like` pattern is coerced to the
-        // indexed column's `Utf8` type first, so it never reaches the parser as
-        // `Utf8View`; an ngram-indexed column is never `Utf8View` either, because
-        // Lance normalizes it to `Utf8` at write time.)
+        // indexed column's type first, and an ngram index only ever covers a
+        // `Utf8` / `LargeUtf8` column, so that path never sees `Utf8View`.)
         //
         // `visit_like` is exercised directly so the test does not depend on
         // DataFusion's LIKE type coercion choosing `Utf8View` for the pattern. The
         // `Utf8` case is a parity control: the pre-existing path must keep behaving
-        // identically.
+        // identically. Each case builds its `Like` from the same literal it hands
+        // to the parser, mirroring `visit_like_expr`, which reads the pattern out
+        // of `like.pattern`.
         let parser = TextQueryParser::new("color_idx".to_string(), "NGram".to_string(), true, true);
-        let like = Like::new(
-            false,
-            Box::new(Expr::Column(Column::new_unqualified("color"))),
-            Box::new(Expr::Literal(
-                ScalarValue::Utf8View(Some("%foobar%".to_string())),
-                None,
-            )),
-            None,
-            false,
-        );
         for pattern in [
             ScalarValue::Utf8View(Some("%foobar%".to_string())),
             ScalarValue::Utf8(Some("%foobar%".to_string())),
         ] {
+            let like = Like::new(
+                false,
+                Box::new(Expr::Column(Column::new_unqualified("color"))),
+                Box::new(Expr::Literal(pattern.clone(), None)),
+                None,
+                false,
+            );
             let indexed = parser
                 .visit_like("color", &like, &pattern)
                 .expect("infix LIKE should use the ngram index");
-            assert!(indexed.scalar_query.is_some(), "index query missing");
-            assert!(indexed.refine_expr.is_some(), "LIKE recheck missing");
+
+            let Some(ScalarIndexExpr::Query(search)) = indexed.scalar_query else {
+                panic!("expected an index query for {pattern:?}");
+            };
+            assert_eq!(
+                search.query.as_any().downcast_ref::<TextQuery>(),
+                Some(&TextQuery::Regex(".*foobar.*".to_string())),
+            );
+            // The recheck is the original predicate verbatim, so its literal keeps
+            // the variant that was exercised.
+            assert_eq!(indexed.refine_expr, Some(Expr::Like(like)));
         }
     }
 
