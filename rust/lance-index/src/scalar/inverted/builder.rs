@@ -143,6 +143,12 @@ fn merge_all_tail_partitions(
     {
         merged_builders.push(builder);
     }
+    // Each merged partition concatenated several workers' ascending runs, so
+    // restore a global row_id order. Already inside `spawn_cpu`, off the async
+    // runtime, alongside the rest of the merge.
+    for builder in &mut merged_builders {
+        builder.sort_docs_by_row_id()?;
+    }
     Ok(merged_builders)
 }
 
@@ -371,6 +377,14 @@ impl InvertedIndexBuilder {
     ) -> Result<Vec<IndexFile>> {
         let partition_id = self.next_partition_id() | self.fragment_mask.unwrap_or(0);
         builder.set_id(partition_id);
+        // A partition merged from several existing segments concatenates their doc
+        // runs, so restore a global row_id order (see `sort_docs_by_row_id`). On the
+        // CPU pool, or a large partition would block the async runtime thread.
+        let mut builder = spawn_cpu(move || {
+            builder.sort_docs_by_row_id()?;
+            Result::Ok(builder)
+        })
+        .await?;
         let files = builder
             .write_to(dest_store, self.partition_write_target())
             .await?;
@@ -1110,6 +1124,134 @@ impl InnerBuilder {
         Ok(())
     }
 
+    /// Reorder this partition's documents so their `row_id`s are strictly
+    /// ascending in `doc_id` order, applying one consistent old->new `doc_id`
+    /// remap to the doc set (row_ids + num_tokens) and to every posting list
+    /// (doc_ids, frequencies, and positions).
+    ///
+    /// Scores are unaffected. `doc_id`s are internal dense indices, and a BM25
+    /// score depends only on term frequency, document length
+    /// (`num_tokens[doc_id]`), average document length, document count, and
+    /// posting length, none of which move under a consistent relabeling. Ties
+    /// break on `doc_id`, so the order among equal-scoring documents becomes
+    /// `row_id` order instead of worker order. What the reorder buys is monotonic
+    /// `row_id`s per partition, which lets combined-field read pruning skip
+    /// posting blocks by `row_id` range.
+    ///
+    /// The parallel builder assigns `doc_id`s per worker, so a partition merged
+    /// from several workers' tails (see [`merge_from`](Self::merge_from)) is a
+    /// concatenation of individually ascending runs and needs the global order
+    /// restored. A cheap no-op when the documents already ascend, the common
+    /// single-worker / single-tail case.
+    ///
+    /// A list-element partition stores several documents per row, so its
+    /// `row_id`s can only be non-decreasing. Its element coordinates are part of
+    /// the document and travel with it through the remap.
+    fn sort_docs_by_row_id(&mut self) -> Result<()> {
+        let num_docs = self.docs.len();
+        if num_docs <= 1 {
+            return Ok(());
+        }
+
+        // Already strictly ascending: nothing to remap, and no sort below.
+        let mut previous_row_id: Option<u64> = None;
+        let already_ascending = self.docs.iter().all(|(row_id, _)| {
+            let ascending = previous_row_id < Some(*row_id);
+            previous_row_id = Some(*row_id);
+            ascending
+        });
+        if already_ascending {
+            return Ok(());
+        }
+
+        // new_to_old[new_doc_id] = old_doc_id, stable-sorted by row_id. The
+        // stable order keeps the result deterministic even when two documents
+        // share a row_id, and keeps the elements of one row in their original
+        // order. Several documents per row happen for list-element indexes and
+        // for legacy list indexes re-merged via `merge_existing_segments`;
+        // row-document partitions hold exactly one document per row, so their
+        // row_ids are distinct and strictly ascending after the sort.
+        let mut new_to_old: Vec<u32> = (0..num_docs as u32).collect();
+        new_to_old.sort_by_key(|&old_doc_id| self.docs.row_id(old_doc_id));
+
+        // The docs were not strictly ascending but may already be in a valid
+        // (stable) order, e.g. the repeated row_ids of a list index: skip the
+        // rebuild when the permutation is the identity.
+        if new_to_old
+            .iter()
+            .enumerate()
+            .all(|(new_doc_id, &old_doc_id)| new_doc_id as u32 == old_doc_id)
+        {
+            return Ok(());
+        }
+
+        // old_to_new[old_doc_id] = new_doc_id, the inverse permutation used to
+        // relabel the posting lists.
+        let mut old_to_new = vec![0u32; num_docs];
+        for (new_doc_id, &old_doc_id) in new_to_old.iter().enumerate() {
+            old_to_new[old_doc_id as usize] = new_doc_id as u32;
+        }
+
+        // Rebuild the doc set in the new order. The append path recomputes
+        // total_tokens as it goes, so the corpus statistics are preserved
+        // exactly, and a list-element partition carries each document's
+        // coordinates across with it.
+        let coordinate_rank = self.docs.coordinate_rank();
+        let mut reordered_docs = DocSet::with_coordinate_rank(coordinate_rank);
+        for &old_doc_id in &new_to_old {
+            let row_id = self.docs.row_id(old_doc_id);
+            let num_tokens = self.docs.num_tokens(old_doc_id);
+            if coordinate_rank == 0 {
+                reordered_docs.append(row_id, num_tokens);
+            } else {
+                reordered_docs.append_with_doc_index(
+                    row_id,
+                    num_tokens,
+                    &self.docs.doc_index(old_doc_id),
+                )?;
+            }
+        }
+        self.docs = reordered_docs;
+
+        // Rebuild every posting list with remapped doc_ids. Posting-list block
+        // compression delta-encodes doc_ids and requires them strictly
+        // ascending within the list, so the remapped entries are re-sorted by
+        // new doc_id before they are re-added. Frequencies and positions travel
+        // with their entry, exactly as `merge_from` and `PostingListBuilder::remap`
+        // reconstruct a list.
+        for posting_list in &mut self.posting_lists {
+            if posting_list.is_empty() {
+                continue;
+            }
+            let mut entries: Vec<(u32, u32, Option<Vec<u32>>)> =
+                Vec::with_capacity(posting_list.len());
+            posting_list
+                .for_each_entry(|old_doc_id, frequency, positions| {
+                    entries.push((old_to_new[old_doc_id as usize], frequency, positions));
+                    Ok::<(), Error>(())
+                })
+                .expect("posting list iteration is infallible");
+            // doc_ids are a bijection image, hence distinct: no ties to break.
+            entries.sort_unstable_by_key(|(new_doc_id, _, _)| *new_doc_id);
+
+            let mut reordered_posting =
+                PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                    posting_list.has_positions(),
+                    self.posting_tail_codec,
+                    self.block_size,
+                );
+            for (new_doc_id, frequency, positions) in entries {
+                let positions = match positions {
+                    Some(positions) => PositionRecorder::Position(positions.into()),
+                    None => PositionRecorder::Count(frequency),
+                };
+                reordered_posting.add(new_doc_id, positions);
+            }
+            *posting_list = reordered_posting;
+        }
+        Ok(())
+    }
+
     fn memory_size(&self) -> u64 {
         let posting_lists_overhead =
             self.posting_lists.capacity() * std::mem::size_of::<PostingListBuilder>();
@@ -1797,6 +1939,16 @@ impl IndexWorker {
         Ok(())
     }
 
+    /// Flush the worker's in-memory posting lists into a new on-disk partition.
+    ///
+    /// A flushed partition inherits the input scan's row_id order. For a normal
+    /// ascending row_id scan each worker's subsequence is ascending, so flushed
+    /// partitions are already sorted and the combined_fields read-pruning fast
+    /// path engages. A non-monotonic input stream can yield an unsorted partition,
+    /// which only costs that fast path; scores are unaffected.
+    ///
+    /// Do not add an inline sort here: it would block the async runtime. The
+    /// reorder belongs to the offloaded merge path.
     #[instrument(level = "debug", skip_all)]
     async fn flush(&mut self) -> Result<()> {
         if self.builder.docs.is_empty() {
@@ -4795,6 +4947,347 @@ mod tests {
             merged.posting_lists[merged.tokens.get("world").unwrap() as usize].len(),
             1
         );
+        Ok(())
+    }
+
+    // Merging worker tails whose row_ids interleave across the tails must leave
+    // the merged partition with row_ids strictly ascending in doc-id order,
+    // while preserving every (token -> row_id -> frequency/positions)
+    // association exactly (the remap is identity-preserving for scoring). Covers
+    // the plain (V1/Fixed32) and delta (V2/V3/VarintDelta) tail codecs, both
+    // 128- and 256-document blocks, and with/without positions.
+    #[rstest::rstest]
+    #[case::v1(InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE)]
+    #[case::v2(InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE)]
+    #[case::v3(InvertedListFormatVersion::V3, 256)]
+    fn test_merge_reorders_docs_by_row_id_ascending(
+        #[case] format_version: InvertedListFormatVersion,
+        #[case] block_size: usize,
+        #[values(false, true)] with_position: bool,
+    ) {
+        use std::collections::BTreeMap;
+
+        // Append one token occurrence for a document to the pre-registered
+        // posting list. `positions` doubles as the frequency (its length) in the
+        // no-position case.
+        fn add_entry(
+            builder: &mut InnerBuilder,
+            doc_id: u32,
+            token: &str,
+            positions: &[u32],
+            with_position: bool,
+        ) {
+            let token_id = builder.tokens.get(token).expect("token pre-registered") as usize;
+            let recorder = if with_position {
+                PositionRecorder::Position(positions.iter().copied().collect())
+            } else {
+                PositionRecorder::Count(positions.len() as u32)
+            };
+            builder.posting_lists[token_id].add(doc_id, recorder);
+        }
+
+        let make_tail = |id: u64, first_token: &str, second_token: &str| {
+            let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+                id,
+                with_position,
+                TokenSetFormat::default(),
+                format_version,
+                block_size,
+            );
+            builder.tokens.add(first_token.to_owned());
+            builder.tokens.add(second_token.to_owned());
+            builder.posting_lists.resize_with(builder.tokens.len(), || {
+                PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                    with_position,
+                    format_version.posting_tail_codec(),
+                    block_size,
+                )
+            });
+            builder
+        };
+
+        // Each tail is internally ascending by row_id, mirroring a real worker.
+        // Tail A registers alpha before beta; tail B registers beta before
+        // alpha, so the two tails carry different local token ids and the merge
+        // exercises the token-id remap as well as the doc-id remap.
+        //
+        //   tail A: row 10 -> alpha@[0], beta@[1]   (num_tokens 2)
+        //           row 20 -> beta@[0]              (num_tokens 1)
+        //           row 30 -> alpha@[0, 1]          (num_tokens 2)
+        //   tail B: row  5 -> beta@[0]              (num_tokens 1)
+        //           row 15 -> alpha@[0]             (num_tokens 1)
+        //           row 25 -> alpha@[0], beta@[1,2] (num_tokens 3)
+        let mut tail_a = make_tail(0, "alpha", "beta");
+        tail_a.docs.append(10, 2);
+        add_entry(&mut tail_a, 0, "alpha", &[0], with_position);
+        add_entry(&mut tail_a, 0, "beta", &[1], with_position);
+        tail_a.docs.append(20, 1);
+        add_entry(&mut tail_a, 1, "beta", &[0], with_position);
+        tail_a.docs.append(30, 2);
+        add_entry(&mut tail_a, 2, "alpha", &[0, 1], with_position);
+
+        let mut tail_b = make_tail(1, "beta", "alpha");
+        tail_b.docs.append(5, 1);
+        add_entry(&mut tail_b, 0, "beta", &[0], with_position);
+        tail_b.docs.append(15, 1);
+        add_entry(&mut tail_b, 1, "alpha", &[0], with_position);
+        tail_b.docs.append(25, 3);
+        add_entry(&mut tail_b, 2, "alpha", &[0], with_position);
+        add_entry(&mut tail_b, 2, "beta", &[1, 2], with_position);
+
+        // Concatenating the two tails yields doc-id order row_ids
+        // [10, 20, 30, 5, 15, 25], which is NOT globally ascending.
+        let merged = merge_all_tail_partitions(
+            vec![
+                TailPartition { builder: tail_a },
+                TailPartition { builder: tail_b },
+            ],
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1, "both tails fit within the memory budget");
+        let merged = &merged[0];
+
+        // row_ids are strictly ascending in doc-id order.
+        let row_ids: Vec<u64> = merged.docs.iter().map(|(row_id, _)| *row_id).collect();
+        assert_eq!(row_ids, vec![5, 10, 15, 20, 25, 30]);
+        assert!(
+            row_ids.windows(2).all(|w| w[0] < w[1]),
+            "row_ids must be strictly ascending, got {row_ids:?}"
+        );
+
+        // num_tokens travels with each row (corpus statistics preserved).
+        let num_tokens_by_row: BTreeMap<u64, u32> =
+            merged.docs.iter().map(|(r, n)| (*r, *n)).collect();
+        assert_eq!(
+            num_tokens_by_row,
+            BTreeMap::from([(5, 1), (10, 2), (15, 1), (20, 1), (25, 3), (30, 2)]),
+        );
+        assert_eq!(merged.docs.total_tokens_num(), 10);
+
+        // Posting lists: doc_ids strictly ascending, and each row_id keeps its
+        // exact frequency (and positions when recorded).
+        let expected_alpha: BTreeMap<u64, (u32, Vec<u32>)> = BTreeMap::from([
+            (10, (1, vec![0])),
+            (15, (1, vec![0])),
+            (25, (1, vec![0])),
+            (30, (2, vec![0, 1])),
+        ]);
+        let expected_beta: BTreeMap<u64, (u32, Vec<u32>)> = BTreeMap::from([
+            (5, (1, vec![0])),
+            (10, (1, vec![1])),
+            (20, (1, vec![0])),
+            (25, (2, vec![1, 2])),
+        ]);
+
+        for (token, expected) in [("alpha", expected_alpha), ("beta", expected_beta)] {
+            let token_id = merged.tokens.get(token).expect("token present") as usize;
+            let mut doc_ids = Vec::new();
+            let mut by_row: BTreeMap<u64, (u32, Vec<u32>)> = BTreeMap::new();
+            merged.posting_lists[token_id]
+                .for_each_entry(|doc_id, freq, positions| {
+                    doc_ids.push(doc_id);
+                    let recorded_positions = if with_position {
+                        positions.expect("positions present when with_position")
+                    } else {
+                        assert!(positions.is_none());
+                        Vec::new()
+                    };
+                    by_row.insert(merged.docs.row_id(doc_id), (freq, recorded_positions));
+                    Ok::<(), Error>(())
+                })
+                .unwrap();
+
+            assert!(
+                doc_ids.windows(2).all(|w| w[0] < w[1]),
+                "{token} posting doc_ids must be strictly ascending, got {doc_ids:?}"
+            );
+            if with_position {
+                assert_eq!(by_row, expected, "{token} row_id -> (freq, positions)");
+            } else {
+                let actual_freqs: BTreeMap<u64, u32> =
+                    by_row.iter().map(|(r, (f, _))| (*r, *f)).collect();
+                let expected_freqs: BTreeMap<u64, u32> =
+                    expected.iter().map(|(r, (f, _))| (*r, *f)).collect();
+                assert_eq!(actual_freqs, expected_freqs, "{token} row_id -> freq");
+            }
+        }
+    }
+
+    // A list-element partition holds several documents per row, so the reorder
+    // can only make its row_ids non-decreasing. Each document's element
+    // coordinates are part of the document and must travel with it, or the
+    // `_doc_index` a search reports would point at the wrong element.
+    #[test]
+    fn test_merge_reorders_element_documents_and_keeps_coordinates() {
+        let make_tail = |id: u64| {
+            let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+                id,
+                false,
+                TokenSetFormat::default(),
+                InvertedListFormatVersion::V3,
+                256,
+            );
+            builder.tokens.add("alpha".to_owned());
+            builder.posting_lists.resize_with(builder.tokens.len(), || {
+                PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                    false,
+                    InvertedListFormatVersion::V3.posting_tail_codec(),
+                    256,
+                )
+            });
+            builder
+        };
+
+        // Concatenating the tails yields row_ids [10, 10, 30, 5, 20, 20], which
+        // is not globally ordered.
+        let mut tail_a = make_tail(0);
+        for (doc_id, (row_id, element)) in [(10, 0), (10, 1), (30, 0)].into_iter().enumerate() {
+            tail_a
+                .docs
+                .append_with_doc_index(row_id, 1, &[element])
+                .unwrap();
+            tail_a.posting_lists[0].add(doc_id as u32, PositionRecorder::Count(1));
+        }
+        let mut tail_b = make_tail(1);
+        for (doc_id, (row_id, element)) in [(5, 0), (20, 0), (20, 1)].into_iter().enumerate() {
+            tail_b
+                .docs
+                .append_with_doc_index(row_id, 1, &[element])
+                .unwrap();
+            tail_b.posting_lists[0].add(doc_id as u32, PositionRecorder::Count(1));
+        }
+
+        let merged = merge_all_tail_partitions(
+            vec![
+                TailPartition { builder: tail_a },
+                TailPartition { builder: tail_b },
+            ],
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        let merged = &merged[0];
+
+        assert_eq!(merged.docs.coordinate_rank(), 1);
+        let documents: Vec<(u64, Vec<u32>)> = (0..merged.docs.len() as u32)
+            .map(|doc_id| (merged.docs.row_id(doc_id), merged.docs.doc_index(doc_id)))
+            .collect();
+        assert_eq!(
+            documents,
+            vec![
+                (5, vec![0]),
+                (10, vec![0]),
+                (10, vec![1]),
+                (20, vec![0]),
+                (20, vec![1]),
+                (30, vec![0]),
+            ]
+        );
+
+        // Every document keeps its posting, relabeled to the new doc id.
+        let mut posting_doc_ids = Vec::new();
+        merged.posting_lists[merged.tokens.get("alpha").unwrap() as usize]
+            .for_each_entry(|doc_id, _, _| {
+                posting_doc_ids.push(doc_id);
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+        assert_eq!(posting_doc_ids, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    // End-to-end: a real (multi-worker) build over rows whose row_ids arrive in
+    // shuffled order must produce partitions whose row_ids are strictly
+    // ascending in doc-id order, with no document dropped or duplicated.
+    #[rstest::rstest]
+    #[case::single_worker(1)]
+    #[case::multi_worker(4)]
+    #[tokio::test]
+    async fn test_build_yields_ascending_row_ids_per_partition(
+        #[case] num_workers: usize,
+        #[values(false, true)] with_position: bool,
+    ) -> Result<()> {
+        use std::collections::BTreeSet;
+
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // A deterministic shuffle of 0..NUM_DOCS (stride coprime with NUM_DOCS)
+        // so the worker(s) append documents out of row_id order.
+        const NUM_DOCS: u64 = 60;
+        let shuffled: Vec<u64> = {
+            let mut ids = Vec::with_capacity(NUM_DOCS as usize);
+            let mut next = 0u64;
+            for _ in 0..NUM_DOCS {
+                ids.push(next);
+                next = (next + 23) % NUM_DOCS;
+            }
+            ids
+        };
+        assert_eq!(
+            shuffled.iter().copied().collect::<BTreeSet<_>>().len(),
+            NUM_DOCS as usize
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        // Several batches so more than one worker receives data.
+        let batches: Vec<RecordBatch> = shuffled
+            .chunks(5)
+            .map(|chunk| {
+                let docs: Vec<String> = chunk
+                    .iter()
+                    .map(|row_id| format!("common token{row_id}"))
+                    .collect();
+                let doc_arr =
+                    StringArray::from(docs.iter().map(|s| Some(s.as_str())).collect::<Vec<_>>());
+                let row_arr = UInt64Array::from(chunk.to_vec());
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(doc_arr), Arc::new(row_arr)])
+                    .unwrap()
+            })
+            .collect();
+
+        let stream = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(batches.into_iter().map(Ok)),
+        );
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .with_position(with_position)
+                .remove_stop_words(false)
+                .stem(false)
+                .max_token_length(None)
+                .num_workers(num_workers);
+        let mut builder = InvertedIndexBuilder::new(params);
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        let mut seen_row_ids = BTreeSet::new();
+        for partition in &index.partitions {
+            let part_builder = partition.as_ref().clone().into_builder().await?;
+            let row_ids: Vec<u64> = part_builder.docs.iter().map(|(r, _)| *r).collect();
+            assert!(
+                row_ids.windows(2).all(|w| w[0] < w[1]),
+                "partition {} row_ids must be strictly ascending, got {row_ids:?}",
+                partition.id(),
+            );
+            for row_id in row_ids {
+                assert!(
+                    seen_row_ids.insert(row_id),
+                    "row_id {row_id} appeared twice"
+                );
+            }
+        }
+        assert_eq!(seen_row_ids, (0..NUM_DOCS).collect::<BTreeSet<_>>());
+
         Ok(())
     }
 
