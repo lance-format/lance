@@ -424,6 +424,327 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
+  // ==========================================================================
+  // Action-based transactions (Transaction V2) — DRAFT (OSS-1530).
+  //
+  // A `UserOperation` replaces the single legacy `Operation` with an ordered
+  // list of granular `Action`s that commit atomically as one manifest change.
+  // Actions are *deltas* (the change to the manifest), not post-images, which is
+  // what makes compound commits and branch merge fall out uniformly. See the
+  // design principles in OSS-1530.
+  //
+  // STATUS: this is the wire draft for the OSS-1529 spike and the OSS-757 PMC
+  // vote. The messages and field numbers below are NOT yet a stable contract.
+  // Current library support is READ-side fail-closed only: a transaction
+  // carrying a `UserOperation` is rejected on load, and there is no write path.
+  // `apply`, translation, and conflict resolution are intentionally absent.
+  //
+  // The schema is designed to be additive-safe (principle 9): message
+  // identities and the core mutation fields are pinned; anything discovered
+  // during implementation should arrive as an *added* optional field. Two
+  // classes of information deliberately stay off the wire: computed conflict
+  // *footprints* (a pure function of each action, principle 7) and large
+  // derivable row-level deltas (e.g. a deletion's affected rows, an update's
+  // matched offsets) — both are recomputed at conflict time, not serialized.
+  // ==========================================================================
+
+  // A reference to a counter-allocated identifier (field id, fragment id, or
+  // base id), which may not be committed yet.
+  //
+  // `committed` is an already-assigned id. `local` is a placeholder token minted
+  // by an `Add*` action earlier in the same `UserOperation`; it resolves to a
+  // freshly-allocated committed id at apply time, and re-resolves against the
+  // *target's* counters on merge/rebase (this is what lets two independent
+  // `AddField`s on divergent branches become two distinct fields). `local`
+  // tokens are scoped to a single `UserOperation` and must be distinct within it
+  // (validated by the writer once the write path exists).
+  message Ref {
+    oneof kind {
+      uint64 committed = 1;
+      uint32 local = 2;
+    }
+  }
+
+  // A user-facing, composable transaction: an ordered list of user actions that
+  // commit atomically as a single manifest change.
+  message UserOperation {
+    // Human-readable description, e.g. "INSERT INTO t VALUES (1)".
+    string description = 1;
+    // Unique identifier for this operation (matches Transaction.uuid semantics).
+    string uuid = 2;
+    // The dataset version this operation was planned against.
+    uint64 read_version = 3;
+    // The ordered list of user actions applied by this operation.
+    repeated UserAction actions = 4;
+  }
+
+  // A single user-recognizable step within a UserOperation (e.g. "append batch",
+  // "rebuild index"), carrying a description and the granular actions it expands
+  // to. The description keeps the transaction history human-readable; when a
+  // range of transactions is squashed, each original UserOperation collapses
+  // into one UserAction so the readable sequence survives. Action lists are
+  // flattened when applied to the manifest.
+  message UserAction {
+    // Human-readable description of this step.
+    string description = 1;
+    // The granular manifest changes this step expands to.
+    repeated Action actions = 2;
+  }
+
+  // A single granular change (a *delta*) or assertion. Legacy operations
+  // decompose into an ordered list of these.
+  //
+  // TODO(OSS-1529): the `data_change` markers below are drafted per-action (for
+  // maximum flexibility); the spike should validate per-action vs. per-UserAction
+  // granularity before the vote.
+  message Action {
+    oneof action {
+      // --- Minting actions (allocate a new counter-based id via a Local token)
+      AddFragment add_fragment = 1;
+      AddField add_field = 3;
+      AddBase add_base = 4;
+      // --- Fragment / data-file deltas
+      AddDataFile add_data_file = 2;
+      TombstoneFieldData tombstone_field_data = 5;
+      RemoveFragment remove_fragment = 6;
+      // --- Reference-stable changes (committed coordinates; post-image at rest)
+      SetDeletionFile set_deletion_file = 7;
+      ConfigUpdate config_update = 8;
+      AddOverlays add_overlays = 9;
+      RefreshRowVersionMetadata refresh_row_version_metadata = 10;
+      UpdateMergedGenerations update_merged_generations = 11;
+      // --- Schema (field-level; no wholesale SetSchema)
+      DropField drop_field = 12;
+      AlterField alter_field = 13;
+      // --- Index segments (segment = UUID; a logical index = the segments that
+      //     share a `name`; per-segment config duplication is a pre-existing
+      //     limitation this project does not fix)
+      AddIndexSegment add_index_segment = 14;
+      RemoveIndexSegment remove_index_segment = 15;
+      AdjustIndexCoverage adjust_index_coverage = 16;
+      // --- Wholesale-within-operation
+      ResetTable reset_table = 17;
+      ReserveFragmentIds reserve_fragment_ids = 18;
+      // --- Assertions (preconditions, not deltas)
+      AssertUniqueKeys assert_unique_keys = 19;
+    }
+  }
+
+  // Mint a new, empty fragment. Its data files arrive via AddDataFile actions
+  // referencing this fragment's `local` token; its deletion vector (if any) via
+  // SetDeletionFile.
+  message AddFragment {
+    // Placeholder token for the fragment id, resolved to a committed id at apply.
+    uint32 local = 1;
+    // Number of physical rows (including rows later tombstoned).
+    uint64 physical_rows = 2;
+    // Stable-row-id and row-version sequences, carried exactly as on
+    // DataFragment. Absent on datasets without stable row ids.
+    oneof row_id_sequence {
+      bytes inline_row_ids = 3;
+      ExternalFile external_row_ids = 4;
+    }
+    oneof last_updated_at_version_sequence {
+      bytes inline_last_updated_at_versions = 5;
+      ExternalFile external_last_updated_at_versions = 6;
+    }
+    oneof created_at_version_sequence {
+      bytes inline_created_at_versions = 7;
+      ExternalFile external_created_at_versions = 8;
+    }
+    // false => rearrangement only (rows unchanged, e.g. compaction); CDC and
+    // streaming consumers may skip it. Absent is treated as true (real change).
+    optional bool data_change = 9;
+  }
+
+  // Add a data file to a fragment.
+  message AddDataFile {
+    // The fragment to add the file to (Committed, or a same-op Local fragment).
+    Ref fragment = 1;
+    // The data file. Its `fields` are ignored/left unset (-1) and stamped in at
+    // apply once `field_ids` resolve; the authority for the column->field
+    // mapping is `field_ids` below.
+    DataFile file = 2;
+    // One entry per column in `file`, in order. Committed for existing fields,
+    // Local for fields minted by an AddField in the same operation.
+    repeated Ref field_ids = 3;
+    optional bool data_change = 4;
+  }
+
+  // Mint a new schema field. A struct/list column that introduces several fields
+  // is expressed as several ordered AddField actions (parent before children,
+  // children referencing the parent via a Local ref).
+  message AddField {
+    // Placeholder token for the new field id, resolved at apply.
+    uint32 local = 1;
+    // The parent field (Committed for reparenting under an existing field, Local
+    // for a sibling minted in the same operation). Absent => top-level column.
+    optional Ref parent = 2;
+    // Field definition; its `id` and `parent_id` are ignored (see `local`,
+    // `parent`).
+    lance.file.Field def = 3;
+  }
+
+  // Mint a new base path.
+  message AddBase {
+    // Placeholder token for the base id, resolved at apply.
+    uint32 local = 1;
+    // Base path; its `id` is ignored and stamped in at apply.
+    BasePath base = 2;
+  }
+
+  // Tombstone the data-file binding of one or more committed fields: their slot
+  // in whatever data file currently backs them is set to -2, and any file left
+  // with no live fields is pruned at apply. This is how a column's data is
+  // dropped or superseded (data files have no id of their own; a live field is
+  // backed by exactly one file). A column re-encode is TombstoneFieldData(X)
+  // followed by AddDataFile(new file, field X).
+  message TombstoneFieldData {
+    Ref fragment = 1;
+    // Committed field ids whose current backing is tombstoned.
+    repeated uint64 field_ids = 2;
+    optional bool data_change = 3;
+  }
+
+  // Remove a fragment entirely (all rows deleted, or replaced by compaction).
+  message RemoveFragment {
+    Ref fragment = 1;
+    optional bool data_change = 2;
+  }
+
+  // Set (replace) a fragment's deletion file. Reference-stable: the fragment id
+  // is committed and physical row offsets are stable, so the post-image deletion
+  // file is safe to store; the newly-deleted rows (the delta used for rebase and
+  // conflict) are derived by diffing against the read-version deletion file and
+  // are NOT serialized here.
+  message SetDeletionFile {
+    uint64 fragment = 1;
+    DeletionFile deletion_file = 2;
+    optional bool data_change = 3;
+  }
+
+  // Apply config / metadata updates. Reference-stable key-merges over stable
+  // coordinates (config keys, field ids). Mirrors the new-style fields of the
+  // legacy UpdateConfig operation.
+  message ConfigUpdate {
+    optional UpdateMap config = 1;
+    optional UpdateMap table_metadata = 2;
+    optional UpdateMap schema_metadata = 3;
+    // Per-field metadata updates. Keyed by Ref so a field minted in the same
+    // operation (Local) can receive metadata.
+    repeated FieldMetadata field_metadata = 4;
+
+    message FieldMetadata {
+      Ref field = 1;
+      UpdateMap updates = 2;
+    }
+  }
+
+  // Append overlay files to fragments (see DataOverlayFile in table.proto).
+  // Reference-stable: overlays target committed fragments/offsets/fields and are
+  // appended, never replacing existing overlays.
+  message AddOverlays {
+    Ref fragment = 1;
+    repeated DataOverlayFile overlays = 2;
+    optional bool data_change = 3;
+  }
+
+  // Refresh row-version (created-at / last-updated-at) metadata for fragments
+  // whose columns were merged in place, mirroring the implicit refresh Merge
+  // performs on stable-row-id datasets.
+  message RefreshRowVersionMetadata {
+    repeated uint64 fragment_ids = 1;
+  }
+
+  // Mark MemWAL shard generations as merged. Covers UpdateMemWalState and the
+  // merged-generations bookkeeping of Update.
+  message UpdateMergedGenerations {
+    repeated MergedGeneration merged_generations = 1;
+  }
+
+  // Remove a field from the schema (and, at apply, prune any data file left with
+  // no live fields). References an existing committed field id.
+  message DropField {
+    uint64 field = 1;
+  }
+
+  // Alter facets of an existing field in place, preserving its identity (id).
+  // Each facet is optional: present means "change this facet", absent means
+  // "leave unchanged". Keying conflict on (field id, facet) lets independent
+  // facet changes to the same field commute (e.g. a cast concurrent with a
+  // nullability change). A cast additionally needs TombstoneFieldData + a new
+  // AddDataFile to rewrite the data. New facets are added as optional fields.
+  message AlterField {
+    uint64 field = 1;
+    optional string name = 2;
+    // New Arrow logical type (see Field.logical_type). The cast.
+    optional string logical_type = 3;
+    optional bool nullable = 4;
+  }
+
+  // Add an index segment. A brand-new index is expressed as its first segment.
+  // The set of segments sharing `name` constitutes one logical index.
+  message AddIndexSegment {
+    UUID uuid = 1;
+    string name = 2;
+    // Indexed field ids (Committed, or Local for same-op minted fields).
+    repeated Ref fields = 3;
+    google.protobuf.Any index_details = 4;
+    optional int32 index_version = 5;
+    // Fragments covered by this segment (resolved to a fragment_bitmap at apply,
+    // and remapped under fragment relocation). Committed or same-op Local.
+    repeated Ref covered_fragments = 6;
+    // Index files with sizes, when produced by the writer (e.g. a compaction
+    // that rewrites the segment). Empty when unavailable.
+    repeated IndexFile files = 7;
+    optional bool data_change = 8;
+  }
+
+  // Remove an index segment by uuid.
+  message RemoveIndexSegment {
+    UUID uuid = 1;
+    optional bool data_change = 2;
+  }
+
+  // Adjust the fragment coverage of an existing index segment without rewriting
+  // it. NOTE: coverage representation is the acknowledged-open area of OSS-1530;
+  // this shape is provisional pending the OSS-1529 spike (which will settle how
+  // much coverage change is derivable from fragment relocation vs. stated here).
+  message AdjustIndexCoverage {
+    UUID uuid = 1;
+    repeated Ref add = 2;
+    repeated uint64 remove = 3;
+  }
+
+  // Reset the table to an empty state, in preparation for a fresh schema and
+  // data written by later actions in the same operation (the decomposition of a
+  // full Overwrite / CREATE OR REPLACE). Drops the entire schema, schema
+  // metadata, all fragments, and all indices; preserves table config, table
+  // metadata, and base paths (change those via ConfigUpdate / AddBase in the
+  // same operation). Its write footprint spans the whole schema, all fragments,
+  // and all indices, so it conflicts with any concurrent change to them
+  // (DROP TABLE-style exclusivity).
+  message ResetTable {}
+
+  // Reserve a contiguous range of fragment ids from the counter, for a later
+  // (possibly distributed) writer to populate. Fragments written against a
+  // reserved range reference those ids as Committed.
+  message ReserveFragmentIds {
+    uint32 count = 1;
+  }
+
+  // An assertion (precondition), not a delta: the keys this operation inserts
+  // must not collide with keys inserted by a concurrent commit. Carries a bloom
+  // / exact-set filter of the inserted key hashes (not derivable from any
+  // post-image); conflict = the two filters intersect. Home for merge-insert's
+  // strict primary-key conflict detection.
+  message AssertUniqueKeys {
+    // Field ids of the key columns (unenforced primary key). Committed, or Local
+    // for same-op minted fields.
+    repeated Ref key_fields = 1;
+    KeyExistenceFilter filter = 2;
+  }
+
   /* The operation of this transaction.
    *
    * Field numbers 100-199 are reserved for operations. A reader that sees a
@@ -447,6 +768,9 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
+    // Action-based transaction (Transaction V2). See UserOperation above.
+    // DRAFT: currently rejected on load; no write path.
+    UserOperation user_operation = 116;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
