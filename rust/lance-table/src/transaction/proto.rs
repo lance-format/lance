@@ -10,6 +10,7 @@
 
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::pb;
+use crate::format::pb_transaction;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::{
@@ -677,19 +678,17 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 schema_metadata_updates,
                 field_metadata_updates,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
-                config_updates: config_updates
-                    .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                config_updates: config_updates.as_ref().map(pb_transaction::UpdateMap::from),
                 table_metadata_updates: table_metadata_updates
                     .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                    .map(pb_transaction::UpdateMap::from),
                 schema_metadata_updates: schema_metadata_updates
                     .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                    .map(pb_transaction::UpdateMap::from),
                 field_metadata_updates: field_metadata_updates
                     .iter()
                     .map(|(field_id, update_map)| {
-                        (*field_id, pb::transaction::UpdateMap::from(update_map))
+                        (*field_id, pb_transaction::UpdateMap::from(update_map))
                     })
                     .collect(),
                 // Leave old fields empty - we only write new-style fields
@@ -804,13 +803,13 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
     }
 }
 
-impl From<&UpdateMap> for pb::transaction::UpdateMap {
+impl From<&UpdateMap> for pb_transaction::UpdateMap {
     fn from(update_map: &UpdateMap) -> Self {
         Self {
             update_entries: update_map
                 .update_entries
                 .iter()
-                .map(|entry| pb::transaction::UpdateMapEntry {
+                .map(|entry| pb_transaction::UpdateMapEntry {
                     key: entry.key.clone(),
                     value: entry.value.clone(),
                 })
@@ -820,8 +819,8 @@ impl From<&UpdateMap> for pb::transaction::UpdateMap {
     }
 }
 
-impl From<&pb::transaction::UpdateMap> for UpdateMap {
-    fn from(pb_update_map: &pb::transaction::UpdateMap) -> Self {
+impl From<&pb_transaction::UpdateMap> for UpdateMap {
+    fn from(pb_update_map: &pb_transaction::UpdateMap) -> Self {
         Self {
             update_entries: pb_update_map
                 .update_entries
@@ -960,15 +959,15 @@ mod tests {
             read_version: 1,
             uuid: Uuid::new_v4().to_string(),
             operation: Some(pb::transaction::Operation::UserOperation(
-                pb::transaction::UserOperation {
+                pb_transaction::UserOperation {
                     description: "INSERT INTO t VALUES (1)".to_string(),
                     uuid: Uuid::new_v4().to_string(),
                     read_version: 1,
-                    actions: vec![pb::transaction::UserAction {
+                    actions: vec![pb_transaction::UserAction {
                         description: "append batch".to_string(),
-                        actions: vec![pb::transaction::Action {
-                            action: Some(pb::transaction::action::Action::AddFragment(
-                                pb::transaction::AddFragment {
+                        actions: vec![pb_transaction::Action {
+                            action: Some(pb_transaction::action::Action::AddFragment(
+                                pb_transaction::AddFragment {
                                     local: 0,
                                     physical_rows: 1,
                                     data_change: Some(true),
