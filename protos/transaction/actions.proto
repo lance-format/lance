@@ -193,7 +193,9 @@ message Action {
  * Mint a new, empty fragment.
  *
  * Its data files arrive via AddDataFile actions referencing this fragment's
- * `local` token; its deletion vector (if any) via SetDeletionFile.
+ * `local` token. A freshly-minted fragment has no deletion vector; deletions
+ * are applied by a later operation via SetDeletionFile, once the fragment has a
+ * committed id.
  */
 message AddFragment {
   // Placeholder token for the fragment id, resolved to a committed id at apply.
@@ -240,6 +242,7 @@ message AddDataFile {
    * Local for fields minted by an AddField in the same operation.
    */
   repeated Ref field_ids = 3;
+  // Data-change marker; see AddFragment.data_change.
   optional bool data_change = 4;
 }
 
@@ -285,6 +288,7 @@ message TombstoneFieldData {
   Ref fragment = 1;
   // Committed field ids whose current backing is tombstoned.
   repeated uint64 field_ids = 2;
+  // Data-change marker; see AddFragment.data_change.
   optional bool data_change = 3;
 }
 
@@ -293,6 +297,7 @@ message TombstoneFieldData {
  */
 message RemoveFragment {
   Ref fragment = 1;
+  // Data-change marker; see AddFragment.data_change.
   optional bool data_change = 2;
 }
 
@@ -305,8 +310,12 @@ message RemoveFragment {
  * the read-version deletion file and are not serialized here.
  */
 message SetDeletionFile {
+  // The fragment, by committed id: unlike the sibling fragment actions this
+  // takes no Ref, because a fragment minted in the same operation has no rows
+  // to delete yet (see AddFragment).
   uint64 fragment = 1;
   lance.table.DeletionFile deletion_file = 2;
+  // Data-change marker; see AddFragment.data_change.
   optional bool data_change = 3;
 }
 
@@ -341,6 +350,7 @@ message ConfigUpdate {
 message AddOverlays {
   Ref fragment = 1;
   repeated lance.table.DataOverlayFile overlays = 2;
+  // Data-change marker; see AddFragment.data_change.
   optional bool data_change = 3;
 }
 
@@ -409,6 +419,8 @@ message AddIndexSegment {
    * rewrites the segment). Empty when unavailable.
    */
   repeated lance.table.IndexFile files = 7;
+  // Data-change marker; see AddFragment.data_change. false marks a segment
+  // rebuild/compaction that does not reflect any change to the indexed data.
   optional bool data_change = 8;
 }
 
@@ -417,6 +429,8 @@ message AddIndexSegment {
  */
 message RemoveIndexSegment {
   lance.table.UUID uuid = 1;
+  // Data-change marker; see AddFragment.data_change. false marks removal of a
+  // segment superseded by compaction, not a change to the indexed data.
   optional bool data_change = 2;
 }
 
@@ -430,8 +444,10 @@ message RemoveIndexSegment {
  */
 message AdjustIndexCoverage {
   lance.table.UUID uuid = 1;
-  repeated Ref add = 2;
-  repeated uint64 remove = 3;
+  // Fragments to add to the segment's coverage (Committed or same-op Local).
+  repeated Ref add_fragments = 2;
+  // Committed fragment ids to drop from the segment's coverage.
+  repeated uint64 remove_fragments = 3;
 }
 
 /*
@@ -467,7 +483,9 @@ message ReserveFragmentIds {
 message AssertUniqueKeys {
   /*
    * Field ids of the key columns (unenforced primary key). Committed, or Local
-   * for same-op minted fields.
+   * for same-op minted fields. This is the authoritative key-column list;
+   * `filter.field_ids` (an artifact of the shared KeyExistenceFilter type) is
+   * ignored here and left empty.
    */
   repeated Ref key_fields = 1;
   KeyExistenceFilter filter = 2;
