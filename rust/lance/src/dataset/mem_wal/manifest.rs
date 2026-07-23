@@ -440,6 +440,31 @@ impl ShardManifestStore {
     // Epoch-based Writer Fencing
     // ========================================================================
 
+    fn validate_claimable(
+        &self,
+        manifest: &ShardManifest,
+        incoming_shard_spec_id: u32,
+    ) -> Result<()> {
+        // A `Sealed` manifest is the drop-table 2PC in-doubt marker.
+        // Sophon's reconcile uses the "sealed" marker to distinguish this
+        // state from an ordinary epoch fence or invalid writer configuration.
+        if manifest.status == ShardStatus::Sealed {
+            return Err(Error::invalid_input(format!(
+                "shard {} is sealed; refusing claim (drop in flight)",
+                self.shard_id
+            )));
+        }
+
+        if manifest.shard_spec_id != incoming_shard_spec_id {
+            return Err(Error::invalid_input(format!(
+                "cannot claim shard {} with incoming shard_spec_id {}; \
+                 stored shard_spec_id {} is immutable",
+                self.shard_id, incoming_shard_spec_id, manifest.shard_spec_id
+            )));
+        }
+        Ok(())
+    }
+
     /// Claim a shard by incrementing its writer epoch.
     ///
     /// This establishes single-writer semantics by:
@@ -464,9 +489,10 @@ impl ShardManifestStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if another writer claimed an equal-or-higher
-    /// epoch than our target, or if the manifest stays contended past
-    /// the retry budget.
+    /// Returns an error without claiming or mutating the manifest if the shard
+    /// is sealed or the incoming shard spec conflicts with its stored identity.
+    /// Also returns an error if another writer claimed an equal-or-higher epoch
+    /// than our target, or if the manifest stays contended past the retry budget.
     #[instrument(name = "manifest_claim_epoch", level = "info", skip_all, fields(shard_id = %self.shard_id, shard_spec_id))]
     pub async fn claim_epoch(&self, shard_spec_id: u32) -> Result<(u64, ShardManifest)> {
         const MAX_CLAIM_RETRIES: usize = 16;
@@ -476,19 +502,8 @@ impl ShardManifestStore {
             // writer's epoch, and the tip it finds is what our write builds on.
             let current = self.refresh_latest().await?;
 
-            // A sealed shard is mid-drop (drop-table 2PC). Refuse the claim
-            // with a distinguishable error rather than minting a new epoch,
-            // so a caller that skips its own status check still cannot
-            // resurrect a shard being dropped. Sophon's reconcile keys on
-            // the "sealed" marker in this message to tell it apart from an
-            // ordinary epoch fence.
-            if let Some(m) = &current
-                && m.status == ShardStatus::Sealed
-            {
-                return Err(Error::invalid_input(format!(
-                    "shard {} is sealed; refusing claim (drop in flight)",
-                    self.shard_id
-                )));
+            if let Some(manifest) = &current {
+                self.validate_claimable(manifest, shard_spec_id)?;
             }
 
             let (next_version, next_epoch, base_manifest) = match current {
@@ -526,11 +541,13 @@ impl ShardManifestStore {
                     return Ok((next_epoch, new_manifest));
                 }
                 Err(write_err) => {
-                    let latest_epoch = self
-                        .refresh_latest()
-                        .await?
-                        .map(|m| m.writer_epoch)
-                        .unwrap_or(0);
+                    // Refresh uncached: a claim must see another process's
+                    // write, and the tip it finds is what the retry builds on.
+                    let latest = self.refresh_latest().await?;
+                    if let Some(manifest) = &latest {
+                        self.validate_claimable(manifest, shard_spec_id)?;
+                    }
+                    let latest_epoch = latest.map(|m| m.writer_epoch).unwrap_or(0);
                     if latest_epoch >= next_epoch {
                         return Err(Error::io(format!(
                             "Failed to claim shard {} (version {}): another writer claimed epoch {} (>= our target {}): {}",
@@ -995,6 +1012,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_claim_epoch_preserves_matching_shard_spec() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let (first_epoch, first) = manifest_store.claim_epoch(1).await.unwrap();
+        assert_eq!(first_epoch, 1);
+        assert_eq!(first.version, 1);
+        assert_eq!(first.shard_spec_id, 1);
+
+        let (second_epoch, second) = manifest_store.claim_epoch(1).await.unwrap();
+        assert_eq!(second_epoch, 2);
+        assert_eq!(second.version, 2);
+        assert_eq!(second.shard_spec_id, 1);
+    }
+
+    #[rstest::rstest]
+    #[case::manual_shard(0, 1)]
+    #[case::configured_shard_rejects_manual_claim(1, 0)]
+    #[tokio::test]
+    async fn test_claim_epoch_rejects_mismatched_shard_spec(
+        #[case] stored_shard_spec_id: u32,
+        #[case] incoming_shard_spec_id: u32,
+    ) {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let initial = manifest_store
+            .initialize_shard(stored_shard_spec_id, HashMap::new())
+            .await
+            .unwrap();
+
+        let error = manifest_store
+            .claim_epoch(incoming_shard_spec_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains(&shard_id.to_string())
+                && message.contains(&format!("incoming shard_spec_id {incoming_shard_spec_id}"))
+                && message.contains(&format!("stored shard_spec_id {stored_shard_spec_id}")),
+            "error must include the shard id and both shard spec ids, got: {error}"
+        );
+
+        let after = manifest_store.latest().await.unwrap().unwrap();
+        assert_eq!(
+            after, initial,
+            "a rejected claim must not change the manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_claims_reject_mismatched_shard_spec() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let (first, second) =
+            tokio::join!(manifest_store.claim_epoch(0), manifest_store.claim_epoch(1));
+        let (claimed, error) = match (first, second) {
+            (Ok(claimed), Err(error)) | (Err(error), Ok(claimed)) => (claimed, error),
+            results => panic!("exactly one claim must succeed, got: {results:?}"),
+        };
+
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains(&shard_id.to_string())
+                && message.contains("incoming shard_spec_id")
+                && message.contains("stored shard_spec_id"),
+            "error must include the shard id and both shard spec ids, got: {error}"
+        );
+
+        let latest = manifest_store.latest().await.unwrap().unwrap();
+        assert_eq!(latest, claimed.1);
+        assert_eq!(latest.version, 1);
+        assert_eq!(latest.writer_epoch, claimed.0);
+        assert_eq!(manifest_store.list_versions().await.unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
     async fn test_claim_epoch_refuses_sealed_manifest() {
         // A `Sealed` manifest is the drop-table 2PC in-doubt marker:
         // `claim_epoch` must refuse it with a distinguishable error rather
@@ -1018,7 +1118,7 @@ mod tests {
 
         // The claim is refused with the distinguishable "sealed" error —
         // and the manifest is left untouched (no new epoch minted).
-        let err = manifest_store.claim_epoch(0).await.unwrap_err();
+        let err = manifest_store.claim_epoch(1).await.unwrap_err();
         assert!(
             err.to_string().contains("sealed"),
             "expected a distinguishable sealed-refusal error, got: {err}"
