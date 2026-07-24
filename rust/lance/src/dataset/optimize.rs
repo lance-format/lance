@@ -604,15 +604,15 @@ impl CompactionOptions {
 
 /// Determine if page-level binary copy can safely merge the provided fragments.
 ///
-/// Preconditions checked in order:
+/// Preconditions:
 /// - Compaction mode is not `Reencode`
 /// - Dataset storage format is non-legacy
-/// - Fragment list is non-empty
+/// - Fragment list is non-empty and every fragment has at least one data file
 /// - All data files share identical Lance file versions
 /// - No fragment has a deletion file
-///   TODO: Need to support schema evolution case like add column and drop column
+/// - No fragment has data overlays
 /// - All data files use an identical schema mapping (`fields`, `column_indices`) in dataset schema
-///   order
+///   order, with the current schema's expected physical-column count
 /// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
 async fn can_use_binary_copy(
     dataset: &Dataset,
@@ -670,10 +670,10 @@ pub(super) async fn can_use_binary_copy_current(
         return Ok(false);
     }
 
-    if fragments[0].files.is_empty() {
+    if let Some(fragment) = fragments.iter().find(|fragment| fragment.files.is_empty()) {
         log::debug!(
             "Binary copy disabled: fragment {} has no data files",
-            fragments[0].id
+            fragment.id
         );
         return Ok(false);
     }
@@ -690,6 +690,12 @@ pub(super) async fn can_use_binary_copy_current(
         );
         return Ok(false);
     }
+    let expected_column_count: usize = dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|field| lance_file::versions::physical_column_count(version, field))
+        .sum();
     for fragment in fragments {
         // Binary copy only reads base files; overlays must be materialized by the scanner.
         if !fragment.overlays.is_empty() {
@@ -729,6 +735,16 @@ pub(super) async fn can_use_binary_copy_current(
                 .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
                 .await?;
             let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
+            if file_meta.column_infos.len() != expected_column_count {
+                log::debug!(
+                    "Binary copy disabled: data file '{}' in fragment {} has {} physical columns, expected {} for the current schema",
+                    data_file.path,
+                    fragment.id,
+                    file_meta.column_infos.len(),
+                    expected_column_count
+                );
+                return Ok(false);
+            }
             // Binary copy only preserves page and column-buffer bytes. The output file's footer
             // (including global buffers) is re-generated, not copied from inputs.
             //
