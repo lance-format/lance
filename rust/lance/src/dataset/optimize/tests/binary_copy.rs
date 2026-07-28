@@ -843,11 +843,14 @@ async fn test_binary_copy_fallback_to_common_compaction() {
     assert_eq!(before, after);
 }
 
+#[rstest]
+#[case::unstable_row_ids(false)]
+#[case::stable_row_ids(true)]
 #[tokio::test]
-async fn test_try_binary_copy_falls_back_for_file_less_fragment() {
-    for enable_stable_row_ids in [false, true] {
-        do_try_binary_copy_falls_back_for_file_less_fragment(enable_stable_row_ids).await;
-    }
+async fn test_try_binary_copy_falls_back_for_file_less_fragment(
+    #[case] enable_stable_row_ids: bool,
+) {
+    do_try_binary_copy_falls_back_for_file_less_fragment(enable_stable_row_ids).await;
 }
 
 async fn do_try_binary_copy_falls_back_for_file_less_fragment(enable_stable_row_ids: bool) {

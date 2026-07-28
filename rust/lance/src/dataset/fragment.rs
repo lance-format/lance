@@ -1944,6 +1944,8 @@ impl FileFragment {
             }
             *first_length
         } else {
+            // No user data file supplied a length, so validation must use a
+            // trustworthy persisted count, including when only lineage remains.
             if self.dataset.manifest.writer_version.is_none() {
                 return Err(Error::corrupt_file(
                     self.dataset.base.clone(),
