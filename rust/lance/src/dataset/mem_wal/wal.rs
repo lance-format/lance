@@ -1103,11 +1103,10 @@ impl WalAppender {
         shard_id: Uuid,
         shard_spec_id: u32,
     ) -> Result<Self> {
-        let manifest_store = Arc::new(ShardManifestStore::new(
+        let manifest_store = Arc::new(ShardManifestStore::new_adaptive(
             object_store.clone(),
             &base_path,
             shard_id,
-            2,
         ));
         let (writer_epoch, manifest) = manifest_store.claim_epoch(shard_spec_id).await?;
         let position_hint = manifest
@@ -1381,11 +1380,10 @@ pub struct WalTailer {
 impl WalTailer {
     /// Create a WAL tailer for a shard.
     pub fn new(object_store: Arc<ObjectStore>, base_path: Path, shard_id: Uuid) -> Self {
-        let manifest_store = Arc::new(ShardManifestStore::new(
+        let manifest_store = Arc::new(ShardManifestStore::new_adaptive(
             object_store.clone(),
             &base_path,
             shard_id,
-            2,
         ));
         Self {
             object_store,
@@ -1688,6 +1686,7 @@ async fn scan_first_position(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::dataset::mem_wal::test_util::failing_memory_store;

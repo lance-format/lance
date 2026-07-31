@@ -59,7 +59,7 @@ use super::wal::{
 use super::{TOMBSTONE, relax_non_pk_nullability, schema_with_tombstone};
 use crate::session::Session;
 
-use super::manifest::{ShardManifestStore, validate_manifest_scan_batch_size};
+use super::manifest::ShardManifestStore;
 
 // ============================================================================
 // Configuration
@@ -134,11 +134,14 @@ pub struct ShardWriterConfig {
     /// Default: 8,000 batches
     pub max_memtable_batches: usize,
 
-    /// Batch size for parallel HEAD requests when scanning for manifest versions.
+    /// Legacy batch size for parallel manifest HEAD requests.
     ///
-    /// Must be greater than zero. Higher values scan faster but use more parallel
-    /// requests.
-    /// Default: 2
+    /// This value is ignored because manifest discovery now uses an internal
+    /// adaptive batch size. It is retained for source compatibility.
+    #[deprecated(
+        since = "10.0.0",
+        note = "manifest scan concurrency is managed internally and this field is ignored"
+    )]
     pub manifest_scan_batch_size: usize,
 
     /// Maximum unflushed bytes before applying backpressure.
@@ -257,6 +260,7 @@ pub struct ShardWriterConfig {
     pub backpressure: Option<Arc<dyn BackpressureController>>,
 }
 
+#[allow(deprecated)]
 impl Default for ShardWriterConfig {
     fn default() -> Self {
         Self {
@@ -351,8 +355,15 @@ impl ShardWriterConfig {
         self
     }
 
-    /// Set manifest scan batch size. Values must be greater than zero and are
-    /// validated when opening the writer.
+    /// Retain a legacy manifest scan batch size without changing scan behavior.
+    ///
+    /// Manifest discovery now uses an internal adaptive batch size, so `size`
+    /// is ignored.
+    #[allow(deprecated)]
+    #[deprecated(
+        since = "10.0.0",
+        note = "manifest scan concurrency is managed internally and this method has no effect"
+    )]
     pub fn with_manifest_scan_batch_size(mut self, size: usize) -> Self {
         self.manifest_scan_batch_size = size;
         self
@@ -2012,8 +2023,6 @@ impl ShardWriter {
         schema: Arc<ArrowSchema>,
         index_configs: Vec<MemIndexConfig>,
     ) -> Result<Self> {
-        validate_manifest_scan_batch_size(config.manifest_scan_batch_size)?;
-
         if !config.enable_memtable && !index_configs.is_empty() {
             return Err(Error::invalid_input(
                 "indexes require enable_memtable = true; \
@@ -2044,11 +2053,10 @@ impl ShardWriter {
 
         let base_uri = base_uri.into();
         let shard_id = config.shard_id;
-        let manifest_store = Arc::new(ShardManifestStore::new(
+        let manifest_store = Arc::new(ShardManifestStore::new_adaptive(
             object_store.clone(),
             &base_path,
             shard_id,
-            config.manifest_scan_batch_size,
         ));
 
         // Derive PK metadata and run every side-effect-free validation *before*
@@ -4423,6 +4431,7 @@ pub fn new_shared_stats() -> SharedWriteStats {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::dataset::mem_wal::test_util::failing_memory_store;
@@ -7820,26 +7829,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_open_rejects_zero_manifest_scan_batch_size() {
-        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let config = ShardWriterConfig {
-            manifest_scan_batch_size: 0,
-            ..memtable_config_with_pk(Uuid::new_v4())
-        };
-
-        let Err(err) =
-            ShardWriter::open(store, base_path, base_uri, config, schema_with_pk(), vec![]).await
-        else {
-            panic!("manifest_scan_batch_size=0 must be rejected");
-        };
-        assert!(matches!(&err, Error::InvalidInput { .. }));
-        assert!(
-            err.to_string().contains("manifest_scan_batch_size=0"),
-            "the error must name manifest_scan_batch_size and its value, got: {err}"
-        );
-    }
-
     /// WAL entries must be appended in global batch-position order across a
     /// memtable rotation, because append order *is* primary-key recency order.
     ///
@@ -9387,6 +9376,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod shard_writer_tests {
     use std::sync::Arc;
 
