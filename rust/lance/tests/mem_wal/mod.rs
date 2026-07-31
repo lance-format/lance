@@ -21,7 +21,6 @@ fn durable_writer_config(shard_id: Uuid) -> ShardWriterConfig {
         max_wal_buffer_size: 64 * 1024 * 1024,
         max_wal_flush_interval: Some(Duration::from_millis(10)),
         max_memtable_size: 64 * 1024 * 1024,
-        manifest_scan_batch_size: 2,
         ..Default::default()
     }
 }

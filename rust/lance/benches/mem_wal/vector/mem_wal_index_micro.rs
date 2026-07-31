@@ -396,11 +396,10 @@ async fn measure_flush(
     };
     let (store, base_path) = ObjectStore::from_uri(&uri).await?;
     let shard_id = Uuid::new_v4();
-    let manifest_store = Arc::new(ShardManifestStore::new(
+    let manifest_store = Arc::new(ShardManifestStore::new_adaptive(
         store.clone(),
         &base_path,
         shard_id,
-        2,
     ));
     let (epoch, _) = manifest_store.claim_epoch(0).await?;
     let flusher = MemTableFlusher::new(store, base_path, uri, shard_id, manifest_store);
