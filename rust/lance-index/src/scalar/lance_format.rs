@@ -406,6 +406,13 @@ impl IndexStore for LanceIndexStore {
         Arc::new(self.clone())
     }
 
+    fn is_same_storage_binding(&self, other: &dyn IndexStore) -> bool {
+        other.as_any().downcast_ref::<Self>().is_some_and(|other| {
+            Arc::ptr_eq(&self.object_store, &other.object_store)
+                && self.index_dir == other.index_dir
+        })
+    }
+
     fn io_parallelism(&self) -> usize {
         self.object_store.io_parallelism()
     }

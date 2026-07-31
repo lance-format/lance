@@ -3558,6 +3558,7 @@ mod tests {
     use lance_index::scalar::inverted::{
         INVERTED_INDEX_VERSION_V1, INVERTED_INDEX_VERSION_V2, INVERTED_INDEX_VERSION_V3,
     };
+    use lance_index::scalar::registry::ScalarIndexCacheKey;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -3567,7 +3568,11 @@ mod tests {
         kmeans::{KMeansParams, train_kmeans},
         sq::builder::SQBuildParams,
     };
-    use lance_io::{assert_io_eq, assert_io_lt, utils::tracking_store::IoStats};
+    use lance_io::{
+        assert_io_eq, assert_io_lt,
+        object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor},
+        utils::tracking_store::IoStats,
+    };
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use object_store::ObjectStoreExt;
@@ -3608,6 +3613,199 @@ mod tests {
                 size_bytes: payload.len() as u64,
             }]),
         }
+    }
+
+    #[tokio::test]
+    async fn test_scalar_cache_uses_current_object_store() {
+        async fn search_ids(dataset: &Dataset, term: &str) -> Vec<i32> {
+            let result = dataset
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new(term.to_owned()))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+            ids.sort_unstable();
+            ids
+        }
+
+        // Rotated credentials require distinct ObjectStore instances to read the same data.
+        // `memory://` creates an isolated in-memory backend for each instance, so this test needs
+        // a filesystem-backed URI.
+        let test_dir = TempStrDir::default();
+        let batches = vec![
+            arrow_array::record_batch!(
+                ("id", Int32, [0, 1, 2, 3]),
+                (
+                    "text",
+                    Utf8,
+                    [
+                        "alpha common",
+                        "beta common",
+                        "gamma common",
+                        "alpha common"
+                    ]
+                )
+            )
+            .unwrap(),
+            arrow_array::record_batch!(
+                ("id", Int32, [4, 5, 6, 7]),
+                (
+                    "text",
+                    Utf8,
+                    ["beta common", "gamma common", "alpha common", "beta common"]
+                )
+            )
+            .unwrap(),
+        ];
+        let schema = batches[0].schema();
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_group: 4,
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("credential_rotation_fts".to_owned()),
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let index_meta = dataset
+            .load_indices_by_name("credential_rotation_fts")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let session = Arc::new(Session::default());
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+
+        let store_params_a = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    "credential_generation".to_owned(),
+                    "secret-generation-a".to_owned(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+        let (store_a, _) = ObjectStore::from_uri_and_params(
+            dataset.session().store_registry(),
+            dataset.uri(),
+            &store_params_a,
+        )
+        .await
+        .unwrap();
+        let dataset_a = dataset.with_object_store(store_a.clone(), Some(store_params_a));
+
+        let store_params_b = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    "credential_generation".to_owned(),
+                    "secret-generation-b".to_owned(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+        let (store_b, _) = ObjectStore::from_uri_and_params(
+            dataset.session().store_registry(),
+            dataset.uri(),
+            &store_params_b,
+        )
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&store_a, &store_b));
+        let dataset_b = dataset.with_object_store(store_b.clone(), Some(store_params_b));
+        let index_path_fragment = format!("_indices/{}", index_meta.uuid);
+
+        let _ = store_a.io_stats_incremental();
+        let _ = store_b.io_stats_incremental();
+        assert_eq!(search_ids(&dataset_a, "alpha").await, vec![0, 3, 6]);
+        let first_store_stats = store_a.io_stats_incremental();
+        assert!(
+            first_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "the first query should read the FTS index through store A: {first_store_stats:#?}"
+        );
+        let _ = store_b.io_stats_incremental();
+
+        assert_eq!(search_ids(&dataset_a, "alpha").await, vec![0, 3, 6]);
+        let warm_store_stats = store_a.io_stats_incremental();
+        assert!(
+            !warm_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "the same store binding should reuse the live scalar index: {warm_store_stats:#?}"
+        );
+
+        assert_eq!(search_ids(&dataset_b, "beta").await, vec![1, 4, 7]);
+        let old_store_stats = store_a.io_stats_incremental();
+        let new_store_stats = store_b.io_stats_incremental();
+        assert!(
+            !old_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "the second dataset must not use the scalar index bound to store A: {old_store_stats:#?}"
+        );
+        assert!(
+            new_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "the second dataset should read the scalar index through store B: {new_store_stats:#?}"
+        );
+
+        let scalar_cache = dataset.index_cache.for_index(&index_meta.uuid, None);
+        assert!(
+            scalar_cache
+                .get_unsized_with_key(&ScalarIndexCacheKey)
+                .await
+                .is_some(),
+            "the live scalar index should be cached with store B's binding"
+        );
+
+        let _ = store_a.io_stats_incremental();
+        let _ = store_b.io_stats_incremental();
+        assert_eq!(search_ids(&dataset_a, "gamma").await, vec![2, 5]);
+        let reopened_store_stats = store_a.io_stats_incremental();
+        let untouched_store_stats = store_b.io_stats_incremental();
+        assert!(
+            reopened_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "re-querying dataset A should replace store B's binding and read through store A: {reopened_store_stats:#?}"
+        );
+        assert!(
+            !untouched_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "re-querying dataset A must not use store B: {untouched_store_stats:#?}"
+        );
     }
 
     fn list_io_stats(stats: &IoStats) -> IoStats {

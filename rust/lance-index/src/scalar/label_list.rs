@@ -826,7 +826,12 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         Ok(Some(index as Arc<dyn ScalarIndex>))
     }
 
-    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
+    async fn put_in_cache(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        cache: &LanceCache,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
         let state = LabelListIndexState::from_scalar_index(index.as_ref())?;
         cache
             .insert_with_key(&LabelListIndexStateKey, Arc::new(state))
