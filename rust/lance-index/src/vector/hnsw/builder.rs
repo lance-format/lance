@@ -347,6 +347,32 @@ impl HNSW {
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
+        Ok(self
+            .search_inner_counted(
+                query,
+                k,
+                params,
+                bitset,
+                visited_generator,
+                storage,
+                prefetch_distance,
+            )?
+            .0)
+    }
+
+    /// [Self::search_inner], additionally reporting how many distances the
+    /// traversal computed.
+    #[allow(clippy::too_many_arguments)]
+    fn search_inner_counted(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: &HnswQueryParams,
+        bitset: Option<Visited>,
+        visited_generator: &mut VisitedGenerator,
+        storage: &impl VectorStore,
+        prefetch_distance: Option<usize>,
+    ) -> Result<(Vec<OrderedNode>, usize)> {
         self.ensure_storage_covers_graph(storage)?;
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
@@ -357,7 +383,7 @@ impl HNSW {
         // generic over those view types so the loop is single-sourced:
         // each backend supplies a per-level view closure and a
         // bottom-level view.
-        let result = match &self.inner.graph {
+        let (result, comparisons) = match &self.inner.graph {
             HnswGraph::Built(nodes) => {
                 let nodes = nodes.as_slice();
                 self.run_search(
@@ -389,7 +415,8 @@ impl HNSW {
                 )
             }
         };
-        Ok(result)
+        // the entry point distance is computed above, outside the traversal
+        Ok((result, comparisons + 1))
     }
 
     /// Drives the shared HNSW query path over backend-specific graph
@@ -412,7 +439,7 @@ impl HNSW {
         dist_calc: &impl DistCalculator,
         make_level: impl Fn(u16) -> L,
         bottom: B,
-    ) -> Vec<OrderedNode>
+    ) -> (Vec<OrderedNode>, usize)
     where
         L: BorrowingGraph,
         B: BorrowingGraph,
@@ -423,17 +450,20 @@ impl HNSW {
         // minimum, which costs extra distance computations and measurably
         // hurts recall at low ef (https://github.com/lance-format/lance/issues/5208).
         let mut ep = ep;
+        let mut comparisons = 0;
         for level in (1..self.max_level()).rev() {
             let cur_level = make_level(level);
-            ep = greedy_search_borrowed(
+            let (next, level_comparisons) = greedy_search_borrowed(
                 &cur_level,
                 ep,
                 dist_calc,
                 self.inner.params.prefetch_distance,
             );
+            ep = next;
+            comparisons += level_comparisons;
         }
         let mut visited = visited_generator.generate(storage_len);
-        beam_search_borrowed(
+        let (results, beam_comparisons) = beam_search_borrowed(
             &bottom,
             &ep,
             params,
@@ -441,10 +471,12 @@ impl HNSW {
             bitset,
             prefetch_distance,
             &mut visited,
+        );
+        comparisons += beam_comparisons;
+        (
+            results.into_iter().take(k).collect::<Vec<OrderedNode>>(),
+            comparisons,
         )
-        .into_iter()
-        .take(k)
-        .collect::<Vec<OrderedNode>>()
     }
 
     #[instrument(level = "debug", skip(self, query, bitset, storage))]
@@ -456,12 +488,27 @@ impl HNSW {
         bitset: Option<Visited>,
         storage: &impl VectorStore,
     ) -> Result<Vec<OrderedNode>> {
+        Ok(self
+            .search_basic_counted(query, k, params, bitset, storage)?
+            .0)
+    }
+
+    /// [Self::search_basic], additionally reporting how many distances the
+    /// traversal computed.
+    fn search_basic_counted(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: &HnswQueryParams,
+        bitset: Option<Visited>,
+        storage: &impl VectorStore,
+    ) -> Result<(Vec<OrderedNode>, usize)> {
         let mut visited_generator = self
             .inner
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let result = self.search_inner(
+        let result = self.search_inner_counted(
             query,
             k,
             params,
@@ -491,6 +538,21 @@ impl HNSW {
         bitset: &Visited,
         storage: &impl VectorStore,
     ) -> Result<Vec<OrderedNode>> {
+        Ok(self
+            .search_acorn_counted(query, k, params, bitset, storage)?
+            .0)
+    }
+
+    /// [Self::search_acorn], additionally reporting how many distances the
+    /// traversal computed.
+    fn search_acorn_counted(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: &HnswQueryParams,
+        bitset: &Visited,
+        storage: &impl VectorStore,
+    ) -> Result<(Vec<OrderedNode>, usize)> {
         let mut visited_generator = self
             .inner
             .visited_generator_queue
@@ -530,13 +592,13 @@ impl HNSW {
         expanded_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
-    ) -> Result<Vec<OrderedNode>> {
+    ) -> Result<(Vec<OrderedNode>, usize)> {
         self.ensure_storage_covers_graph(storage)?;
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
-        let result = match &self.inner.graph {
+        let (result, comparisons) = match &self.inner.graph {
             HnswGraph::Built(nodes) => {
                 let nodes = nodes.as_slice();
                 self.run_search_acorn(
@@ -568,7 +630,8 @@ impl HNSW {
                 )
             }
         };
-        Ok(result.into_iter().take(k).collect())
+        // the entry point distance is computed above, outside the traversal
+        Ok((result.into_iter().take(k).collect(), comparisons + 1))
     }
 
     /// [Self::run_search] for the ACORN traversal: same level descent, but
@@ -586,7 +649,7 @@ impl HNSW {
         dist_calc: &impl DistCalculator,
         make_level: impl Fn(u16) -> L,
         bottom: B,
-    ) -> Vec<OrderedNode>
+    ) -> (Vec<OrderedNode>, usize)
     where
         L: BorrowingGraph,
         B: BorrowingGraph,
@@ -594,18 +657,21 @@ impl HNSW {
         // Same level descent as [Self::run_search]: greedy stops at level 1
         // (see the comment there); level 0 is left to the beam below.
         let mut ep = ep;
+        let mut comparisons = 0;
         for level in (1..self.max_level()).rev() {
             let cur_level = make_level(level);
-            ep = greedy_search_borrowed(
+            let (next, level_comparisons) = greedy_search_borrowed(
                 &cur_level,
                 ep,
                 dist_calc,
                 self.inner.params.prefetch_distance,
             );
+            ep = next;
+            comparisons += level_comparisons;
         }
         let mut visited = visited_generator.generate(storage_len);
         let mut expanded = expanded_generator.generate(storage_len);
-        beam_search_acorn(
+        let (results, beam_comparisons) = beam_search_acorn(
             &bottom,
             &ep,
             params,
@@ -614,7 +680,8 @@ impl HNSW {
             prefetch_distance,
             &mut visited,
             &mut expanded,
-        )
+        );
+        (results, comparisons + beam_comparisons)
     }
 
     #[instrument(level = "debug", skip(self, storage, query, prefilter_bitset))]
@@ -625,9 +692,11 @@ impl HNSW {
         k: usize,
         prefilter_bitset: Visited,
         params: &HnswQueryParams,
-    ) -> Vec<OrderedNode> {
+    ) -> (Vec<OrderedNode>, usize) {
         let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
         let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
+        // every set bit gets exactly one distance on both branches below
+        let comparisons = prefilter_bitset.count_ones();
 
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
@@ -679,7 +748,7 @@ impl HNSW {
                 }
             }
         };
-        heap.into_sorted_vec()
+        (heap.into_sorted_vec(), comparisons)
     }
 
     /// Returns the metadata of this [`HNSW`].
@@ -837,7 +906,7 @@ impl HnswBuilder {
         // ```
         for level in (target_level + 1..=entry_level).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
+            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance).0;
         }
 
         let mut pruned_neighbors_per_level: Vec<Vec<_>> =
@@ -903,6 +972,7 @@ impl HnswBuilder {
             self.params.prefetch_distance,
             &mut visited,
         )
+        .0
     }
 
     fn prune(
@@ -1448,7 +1518,7 @@ impl IvfSubIndex for HNSW {
         Some(&[VECTOR_ID_COL, NEIGHBORS_COL])
     }
 
-    #[instrument(level = "debug", skip(self, query, storage, prefilter, _metrics))]
+    #[instrument(level = "debug", skip(self, query, storage, prefilter, metrics))]
     fn search(
         &self,
         query: ArrayRef,
@@ -1456,7 +1526,7 @@ impl IvfSubIndex for HNSW {
         params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
-        _metrics: &dyn MetricsCollector,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         if params.ef < k {
             return Err(Error::index(
@@ -1474,8 +1544,8 @@ impl IvfSubIndex for HNSW {
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let results = if prefilter.is_empty() {
-            self.search_basic(query, k, &params, None, storage)?
+        let (results, comparisons) = if prefilter.is_empty() {
+            self.search_basic_counted(query, k, &params, None, storage)?
         } else {
             // the bitset must be moved into a callee on every path so its
             // borrow of `prefilter_generator` ends before the push below
@@ -1488,27 +1558,41 @@ impl IvfSubIndex for HNSW {
             if remained == storage.len() {
                 // mask passes every row: same as unfiltered
                 drop(prefilter_bitset);
-                self.search_basic(query, k, &params, None, storage)?
+                self.search_basic_counted(query, k, &params, None, storage)?
             } else if remained < self.len() * 10 / 100 {
                 // few matching rows: brute force is cheaper and exact
                 self.flat_search(storage, query, k, prefilter_bitset, &params)
             } else if params.use_acorn {
-                let acorn_results =
-                    self.search_acorn(query.clone(), k, &params, &prefilter_bitset, storage)?;
+                let (acorn_results, acorn_comparisons) = self.search_acorn_counted(
+                    query.clone(),
+                    k,
+                    &params,
+                    &prefilter_bitset,
+                    storage,
+                )?;
                 // under-delivery means the budget ran out on a fragmented
                 // mask, except range-bounded queries which return short
                 // legitimately
                 let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
                 if !bounded && acorn_results.len() < k.min(remained) {
-                    self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
+                    // the abandoned ACORN traversal still cost its distances
+                    let (results, basic_comparisons) = self.search_basic_counted(
+                        query,
+                        k,
+                        &params,
+                        Some(prefilter_bitset),
+                        storage,
+                    )?;
+                    (results, acorn_comparisons + basic_comparisons)
                 } else {
                     drop(prefilter_bitset);
-                    acorn_results
+                    (acorn_results, acorn_comparisons)
                 }
             } else {
-                self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
+                self.search_basic_counted(query, k, &params, Some(prefilter_bitset), storage)?
             }
         };
+        metrics.record_comparisons(comparisons);
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
 
@@ -2166,7 +2250,7 @@ mod tests {
         let ep = OrderedNode::new(0, dist_calc.distance(0).into());
         let mut visited_generator = VisitedGenerator::new(N);
 
-        let results = hnsw.run_search(
+        let (results, _) = hnsw.run_search(
             ep.clone(),
             3,
             &query_params,
@@ -2196,7 +2280,7 @@ mod tests {
         }
         let mut expanded_generator = VisitedGenerator::new(N);
         calls.store(0, Ordering::Relaxed);
-        let results = hnsw.run_search_acorn(
+        let (results, _) = hnsw.run_search_acorn(
             ep,
             &query_params,
             &mask,
@@ -2319,6 +2403,26 @@ mod tests {
             let hits = results.iter().filter(|n| truth.contains(&n.id)).count();
             let recall = hits as f32 / k as f32;
             assert!(recall >= 0.5, "recall {recall} below 0.5 (k={k})");
+        }
+    }
+
+    struct MaskPreFilter {
+        mask: Arc<lance_select::RowAddrMask>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::prefilter::PreFilter for MaskPreFilter {
+        async fn wait_for_ready(&self) -> lance_core::Result<()> {
+            Ok(())
+        }
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn mask(&self) -> Arc<lance_select::RowAddrMask> {
+            self.mask.clone()
+        }
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            self.mask.selected_indices(row_ids)
         }
     }
 
@@ -2471,6 +2575,78 @@ mod tests {
         // the graph. Both must include the lower bound and exclude the upper.
         assert_eq!(search_row_ids(vec![0, 1, 2]), vec![0]);
         assert_eq!(search_row_ids((0..60).collect()), vec![0]);
+    }
+
+    /// Every dispatch path reports the distances it computed, so an HNSW query
+    /// no longer shows up as zero comparisons in per-query metrics.
+    #[tokio::test]
+    async fn test_search_reports_distance_comparisons() {
+        use crate::metrics::LocalMetricsCollector;
+        use crate::prefilter::NoFilter;
+
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+        let hnsw = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+
+        let k = 10;
+        let query_key = fsl.value(0);
+        let comparisons = |prefilter: Arc<dyn PreFilter>, use_acorn: bool| {
+            let metrics = LocalMetricsCollector::default();
+            hnsw.search(
+                query_key.clone(),
+                k,
+                HnswQueryParams {
+                    ef: 50,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn,
+                },
+                store.as_ref(),
+                prefilter,
+                &metrics,
+            )
+            .unwrap();
+            metrics.comparisons.load(Ordering::Relaxed)
+        };
+        let masked = |allowed: Vec<u64>| -> Arc<dyn PreFilter> {
+            Arc::new(MaskPreFilter {
+                mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                    allowed,
+                ))),
+            })
+        };
+
+        // Graph traversal, unfiltered: returning k results takes at least k
+        // distances, and the point of the graph is to stay well under a scan.
+        let unfiltered = comparisons(Arc::new(NoFilter), false);
+        assert!(
+            (k..TOTAL).contains(&unfiltered),
+            "unfiltered comparisons {unfiltered} outside [{k}, {TOTAL})"
+        );
+
+        // Sparse mask takes the exact flat scan, which scores every passing
+        // row exactly once, so the count is known rather than merely non-zero.
+        let sparse: Vec<u64> = (0..TOTAL as u64).step_by(25).collect();
+        assert_eq!(comparisons(masked(sparse.clone()), false), sparse.len());
+
+        // Dense mask, both traversals.
+        let dense: Vec<u64> = (0..TOTAL as u64).step_by(2).collect();
+        for use_acorn in [false, true] {
+            let dense_comparisons = comparisons(masked(dense.clone()), use_acorn);
+            assert!(
+                dense_comparisons >= k,
+                "dense comparisons {dense_comparisons} below k={k} (use_acorn={use_acorn})"
+            );
+        }
     }
 
     /// Every fresh `level_offsets` range must exactly delimit the rows emitted

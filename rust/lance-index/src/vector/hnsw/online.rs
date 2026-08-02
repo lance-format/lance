@@ -262,7 +262,7 @@ impl OnlineHnswBuilder {
         // Walk down upper levels with greedy_search to refine the entry point.
         for level in (target_level + 1..=entry_target_level).rev() {
             let cur_level = OnlineHnswLevelView::new(level, nodes);
-            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
+            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance).0;
         }
 
         // Insert at each level from target_level down to 0.
@@ -364,6 +364,7 @@ impl OnlineHnswBuilder {
             self.params.prefetch_distance,
             &mut visited,
         )
+        .0
     }
 
     fn prune(
@@ -420,7 +421,7 @@ impl OnlineHnswBuilder {
         let nodes = self.nodes.as_slice();
         for level in (1..=nodes[entry as usize].target_level()).rev() {
             let cur_level = OnlineHnswLevelView::new(level, nodes);
-            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
+            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance).0;
         }
 
         let bottom = OnlineHnswBottomView::new(nodes);
@@ -432,7 +433,7 @@ impl OnlineHnswBuilder {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let result = beam_search(
+        let (result, _) = beam_search(
             &bottom,
             &ep,
             &params,
