@@ -1744,10 +1744,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow_array::cast::AsArray;
+    use arrow_array::types::Float32Type;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
     };
-    use arrow_schema::Schema;
+    use arrow_schema::{Schema, SchemaRef};
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::{Error, Result, deepsize::DeepSizeOf};
@@ -1760,7 +1761,7 @@ mod tests {
     use lance_select::{RowAddrMask, RowAddrTreeMap};
     use lance_table::format::SelfDescribingFileReader;
     use lance_table::io::manifest::ManifestDescribing;
-    use lance_testing::datagen::generate_random_array;
+    use lance_testing::datagen::{generate_random_array, generate_random_array_with_seed};
     use object_store::path::Path;
     use rand::{Rng, SeedableRng, rngs::SmallRng};
     use rstest::rstest;
@@ -1769,13 +1770,13 @@ mod tests {
         HNSW_LEVEL_RNG_SEED, HNSW_METADATA_KEY, HnswBuilder, HnswGraph, ImmutableHnswBottomView,
         ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
     };
-    use crate::metrics::NoOpMetricsCollector;
-    use crate::prefilter::PreFilter;
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
+    use crate::prefilter::{NoFilter, PreFilter};
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
-        flat::storage::{FlatBinStorage, FlatFloatStorage},
+        flat::storage::{FlatBinStorage, FlatFloatDistanceCalc, FlatFloatStorage},
         graph::{DISTS_FIELD, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
         hnsw::{
             HNSW, HnswMetadata, VECTOR_ID_FIELD,
@@ -2426,6 +2427,117 @@ mod tests {
         }
     }
 
+    fn masked_prefilter(allowed: Vec<u64>) -> Arc<dyn PreFilter> {
+        Arc::new(MaskPreFilter {
+            mask: Arc::new(lance_select::RowAddrMask::from_allowed(
+                lance_select::RowAddrTreeMap::from_iter(allowed),
+            )),
+        })
+    }
+
+    /// Counts the distances a search actually computes, so a reported metric
+    /// can be checked against an independent oracle instead of a bound.
+    /// Prefetches are forwarded uncounted: they compute no distance, and the
+    /// default `prefetch_distance` keeps that path live.
+    #[derive(Clone)]
+    struct CountingStorage {
+        inner: FlatFloatStorage,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingStorage {
+        fn new(inner: FlatFloatStorage) -> Self {
+            Self {
+                inner,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// Distances computed since the previous call.
+        fn take(&self) -> usize {
+            self.calls.swap(0, Ordering::Relaxed)
+        }
+    }
+
+    struct CountingDistCalc<'a> {
+        inner: FlatFloatDistanceCalc<'a>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DistCalculator for CountingDistCalc<'_> {
+        fn distance(&self, id: u32) -> f32 {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.distance(id)
+        }
+
+        fn distance_all(&self, k_hint: usize) -> Vec<f32> {
+            let dists = self.inner.distance_all(k_hint);
+            self.calls.fetch_add(dists.len(), Ordering::Relaxed);
+            dists
+        }
+
+        fn prefetch(&self, id: u32) {
+            self.inner.prefetch(id);
+        }
+    }
+
+    impl VectorStore for CountingStorage {
+        type DistanceCalculator<'a> = CountingDistCalc<'a>;
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> &SchemaRef {
+            self.inner.schema()
+        }
+
+        fn to_batches(&self) -> lance_core::Result<impl Iterator<Item = RecordBatch> + Send> {
+            self.inner.to_batches()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn distance_type(&self) -> DistanceType {
+            self.inner.distance_type()
+        }
+
+        fn row_id(&self, id: u32) -> u64 {
+            self.inner.row_id(id)
+        }
+
+        fn row_ids(&self) -> impl Iterator<Item = &u64> {
+            self.inner.row_ids()
+        }
+
+        fn append_batch(
+            &self,
+            batch: RecordBatch,
+            vector_column: &str,
+        ) -> lance_core::Result<Self> {
+            Ok(Self {
+                inner: self.inner.append_batch(batch, vector_column)?,
+                calls: self.calls.clone(),
+            })
+        }
+
+        fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
+            CountingDistCalc {
+                inner: self.inner.dist_calculator(query, dist_q_c),
+                calls: self.calls.clone(),
+            }
+        }
+
+        fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+            CountingDistCalc {
+                inner: self.inner.dist_calculator_from_id(id),
+                calls: self.calls.clone(),
+            }
+        }
+    }
+
     /// Dispatch: dense prefilters take the graph traversal, sparse ones the
     /// exact flat scan, and both return only mask-passing row ids.
     #[tokio::test]
@@ -2453,18 +2565,13 @@ mod tests {
                 dist_q_c: 0.0,
                 use_acorn,
             };
-            let filter = Arc::new(MaskPreFilter {
-                mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
-                    allowed,
-                ))),
-            });
             let batch = hnsw
                 .search(
                     query_key.clone(),
                     k,
                     params,
                     store.as_ref(),
-                    filter,
+                    masked_prefilter(allowed),
                     &NoOpMetricsCollector,
                 )
                 .unwrap();
@@ -2577,28 +2684,33 @@ mod tests {
         assert_eq!(search_row_ids((0..60).collect()), vec![0]);
     }
 
-    /// Every dispatch path reports the distances it computed, so an HNSW query
-    /// no longer shows up as zero comparisons in per-query metrics.
+    /// Every dispatch path reports exactly the distances it computed: the
+    /// metric is compared against a [CountingStorage] oracle, so a dropped or
+    /// double-counted call fails even though the reported number itself is
+    /// graph-dependent.
     #[tokio::test]
     async fn test_search_reports_distance_comparisons() {
-        use crate::metrics::LocalMetricsCollector;
-        use crate::prefilter::NoFilter;
-
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
-        let fsl =
-            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
-                .unwrap();
-        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
         let hnsw = HNSW::index_vectors(
-            store.as_ref(),
+            &store,
             HnswBuildParams::default().num_edges(20).ef_construction(50),
         )
         .unwrap();
+        // build through the plain storage, search through the counting one, so
+        // only query-time distances reach the oracle
+        let counting = CountingStorage::new(store);
 
         let k = 10;
         let query_key = fsl.value(0);
-        let comparisons = |prefilter: Arc<dyn PreFilter>, use_acorn: bool| {
+        let reported = |prefilter: Arc<dyn PreFilter>, use_acorn: bool| {
+            counting.take();
             let metrics = LocalMetricsCollector::default();
             hnsw.search(
                 query_key.clone(),
@@ -2610,43 +2722,138 @@ mod tests {
                     dist_q_c: 0.0,
                     use_acorn,
                 },
-                store.as_ref(),
+                &counting,
                 prefilter,
                 &metrics,
             )
             .unwrap();
-            metrics.comparisons.load(Ordering::Relaxed)
-        };
-        let masked = |allowed: Vec<u64>| -> Arc<dyn PreFilter> {
-            Arc::new(MaskPreFilter {
-                mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
-                    allowed,
-                ))),
-            })
+            let reported = metrics.comparisons.load(Ordering::Relaxed);
+            let computed = counting.take();
+            assert_eq!(
+                reported, computed,
+                "reported {reported} distances, computed {computed} (use_acorn={use_acorn})"
+            );
+            reported
         };
 
-        // Graph traversal, unfiltered: returning k results takes at least k
-        // distances, and the point of the graph is to stay well under a scan.
-        let unfiltered = comparisons(Arc::new(NoFilter), false);
+        // Unfiltered graph traversal: exact against the oracle, and the point
+        // of the graph is to stay under a full scan.
+        let unfiltered = reported(Arc::new(NoFilter), false);
         assert!(
             (k..TOTAL).contains(&unfiltered),
             "unfiltered comparisons {unfiltered} outside [{k}, {TOTAL})"
         );
 
-        // Sparse mask takes the exact flat scan, which scores every passing
-        // row exactly once, so the count is known rather than merely non-zero.
-        let sparse: Vec<u64> = (0..TOTAL as u64).step_by(25).collect();
-        assert_eq!(comparisons(masked(sparse.clone()), false), sparse.len());
+        // A mask that passes every row is dispatched as unfiltered, so it must
+        // cost exactly the same.
+        let all: Vec<u64> = (0..TOTAL as u64).collect();
+        assert_eq!(reported(masked_prefilter(all), false), unfiltered);
 
-        // Dense mask, both traversals.
+        // Sparse mask takes the exact flat scan, which scores every passing row
+        // once, so the count is also known up front.
+        let sparse: Vec<u64> = (0..TOTAL as u64).step_by(25).collect();
+        assert_eq!(
+            reported(masked_prefilter(sparse.clone()), false),
+            sparse.len()
+        );
+
+        // Dense mask, both graph traversals.
         let dense: Vec<u64> = (0..TOTAL as u64).step_by(2).collect();
         for use_acorn in [false, true] {
-            let dense_comparisons = comparisons(masked(dense.clone()), use_acorn);
-            assert!(
-                dense_comparisons >= k,
-                "dense comparisons {dense_comparisons} below k={k} (use_acorn={use_acorn})"
-            );
+            reported(masked_prefilter(dense.clone()), use_acorn);
         }
+    }
+
+    /// When ACORN under-delivers, the query re-runs the basic traversal and the
+    /// reported count is the sum of both: the abandoned work was still paid for.
+    #[tokio::test]
+    async fn test_acorn_fallback_reports_both_traversals() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        const STEP: usize = 5;
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        // A low degree fragments the mask-passing subgraph, which is what
+        // starves the ACORN frontier in the first place; `MIN_HNSW_M` is as low
+        // as the builder allows. How many passing nodes end up unreachable is a
+        // property of the graph, and insertion runs in parallel, so build on a
+        // single-threaded pool: with the level RNG already seeded that makes the
+        // graph reproducible and keeps the fallback from being a coin flip.
+        let hnsw = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                HNSW::index_vectors(
+                    &store,
+                    HnswBuildParams::default()
+                        .num_edges(MIN_HNSW_M)
+                        .ef_construction(MIN_HNSW_M),
+                )
+            })
+            .unwrap();
+        let counting = CountingStorage::new(store);
+
+        let passing: Vec<u64> = (0..TOTAL as u64).step_by(STEP).collect();
+        let remained = passing.len();
+        // above the flat-scan threshold, so the query is dispatched to ACORN
+        assert!((TOTAL * 10 / 100..TOTAL).contains(&remained));
+        // `k.min(remained) == remained` demands every passing node, which the
+        // fragmented traversal cannot reach in full, so the fallback fires
+        let k = remained;
+        let params = HnswQueryParams {
+            ef: k,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: true,
+        };
+        let query_key = fsl.value(0);
+
+        let mut generator = VisitedGenerator::new(TOTAL);
+        let mut bitset = generator.generate(TOTAL);
+        for id in &passing {
+            bitset.insert(*id as u32);
+        }
+        counting.take();
+        let (acorn_results, acorn_reported) = hnsw
+            .search_acorn_counted(query_key.clone(), k, &params, &bitset, &counting)
+            .unwrap();
+        assert_eq!(acorn_reported, counting.take());
+        assert!(
+            acorn_results.len() < k.min(remained),
+            "ACORN delivered {} of {} demanded, so the fallback is no longer forced",
+            acorn_results.len(),
+            k.min(remained)
+        );
+        drop(bitset);
+
+        let mut bitset = generator.generate(TOTAL);
+        for id in &passing {
+            bitset.insert(*id as u32);
+        }
+        let (_, basic_reported) = hnsw
+            .search_basic_counted(query_key.clone(), k, &params, Some(bitset), &counting)
+            .unwrap();
+        assert_eq!(basic_reported, counting.take());
+
+        let metrics = LocalMetricsCollector::default();
+        hnsw.search(
+            query_key,
+            k,
+            params,
+            &counting,
+            masked_prefilter(passing),
+            &metrics,
+        )
+        .unwrap();
+        let reported = metrics.comparisons.load(Ordering::Relaxed);
+        assert_eq!(reported, counting.take());
+        assert_eq!(reported, acorn_reported + basic_reported);
     }
 
     /// Every fresh `level_offsets` range must exactly delimit the rows emitted
