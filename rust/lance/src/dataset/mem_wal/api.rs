@@ -44,6 +44,9 @@ use super::write::ShardWriter;
 /// Spec id of the sole sharding spec installed by [`InitializeMemWalBuilder`].
 const SHARDING_SPEC_ID: u32 = 1;
 
+/// Spec id used by manually managed shards, which have no sharding spec.
+const MANUAL_SHARD_SPEC_ID: u32 = 0;
+
 /// Field id, within the sharding spec, of the derived shard-routing value.
 const SHARDING_FIELD_ID: &str = "bucket";
 
@@ -69,6 +72,30 @@ const NUM_BUCKETS_PARAM: &str = "num_buckets";
 /// MemWAL shards a single bucket spec can address, which caps how many shard
 /// manifests the dataset has to manage.
 const MAX_NUM_BUCKETS: u32 = 1024;
+
+/// Resolve the shard identity before a dataset-level writer creates or claims
+/// a manifest.
+fn resolve_writer_shard_spec_id(
+    details: &MemWalIndexDetails,
+    configured_spec_id: u32,
+) -> Result<u32> {
+    match details.sharding_specs.as_slice() {
+        [] if configured_spec_id == MANUAL_SHARD_SPEC_ID => Ok(MANUAL_SHARD_SPEC_ID),
+        [] => Err(Error::invalid_input(format!(
+            "shard_spec_id {configured_spec_id} is invalid for manual sharding; expected {MANUAL_SHARD_SPEC_ID}"
+        ))),
+        [spec] if configured_spec_id == MANUAL_SHARD_SPEC_ID => Ok(spec.spec_id),
+        [spec] if configured_spec_id == spec.spec_id => Ok(configured_spec_id),
+        [spec] => Err(Error::invalid_input(format!(
+            "shard_spec_id {configured_spec_id} does not match the MemWAL index sharding spec id {}",
+            spec.spec_id
+        ))),
+        specs => Err(Error::not_supported(format!(
+            "opening a MemWAL writer requires at most one sharding spec, found {}",
+            specs.len()
+        ))),
+    }
+}
 
 /// How writes are partitioned into MemWAL shards.
 #[derive(Debug)]
@@ -516,6 +543,9 @@ pub trait DatasetMemWalExt {
     ///
     /// Automatically loads index configurations from the MemWalIndex
     /// and creates the appropriate in-memory indexes.
+    /// The default `config.shard_spec_id` is resolved to the index's sole
+    /// automatic sharding spec; an explicit id must match it. A manually
+    /// sharded index accepts only id `0`.
     ///
     /// # Arguments
     ///
@@ -639,6 +669,9 @@ impl DatasetMemWalExt for Dataset {
                     "MemWAL is not initialized on this dataset. Call initialize_mem_wal() first.",
                 )
             })?;
+
+        config.shard_spec_id =
+            resolve_writer_shard_spec_id(&mem_wal_index.details, config.shard_spec_id)?;
 
         // Get maintained_indexes from the MemWalIndex details
         let maintained_indexes = &mem_wal_index.details.maintained_indexes;
@@ -824,6 +857,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
+    use rstest::rstest;
 
     use crate::dataset::WriteParams;
 
@@ -914,6 +948,42 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn sharding_spec(spec_id: u32) -> ShardingSpec {
+        ShardingSpec {
+            spec_id,
+            fields: Vec::new(),
+        }
+    }
+
+    #[rstest]
+    #[case::manual_rejects_automatic(Vec::new(), 1, "manual sharding", false)]
+    #[case::automatic_rejects_other(vec![sharding_spec(1)], 2, "sharding spec id 1", false)]
+    #[case::multiple_specs_are_unsupported(
+        vec![sharding_spec(1), sharding_spec(2)],
+        0,
+        "found 2",
+        true
+    )]
+    fn test_writer_shard_spec_resolution_rejects_invalid_identity(
+        #[case] sharding_specs: Vec<ShardingSpec>,
+        #[case] configured_spec_id: u32,
+        #[case] expected_message: &str,
+        #[case] is_not_supported: bool,
+    ) {
+        let details = MemWalIndexDetails {
+            sharding_specs,
+            ..Default::default()
+        };
+
+        let error = resolve_writer_shard_spec_id(&details, configured_spec_id).unwrap_err();
+        if is_not_supported {
+            assert!(matches!(&error, Error::NotSupported { .. }));
+        } else {
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+        }
+        assert!(error.to_string().contains(expected_message), "{error}");
     }
 
     #[tokio::test]
@@ -1160,5 +1230,31 @@ mod tests {
         base.prewarm_mem_wal(std::slice::from_ref(&empty), None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mem_wal_writer_uses_automatic_sharding_spec() {
+        let uri = "memory://";
+        let schema = id_v_schema();
+        let reader = RecordBatchIterator::new([Ok(id_v_batch(&schema, &[1]))], schema.clone());
+        let mut dataset = Dataset::write(reader, uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+            .await
+            .unwrap();
+        let manifest = writer.manifest().await.unwrap().unwrap();
+
+        assert_eq!(manifest.shard_spec_id, SHARDING_SPEC_ID);
+        writer.close().await.unwrap();
     }
 }
