@@ -40,6 +40,50 @@ pub(crate) const LOG_ELEMS_PER_CHUNK: u8 = 10;
 /// Number of values encoded in each inline bitpacking chunk.
 pub const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
 
+pub(crate) fn out_of_line_payload_bytes(
+    num_values: u64,
+    uncompressed_bit_width: u64,
+    compressed_bit_width: u64,
+) -> Result<u64> {
+    if !matches!(uncompressed_bit_width, 8 | 16 | 32 | 64) {
+        return Err(Error::invalid_input(format!(
+            "Out-of-line bitpacking requires an 8, 16, 32, or 64-bit word, got {uncompressed_bit_width}"
+        )));
+    }
+    if compressed_bit_width == 0 || compressed_bit_width >= uncompressed_bit_width {
+        return Err(Error::invalid_input(format!(
+            "Out-of-line bitpacking width {compressed_bit_width} is invalid for {uncompressed_bit_width}-bit values"
+        )));
+    }
+    let words_per_chunk = ELEMS_PER_CHUNK
+        .checked_mul(compressed_bit_width)
+        .ok_or_else(|| Error::invalid_input("Bitpacking chunk width overflows u64"))?
+        .div_ceil(uncompressed_bit_width);
+    let full_chunks = num_values / ELEMS_PER_CHUNK;
+    let tail_values = num_values % ELEMS_PER_CHUNK;
+    let mut words = full_chunks
+        .checked_mul(words_per_chunk)
+        .ok_or_else(|| Error::invalid_input("Bitpacking word count overflows u64"))?;
+    if tail_values > 0 {
+        let padding_cost = compressed_bit_width
+            .checked_mul(ELEMS_PER_CHUNK - tail_values)
+            .ok_or_else(|| Error::invalid_input("Bitpacking tail padding overflows u64"))?;
+        let tail_savings = (uncompressed_bit_width - compressed_bit_width)
+            .checked_mul(tail_values)
+            .ok_or_else(|| Error::invalid_input("Bitpacking tail savings overflow u64"))?;
+        words = words
+            .checked_add(if padding_cost < tail_savings {
+                words_per_chunk
+            } else {
+                tail_values
+            })
+            .ok_or_else(|| Error::invalid_input("Bitpacking tail word count overflows u64"))?;
+    }
+    words
+        .checked_mul(uncompressed_bit_width / 8)
+        .ok_or_else(|| Error::invalid_input("Bitpacking payload byte length overflows u64"))
+}
+
 #[derive(Debug, Default)]
 pub struct InlineBitpacking {
     uncompressed_bit_width: u64,
@@ -611,9 +655,29 @@ impl BlockDecompressor for OutOfLineBitpacking {
             16 => std::mem::size_of::<u16>(),
             32 => std::mem::size_of::<u32>(),
             64 => std::mem::size_of::<u64>(),
-            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+            bits => {
+                return Err(Error::invalid_input(format!(
+                    "Bitpacking word size must be 8, 16, 32, or 64, got {bits}"
+                )));
+            }
         };
-        debug_assert_eq!(data.len() % word_size, 0);
+        let expected_bytes = out_of_line_payload_bytes(
+            num_values,
+            self.uncompressed_bit_width,
+            self.compressed_bit_width,
+        )?;
+        let expected_bytes = usize::try_from(expected_bytes).map_err(|_| {
+            Error::invalid_input("Out-of-line bitpacking payload length does not fit usize")
+        })?;
+        if data.len() != expected_bytes {
+            return Err(Error::corrupt_file_named(
+                "out-of-line bitpacking",
+                format!(
+                    "payload has {} bytes, expected {expected_bytes} bytes for {num_values} values",
+                    data.len()
+                ),
+            ));
+        }
         let total_words = (data.len() / word_size) as u64;
         let block = FixedWidthDataBlock {
             data,
@@ -622,27 +686,14 @@ impl BlockDecompressor for OutOfLineBitpacking {
             block_info: BlockInfo::new(),
         };
 
+        let num_values = usize::try_from(num_values).map_err(|_| {
+            Error::invalid_input("Out-of-line bitpacking cardinality does not fit usize")
+        })?;
         let unpacked = match self.uncompressed_bit_width {
-            8 => unpack_out_of_line::<u8>(
-                block,
-                num_values as usize,
-                self.compressed_bit_width as usize,
-            ),
-            16 => unpack_out_of_line::<u16>(
-                block,
-                num_values as usize,
-                self.compressed_bit_width as usize,
-            ),
-            32 => unpack_out_of_line::<u32>(
-                block,
-                num_values as usize,
-                self.compressed_bit_width as usize,
-            ),
-            64 => unpack_out_of_line::<u64>(
-                block,
-                num_values as usize,
-                self.compressed_bit_width as usize,
-            ),
+            8 => unpack_out_of_line::<u8>(block, num_values, self.compressed_bit_width as usize),
+            16 => unpack_out_of_line::<u16>(block, num_values, self.compressed_bit_width as usize),
+            32 => unpack_out_of_line::<u32>(block, num_values, self.compressed_bit_width as usize),
+            64 => unpack_out_of_line::<u64>(block, num_values, self.compressed_bit_width as usize),
             _ => unreachable!(),
         };
         Ok(DataBlock::FixedWidth(unpacked))
@@ -660,7 +711,10 @@ mod test {
     use lance_bitpacking::{BitPacking, BitPackingUninit};
     use rstest::rstest;
 
-    use super::{ELEMS_PER_CHUNK, InlineBitpacking, bitpack_out_of_line, unpack_out_of_line};
+    use super::{
+        ELEMS_PER_CHUNK, InlineBitpacking, OutOfLineBitpacking, bitpack_out_of_line,
+        unpack_out_of_line,
+    };
     use crate::{
         buffer::LanceBuffer,
         compression::{BlockDecompressor, MiniBlockDecompressor},
@@ -893,5 +947,14 @@ mod test {
         let decoded = unpack_out_of_line::<u32>(compressed_block, values.len(), bit_width);
         let decoded_values = decoded.data.borrow_to_typed_slice::<u32>();
         assert_eq!(decoded_values.as_ref(), values.as_slice());
+    }
+
+    #[test]
+    fn test_out_of_line_bitpack_rejects_wrong_payload_length() {
+        let decompressor = OutOfLineBitpacking::new(8, 32);
+        let error = decompressor
+            .decompress(Some(LanceBuffer::from(vec![0_u8; 3])), 16)
+            .unwrap_err();
+        assert!(error.to_string().contains("expected 64 bytes"), "{error}");
     }
 }
