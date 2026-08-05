@@ -619,6 +619,58 @@ When applied in a mini-block context each block may have a different number of v
 until we find the point that would exceed 4,096 bytes and then use the most recent power of 2 number of values that
 we have passed.
 
+Lance 2.1 and 2.2 store each variable-width mini-block in the legacy interleaved form. `Variable.offsets` is a
+plain `Flat` encoding, and each chunk has one buffer:
+
+```text
+chunk buffer
+├── chunk-relative offsets
+└── value bytes
+```
+
+The first legacy offset points past the offset table to the first value byte. The chunk is padded to an 8-byte
+boundary.
+
+Starting with Lance 2.3, a writer may instead encode the offsets as an independently decodable generic block when
+that produces fewer complete serialized bytes, including the descriptor, chunk header, buffer entries and padding.
+Every chunk in the page uses the same offset codec. Its offset sequence contains `num_values + 1` unsigned values,
+starts at zero, is non-decreasing, and ends at the length of that chunk's value buffer.
+
+The writer first chooses the same power-of-two chunk boundaries as the legacy layout. For each chunk it subtracts
+the first offset, then collects range, delta, run and bounded-cardinality statistics in one pass. It evaluates the
+permitted codecs over the complete family of chunks, including metadata and aligned payload costs, and selects one
+codec for the page. The writer serializes both the legacy and selected generic candidates and emits the generic
+candidate only when its complete serialized size is strictly smaller. A tie preserves the legacy bytes.
+
+```text
+metadata-only offset codec       payload-bearing offset codec
+└── value buffer                 ├── offset payload buffer
+                                 └── value buffer
+```
+
+A non-`Flat` `Variable.offsets` descriptor identifies this generic form. The bounded grammar permits `Constant`,
+`Range`, `Delta`, out-of-line bitpacking, general compression, RLE and block dictionary compositions defined in
+this section. `Flat` remains the legacy interleaved signal; writers do not emit a separate generic `Flat` container.
+Readers fetch and decode only the selected mini-block, so the additional logical buffer does not change random-read
+granularity. This extension does not change the `SparseLayout` wire format.
+
+The generic fixed-width decoder accepts one composite root at most:
+
+```text
+generic offset root
+├── leaf: Flat, Constant, Range, InlineBitpacking, OutOfLineBitpacking
+├── Delta(leaf)
+├── General(Flat)
+├── Rle(values=leaf, run_lengths=u32 leaf)
+└── Dictionary(indices=u32 leaf, items=offset-width leaf)
+```
+
+`Delta` decodes `num_values - 1` child values. RLE children have the same run cardinality, all run lengths are
+positive, and their checked sum equals `num_values`. Dictionary indices have `num_values` entries and every index
+is less than the declared dictionary item count. General compression must decode exactly the byte length implied by
+the containing cardinality and offset width. Readers reject missing children, incompatible widths, unsupported
+nesting, wrong payload arity, malformed framing and arithmetic overflow.
+
 ### Constant
 
 Constant compression is currently only utilized in a few specialized scenarios such as all-null arrays.
