@@ -3514,7 +3514,14 @@ mod tests {
     #[case::utf8_view(ScalarValue::Utf8View(Some("%foobar%".to_string())))]
     #[case::utf8(ScalarValue::Utf8(Some("%foobar%".to_string())))]
     fn test_text_query_parser_utf8view(#[case] pattern: ScalarValue) {
-        let parser = TextQueryParser::new("color_idx".to_string(), "NGram".to_string(), true, true);
+        let parser = TextQueryParser::new(
+            "color_idx".to_string(),
+            "NGram".to_string(),
+            true,
+            true,
+            // min_contains_chars: the ngram trigram width; unused by `visit_like`.
+            3,
+        );
         let like = Like::new(
             false,
             Box::new(Expr::Column(Column::new_unqualified("color"))),
