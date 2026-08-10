@@ -187,9 +187,9 @@ object_store = { version = "0.14.2" }
 # Keep OpenDAL's default capabilities without auto-register-services. Its
 # process constructor emits a __text_startup trampoline that can exceed the
 # ARM64 branch range in large dynamic libraries.
+# Also omit http-transport-reqwest: it aliases the aws-lc-rs rustls transport; lance-io's tls-* features pick the transport.
 opendal = { version = "0.59.2", default-features = false, features = [
     "executors-tokio",
-    "http-transport-reqwest",
     "layers-concurrent-limit",
     "layers-logging",
     "layers-retry",

@@ -78,7 +78,7 @@ name = "scheduler"
 harness = false
 
 [features]
-default = ["aws", "azure", "gcp"]
+default = ["aws", "azure", "gcp", "tls-aws-lc-rs"]
 metrics = ["dep:metrics"]
 gcs-test = []
 goosefs-test = []
@@ -108,6 +108,9 @@ goosefs = [
 tencent = ["dep:opendal", "opendal/services-cos", "dep:object_store_opendal"]
 huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
 tos = ["dep:opendal", "opendal/services-tos", "dep:object_store_opendal"]
+# Granular opendal transports (not the reqwest-rustls-* aliases, which also pull aws-lc-rs); tls-no-provider needs an app-installed rustls provider.
+tls-aws-lc-rs = ["opendal?/http-transport-reqwest-rustls"]
+tls-no-provider = ["opendal?/http-transport-reqwest-rustls-no-provider"]
 tos-test = ["tos"]
 test-util = []
 
