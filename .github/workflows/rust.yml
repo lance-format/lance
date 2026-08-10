@@ -23,6 +23,7 @@ on:
       - ci/check_dependency_age.py
       - ci/check_advisory_ignores.py
       - ci/arrow_upgrade.py
+      - ci/check_forbidden_deps.sh
 
 permissions:
   contents: read
@@ -141,6 +142,11 @@ jobs:
       - name: Check advisory ignores
         if: ${{ !cancelled() }}
         run: python3 ci/check_advisory_ignores.py
+      # cargo-deny resolves with all features, so it cannot assert a crate is
+      # absent from a specific feature combo. This checks each non-AWS backend.
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - name: Check non-AWS builds stay free of aws-lc-rs/cmake
+        run: ci/check_forbidden_deps.sh
 
   arrow-ordering-detect:
     # Lance inherits its comparison semantics from Arrow, DataFusion and `half`.
