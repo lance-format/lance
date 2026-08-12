@@ -743,7 +743,7 @@ mod tests {
 
         let hnsw = builder.finalize();
         let mut visited = VisitedGenerator::new(N);
-        let bottom_results = hnsw
+        let (bottom_results, _) = hnsw
             .search_inner(
                 fsl.value(0),
                 10,

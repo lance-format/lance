@@ -336,34 +336,9 @@ impl HNSW {
         Ok(())
     }
 
+    /// Returns the top-`k` results and the number of distances computed.
     #[allow(clippy::too_many_arguments)]
     pub fn search_inner(
-        &self,
-        query: ArrayRef,
-        k: usize,
-        params: &HnswQueryParams,
-        bitset: Option<Visited>,
-        visited_generator: &mut VisitedGenerator,
-        storage: &impl VectorStore,
-        prefetch_distance: Option<usize>,
-    ) -> Result<Vec<OrderedNode>> {
-        Ok(self
-            .search_inner_counted(
-                query,
-                k,
-                params,
-                bitset,
-                visited_generator,
-                storage,
-                prefetch_distance,
-            )?
-            .0)
-    }
-
-    /// [Self::search_inner], additionally reporting how many distances the
-    /// traversal computed.
-    #[allow(clippy::too_many_arguments)]
-    fn search_inner_counted(
         &self,
         query: ArrayRef,
         k: usize,
@@ -479,23 +454,9 @@ impl HNSW {
         )
     }
 
+    /// Returns the top-`k` results and the number of distances computed.
     #[instrument(level = "debug", skip(self, query, bitset, storage))]
     pub fn search_basic(
-        &self,
-        query: ArrayRef,
-        k: usize,
-        params: &HnswQueryParams,
-        bitset: Option<Visited>,
-        storage: &impl VectorStore,
-    ) -> Result<Vec<OrderedNode>> {
-        Ok(self
-            .search_basic_counted(query, k, params, bitset, storage)?
-            .0)
-    }
-
-    /// [Self::search_basic], additionally reporting how many distances the
-    /// traversal computed.
-    fn search_basic_counted(
         &self,
         query: ArrayRef,
         k: usize,
@@ -508,7 +469,7 @@ impl HNSW {
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let result = self.search_inner_counted(
+        let result = self.search_inner(
             query,
             k,
             params,
@@ -530,22 +491,9 @@ impl HNSW {
 
     /// Like [Self::search_basic] but the bottom level runs
     /// [beam_search_acorn], which only scores mask-passing nodes.
+    ///
+    /// Also returns the number of distances computed.
     pub fn search_acorn(
-        &self,
-        query: ArrayRef,
-        k: usize,
-        params: &HnswQueryParams,
-        bitset: &Visited,
-        storage: &impl VectorStore,
-    ) -> Result<Vec<OrderedNode>> {
-        Ok(self
-            .search_acorn_counted(query, k, params, bitset, storage)?
-            .0)
-    }
-
-    /// [Self::search_acorn], additionally reporting how many distances the
-    /// traversal computed.
-    fn search_acorn_counted(
         &self,
         query: ArrayRef,
         k: usize,
@@ -1545,7 +1493,7 @@ impl IvfSubIndex for HNSW {
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
         let (results, comparisons) = if prefilter.is_empty() {
-            self.search_basic_counted(query, k, &params, None, storage)?
+            self.search_basic(query, k, &params, None, storage)?
         } else {
             // the bitset must be moved into a callee on every path so its
             // borrow of `prefilter_generator` ends before the push below
@@ -1558,38 +1506,28 @@ impl IvfSubIndex for HNSW {
             if remained == storage.len() {
                 // mask passes every row: same as unfiltered
                 drop(prefilter_bitset);
-                self.search_basic_counted(query, k, &params, None, storage)?
+                self.search_basic(query, k, &params, None, storage)?
             } else if remained < self.len() * 10 / 100 {
                 // few matching rows: brute force is cheaper and exact
                 self.flat_search(storage, query, k, prefilter_bitset, &params)
             } else if params.use_acorn {
-                let (acorn_results, acorn_comparisons) = self.search_acorn_counted(
-                    query.clone(),
-                    k,
-                    &params,
-                    &prefilter_bitset,
-                    storage,
-                )?;
+                let (acorn_results, acorn_comparisons) =
+                    self.search_acorn(query.clone(), k, &params, &prefilter_bitset, storage)?;
                 // under-delivery means the budget ran out on a fragmented
                 // mask, except range-bounded queries which return short
                 // legitimately
                 let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
                 if !bounded && acorn_results.len() < k.min(remained) {
                     // the abandoned ACORN traversal still cost its distances
-                    let (results, basic_comparisons) = self.search_basic_counted(
-                        query,
-                        k,
-                        &params,
-                        Some(prefilter_bitset),
-                        storage,
-                    )?;
+                    let (results, basic_comparisons) =
+                        self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?;
                     (results, acorn_comparisons + basic_comparisons)
                 } else {
                     drop(prefilter_bitset);
                     (acorn_results, acorn_comparisons)
                 }
             } else {
-                self.search_basic_counted(query, k, &params, Some(prefilter_bitset), storage)?
+                self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
             }
         };
         metrics.record_comparisons(comparisons);
@@ -1871,10 +1809,10 @@ mod tests {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let builder_results = builder
+        let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
-        let loaded_results = loaded_hnsw
+        let (loaded_results, _) = loaded_hnsw
             .search_basic(query, k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
@@ -1933,10 +1871,10 @@ mod tests {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let builder_results = builder
+        let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
-        let loaded_results = loaded_hnsw
+        let (loaded_results, _) = loaded_hnsw
             .search_basic(query, k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
@@ -2017,7 +1955,7 @@ mod tests {
                 .ef_construction(MIN_HNSW_M),
         )
         .unwrap();
-        let results = hnsw
+        let (results, _) = hnsw
             .search_basic(
                 vectors.value(0),
                 TOTAL,
@@ -2151,10 +2089,10 @@ mod tests {
         };
         let query = fsl.value(0);
 
-        let builder_results = builder
+        let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
-        let loaded_results = loaded
+        let (loaded_results, _) = loaded
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
@@ -2362,7 +2300,7 @@ mod tests {
             for id in (0..TOTAL as u32).step_by(2) {
                 bitset.insert(id);
             }
-            let results = hnsw
+            let (results, _) = hnsw
                 .search_acorn(query.clone(), k, &params, &bitset, store.as_ref())
                 .unwrap();
             assert_eq!(results.len(), k);
@@ -2390,7 +2328,7 @@ mod tests {
                 brute_force_topk_masked(store.as_ref(), query.clone(), k, passes)
                     .into_iter()
                     .collect();
-            let results = builder
+            let (results, _) = builder
                 .search_acorn(
                     query.clone(),
                     k,
@@ -2591,7 +2529,7 @@ mod tests {
 
         // All-pass mask: shortcuts to the unfiltered path.
         let all: Vec<u64> = (0..TOTAL as u64).collect();
-        let unfiltered = hnsw
+        let (unfiltered, _) = hnsw
             .search_basic(
                 query_key.clone(),
                 k,
@@ -2821,7 +2759,7 @@ mod tests {
         }
         counting.take();
         let (acorn_results, acorn_reported) = hnsw
-            .search_acorn_counted(query_key.clone(), k, &params, &bitset, &counting)
+            .search_acorn(query_key.clone(), k, &params, &bitset, &counting)
             .unwrap();
         assert_eq!(acorn_reported, counting.take());
         assert!(
@@ -2837,7 +2775,7 @@ mod tests {
             bitset.insert(*id as u32);
         }
         let (_, basic_reported) = hnsw
-            .search_basic_counted(query_key.clone(), k, &params, Some(bitset), &counting)
+            .search_basic(query_key.clone(), k, &params, Some(bitset), &counting)
             .unwrap();
         assert_eq!(basic_reported, counting.take());
 
@@ -2991,10 +2929,10 @@ mod tests {
         assert_eq!(query_indices.len(), 3);
         for query_index in query_indices {
             let query = fsl.value(query_index);
-            let builder_results = builder
+            let (builder_results, _) = builder
                 .search_basic(query.clone(), 10, &params, None, store.as_ref())
                 .unwrap();
-            let loaded_results = loaded
+            let (loaded_results, _) = loaded
                 .search_basic(query, 10, &params, None, store.as_ref())
                 .unwrap();
             assert_eq!(builder_results, loaded_results);
@@ -3306,10 +3244,10 @@ mod tests {
             use_acorn: false,
         };
         let query = fsl.value(7);
-        let a = builder
+        let (a, _) = builder
             .search_basic(query.clone(), 10, &params, None, store.as_ref())
             .unwrap();
-        let b = reloaded
+        let (b, _) = reloaded
             .search_basic(query, 10, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(a, b);
