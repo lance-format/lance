@@ -59,6 +59,7 @@ fn bench_hnsw(c: &mut Criterion) {
                     vectors.as_ref(),
                 )
                 .unwrap()
+                .0
                 .iter()
                 .map(|node| node.id)
                 .collect();
@@ -88,6 +89,7 @@ fn bench_hnsw(c: &mut Criterion) {
                     vectors.as_ref(),
                 )
                 .unwrap()
+                .0
                 .iter()
                 .map(|node| node.id)
                 .collect();
@@ -149,6 +151,7 @@ fn bench_hnsw_load(c: &mut Criterion) {
                         vectors.as_ref(),
                     )
                     .unwrap()
+                    .0
                     .iter()
                     .map(|node| node.id)
                     .collect();
@@ -215,6 +218,7 @@ fn bench_hnsw_sq(c: &mut Criterion) {
                         vectors.as_ref(),
                     )
                     .unwrap()
+                    .0
                     .iter()
                     .map(|node| node.id)
                     .collect();
@@ -245,6 +249,7 @@ fn bench_hnsw_sq(c: &mut Criterion) {
                     vectors.as_ref(),
                 )
                 .unwrap()
+                .0
                 .iter()
                 .map(|node| node.id)
                 .collect();
@@ -313,6 +318,7 @@ fn bench_hnsw_pq(c: &mut Criterion) {
                         vectors.as_ref(),
                     )
                     .unwrap()
+                    .0
                     .iter()
                     .map(|node| node.id)
                     .collect();
@@ -343,6 +349,7 @@ fn bench_hnsw_pq(c: &mut Criterion) {
                     vectors.as_ref(),
                 )
                 .unwrap()
+                .0
                 .iter()
                 .map(|node| node.id)
                 .collect();
