@@ -36,6 +36,7 @@ public abstract class FullTextQuery {
     MATCH_PHRASE,
     BOOST,
     MULTI_MATCH,
+    COMBINED_FIELDS,
     BOOLEAN
   }
 
@@ -154,6 +155,15 @@ public abstract class FullTextQuery {
   public static FullTextQuery multiMatch(
       String queryText, List<String> columns, List<Float> boosts, Operator operator) {
     return new MultiMatchQuery(queryText, columns, boosts, operator);
+  }
+
+  public static FullTextQuery combinedFields(String queryText, List<String> columns) {
+    return combinedFields(queryText, columns, null, Operator.OR);
+  }
+
+  public static FullTextQuery combinedFields(
+      String queryText, List<String> columns, List<Float> boosts, Operator operator) {
+    return new CombinedFieldsQuery(queryText, columns, boosts, operator);
   }
 
   public static FullTextQuery boost(FullTextQuery positive, FullTextQuery negative) {
@@ -408,6 +418,93 @@ public abstract class FullTextQuery {
       if (this == o) return true;
       if (!(o instanceof MultiMatchQuery)) return false;
       MultiMatchQuery other = (MultiMatchQuery) o;
+      return operator == other.operator
+          && Objects.equals(queryText, other.queryText)
+          && Objects.equals(columns, other.columns)
+          && Objects.equals(boosts, other.boosts);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(queryText, columns, operator, boosts);
+    }
+
+    @Override
+    public String toString() {
+      return MoreObjects.toStringHelper(this)
+          .add("type", getType())
+          .add("queryText", queryText)
+          .add("columns", columns)
+          .add("boosts", boosts)
+          .add("operator", operator)
+          .toString();
+    }
+  }
+
+  /**
+   * Combined-fields (BM25F) query across multiple columns.
+   *
+   * <p>Unlike {@link MultiMatchQuery}, which scores each column independently and keeps the best
+   * field, this query treats the target columns as a single virtual field so that term statistics
+   * are blended across fields (Lucene {@code CombinedFieldQuery}). A term that is rare in one field
+   * but common in another then scores consistently, and a single query term can match across fields
+   * (for example a first name in one column and a last name in another).
+   *
+   * <p>Target columns must be unique and share the same tokenizer/index configuration. When {@code
+   * boosts} is given, its length must equal the number of columns and each per-column weight must
+   * be finite and {@code >= 1} (fractional weights allowed); when {@code null}, every column
+   * defaults to {@code 1.0}. A {@code null} operator defaults to {@link Operator#OR}. These
+   * constraints are validated in the Rust core and surface as an exception when the query runs.
+   */
+  public static final class CombinedFieldsQuery extends FullTextQuery {
+    private final String queryText;
+    private final List<String> columns;
+    private final Optional<List<Float>> boosts;
+    private final Operator operator;
+
+    CombinedFieldsQuery(
+        String queryText, List<String> columns, List<Float> boosts, Operator operator) {
+      Preconditions.checkArgument(
+          queryText != null && !queryText.isEmpty(), "queryText must not be null or empty");
+      Preconditions.checkArgument(
+          columns != null && !columns.isEmpty(), "columns must not be null or empty");
+
+      this.queryText = queryText;
+      this.columns =
+          Collections.unmodifiableList(new java.util.ArrayList<>(Objects.requireNonNull(columns)));
+      this.boosts =
+          boosts == null
+              ? Optional.empty()
+              : Optional.of(Collections.unmodifiableList(new java.util.ArrayList<>(boosts)));
+      this.operator = operator == null ? Operator.OR : operator;
+    }
+
+    @Override
+    public Type getType() {
+      return Type.COMBINED_FIELDS;
+    }
+
+    public String getQueryText() {
+      return queryText;
+    }
+
+    public List<String> getColumns() {
+      return columns;
+    }
+
+    public Optional<List<Float>> getBoosts() {
+      return boosts;
+    }
+
+    public Operator getOperator() {
+      return operator;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (!(o instanceof CombinedFieldsQuery)) return false;
+      CombinedFieldsQuery other = (CombinedFieldsQuery) o;
       return operator == other.operator
           && Objects.equals(queryText, other.queryText)
           && Objects.equals(columns, other.columns)
