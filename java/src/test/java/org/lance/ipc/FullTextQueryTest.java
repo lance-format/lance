@@ -332,6 +332,101 @@ public class FullTextQueryTest {
   }
 
   @Test
+  void testCombinedFieldsWithoutBoosts() {
+    FullTextQuery.CombinedFieldsQuery q =
+        (FullTextQuery.CombinedFieldsQuery)
+            FullTextQuery.combinedFields("hello", Arrays.asList("title", "body"));
+
+    assertEquals(FullTextQuery.Type.COMBINED_FIELDS, q.getType());
+    assertEquals("hello", q.getQueryText());
+    assertEquals(Arrays.asList("title", "body"), q.getColumns());
+    assertFalse(q.getBoosts().isPresent());
+    assertEquals(FullTextQuery.Operator.OR, q.getOperator());
+  }
+
+  @Test
+  void testCombinedFieldsWithBoosts() {
+    FullTextQuery.CombinedFieldsQuery q =
+        (FullTextQuery.CombinedFieldsQuery)
+            FullTextQuery.combinedFields(
+                "hello",
+                Arrays.asList("title", "body"),
+                Arrays.asList(2.0f, 1.0f),
+                FullTextQuery.Operator.AND);
+
+    assertEquals(FullTextQuery.Type.COMBINED_FIELDS, q.getType());
+    assertTrue(q.getBoosts().isPresent());
+    assertEquals(2, q.getBoosts().get().size());
+    assertEquals(2.0f, q.getBoosts().get().get(0));
+    assertEquals(1.0f, q.getBoosts().get().get(1));
+    assertEquals(FullTextQuery.Operator.AND, q.getOperator());
+    assertNotNull(q.toString());
+  }
+
+  @Test
+  void testCombinedFieldsQueryEquality() {
+    FullTextQuery a = FullTextQuery.combinedFields("hello", Arrays.asList("title", "body"));
+    FullTextQuery b = FullTextQuery.combinedFields("hello", Arrays.asList("title", "body"));
+    assertEquals(a, b, "Two CombinedFieldsQuery instances with the same fields must be equal");
+    assertEquals(a.hashCode(), b.hashCode());
+  }
+
+  @Test
+  void testCombinedFieldsQueryInequalityDifferentOperator() {
+    FullTextQuery a =
+        FullTextQuery.combinedFields(
+            "hello", Arrays.asList("title", "body"), null, FullTextQuery.Operator.AND);
+    FullTextQuery b =
+        FullTextQuery.combinedFields(
+            "hello", Arrays.asList("title", "body"), null, FullTextQuery.Operator.OR);
+    assertFalse(
+        a.equals(b), "CombinedFieldsQuery instances with different operator must not be equal");
+  }
+
+  @Test
+  void testCombinedFieldsQueryInequalityDifferentBoosts() {
+    FullTextQuery a =
+        FullTextQuery.combinedFields(
+            "hello",
+            Arrays.asList("title", "body"),
+            Arrays.asList(2.0f, 1.0f),
+            FullTextQuery.Operator.OR);
+    FullTextQuery b =
+        FullTextQuery.combinedFields(
+            "hello",
+            Arrays.asList("title", "body"),
+            Arrays.asList(1.0f, 1.0f),
+            FullTextQuery.Operator.OR);
+    assertFalse(
+        a.equals(b), "CombinedFieldsQuery instances with different boosts must not be equal");
+  }
+
+  @Test
+  void testCombinedFieldsNotEqualMultiMatch() {
+    FullTextQuery combined = FullTextQuery.combinedFields("hello", Arrays.asList("title", "body"));
+    FullTextQuery multi = FullTextQuery.multiMatch("hello", Arrays.asList("title", "body"));
+    assertFalse(
+        combined.equals(multi),
+        "CombinedFieldsQuery and MultiMatchQuery must not be equal even with same fields");
+  }
+
+  @Test
+  void testCombinedFieldsBoostsDefensivelyCopied() {
+    java.util.List<Float> boosts = new java.util.ArrayList<>(Arrays.asList(2.0f, 1.0f));
+    FullTextQuery.CombinedFieldsQuery q =
+        (FullTextQuery.CombinedFieldsQuery)
+            FullTextQuery.combinedFields(
+                "hello", Arrays.asList("title", "body"), boosts, FullTextQuery.Operator.OR);
+
+    // Mutating the caller-provided list must not change the stored query.
+    boosts.set(0, 9.0f);
+    boosts.clear();
+
+    assertTrue(q.getBoosts().isPresent());
+    assertEquals(Arrays.asList(2.0f, 1.0f), q.getBoosts().get());
+  }
+
+  @Test
   void testDifferentSubtypesNotEqual() {
     FullTextQuery match = FullTextQuery.match("hello", "body");
     FullTextQuery phrase = FullTextQuery.phrase("hello", "body");
