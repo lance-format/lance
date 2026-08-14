@@ -946,6 +946,13 @@ class PyFullTextQuery:
         boosts: Optional[List[float]] = None,
         operator: str = "OR",
     ) -> PyFullTextQuery: ...
+    @staticmethod
+    def combined_fields_query(
+        query: str,
+        columns: List[str],
+        boosts: Optional[List[float]] = None,
+        operator: str = "OR",
+    ) -> PyFullTextQuery: ...
 
 class ScanStatistics:
     """Statistics about a scan operation."""
