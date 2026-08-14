@@ -21,9 +21,9 @@ use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     DocumentGranularity,
     query::{
-        BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
-        MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
-        PhraseQuery as FtsPhraseQuery,
+        BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery,
+        CombinedFieldsQuery as FtsCombinedFieldsQuery, FtsQuery, MatchQuery as FtsMatchQuery,
+        MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur, PhraseQuery as FtsPhraseQuery,
     },
 };
 use lance_io::ffi::to_ffi_arrow_array_stream;
@@ -172,6 +172,33 @@ pub(crate) fn build_full_text_search_query<'a>(
             query = query.with_operator(operator);
 
             Ok(FtsQuery::MultiMatch(query))
+        }
+        "COMBINED_FIELDS" => {
+            let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
+            let columns: Vec<String> =
+                import_vec_from_method(env, &java_obj, "getColumns", |env, elem| {
+                    let jstr = JString::from(elem);
+                    let value: String = env.get_string(&jstr)?.into();
+                    Ok(value)
+                })?;
+
+            let boosts: Option<Vec<f32>> =
+                env.get_optional_from_method(&java_obj, "getBoosts", |env, list_obj| {
+                    import_vec_to_rust(env, &list_obj, |env, elem| {
+                        env.get_f32_from_method(&elem, "floatValue")
+                    })
+                })?;
+            let operator = env.get_fts_operator_from_method(&java_obj)?;
+
+            // Column uniqueness and boost (>= 1) validation live in the Rust core;
+            // `?` surfaces those errors across the JNI boundary.
+            let mut query = FtsCombinedFieldsQuery::try_new(query_text, columns)?;
+            if let Some(boosts) = boosts {
+                query = query.try_with_boosts(boosts)?;
+            }
+            query = query.with_operator(operator);
+
+            Ok(FtsQuery::CombinedFields(query))
         }
         "BOOST" => {
             let positive_obj = env
