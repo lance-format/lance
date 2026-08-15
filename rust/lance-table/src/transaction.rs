@@ -17,6 +17,7 @@
 //! ```text
 //! builder            Transaction: an operation plus the version it was based on
 //! operation          the vocabulary of changes an operation can describe
+//! action             the finer-grained Transaction V2 vocabulary (draft)
 //! update_map         incremental edits to the manifest's string maps
 //! validate           pre-commit checks against the manifest being replaced
 //! manifest_build     applying an operation to produce the next manifest
@@ -26,6 +27,7 @@
 //! proto              the persisted protobuf encoding of all of the above
 //! ```
 
+pub mod action;
 mod builder;
 mod conflicts;
 mod index_maintenance;
