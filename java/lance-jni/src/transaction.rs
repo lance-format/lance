@@ -1217,6 +1217,11 @@ fn convert_to_java_operation_inner<'local>(
                 &[JValue::Object(&new_bases)],
             )?)
         }
+        // Transaction V2 is a pre-vote draft with no Java surface yet; a
+        // composite operation has no Java class to map onto.
+        Operation::CompositeOperation(_) => Err(Error::unsupported_error(
+            "CompositeOperation transactions are not exposed to the Java bindings".to_string(),
+        )),
     }
 }
 
