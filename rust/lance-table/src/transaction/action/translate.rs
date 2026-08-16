@@ -11,11 +11,18 @@
 //! Translation is fail-closed. An operation whose recipe is not written yet, or
 //! one carrying a detail the actions cannot express, is rejected rather than
 //! silently translated into something narrower.
+//!
+//! `Merge` and `Project` are not translated. Both hand over a whole new schema
+//! rather than a description of what changed, so recovering the delta needs the
+//! read version's schema to diff against, and `Project` additionally needs a
+//! field-removal action that this draft does not define.
 
-use super::UserAction;
-use super::{Action, AddBase, AddDataFile, AddFragment, Ref, RemoveFragment, SetDeletionFile};
+use super::{
+    Action, AddBase, AddDataFile, AddFragment, Ref, RemoveFragment, SetDeletionFile,
+    TombstoneFieldData, UserAction,
+};
 use crate::format::Fragment;
-use crate::transaction::Operation;
+use crate::transaction::{DataReplacementGroup, Operation};
 use lance_core::{Error, Result};
 
 impl TryFrom<&Operation> for Vec<UserAction> {
@@ -47,6 +54,10 @@ impl TryFrom<&Operation> for Vec<UserAction> {
                         })
                     })
                     .collect(),
+            )]),
+            Operation::DataReplacement { replacements } => Ok(vec![UserAction::new(
+                format!("replace data files in {} fragments", replacements.len()),
+                data_replacement_actions(replacements)?,
             )]),
             other => Err(Error::not_supported(format!(
                 "translating a {} operation into actions",
@@ -117,6 +128,30 @@ fn delete_actions(updated_fragments: &[Fragment], deleted_fragment_ids: &[u64]) 
     actions
 }
 
+/// Replacing a field's data is a drop of the old backing file followed by an
+/// add of the new one. The legacy path swaps the path on the existing file in
+/// place instead, so the resulting fragment holds the same set of data files
+/// but not necessarily in the same order -- files are addressed by field, so
+/// the order carries no meaning.
+fn data_replacement_actions(replacements: &[DataReplacementGroup]) -> Result<Vec<Action>> {
+    let mut actions = Vec::with_capacity(replacements.len() * 2);
+    for DataReplacementGroup(fragment_id, new_file) in replacements {
+        let fragment = Ref::Committed(*fragment_id);
+        actions.push(Action::TombstoneFieldData(TombstoneFieldData {
+            fragment,
+            field_ids: new_file.fields.to_vec(),
+            data_change: true,
+        }));
+        actions.push(Action::AddDataFile(AddDataFile {
+            fragment,
+            file: new_file.clone(),
+            field_ids: committed_field_refs(new_file.fields.as_ref())?,
+            data_change: true,
+        }));
+    }
+    Ok(actions)
+}
+
 fn committed_field_refs(field_ids: &[i32]) -> Result<Vec<Ref>> {
     field_ids
         .iter()
@@ -156,13 +191,34 @@ mod tests {
             Operation::UserOperation(UserOperation::new("translated", actions)),
         );
 
-        assert_eq!(translated.fragments, legacy.fragments);
+        // Data files are addressed by field, so the two paths are allowed to
+        // hold them in different orders within a fragment.
+        assert_eq!(translated.fragments.len(), legacy.fragments.len());
+        for (translated, legacy) in translated.fragments.iter().zip(legacy.fragments.iter()) {
+            assert_eq!(sorted_files(translated), sorted_files(legacy));
+            assert_eq!(
+                Fragment {
+                    files: Vec::new(),
+                    ..translated.clone()
+                },
+                Fragment {
+                    files: Vec::new(),
+                    ..legacy.clone()
+                }
+            );
+        }
         assert_eq!(translated.schema, legacy.schema);
         assert_eq!(translated.base_paths, legacy.base_paths);
         assert_eq!(translated.next_row_id, legacy.next_row_id);
         assert_eq!(translated.max_fragment_id, legacy.max_fragment_id);
         assert_eq!(translated_indices, legacy_indices);
         translated
+    }
+
+    fn sorted_files(fragment: &Fragment) -> Vec<DataFile> {
+        let mut files = fragment.files.clone();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        files
     }
 
     fn build(manifest: &Manifest, operation: Operation) -> (Manifest, Vec<IndexMetadata>) {
@@ -287,6 +343,63 @@ mod tests {
         );
 
         assert_eq!(next.base_paths.len(), 2);
+    }
+
+    #[test]
+    fn test_data_replacement_matches_the_legacy_path() {
+        let mut fragment = appendable_fragment("data/0.lance");
+        fragment.files.push(DataFile::new(
+            "data/0b.lance",
+            vec![1],
+            vec![0],
+            2,
+            0,
+            None,
+            None,
+        ));
+        let manifest = manifest_with_fragments(vec![fragment]);
+
+        let replacement = DataFile::new("data/0-new.lance", vec![0], vec![0], 2, 0, None, None);
+        let next = assert_parity(
+            &manifest,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(0, replacement)],
+            },
+        );
+
+        let paths = sorted_files(&next.fragments[0])
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["data/0-new.lance", "data/0b.lance"]);
+    }
+
+    #[test]
+    fn test_data_replacement_of_an_unbacked_field_is_rejected() {
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
+        let operation = Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(
+                0,
+                DataFile::new("data/0-new.lance", vec![9], vec![0], 2, 0, None, None),
+            )],
+        };
+        let actions = Vec::<UserAction>::try_from(&operation).unwrap();
+        let error = Transaction::new(
+            manifest.version,
+            Operation::UserOperation(UserOperation::new("translated", actions)),
+            None,
+        )
+        .build_manifest(
+            Some(&manifest),
+            Vec::new(),
+            "tx.txn",
+            &default_build_config(),
+        )
+        .unwrap_err();
+
+        // The legacy path treats this as an all-NULL column gaining real data;
+        // the action form has no way to say "drop this if it is there".
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
     }
 
     #[test]
