@@ -16,6 +16,7 @@ use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
+use lance_table::transaction::action::{Footprint, UserAction, UserOperation};
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
@@ -90,9 +91,9 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::Restore { .. }
             | Operation::UpdateBases { .. }
-            // An action set can modify fragments, but check_action_txn rejects
-            // any concurrency before the rebase state is consulted, so there is
-            // nothing to collect yet.
+            // An action set can modify fragments, but conflicts against it are
+            // settled by comparing footprints, which are derived from the
+            // actions rather than from collected rebase state.
             | Operation::UserOperation(_) => Ok(Self {
                 transaction,
                 affected_rows,
@@ -331,9 +332,19 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        // Conservative until action footprints land: an action-based
-        // transaction on either side means retry against the newer version.
-        Err(self.retryable_conflict_err(other_transaction, other_version))
+        let (Some(ours), Some(theirs)) = (
+            footprint_of(&self.transaction.operation),
+            footprint_of(&other_transaction.operation),
+        ) else {
+            // One side does not decompose into actions yet, so there is nothing
+            // to compare and the conservative answer stands.
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        };
+
+        if ours.conflicts_with(&theirs) {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+        Ok(())
     }
 
     fn check_delete_txn(
@@ -1803,9 +1814,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. }
-            // Rebasing an action set (relocating its minted ids onto the newer
-            // version) is not implemented yet; check_action_txn rejects before
-            // this is reached.
+            // An action set needs no rewriting to move to a newer version: its
+            // minted ids are allocated when the actions are applied, against
+            // whichever manifest they land on, and its committed references
+            // name coordinates that do not move.
             | Operation::UserOperation(_) => Ok(self.transaction),
         }
     }
@@ -2317,6 +2329,21 @@ fn overlay_group_coverage(group: &DataOverlayGroup) -> RoaringBitmap {
     union
 }
 
+/// The set of coordinates an operation writes, or `None` when it does not
+/// decompose into actions yet.
+///
+/// A legacy operation gets a footprint through its action translation, so an
+/// action set can be compared against a concurrent named operation without
+/// either side needing an entry in the operation-pair matrix.
+fn footprint_of(operation: &Operation) -> Option<Footprint> {
+    match operation {
+        Operation::UserOperation(user_operation) => Some(Footprint::from(user_operation)),
+        other => Vec::<UserAction>::try_from(other)
+            .ok()
+            .map(|actions| Footprint::from(&UserOperation::new(other.name(), actions))),
+    }
+}
+
 fn wrong_operation_err(op: &Operation) -> Error {
     Error::internal(format!("function called against a wrong operation: {}", op))
 }
@@ -2335,6 +2362,9 @@ mod tests {
 
     use lance_table::format::IndexMetadata;
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
+    use lance_table::transaction::action::{
+        Action as TxnAction, Ref as ActionRef, RemoveFragment, TombstoneFieldData,
+    };
 
     use super::*;
     use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup};
@@ -4235,6 +4265,97 @@ mod tests {
             .await
             .unwrap();
         assert!(rebase.check_txn(&txn2, 2).is_ok());
+    }
+
+    fn action_txn(actions: Vec<TxnAction>) -> Transaction {
+        Transaction::new_from_version(
+            1,
+            Operation::UserOperation(UserOperation::new(
+                "test",
+                vec![UserAction::new("step", actions)],
+            )),
+        )
+    }
+
+    fn tombstone_txn(fragment: u64, field: i32) -> Transaction {
+        action_txn(vec![TxnAction::TombstoneFieldData(TombstoneFieldData {
+            fragment: ActionRef::Committed(fragment),
+            field_ids: vec![field],
+            data_change: true,
+        })])
+    }
+
+    /// Assert the verdict holds whichever transaction is the one rebasing.
+    async fn assert_conflict(dataset: &Dataset, a: Transaction, b: Transaction, expected: bool) {
+        for (ours, theirs) in [(a.clone(), b.clone()), (b, a)] {
+            let mut rebase = TransactionRebase::try_new(dataset, ours, None)
+                .await
+                .unwrap();
+            assert_eq!(rebase.check_txn(&theirs, 2).is_err(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_action_txns_on_disjoint_coordinates_do_not_conflict() {
+        let dataset = test_dataset(10, 2).await;
+        assert_conflict(&dataset, tombstone_txn(0, 0), tombstone_txn(1, 0), false).await;
+        assert_conflict(&dataset, tombstone_txn(0, 0), tombstone_txn(0, 1), false).await;
+    }
+
+    #[tokio::test]
+    async fn test_action_txns_writing_the_same_field_data_conflict() {
+        let dataset = test_dataset(10, 2).await;
+        assert_conflict(&dataset, tombstone_txn(0, 0), tombstone_txn(0, 0), true).await;
+    }
+
+    #[tokio::test]
+    async fn test_removing_a_fragment_conflicts_with_a_concurrent_delete_on_it() {
+        let dataset = test_dataset(10, 2).await;
+        let removal = action_txn(vec![TxnAction::RemoveFragment(RemoveFragment {
+            fragment: ActionRef::Committed(0),
+            data_change: true,
+        })]);
+        let delete = Transaction::new_from_version(
+            1,
+            Operation::Delete {
+                updated_fragments: vec![dataset.fragments()[0].clone()],
+                deleted_fragment_ids: vec![],
+                predicate: "a > 5".into(),
+            },
+        );
+
+        assert_conflict(&dataset, removal, delete, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_an_action_txn_does_not_conflict_with_a_concurrent_append() {
+        let dataset = test_dataset(10, 2).await;
+        let append = Transaction::new_from_version(
+            1,
+            Operation::Append {
+                fragments: vec![{
+                    let mut fragment = Fragment::new(0);
+                    fragment.physical_rows = Some(5);
+                    fragment
+                }],
+            },
+        );
+
+        // An append only mints; it names nothing the action set could touch.
+        assert_conflict(&dataset, tombstone_txn(0, 0), append, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_an_untranslatable_operation_stays_conservative() {
+        let dataset = test_dataset(10, 2).await;
+        let project = Transaction::new_from_version(
+            1,
+            Operation::Project {
+                schema: dataset.schema().clone(),
+            },
+        );
+
+        assert_conflict(&dataset, tombstone_txn(0, 0), project, true).await;
     }
 
     #[tokio::test]
