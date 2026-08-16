@@ -16,6 +16,7 @@
 //!
 //! ```text
 //! action             the vocabulary (this module)
+//! action::apply      applying an action set to produce the next manifest
 //! action::proto      its persisted protobuf encoding
 //! ```
 //!
@@ -25,6 +26,7 @@
 //! contract, and a transaction carrying a [`UserOperation`] is rejected outright
 //! by libraries that predate it.
 
+mod apply;
 mod proto;
 
 use crate::format::{BasePath, DataFile, DeletionFile, RowIdMeta};

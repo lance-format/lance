@@ -725,6 +725,16 @@ impl Transaction {
             config.migration_next_row_id,
         )?;
         let (original_indices, prepared_indices, frag_reuse) = prepared.into_parts();
+        if let Operation::UserOperation(user_operation) = &self.operation {
+            return self.build_manifest_from_actions(
+                user_operation,
+                current_manifest,
+                original_indices,
+                transaction_file_path,
+                config,
+            );
+        }
+
         if config.use_stable_row_ids
             && config.migration_next_row_id.is_none()
             && current_manifest
@@ -1832,8 +1842,9 @@ impl Transaction {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
             Operation::UserOperation(_) => {
-                return Err(Error::not_supported(
-                    "applying an action-based transaction is not implemented yet",
+                // Handled by build_manifest_from_actions before this match.
+                return Err(Error::internal(
+                    "an action-based operation reached the legacy manifest build".to_string(),
                 ));
             }
         };
@@ -2187,7 +2198,7 @@ impl Transaction {
     /// ordered by id, with no data file left holding only tombstoned fields,
     /// with each fragment's overlays in oldest-to-newest order, and with every
     /// spilled row lineage sequence still in its carrier file.
-    pub(super) fn normalize_fragments(fragments: &mut Vec<Fragment>) -> Result<()> {
+    pub(super) fn normalize_fragments(fragments: &mut [Fragment]) -> Result<()> {
         // If a fragment was reserved then it may not belong at the end of the list.
         fragments.sort_by_key(|frag| frag.id);
 
