@@ -13,6 +13,7 @@ use crate::format::pb;
 use crate::format::pb_actions;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
+use crate::transaction::action::UserOperation;
 use crate::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
@@ -411,18 +412,14 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
-            Some(pb::transaction::Operation::CompositeOperation(_)) => {
+            Some(pb::transaction::Operation::CompositeOperation(user_operation)) => {
                 // Action-based transactions (Transaction V2) are an experimental
-                // wire format (discussion #5960). This version of Lance recognizes
-                // the message but has no support for it: reject on load, fail-closed. Because
-                // load_and_sort_new_transactions collects transactions with
-                // try_collect, a concurrent V2 commit in the conflict window
-                // aborts the whole commit rather than being silently skipped.
-                // Do NOT make this parsing lenient.
-                return Err(Error::not_supported(
-                    "action-based transactions (Transaction V2) are not supported \
-                     by this version of Lance; please upgrade",
-                ));
+                // wire format (OSS-1530). Parsing is fail-closed: an action this build
+                // does not implement is an error, never a skipped element.
+                // load_and_sort_new_transactions collects concurrent transactions
+                // with try_collect, so such a transaction aborts the commit rather
+                // than being silently treated as a no-op. Do NOT make this lenient.
+                Operation::UserOperation(UserOperation::try_from(user_operation)?)
             }
             // prost drops unrecognized oneof fields, so an operation from a
             // newer writer is indistinguishable from a missing one.
@@ -742,6 +739,18 @@ impl TryFrom<&Transaction> for pb::Transaction {
                     value.uuid
                 )));
             }
+            Operation::UserOperation(user_operation) => {
+                let mut message = pb_transaction::CompositeOperation::from(user_operation);
+                // The operation's identity and read version are the enclosing
+                // transaction's; the wire carries them in both places so a
+                // squashed operation keeps its own provenance.
+                message.uuid = Uuid::parse_str(&value.uuid)
+                    .ok()
+                    .as_ref()
+                    .map(pb::Uuid::from);
+                message.read_version = value.read_version;
+                pb::transaction::Operation::CompositeOperation(message)
+            }
         };
 
         let transaction_properties = value
@@ -850,6 +859,7 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use crate::transaction::action::{Action, AddFragment, UserAction};
 
     #[test]
     fn test_rewrite_frag_reuse_update_stays_in_memory() {
@@ -950,28 +960,65 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_operation_rejected_on_load() {
-        // Action-based transactions (Transaction V2) are an experimental wire
-        // format that this version of Lance does not support. Loading one must fail closed
-        // (never be silently skipped or leniently parsed), so that a concurrent
-        // V2 commit in the conflict window aborts an in-flight commit.
+    fn test_user_operation_round_trips_through_transaction() {
+        let uuid = Uuid::new_v4().to_string();
+        let transaction = Transaction {
+            read_version: 4,
+            uuid: uuid.clone(),
+            operation: Operation::UserOperation(UserOperation::new(
+                "INSERT INTO t VALUES (1)",
+                vec![UserAction::new(
+                    "append batch",
+                    vec![Action::AddFragment(AddFragment {
+                        local: 0,
+                        physical_rows: 1,
+                        row_id_meta: None,
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
+                        data_change: true,
+                    })],
+                )],
+            )),
+            tag: None,
+            transaction_properties: None,
+        };
+
+        let message = pb::Transaction::from(&transaction);
+        // The operation repeats the envelope's identity so a squashed operation
+        // keeps the provenance of the commit it came from.
+        match &message.operation {
+            Some(pb::transaction::Operation::CompositeOperation(composite_operation)) => {
+                assert_eq!(
+                    Uuid::try_from(composite_operation.uuid.as_ref().unwrap())
+                        .unwrap()
+                        .to_string(),
+                    uuid
+                );
+                assert_eq!(composite_operation.read_version, 4);
+            }
+            other => panic!("expected UserOperation, got {other:?}"),
+        }
+
+        assert_eq!(Transaction::try_from(message).unwrap(), transaction);
+    }
+
+    #[test]
+    fn test_unimplemented_action_fails_closed_on_load() {
+        // The vocabulary is larger than what is implemented. Loading a
+        // transaction that uses an unimplemented action must fail rather than
+        // parse leniently: load_and_sort_new_transactions collects concurrent
+        // transactions with try_collect, so this aborts an in-flight commit
+        // instead of letting it proceed against a change it cannot see.
         let message = pb::Transaction {
             read_version: 1,
             uuid: Uuid::new_v4().to_string(),
             operation: Some(pb::transaction::Operation::CompositeOperation(
-                pb_actions::CompositeOperation {
-                    steps: vec![pb_actions::UserStep {
-                        description: "append batch".to_string(),
-                        actions: vec![pb_actions::Action {
-                            action: Some(pb_actions::action::Action::AddFragment(
-                                pb_actions::AddFragment {
-                                    id: Some(pb_actions::Ref {
-                                        kind: Some(pb_actions::r#ref::Kind::Local(0)),
-                                    }),
-                                    physical_rows: 1,
-                                    data_change: Some(true),
-                                    ..Default::default()
-                                },
+                pb_transaction::CompositeOperation {
+                    actions: vec![pb_transaction::UserStep {
+                        description: "reset".to_string(),
+                        actions: vec![pb_transaction::Action {
+                            action: Some(pb_transaction::action::Action::ResetTable(
+                                pb_transaction::ResetTable {},
                             )),
                         }],
                     }],
