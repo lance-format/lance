@@ -27,8 +27,11 @@
 //! by libraries that predate it.
 
 mod apply;
+mod footprint;
 mod proto;
 mod translate;
+
+pub use footprint::{Coordinate, Footprint};
 
 use crate::format::{BasePath, DataFile, DeletionFile, RowIdMeta};
 use crate::rowids::version::RowDatasetVersionMeta;
