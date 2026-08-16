@@ -982,6 +982,53 @@ mod tests {
     }
 
     #[test]
+    fn test_an_action_set_relocates_onto_a_newer_version() {
+        let actions = vec![
+            Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: added_field("added"),
+            }),
+            Action::AddFragment(AddFragment {
+                local: 0,
+                physical_rows: 10,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: DataFile::new_unstarted("data/new.lance", 2, 0),
+                field_ids: vec![Ref::Local(0)],
+                data_change: true,
+            }),
+        ];
+
+        // Replaying the very same actions against the manifest the first run
+        // produced re-resolves both local tokens against the newer counters.
+        let first = apply(&backed_manifest(), actions.clone()).unwrap();
+        let second = apply(&first, actions).unwrap();
+
+        assert_eq!(
+            second.fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            second
+                .schema
+                .fields_pre_order()
+                .map(|field| field.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // The second run's data file points at the field the second run minted,
+        // not at the one the first run did.
+        let relocated = second.fragments.iter().find(|f| f.id == 2).unwrap();
+        assert_eq!(relocated.files[0].fields.as_ref(), &[2]);
+    }
+
+    #[test]
     fn test_action_set_cannot_create_a_dataset() {
         let transaction = Transaction::new(
             0,
