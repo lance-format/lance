@@ -1294,27 +1294,12 @@ impl Transaction {
             }
         };
 
-        // If a fragment was reserved then it may not belong at the end of the fragments list.
-        final_fragments.sort_by_key(|frag| frag.id);
+        Self::normalize_fragments(&mut final_fragments)?;
 
-        // Clean up data files that only contain tombstoned fields
-        Self::remove_tombstoned_data_files(&mut final_fragments);
-
-        // Enforce the newest-last overlay ordering invariant at the write
-        // boundary. Load normalizes with a sort; this rejects any commit path
-        // that assembled a fragment's overlays out of order.
-        for fragment in &final_fragments {
-            if !fragment.overlays.is_empty() {
-                crate::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
-            }
-        }
-
-        let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
-            (Some(storage_format), _) => Some(storage_format.lance_file_format()),
-            (None, Some(true)) => Some(ConcreteFileVersion::V1),
-            (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
-            (None, None) => None,
-        };
+        // If this is an overwrite operation and the user has requested a specific
+        // version then overwrite with that version. Otherwise, if the user didn't
+        // request a specific version, then keep whatever version we had before.
+        let overwrite_storage_format = matches!(self.operation, Operation::Overwrite { .. });
 
         // Applied once the final index list is known, so it sees exactly the
         // indices this commit publishes rather than what any one operation arm
@@ -1330,55 +1315,14 @@ impl Transaction {
             )?;
         }
 
-        let mut manifest = if let Some(current_manifest) = current_manifest {
-            // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
-            // So we always use new_from_previous which preserves base_paths
-            let mut prev_manifest =
-                Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
-
-            if let (Some(user_requested_version), Operation::Overwrite { .. }) =
-                (user_requested_version, &self.operation)
-            {
-                // If this is an overwrite operation and the user has requested a specific version
-                // then overwrite with that version.  Otherwise, if the user didn't request a specific
-                // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
-            }
-
-            prev_manifest
-        } else {
-            let data_storage_format =
-                Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
-            Manifest::new(
-                schema,
-                Arc::new(final_fragments),
-                data_storage_format,
-                reference_paths,
-            )
-        };
-
-        manifest.tag.clone_from(&self.tag);
-
-        if config.auto_set_feature_flags {
-            // Internal operations (e.g. CreateIndex) build with the default config,
-            // which has use_stable_row_ids = false. Without inheriting from the previous
-            // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
-            let inherited = current_manifest
-                .map(|m| m.uses_stable_row_ids())
-                .unwrap_or(false);
-            let use_stable_row_ids = config.use_stable_row_ids || inherited;
-            apply_feature_flags(
-                &mut manifest,
-                use_stable_row_ids,
-                config.disable_transaction_file,
-            )?;
-        }
-        // Carried from the manifest this one is derived from. `new_from_previous`
-        // zeroes both feature words, so `apply_feature_flags` cannot see the
-        // previous state and every ordinary commit would otherwise drop the bit.
-        if let Some(current_manifest) = current_manifest {
-            inherit_mem_wal_index_catchup(&mut manifest, current_manifest)?;
-        }
+        let mut manifest = self.assemble_manifest(
+            current_manifest,
+            schema,
+            final_fragments,
+            reference_paths,
+            overwrite_storage_format,
+            config,
+        )?;
 
         // Set after apply_feature_flags, which resets both flag words: activation
         // is the one place the bit is turned on, and it must survive that reset.
@@ -1418,9 +1362,6 @@ impl Transaction {
             manifest.writer_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
         }
 
-        manifest.set_timestamp(config.timestamp_nanos);
-
-        manifest.update_max_fragment_id();
 
         match &self.operation {
             Operation::Overwrite {
@@ -1602,6 +1543,106 @@ impl Transaction {
         }
 
         Ok((manifest, final_indices))
+    }
+
+    /// Put an assembled fragment list into the shape the manifest requires:
+    /// ordered by id, with no data file left holding only tombstoned fields, and
+    /// with each fragment's overlays in oldest-to-newest order.
+    pub(super) fn normalize_fragments(fragments: &mut Vec<Fragment>) -> Result<()> {
+        // If a fragment was reserved then it may not belong at the end of the list.
+        fragments.sort_by_key(|frag| frag.id);
+
+        Self::remove_tombstoned_data_files(fragments);
+
+        // Enforce the newest-last overlay ordering invariant at the write
+        // boundary. Load normalizes with a sort; this rejects any commit path
+        // that assembled a fragment's overlays out of order.
+        for fragment in fragments.iter() {
+            if !fragment.overlays.is_empty() {
+                crate::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn user_requested_version(config: &ManifestBuildConfig) -> Option<ConcreteFileVersion> {
+        match (&config.storage_format, config.use_legacy_format) {
+            (Some(storage_format), _) => Some(storage_format.lance_file_format()),
+            (None, Some(true)) => Some(ConcreteFileVersion::V1),
+            (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
+            (None, None) => None,
+        }
+    }
+
+    /// Build the manifest itself from an already-decided schema and fragment
+    /// list, and apply the settings that every operation shares: the tag,
+    /// feature flags, timestamp, and fragment id watermark.
+    ///
+    /// `overwrite_storage_format` replaces the inherited storage format with the
+    /// user-requested one, for operations that rewrite the whole dataset.
+    pub(super) fn assemble_manifest(
+        &self,
+        current_manifest: Option<&Manifest>,
+        schema: lance_core::datatypes::Schema,
+        fragments: Vec<Fragment>,
+        reference_paths: HashMap<u32, crate::format::BasePath>,
+        overwrite_storage_format: bool,
+        config: &ManifestBuildConfig,
+    ) -> Result<Manifest> {
+        let user_requested_version = Self::user_requested_version(config);
+
+        let mut manifest = if let Some(current_manifest) = current_manifest {
+            // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
+            // So we always use new_from_previous which preserves base_paths
+            let mut prev_manifest =
+                Manifest::new_from_previous(current_manifest, schema, Arc::new(fragments));
+
+            if let (true, Some(user_requested_version)) =
+                (overwrite_storage_format, user_requested_version)
+            {
+                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
+            }
+
+            prev_manifest
+        } else {
+            let data_storage_format =
+                Self::data_storage_format_from_files(&fragments, user_requested_version)?;
+            Manifest::new(
+                schema,
+                Arc::new(fragments),
+                data_storage_format,
+                reference_paths,
+            )
+        };
+
+        manifest.tag.clone_from(&self.tag);
+
+        if config.auto_set_feature_flags {
+            // Internal operations (e.g. CreateIndex) build with the default config,
+            // which has use_stable_row_ids = false. Without inheriting from the previous
+            // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
+            let inherited = current_manifest
+                .map(|m| m.uses_stable_row_ids())
+                .unwrap_or(false);
+            let use_stable_row_ids = config.use_stable_row_ids || inherited;
+            apply_feature_flags(
+                &mut manifest,
+                use_stable_row_ids,
+                config.disable_transaction_file,
+            )?;
+        }
+        // Carried from the manifest this one is derived from. `new_from_previous`
+        // zeroes both feature words, so `apply_feature_flags` cannot see the
+        // previous state and every ordinary commit would otherwise drop the bit.
+        if let Some(current_manifest) = current_manifest {
+            inherit_mem_wal_index_catchup(&mut manifest, current_manifest)?;
+        }
+
+        manifest.set_timestamp(config.timestamp_nanos);
+
+        manifest.update_max_fragment_id();
+
+        Ok(manifest)
     }
 
     /// Remove data files that only contain tombstoned fields (-2)
