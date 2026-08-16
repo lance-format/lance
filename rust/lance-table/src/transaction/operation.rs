@@ -14,6 +14,7 @@ use crate::format::overlay::DataOverlayFile;
 use crate::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::UpdateMap;
+use crate::transaction::action::UserOperation;
 use lance_core::datatypes::Schema;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
@@ -220,6 +221,14 @@ pub enum Operation {
         /// The new base paths to add to the manifest.
         new_bases: Vec<BasePath>,
     },
+
+    /// A Transaction V2 operation: an ordered list of granular actions that
+    /// commit atomically as one manifest change.
+    ///
+    /// Unlike the variants above, this one is not a single named change -- it is
+    /// the composable form the others decompose into. See
+    /// [`super::action`] for the vocabulary and its stability caveats.
+    UserOperation(UserOperation),
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -270,6 +279,7 @@ impl std::fmt::Display for Operation {
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
+            Self::UserOperation(_) => write!(f, "UserOperation"),
         }
     }
 }
@@ -329,6 +339,7 @@ impl Operation {
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",
+            Self::UserOperation(_) => "UserOperation",
         }
     }
 }

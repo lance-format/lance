@@ -16,6 +16,7 @@
 //!
 //! ```text
 //! action             the vocabulary (this module)
+//! action::proto      its persisted protobuf encoding
 //! ```
 //!
 //! # Stability
@@ -23,6 +24,8 @@
 //! Transaction V2 is a pre-vote draft. Nothing in this module is a compatibility
 //! contract, and a transaction carrying a [`UserOperation`] is rejected outright
 //! by libraries that predate it.
+
+mod proto;
 
 use crate::format::{BasePath, DataFile, DeletionFile, RowIdMeta};
 use crate::rowids::version::RowDatasetVersionMeta;

@@ -1287,6 +1287,11 @@ impl Transaction {
                 // Base paths are handled in the manifest creation section below
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
+            Operation::UserOperation(_) => {
+                return Err(Error::not_supported(
+                    "applying an action-based transaction is not implemented yet",
+                ));
+            }
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.

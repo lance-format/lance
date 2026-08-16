@@ -863,6 +863,13 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
+            // A V2 operation is an ordered list, so unlike the operations above
+            // it compares element-wise with no order-insensitivity to work
+            // around. It is never equal to a legacy operation: equality here
+            // answers "is the operation I am holding the one already
+            // committed?", and a translated operation is a different commit.
+            (Self::UserOperation(a), Self::UserOperation(b)) => a == b,
+            (Self::UserOperation(_), _) | (_, Self::UserOperation(_)) => false,
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
         }
     }
