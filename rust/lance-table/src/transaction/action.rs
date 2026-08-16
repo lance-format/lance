@@ -28,6 +28,7 @@
 
 mod apply;
 mod proto;
+mod translate;
 
 use crate::format::{BasePath, DataFile, DeletionFile, RowIdMeta};
 use crate::rowids::version::RowDatasetVersionMeta;
