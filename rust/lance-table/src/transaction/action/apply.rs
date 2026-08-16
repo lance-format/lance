@@ -10,13 +10,20 @@
 //! Replaying the same action set against a different version therefore produces
 //! different ids without any of the actions changing.
 
-use super::{Action, AddBase, AddDataFile, AddField, AddFragment, Ref, UserOperation};
+use super::{
+    Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, Ref, RemoveFragment,
+    SetDeletionFile, TombstoneFieldData, UserOperation,
+};
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig};
 use crate::rowids::version::build_version_meta;
 use crate::transaction::Transaction;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
 use std::collections::{HashMap, HashSet};
+
+/// The field id written into a data file's field list once the file no longer
+/// backs that field. A file whose every slot is tombstoned is dropped.
+const TOMBSTONED_FIELD: i32 = -2;
 
 impl Transaction {
     /// Build the next manifest by applying an action set.
@@ -59,10 +66,12 @@ impl Transaction {
             schema,
             mut fragments,
             new_bases,
+            rebound_fields,
             ..
         } = state;
 
         let mut indices = current_indices;
+        prune_rebound_fields_from_indices(&mut indices, &rebound_fields);
         Self::retain_relevant_indices(&mut indices, &schema, &fragments);
 
         Self::normalize_fragments(&mut fragments)?;
@@ -109,6 +118,10 @@ struct ApplyState {
 
     /// Ids of the fragments this operation minted.
     minted_fragments: HashSet<u64>,
+
+    /// Fields whose backing data changed, per fragment. An index covering such
+    /// a field no longer describes that fragment's contents.
+    rebound_fields: HashMap<u64, HashSet<i32>>,
 }
 
 impl ApplyState {
@@ -130,6 +143,7 @@ impl ApplyState {
             field_tokens: HashMap::new(),
             base_tokens: HashMap::new(),
             minted_fragments: HashSet::new(),
+            rebound_fields: HashMap::new(),
         }
     }
 
@@ -139,9 +153,10 @@ impl ApplyState {
             Action::AddDataFile(action) => self.add_data_file(action),
             Action::AddField(action) => self.add_field(action),
             Action::AddBase(action) => self.add_base(action),
-            other => Err(Error::not_supported(format!(
-                "applying the {other} action is not implemented yet"
-            ))),
+            Action::TombstoneFieldData(action) => self.tombstone_field_data(action),
+            Action::RemoveFragment(action) => self.remove_fragment(action),
+            Action::SetDeletionFile(action) => self.set_deletion_file(action),
+            Action::AlterField(action) => self.alter_field(action),
         }
     }
 
@@ -263,6 +278,93 @@ impl ApplyState {
         Ok(())
     }
 
+    fn tombstone_field_data(&mut self, action: &TombstoneFieldData) -> Result<()> {
+        let fragment_id = self.resolve_fragment(action.fragment)?;
+        let fragment = fragment_mut(&mut self.fragments, fragment_id, "TombstoneFieldData")?;
+
+        for &field_id in &action.field_ids {
+            let mut found = false;
+            for file in fragment.files.iter_mut() {
+                let Some(position) = file.fields.iter().position(|id| *id == field_id) else {
+                    continue;
+                };
+                let mut fields = file.fields.to_vec();
+                fields[position] = TOMBSTONED_FIELD;
+                file.fields = fields.into();
+                found = true;
+            }
+            if !found {
+                return Err(Error::invalid_input(format!(
+                    "TombstoneFieldData names field {field_id}, which no data file in fragment \
+                     {fragment_id} backs"
+                )));
+            }
+        }
+
+        // New values for these fields supersede any overlay still shadowing
+        // them, so the drop is not silently masked by stale overlay cells.
+        let overlaid: Vec<u32> = action
+            .field_ids
+            .iter()
+            .filter_map(|id| u32::try_from(*id).ok())
+            .collect();
+        crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
+
+        self.rebound_fields
+            .entry(fragment_id)
+            .or_default()
+            .extend(action.field_ids.iter().copied());
+        Ok(())
+    }
+
+    fn remove_fragment(&mut self, action: &RemoveFragment) -> Result<()> {
+        let fragment_id = self.resolve_fragment(action.fragment)?;
+        let before = self.fragments.len();
+        self.fragments.retain(|fragment| fragment.id != fragment_id);
+        if self.fragments.len() == before {
+            return Err(Error::invalid_input(format!(
+                "RemoveFragment targets fragment {fragment_id}, which does not exist"
+            )));
+        }
+        self.minted_fragments.remove(&fragment_id);
+        self.rebound_fields.remove(&fragment_id);
+        Ok(())
+    }
+
+    fn set_deletion_file(&mut self, action: &SetDeletionFile) -> Result<()> {
+        let fragment = fragment_mut(&mut self.fragments, action.fragment, "SetDeletionFile")?;
+        fragment.deletion_file = action.deletion_file.clone();
+        Ok(())
+    }
+
+    fn alter_field(&mut self, action: &AlterField) -> Result<()> {
+        let field = self.schema.field_by_id_mut(action.field).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "AlterField names field {}, which does not exist",
+                action.field
+            ))
+        })?;
+        if let Some(name) = &action.name {
+            field.name.clone_from(name);
+        }
+        if let Some(nullable) = action.nullable {
+            field.nullable = nullable;
+        }
+        if let Some(logical_type) = &action.logical_type {
+            field.logical_type = logical_type.as_str().into();
+            // The cast leaves any index on the field describing the old type.
+            // The data rewrite itself is separate actions; this only records
+            // that every fragment's view of the field changed.
+            for fragment in &self.fragments {
+                self.rebound_fields
+                    .entry(fragment.id)
+                    .or_default()
+                    .insert(action.field);
+            }
+        }
+        Ok(())
+    }
+
     /// Stamp row ids and version metadata onto the fragments this operation
     /// minted, matching what an Append does for its new fragments.
     fn assign_row_ids_to_minted_fragments(
@@ -325,6 +427,48 @@ impl ApplyState {
     }
 }
 
+fn fragment_mut<'a>(
+    fragments: &'a mut [Fragment],
+    fragment_id: u64,
+    action: &str,
+) -> Result<&'a mut Fragment> {
+    fragments
+        .iter_mut()
+        .find(|fragment| fragment.id == fragment_id)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "{action} targets fragment {fragment_id}, which does not exist"
+            ))
+        })
+}
+
+/// Drop the fragments whose data no longer matches what an index recorded.
+///
+/// An index built over a field describes the values that were in that field
+/// when it was built. Rebinding the field's data in a fragment invalidates the
+/// index for that fragment only, so the fragment leaves the bitmap rather than
+/// the whole index being discarded.
+fn prune_rebound_fields_from_indices(
+    indices: &mut [IndexMetadata],
+    rebound: &HashMap<u64, HashSet<i32>>,
+) {
+    if rebound.is_empty() {
+        return;
+    }
+    for index in indices.iter_mut() {
+        let Some(bitmap) = index.fragment_bitmap.as_mut() else {
+            continue;
+        };
+        for (fragment_id, fields) in rebound {
+            if index.fields.iter().any(|field| fields.contains(field))
+                && let Ok(fragment_id) = u32::try_from(*fragment_id)
+            {
+                bitmap.remove(fragment_id);
+            }
+        }
+    }
+}
+
 fn unbound_token_err(space: &str, token: u32) -> Error {
     Error::invalid_input(format!(
         "an action references local {space} token {token}, which no earlier action in this \
@@ -342,19 +486,23 @@ fn duplicate_token_err(space: &str, token: u32) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::DataFile;
+    use crate::format::{DataFile, DeletionFile, DeletionFileType};
     use crate::transaction::Operation;
     use crate::transaction::action::UserAction;
-    use crate::transaction::test_support::{default_build_config, sample_manifest};
+    use crate::transaction::test_support::{
+        default_build_config, sample_index_metadata, sample_manifest,
+    };
     use arrow_schema::{DataType, Field as ArrowField};
+    use std::sync::Arc;
 
     fn apply(manifest: &Manifest, actions: Vec<Action>) -> Result<Manifest> {
-        apply_with_indices(manifest, actions).map(|(manifest, _)| manifest)
+        apply_with_indices(manifest, actions, Vec::new()).map(|(manifest, _)| manifest)
     }
 
     fn apply_with_indices(
         manifest: &Manifest,
         actions: Vec<Action>,
+        indices: Vec<IndexMetadata>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let transaction = Transaction::new(
             manifest.version,
@@ -364,16 +512,275 @@ mod tests {
             )),
             None,
         );
-        transaction.build_manifest(
-            Some(manifest),
-            Vec::new(),
-            "tx.txn",
-            &default_build_config(),
-        )
+        transaction.build_manifest(Some(manifest), indices, "tx.txn", &default_build_config())
     }
 
     fn added_field(name: &str) -> Field {
         Field::try_from(ArrowField::new(name, DataType::Int32, true)).unwrap()
+    }
+
+    /// `sample_manifest` with fragment 0 actually backed by a data file, so the
+    /// reference-stable actions have something committed to point at.
+    fn backed_manifest() -> Manifest {
+        let mut manifest = sample_manifest();
+        let mut fragment = Fragment::new(0);
+        fragment.physical_rows = Some(10);
+        fragment.files.push(DataFile::new(
+            "data/0.lance",
+            vec![0],
+            vec![0],
+            2,
+            0,
+            None,
+            None,
+        ));
+        manifest.fragments = Arc::new(vec![fragment]);
+        manifest
+    }
+
+    #[test]
+    fn test_tombstone_field_data_drops_the_backing_file() {
+        let manifest = backed_manifest();
+        let next = apply(
+            &manifest,
+            vec![Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![0],
+                data_change: true,
+            })],
+        )
+        .unwrap();
+
+        // The file backed only field 0, so tombstoning it leaves nothing behind.
+        assert!(next.fragments[0].files.is_empty());
+    }
+
+    #[test]
+    fn test_tombstone_field_data_keeps_a_file_with_a_live_field() {
+        let mut manifest = backed_manifest();
+        let mut fragment = manifest.fragments[0].clone();
+        fragment.files[0] = DataFile::new("data/0.lance", vec![0, 1], vec![0, 1], 2, 0, None, None);
+        manifest.fragments = Arc::new(vec![fragment]);
+
+        let next = apply(
+            &manifest,
+            vec![Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![0],
+                data_change: true,
+            })],
+        )
+        .unwrap();
+
+        assert_eq!(
+            next.fragments[0].files[0].fields.as_ref(),
+            &[TOMBSTONED_FIELD, 1]
+        );
+    }
+
+    #[test]
+    fn test_tombstone_field_data_prunes_the_fragment_from_covering_indices() {
+        let manifest = backed_manifest();
+        let (_, indices) = apply_with_indices(
+            &manifest,
+            vec![Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![0],
+                data_change: true,
+            })],
+            vec![sample_index_metadata("idx")],
+        )
+        .unwrap();
+
+        // The index covers field 0, whose data in fragment 0 is now gone.
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_tombstone_field_data_rejects_a_field_no_file_backs() {
+        let manifest = backed_manifest();
+        let error = apply(
+            &manifest,
+            vec![Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![7],
+                data_change: true,
+            })],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("field 7"), "{error}");
+    }
+
+    #[test]
+    fn test_remove_fragment() {
+        let manifest = backed_manifest();
+        let next = apply(
+            &manifest,
+            vec![Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(0),
+                data_change: true,
+            })],
+        )
+        .unwrap();
+
+        assert!(next.fragments.is_empty());
+    }
+
+    #[test]
+    fn test_remove_fragment_can_drop_one_minted_in_the_same_operation() {
+        let manifest = backed_manifest();
+        let next = apply(
+            &manifest,
+            vec![
+                Action::AddFragment(AddFragment {
+                    local: 0,
+                    physical_rows: 10,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Local(0),
+                    data_change: true,
+                }),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            next.fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn test_remove_fragment_rejects_a_missing_fragment() {
+        let manifest = backed_manifest();
+        let error = apply(
+            &manifest,
+            vec![Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(7),
+                data_change: true,
+            })],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("fragment 7"), "{error}");
+    }
+
+    #[test]
+    fn test_set_deletion_file_sets_and_clears() {
+        let manifest = backed_manifest();
+        let deletion_file = DeletionFile {
+            read_version: manifest.version,
+            id: 3,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(2),
+            base_id: None,
+        };
+        let next = apply(
+            &manifest,
+            vec![Action::SetDeletionFile(SetDeletionFile {
+                fragment: 0,
+                deletion_file: Some(deletion_file.clone()),
+                data_change: true,
+            })],
+        )
+        .unwrap();
+        assert_eq!(next.fragments[0].deletion_file, Some(deletion_file));
+
+        // An absent deletion file is a request to clear it, not a no-op.
+        let cleared = apply(
+            &next,
+            vec![Action::SetDeletionFile(SetDeletionFile {
+                fragment: 0,
+                deletion_file: None,
+                data_change: true,
+            })],
+        )
+        .unwrap();
+        assert_eq!(cleared.fragments[0].deletion_file, None);
+    }
+
+    #[test]
+    fn test_set_deletion_file_rejects_a_missing_fragment() {
+        let manifest = backed_manifest();
+        let error = apply(
+            &manifest,
+            vec![Action::SetDeletionFile(SetDeletionFile {
+                fragment: 7,
+                deletion_file: None,
+                data_change: true,
+            })],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn test_alter_field_renames_without_touching_indices() {
+        let manifest = backed_manifest();
+        let (next, indices) = apply_with_indices(
+            &manifest,
+            vec![Action::AlterField(AlterField {
+                field: 0,
+                name: Some("renamed".into()),
+                logical_type: None,
+                nullable: Some(true),
+            })],
+            vec![sample_index_metadata("idx")],
+        )
+        .unwrap();
+
+        let field = next.schema.field_by_id(0).unwrap();
+        assert_eq!(field.name, "renamed");
+        assert!(field.nullable);
+        // A rename does not change the values the index recorded.
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
+    }
+
+    #[test]
+    fn test_alter_field_retype_prunes_covering_indices() {
+        let manifest = backed_manifest();
+        let (next, indices) = apply_with_indices(
+            &manifest,
+            vec![Action::AlterField(AlterField {
+                field: 0,
+                name: None,
+                logical_type: Some("int64".into()),
+                nullable: None,
+            })],
+            vec![sample_index_metadata("idx")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            next.schema.field_by_id(0).unwrap().logical_type.to_string(),
+            "int64"
+        );
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_alter_field_rejects_a_missing_field() {
+        let manifest = backed_manifest();
+        let error = apply(
+            &manifest,
+            vec![Action::AlterField(AlterField {
+                field: 7,
+                name: Some("nope".into()),
+                ..Default::default()
+            })],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("field 7"), "{error}");
     }
 
     #[test]
