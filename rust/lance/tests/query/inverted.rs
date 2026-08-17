@@ -22,8 +22,8 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::query::{
-    BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, MultiMatchQuery, Occur,
-    Operator, PhraseQuery, collect_query_tokens,
+    BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, FtsSearchParams, MatchQuery,
+    MultiMatchQuery, Occur, Operator, PhraseQuery, collect_query_tokens,
 };
 use lance_index::scalar::inverted::{DocumentGranularity, Language};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
@@ -83,6 +83,16 @@ fn row_match_node(column: &str, terms: &str) -> MatchQuery {
 
 fn row_match(column: &str, terms: &str) -> FullTextSearchQuery {
     FullTextSearchQuery::new_query(FtsQuery::Match(row_match_node(column, terms)))
+}
+
+fn combined_fields(terms: &str, columns: &[&str]) -> FullTextSearchQuery {
+    FullTextSearchQuery::new_query(FtsQuery::CombinedFields(
+        CombinedFieldsQuery::try_new(
+            terms.to_string(),
+            columns.iter().map(|column| column.to_string()).collect(),
+        )
+        .unwrap(),
+    ))
 }
 
 fn row_phrase(column: &str, terms: &str) -> FullTextSearchQuery {
@@ -479,6 +489,20 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         "{err}"
     );
 
+    // BM25F sums each target column's contribution for one row and reports no
+    // element coordinates, so a column that only has a list-element index has to
+    // be rejected rather than silently collapsed to a row score.
+    let mut element_only_combined = ds.scan();
+    element_only_combined
+        .full_text_search(combined_fields("alpha", &["tags"]))
+        .unwrap();
+    let err = element_only_combined.try_into_batch().await.unwrap_err();
+    assert!(
+        err.to_string().contains("combined_fields")
+            && err.to_string().contains("Row document granularity"),
+        "{err}"
+    );
+
     ds.create_index(
         &["tags"],
         IndexType::Inverted,
@@ -488,6 +512,17 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     )
     .await
     .unwrap();
+
+    // With a row index alongside the list-element one, combined_fields picks the
+    // row index and scores whole rows, without a `_doc_index` column.
+    let combined = run_fts(&ds, combined_fields("alpha", &["tags"]), None).await;
+    assert_eq!(
+        combined["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[0]
+    );
+    assert!(combined.column_by_name("_doc_index").is_none());
     let names = ds
         .load_indices()
         .await
@@ -969,6 +1004,40 @@ async fn test_element_document_nested_lists_use_deepest_boundary() {
     assert_eq!(row.fields, elements.fields);
     assert_eq!(row.fields, vec![content.id]);
     assert_ne!(row.fields, vec![docs.children[0].id]);
+
+    // A cross-field scan resolves the same path through the row index, and its
+    // flat sibling walks two list levels down to the leaf. Rows 2 and 3 repeat
+    // rows 0 and 1 in a fragment no index covers, so both sides contribute.
+    let combined_indexed = run_fts(&ds, combined_fields("alpha", &[path]), None).await;
+    assert_eq!(
+        combined_indexed["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[0, 1]
+    );
+    assert!(combined_indexed.column_by_name("_doc_index").is_none());
+
+    let appended = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![2, 3])) as ArrayRef),
+        ("groups", batch.column_by_name("groups").unwrap().clone()),
+    ])
+    .unwrap();
+    let ds = InsertBuilder::new(Arc::new(ds))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![appended])
+        .await
+        .unwrap();
+
+    let combined_mixed = run_fts(&ds, combined_fields("alpha", &[path]), None).await;
+    assert_eq!(
+        combined_mixed["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[0, 1, 2, 3]
+    );
 }
 
 #[tokio::test]

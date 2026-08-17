@@ -80,3 +80,129 @@ pub async fn build_combined_bm25_scorer(
         doc_freq,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::index::InvertedListFormatVersion;
+    use super::super::super::tokenizer::document_tokenizer::DocType;
+    use super::super::testing::{ElementRows, combined_columns, element_document_index};
+    use super::*;
+    use crate::metrics::LocalMetricsCollector;
+    use rstest::rstest;
+
+    /// The scorer build must report its index cache lookups to the query's
+    /// collector, the way the single-column `build_global_bm25_scorer` does; see
+    /// [`build_combined_bm25_scorer`] for what goes wrong otherwise.
+    ///
+    /// The two format versions cover both statistics arms:
+    /// `bm25_row_stats_for_terms` delegates to the document-granularity path on
+    /// V3, and takes `InvertedPartition::row_stats_for_terms` on V1/V2, where this
+    /// element-per-document fixture makes it read the posting lists themselves.
+    #[rstest]
+    #[case::modern(InvertedListFormatVersion::V3)]
+    #[case::legacy_elements(InvertedListFormatVersion::V2)]
+    #[tokio::test]
+    async fn test_combined_scorer_build_reports_index_cache_lookups(
+        #[case] format_version: InvertedListFormatVersion,
+    ) {
+        let vocab = ["alpha", "beta"];
+        // Row 0 owns two elements, so the legacy fixture is element-per-document
+        // and its row-granularity statistics take the deduplicating branch.
+        let rows: ElementRows = vec![vec![vec!["alpha"], vec!["beta"]], vec![vec!["alpha"]]];
+        let (first, _first_dir) = element_document_index(format_version, &vocab, &rows).await;
+        let (second, _second_dir) = element_document_index(format_version, &vocab, &rows).await;
+        let columns = combined_columns(vec![first, second]);
+        let tokens = Tokens::new(vec!["alpha".to_owned(), "beta".to_owned()], DocType::Text);
+        // One lookup per (term, column, partition), over 2 terms and the single
+        // partition each fixture index holds.
+        let expected_lookups = 2 * columns.len();
+
+        let indexed = LocalMetricsCollector::default();
+        build_combined_bm25_scorer(&columns, &tokens, Some(&indexed))
+            .await
+            .unwrap();
+        assert_eq!(
+            indexed.index_cache_hits() + indexed.index_cache_misses(),
+            expected_lookups,
+            "the scorer build must report every cache lookup it makes",
+        );
+    }
+
+    /// A legacy index whose documents already map one-to-one onto rows (a plain
+    /// `Utf8` column, or a list column with a single element per row) must be
+    /// completely unaffected: the row-granularity statistics equal the
+    /// document-granularity ones, so no score can move.
+    #[rstest]
+    #[case::v1(InvertedListFormatVersion::V1)]
+    #[case::v2(InvertedListFormatVersion::V2)]
+    #[case::v3(InvertedListFormatVersion::V3)]
+    #[tokio::test]
+    async fn test_row_stats_match_document_stats_without_list_multiplicity(
+        #[case] format_version: InvertedListFormatVersion,
+    ) {
+        let vocab = ["alpha", "beta"];
+        // Row 0: a multi-token `Utf8` document. Row 1: a single-element list.
+        // Row 2: an empty list, so the row owns no document at all.
+        let rows: ElementRows = vec![
+            vec![vec!["alpha", "beta", "alpha"]],
+            vec![vec!["beta"]],
+            vec![Vec::new()],
+            vec![vec!["alpha"]],
+        ];
+        let (index, _dir) = element_document_index(format_version, &vocab, &rows).await;
+
+        let docs = index.partitions[0].docs.address_keyed().await.unwrap();
+        assert_eq!(docs.len(), 3, "the empty list must not become a document");
+        assert_eq!(docs.num_distinct_rows(), docs.len());
+        let terms = ["alpha".to_owned(), "beta".to_owned(), "absent".to_owned()];
+        let documents = index.bm25_stats_for_terms(&terms, None).await.unwrap();
+        assert_eq!(documents, (5, 3, vec![2, 2, 0]));
+        assert_eq!(
+            index.bm25_row_stats_for_terms(&terms, None).await.unwrap(),
+            documents
+        );
+    }
+
+    /// Rows a legacy list index never indexed (a null or empty list, a list of
+    /// empty strings) own no document, so they must not count toward
+    /// `docCount_f` or `docFreq_f`. This is the same rule the indexed and flat
+    /// sides already follow (`AddressKeyedDocuments::doc_length_at` reports 0 for them and
+    /// `FlatFieldStats::fold_row` skips a column with `dl_f == 0`), applied to
+    /// distinct-row counting.
+    #[rstest]
+    #[case::v1(InvertedListFormatVersion::V1)]
+    #[case::v2(InvertedListFormatVersion::V2)]
+    #[tokio::test]
+    async fn test_row_stats_skip_rows_a_legacy_list_index_never_indexed(
+        #[case] format_version: InvertedListFormatVersion,
+    ) {
+        let vocab = ["alpha", "beta"];
+        let rows: ElementRows = vec![
+            // Several elements, one of them empty.
+            vec![vec!["alpha"], Vec::new(), vec!["alpha"], vec!["beta"]],
+            // A null or empty list.
+            Vec::new(),
+            vec![vec!["beta"]],
+            // A list of nothing but empty strings.
+            vec![Vec::new(), Vec::new()],
+        ];
+        let (index, _dir) = element_document_index(format_version, &vocab, &rows).await;
+
+        let docs = index.partitions[0].docs.address_keyed().await.unwrap();
+        assert_eq!(docs.len(), 4, "only rows 0 and 2 own documents");
+        assert_eq!(docs.num_distinct_rows(), 2);
+        for unindexed in [1u64, 3] {
+            assert_eq!(docs.doc_length_at(unindexed), 0);
+        }
+
+        let terms = ["alpha".to_owned(), "beta".to_owned()];
+        assert_eq!(
+            index.bm25_stats_for_terms(&terms, None).await.unwrap(),
+            (4, 4, vec![2, 2]),
+        );
+        assert_eq!(
+            index.bm25_row_stats_for_terms(&terms, None).await.unwrap(),
+            (4, 2, vec![1, 2]),
+        );
+    }
+}

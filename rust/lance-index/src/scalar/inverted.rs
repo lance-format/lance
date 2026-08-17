@@ -14,6 +14,8 @@ mod iter;
 pub mod json;
 /// Brute-force scoring reference for tests and benches. Never built normally; see
 /// the module docs for the gating.
+#[cfg(any(test, feature = "test-oracle"))]
+pub mod oracle;
 pub mod parser;
 pub mod query;
 mod scorer;
