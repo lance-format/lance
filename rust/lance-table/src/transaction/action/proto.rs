@@ -9,8 +9,8 @@
 //! must abort the commit rather than be treated as a no-op.
 
 use super::{
-    Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, Ref, RemoveFragment,
-    SetDeletionFile, TombstoneFieldData, UserAction, UserOperation,
+    Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, Ref,
+    RemoveFragment, SetDeletionFile, TombstoneFieldData, UserAction, UserOperation,
 };
 use crate::format::pb;
 use crate::format::{BasePath, DataFile, DeletionFile, ExternalFile, RowIdMeta};
@@ -138,6 +138,7 @@ impl From<&Action> for pb::Action {
             Action::RemoveFragment(action) => pb::action::Action::RemoveFragment(action.into()),
             Action::SetDeletionFile(action) => pb::action::Action::SetDeletionFile(action.into()),
             Action::AlterField(action) => pb::action::Action::AlterField(action.into()),
+            Action::DropField(action) => pb::action::Action::DropField(action.into()),
         };
         Self {
             action: Some(action),
@@ -170,6 +171,7 @@ impl TryFrom<pb::Action> for Action {
             Some(pb::action::Action::AlterField(action)) => {
                 Ok(Self::AlterField(action.try_into()?))
             }
+            Some(pb::action::Action::DropField(action)) => Ok(Self::DropField(action.try_into()?)),
             // The drafted vocabulary is larger than what is implemented. Reject
             // rather than skip: silently dropping an action would apply a
             // partial transaction.
@@ -453,6 +455,24 @@ impl TryFrom<pb::AlterField> for AlterField {
     }
 }
 
+impl From<&DropField> for pb::DropField {
+    fn from(value: &DropField) -> Self {
+        Self {
+            field: value.field as u64,
+        }
+    }
+}
+
+impl TryFrom<pb::DropField> for DropField {
+    type Error = Error;
+
+    fn try_from(message: pb::DropField) -> Result<Self> {
+        Ok(Self {
+            field: field_id_from_wire(message.field)?,
+        })
+    }
+}
+
 fn required<T>(value: Option<T>, what: &str) -> Result<T> {
     value.ok_or_else(|| Error::invalid_input(format!("{what} is required but was not set")))
 }
@@ -521,6 +541,7 @@ mod tests {
                 logical_type: Some("int64".into()),
                 nullable: Some(false),
             }),
+            Action::DropField(DropField { field: 3 }),
         ]
     }
 
