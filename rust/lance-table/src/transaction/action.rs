@@ -44,6 +44,7 @@ mod footprint;
 mod proto;
 mod remove_fragment;
 mod reserve_fragment_ids;
+mod reset_table;
 mod set_deletion_file;
 mod tombstone_field_data;
 mod translate;
@@ -60,6 +61,7 @@ pub use drop_field::DropField;
 pub use footprint::{Coordinate, Footprint};
 pub use remove_fragment::RemoveFragment;
 pub use reserve_fragment_ids::ReserveFragmentIds;
+pub use reset_table::ResetTable;
 pub use set_deletion_file::SetDeletionFile;
 pub use tombstone_field_data::TombstoneFieldData;
 
@@ -171,6 +173,7 @@ pub enum Action {
     AlterField(AlterField),
     DropField(DropField),
     ReserveFragmentIds(ReserveFragmentIds),
+    ResetTable(ResetTable),
 }
 
 impl Action {
@@ -186,6 +189,7 @@ impl Action {
             Self::AlterField(_) => "AlterField",
             Self::DropField(_) => "DropField",
             Self::ReserveFragmentIds(_) => "ReserveFragmentIds",
+            Self::ResetTable(_) => "ResetTable",
         }
     }
 
@@ -204,6 +208,8 @@ impl Action {
             // Dropping a field discards the values it held.
             Self::DropField(_) => true,
             // Other schema and base-path changes touch no row values.
+            // Emptying the table discards every row it held.
+            Self::ResetTable(_) => true,
             // Reserving ids writes no rows either.
             Self::AddField(_)
             | Self::AddBase(_)
@@ -225,6 +231,7 @@ impl Action {
             Self::AlterField(action) => action.apply(state),
             Self::DropField(action) => action.apply(state),
             Self::ReserveFragmentIds(action) => action.apply(state),
+            Self::ResetTable(action) => action.apply(state),
         }
     }
 
@@ -241,6 +248,7 @@ impl Action {
             Self::AlterField(action) => action.footprint(footprint),
             Self::DropField(action) => action.footprint(footprint),
             Self::ReserveFragmentIds(action) => action.footprint(footprint),
+            Self::ResetTable(action) => action.footprint(footprint),
         }
     }
 }
