@@ -68,6 +68,7 @@ impl Transaction {
             mut fragments,
             new_bases,
             rebound_fields,
+            reserved_fragment_ids,
             ..
         } = state;
 
@@ -87,6 +88,24 @@ impl Transaction {
 
         for base in new_bases {
             manifest.base_paths.insert(base.id, base);
+        }
+
+        // A reserved id backs no fragment, so the manifest assembly cannot
+        // derive it from the fragment list; raise the high-water mark to cover
+        // the range so a later writer's ids are not handed out twice.
+        if let Some(high_water) = reserved_fragment_ids {
+            let high_water = u32::try_from(high_water).map_err(|_| {
+                Error::invalid_input(format!(
+                    "reserving fragment ids up to {high_water} exceeds the maximum fragment id \
+                     ({})",
+                    u32::MAX
+                ))
+            })?;
+            manifest.max_fragment_id = Some(
+                manifest
+                    .max_fragment_id
+                    .map_or(high_water, |current| current.max(high_water)),
+            );
         }
 
         manifest.transaction_file = Some(transaction_file_path.to_string());
@@ -120,6 +139,11 @@ pub(super) struct ApplyState {
     /// Ids of the fragments this operation minted.
     minted_fragments: HashSet<u64>,
 
+    /// The highest fragment id this operation reserved for a later writer, if
+    /// it reserved any. No fragment backs it, so the manifest assembly cannot
+    /// infer it from the fragment list.
+    reserved_fragment_ids: Option<u64>,
+
     /// Fields whose backing data changed, per fragment. An index covering such
     /// a field no longer describes that fragment's contents.
     rebound_fields: HashMap<u64, HashSet<i32>>,
@@ -144,6 +168,7 @@ impl ApplyState {
             field_tokens: HashMap::new(),
             base_tokens: HashMap::new(),
             minted_fragments: HashSet::new(),
+            reserved_fragment_ids: None,
             rebound_fields: HashMap::new(),
         }
     }
@@ -209,6 +234,17 @@ impl ApplyState {
         self.fragment_tokens.insert(token, id);
         self.minted_fragments.insert(id);
         Ok(id)
+    }
+
+    /// Take `count` ids off the fragment counter without minting fragments for
+    /// them. The reserved ids are `[next, next + count)`; a later writer names
+    /// them as [`Ref::Committed`].
+    pub(super) fn reserve_fragment_ids(&mut self, count: u32) {
+        if count == 0 {
+            return;
+        }
+        self.next_fragment_id += u64::from(count);
+        self.reserved_fragment_ids = Some(self.next_fragment_id - 1);
     }
 
     pub(super) fn mint_field(&mut self, token: u32) -> Result<i32> {
