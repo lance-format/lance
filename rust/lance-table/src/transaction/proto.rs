@@ -1015,11 +1015,15 @@ mod tests {
             operation: Some(pb::transaction::Operation::CompositeOperation(
                 pb_transaction::CompositeOperation {
                     actions: vec![pb_transaction::UserStep {
-                        description: "reset".to_string(),
+                        description: "refresh row versions".to_string(),
                         actions: vec![pb_transaction::Action {
-                            action: Some(pb_transaction::action::Action::ResetTable(
-                                pb_transaction::ResetTable {},
-                            )),
+                            action: Some(
+                                pb_transaction::action::Action::RefreshRowVersionMetadata(
+                                    pb_transaction::RefreshRowVersionMetadata {
+                                        fragment_ids: vec![1],
+                                    },
+                                ),
+                            ),
                         }],
                     }],
                 },

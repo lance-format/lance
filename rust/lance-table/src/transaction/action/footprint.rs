@@ -88,10 +88,20 @@ pub struct Footprint {
     /// away -- leaving the new fragment carrying data for a field the manifest
     /// no longer has.
     required_fields: HashSet<i32>,
+    /// Whether this set rewrites the table wholesale. Such a set writes every
+    /// coordinate there is, including ones a concurrent set would only mint, so
+    /// it is tracked as a flag rather than enumerated.
+    exclusive: bool,
 }
 
 impl Footprint {
     pub fn conflicts_with(&self, other: &Self) -> bool {
+        // A wholesale rewrite leaves nothing for a concurrent set to land on --
+        // not even an append, whose rows the reset would discard or resurrect
+        // depending on which commit won.
+        if self.exclusive || other.exclusive {
+            return true;
+        }
         if !self.writes.is_disjoint(&other.writes) {
             return true;
         }
@@ -137,6 +147,12 @@ impl Footprint {
     pub(super) fn remove_fragment(&mut self, fragment: u64) {
         self.add(Coordinate::FragmentExistence(fragment));
         self.removed_fragments.insert(fragment);
+    }
+
+    /// Mark this set as rewriting the whole table, conflicting with any
+    /// concurrent set whatsoever.
+    pub(super) fn take_exclusive(&mut self) {
+        self.exclusive = true;
     }
 
     pub(super) fn remove_field(&mut self, field: i32) {
