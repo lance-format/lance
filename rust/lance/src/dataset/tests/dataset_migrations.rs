@@ -185,10 +185,11 @@ async fn test_fix_v0_8_0_broken_migration() {
 }
 
 #[rstest]
+#[case::legacy(LanceFileVersion::Legacy)]
+#[case::v1_v2_mixed_rejected(LanceFileVersion::Stable)]
 #[tokio::test]
 async fn test_v0_8_14_invalid_index_fragment_bitmap(
-    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-    data_storage_version: LanceFileVersion,
+    #[case] data_storage_version: LanceFileVersion,
 ) {
     // Old versions of lance could create an index whose fragment bitmap was
     // invalid because it did not include fragments that were part of the index
@@ -233,7 +234,7 @@ async fn test_v0_8_14_invalid_index_fragment_bitmap(
     let broken_version = dataset.version().version;
 
     // Any transaction, no matter how simple, should trigger the fragment bitmap to be recalculated
-    dataset
+    let append_result = dataset
         .append(
             data,
             Some(WriteParams {
@@ -241,8 +242,17 @@ async fn test_v0_8_14_invalid_index_fragment_bitmap(
                 ..Default::default()
             }),
         )
-        .await
-        .unwrap();
+        .await;
+
+    if matches!(data_storage_version, LanceFileVersion::Stable) {
+        let error = append_result.unwrap_err();
+        assert!(
+            error.to_string().contains("do not have a single version"),
+            "{error}"
+        );
+        return;
+    }
+    append_result.unwrap();
 
     for idx in dataset.load_indices().await.unwrap().iter() {
         // The corrupt fragment_bitmap does not contain 0 but the

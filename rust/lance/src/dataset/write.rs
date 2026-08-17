@@ -606,7 +606,9 @@ pub struct WriteParams {
     /// of lance.
     /// Lance file version 2.3 enables RLE v2 run length widths by default.
     ///
-    /// If not specified then the latest stable version will be used.
+    /// For an existing dataset, an explicit version is the exact target for
+    /// this operation; if omitted, the manifest storage version is used as the
+    /// fallback. New datasets default to the latest stable version.
     pub data_storage_version: Option<LanceFileVersion>,
 
     /// Experimental: if set to true, the writer will use stable row ids.
