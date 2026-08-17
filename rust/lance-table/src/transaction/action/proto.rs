@@ -9,8 +9,8 @@
 //! must abort the commit rather than be treated as a no-op.
 
 use super::{
-    Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, Ref, RemoveFragment,
-    SetDeletionFile, TombstoneFieldData, UserAction, UserOperation,
+    Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, Ref,
+    RemoveFragment, SetDeletionFile, TombstoneFieldData, UserAction, UserOperation,
 };
 use crate::format::pb;
 use crate::format::pb_transaction;
@@ -155,6 +155,7 @@ impl From<&Action> for pb_transaction::Action {
                 pb_transaction::action::Action::SetDeletionFile(action.into())
             }
             Action::AlterField(action) => pb_transaction::action::Action::AlterField(action.into()),
+            Action::DropField(action) => pb_transaction::action::Action::DropField(action.into()),
         };
         Self {
             action: Some(action),
@@ -190,6 +191,9 @@ impl TryFrom<pb_transaction::Action> for Action {
             }
             Some(pb_transaction::action::Action::AlterField(action)) => {
                 Ok(Self::AlterField(action.try_into()?))
+            }
+            Some(pb_transaction::action::Action::DropField(action)) => {
+                Ok(Self::DropField(action.try_into()?))
             }
             // The drafted vocabulary is larger than what is implemented. Reject
             // rather than skip: silently dropping an action would apply a
@@ -478,6 +482,24 @@ impl TryFrom<pb_transaction::AlterField> for AlterField {
     }
 }
 
+impl From<&DropField> for pb_transaction::DropField {
+    fn from(value: &DropField) -> Self {
+        Self {
+            field: value.field as u64,
+        }
+    }
+}
+
+impl TryFrom<pb_transaction::DropField> for DropField {
+    type Error = Error;
+
+    fn try_from(message: pb_transaction::DropField) -> Result<Self> {
+        Ok(Self {
+            field: field_id_from_wire(message.field)?,
+        })
+    }
+}
+
 fn required<T>(value: Option<T>, what: &str) -> Result<T> {
     value.ok_or_else(|| Error::invalid_input(format!("{what} is required but was not set")))
 }
@@ -546,6 +568,7 @@ mod tests {
                 logical_type: Some("int64".into()),
                 nullable: Some(false),
             }),
+            Action::DropField(DropField { field: 3 }),
         ]
     }
 
