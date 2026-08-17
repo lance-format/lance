@@ -51,7 +51,7 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_select::{RowAddrMask, RowAddrTreeMap};
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use std::sync::LazyLock;
 use tokio::{
     sync::{Mutex, OnceCell},
@@ -60,7 +60,8 @@ use tokio::{
 use tracing::{info, instrument, warn};
 
 use super::documents::{
-    DocId, DocLengths, DocVisibility, PartitionDocumentStore, PartitionDocuments,
+    AddressKeyedDocuments, DocId, DocLengths, DocVisibility, PartitionDocumentStore,
+    PartitionDocuments,
 };
 use super::encoding::{MAX_POSTING_BLOCK_SIZE, PositionBlockBuilder};
 use super::impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData, ImpactSkipDataBuilder};
@@ -125,6 +126,33 @@ pub use posting_reader::*;
 use prewarm::*;
 pub(super) use search_candidates::*;
 pub use token_set::*;
+
+/// Walk `posting` as `(row_id, frequency)` over the rows that still exist,
+/// translating each posting's key into a row id.
+///
+/// Compressed postings key on a partition-local doc id, so they go through
+/// `docs`; legacy plain postings key on the row id directly.
+///
+/// A remapped partition keeps a deleted document's slot so the posting lists stay
+/// aligned with its DocIds, and `row_address` answers `TOMBSTONE_ROW` for it.
+/// Those postings are dropped here: a default prefilter mask is an empty block
+/// list, which selects them, and `doc_length_at` reports 0 for them, which would
+/// hand them the largest `doc_weight` there is. The single-column `wand` cursor
+/// guards the same way.
+pub(in crate::scalar::inverted) fn live_posting_rows<'a>(
+    posting: &'a PostingList,
+    docs: &'a AddressKeyedDocuments,
+    is_legacy: bool,
+) -> impl Iterator<Item = (u64, u32)> + 'a {
+    posting.iter().filter_map(move |(posting_doc_id, freq, _)| {
+        let row_id = if is_legacy {
+            posting_doc_id
+        } else {
+            docs.row_address(posting_doc_id as u32)
+        };
+        (row_id != RowAddress::TOMBSTONE_ROW).then_some((row_id, freq))
+    })
+}
 
 #[cfg(test)]
 mod tests;

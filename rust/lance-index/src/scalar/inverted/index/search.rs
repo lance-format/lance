@@ -50,6 +50,10 @@ impl InvertedIndex {
         Ok(MemBM25Scorer::new(total_tokens, num_docs, token_docs))
     }
 
+    /// Corpus statistics at document granularity: `(total_tokens, docCount,
+    /// per_term_docFreq)`, where a document is one entry of a partition's
+    /// [`DocSet`]. This is what the single-column scoring path pairs with, since
+    /// wand scores one posting per document.
     pub async fn bm25_stats_for_terms(
         &self,
         terms: &[String],
@@ -60,6 +64,67 @@ impl InvertedIndex {
             futures::future::try_join_all(terms.iter().map(|term| self.df_for_term(term, metrics)))
                 .await?;
         Ok((total_tokens, num_docs, token_docs))
+    }
+
+    /// Corpus statistics at row granularity: `(total_tokens, docCount,
+    /// per_term_docFreq)` counted over distinct row ids.
+    ///
+    /// Cross-field BM25F scores rows, not documents: `combined_fields_search`
+    /// sums all of a row's postings into one `tf'` and all of its document
+    /// lengths into one `dl'`. Released V1/V2 indexes indexed each
+    /// `List<String>` element as its own document, so pairing that row-granular
+    /// `tf'`/`dl'` with [`Self::bm25_stats_for_terms`] would measure it against a
+    /// corpus of a different size: `idf'` and `avgdl'` would describe elements
+    /// while the frequencies describe rows, shifting an old index's top-k relative
+    /// to the same data reindexed on a current build.
+    ///
+    /// V3 indexes always map one row to one document, so they delegate to
+    /// [`Self::bm25_stats_for_terms`] and keep its IO profile: no `DocSet` load,
+    /// one posting-metadata row per term and partition. `total_tokens` is
+    /// granularity-independent, so it comes from the shared
+    /// `aggregate_corpus_stats` cache either way.
+    ///
+    /// `metrics`, when provided, receives the posting-metadata cache lookups these
+    /// statistics trigger, so both granularities report comparable
+    /// `index_cache_hits`/`index_cache_misses`.
+    pub async fn bm25_row_stats_for_terms(
+        &self,
+        terms: &[String],
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<(u64, usize, Vec<usize>)> {
+        if !matches!(
+            self.format_version,
+            InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2
+        ) {
+            return self.bm25_stats_for_terms(terms, metrics).await;
+        }
+
+        let (total_tokens, _) = self.aggregate_corpus_stats().await?;
+        let io_parallelism = self.store.io_parallelism();
+        let futures = self
+            .partitions
+            .iter()
+            .map(|partition| {
+                let partition = partition.clone();
+                async move { partition.row_stats_for_terms(terms, metrics).await }
+            })
+            .collect::<Vec<_>>();
+        let per_partition: Vec<(usize, Vec<usize>)> = stream::iter(futures)
+            .buffer_unordered(io_parallelism)
+            .try_collect()
+            .await?;
+
+        let mut num_rows = 0usize;
+        let mut row_freqs = vec![0usize; terms.len()];
+        for (partition_rows, partition_freqs) in per_partition {
+            // Partitions hold disjoint row sets, so per-partition distinct counts
+            // add up to the index's distinct count.
+            num_rows += partition_rows;
+            for (total, partition_freq) in row_freqs.iter_mut().zip(partition_freqs) {
+                *total += partition_freq;
+            }
+        }
+        Ok((total_tokens, num_rows, row_freqs))
     }
 
     /// Aggregate immutable per-partition corpus statistics.  New modern files

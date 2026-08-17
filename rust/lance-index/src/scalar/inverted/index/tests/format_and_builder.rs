@@ -222,6 +222,67 @@ fn test_cached_num_tokens_uses_supplied_total_and_full_stays_owned() {
 }
 
 #[test]
+fn test_combined_fields_append_invalidates_row_ids_ascending_cache() {
+    let row_ids = UInt64Array::from(vec![10, 20, 30]);
+    let num_tokens = UInt32Array::from(vec![1, 1, 1]);
+    let mut docs = DocSet::from_columns(&row_ids, &num_tokens, false, None).unwrap();
+
+    // Memoize the ascending answer for the current (sorted) row_ids.
+    assert!(docs.row_ids_strictly_ascending());
+
+    // Appending a smaller row_id breaks the invariant; the cached answer
+    // must be dropped so the recomputed value reflects the mutation.
+    docs.append(5, 1);
+    assert!(!docs.row_ids_strictly_ascending());
+
+    // The element-document append is the same mutation and owes the same
+    // invalidation. A set built by `with_coordinate_rank` is shared by its
+    // clones, so a stale answer would outlive the builder that produced it.
+    let mut docs = DocSet::with_coordinate_rank(1);
+    for (doc_id, row_id) in [10u64, 20, 30].into_iter().enumerate() {
+        assert_eq!(
+            docs.append_with_doc_index(row_id, 1, &[doc_id as u32])
+                .unwrap(),
+            doc_id as u32
+        );
+    }
+    assert!(docs.row_ids_strictly_ascending());
+
+    docs.append_with_doc_index(5, 1, &[0]).unwrap();
+    assert!(!docs.row_ids_strictly_ascending());
+}
+
+#[test]
+fn test_doc_length_by_row_id_matches_scan() {
+    // Compressed layout: row ids are stored in doc-id order and resolved
+    // through `inv`. The targeted lookup must equal an `iter()` scan that
+    // sums the matching row's lengths, and return 0 for an absent row.
+    let row_ids = UInt64Array::from(vec![30, 10, 20]);
+    let num_tokens = UInt32Array::from(vec![8, 3, 5]);
+    let docs = DocSet::from_columns(&row_ids, &num_tokens, false, None).unwrap();
+    for target in [10u64, 20, 30, 99] {
+        let expected: u64 = docs
+            .iter()
+            .filter(|(id, _)| **id == target)
+            .map(|(_, nt)| *nt as u64)
+            .sum();
+        assert_eq!(docs.doc_length_by_row_id(target), expected, "row {target}");
+    }
+    assert_eq!(docs.doc_length_by_row_id(10), 3);
+    assert_eq!(docs.doc_length_by_row_id(99), 0);
+
+    // Legacy layout: row id == doc id, row ids are sorted, and a row indexed
+    // as several list documents forms a contiguous run whose lengths sum.
+    let legacy_row_ids = UInt64Array::from(vec![10, 10, 20]);
+    let legacy_num_tokens = UInt32Array::from(vec![3, 4, 5]);
+    let legacy = DocSet::from_columns(&legacy_row_ids, &legacy_num_tokens, true, None).unwrap();
+    assert!(legacy.inv.is_empty());
+    assert_eq!(legacy.doc_length_by_row_id(10), 7);
+    assert_eq!(legacy.doc_length_by_row_id(20), 5);
+    assert_eq!(legacy.doc_length_by_row_id(99), 0);
+}
+
+#[test]
 fn test_posting_builder_writes_impacts_for_supported_block_sizes() {
     for block_size in [128, 256] {
         let format_version = default_fts_format_version_for_block_size(block_size).unwrap();

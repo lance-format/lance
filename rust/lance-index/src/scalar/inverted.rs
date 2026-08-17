@@ -3,6 +3,7 @@
 
 pub mod builder;
 mod cache_codec;
+mod combined;
 mod compound;
 mod cross_column;
 mod documents;
@@ -11,6 +12,8 @@ mod impact;
 mod index;
 mod iter;
 pub mod json;
+/// Brute-force scoring reference for tests and benches. Never built normally; see
+/// the module docs for the gating.
 pub mod parser;
 pub mod query;
 mod scorer;
@@ -23,6 +26,10 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
+pub use combined::{
+    CombinedFieldColumn, build_combined_bm25_scorer, combined_fields_search,
+    validate_combined_tokenizers,
+};
 pub use compound::{compound_search, compound_search_with_base_scorer};
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
@@ -30,7 +37,7 @@ use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
 pub use lance_tokenizer::Language;
-pub use scorer::{MemBM25Scorer, Scorer};
+pub use scorer::{CombinedFieldsBM25Scorer, MemBM25Scorer, Scorer};
 pub use tokenizer::*;
 
 use crate::scalar::inverted::query::{FtsSearchParams, Tokens};

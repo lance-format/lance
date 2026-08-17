@@ -1177,6 +1177,12 @@ fn independent_compound_fts_oracle<'a>(
                 }
                 result
             }
+            // This oracle scores each leaf against its own column's statistics,
+            // which is exactly what BM25F does not do. combined_fields never
+            // reaches the cross-column compound path.
+            FtsQuery::CombinedFields(_) => {
+                unreachable!("combined_fields is not a cross-column compound leaf")
+            }
         }
     })
 }

@@ -633,6 +633,45 @@ pub(crate) async fn resolve_query_document_granularity(
     Ok(resolved)
 }
 
+/// Check that one `combined_fields` target column can take part in a BM25F
+/// blend, and resolve its path.
+///
+/// Cross-field scoring joins the target columns on the row address and sums their
+/// per-row term frequencies and document lengths, so it needs row documents. A
+/// column indexed only at list-element granularity cannot supply them: that index
+/// stores several documents per row, identified by element coordinates a
+/// cross-column scan cannot pair up between columns and the combined result schema
+/// cannot report. A column carrying both granularities is fine; the row index is
+/// the one used.
+///
+/// Any field shape a row-document index accepts is allowed, list nesting included:
+/// the flat sibling scan reaches such a leaf through
+/// [`flatten_fts_document_column`], which uses the same traversal a single-column
+/// match drives through [`FtsDocument`].
+pub(crate) async fn validate_combined_fields_target_column(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<()> {
+    let indices = indexed_fts_document_granularities(dataset, column).await?;
+    if !indices.is_empty()
+        && indices
+            .iter()
+            .all(|(_, granularity)| granularity.is_list_element())
+    {
+        let indexed = indices
+            .iter()
+            .map(|(name, granularity)| format!("'{name}' ({granularity:?})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::not_supported(format!(
+            "combined_fields (BM25F) scores whole rows and needs a Row document granularity FTS \
+             index on every target column, but '{column}' only has: {indexed}"
+        )));
+    }
+    resolve_fts_field(dataset.schema(), column, DocumentGranularity::Row)?;
+    Ok(())
+}
+
 pub(crate) fn fts_document_schema(coordinate_rank: usize) -> Arc<ArrowSchema> {
     let mut fields = vec![
         ArrowField::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
