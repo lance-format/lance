@@ -25,6 +25,8 @@
 mod cursor;
 mod search;
 mod stats;
+#[cfg(test)]
+mod testing;
 
 use std::sync::Arc;
 
