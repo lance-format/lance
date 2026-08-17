@@ -158,6 +158,9 @@ impl From<&Action> for pb_transaction::Action {
             }
             Action::AlterField(action) => pb_transaction::action::Action::AlterField(action.into()),
             Action::DropField(action) => pb_transaction::action::Action::DropField(action.into()),
+            Action::ReserveFragmentIds(action) => {
+                pb_transaction::action::Action::ReserveFragmentIds(action.into())
+            }
         };
         Self {
             action: Some(action),
@@ -197,6 +200,9 @@ impl TryFrom<pb_transaction::Action> for Action {
             Some(pb_transaction::action::Action::DropField(action)) => {
                 Ok(Self::DropField(action.try_into()?))
             }
+            Some(pb_transaction::action::Action::ReserveFragmentIds(action)) => {
+                Ok(Self::ReserveFragmentIds(action.try_into()?))
+            }
             // The drafted vocabulary is larger than what is implemented. Reject
             // rather than skip: silently dropping an action would apply a
             // partial transaction.
@@ -218,7 +224,7 @@ mod tests {
     use crate::rowids::version::RowDatasetVersionMeta;
     use crate::transaction::action::{
         AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, RemoveFragment,
-        SetDeletionFile, TombstoneFieldData,
+        ReserveFragmentIds, SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::Field;
@@ -282,6 +288,7 @@ mod tests {
                 nullable: Some(false),
             }),
             Action::DropField(DropField { field: 3 }),
+            Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
         ]
     }
 
