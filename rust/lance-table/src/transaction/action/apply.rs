@@ -70,6 +70,8 @@ impl Transaction {
             rebound_fields,
             reserved_fragment_ids,
             reset,
+            config: dataset_config,
+            table_metadata,
             ..
         } = state;
 
@@ -93,6 +95,9 @@ impl Transaction {
         for base in new_bases {
             manifest.base_paths.insert(base.id, base);
         }
+
+        manifest.config = dataset_config;
+        manifest.table_metadata = table_metadata;
 
         // A reserved id backs no fragment, so the manifest assembly cannot
         // derive it from the fragment list; raise the high-water mark to cover
@@ -130,6 +135,11 @@ pub(super) struct ApplyState {
     /// base paths, which the manifest assembly inherits from the read version.
     new_bases: Vec<BasePath>,
     existing_base_paths: HashMap<u32, BasePath>,
+    /// The manifest's string maps. Unlike the schema and the fragment list,
+    /// these are inherited wholesale by the manifest assembly, so an edit has
+    /// to be written back over the assembled manifest.
+    config: HashMap<String, String>,
+    table_metadata: HashMap<String, String>,
 
     next_fragment_id: u64,
     next_field_id: i32,
@@ -164,6 +174,8 @@ impl ApplyState {
             fragments: manifest.fragments.as_ref().clone(),
             new_bases: Vec::new(),
             existing_base_paths: manifest.base_paths.clone(),
+            config: manifest.config.clone(),
+            table_metadata: manifest.table_metadata.clone(),
             next_fragment_id: manifest.max_fragment_id().map(|id| id + 1).unwrap_or(0),
             next_field_id: manifest.max_field_id() + 1,
             next_base_id: manifest
@@ -188,6 +200,14 @@ impl ApplyState {
 
     pub(super) fn schema_mut(&mut self) -> &mut Schema {
         &mut self.schema
+    }
+
+    pub(super) fn config_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.config
+    }
+
+    pub(super) fn table_metadata_mut(&mut self) -> &mut HashMap<String, String> {
+        &mut self.table_metadata
     }
 
     pub(super) fn fragments_mut(&mut self) -> &mut [Fragment] {

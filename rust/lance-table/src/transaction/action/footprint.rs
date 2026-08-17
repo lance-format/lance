@@ -17,6 +17,7 @@
 //! module. This module holds the coordinate space and the comparison.
 
 use super::{Ref, UserOperation};
+use crate::transaction::UpdateMap;
 use std::collections::HashSet;
 
 /// One thing an action set writes.
@@ -38,6 +39,21 @@ pub enum Coordinate {
     BaseName(Option<String>),
     /// A base path's location, which the manifest requires to be unique.
     BaseLocation(String),
+    /// One key in one of the manifest's string maps.
+    ConfigEntry { map: ConfigMap, key: String },
+}
+
+/// One of the string maps a manifest carries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConfigMap {
+    /// Dataset config.
+    Config,
+    /// Table metadata.
+    TableMetadata,
+    /// Schema-level metadata.
+    SchemaMetadata,
+    /// One field's metadata, by field id.
+    Field(i32),
 }
 
 impl Coordinate {
@@ -46,7 +62,10 @@ impl Coordinate {
         match self {
             Self::FragmentExistence(id) | Self::FragmentDeletions(id) => Some(*id),
             Self::FieldData { fragment, .. } => Some(*fragment),
-            Self::FieldDefinition(_) | Self::BaseName(_) | Self::BaseLocation(_) => None,
+            Self::FieldDefinition(_)
+            | Self::BaseName(_)
+            | Self::BaseLocation(_)
+            | Self::ConfigEntry { .. } => None,
         }
     }
 
@@ -55,10 +74,25 @@ impl Coordinate {
         match self {
             Self::FieldData { field, .. } => Some(*field),
             Self::FieldDefinition(id) => Some(*id),
+            // A field's metadata goes with the field, so dropping the field
+            // writes over a concurrent update to its metadata.
+            Self::ConfigEntry {
+                map: ConfigMap::Field(id),
+                ..
+            } => Some(*id),
             Self::FragmentExistence(_)
             | Self::FragmentDeletions(_)
             | Self::BaseName(_)
-            | Self::BaseLocation(_) => None,
+            | Self::BaseLocation(_)
+            | Self::ConfigEntry { .. } => None,
+        }
+    }
+
+    /// The string map this coordinate is a key in, if it is one.
+    fn config_map(&self) -> Option<&ConfigMap> {
+        match self {
+            Self::ConfigEntry { map, .. } => Some(map),
+            _ => None,
         }
     }
 }
@@ -80,6 +114,10 @@ pub struct Footprint {
     /// is therefore not caught here and fails when it is applied against the
     /// version where the child no longer exists.
     removed_fields: HashSet<i32>,
+    /// String maps this set replaces outright rather than merging into. Like a
+    /// fragment removal, this writes every key in the map, including keys it
+    /// does not name, so it is matched by map rather than by key.
+    replaced_maps: HashSet<ConfigMap>,
     /// Whether this set rewrites the table wholesale. Such a set writes every
     /// coordinate there is, including ones a concurrent set would only mint, so
     /// it is tracked as a flag rather than enumerated.
@@ -97,10 +135,16 @@ impl Footprint {
         if !self.writes.is_disjoint(&other.writes) {
             return true;
         }
+        // Two sets replacing the same map collide even when neither names a
+        // key, since clearing a map is a replacement with no entries.
+        if !self.replaced_maps.is_disjoint(&other.replaced_maps) {
+            return true;
+        }
         self.removes_something_touched_by(other) || other.removes_something_touched_by(self)
     }
 
-    /// Whether this set removes a fragment or field that `other` also writes to.
+    /// Whether this set wipes out something -- a fragment, a field, a whole
+    /// string map -- that `other` also writes to.
     fn removes_something_touched_by(&self, other: &Self) -> bool {
         other.writes.iter().any(|coordinate| {
             coordinate
@@ -109,6 +153,9 @@ impl Footprint {
                 || coordinate
                     .field()
                     .is_some_and(|id| self.removed_fields.contains(&id))
+                || coordinate
+                    .config_map()
+                    .is_some_and(|map| self.replaced_maps.contains(map))
         })
     }
 
@@ -130,6 +177,21 @@ impl Footprint {
     pub(super) fn remove_fragment(&mut self, fragment: u64) {
         self.add(Coordinate::FragmentExistence(fragment));
         self.removed_fragments.insert(fragment);
+    }
+
+    /// Record an edit to one of the manifest's string maps: the keys it names,
+    /// or the whole map when it replaces rather than merges.
+    pub(super) fn add_map_update(&mut self, map: ConfigMap, update: &UpdateMap) {
+        if update.replace {
+            self.replaced_maps.insert(map);
+            return;
+        }
+        for entry in &update.update_entries {
+            self.add(Coordinate::ConfigEntry {
+                map: map.clone(),
+                key: entry.key.clone(),
+            });
+        }
     }
 
     /// Mark this set as rewriting the whole table, conflicting with any
