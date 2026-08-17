@@ -29,8 +29,8 @@ use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
 pub use combined::{
-    CombinedFieldColumn, build_combined_bm25_scorer, combined_fields_search,
-    validate_combined_tokenizers,
+    CombinedCorpusStats, CombinedFieldColumn, FlatFieldStats, build_combined_bm25_scorer,
+    combined_fields_search, flat_combined_fields_search_stream, validate_combined_tokenizers,
 };
 pub use compound::{compound_search, compound_search_with_base_scorer};
 #[doc(hidden)]

@@ -150,7 +150,7 @@ mod tests {
     use super::super::super::index::InvertedListFormatVersion;
     use super::super::super::scorer::idf;
     use super::super::super::tokenizer::document_tokenizer::DocType;
-    use super::super::stats::build_combined_bm25_scorer;
+    use super::super::stats::{CombinedCorpusStats, build_combined_bm25_scorer};
     use super::super::testing::{
         ElementRows, as_row_documents, combined_columns, combined_top_k, element_document_index,
     };
@@ -371,6 +371,7 @@ mod tests {
         let scorer = build_combined_bm25_scorer(
             &columns,
             &Tokens::new(vec!["alpha".to_owned(), "beta".to_owned()], DocType::Text),
+            CombinedCorpusStats::IndexOnly,
             None,
         )
         .await

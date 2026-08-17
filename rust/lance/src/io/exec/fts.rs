@@ -37,9 +37,10 @@ use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, build_prefilter, build_prefilter_restricted_to_fragments};
+use crate::index::prefilter::DatasetPreFilter;
 use crate::index::scalar::inverted::{
-    ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
-    transform_fts_document_stream,
+    ResolvedFtsField, flatten_fts_document_column, fts_document_schema, load_segment_details,
+    load_segments, transform_fts_document_stream,
 };
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::{
@@ -61,14 +62,15 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
-    CombinedFieldColumn, CombinedFieldsBM25Scorer, DOC_INDEX_COL, DocumentGranularity, FTS_SCHEMA,
-    FlatBm25SearchOptions, InvertedIndex, MemBM25Scorer, SCORE_COL, build_combined_bm25_scorer,
-    build_global_bm25_scorer, combined_fields_search, compound_search,
-    compound_search_with_base_scorer, cross_column_compound_search,
-    flat_bm25_search_stream_with_options_and_scorer, fts_schema, validate_combined_tokenizers,
+    CombinedCorpusStats, CombinedFieldColumn, CombinedFieldsBM25Scorer, DOC_INDEX_COL,
+    DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex, MemBM25Scorer,
+    SCORE_COL, build_combined_bm25_scorer, build_global_bm25_scorer, combined_fields_search,
+    compound_search, compound_search_with_base_scorer, cross_column_compound_search,
+    flat_bm25_search_stream_with_options_and_scorer, flat_combined_fields_search_stream,
+    fts_schema, validate_combined_tokenizers,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
-use lance_select::RowAddrMask;
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 use uuid::Uuid;
@@ -2391,13 +2393,26 @@ impl DisplayAs for CombinedFieldsQueryExec {
     }
 }
 
-/// What [`open_combined_fields_scan`] hands back to the `combined_fields` exec.
+/// Which target columns of a `combined_fields` scan need an inverted index.
+#[derive(Debug, Clone, Copy)]
+enum CombinedFieldsIndexRequirement {
+    /// Every column, because the indexed side scores each of them from its
+    /// index.
+    EveryColumn,
+    /// At least one column, for the tokenizer. The flat side reads the document
+    /// text from the scan, so a column without an index only misses out on
+    /// contributing corpus statistics.
+    AtLeastOneColumn,
+}
+
+/// What [`open_combined_fields_scan`] hands back to either `combined_fields` exec.
 struct CombinedFieldsScan {
     columns: Vec<CombinedFieldColumn>,
     /// Every segment opened across all target columns, for the indexed side's
     /// prefilter.
     segments: Vec<IndexMetadata>,
     tokens: Tokens,
+    tokenizer: Box<dyn LanceTokenizer>,
 }
 
 /// Open every target column's segments, pair each with its boost, and tokenize
@@ -2414,22 +2429,30 @@ struct CombinedFieldsScan {
 async fn open_combined_fields_scan(
     dataset: &Dataset,
     query: &CombinedFieldsQuery,
+    index_requirement: CombinedFieldsIndexRequirement,
     tokenized_query: &OnceLock<TokenizedQuery>,
     metrics: &FtsIndexMetrics,
 ) -> DataFusionResult<CombinedFieldsScan> {
     let mut columns = Vec::with_capacity(query.column_names().len());
     let mut all_segments = Vec::new();
     for (column, weight) in query.weighted_columns() {
-        let segments = Some(
-            FtsSegmentSelection::AllCommitted
-                .resolve(
-                    dataset,
-                    column,
-                    DocumentGranularity::Row,
-                    &metrics.segment_bind_duration,
-                )
-                .await?,
-        );
+        let segments = match index_requirement {
+            CombinedFieldsIndexRequirement::EveryColumn => Some(
+                FtsSegmentSelection::AllCommitted
+                    .resolve(
+                        dataset,
+                        column,
+                        DocumentGranularity::Row,
+                        &metrics.segment_bind_duration,
+                    )
+                    .await?,
+            ),
+            CombinedFieldsIndexRequirement::AtLeastOneColumn => {
+                load_segments(dataset, column, DocumentGranularity::Row)
+                    .await?
+                    .map(Arc::from)
+            }
+        };
         let indices = match segments {
             Some(segments) => {
                 let _details = load_segment_details(dataset, column, &segments).await?;
@@ -2459,13 +2482,20 @@ async fn open_combined_fields_scan(
     let first_index = columns
         .iter()
         .find_map(|column| column.indices.first())
-        .ok_or_else(|| {
-            // Not a user error: segment resolution already failed for any column
-            // without an index, and `CombinedFieldsQuery::try_new` rejects an empty
-            // column list, so reaching this means one of those two guarantees broke.
-            DataFusionError::Internal(
+        .ok_or_else(|| match index_requirement {
+            // Not a user error: `EveryColumn` resolution already failed for any
+            // column without an index, and `CombinedFieldsQuery::try_new` rejects
+            // an empty column list, so reaching this means one of those two
+            // guarantees broke.
+            CombinedFieldsIndexRequirement::EveryColumn => DataFusionError::Internal(
                 "combined_fields query reached execution with no target columns".to_string(),
-            )
+            ),
+            CombinedFieldsIndexRequirement::AtLeastOneColumn => {
+                DataFusionError::Execution(format!(
+                    "combined_fields requires an inverted index on at least one of {:?}",
+                    query.column_names().collect::<Vec<_>>()
+                ))
+            }
         })?;
     let mut tokenizer = first_index.tokenizer();
     let tokens = collect_query_tokens(query.terms(), &mut tokenizer);
@@ -2475,6 +2505,7 @@ async fn open_combined_fields_scan(
         columns,
         segments: all_segments,
         tokens,
+        tokenizer,
     })
 }
 
@@ -2556,7 +2587,14 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                 segments: all_segments,
                 tokens,
                 ..
-            } = open_combined_fields_scan(&ds, &query, &tokenized_query, metrics.as_ref()).await?;
+            } = open_combined_fields_scan(
+                &ds,
+                &query,
+                CombinedFieldsIndexRequirement::EveryColumn,
+                &tokenized_query,
+                metrics.as_ref(),
+            )
+            .await?;
 
             // With mixed coverage the planner supplies the fragments every target
             // column indexes, and the scan is restricted to exactly those: the
@@ -2593,15 +2631,22 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             }
             let scorer = match (preset_base_scorer, shared_scorer) {
                 (Some(scorer), _) => scorer,
-                // An injected scorer describes the corpus the whole plan scores
-                // against; wait for it rather than folding this side's statistics.
+                // A mixed plan routes the rows no index covers to a flat sibling,
+                // so folding only this side's index statistics here would score the
+                // two children against different `docCount'`/`docFreq'`/`avgdl'`.
+                // Wait for the blend that describes the whole scanned corpus.
                 (None, Some(shared_scorer)) => shared_scorer.wait().await?,
                 (None, None) => {
                     let scorer_start = std::time::Instant::now();
                     let scorer = Arc::new(
-                        build_combined_bm25_scorer(&columns, &tokens, Some(metrics.as_ref()))
-                            .boxed()
-                            .await?,
+                        build_combined_bm25_scorer(
+                            &columns,
+                            &tokens,
+                            CombinedCorpusStats::IndexOnly,
+                            Some(metrics.as_ref()),
+                        )
+                        .boxed()
+                        .await?,
                     );
                     metrics.record_scorer_build(scorer_start.elapsed());
                     scorer
@@ -3458,6 +3503,466 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 _ => unreachable!("record_poll preserves Ready(Some) input"),
             }
         });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream.stream_in_current_span().boxed(),
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
+}
+
+/// Cross-field (BM25F) scoring for rows no index covers.
+///
+/// One target column's share of the rows a flat `combined_fields` scan may fold
+/// into corpus statistics; see [`FlatCombinedFieldsExec::with_stats_coverage`].
+#[derive(Debug, Clone, Default)]
+pub struct FlatStatsCoverage {
+    /// Fragments this column's index does not cover at all.
+    pub fragments: roaring::RoaringBitmap,
+    /// Rows it does cover, but whose entries a newer overlay made stale, in the id
+    /// domain the scan's `_rowid` uses. The index still counts their pre-overlay
+    /// values, so folding these over-counts the column by at most their number.
+    pub stale_rows: RowAddrTreeMap,
+}
+
+impl FlatStatsCoverage {
+    /// Coverage by whole fragments, with no individually named stale rows.
+    pub fn for_fragments(fragments: roaring::RoaringBitmap) -> Self {
+        Self {
+            fragments,
+            stale_rows: RowAddrTreeMap::new(),
+        }
+    }
+}
+
+/// The sibling of [`CombinedFieldsQueryExec`] for the fragments that at least one
+/// target column's index is missing. Those rows cannot be scored from the indexes
+/// (`tf'`/`dl'` would omit the unindexed columns), so they are scored straight
+/// from their column values here. The two plans are unioned and re-sorted by the
+/// planner, exactly as the single-column match path does.
+///
+/// The input must carry `_rowid` plus every target column of the query.
+#[derive(Debug)]
+pub struct FlatCombinedFieldsExec {
+    dataset: Arc<Dataset>,
+    query: CombinedFieldsQuery,
+    /// Tokens `execute()` actually produced, for `analyze_plan`. Single snapshot
+    /// for the same reason as [`CombinedFieldsQueryExec::tokenized_query`].
+    tokenized_query: Arc<OnceLock<TokenizedQuery>>,
+    params: FtsSearchParams,
+    unindexed_input: Arc<dyn ExecutionPlan>,
+    /// Optional override for the blended scorer normally built locally inside
+    /// `execute()`. See [`CombinedFieldsQueryExec::with_base_scorer`].
+    base_scorer: Option<Arc<CombinedFieldsBM25Scorer>>,
+    /// Per target column (aligned with `query.columns`): the fragments that
+    /// column's index does not cover. Only rows in those fragments may be folded
+    /// into that column's corpus statistics; see
+    /// [`Self::with_stats_coverage`].
+    stats_coverage: Vec<FlatStatsCoverage>,
+    /// Set when the scan was read unfiltered: this then selects the rows to emit,
+    /// over `scanned_fragments`. See [`Self::with_emit_prefilter`].
+    emit_prefilter: Option<PreFilterSource>,
+    /// The fragments `unindexed_input` reads, so the emit mask spans exactly them.
+    scanned_fragments: roaring::RoaringBitmap,
+    /// Whether the target columns' index statistics are dropped in favour of this
+    /// scan's own. See [`Self::with_whole_corpus_stats`].
+    whole_corpus_stats: bool,
+    /// Per target column (aligned with `query.columns`): the schema-derived form
+    /// of its field path, which decides how `execute` turns the scanned column
+    /// into document text. See [`Self::with_resolved_fields`].
+    resolved_fields: Vec<ResolvedFtsField>,
+    /// Publishes the blended scorer to an indexed sibling; see
+    /// [`Self::with_shared_scorer`].
+    shared_scorer: Option<Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>>,
+    properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl DisplayAs for FlatCombinedFieldsExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let columns = self.query.column_names().collect::<Vec<_>>().join(", ");
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "FlatCombinedFields: columns=[{}], query={}",
+                    columns,
+                    self.query.terms()
+                )?;
+                fmt_tokenized_query(&self.tokenized_query, ", ", f)
+            }
+            DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "FlatCombinedFields\ncolumns=[{}]\nquery={}",
+                    columns,
+                    self.query.terms()
+                )?;
+                fmt_tokenized_query(&self.tokenized_query, "\n", f)
+            }
+        }
+    }
+}
+
+impl FlatCombinedFieldsExec {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        query: CombinedFieldsQuery,
+        params: FtsSearchParams,
+        unindexed_input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        let stats_coverage = vec![FlatStatsCoverage::default(); query.column_names().len()];
+        Self {
+            dataset,
+            query,
+            tokenized_query: Arc::new(OnceLock::new()),
+            params,
+            unindexed_input,
+            base_scorer: None,
+            stats_coverage,
+            emit_prefilter: None,
+            scanned_fragments: roaring::RoaringBitmap::new(),
+            whole_corpus_stats: false,
+            resolved_fields: Vec::new(),
+            shared_scorer: None,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// Supply the schema-derived form of each target column's field path, in
+    /// query order.
+    ///
+    /// The planner resolves these to decide what the scan projects, and `execute`
+    /// needs the same answers to read the projected batches back, so one entry
+    /// per target column is required.
+    pub(crate) fn with_resolved_fields(mut self, resolved_fields: Vec<ResolvedFtsField>) -> Self {
+        self.resolved_fields = resolved_fields;
+        self
+    }
+
+    /// Publish the blended scorer this scan builds to an indexed sibling.
+    ///
+    /// Only this side sees the unindexed rows, so only it can produce the corpus
+    /// statistics both sides must score against.
+    pub(crate) fn with_shared_scorer(
+        mut self,
+        scorer: Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>,
+    ) -> Self {
+        self.shared_scorer = Some(scorer);
+        self
+    }
+
+    /// Record, per target column, which scanned rows its index does not already
+    /// account for.
+    ///
+    /// The flat scan must read all of a row's target columns or `tf'`/`dl'` would be
+    /// partial, but a scanned fragment can still be indexed for some of those
+    /// columns. Without this, such a row would be folded into that column's corpus
+    /// statistics on top of the index statistics that already include it, inflating
+    /// `docCount_f`, `sumTotalTermFreq_f`, and `docFreq_f`.
+    pub fn with_stats_coverage(mut self, coverage: Vec<FlatStatsCoverage>) -> Self {
+        self.stats_coverage = coverage;
+        self
+    }
+
+    /// Select emitted rows with `prefilter` rather than with the scan.
+    ///
+    /// The caller reads the scan unfiltered so that a folded row's contribution to the
+    /// corpus statistics does not depend on the query's filter, and hands the filter
+    /// here instead, which is how [`CombinedFieldsQueryExec`] treats its own.
+    pub fn with_emit_prefilter(
+        mut self,
+        prefilter: PreFilterSource,
+        scanned_fragments: roaring::RoaringBitmap,
+    ) -> Self {
+        self.emit_prefilter = Some(prefilter);
+        self.scanned_fragments = scanned_fragments;
+        self
+    }
+
+    /// Drop the target columns' index statistics in favour of this scan's own; see
+    /// [`CombinedCorpusStats::FlatOnly`](lance_index::scalar::inverted::CombinedCorpusStats::FlatOnly).
+    ///
+    /// Every entry of [`Self::with_stats_coverage`] must then span every target
+    /// fragment, or the fold drops rows nothing else now accounts for.
+    pub fn with_whole_corpus_stats(mut self) -> Self {
+        self.whole_corpus_stats = true;
+        self
+    }
+
+    /// Override the local blended scorer; see
+    /// [`CombinedFieldsQueryExec::with_base_scorer`].
+    pub fn with_base_scorer(mut self, scorer: Arc<CombinedFieldsBM25Scorer>) -> Self {
+        self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub fn query(&self) -> &CombinedFieldsQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+}
+
+impl ExecutionPlan for FlatCombinedFieldsExec {
+    fn name(&self) -> &str {
+        "FlatCombinedFieldsExec"
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        let mut children = vec![&self.unindexed_input];
+        if let Some(
+            PreFilterSource::FilteredRowIds(source) | PreFilterSource::ScalarIndexQuery(source),
+        ) = &self.emit_prefilter
+        {
+            children.push(source);
+        }
+        children
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // `execute()` reads only `unindexed_input.execute(partition)` for the
+        // single output partition, so the input must be coalesced to one
+        // partition or fragments would be silently dropped. Same reasoning as
+        // `FlatMatchQueryExec`.
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != self.children().len() {
+            return Err(DataFusionError::Internal(
+                "Unexpected number of children".to_string(),
+            ));
+        }
+        // Reverse order: the optional prefilter child is last.
+        let emit_prefilter = match (&self.emit_prefilter, children.pop()) {
+            (Some(PreFilterSource::FilteredRowIds(_)), Some(source)) => {
+                Some(PreFilterSource::FilteredRowIds(source))
+            }
+            (Some(PreFilterSource::ScalarIndexQuery(_)), Some(source)) => {
+                Some(PreFilterSource::ScalarIndexQuery(source))
+            }
+            // No prefilter child, so the popped plan is the input itself.
+            (source, popped) => {
+                children.extend(popped);
+                source.clone()
+            }
+        };
+        let Some(unindexed_input) = children.pop() else {
+            return Err(DataFusionError::Internal(
+                "combined_fields flat scan lost its input child".to_string(),
+            ));
+        };
+        Ok(Arc::new(Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params: self.params.clone(),
+            unindexed_input,
+            base_scorer: self.base_scorer.clone(),
+            stats_coverage: self.stats_coverage.clone(),
+            emit_prefilter,
+            scanned_fragments: self.scanned_fragments.clone(),
+            whole_corpus_stats: self.whole_corpus_stats,
+            resolved_fields: self.resolved_fields.clone(),
+            shared_scorer: self.shared_scorer.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }))
+    }
+
+    #[instrument(name = "flat_combined_fields_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let query = self.query.clone();
+        let tokenized_query = self.tokenized_query.clone();
+        let ds = self.dataset.clone();
+        let preset_base_scorer = self.base_scorer.clone();
+        let stats_coverage = self.stats_coverage.clone();
+        let emit_prefilter = self.emit_prefilter.clone();
+        let scanned_fragments = self.scanned_fragments.clone();
+        let whole_corpus_stats = self.whole_corpus_stats;
+        let prefilter_context = context.clone();
+        let stats_mask_ds = self.dataset.clone();
+        let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
+        let metrics_clone = metrics.clone();
+        let target_batch_size = context.session_config().batch_size();
+        let elapsed_compute = metrics.baseline_metrics.elapsed_compute().clone();
+
+        let shared_scorer_producer = self.shared_scorer.clone().map(SharedFtsScorerProducer::new);
+
+        // One resolved field per target column. Without the check a short list
+        // would silently fall back to reading the raw column, which for a
+        // `List<Utf8>` target still tokenizes and so reverts to a per-element
+        // `dl_f` instead of erroring.
+        if self.resolved_fields.len() != query.column_names().len() {
+            return Err(DataFusionError::Internal(format!(
+                "combined_fields flat scan got {} resolved fields for {} target columns",
+                self.resolved_fields.len(),
+                query.column_names().len()
+            )));
+        }
+        let mut input = self.unindexed_input.execute(partition, context)?;
+        for (column, resolved) in query.column_names().zip(&self.resolved_fields) {
+            // A path that continues past a `List` cannot be projected, so the scan
+            // brought its list root instead and the leaf text is derived here.
+            input = if resolved.has_lists() {
+                flatten_fts_document_column(input, resolved.clone())?
+            } else {
+                document_input(input, column)?
+            };
+        }
+
+        let stream =
+            stream::once(async move {
+                let shared_scorer_producer = shared_scorer_producer;
+                let result = async {
+                let CombinedFieldsScan {
+                    columns,
+                    tokens,
+                    tokenizer,
+                    ..
+                } = open_combined_fields_scan(
+                    &ds,
+                    &query,
+                    CombinedFieldsIndexRequirement::AtLeastOneColumn,
+                    &tokenized_query,
+                    metrics.as_ref(),
+                )
+                .await?;
+
+                let input_schema = input.schema();
+                let doc_col_indices = query
+                    .column_names()
+                    .map(|column| input_schema.index_of(column))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+
+                if stats_coverage.len() != columns.len() {
+                    return Err(DataFusionError::Internal(format!(
+                        "combined_fields flat scan got {} statistics coverage sets for {} columns",
+                        stats_coverage.len(),
+                        columns.len()
+                    )));
+                }
+                // One mask per target column, allowing the rows that column's index is
+                // missing. Built through `create_restricted_deletion_mask` so the
+                // fragment restriction lands in the same id space the flat scan's
+                // `_rowid` uses; a hand-rolled fragment-address allow list would match
+                // nothing under stable row ids. `None` means nothing needed filtering,
+                // i.e. every scanned row is missing from that index.
+                let mut stats_masks = Vec::with_capacity(stats_coverage.len());
+                for coverage in &stats_coverage {
+                    let mask = match DatasetPreFilter::create_restricted_deletion_mask(
+                        stats_mask_ds.clone(),
+                        coverage.fragments.clone(),
+                    ) {
+                        Some(fut) => fut.await?,
+                        None => Arc::new(RowAddrMask::all_rows()),
+                    };
+                    // The overlay-stale rows sit in fragments this column's index does
+                    // cover, so they are named individually rather than by fragment.
+                    let mask = if coverage.stale_rows.is_empty() {
+                        mask
+                    } else {
+                        Arc::new(mask.as_ref().clone().also_allow(coverage.stale_rows.clone()))
+                    };
+                    stats_masks.push(mask);
+                }
+
+                // Set when the scan was read unfiltered so a folded row's contribution
+                // does not move with the filter; the filter then picks what to emit.
+                let emit_mask = match emit_prefilter {
+                    Some(prefilter) => {
+                        let pre_filter = build_prefilter_restricted_to_fragments(
+                            prefilter_context,
+                            partition,
+                            &prefilter,
+                            stats_mask_ds.clone(),
+                            scanned_fragments,
+                        )?;
+                        pre_filter.wait_for_ready().await?;
+                        Some(pre_filter.mask())
+                    }
+                    None => None,
+                };
+
+                flat_combined_fields_search_stream(
+                    input,
+                    &columns,
+                    doc_col_indices,
+                    &stats_masks,
+                    emit_mask,
+                    whole_corpus_stats,
+                    &tokens,
+                    tokenizer,
+                    query.operator(),
+                    preset_base_scorer,
+                    target_batch_size,
+                    Some(elapsed_compute),
+                    Some(metrics.as_ref()),
+                )
+                .await
+            }
+            .await;
+
+                match result {
+                    Ok((stream, scorer)) => {
+                        if let Some(producer) = shared_scorer_producer {
+                            producer.publish(scorer);
+                        }
+                        Ok(stream)
+                    }
+                    Err(error) => {
+                        if let Some(producer) = shared_scorer_producer {
+                            producer.publish_error(&error);
+                        }
+                        Err(error)
+                    }
+                }
+            })
+            .try_flatten()
+            .map(move |batch| {
+                let poll = metrics_clone
+                    .baseline_metrics
+                    .record_poll(std::task::Poll::Ready(Some(batch)));
+                match poll {
+                    std::task::Poll::Ready(Some(b)) => b,
+                    _ => unreachable!("record_poll preserves Ready(Some) input"),
+                }
+            });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
             stream.stream_in_current_span().boxed(),
@@ -4457,7 +4962,9 @@ mod tests {
     use lance_core::{ROW_ID, utils::address::RowAddress};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
-    use lance_datafusion::utils::{INDEX_CACHE_HITS_METRIC, PARTITIONS_SEARCHED_METRIC};
+    use lance_datafusion::utils::{
+        INDEX_CACHE_HITS_METRIC, INDEX_CACHE_MISSES_METRIC, PARTITIONS_SEARCHED_METRIC,
+    };
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
     use lance_index::scalar::inverted::query::{
@@ -4465,8 +4972,8 @@ mod tests {
         Occur, Operator, PhraseQuery, collect_query_tokens, has_query_token,
     };
     use lance_index::scalar::inverted::{
-        CombinedFieldColumn, DocumentGranularity, FTS_SCHEMA, InvertedIndex, Language, SCORE_COL,
-        build_combined_bm25_scorer, build_global_bm25_scorer,
+        CombinedCorpusStats, CombinedFieldColumn, DocumentGranularity, FTS_SCHEMA, InvertedIndex,
+        Language, SCORE_COL, build_combined_bm25_scorer, build_global_bm25_scorer,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
@@ -4484,9 +4991,9 @@ mod tests {
 
     use super::{
         BoolSlot, BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec,
-        CrossColumnCompoundQueryExec, FTS_SEGMENT_BIND_DURATION_METRIC, FlatMatchFilterExec,
-        FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec, build_boolean_query_children,
-        default_text_tokenizer, open_fts_segments,
+        CrossColumnCompoundQueryExec, FTS_SEGMENT_BIND_DURATION_METRIC, FlatCombinedFieldsExec,
+        FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
+        build_boolean_query_children, default_text_tokenizer, open_fts_segments,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -5116,6 +5623,41 @@ mod tests {
         );
     }
 
+    /// A `combined_fields` scan is a leaf FTS node, so `analyze_plan` must show
+    /// its tokens the way it does for `match` and `phrase`. Both children of a
+    /// mixed plan report, or a `Boolean{combined_fields, match}` plan would show
+    /// tokens on the `match` sibling only.
+    #[tokio::test]
+    async fn test_analyze_plan_shows_combined_fields_tokens() {
+        let dataset = create_tokenized_query_fixture(&["title", "body"], true).await;
+        let query = CombinedFieldsQuery::try_new(
+            "FIRST and SECOND".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(query.into()))
+            .unwrap();
+
+        let explained = scanner.explain_plan(false).await.unwrap();
+        assert!(
+            !explained.contains("tokenized_query="),
+            "explain_plan should not claim runtime tokenization: {explained}"
+        );
+
+        let analysis = scanner.analyze_plan().await.unwrap();
+        let expected = r#"tokenized_query=[("first", 0), ("second", 2)]"#;
+        assert!(
+            find_plan_line(&analysis, "CombinedFieldsQuery:").contains(expected),
+            "indexed combined_fields is missing token positions:\n{analysis}"
+        );
+        assert!(
+            find_plan_line(&analysis, "FlatCombinedFields:").contains(expected),
+            "flat combined_fields is missing token positions:\n{analysis}"
+        );
+    }
+
     #[tokio::test]
     async fn test_boolean_query_parts_searched_metrics() {
         let mut dataset = lance_datagen::gen_batch()
@@ -5272,7 +5814,7 @@ mod tests {
         let expected_lookups = terms.len() * partitions;
         assert!(expected_lookups > 0);
         let scorer = Arc::new(
-            build_combined_bm25_scorer(&columns, &tokens, None)
+            build_combined_bm25_scorer(&columns, &tokens, CombinedCorpusStats::IndexOnly, None)
                 .await
                 .unwrap(),
         );
@@ -5313,6 +5855,40 @@ mod tests {
                 - metric_value(&preset, INDEX_CACHE_HITS_METRIC),
             expected_lookups,
             "CombinedFieldsQueryExec must report the scorer build's cache lookups",
+        );
+
+        // The flat sibling builds its own scorer from the same per-column index
+        // statistics. An empty input isolates those reads: the scanned rows
+        // contribute none, so the count is absolute rather than a delta.
+        let flat_schema = Arc::new(arrow_schema::Schema::new(vec![
+            lance_core::ROW_ID_FIELD.clone(),
+            arrow_schema::Field::new("title", DataType::Utf8, true),
+            arrow_schema::Field::new("body", DataType::Utf8, true),
+        ]));
+        let resolved_fields = query
+            .column_names()
+            .map(|column| {
+                crate::index::scalar::inverted::resolve_fts_field(
+                    dataset.schema(),
+                    column,
+                    DocumentGranularity::Row,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let flat = FlatCombinedFieldsExec::new(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            Arc::new(EmptyExec::new(flat_schema)),
+        )
+        .with_resolved_fields(resolved_fields);
+        assert!(execute_results(&flat).await.unwrap().is_empty());
+        assert_eq!(
+            metric_value(&flat, INDEX_CACHE_HITS_METRIC)
+                + metric_value(&flat, INDEX_CACHE_MISSES_METRIC),
+            expected_lookups,
+            "FlatCombinedFieldsExec must report the scorer build's cache lookups",
         );
     }
 

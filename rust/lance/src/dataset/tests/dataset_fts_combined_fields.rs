@@ -17,13 +17,13 @@ use arrow_array::{
     types::{Float32Type, Int32Type, Int64Type},
 };
 use lance_core::utils::tempfile::TempStrDir;
+use lance_index::IndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     Language,
     query::{MatchQuery, Operator},
     tokenizer::InvertedIndexParams,
 };
-use lance_index::IndexType;
 
 use lance_index::scalar::inverted::builder::BLOCK_SIZE;
 use lance_index::scalar::inverted::oracle::{brute_force_bm25f, brute_force_ids};

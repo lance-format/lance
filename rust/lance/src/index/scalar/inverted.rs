@@ -684,6 +684,71 @@ pub(crate) fn fts_document_schema(coordinate_rank: usize) -> Arc<ArrowSchema> {
     Arc::new(ArrowSchema::new(fields))
 }
 
+/// Add (or replace) a flat `Utf8` column holding each row's document text for a
+/// list-bearing FTS field path, leaving every other column and row untouched.
+///
+/// A Lance projection cannot address a field that continues past a `List`, so a
+/// scan that needs `docs.content` has to project the `docs` root instead. This
+/// walks the traversal down to the leaf per row, joining the elements exactly the
+/// way the index builder does at row granularity.
+///
+/// Row granularity yields one document per input row, in row order, keeping several
+/// such columns aligned for a cross-field blend. Not valid for list-element
+/// granularity, where a row expands to several documents.
+pub(crate) fn flatten_fts_document_column(
+    input: SendableRecordBatchStream,
+    resolved: ResolvedFtsField,
+) -> Result<SendableRecordBatchStream> {
+    if resolved.document_granularity.is_list_element() {
+        return Err(Error::internal(
+            "flatten_fts_document_column needs row documents to keep one output row per input row"
+                .to_string(),
+        ));
+    }
+    let input_schema = input.schema();
+    if input_schema
+        .column_with_name(&resolved.root_column)
+        .is_none()
+    {
+        return Err(Error::internal(format!(
+            "FTS document input must contain the root source column '{}'",
+            resolved.root_column
+        )));
+    }
+    let text_field = ArrowField::new(&resolved.canonical_path, DataType::Utf8, false);
+    let replaced = input_schema.column_with_name(&resolved.canonical_path);
+    let mut fields = input_schema.fields().to_vec();
+    match replaced {
+        Some((index, _)) => fields[index] = Arc::new(text_field),
+        None => fields.push(Arc::new(text_field)),
+    }
+    let replaced = replaced.map(|(index, _)| index);
+    let output_schema = Arc::new(ArrowSchema::new(fields));
+    let stream_schema = output_schema.clone();
+    let stream = input.map(move |batch| {
+        let batch = batch?;
+        let source = batch
+            .column_by_name(&resolved.root_column)
+            .expect("FTS document input schema was validated");
+        let documents = resolved
+            .documents_from_array(source, batch.num_rows())
+            .map_err(DataFusionError::from)?;
+        let texts = Arc::new(StringArray::from_iter_values(
+            documents.iter().map(|document| document.text.as_str()),
+        )) as ArrayRef;
+        let mut columns = batch.columns().to_vec();
+        match replaced {
+            Some(index) => columns[index] = texts,
+            None => columns.push(texts),
+        }
+        RecordBatch::try_new(stream_schema.clone(), columns).map_err(DataFusionError::from)
+    });
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        output_schema,
+        stream,
+    )))
+}
+
 pub(crate) fn transform_fts_document_stream(
     input: SendableRecordBatchStream,
     resolved: ResolvedFtsField,

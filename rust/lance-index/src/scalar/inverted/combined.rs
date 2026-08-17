@@ -23,6 +23,7 @@
 //! scored; see [`combined_fields_search`].
 
 mod cursor;
+mod flat;
 mod search;
 mod stats;
 #[cfg(test)]
@@ -32,8 +33,9 @@ use std::sync::Arc;
 
 use lance_core::{Error, Result};
 
+pub use flat::flat_combined_fields_search_stream;
 pub use search::combined_fields_search;
-pub use stats::build_combined_bm25_scorer;
+pub use stats::{CombinedCorpusStats, FlatFieldStats, build_combined_bm25_scorer};
 
 use super::index::InvertedIndex;
 use super::query::Tokens;

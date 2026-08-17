@@ -8,9 +8,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::array::AsArray;
+use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::stream;
 use lance_core::Result;
 use lance_core::cache::{LanceCache, WeakLanceCache};
+use lance_core::error::DataFusionResult;
 use lance_core::utils::tempfile::TempObjDir;
 use lance_io::object_store::ObjectStore;
 use lance_select::RowAddrTreeMap;
@@ -29,7 +35,9 @@ use super::super::index::{
 use super::super::query::{FtsSearchParams, Operator, Tokens};
 use super::super::tokenizer::document_tokenizer::DocType;
 use super::super::tokenizer::{InvertedIndexParams, LEGACY_BLOCK_SIZE};
-use super::{CombinedFieldColumn, build_combined_bm25_scorer, combined_fields_search};
+use super::{
+    CombinedCorpusStats, CombinedFieldColumn, build_combined_bm25_scorer, combined_fields_search,
+};
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::lance_format::LanceIndexStore;
@@ -133,6 +141,58 @@ pub(super) async fn modern_identity_docs(
     .address_keyed()
     .await
     .unwrap()
+}
+
+/// `_rowid` plus one `Utf8` document column per entry of `docs`
+/// (`docs[column][row]`), delivered as `num_batches` equal batches.
+pub(super) fn flat_input(
+    row_ids: &[u64],
+    docs: &[Vec<Option<&str>>],
+    num_batches: usize,
+) -> SendableRecordBatchStream {
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, Field, Schema};
+
+    let mut fields = vec![lance_core::ROW_ID_FIELD.clone()];
+    let mut arrays: Vec<ArrayRef> = vec![Arc::new(UInt64Array::from(row_ids.to_vec()))];
+    for (slot, column) in docs.iter().enumerate() {
+        fields.push(Field::new(format!("doc{slot}"), DataType::Utf8, true));
+        arrays.push(Arc::new(StringArray::from(column.clone())));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+    // No rows means no batches at all, the way an empty scan arrives.
+    let rows_per_batch = row_ids.len().div_ceil(num_batches.max(1));
+    let batches = (0..row_ids.len().div_ceil(rows_per_batch.max(1)))
+        .map(|i| {
+            let start = i * rows_per_batch;
+            let len = (row_ids.len() - start).min(rows_per_batch);
+            DataFusionResult::Ok(batch.slice(start, len))
+        })
+        .collect::<Vec<_>>();
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream::iter(batches)))
+}
+
+/// Every `(row_id, score)` the flat scan emits, in emission order, with the
+/// score as raw bits so the comparison is exact.
+pub(super) async fn flat_scores(
+    stream: SendableRecordBatchStream,
+) -> (Vec<usize>, Vec<(u64, u32)>) {
+    use futures::TryStreamExt;
+
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    let sizes = batches.iter().map(|batch| batch.num_rows()).collect();
+    let scored = batches
+        .iter()
+        .flat_map(|batch| {
+            let row_ids = batch.column(0).as_primitive::<UInt64Type>();
+            let scores = batch.column(1).as_primitive::<Float32Type>();
+            (0..batch.num_rows())
+                .map(|i| (row_ids.value(i), scores.value(i).to_bits()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    (sizes, scored)
 }
 
 // Legacy element-per-document corpus statistics.
@@ -284,7 +344,7 @@ pub(super) async fn combined_top_k(
         terms.iter().map(|t| (*t).to_owned()).collect(),
         DocType::Text,
     );
-    let scorer = build_combined_bm25_scorer(columns, &tokens, None)
+    let scorer = build_combined_bm25_scorer(columns, &tokens, CombinedCorpusStats::IndexOnly, None)
         .await
         .unwrap();
     let params = FtsSearchParams::new().with_limit(Some(limit));
