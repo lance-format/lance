@@ -144,6 +144,7 @@ impl From<&Action> for pb::Action {
             Action::ReserveFragmentIds(action) => {
                 pb::action::Action::ReserveFragmentIds(action.into())
             }
+            Action::ResetTable(action) => pb::action::Action::ResetTable(action.into()),
         };
         Self {
             action: Some(action),
@@ -180,6 +181,9 @@ impl TryFrom<pb::Action> for Action {
             Some(pb::action::Action::ReserveFragmentIds(action)) => {
                 Ok(Self::ReserveFragmentIds(action.try_into()?))
             }
+            Some(pb::action::Action::ResetTable(action)) => {
+                Ok(Self::ResetTable(action.try_into()?))
+            }
             // The drafted vocabulary is larger than what is implemented. Reject
             // rather than skip: silently dropping an action would apply a
             // partial transaction.
@@ -201,7 +205,7 @@ mod tests {
     use crate::rowids::version::RowDatasetVersionMeta;
     use crate::transaction::action::{
         AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, RemoveFragment,
-        ReserveFragmentIds, SetDeletionFile, TombstoneFieldData,
+        ReserveFragmentIds, ResetTable, SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::Field;
@@ -266,6 +270,7 @@ mod tests {
             }),
             Action::DropField(DropField { field: 3 }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
+            Action::ResetTable(ResetTable),
         ]
     }
 
@@ -300,7 +305,11 @@ mod tests {
     #[test]
     fn test_unimplemented_action_is_rejected() {
         let message = pb::Action {
-            action: Some(pb::action::Action::ResetTable(pb::ResetTable {})),
+            action: Some(pb::action::Action::RefreshRowVersionMetadata(
+                pb::RefreshRowVersionMetadata {
+                    fragment_ids: vec![1],
+                },
+            )),
         };
         let error = Action::try_from(message).unwrap_err();
         assert!(
