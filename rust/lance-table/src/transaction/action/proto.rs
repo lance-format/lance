@@ -1,27 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Conversions between the action vocabulary and its protobuf encoding.
+//! The envelope around the per-action protobuf encodings.
+//!
+//! Each action encodes itself, in its own module; this module carries the
+//! [`Ref`], [`UserOperation`], and [`UserAction`] wrappers, the dispatch over
+//! the `oneof`, and the helpers the per-action conversions share.
 //!
 //! Reading is fail-closed: an action this build does not implement is an error,
 //! never a silently skipped element. The commit path collects concurrent
 //! transactions with `try_collect`, so a transaction carrying an unknown action
 //! must abort the commit rather than be treated as a no-op.
 
-use super::{
-    Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, Ref,
-    RemoveFragment, SetDeletionFile, TombstoneFieldData, UserAction, UserOperation,
-};
+use super::{Action, Ref, UserAction, UserOperation};
 use crate::format::pb;
-use crate::format::{BasePath, DataFile, DeletionFile, ExternalFile, RowIdMeta};
-use crate::rowids::version::RowDatasetVersionMeta;
-use lance_core::datatypes::Field;
 use lance_core::{Error, Result};
 
 /// A field on the wire is a [`Ref`], so an action can name a field the same
 /// operation is minting. The actions that resolve one against the manifest come
 /// later; until then only a committed reference means anything here.
-fn field_id_from_wire(field: pb::Ref) -> Result<i32> {
+pub(super) fn field_id_from_wire(field: pb::Ref) -> Result<i32> {
     match Ref::try_from(field)? {
         Ref::Committed(id) => i32::try_from(id).map_err(|_| {
             Error::invalid_input(format!(
@@ -36,8 +34,22 @@ fn field_id_from_wire(field: pb::Ref) -> Result<i32> {
     }
 }
 
-fn field_id_to_wire(id: i32) -> pb::Ref {
+pub(super) fn field_id_to_wire(id: i32) -> pb::Ref {
     Ref::Committed(id as u64).into()
+}
+
+/// `data_change` is absent-means-true on the wire, so only the `false` case is
+/// written out.
+pub(super) fn data_change_to_wire(data_change: bool) -> Option<bool> {
+    (!data_change).then_some(false)
+}
+
+pub(super) fn data_change_from_wire(data_change: Option<bool>) -> bool {
+    data_change.unwrap_or(true)
+}
+
+pub(super) fn required<T>(value: Option<T>, what: &str) -> Result<T> {
+    value.ok_or_else(|| Error::invalid_input(format!("{what} is required but was not set")))
 }
 
 impl From<Ref> for pb::Ref {
@@ -62,16 +74,6 @@ impl TryFrom<pb::Ref> for Ref {
             )),
         }
     }
-}
-
-/// `data_change` is absent-means-true on the wire, so only the `false` case is
-/// written out.
-fn data_change_to_wire(data_change: bool) -> Option<bool> {
-    (!data_change).then_some(false)
-}
-
-fn data_change_from_wire(data_change: Option<bool>) -> bool {
-    data_change.unwrap_or(true)
 }
 
 impl From<&UserOperation> for pb::CompositeOperation {
@@ -186,302 +188,17 @@ impl TryFrom<pb::Action> for Action {
     }
 }
 
-impl From<&AddFragment> for pb::AddFragment {
-    fn from(value: &AddFragment) -> Self {
-        Self {
-            local: value.local,
-            physical_rows: value.physical_rows,
-            row_id_sequence: value.row_id_meta.as_ref().map(|meta| match meta {
-                RowIdMeta::Inline(data) => {
-                    pb::add_fragment::RowIdSequence::InlineRowIds(data.clone())
-                }
-                RowIdMeta::External(file) => {
-                    pb::add_fragment::RowIdSequence::ExternalRowIds(external_file_to_wire(file))
-                }
-            }),
-            last_updated_at_version_sequence: value
-                .last_updated_at_version_meta
-                .as_ref()
-                .map(|meta| match meta {
-                    RowDatasetVersionMeta::Inline(data) => {
-                        pb::add_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
-                            data.to_vec(),
-                        )
-                    }
-                    RowDatasetVersionMeta::External(file) => {
-                        pb::add_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
-                            external_file_to_wire(file),
-                        )
-                    }
-                }),
-            created_at_version_sequence: value
-                .created_at_version_meta
-                .as_ref()
-                .map(|meta| match meta {
-                    RowDatasetVersionMeta::Inline(data) => {
-                        pb::add_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(
-                            data.to_vec(),
-                        )
-                    }
-                    RowDatasetVersionMeta::External(file) => {
-                        pb::add_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(
-                            external_file_to_wire(file),
-                        )
-                    }
-                }),
-            data_change: data_change_to_wire(value.data_change),
-        }
-    }
-}
-
-impl TryFrom<pb::AddFragment> for AddFragment {
-    type Error = Error;
-
-    fn try_from(message: pb::AddFragment) -> Result<Self> {
-        Ok(Self {
-            local: message.local,
-            physical_rows: message.physical_rows,
-            row_id_meta: message.row_id_sequence.map(|sequence| match sequence {
-                pb::add_fragment::RowIdSequence::InlineRowIds(data) => RowIdMeta::Inline(data),
-                pb::add_fragment::RowIdSequence::ExternalRowIds(file) => {
-                    RowIdMeta::External(external_file_from_wire(file))
-                }
-            }),
-            last_updated_at_version_meta: message.last_updated_at_version_sequence.map(
-                |sequence| {
-                    match sequence {
-                    pb::add_fragment::LastUpdatedAtVersionSequence::InlineLastUpdatedAtVersions(
-                        data,
-                    ) => RowDatasetVersionMeta::Inline(data.into()),
-                    pb::add_fragment::LastUpdatedAtVersionSequence::ExternalLastUpdatedAtVersions(
-                        file,
-                    ) => RowDatasetVersionMeta::External(external_file_from_wire(file)),
-                }
-                },
-            ),
-            created_at_version_meta: message.created_at_version_sequence.map(|sequence| {
-                match sequence {
-                    pb::add_fragment::CreatedAtVersionSequence::InlineCreatedAtVersions(data) => {
-                        RowDatasetVersionMeta::Inline(data.into())
-                    }
-                    pb::add_fragment::CreatedAtVersionSequence::ExternalCreatedAtVersions(file) => {
-                        RowDatasetVersionMeta::External(external_file_from_wire(file))
-                    }
-                }
-            }),
-            data_change: data_change_from_wire(message.data_change),
-        })
-    }
-}
-
-fn external_file_to_wire(file: &ExternalFile) -> pb::ExternalFile {
-    pb::ExternalFile {
-        path: file.path.clone(),
-        offset: file.offset,
-        size: file.size,
-    }
-}
-
-fn external_file_from_wire(file: pb::ExternalFile) -> ExternalFile {
-    ExternalFile {
-        path: file.path,
-        offset: file.offset,
-        size: file.size,
-    }
-}
-
-impl From<&AddDataFile> for pb::AddDataFile {
-    fn from(value: &AddDataFile) -> Self {
-        Self {
-            fragment: Some(value.fragment.into()),
-            file: Some(pb::DataFile::from(&value.file)),
-            field_ids: value.field_ids.iter().map(|id| (*id).into()).collect(),
-            data_change: data_change_to_wire(value.data_change),
-        }
-    }
-}
-
-impl TryFrom<pb::AddDataFile> for AddDataFile {
-    type Error = Error;
-
-    fn try_from(message: pb::AddDataFile) -> Result<Self> {
-        Ok(Self {
-            fragment: required(message.fragment, "AddDataFile.fragment")?.try_into()?,
-            file: DataFile::try_from(required(message.file, "AddDataFile.file")?)?,
-            field_ids: message
-                .field_ids
-                .into_iter()
-                .map(Ref::try_from)
-                .collect::<Result<Vec<_>>>()?,
-            data_change: data_change_from_wire(message.data_change),
-        })
-    }
-}
-
-impl From<&AddField> for pb::AddField {
-    fn from(value: &AddField) -> Self {
-        Self {
-            local: value.local,
-            parent: value.parent.map(Into::into),
-            def: Some(lance_file::format::pb::Field::from(&value.def)),
-        }
-    }
-}
-
-impl TryFrom<pb::AddField> for AddField {
-    type Error = Error;
-
-    fn try_from(message: pb::AddField) -> Result<Self> {
-        Ok(Self {
-            local: message.local,
-            parent: message.parent.map(Ref::try_from).transpose()?,
-            def: Field::from(&required(message.def, "AddField.def")?),
-        })
-    }
-}
-
-impl From<&AddBase> for pb::AddBase {
-    fn from(value: &AddBase) -> Self {
-        Self {
-            local: value.local,
-            base: Some(pb::BasePath::from(value.base.clone())),
-        }
-    }
-}
-
-impl TryFrom<pb::AddBase> for AddBase {
-    type Error = Error;
-
-    fn try_from(message: pb::AddBase) -> Result<Self> {
-        Ok(Self {
-            local: message.local,
-            base: BasePath::from(required(message.base, "AddBase.base")?),
-        })
-    }
-}
-
-impl From<&TombstoneFieldData> for pb::TombstoneFieldData {
-    fn from(value: &TombstoneFieldData) -> Self {
-        Self {
-            fragment: Some(value.fragment.into()),
-            field_ids: value.field_ids.iter().map(|id| field_id_to_wire(*id)).collect(),
-            data_change: data_change_to_wire(value.data_change),
-        }
-    }
-}
-
-impl TryFrom<pb::TombstoneFieldData> for TombstoneFieldData {
-    type Error = Error;
-
-    fn try_from(message: pb::TombstoneFieldData) -> Result<Self> {
-        Ok(Self {
-            fragment: required(message.fragment, "TombstoneFieldData.fragment")?.try_into()?,
-            field_ids: message
-                .field_ids
-                .into_iter()
-                .map(field_id_from_wire)
-                .collect::<Result<Vec<_>>>()?,
-            data_change: data_change_from_wire(message.data_change),
-        })
-    }
-}
-
-impl From<&RemoveFragment> for pb::RemoveFragment {
-    fn from(value: &RemoveFragment) -> Self {
-        Self {
-            fragment: Some(value.fragment.into()),
-            data_change: data_change_to_wire(value.data_change),
-        }
-    }
-}
-
-impl TryFrom<pb::RemoveFragment> for RemoveFragment {
-    type Error = Error;
-
-    fn try_from(message: pb::RemoveFragment) -> Result<Self> {
-        Ok(Self {
-            fragment: required(message.fragment, "RemoveFragment.fragment")?.try_into()?,
-            data_change: data_change_from_wire(message.data_change),
-        })
-    }
-}
-
-impl From<&SetDeletionFile> for pb::SetDeletionFile {
-    fn from(value: &SetDeletionFile) -> Self {
-        Self {
-            fragment: value.fragment,
-            deletion_file: value.deletion_file.as_ref().map(pb::DeletionFile::from),
-            data_change: data_change_to_wire(value.data_change),
-        }
-    }
-}
-
-impl TryFrom<pb::SetDeletionFile> for SetDeletionFile {
-    type Error = Error;
-
-    fn try_from(message: pb::SetDeletionFile) -> Result<Self> {
-        Ok(Self {
-            fragment: message.fragment,
-            deletion_file: message
-                .deletion_file
-                .map(DeletionFile::try_from)
-                .transpose()?,
-            data_change: data_change_from_wire(message.data_change),
-        })
-    }
-}
-
-impl From<&AlterField> for pb::AlterField {
-    fn from(value: &AlterField) -> Self {
-        Self {
-            field: Some(field_id_to_wire(value.field)),
-            name: value.name.clone(),
-            logical_type: value.logical_type.clone(),
-            nullable: value.nullable,
-        }
-    }
-}
-
-impl TryFrom<pb::AlterField> for AlterField {
-    type Error = Error;
-
-    fn try_from(message: pb::AlterField) -> Result<Self> {
-        Ok(Self {
-            field: field_id_from_wire(required(message.field, "AlterField.field")?)?,
-            name: message.name,
-            logical_type: message.logical_type,
-            nullable: message.nullable,
-        })
-    }
-}
-
-impl From<&DropField> for pb::DropField {
-    fn from(value: &DropField) -> Self {
-        Self {
-            field: value.field as u64,
-        }
-    }
-}
-
-impl TryFrom<pb::DropField> for DropField {
-    type Error = Error;
-
-    fn try_from(message: pb::DropField) -> Result<Self> {
-        Ok(Self {
-            field: field_id_from_wire(message.field)?,
-        })
-    }
-}
-
-fn required<T>(value: Option<T>, what: &str) -> Result<T> {
-    value.ok_or_else(|| Error::invalid_input(format!("{what} is required but was not set")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{DeletionFileType, pb};
+    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, RowIdMeta, pb};
+    use crate::rowids::version::RowDatasetVersionMeta;
+    use crate::transaction::action::{
+        AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, RemoveFragment,
+        SetDeletionFile, TombstoneFieldData,
+    };
     use arrow_schema::{DataType, Field as ArrowField};
+    use lance_core::datatypes::Field;
     use std::sync::Arc;
 
     fn sample_data_file() -> DataFile {
@@ -603,6 +320,15 @@ mod tests {
         let error = Ref::try_from(pb::Ref { kind: None }).unwrap_err();
         assert!(
             error.to_string().contains("committed or local"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn test_field_id_out_of_range_is_rejected() {
+        let error = field_id_from_wire(u64::from(u32::MAX) + 1).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds the maximum field id"),
             "unexpected message: {error}"
         );
     }

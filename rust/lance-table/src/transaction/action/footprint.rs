@@ -12,8 +12,11 @@
 //! Footprints are derived from the actions at conflict time and never
 //! serialized. A writer cannot pin down what a reader considers a conflict, and
 //! the rule can be tightened in a later release without a format change.
+//!
+//! Which coordinates an action writes is decided by that action, in its own
+//! module. This module holds the coordinate space and the comparison.
 
-use super::{Action, Ref, UserOperation};
+use super::{Ref, UserOperation};
 use std::collections::HashSet;
 
 /// One thing an action set writes.
@@ -99,11 +102,13 @@ impl Footprint {
         })
     }
 
-    fn add(&mut self, coordinate: Coordinate) {
+    pub(super) fn add(&mut self, coordinate: Coordinate) {
         self.writes.insert(coordinate);
     }
 
-    fn add_field_data(&mut self, fragment: Ref, fields: impl IntoIterator<Item = i32>) {
+    /// The data of each field within `fragment`. A fragment minted in this same
+    /// operation records nothing: no concurrent writer can be naming it.
+    pub(super) fn add_field_data(&mut self, fragment: Ref, fields: impl IntoIterator<Item = i32>) {
         let Some(fragment) = fragment.committed() else {
             return;
         };
@@ -111,45 +116,23 @@ impl Footprint {
             self.add(Coordinate::FieldData { fragment, field });
         }
     }
+
+    pub(super) fn remove_fragment(&mut self, fragment: u64) {
+        self.add(Coordinate::FragmentExistence(fragment));
+        self.removed_fragments.insert(fragment);
+    }
+
+    pub(super) fn remove_field(&mut self, field: i32) {
+        self.add(Coordinate::FieldDefinition(field));
+        self.removed_fields.insert(field);
+    }
 }
 
 impl From<&UserOperation> for Footprint {
     fn from(user_operation: &UserOperation) -> Self {
         let mut footprint = Self::default();
         for action in user_operation.iter_actions() {
-            match action {
-                // Minting actions name nothing that exists in the read version.
-                Action::AddFragment(_) | Action::AddField(_) => {}
-                Action::AddBase(action) => {
-                    footprint.add(Coordinate::BaseName(action.base.name.clone()));
-                    footprint.add(Coordinate::BaseLocation(action.base.path.clone()));
-                }
-                Action::AddDataFile(action) => footprint.add_field_data(
-                    action.fragment,
-                    action.field_ids.iter().filter_map(|field| {
-                        field.committed().and_then(|id| i32::try_from(id).ok())
-                    }),
-                ),
-                Action::TombstoneFieldData(action) => {
-                    footprint.add_field_data(action.fragment, action.field_ids.iter().copied())
-                }
-                Action::RemoveFragment(action) => {
-                    if let Some(id) = action.fragment.committed() {
-                        footprint.add(Coordinate::FragmentExistence(id));
-                        footprint.removed_fragments.insert(id);
-                    }
-                }
-                Action::SetDeletionFile(action) => {
-                    footprint.add(Coordinate::FragmentDeletions(action.fragment))
-                }
-                Action::AlterField(action) => {
-                    footprint.add(Coordinate::FieldDefinition(action.field))
-                }
-                Action::DropField(action) => {
-                    footprint.add(Coordinate::FieldDefinition(action.field));
-                    footprint.removed_fields.insert(action.field);
-                }
-            }
+            action.footprint(&mut footprint);
         }
         footprint
     }
@@ -160,7 +143,7 @@ mod tests {
     use super::*;
     use crate::format::{BasePath, DataFile};
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, RemoveFragment,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, RemoveFragment,
         SetDeletionFile, TombstoneFieldData, UserAction,
     };
     use arrow_schema::{DataType, Field as ArrowField};

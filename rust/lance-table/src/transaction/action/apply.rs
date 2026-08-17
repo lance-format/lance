@@ -9,21 +9,22 @@
 //! that token -- in this same operation -- resolves to the id this apply chose.
 //! Replaying the same action set against a different version therefore produces
 //! different ids without any of the actions changing.
+//!
+//! [`ApplyState`] is that working copy, and its methods are the API the action
+//! modules program against. What each action does with it lives in that action's
+//! own module.
 
-use super::{
-    Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, Ref,
-    RemoveFragment, SetDeletionFile, TombstoneFieldData, UserOperation,
-};
+use super::{Ref, UserOperation};
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig};
 use crate::rowids::version::build_version_meta;
 use crate::transaction::Transaction;
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use std::collections::{HashMap, HashSet};
 
 /// The field id written into a data file's field list once the file no longer
 /// backs that field. A file whose every slot is tombstoned is dropped.
-const TOMBSTONED_FIELD: i32 = -2;
+pub(super) const TOMBSTONED_FIELD: i32 = -2;
 
 impl Transaction {
     /// Build the next manifest by applying an action set.
@@ -54,7 +55,7 @@ impl Transaction {
         let new_version = current_manifest.version + 1;
         let mut state = ApplyState::new(current_manifest);
         for action in user_operation.iter_actions() {
-            state.apply(action)?;
+            action.apply(&mut state)?;
         }
 
         let mut next_row_id = current_manifest
@@ -99,7 +100,7 @@ impl Transaction {
 
 /// The read-version state an action set is applied against, plus the id
 /// allocations made so far.
-struct ApplyState {
+pub(super) struct ApplyState {
     schema: Schema,
     fragments: Vec<Fragment>,
     /// Base paths minted by this operation. Kept apart from the manifest's own
@@ -147,271 +148,140 @@ impl ApplyState {
         }
     }
 
-    fn apply(&mut self, action: &Action) -> Result<()> {
-        match action {
-            Action::AddFragment(action) => self.add_fragment(action),
-            Action::AddDataFile(action) => self.add_data_file(action),
-            Action::AddField(action) => self.add_field(action),
-            Action::AddBase(action) => self.add_base(action),
-            Action::TombstoneFieldData(action) => self.tombstone_field_data(action),
-            Action::RemoveFragment(action) => self.remove_fragment(action),
-            Action::SetDeletionFile(action) => self.set_deletion_file(action),
-            Action::AlterField(action) => self.alter_field(action),
-            Action::DropField(action) => self.drop_field(action),
-        }
+    pub(super) fn schema(&self) -> &Schema {
+        &self.schema
     }
 
-    fn add_fragment(&mut self, action: &AddFragment) -> Result<()> {
-        if self.fragment_tokens.contains_key(&action.local) {
-            return Err(duplicate_token_err("fragment", action.local));
-        }
-        let id = self.next_fragment_id;
-        self.next_fragment_id += 1;
-        self.fragment_tokens.insert(action.local, id);
-        self.minted_fragments.insert(id);
-
-        self.fragments.push(Fragment {
-            id,
-            files: Vec::new(),
-            overlays: Vec::new(),
-            deletion_file: None,
-            row_id_meta: action.row_id_meta.clone(),
-            physical_rows: Some(action.physical_rows as usize),
-            last_updated_at_version_meta: action.last_updated_at_version_meta.clone(),
-            created_at_version_meta: action.created_at_version_meta.clone(),
-        });
-        Ok(())
+    pub(super) fn schema_mut(&mut self) -> &mut Schema {
+        &mut self.schema
     }
 
-    fn add_data_file(&mut self, action: &AddDataFile) -> Result<()> {
-        let fragment_id = self.resolve_fragment(action.fragment)?;
-        let field_ids = action
-            .field_ids
-            .iter()
-            .map(|field| self.resolve_field(*field))
-            .collect::<Result<Vec<_>>>()?;
+    pub(super) fn fragments_mut(&mut self) -> &mut [Fragment] {
+        &mut self.fragments
+    }
 
-        let mut file = action.file.clone();
-        if !file.column_indices.is_empty() && file.column_indices.len() != field_ids.len() {
-            return Err(Error::invalid_input(format!(
-                "AddDataFile for fragment {fragment_id} lists {} field ids but the file has {} \
-                 columns",
-                field_ids.len(),
-                file.column_indices.len()
-            )));
-        }
-        file.fields = field_ids.into();
-
-        let fragment = self
-            .fragments
+    pub(super) fn fragment_mut(&mut self, fragment_id: u64, action: &str) -> Result<&mut Fragment> {
+        self.fragments
             .iter_mut()
             .find(|fragment| fragment.id == fragment_id)
             .ok_or_else(|| {
                 Error::invalid_input(format!(
-                    "AddDataFile targets fragment {fragment_id}, which does not exist"
+                    "{action} targets fragment {fragment_id}, which does not exist"
                 ))
-            })?;
-        fragment.files.push(file);
-        Ok(())
+            })
     }
 
-    fn add_field(&mut self, action: &AddField) -> Result<()> {
-        let id = self.next_field_id;
-        self.next_field_id += 1;
-        if self.field_tokens.contains_key(&action.local) {
-            return Err(duplicate_token_err("field", action.local));
-        }
-        self.field_tokens.insert(action.local, id);
-
-        let parent_id = action
-            .parent
-            .map(|parent| self.resolve_field(parent))
-            .transpose()?;
-
-        // The definition's own id, parent id, and children are ignored: the
-        // minted id and the parent reference carry that structure, and each
-        // child column arrives as its own action.
-        let field = Field {
-            id,
-            parent_id: parent_id.unwrap_or(-1),
-            children: Vec::new(),
-            ..action.def.clone()
-        };
-
-        match parent_id {
-            None => self.schema.fields.push(field),
-            Some(parent_id) => {
-                let parent = self.schema.field_by_id_mut(parent_id).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "AddField names parent field {parent_id}, which does not exist"
-                    ))
-                })?;
-                parent.children.push(field);
-            }
-        }
-        Ok(())
+    pub(super) fn push_fragment(&mut self, fragment: Fragment) {
+        self.fragments.push(fragment);
     }
 
-    fn add_base(&mut self, action: &AddBase) -> Result<()> {
-        let id = self.next_base_id;
-        self.next_base_id += 1;
-        if self.base_tokens.contains_key(&action.local) {
-            return Err(duplicate_token_err("base", action.local));
-        }
-        self.base_tokens.insert(action.local, id);
-
-        let conflicting = self
-            .existing_base_paths
-            .values()
-            .chain(self.new_bases.iter())
-            .find(|base| base.name == action.base.name || base.path == action.base.path);
-        if let Some(conflicting) = conflicting {
-            return Err(Error::invalid_input(format!(
-                "Conflict detected: Base path with name '{:?}' or path '{}' already exists. \
-                 Existing: name='{:?}', path='{}'",
-                action.base.name, action.base.path, conflicting.name, conflicting.path
-            )));
-        }
-
-        let mut base = action.base.clone();
-        base.id = id;
-        self.new_bases.push(base);
-        Ok(())
-    }
-
-    fn tombstone_field_data(&mut self, action: &TombstoneFieldData) -> Result<()> {
-        let fragment_id = self.resolve_fragment(action.fragment)?;
-        let fragment = fragment_mut(&mut self.fragments, fragment_id, "TombstoneFieldData")?;
-
-        for &field_id in &action.field_ids {
-            let mut found = false;
-            for file in fragment.files.iter_mut() {
-                let Some(position) = file.fields.iter().position(|id| *id == field_id) else {
-                    continue;
-                };
-                let mut fields = file.fields.to_vec();
-                fields[position] = TOMBSTONED_FIELD;
-                file.fields = fields.into();
-                found = true;
-            }
-            if !found {
-                return Err(Error::invalid_input(format!(
-                    "TombstoneFieldData names field {field_id}, which no data file in fragment \
-                     {fragment_id} backs"
-                )));
-            }
-        }
-
-        // New values for these fields supersede any overlay still shadowing
-        // them, so the drop is not silently masked by stale overlay cells.
-        let overlaid: Vec<u32> = action
-            .field_ids
-            .iter()
-            .filter_map(|id| u32::try_from(*id).ok())
-            .collect();
-        crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
-
-        self.rebound_fields
-            .entry(fragment_id)
-            .or_default()
-            .extend(action.field_ids.iter().copied());
-        Ok(())
-    }
-
-    fn remove_fragment(&mut self, action: &RemoveFragment) -> Result<()> {
-        let fragment_id = self.resolve_fragment(action.fragment)?;
+    /// Drop a fragment and forget everything recorded about it. `false` if no
+    /// such fragment was present.
+    pub(super) fn remove_fragment(&mut self, fragment_id: u64) -> bool {
         let before = self.fragments.len();
         self.fragments.retain(|fragment| fragment.id != fragment_id);
         if self.fragments.len() == before {
-            return Err(Error::invalid_input(format!(
-                "RemoveFragment targets fragment {fragment_id}, which does not exist"
-            )));
+            return false;
         }
         self.minted_fragments.remove(&fragment_id);
         self.rebound_fields.remove(&fragment_id);
-        Ok(())
+        true
     }
 
-    fn set_deletion_file(&mut self, action: &SetDeletionFile) -> Result<()> {
-        let fragment = fragment_mut(&mut self.fragments, action.fragment, "SetDeletionFile")?;
-        fragment.deletion_file = action.deletion_file.clone();
-        Ok(())
+    /// The base paths this apply can see: the read version's, plus the ones
+    /// earlier actions in this operation minted.
+    pub(super) fn bases(&self) -> impl Iterator<Item = &BasePath> {
+        self.existing_base_paths
+            .values()
+            .chain(self.new_bases.iter())
     }
 
-    fn alter_field(&mut self, action: &AlterField) -> Result<()> {
-        let field = self.schema.field_by_id_mut(action.field).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "AlterField names field {}, which does not exist",
-                action.field
-            ))
-        })?;
-        if let Some(name) = &action.name {
-            field.name.clone_from(name);
-        }
-        if let Some(nullable) = action.nullable {
-            field.nullable = nullable;
-        }
-        if let Some(logical_type) = &action.logical_type {
-            field.logical_type = logical_type.as_str().into();
-            // The cast leaves any index on the field describing the old type.
-            // The data rewrite itself is separate actions; this only records
-            // that every fragment's view of the field changed.
-            for fragment in &self.fragments {
-                self.rebound_fields
-                    .entry(fragment.id)
-                    .or_default()
-                    .insert(action.field);
-            }
-        }
-        Ok(())
+    pub(super) fn push_base(&mut self, base: BasePath) {
+        self.new_bases.push(base);
     }
 
-    fn drop_field(&mut self, action: &DropField) -> Result<()> {
-        let field = self.schema.field_by_id(action.field).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "DropField names field {}, which does not exist",
-                action.field
-            ))
-        })?;
-        // A struct's children cannot outlive it, so the whole subtree goes.
-        let mut dropped = HashSet::new();
-        collect_subtree_ids(field, &mut dropped);
-        remove_field(&mut self.schema.fields, action.field);
-
-        // The fields are gone from the schema, so the slots that backed them in
-        // each data file are dead. Tombstoning rather than rewriting the field
-        // list keeps a file's remaining columns at the positions they were
-        // written at; a file left with nothing live is pruned during
-        // normalization.
-        for fragment in self.fragments.iter_mut() {
-            for file in fragment.files.iter_mut() {
-                if !file.fields.iter().any(|id| dropped.contains(id)) {
-                    continue;
-                }
-                let fields = file
-                    .fields
-                    .iter()
-                    .map(|id| {
-                        if dropped.contains(id) {
-                            TOMBSTONED_FIELD
-                        } else {
-                            *id
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                file.fields = fields.into();
-            }
-
-            let overlaid: Vec<u32> = dropped
-                .iter()
-                .filter_map(|id| u32::try_from(*id).ok())
-                .collect();
-            crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
+    pub(super) fn mint_fragment(&mut self, token: u32) -> Result<u64> {
+        if self.fragment_tokens.contains_key(&token) {
+            return Err(duplicate_token_err("fragment", token));
         }
+        let id = self.next_fragment_id;
+        self.next_fragment_id += 1;
+        self.fragment_tokens.insert(token, id);
+        self.minted_fragments.insert(id);
+        Ok(id)
+    }
 
-        // Indices over a field that no longer exists are discarded wholesale by
-        // `retain_relevant_indices`, so there is nothing to record here.
-        Ok(())
+    pub(super) fn mint_field(&mut self, token: u32) -> Result<i32> {
+        if self.field_tokens.contains_key(&token) {
+            return Err(duplicate_token_err("field", token));
+        }
+        let id = self.next_field_id;
+        self.next_field_id += 1;
+        self.field_tokens.insert(token, id);
+        Ok(id)
+    }
+
+    pub(super) fn mint_base(&mut self, token: u32) -> Result<u32> {
+        if self.base_tokens.contains_key(&token) {
+            return Err(duplicate_token_err("base", token));
+        }
+        let id = self.next_base_id;
+        self.next_base_id += 1;
+        self.base_tokens.insert(token, id);
+        Ok(id)
+    }
+
+    pub(super) fn resolve_fragment(&self, reference: Ref) -> Result<u64> {
+        match reference {
+            Ref::Committed(id) => Ok(id),
+            Ref::Local(token) => self
+                .fragment_tokens
+                .get(&token)
+                .copied()
+                .ok_or_else(|| unbound_token_err("fragment", token)),
+        }
+    }
+
+    pub(super) fn resolve_field(&self, reference: Ref) -> Result<i32> {
+        match reference {
+            Ref::Committed(id) => i32::try_from(id).map_err(|_| {
+                Error::invalid_input(format!("field id {id} in an action is out of range"))
+            }),
+            Ref::Local(token) => self
+                .field_tokens
+                .get(&token)
+                .copied()
+                .ok_or_else(|| unbound_token_err("field", token)),
+        }
+    }
+
+    /// Record that these fields' data in this fragment no longer matches what
+    /// an index built over them recorded.
+    pub(super) fn rebind_fields(
+        &mut self,
+        fragment_id: u64,
+        fields: impl IntoIterator<Item = i32>,
+    ) {
+        self.rebound_fields
+            .entry(fragment_id)
+            .or_default()
+            .extend(fields);
+    }
+
+    /// As [`Self::rebind_fields`], for a change that invalidates the field
+    /// across every fragment at once.
+    pub(super) fn rebind_field_everywhere(&mut self, field: i32) {
+        let fragment_ids = self
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        for fragment_id in fragment_ids {
+            self.rebound_fields
+                .entry(fragment_id)
+                .or_default()
+                .insert(field);
+        }
     }
 
     /// Stamp row ids and version metadata onto the fragments this operation
@@ -450,64 +320,6 @@ impl ApplyState {
         self.minted_fragments = minted_ids;
         Ok(())
     }
-
-    fn resolve_fragment(&self, reference: Ref) -> Result<u64> {
-        match reference {
-            Ref::Committed(id) => Ok(id),
-            Ref::Local(token) => self
-                .fragment_tokens
-                .get(&token)
-                .copied()
-                .ok_or_else(|| unbound_token_err("fragment", token)),
-        }
-    }
-
-    fn resolve_field(&self, reference: Ref) -> Result<i32> {
-        match reference {
-            Ref::Committed(id) => i32::try_from(id).map_err(|_| {
-                Error::invalid_input(format!("field id {id} in an action is out of range"))
-            }),
-            Ref::Local(token) => self
-                .field_tokens
-                .get(&token)
-                .copied()
-                .ok_or_else(|| unbound_token_err("field", token)),
-        }
-    }
-}
-
-fn collect_subtree_ids(field: &Field, out: &mut HashSet<i32>) {
-    out.insert(field.id);
-    for child in &field.children {
-        collect_subtree_ids(child, out);
-    }
-}
-
-/// Remove the field with `field_id` from `fields`, at whatever depth it sits.
-fn remove_field(fields: &mut Vec<Field>, field_id: i32) {
-    let before = fields.len();
-    fields.retain(|field| field.id != field_id);
-    if fields.len() != before {
-        return;
-    }
-    for field in fields.iter_mut() {
-        remove_field(&mut field.children, field_id);
-    }
-}
-
-fn fragment_mut<'a>(
-    fragments: &'a mut [Fragment],
-    fragment_id: u64,
-    action: &str,
-) -> Result<&'a mut Fragment> {
-    fragments
-        .iter_mut()
-        .find(|fragment| fragment.id == fragment_id)
-        .ok_or_else(|| {
-            Error::invalid_input(format!(
-                "{action} targets fragment {fragment_id}, which does not exist"
-            ))
-        })
 }
 
 /// Drop the fragments whose data no longer matches what an index recorded.
@@ -554,593 +366,11 @@ fn duplicate_token_err(space: &str, token: u32) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{DataFile, DeletionFile, DeletionFileType};
+    use crate::format::DataFile;
     use crate::transaction::Operation;
-    use crate::transaction::action::UserAction;
-    use crate::transaction::test_support::{
-        default_build_config, sample_index_metadata, sample_manifest,
-    };
-    use arrow_schema::{DataType, Field as ArrowField};
-    use std::sync::Arc;
-
-    fn apply(manifest: &Manifest, actions: Vec<Action>) -> Result<Manifest> {
-        apply_with_indices(manifest, actions, Vec::new()).map(|(manifest, _)| manifest)
-    }
-
-    fn apply_with_indices(
-        manifest: &Manifest,
-        actions: Vec<Action>,
-        indices: Vec<IndexMetadata>,
-    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
-        let transaction = Transaction::new(
-            manifest.version,
-            Operation::UserOperation(UserOperation::new(
-                "test",
-                vec![UserAction::new("step", actions)],
-            )),
-            None,
-        );
-        transaction.build_manifest(Some(manifest), indices, "tx.txn", &default_build_config())
-    }
-
-    fn added_field(name: &str) -> Field {
-        Field::try_from(ArrowField::new(name, DataType::Int32, true)).unwrap()
-    }
-
-    /// `sample_manifest` with fragment 0 actually backed by a data file, so the
-    /// reference-stable actions have something committed to point at.
-    fn backed_manifest() -> Manifest {
-        let mut manifest = sample_manifest();
-        let mut fragment = Fragment::new(0);
-        fragment.physical_rows = Some(10);
-        fragment.files.push(DataFile::new(
-            "data/0.lance",
-            vec![0],
-            vec![0],
-            2,
-            0,
-            None,
-            None,
-        ));
-        manifest.fragments = Arc::new(vec![fragment]);
-        manifest
-    }
-
-    #[test]
-    fn test_tombstone_field_data_drops_the_backing_file() {
-        let manifest = backed_manifest();
-        let next = apply(
-            &manifest,
-            vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![0],
-                data_change: true,
-            })],
-        )
-        .unwrap();
-
-        // The file backed only field 0, so tombstoning it leaves nothing behind.
-        assert!(next.fragments[0].files.is_empty());
-    }
-
-    #[test]
-    fn test_tombstone_field_data_keeps_a_file_with_a_live_field() {
-        let mut manifest = backed_manifest();
-        let mut fragment = manifest.fragments[0].clone();
-        fragment.files[0] = DataFile::new("data/0.lance", vec![0, 1], vec![0, 1], 2, 0, None, None);
-        manifest.fragments = Arc::new(vec![fragment]);
-
-        let next = apply(
-            &manifest,
-            vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![0],
-                data_change: true,
-            })],
-        )
-        .unwrap();
-
-        assert_eq!(
-            next.fragments[0].files[0].fields.as_ref(),
-            &[TOMBSTONED_FIELD, 1]
-        );
-    }
-
-    #[test]
-    fn test_tombstone_field_data_prunes_the_fragment_from_covering_indices() {
-        let manifest = backed_manifest();
-        let (_, indices) = apply_with_indices(
-            &manifest,
-            vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![0],
-                data_change: true,
-            })],
-            vec![sample_index_metadata("idx")],
-        )
-        .unwrap();
-
-        // The index covers field 0, whose data in fragment 0 is now gone.
-        assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_tombstone_field_data_rejects_a_field_no_file_backs() {
-        let manifest = backed_manifest();
-        let error = apply(
-            &manifest,
-            vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![7],
-                data_change: true,
-            })],
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-        assert!(error.to_string().contains("field 7"), "{error}");
-    }
-
-    #[test]
-    fn test_remove_fragment() {
-        let manifest = backed_manifest();
-        let next = apply(
-            &manifest,
-            vec![Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(0),
-                data_change: true,
-            })],
-        )
-        .unwrap();
-
-        assert!(next.fragments.is_empty());
-    }
-
-    #[test]
-    fn test_remove_fragment_can_drop_one_minted_in_the_same_operation() {
-        let manifest = backed_manifest();
-        let next = apply(
-            &manifest,
-            vec![
-                Action::AddFragment(AddFragment {
-                    local: 0,
-                    physical_rows: 10,
-                    row_id_meta: None,
-                    last_updated_at_version_meta: None,
-                    created_at_version_meta: None,
-                    data_change: true,
-                }),
-                Action::RemoveFragment(RemoveFragment {
-                    fragment: Ref::Local(0),
-                    data_change: true,
-                }),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(
-            next.fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
-            vec![0]
-        );
-    }
-
-    #[test]
-    fn test_remove_fragment_rejects_a_missing_fragment() {
-        let manifest = backed_manifest();
-        let error = apply(
-            &manifest,
-            vec![Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(7),
-                data_change: true,
-            })],
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-        assert!(error.to_string().contains("fragment 7"), "{error}");
-    }
-
-    #[test]
-    fn test_set_deletion_file_sets_and_clears() {
-        let manifest = backed_manifest();
-        let deletion_file = DeletionFile {
-            read_version: manifest.version,
-            id: 3,
-            file_type: DeletionFileType::Array,
-            num_deleted_rows: Some(2),
-            base_id: None,
-        };
-        let next = apply(
-            &manifest,
-            vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment: 0,
-                deletion_file: Some(deletion_file.clone()),
-                data_change: true,
-            })],
-        )
-        .unwrap();
-        assert_eq!(next.fragments[0].deletion_file, Some(deletion_file));
-
-        // An absent deletion file is a request to clear it, not a no-op.
-        let cleared = apply(
-            &next,
-            vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment: 0,
-                deletion_file: None,
-                data_change: true,
-            })],
-        )
-        .unwrap();
-        assert_eq!(cleared.fragments[0].deletion_file, None);
-    }
-
-    #[test]
-    fn test_set_deletion_file_rejects_a_missing_fragment() {
-        let manifest = backed_manifest();
-        let error = apply(
-            &manifest,
-            vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment: 7,
-                deletion_file: None,
-                data_change: true,
-            })],
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-    }
-
-    #[test]
-    fn test_alter_field_renames_without_touching_indices() {
-        let manifest = backed_manifest();
-        let (next, indices) = apply_with_indices(
-            &manifest,
-            vec![Action::AlterField(AlterField {
-                field: 0,
-                name: Some("renamed".into()),
-                logical_type: None,
-                nullable: Some(true),
-            })],
-            vec![sample_index_metadata("idx")],
-        )
-        .unwrap();
-
-        let field = next.schema.field_by_id(0).unwrap();
-        assert_eq!(field.name, "renamed");
-        assert!(field.nullable);
-        // A rename does not change the values the index recorded.
-        assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
-    }
-
-    #[test]
-    fn test_alter_field_retype_prunes_covering_indices() {
-        let manifest = backed_manifest();
-        let (next, indices) = apply_with_indices(
-            &manifest,
-            vec![Action::AlterField(AlterField {
-                field: 0,
-                name: None,
-                logical_type: Some("int64".into()),
-                nullable: None,
-            })],
-            vec![sample_index_metadata("idx")],
-        )
-        .unwrap();
-
-        assert_eq!(
-            next.schema.field_by_id(0).unwrap().logical_type.to_string(),
-            "int64"
-        );
-        assert!(indices[0].fragment_bitmap.as_ref().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_alter_field_rejects_a_missing_field() {
-        let manifest = backed_manifest();
-        let error = apply(
-            &manifest,
-            vec![Action::AlterField(AlterField {
-                field: 7,
-                name: Some("nope".into()),
-                ..Default::default()
-            })],
-        )
-        .unwrap_err();
-
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-        assert!(error.to_string().contains("field 7"), "{error}");
-    }
-
-    #[test]
-    fn test_drop_field_removes_it_and_its_data() {
-        let manifest = backed_manifest();
-        let (next, indices) = apply_with_indices(
-            &manifest,
-            vec![Action::DropField(DropField { field: 0 })],
-            vec![sample_index_metadata("idx")],
-        )
-        .unwrap();
-
-        assert!(next.schema.field_by_id(0).is_none());
-        // The file backed only the dropped field, so nothing is left of it.
-        assert!(next.fragments[0].files.is_empty());
-        // An index over a field that no longer exists is discarded outright.
-        assert!(indices.is_empty());
-    }
-
-    #[test]
-    fn test_drop_field_keeps_a_file_with_a_surviving_field() {
-        let mut manifest = backed_manifest();
-        let mut schema_field = added_field("keep");
-        schema_field.id = 1;
-        manifest.schema.fields.push(schema_field);
-        let mut fragment = manifest.fragments[0].clone();
-        fragment.files[0] = DataFile::new("data/0.lance", vec![0, 1], vec![0, 1], 2, 0, None, None);
-        manifest.fragments = Arc::new(vec![fragment]);
-
-        let next = apply(&manifest, vec![Action::DropField(DropField { field: 0 })]).unwrap();
-
-        assert!(next.schema.field_by_id(0).is_none());
-        assert!(next.schema.field_by_id(1).is_some());
-        // The surviving field stays at the position it was written at.
-        assert_eq!(
-            next.fragments[0].files[0].fields.as_ref(),
-            &[TOMBSTONED_FIELD, 1]
-        );
-    }
-
-    #[test]
-    fn test_drop_field_takes_the_whole_subtree() {
-        let mut manifest = backed_manifest();
-        let mut parent = Field::try_from(ArrowField::new("parent", DataType::Int32, true)).unwrap();
-        parent.id = 1;
-        let mut child = added_field("child");
-        child.id = 2;
-        child.parent_id = 1;
-        parent.children.push(child);
-        manifest.schema.fields.push(parent);
-
-        let next = apply(&manifest, vec![Action::DropField(DropField { field: 1 })]).unwrap();
-
-        assert!(next.schema.field_by_id(1).is_none());
-        assert!(
-            next.schema.field_by_id(2).is_none(),
-            "a struct's children cannot outlive it"
-        );
-    }
-
-    #[test]
-    fn test_drop_field_rejects_a_missing_field() {
-        let manifest = backed_manifest();
-        let error = apply(&manifest, vec![Action::DropField(DropField { field: 7 })]).unwrap_err();
-
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-        assert!(error.to_string().contains("field 7"), "{error}");
-    }
-
-    #[test]
-    fn test_drop_field_then_add_a_field_reuses_no_id() {
-        let manifest = backed_manifest();
-        let next = apply(
-            &manifest,
-            vec![
-                Action::DropField(DropField { field: 0 }),
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("replacement"),
-                }),
-            ],
-        )
-        .unwrap();
-
-        // Field ids come from a monotonic counter, never from the freed id --
-        // an old data file naming id 0 must not be read as the new field.
-        let ids = next
-            .schema
-            .fields_pre_order()
-            .map(|field| field.id)
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec![1]);
-    }
-
-    #[test]
-    fn test_add_fragment_and_data_file_mint_ids() {
-        let manifest = sample_manifest();
-        let next = apply(
-            &manifest,
-            vec![
-                Action::AddFragment(AddFragment {
-                    local: 0,
-                    physical_rows: 10,
-                    row_id_meta: None,
-                    last_updated_at_version_meta: None,
-                    created_at_version_meta: None,
-                    data_change: true,
-                }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file: DataFile::new_unstarted("data/new.lance", 2, 0),
-                    field_ids: vec![Ref::Committed(0)],
-                    data_change: true,
-                }),
-            ],
-        )
-        .unwrap();
-
-        // sample_manifest already holds fragment 0, so the mint lands on 1.
-        assert_eq!(
-            next.fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        let minted = next.fragments.iter().find(|f| f.id == 1).unwrap();
-        assert_eq!(minted.physical_rows, Some(10));
-        assert_eq!(minted.files.len(), 1);
-        // The file's field list is stamped in from the action's refs.
-        assert_eq!(minted.files[0].fields.as_ref(), &[0]);
-        assert_eq!(next.max_fragment_id(), Some(1));
-    }
-
-    #[test]
-    fn test_two_add_fields_mint_distinct_ids() {
-        let manifest = sample_manifest();
-        let next = apply(
-            &manifest,
-            vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("a"),
-                }),
-                Action::AddField(AddField {
-                    local: 1,
-                    parent: None,
-                    def: added_field("b"),
-                }),
-            ],
-        )
-        .unwrap();
-
-        let ids = next
-            .schema
-            .fields
-            .iter()
-            .map(|f| (f.name.as_str(), f.id))
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec![("id", 0), ("a", 1), ("b", 2)]);
-    }
-
-    #[test]
-    fn test_add_field_then_add_its_data_file() {
-        // The add-column shape: mint the field, then write the file that backs
-        // it, naming the field by the token the mint has not resolved yet.
-        let manifest = sample_manifest();
-        let next = apply(
-            &manifest,
-            vec![
-                Action::AddField(AddField {
-                    local: 7,
-                    parent: None,
-                    def: added_field("added"),
-                }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(0),
-                    file: DataFile::new_unstarted("data/added.lance", 2, 0),
-                    field_ids: vec![Ref::Local(7)],
-                    data_change: true,
-                }),
-            ],
-        )
-        .unwrap();
-
-        let field_id = next.schema.field("added").unwrap().id;
-        assert_eq!(field_id, 1);
-        let fragment = next.fragments.iter().find(|f| f.id == 0).unwrap();
-        assert_eq!(fragment.files.last().unwrap().fields.as_ref(), &[field_id]);
-    }
-
-    #[test]
-    fn test_add_field_under_a_parent() {
-        let manifest = sample_manifest();
-        let next = apply(
-            &manifest,
-            vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: Field::try_from(ArrowField::new(
-                        "nested",
-                        DataType::Struct(Default::default()),
-                        true,
-                    ))
-                    .unwrap(),
-                }),
-                Action::AddField(AddField {
-                    local: 1,
-                    parent: Some(Ref::Local(0)),
-                    def: added_field("child"),
-                }),
-            ],
-        )
-        .unwrap();
-
-        let parent = next.schema.field("nested").unwrap();
-        assert_eq!(parent.children.len(), 1);
-        assert_eq!(parent.children[0].name, "child");
-        assert_eq!(parent.children[0].parent_id, parent.id);
-    }
-
-    #[test]
-    fn test_add_base_mints_an_id_and_rejects_duplicates() {
-        let manifest = sample_manifest();
-        let next = apply(
-            &manifest,
-            vec![Action::AddBase(AddBase {
-                local: 0,
-                base: BasePath::new(0, "s3://bucket/a".into(), Some("a".into()), false),
-            })],
-        )
-        .unwrap();
-        assert_eq!(next.base_paths.len(), 1);
-        assert_eq!(next.base_paths[&1].path, "s3://bucket/a");
-
-        let error = apply(
-            &next,
-            vec![Action::AddBase(AddBase {
-                local: 0,
-                base: BasePath::new(0, "s3://bucket/a".into(), Some("other".into()), false),
-            })],
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("already exists"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn test_unbound_local_token_is_rejected() {
-        let manifest = sample_manifest();
-        let error = apply(
-            &manifest,
-            vec![Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(3),
-                file: DataFile::new_unstarted("data/x.lance", 2, 0),
-                field_ids: vec![Ref::Committed(0)],
-                data_change: true,
-            })],
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("local fragment token 3"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn test_duplicate_local_token_is_rejected() {
-        let manifest = sample_manifest();
-        let error = apply(
-            &manifest,
-            vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("a"),
-                }),
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("b"),
-                }),
-            ],
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("minted more than once"),
-            "unexpected error: {error}"
-        );
-    }
+    use crate::transaction::action::test_support::{added_field, apply, backed_manifest};
+    use crate::transaction::action::{Action, AddDataFile, AddField, AddFragment};
+    use crate::transaction::test_support::default_build_config;
 
     #[test]
     fn test_an_action_set_relocates_onto_a_newer_version() {

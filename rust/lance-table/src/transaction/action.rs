@@ -14,10 +14,17 @@
 //! Only the subset of the drafted vocabulary that is implemented appears here --
 //! an action this build does not know is rejected on load rather than skipped.
 //!
+//! Each action lives in its own module and owns everything about itself: its
+//! definition, how it is applied, which coordinates it writes, and its wire
+//! encoding. This module holds the shared vocabulary and dispatches to them.
+//!
 //! ```text
-//! action             the vocabulary (this module)
-//! action::apply      applying an action set to produce the next manifest
-//! action::proto      its persisted protobuf encoding
+//! action                the vocabulary and the dispatch (this module)
+//! action::<an_action>   one action, end to end
+//! action::apply         the working state an action set is applied against
+//! action::footprint     comparing two action sets for conflicts
+//! action::proto         the envelope around the per-action encodings
+//! action::translate     lowering a named operation into actions
 //! ```
 //!
 //! # Stability
@@ -26,16 +33,36 @@
 //! contract, and a transaction carrying a [`UserOperation`] is rejected outright
 //! by libraries that predate it.
 
+mod add_base;
+mod add_data_file;
+mod add_field;
+mod add_fragment;
+mod alter_field;
 mod apply;
+mod drop_field;
 mod footprint;
 mod proto;
+mod remove_fragment;
+mod set_deletion_file;
+mod tombstone_field_data;
 mod translate;
 
-pub use footprint::{Coordinate, Footprint};
+#[cfg(test)]
+mod test_support;
 
-use crate::format::{BasePath, DataFile, DeletionFile, RowIdMeta};
-use crate::rowids::version::RowDatasetVersionMeta;
-use lance_core::datatypes::Field;
+pub use add_base::AddBase;
+pub use add_data_file::AddDataFile;
+pub use add_field::AddField;
+pub use add_fragment::AddFragment;
+pub use alter_field::AlterField;
+pub use drop_field::DropField;
+pub use footprint::{Coordinate, Footprint};
+pub use remove_fragment::RemoveFragment;
+pub use set_deletion_file::SetDeletionFile;
+pub use tombstone_field_data::TombstoneFieldData;
+
+use apply::ApplyState;
+use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 
 /// A reference to a counter-allocated identifier -- a field id, fragment id, or
@@ -128,7 +155,8 @@ impl UserAction {
 /// A single granular change to the manifest.
 ///
 /// The drafted vocabulary is larger than this; the variants here are the ones
-/// this build implements end to end.
+/// this build implements end to end. Each one is defined, applied, and encoded
+/// in the module named after it.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub enum Action {
     AddFragment(AddFragment),
@@ -175,142 +203,42 @@ impl Action {
             Self::AddField(_) | Self::AddBase(_) | Self::AlterField(_) => false,
         }
     }
+
+    /// Fold this action into the state the next manifest is built from.
+    fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        match self {
+            Self::AddFragment(action) => action.apply(state),
+            Self::AddDataFile(action) => action.apply(state),
+            Self::AddField(action) => action.apply(state),
+            Self::AddBase(action) => action.apply(state),
+            Self::TombstoneFieldData(action) => action.apply(state),
+            Self::RemoveFragment(action) => action.apply(state),
+            Self::SetDeletionFile(action) => action.apply(state),
+            Self::AlterField(action) => action.apply(state),
+            Self::DropField(action) => action.apply(state),
+        }
+    }
+
+    /// Record the coordinates this action writes.
+    fn footprint(&self, footprint: &mut Footprint) {
+        match self {
+            Self::AddFragment(action) => action.footprint(footprint),
+            Self::AddDataFile(action) => action.footprint(footprint),
+            Self::AddField(action) => action.footprint(footprint),
+            Self::AddBase(action) => action.footprint(footprint),
+            Self::TombstoneFieldData(action) => action.footprint(footprint),
+            Self::RemoveFragment(action) => action.footprint(footprint),
+            Self::SetDeletionFile(action) => action.footprint(footprint),
+            Self::AlterField(action) => action.footprint(footprint),
+            Self::DropField(action) => action.footprint(footprint),
+        }
+    }
 }
 
 impl std::fmt::Display for Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
     }
-}
-
-/// Mint a new, empty fragment.
-///
-/// Its data files arrive via [`AddDataFile`] actions naming this fragment's
-/// local token. A freshly-minted fragment has no deletion vector: it has no
-/// committed rows to delete yet.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub struct AddFragment {
-    /// Token standing in for the fragment id until it is allocated at apply.
-    pub local: u32,
-    /// Physical rows in the fragment, including rows later tombstoned.
-    pub physical_rows: u64,
-    /// Stable row id sequence. `None` on datasets without stable row ids, and
-    /// on datasets that have them but where the ids are assigned at apply.
-    pub row_id_meta: Option<RowIdMeta>,
-    /// Per-row version metadata, carried exactly as on
-    /// [`Fragment`](crate::format::Fragment). `None` means "stamp at apply".
-    pub last_updated_at_version_meta: Option<RowDatasetVersionMeta>,
-    pub created_at_version_meta: Option<RowDatasetVersionMeta>,
-    /// `false` marks a pure rearrangement, e.g. a compaction rewrite.
-    pub data_change: bool,
-}
-
-/// Add a data file to a fragment.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub struct AddDataFile {
-    /// The fragment to add the file to: committed, or a fragment minted earlier
-    /// in the same operation.
-    pub fragment: Ref,
-    /// The file. Its `fields` are placeholders and are stamped in at apply from
-    /// `field_ids`, which is the authority for the column -> field mapping.
-    pub file: DataFile,
-    /// One entry per column in `file`, in column order.
-    pub field_ids: Vec<Ref>,
-    /// See [`AddFragment::data_change`].
-    pub data_change: bool,
-}
-
-/// Mint a new schema field.
-///
-/// A nested column that introduces several fields is several ordered
-/// `AddField`s -- parent first, each child naming its parent's local token.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub struct AddField {
-    /// Token standing in for the field id until it is allocated at apply.
-    pub local: u32,
-    /// The parent field, or `None` for a top-level column.
-    pub parent: Option<Ref>,
-    /// The field definition. Its `id`, `parent_id`, and `children` are ignored:
-    /// `local` and `parent` carry that structure, and each child is its own
-    /// action.
-    pub def: Field,
-}
-
-/// Mint a new base path.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub struct AddBase {
-    /// Token standing in for the base id until it is allocated at apply.
-    pub local: u32,
-    /// The base path. Its `id` is ignored and stamped in at apply.
-    pub base: BasePath,
-}
-
-/// Tombstone the data-file binding of committed fields within one fragment.
-///
-/// Each field's slot in whatever file currently backs it is marked tombstoned,
-/// and a file left with no live field is pruned at apply. Data files have no id
-/// of their own and a live field is backed by exactly one file, so this is how a
-/// column's data is dropped or superseded: re-encoding a column is a tombstone
-/// followed by an [`AddDataFile`] for the same field.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub struct TombstoneFieldData {
-    pub fragment: Ref,
-    /// Committed field ids whose current backing is tombstoned.
-    pub field_ids: Vec<i32>,
-    /// See [`AddFragment::data_change`].
-    pub data_change: bool,
-}
-
-/// Remove a fragment entirely -- every row deleted, or the fragment replaced by
-/// compaction.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub struct RemoveFragment {
-    pub fragment: Ref,
-    /// See [`AddFragment::data_change`].
-    pub data_change: bool,
-}
-
-/// Set (replace) a fragment's deletion file.
-///
-/// This is reference-stable rather than a delta: the fragment id is committed
-/// and physical row offsets never move, so the post-image is unambiguous. The
-/// newly-deleted rows -- the delta rebase and conflict detection need -- are
-/// derived by diffing against the read version rather than serialized.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub struct SetDeletionFile {
-    /// The fragment, by committed id. Unlike its sibling fragment actions this
-    /// takes no [`Ref`]: a fragment minted in the same operation has no
-    /// committed rows to delete.
-    pub fragment: u64,
-    /// The new deletion file, or `None` to clear the fragment's deletions.
-    pub deletion_file: Option<DeletionFile>,
-    /// See [`AddFragment::data_change`].
-    pub data_change: bool,
-}
-
-/// Alter facets of an existing field in place, preserving its id.
-///
-/// Each facet is independently optional -- present means "change this", absent
-/// means "leave it alone" -- so a widening cast and a nullability relaxation on
-/// the same field commute. A cast additionally needs a [`TombstoneFieldData`]
-/// plus a fresh [`AddDataFile`] to rewrite the data.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf, Default)]
-pub struct AlterField {
-    pub field: i32,
-    pub name: Option<String>,
-    /// The new Arrow logical type. The cast.
-    pub logical_type: Option<String>,
-    pub nullable: Option<bool>,
-}
-
-/// Remove a field from the schema.
-///
-/// The field's descendants go with it, since a struct's children cannot outlive
-/// it. At apply, any data file left backing no live field is dropped, and any
-/// index over a removed field is discarded.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub struct DropField {
-    pub field: i32,
 }
 
 #[cfg(test)]
