@@ -39,6 +39,7 @@ mod add_field;
 mod add_fragment;
 mod alter_field;
 mod apply;
+mod config_update;
 mod drop_field;
 mod footprint;
 mod proto;
@@ -57,8 +58,9 @@ pub use add_data_file::AddDataFile;
 pub use add_field::AddField;
 pub use add_fragment::AddFragment;
 pub use alter_field::AlterField;
+pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
-pub use footprint::{Coordinate, Footprint};
+pub use footprint::{ConfigMap, Coordinate, Footprint};
 pub use remove_fragment::RemoveFragment;
 pub use reserve_fragment_ids::ReserveFragmentIds;
 pub use reset_table::ResetTable;
@@ -174,6 +176,7 @@ pub enum Action {
     DropField(DropField),
     ReserveFragmentIds(ReserveFragmentIds),
     ResetTable(ResetTable),
+    ConfigUpdate(ConfigUpdate),
 }
 
 impl Action {
@@ -190,6 +193,7 @@ impl Action {
             Self::DropField(_) => "DropField",
             Self::ReserveFragmentIds(_) => "ReserveFragmentIds",
             Self::ResetTable(_) => "ResetTable",
+            Self::ConfigUpdate(_) => "ConfigUpdate",
         }
     }
 
@@ -214,7 +218,8 @@ impl Action {
             Self::AddField(_)
             | Self::AddBase(_)
             | Self::AlterField(_)
-            | Self::ReserveFragmentIds(_) => false,
+            | Self::ReserveFragmentIds(_)
+            | Self::ConfigUpdate(_) => false,
         }
     }
 
@@ -232,6 +237,7 @@ impl Action {
             Self::DropField(action) => action.apply(state),
             Self::ReserveFragmentIds(action) => action.apply(state),
             Self::ResetTable(action) => action.apply(state),
+            Self::ConfigUpdate(action) => action.apply(state),
         }
     }
 
@@ -249,6 +255,7 @@ impl Action {
             Self::DropField(action) => action.footprint(footprint),
             Self::ReserveFragmentIds(action) => action.footprint(footprint),
             Self::ResetTable(action) => action.footprint(footprint),
+            Self::ConfigUpdate(action) => action.footprint(footprint),
         }
     }
 }
