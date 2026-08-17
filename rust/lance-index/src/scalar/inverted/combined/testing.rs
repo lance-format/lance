@@ -173,6 +173,18 @@ pub(super) fn flat_input(
     Box::pin(RecordBatchStreamAdapter::new(schema, stream::iter(batches)))
 }
 
+pub(super) fn flat_columns(weights: &[f32]) -> Vec<CombinedFieldColumn> {
+    weights
+        .iter()
+        .enumerate()
+        .map(|(slot, weight)| CombinedFieldColumn {
+            column: format!("doc{slot}"),
+            weight: *weight,
+            indices: Vec::new(),
+        })
+        .collect()
+}
+
 /// Every `(row_id, score)` the flat scan emits, in emission order, with the
 /// score as raw bits so the comparison is exact.
 pub(super) async fn flat_scores(

@@ -260,3 +260,233 @@ fn flat_combined_score(
         ],
     )?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::tokenizer::InvertedIndexParams;
+    use super::super::super::tokenizer::document_tokenizer::DocType;
+    use super::super::testing::{flat_columns, flat_input, flat_scores};
+    use super::*;
+    use lance_select::RowAddrTreeMap;
+    use rstest::rstest;
+
+    /// Golden `(row_id, score)` for the flat BM25F scan, compared bit-for-bit.
+    ///
+    /// The blend `dl' = Σ_f w_f·dl_f` and `tf'_t = Σ_f w_f·tf_f,t` accumulates in
+    /// f32, which is not associative, and the corpus statistics it feeds are
+    /// derived from the same rows. Any change to how or where the per-column
+    /// contributions are summed has to leave these exact bits alone, so they are
+    /// pinned here rather than compared with a tolerance.
+    ///
+    /// The fixture exercises the parts that a plausible rewrite gets wrong:
+    /// non-unit and unequal weights, a row empty in one column but not the other,
+    /// a null, a row empty everywhere (dropped), and a `stats_masks` entry that
+    /// keeps one row out of one column's corpus totals.
+    #[tokio::test]
+    async fn test_flat_combined_fields_golden_scores() {
+        let row_ids: Vec<u64> = (0..7).collect();
+        let docs = vec![
+            vec![
+                Some("cat"),
+                Some("dog cat"),
+                None,
+                Some("bird"),
+                Some("cat cat dog"),
+                Some(""),
+                Some("cat dog bird"),
+            ],
+            vec![
+                Some("dog"),
+                None,
+                Some("cat dog dog"),
+                Some("fish"),
+                Some("cat"),
+                Some(""),
+                Some("bird bird"),
+            ],
+        ];
+        let weights = [1.0f32, 2.5];
+        let columns = flat_columns(&weights);
+        let tokens = Tokens::new(vec!["cat".to_string(), "dog".to_string()], DocType::Text);
+        let tokenizer = InvertedIndexParams::default().build().unwrap();
+        // Column 1 must not fold row 4 into its corpus totals (its index already
+        // holds that row); column 0 folds everything.
+        let stats_masks = vec![
+            Arc::new(RowAddrMask::all_rows()),
+            Arc::new(RowAddrMask::all_rows().also_block(RowAddrTreeMap::from_iter([4u64]))),
+        ];
+
+        let stream = flat_combined_fields_search_stream(
+            flat_input(&row_ids, &docs, 1),
+            &columns,
+            vec![1, 2],
+            &stats_masks,
+            /*emit_mask=*/ None,
+            /*flat_covers_whole_corpus=*/ false,
+            &tokens,
+            tokenizer,
+            Operator::Or,
+            None,
+            3,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .0;
+        let (batch_sizes, scored) = flat_scores(stream).await;
+
+        // Row 5 is empty in both columns, so it never reaches the scorer, and row 3
+        // ("bird" / "fish") carries no query term, so it scores 0 and is dropped.
+        // `target_batch_size` of 3 splits the 5 survivors into 3 + 2.
+        assert_eq!(batch_sizes, vec![3, 2]);
+        assert_eq!(
+            scored,
+            vec![
+                (0, 0x3f9b_c3cf),
+                (1, 0x3f8f_0e96),
+                (2, 0x3fa6_8e68),
+                (4, 0x3f84_f2a6),
+                (6, 0x3f32_7287),
+            ]
+        );
+    }
+
+    /// The retained per-row payload must not grow with the number of target
+    /// columns. That independence is the whole point of blending during
+    /// tokenization: a `combined_fields` query over a wide column list routes the
+    /// entire dataset down this path as soon as one column's index is stale, and
+    /// the accumulation lives until the corpus statistics are complete.
+    ///
+    /// The input arrives as several batches, so this also covers the per-batch
+    /// statistics fold and that the retained rows stay in scan order across chunks.
+    #[tokio::test]
+    async fn test_flat_combined_fields_retention_is_independent_of_column_count() {
+        let row_ids: Vec<u64> = (0..64).collect();
+        let column = vec![Some("cat dog bird"); 64];
+        let tokens = Arc::new(Tokens::new(
+            vec!["cat".to_string(), "dog".to_string(), "bird".to_string()],
+            DocType::Text,
+        ));
+        let num_terms = tokens.len();
+
+        let mut footprints = Vec::new();
+        for num_columns in 1..=4usize {
+            let docs = vec![column.clone(); num_columns];
+            let (chunks, stats) = tokenize_and_blend_multi(
+                flat_input(&row_ids, &docs, 5),
+                InvertedIndexParams::default().build().unwrap(),
+                tokens.clone(),
+                Arc::new((1..=num_columns).collect()),
+                Arc::new(vec![1.0; num_columns]),
+                Some(Arc::new(
+                    (0..num_columns)
+                        .map(|_| Arc::new(RowAddrMask::all_rows()))
+                        .collect(),
+                )),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let retained: usize = chunks
+                .iter()
+                .map(|chunk| {
+                    chunk.row_ids.len() * size_of::<u64>()
+                        + (chunk.doc_lengths.len() + chunk.term_freqs.len()) * size_of::<f32>()
+                })
+                .sum();
+            let retained_row_ids: Vec<u64> = chunks
+                .iter()
+                .flat_map(|chunk| &chunk.row_ids)
+                .copied()
+                .collect();
+            assert!(chunks.len() > 1, "expected several chunks to fold");
+            assert_eq!(retained_row_ids, row_ids);
+            let rows = retained_row_ids.len();
+            // 8 bytes of row id plus `dl'` and one `tf'` per term, all f32.
+            assert_eq!(retained, rows * (8 + 4 * (1 + num_terms)));
+            footprints.push(retained);
+
+            // Every column sees the same three-token doc, so the statistics scale
+            // with the column count while the retained payload does not.
+            let stats = stats.unwrap();
+            assert_eq!(stats.doc_counts, vec![rows; num_columns]);
+            assert_eq!(stats.total_tokens, vec![3 * rows as u64; num_columns]);
+            assert_eq!(stats.doc_freqs, vec![vec![rows; num_terms]; num_columns]);
+        }
+        assert!(footprints.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    /// A flat scan can legitimately see no batches at all (every scanned fragment
+    /// empty, or a prefilter that keeps nothing). The statistics fold still owes the
+    /// caller a scorer, so it reports all-zero totals rather than nothing.
+    #[tokio::test]
+    async fn test_flat_combined_fields_empty_scan_still_builds_a_scorer() {
+        let docs = vec![Vec::<Option<&str>>::new(), Vec::new()];
+        let stream = flat_combined_fields_search_stream(
+            flat_input(&[], &docs, 1),
+            &flat_columns(&[1.0, 2.5]),
+            vec![1, 2],
+            &[
+                Arc::new(RowAddrMask::all_rows()),
+                Arc::new(RowAddrMask::all_rows()),
+            ],
+            /*emit_mask=*/ None,
+            /*flat_covers_whole_corpus=*/ false,
+            &Tokens::new(vec!["cat".to_string()], DocType::Text),
+            InvertedIndexParams::default().build().unwrap(),
+            Operator::Or,
+            None,
+            16,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let (batch_sizes, scored) = flat_scores(stream).await;
+        assert!(batch_sizes.is_empty());
+        assert!(scored.is_empty());
+    }
+
+    /// A caller that hands over the wrong number of document columns or statistics
+    /// masks has a bug, and it must surface whatever the query tokenizes to. The
+    /// empty-token case is the one that used to slip through, because matching
+    /// nothing short circuits before any per-column work happens.
+    #[rstest]
+    #[case::empty_query(Vec::new())]
+    #[case::one_term(vec!["cat".to_string()])]
+    #[tokio::test]
+    async fn test_flat_combined_fields_rejects_mismatched_arity(#[case] tokens: Vec<String>) {
+        let docs = vec![Vec::<Option<&str>>::new(), Vec::new()];
+        let result = flat_combined_fields_search_stream(
+            flat_input(&[], &docs, 1),
+            &flat_columns(&[1.0, 2.5]),
+            // Two target columns, but one document column and one mask.
+            vec![1],
+            &[Arc::new(RowAddrMask::all_rows())],
+            /*emit_mask=*/ None,
+            /*flat_covers_whole_corpus=*/ false,
+            &Tokens::new(tokens, DocType::Text),
+            InvertedIndexParams::default().build().unwrap(),
+            Operator::Or,
+            None,
+            16,
+            None,
+            None,
+        )
+        .await;
+
+        let Err(error) = result else {
+            panic!("mismatched arity must be rejected");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("got 1 document columns and 1 statistics masks for 2 target columns"),
+            "unexpected error: {error}",
+        );
+    }
+}
