@@ -22,7 +22,8 @@ use lance::Dataset;
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteParams};
 use lance_table::format::DataFile;
 use lance_table::transaction::action::{
-    Action, AddDataFile, AddField, AddFragment, Ref, TombstoneFieldData, UserAction, UserOperation,
+    Action, AddDataFile, AddField, AddFragment, DropField, Ref, TombstoneFieldData, UserAction,
+    UserOperation,
 };
 use lance_table::transaction::{Operation, Transaction};
 
@@ -154,6 +155,41 @@ async fn test_one_commit_adds_a_field_and_then_fills_it() {
         .expect("the new field's data file was attached");
     // The file points at the id the commit minted, which the caller never knew.
     assert_eq!(added.fields.as_ref(), &[field.id]);
+}
+
+#[tokio::test]
+async fn test_one_commit_swaps_a_field_for_a_new_one() {
+    let dataset = test_dataset(false).await;
+    let fragment_id = dataset.fragments()[0].id;
+    let file = existing_data_file(&dataset, 1);
+
+    let dataset = commit(
+        dataset,
+        vec![
+            Action::DropField(DropField { field: 0 }),
+            Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: lance_core::datatypes::Field::try_from(Field::new("a", DataType::Int64, true))
+                    .unwrap(),
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment_id),
+                file,
+                field_ids: vec![Ref::Local(0)],
+                data_change: true,
+            }),
+        ],
+    )
+    .await;
+
+    // Dropping "a" and adding a new "a" of a different type is one version, and
+    // the new field gets a fresh id rather than inheriting the dropped one.
+    let schema = dataset.schema();
+    assert_eq!(schema.fields.len(), 1);
+    let field = schema.field("a").unwrap();
+    assert_ne!(field.id, 0);
+    assert_eq!(field.logical_type.to_string(), "int64");
 }
 
 #[tokio::test]

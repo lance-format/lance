@@ -46,6 +46,18 @@ impl Coordinate {
             Self::FieldDefinition(_) | Self::BaseName(_) | Self::BaseLocation(_) => None,
         }
     }
+
+    /// The field this coordinate belongs to, if it is field-scoped.
+    fn field(&self) -> Option<i32> {
+        match self {
+            Self::FieldData { field, .. } => Some(*field),
+            Self::FieldDefinition(id) => Some(*id),
+            Self::FragmentExistence(_)
+            | Self::FragmentDeletions(_)
+            | Self::BaseName(_)
+            | Self::BaseLocation(_) => None,
+        }
+    }
 }
 
 /// Everything an action set writes, in one set.
@@ -56,6 +68,23 @@ pub struct Footprint {
     /// coordinate inside it, which cannot be enumerated, so it is tracked
     /// separately and matched against the other set by fragment id.
     removed_fragments: HashSet<u64>,
+    /// Fields this set drops from the schema. Like a fragment removal, this
+    /// writes every coordinate belonging to the field -- its definition and its
+    /// data in every fragment -- so it is matched by field id.
+    ///
+    /// Only the named field, not its descendants: a footprint has no schema to
+    /// expand a struct with. A concurrent write to a child of a dropped struct
+    /// is therefore not caught here and fails when it is applied against the
+    /// version where the child no longer exists.
+    removed_fields: HashSet<i32>,
+    /// Fields this set needs to still be in the schema, without writing their
+    /// definitions. Writing data into a fragment this operation mints is the
+    /// case this exists for: the cells are invisible to a concurrent writer, so
+    /// they are not written coordinates, but the fields they hold data for have
+    /// committed ids that a concurrent [`DropField`](super::DropField) can take
+    /// away -- leaving the new fragment carrying data for a field the manifest
+    /// no longer has.
+    required_fields: HashSet<i32>,
 }
 
 impl Footprint {
@@ -63,15 +92,22 @@ impl Footprint {
         if !self.writes.is_disjoint(&other.writes) {
             return true;
         }
-        self.removes_a_fragment_touched_by(other) || other.removes_a_fragment_touched_by(self)
+        self.removes_something_touched_by(other) || other.removes_something_touched_by(self)
     }
 
-    fn removes_a_fragment_touched_by(&self, other: &Self) -> bool {
-        self.removed_fragments.iter().any(|removed| {
-            other
-                .writes
-                .iter()
-                .any(|coordinate| coordinate.fragment() == Some(*removed))
+    /// Whether this set removes a fragment or field that `other` also writes to
+    /// or needs to still be there.
+    fn removes_something_touched_by(&self, other: &Self) -> bool {
+        if !self.removed_fields.is_disjoint(&other.required_fields) {
+            return true;
+        }
+        other.writes.iter().any(|coordinate| {
+            coordinate
+                .fragment()
+                .is_some_and(|id| self.removed_fragments.contains(&id))
+                || coordinate
+                    .field()
+                    .is_some_and(|id| self.removed_fields.contains(&id))
         })
     }
 
@@ -79,12 +115,19 @@ impl Footprint {
         self.writes.insert(coordinate);
     }
 
+    /// The data of each field within `fragment`.
+    ///
+    /// A fragment this operation mints has no id a concurrent writer could
+    /// name, so its cells are not written coordinates -- but the fields the
+    /// data belongs to are still required to exist.
     fn add_field_data(&mut self, fragment: Ref, fields: impl IntoIterator<Item = i32>) {
-        let Some(fragment) = fragment.committed() else {
-            return;
-        };
-        for field in fields {
-            self.add(Coordinate::FieldData { fragment, field });
+        match fragment.committed() {
+            Some(fragment) => {
+                for field in fields {
+                    self.add(Coordinate::FieldData { fragment, field });
+                }
+            }
+            None => self.required_fields.extend(fields),
         }
     }
 }
@@ -121,6 +164,10 @@ impl From<&UserOperation> for Footprint {
                 Action::AlterField(action) => {
                     footprint.add(Coordinate::FieldDefinition(action.field))
                 }
+                Action::DropField(action) => {
+                    footprint.add(Coordinate::FieldDefinition(action.field));
+                    footprint.removed_fields.insert(action.field);
+                }
             }
         }
         footprint
@@ -132,8 +179,8 @@ mod tests {
     use super::*;
     use crate::format::{BasePath, DataFile};
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AlterField, RemoveFragment, SetDeletionFile,
-        TombstoneFieldData, UserAction,
+        AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, RemoveFragment,
+        SetDeletionFile, TombstoneFieldData, UserAction,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::Field;
@@ -259,6 +306,41 @@ mod tests {
     #[case::different_field_definitions(
         vec![Action::AlterField(AlterField { field: 1, ..Default::default() })],
         vec![Action::AlterField(AlterField { field: 2, ..Default::default() })],
+        false,
+    )]
+    #[case::dropping_a_field_collides_with_altering_it(
+        vec![Action::DropField(DropField { field: 1 })],
+        vec![Action::AlterField(AlterField { field: 1, nullable: Some(true), ..Default::default() })],
+        true,
+    )]
+    #[case::dropping_a_field_collides_with_rewriting_its_data(
+        vec![Action::DropField(DropField { field: 1 })],
+        vec![tombstone(0, &[1])],
+        true,
+    )]
+    #[case::dropping_a_field_leaves_other_fields_alone(
+        vec![Action::DropField(DropField { field: 1 })],
+        vec![tombstone(0, &[2])],
+        false,
+    )]
+    #[case::dropping_a_field_leaves_deletions_alone(
+        vec![Action::DropField(DropField { field: 1 })],
+        vec![set_deletion_file(0)],
+        false,
+    )]
+    // An append writes no coordinate -- its fragment is minted, so no
+    // concurrent writer can name a cell inside it -- but the data it carries
+    // still belongs to committed fields. Dropping one of those fields out from
+    // under it would leave the new fragment holding data for a field the
+    // manifest no longer has.
+    #[case::dropping_a_field_a_concurrent_append_writes_data_for(
+        vec![Action::DropField(DropField { field: 1 })],
+        vec![add_fragment(0), add_data_file(Ref::Local(0), &[1])],
+        true,
+    )]
+    #[case::dropping_a_field_a_concurrent_append_does_not_write(
+        vec![Action::DropField(DropField { field: 1 })],
+        vec![add_fragment(0), add_data_file(Ref::Local(0), &[2])],
         false,
     )]
     #[case::bases_with_the_same_name(
