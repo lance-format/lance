@@ -207,6 +207,76 @@ impl InvertedIndex {
     pub async fn bm25_row_stats_for_terms(
         &self,
         terms: &[String],
+        stale_rows: Option<&RowAddrTreeMap>,
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<(u64, usize, Vec<usize>)> {
+        let base = self.bm25_row_stats_for_terms_unrestricted(terms, metrics);
+        let Some(stale_rows) = stale_rows.filter(|rows| !rows.is_empty()) else {
+            return base.await;
+        };
+        let (total_tokens, num_rows, mut row_freqs) = base.await?;
+        let (stale_tokens, stale_num_rows, stale_freqs) = self
+            .stale_row_stats_for_terms(terms, stale_rows, metrics)
+            .await?;
+        for (total, stale) in row_freqs.iter_mut().zip(stale_freqs) {
+            *total = total.saturating_sub(stale);
+        }
+        Ok((
+            total_tokens.saturating_sub(stale_tokens),
+            num_rows.saturating_sub(stale_num_rows),
+            row_freqs,
+        ))
+    }
+
+    /// What the rows an overlay made stale still contribute to this index's
+    /// statistics, for the caller to subtract.
+    ///
+    /// The index holds their pre-overlay values until it is optimized, and the flat
+    /// scan folds in their current ones. Counting both inflates `docCount` and
+    /// `docFreq`, which is enough to reorder results after an overlay that changed
+    /// no searchable value.
+    async fn stale_row_stats_for_terms(
+        &self,
+        terms: &[String],
+        stale_rows: &RowAddrTreeMap,
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<(u64, usize, Vec<usize>)> {
+        let io_parallelism = self.store.io_parallelism();
+        let futures = self
+            .partitions
+            .iter()
+            .map(|partition| {
+                let partition = partition.clone();
+                async move {
+                    partition
+                        .stale_row_stats_for_terms(terms, stale_rows, metrics)
+                        .await
+                }
+            })
+            .collect::<Vec<_>>();
+        let per_partition: Vec<(u64, usize, Vec<usize>)> = stream::iter(futures)
+            .buffer_unordered(io_parallelism)
+            .try_collect()
+            .await?;
+
+        let mut total_tokens = 0u64;
+        let mut num_rows = 0usize;
+        let mut row_freqs = vec![0usize; terms.len()];
+        // Partitions hold disjoint row sets, so a row lands in at most one of these.
+        for (partition_tokens, partition_rows, partition_freqs) in per_partition {
+            total_tokens += partition_tokens;
+            num_rows += partition_rows;
+            for (total, partition_freq) in row_freqs.iter_mut().zip(partition_freqs) {
+                *total += partition_freq;
+            }
+        }
+        Ok((total_tokens, num_rows, row_freqs))
+    }
+
+    /// [`Self::bm25_row_stats_for_terms`] with nothing subtracted.
+    async fn bm25_row_stats_for_terms_unrestricted(
+        &self,
+        terms: &[String],
         metrics: Option<&dyn MetricsCollector>,
     ) -> Result<(u64, usize, Vec<usize>)> {
         if !matches!(

@@ -51,7 +51,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use std::sync::LazyLock;
 use tokio::{
@@ -68,7 +68,9 @@ use super::encoding::{MAX_POSTING_BLOCK_SIZE, PositionBlockBuilder};
 use super::impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData, ImpactSkipDataBuilder};
 use super::iter::PostingListIterator;
 use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
-use super::{DocumentGranularity, InvertedIndexBuilder, InvertedIndexParams, wand::*};
+use super::{
+    DocumentGranularity, FlatFieldStats, InvertedIndexBuilder, InvertedIndexParams, wand::*,
+};
 use super::{
     builder::{
         BLOCK_SIZE, ScoredDoc, doc_file_path,
