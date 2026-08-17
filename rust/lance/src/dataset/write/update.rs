@@ -31,6 +31,7 @@ use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
 use lance_datafusion::expr::safe_coerce_scalar;
+use lance_file::version::LanceFileVersion;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
@@ -80,6 +81,7 @@ pub struct UpdateBuilder {
     conflict_retries: u32,
     /// Total timeout for retries.
     retry_timeout: Duration,
+    data_storage_version: Option<LanceFileVersion>,
 }
 
 impl UpdateBuilder {
@@ -90,6 +92,7 @@ impl UpdateBuilder {
             updates: HashMap::new(),
             conflict_retries: 10,
             retry_timeout: Duration::from_secs(30),
+            data_storage_version: None,
         }
     }
 
@@ -232,6 +235,14 @@ impl UpdateBuilder {
         self
     }
 
+    /// Set the exact V2 data file version for rewritten rows.
+    ///
+    /// If omitted, the dataset manifest fallback is used.
+    pub fn data_storage_version(mut self, version: LanceFileVersion) -> Self {
+        self.data_storage_version = Some(version);
+        self
+    }
+
     // TODO: set write params
     // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
 
@@ -257,6 +268,7 @@ impl UpdateBuilder {
             updates,
             conflict_retries: self.conflict_retries,
             retry_timeout: self.retry_timeout,
+            data_storage_version: self.data_storage_version,
         })
     }
 }
@@ -285,6 +297,7 @@ pub struct UpdateJob {
     updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
     conflict_retries: u32,
     retry_timeout: Duration,
+    data_storage_version: Option<LanceFileVersion>,
 }
 
 impl UpdateJob {
@@ -437,11 +450,17 @@ impl UpdateJob {
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
+        let write_version = self
+            .data_storage_version
+            .map(LanceFileVersion::resolve)
+            .unwrap_or_else(|| {
+                self.dataset
+                    .manifest
+                    .data_storage_format
+                    .lance_file_format()
+            });
         let (mut new_fragments, _) = write_fragments_internal(
-            self.dataset
-                .manifest
-                .data_storage_format
-                .lance_file_format(),
+            write_version,
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
@@ -542,9 +561,14 @@ impl UpdateJob {
             updated_fragment_offsets: None,
         };
 
+        let write_version = self
+            .data_storage_version
+            .map(LanceFileVersion::resolve)
+            .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format());
         let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
         let new_dataset = CommitBuilder::new(dataset)
+            .with_exact_storage_format(write_version)
             .with_affected_rows(update_data.affected_rows)
             .execute(transaction)
             .await?;
@@ -699,6 +723,7 @@ mod tests {
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_io::object_store::ObjectStoreParams;
     use lance_linalg::distance::MetricType;
+    use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use object_store::throttle::ThrottleConfig;
     use rstest::rstest;
     use tokio::sync::Barrier;
@@ -743,6 +768,85 @@ mod tests {
             .unwrap();
 
         (Arc::new(ds), test_dir)
+    }
+
+    #[tokio::test]
+    async fn update_uses_explicit_exact_version() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, false).await;
+
+        let result = UpdateBuilder::new(dataset)
+            .update_where("id < 10")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap()
+            .data_storage_version(LanceFileVersion::V2_1)
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result
+                .new_dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+            lance_file::version::ConcreteFileVersion::V2_0
+        );
+        assert!(
+            result
+                .new_dataset
+                .manifest
+                .fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+                .any(|file| file.file_version().unwrap()
+                    == lance_file::version::ConcreteFileVersion::V2_1)
+        );
+        assert_ne!(
+            result.new_dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_eq!(
+            result
+                .new_dataset
+                .count_rows(Some("name = 'bar'".to_string()))
+                .await
+                .unwrap(),
+            10
+        );
+    }
+
+    #[tokio::test]
+    async fn no_op_update_ignores_explicit_exact_version() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, false).await;
+
+        let result = UpdateBuilder::new(dataset)
+            .update_where("id < 0")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap()
+            .data_storage_version(LanceFileVersion::V2_1)
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows_updated, 0);
+        assert_eq!(
+            result
+                .new_dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+            lance_file::version::ConcreteFileVersion::V2_0
+        );
+        assert_eq!(
+            result.new_dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
     }
 
     #[tokio::test]

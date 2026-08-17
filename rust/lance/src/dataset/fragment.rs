@@ -1947,6 +1947,23 @@ impl FileFragment {
         batch_size: Option<u32>,
         blob_handling: Option<BlobHandling>,
     ) -> Result<Updater> {
+        let write_version = self
+            .dataset
+            .manifest
+            .data_storage_format
+            .lance_file_format();
+        self.updater_with_version(columns, schemas, batch_size, blob_handling, write_version)
+            .await
+    }
+
+    pub(crate) async fn updater_with_version<T: AsRef<str>>(
+        &self,
+        columns: Option<&[T]>,
+        schemas: Option<(Schema, Schema)>,
+        batch_size: Option<u32>,
+        blob_handling: Option<BlobHandling>,
+        write_version: ConcreteFileVersion,
+    ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
 
         let mut with_row_addr = false;
@@ -1987,7 +2004,15 @@ impl FileFragment {
         let reader = reader?;
         let deletion_vector = deletion_vector?.unwrap_or_default().as_ref().clone();
 
-        Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size).await
+        Updater::try_new(
+            self.clone(),
+            reader,
+            deletion_vector,
+            schemas,
+            batch_size,
+            write_version,
+        )
+        .await
     }
 
     pub async fn merge_columns(
@@ -2325,6 +2350,26 @@ impl FileFragment {
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
     ) -> Result<super::transaction::DataReplacementGroup> {
+        let write_version = self
+            .dataset
+            .manifest
+            .data_storage_format
+            .lance_file_format();
+        self.write_column_with_version(data, schema, write_version)
+            .await
+    }
+
+    /// Write replacement column data using an exact V2 data file version.
+    ///
+    /// When the version differs from the manifest fallback, the commit that
+    /// publishes the returned replacement group derives the mixed-version
+    /// capability from its final manifest.
+    pub async fn write_column_with_version(
+        &self,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &Schema,
+        write_version: ConcreteFileVersion,
+    ) -> Result<super::transaction::DataReplacementGroup> {
         let expected_rows = self.physical_rows().await? as u64;
 
         // Readers take everything but the field id from the manifest, so a
@@ -2402,13 +2447,7 @@ impl FileFragment {
                 .collect::<Vec<_>>(),
         );
 
-        let file_version = self
-            .dataset
-            .manifest
-            .data_storage_format
-            .lance_file_format();
-
-        if file_version == ConcreteFileVersion::V1 {
+        if write_version == ConcreteFileVersion::V1 {
             // The legacy reader pairs a fragment's files by batch boundary, so a
             // staged file chunked to the caller's batches leaves the fragment
             // unreadable. Rechunking is the legacy update path's job, not this
@@ -2428,7 +2467,7 @@ impl FileFragment {
             .fields_pre_order()
             .any(|field| field.is_blob_v2());
         let mut writer = versions::open_update_writer(
-            file_version,
+            write_version,
             self.dataset.as_ref(),
             &writer_schema,
             has_blob_v2,
