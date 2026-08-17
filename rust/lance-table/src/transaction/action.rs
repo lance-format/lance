@@ -139,6 +139,7 @@ pub enum Action {
     RemoveFragment(RemoveFragment),
     SetDeletionFile(SetDeletionFile),
     AlterField(AlterField),
+    DropField(DropField),
 }
 
 impl Action {
@@ -152,6 +153,7 @@ impl Action {
             Self::RemoveFragment(_) => "RemoveFragment",
             Self::SetDeletionFile(_) => "SetDeletionFile",
             Self::AlterField(_) => "AlterField",
+            Self::DropField(_) => "DropField",
         }
     }
 
@@ -167,7 +169,9 @@ impl Action {
             Self::TombstoneFieldData(action) => action.data_change,
             Self::RemoveFragment(action) => action.data_change,
             Self::SetDeletionFile(action) => action.data_change,
-            // Schema and base-path changes touch no row values.
+            // Dropping a field discards the values it held.
+            Self::DropField(_) => true,
+            // Other schema and base-path changes touch no row values.
             Self::AddField(_) | Self::AddBase(_) | Self::AlterField(_) => false,
         }
     }
@@ -297,6 +301,16 @@ pub struct AlterField {
     /// The new Arrow logical type. The cast.
     pub logical_type: Option<String>,
     pub nullable: Option<bool>,
+}
+
+/// Remove a field from the schema.
+///
+/// The field's descendants go with it, since a struct's children cannot outlive
+/// it. At apply, any data file left backing no live field is dropped, and any
+/// index over a removed field is discarded.
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct DropField {
+    pub field: i32,
 }
 
 #[cfg(test)]

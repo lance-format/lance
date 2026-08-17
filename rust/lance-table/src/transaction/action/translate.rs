@@ -14,8 +14,10 @@
 //!
 //! `Merge` and `Project` are not translated. Both hand over a whole new schema
 //! rather than a description of what changed, so recovering the delta needs the
-//! read version's schema to diff against, and `Project` additionally needs a
-//! field-removal action that this draft does not define.
+//! read version's schema to diff against -- which this conversion, taking only
+//! the operation, does not have. The actions themselves are sufficient:
+//! `Project` is a set of [`DropField`](super::DropField)s and `Merge` a set of
+//! [`AddField`](super::AddField)s plus their data files.
 
 use super::{
     Action, AddBase, AddDataFile, AddFragment, Ref, RemoveFragment, SetDeletionFile,

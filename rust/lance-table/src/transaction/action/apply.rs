@@ -11,8 +11,8 @@
 //! different ids without any of the actions changing.
 
 use super::{
-    Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, Ref, RemoveFragment,
-    SetDeletionFile, TombstoneFieldData, UserOperation,
+    Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, Ref,
+    RemoveFragment, SetDeletionFile, TombstoneFieldData, UserOperation,
 };
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig};
 use crate::rowids::version::build_version_meta;
@@ -157,6 +157,7 @@ impl ApplyState {
             Action::RemoveFragment(action) => self.remove_fragment(action),
             Action::SetDeletionFile(action) => self.set_deletion_file(action),
             Action::AlterField(action) => self.alter_field(action),
+            Action::DropField(action) => self.drop_field(action),
         }
     }
 
@@ -365,6 +366,54 @@ impl ApplyState {
         Ok(())
     }
 
+    fn drop_field(&mut self, action: &DropField) -> Result<()> {
+        let field = self.schema.field_by_id(action.field).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "DropField names field {}, which does not exist",
+                action.field
+            ))
+        })?;
+        // A struct's children cannot outlive it, so the whole subtree goes.
+        let mut dropped = HashSet::new();
+        collect_subtree_ids(field, &mut dropped);
+        remove_field(&mut self.schema.fields, action.field);
+
+        // The fields are gone from the schema, so the slots that backed them in
+        // each data file are dead. Tombstoning rather than rewriting the field
+        // list keeps a file's remaining columns at the positions they were
+        // written at; a file left with nothing live is pruned during
+        // normalization.
+        for fragment in self.fragments.iter_mut() {
+            for file in fragment.files.iter_mut() {
+                if !file.fields.iter().any(|id| dropped.contains(id)) {
+                    continue;
+                }
+                let fields = file
+                    .fields
+                    .iter()
+                    .map(|id| {
+                        if dropped.contains(id) {
+                            TOMBSTONED_FIELD
+                        } else {
+                            *id
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                file.fields = fields.into();
+            }
+
+            let overlaid: Vec<u32> = dropped
+                .iter()
+                .filter_map(|id| u32::try_from(*id).ok())
+                .collect();
+            crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
+        }
+
+        // Indices over a field that no longer exists are discarded wholesale by
+        // `retain_relevant_indices`, so there is nothing to record here.
+        Ok(())
+    }
+
     /// Stamp row ids and version metadata onto the fragments this operation
     /// minted, matching what an Append does for its new fragments.
     fn assign_row_ids_to_minted_fragments(
@@ -424,6 +473,25 @@ impl ApplyState {
                 .copied()
                 .ok_or_else(|| unbound_token_err("field", token)),
         }
+    }
+}
+
+fn collect_subtree_ids(field: &Field, out: &mut HashSet<i32>) {
+    out.insert(field.id);
+    for child in &field.children {
+        collect_subtree_ids(child, out);
+    }
+}
+
+/// Remove the field with `field_id` from `fields`, at whatever depth it sits.
+fn remove_field(fields: &mut Vec<Field>, field_id: i32) {
+    let before = fields.len();
+    fields.retain(|field| field.id != field_id);
+    if fields.len() != before {
+        return;
+    }
+    for field in fields.iter_mut() {
+        remove_field(&mut field.children, field_id);
     }
 }
 
@@ -781,6 +849,99 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("field 7"), "{error}");
+    }
+
+    #[test]
+    fn test_drop_field_removes_it_and_its_data() {
+        let manifest = backed_manifest();
+        let (next, indices) = apply_with_indices(
+            &manifest,
+            vec![Action::DropField(DropField { field: 0 })],
+            vec![sample_index_metadata("idx")],
+        )
+        .unwrap();
+
+        assert!(next.schema.field_by_id(0).is_none());
+        // The file backed only the dropped field, so nothing is left of it.
+        assert!(next.fragments[0].files.is_empty());
+        // An index over a field that no longer exists is discarded outright.
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn test_drop_field_keeps_a_file_with_a_surviving_field() {
+        let mut manifest = backed_manifest();
+        let mut schema_field = added_field("keep");
+        schema_field.id = 1;
+        manifest.schema.fields.push(schema_field);
+        let mut fragment = manifest.fragments[0].clone();
+        fragment.files[0] = DataFile::new("data/0.lance", vec![0, 1], vec![0, 1], 2, 0, None, None);
+        manifest.fragments = Arc::new(vec![fragment]);
+
+        let next = apply(&manifest, vec![Action::DropField(DropField { field: 0 })]).unwrap();
+
+        assert!(next.schema.field_by_id(0).is_none());
+        assert!(next.schema.field_by_id(1).is_some());
+        // The surviving field stays at the position it was written at.
+        assert_eq!(
+            next.fragments[0].files[0].fields.as_ref(),
+            &[TOMBSTONED_FIELD, 1]
+        );
+    }
+
+    #[test]
+    fn test_drop_field_takes_the_whole_subtree() {
+        let mut manifest = backed_manifest();
+        let mut parent = Field::try_from(ArrowField::new("parent", DataType::Int32, true)).unwrap();
+        parent.id = 1;
+        let mut child = added_field("child");
+        child.id = 2;
+        child.parent_id = 1;
+        parent.children.push(child);
+        manifest.schema.fields.push(parent);
+
+        let next = apply(&manifest, vec![Action::DropField(DropField { field: 1 })]).unwrap();
+
+        assert!(next.schema.field_by_id(1).is_none());
+        assert!(
+            next.schema.field_by_id(2).is_none(),
+            "a struct's children cannot outlive it"
+        );
+    }
+
+    #[test]
+    fn test_drop_field_rejects_a_missing_field() {
+        let manifest = backed_manifest();
+        let error = apply(&manifest, vec![Action::DropField(DropField { field: 7 })]).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("field 7"), "{error}");
+    }
+
+    #[test]
+    fn test_drop_field_then_add_a_field_reuses_no_id() {
+        let manifest = backed_manifest();
+        let next = apply(
+            &manifest,
+            vec![
+                Action::DropField(DropField { field: 0 }),
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: added_field("replacement"),
+                }),
+            ],
+        )
+        .unwrap();
+
+        // Field ids come from a monotonic counter, never from the freed id --
+        // an old data file naming id 0 must not be read as the new field.
+        let ids = next
+            .schema
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1]);
     }
 
     #[test]
