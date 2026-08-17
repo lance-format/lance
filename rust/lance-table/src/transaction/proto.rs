@@ -941,9 +941,13 @@ mod tests {
                     uuid: Uuid::new_v4().to_string(),
                     read_version: 1,
                     actions: vec![pb::UserAction {
-                        description: "reset".to_string(),
+                        description: "refresh row versions".to_string(),
                         actions: vec![pb::Action {
-                            action: Some(pb::action::Action::ResetTable(pb::ResetTable {})),
+                            action: Some(pb::action::Action::RefreshRowVersionMetadata(
+                                pb::RefreshRowVersionMetadata {
+                                    fragment_ids: vec![1],
+                                },
+                            )),
                         }],
                     }],
                 },

@@ -69,10 +69,14 @@ impl Transaction {
             new_bases,
             rebound_fields,
             reserved_fragment_ids,
+            reset,
             ..
         } = state;
 
         let mut indices = current_indices;
+        if reset {
+            indices.clear();
+        }
         prune_rebound_fields_from_indices(&mut indices, &rebound_fields);
         Self::retain_relevant_indices(&mut indices, &schema, &fragments);
 
@@ -147,6 +151,10 @@ pub(super) struct ApplyState {
     /// Fields whose backing data changed, per fragment. An index covering such
     /// a field no longer describes that fragment's contents.
     rebound_fields: HashMap<u64, HashSet<i32>>,
+
+    /// Whether the table was reset, which discards every index outright rather
+    /// than pruning fragments out of them.
+    reset: bool,
 }
 
 impl ApplyState {
@@ -170,6 +178,7 @@ impl ApplyState {
             minted_fragments: HashSet::new(),
             reserved_fragment_ids: None,
             rebound_fields: HashMap::new(),
+            reset: false,
         }
     }
 
@@ -211,6 +220,18 @@ impl ApplyState {
         self.minted_fragments.remove(&fragment_id);
         self.rebound_fields.remove(&fragment_id);
         true
+    }
+
+    /// Empty the table: no schema, no fragments, no indices. The id counters
+    /// keep going, so a field or fragment added afterwards never reuses an id an
+    /// old file might still name.
+    pub(super) fn reset(&mut self) {
+        self.schema.fields.clear();
+        self.schema.metadata.clear();
+        self.fragments.clear();
+        self.minted_fragments.clear();
+        self.rebound_fields.clear();
+        self.reset = true;
     }
 
     /// The base paths this apply can see: the read version's, plus the ones
