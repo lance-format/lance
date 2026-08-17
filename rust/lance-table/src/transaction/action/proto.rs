@@ -162,6 +162,9 @@ impl From<&Action> for pb_transaction::Action {
                 pb_transaction::action::Action::ReserveFragmentIds(action.into())
             }
             Action::ResetTable(action) => pb_transaction::action::Action::ResetTable(action.into()),
+            Action::ConfigUpdate(action) => {
+                pb_transaction::action::Action::ConfigUpdate(action.into())
+            }
         };
         Self {
             action: Some(action),
@@ -207,6 +210,9 @@ impl TryFrom<pb_transaction::Action> for Action {
             Some(pb_transaction::action::Action::ResetTable(action)) => {
                 Ok(Self::ResetTable(action.try_into()?))
             }
+            Some(pb_transaction::action::Action::ConfigUpdate(action)) => {
+                Ok(Self::ConfigUpdate(action.try_into()?))
+            }
             // The drafted vocabulary is larger than what is implemented. Reject
             // rather than skip: silently dropping an action would apply a
             // partial transaction.
@@ -226,9 +232,11 @@ mod tests {
     use super::*;
     use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, RowIdMeta, pb};
     use crate::rowids::version::RowDatasetVersionMeta;
+    use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, RemoveFragment,
-        ReserveFragmentIds, ResetTable, SetDeletionFile, TombstoneFieldData,
+        AddBase, AddDataFile, AddField, AddFragment, AlterField, ConfigUpdate, DropField,
+        FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds, ResetTable, SetDeletionFile,
+        TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::Field;
@@ -294,6 +302,24 @@ mod tests {
             Action::DropField(DropField { field: 3 }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ResetTable(ResetTable),
+            Action::ConfigUpdate(ConfigUpdate {
+                config: Some(UpdateMap {
+                    update_entries: vec![("a", "1").into(), ("b", None).into()],
+                    replace: false,
+                }),
+                table_metadata: None,
+                schema_metadata: Some(UpdateMap {
+                    update_entries: vec![("c", "2").into()],
+                    replace: true,
+                }),
+                field_metadata: vec![FieldMetadataUpdate {
+                    field: Ref::Local(3),
+                    updates: UpdateMap {
+                        update_entries: vec![("d", "3").into()],
+                        replace: false,
+                    },
+                }],
+            }),
         ]
     }
 
