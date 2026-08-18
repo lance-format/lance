@@ -53,6 +53,12 @@ impl AlterField {
         Ok(())
     }
 
+    /// Renaming or relaxing a field leaves the values alone, and the
+    /// rewrite a cast needs is separate actions that answer for themselves.
+    pub(super) fn is_data_change(&self) -> bool {
+        false
+    }
+
     /// The field's definition. The data rewrite a cast needs is separate
     /// actions, which record their own coordinates.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {

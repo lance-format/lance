@@ -71,6 +71,11 @@ impl DropField {
         Ok(())
     }
 
+    /// Dropping a field discards every value it held.
+    pub(super) fn is_data_change(&self) -> bool {
+        true
+    }
+
     /// The field's definition and all of its data, which cannot be enumerated,
     /// so the removal is recorded as such and matched by field id.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {

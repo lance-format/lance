@@ -30,6 +30,11 @@ impl ResetTable {
         Ok(())
     }
 
+    /// Emptying the table discards every row it held.
+    pub(super) fn is_data_change(&self) -> bool {
+        true
+    }
+
     /// Everything. A reset writes every coordinate there is, including ones a
     /// concurrent set would only mint, so it takes the table exclusively rather
     /// than enumerating them.
