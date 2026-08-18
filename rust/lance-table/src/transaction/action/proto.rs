@@ -152,9 +152,9 @@ mod tests {
     use crate::rowids::version::RowDatasetVersionMeta;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AlterField, ConfigUpdate,
-        DropField, FieldMetadataUpdate, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds,
-        ResetTable, SetDeletionFile, TombstoneFieldData,
+        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
+        AlterField, ConfigUpdate, DropField, FieldMetadataUpdate, RemoveFragment,
+        RemoveIndexSegment, ReserveFragmentIds, ResetTable, SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
@@ -245,6 +245,11 @@ mod tests {
             Action::RemoveIndexSegment(RemoveIndexSegment {
                 uuid: Uuid::from_u128(8),
                 data_change: true,
+            }),
+            Action::AdjustIndexCoverage(AdjustIndexCoverage {
+                uuid: Uuid::from_u128(9),
+                add_fragments: vec![Ref::Committed(1), Ref::Local(0)],
+                remove_fragments: vec![2, 3],
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ResetTable(ResetTable),

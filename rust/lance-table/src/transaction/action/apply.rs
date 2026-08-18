@@ -248,6 +248,17 @@ impl<'a> ApplyState<'a> {
         Ok(())
     }
 
+    pub(super) fn index_segment_mut(&mut self, uuid: Uuid) -> Result<&mut IndexMetadata> {
+        self.indices
+            .iter_mut()
+            .find(|index| index.uuid == uuid)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "index segment {uuid} is not part of the dataset, so it cannot be adjusted"
+                ))
+            })
+    }
+
     pub(super) fn schema(&self) -> &Schema {
         &self.schema
     }
