@@ -69,6 +69,7 @@ macro_rules! for_each_action {
             AlterField,
             DropField,
             AddIndexSegment,
+            RemoveIndexSegment,
             ReserveFragmentIds,
             ReserveRowIds,
             ResetTable,
@@ -89,6 +90,7 @@ mod drop_field;
 mod footprint;
 mod proto;
 mod remove_fragment;
+mod remove_index_segment;
 mod reserve_fragment_ids;
 mod reserve_row_ids;
 mod reset_table;
@@ -108,6 +110,7 @@ pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
 pub use footprint::{ConfigMap, Coordinate, Footprint};
 pub use remove_fragment::RemoveFragment;
+pub use remove_index_segment::RemoveIndexSegment;
 pub use reserve_fragment_ids::ReserveFragmentIds;
 pub use reserve_row_ids::ReserveRowIds;
 pub use reset_table::ResetTable;
