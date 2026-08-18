@@ -22,8 +22,8 @@ use lance::Dataset;
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteParams};
 use lance_table::format::DataFile;
 use lance_table::transaction::action::{
-    Action, AddDataFile, AddField, AddFragment, DropField, Ref, TombstoneFieldData, UserAction,
-    UserOperation,
+    Action, AddDataFile, AddField, AddFragment, CompositeOperation, DropField, Ref,
+    TombstoneFieldData, UserAction,
 };
 use lance_table::transaction::{Operation, Transaction};
 
@@ -54,10 +54,9 @@ async fn commit(dataset: Dataset, actions: Vec<Action>) -> Dataset {
     CommitBuilder::new(Arc::new(dataset))
         .execute(Transaction::new(
             read_version,
-            Operation::UserOperation(UserOperation::new(
-                "composite",
-                vec![UserAction::new("step", actions)],
-            )),
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                "step", actions,
+            )])),
             None,
         ))
         .await
@@ -251,10 +250,10 @@ async fn test_two_action_sets_on_disjoint_coordinates_both_commit() {
     let first = CommitBuilder::new(dataset.clone())
         .execute(Transaction::new(
             read_version,
-            Operation::UserOperation(UserOperation::new(
-                "first",
-                vec![UserAction::new("step", append(0))],
-            )),
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                "step",
+                append(0),
+            )])),
             None,
         ))
         .await
@@ -266,10 +265,10 @@ async fn test_two_action_sets_on_disjoint_coordinates_both_commit() {
     let second = CommitBuilder::new(dataset)
         .execute(Transaction::new(
             read_version,
-            Operation::UserOperation(UserOperation::new(
-                "second",
-                vec![UserAction::new("step", append(0))],
-            )),
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                "step",
+                append(0),
+            )])),
             None,
         ))
         .await
@@ -288,17 +287,14 @@ async fn test_two_action_sets_writing_the_same_field_data_conflict() {
     let tombstone = || {
         Transaction::new(
             read_version,
-            Operation::UserOperation(UserOperation::new(
-                "tombstone",
-                vec![UserAction::new(
-                    "step",
-                    vec![Action::TombstoneFieldData(TombstoneFieldData {
-                        fragment: Ref::Committed(fragment_id),
-                        field_ids: vec![0],
-                        data_change: true,
-                    })],
-                )],
-            )),
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                "step",
+                vec![Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(fragment_id),
+                    field_ids: vec![0],
+                    data_change: true,
+                })],
+            )])),
             None,
         )
     };

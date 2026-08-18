@@ -16,7 +16,7 @@
 //! Which coordinates an action writes is decided by that action, in its own
 //! module. This module holds the coordinate space and the comparison.
 
-use super::{Ref, UserOperation};
+use super::{CompositeOperation, Ref};
 use crate::transaction::UpdateMap;
 use std::collections::HashSet;
 
@@ -206,10 +206,10 @@ impl Footprint {
     }
 }
 
-impl From<&UserOperation> for Footprint {
-    fn from(user_operation: &UserOperation) -> Self {
+impl From<&CompositeOperation> for Footprint {
+    fn from(composite_operation: &CompositeOperation) -> Self {
         let mut footprint = Self::default();
-        for action in user_operation.iter_actions() {
+        for action in composite_operation.iter_actions() {
             action.footprint(&mut footprint);
         }
         footprint
@@ -229,10 +229,9 @@ mod tests {
     use rstest::rstest;
 
     fn footprint(actions: Vec<Action>) -> Footprint {
-        Footprint::from(&UserOperation::new(
-            "test",
-            vec![UserAction::new("step", actions)],
-        ))
+        Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+            "step", actions,
+        )]))
     }
 
     fn add_fragment(local: u32) -> Action {

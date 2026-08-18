@@ -868,8 +868,8 @@ impl PartialEq for Operation {
             // around. It is never equal to a legacy operation: equality here
             // answers "is the operation I am holding the one already
             // committed?", and a translated operation is a different commit.
-            (Self::UserOperation(a), Self::UserOperation(b)) => a == b,
-            (Self::UserOperation(_), _) | (_, Self::UserOperation(_)) => false,
+            (Self::CompositeOperation(a), Self::CompositeOperation(b)) => a == b,
+            (Self::CompositeOperation(_), _) | (_, Self::CompositeOperation(_)) => false,
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
         }
     }

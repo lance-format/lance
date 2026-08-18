@@ -4,7 +4,7 @@
 //! The action vocabulary of Transaction V2.
 //!
 //! Where an [`Operation`](super::Operation) names one whole change and carries a
-//! post-image of the parts of the manifest it touches, a [`UserOperation`] is an
+//! post-image of the parts of the manifest it touches, a [`CompositeOperation`] is an
 //! ordered list of [`Action`]s, each recording a single *delta*. Composing
 //! several changes into one atomic commit and replaying a change onto a
 //! different version both fall out of that, with no per-operation logic.
@@ -30,7 +30,7 @@
 //! # Stability
 //!
 //! Transaction V2 is a pre-vote draft. Nothing in this module is a compatibility
-//! contract, and a transaction carrying a [`UserOperation`] is rejected outright
+//! contract, and a transaction carrying a [`CompositeOperation`] is rejected outright
 //! by libraries that predate it.
 
 mod add_base;
@@ -76,13 +76,13 @@ use lance_core::deepsize::DeepSizeOf;
 ///
 /// [`Ref::Committed`] is a concrete id that already exists in the manifest.
 /// [`Ref::Local`] is a placeholder token minted by an `Add*` action earlier in
-/// the same [`UserOperation`]; it resolves to a freshly-allocated id at apply,
+/// the same [`CompositeOperation`]; it resolves to a freshly-allocated id at apply,
 /// and re-resolves against the target's counters when the operation is replayed
 /// onto a newer version. That re-resolution is what lets two independent
 /// `AddField`s on divergent branches become two distinct fields rather than a
 /// collision.
 ///
-/// Local tokens are scoped to one [`UserOperation`] and must be distinct within
+/// Local tokens are scoped to one [`CompositeOperation`] and must be distinct within
 /// it. The three id spaces do not share a token namespace: a fragment token 0
 /// and a field token 0 are unrelated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, DeepSizeOf)]
@@ -116,19 +116,14 @@ impl Ref {
 /// [`Transaction`](super::Transaction) and are filled in from it, so they are
 /// not repeated here.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf, Default)]
-pub struct UserOperation {
-    /// Human-readable description of the whole operation, e.g. `"INSERT INTO t"`.
-    pub description: String,
+pub struct CompositeOperation {
     /// The ordered steps this operation applies.
     pub actions: Vec<UserAction>,
 }
 
-impl UserOperation {
-    pub fn new(description: impl Into<String>, actions: Vec<UserAction>) -> Self {
-        Self {
-            description: description.into(),
-            actions,
-        }
+impl CompositeOperation {
+    pub fn new(actions: Vec<UserAction>) -> Self {
+        Self { actions }
     }
 
     /// Every action in every step, in application order.
@@ -137,7 +132,7 @@ impl UserOperation {
     }
 }
 
-/// A single user-recognizable step within a [`UserOperation`], e.g. "append
+/// A single user-recognizable step within a [`CompositeOperation`], e.g. "append
 /// batch" or "rebuild index".
 ///
 /// The description keeps transaction history readable: when a range of versions
@@ -296,25 +291,22 @@ mod tests {
 
     #[test]
     fn test_iter_actions_flattens_steps_in_order() {
-        let operation = UserOperation::new(
-            "two steps",
-            vec![
-                UserAction::new(
-                    "first",
-                    vec![Action::RemoveFragment(RemoveFragment {
-                        fragment: Ref::Committed(1),
-                        data_change: true,
-                    })],
-                ),
-                UserAction::new(
-                    "second",
-                    vec![Action::RemoveFragment(RemoveFragment {
-                        fragment: Ref::Committed(2),
-                        data_change: true,
-                    })],
-                ),
-            ],
-        );
+        let operation = CompositeOperation::new(vec![
+            UserAction::new(
+                "first",
+                vec![Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Committed(1),
+                    data_change: true,
+                })],
+            ),
+            UserAction::new(
+                "second",
+                vec![Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Committed(2),
+                    data_change: true,
+                })],
+            ),
+        ]);
         let fragments = operation
             .iter_actions()
             .map(|action| match action {
