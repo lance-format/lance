@@ -107,6 +107,7 @@ impl Transaction {
         let mut state = ApplyState::new(
             current_manifest,
             current_indices,
+            config,
             ReadMarks::of(read_manifest),
         );
         for action in composite_operation.iter_actions() {
@@ -116,7 +117,6 @@ impl Transaction {
         state.into_manifest(
             self,
             transaction_file_path,
-            config,
             mem_wal_segments_before.as_ref(),
             read_version_state,
         )
@@ -152,6 +152,8 @@ pub(super) struct ApplyState<'a> {
     /// attempt, the latest committed version on a retry.
     current_manifest: &'a Manifest,
     read_marks: ReadMarks,
+    /// How the manifest this delta produces is to be assembled.
+    build_config: &'a ManifestBuildConfig,
     schema: Schema,
     fragments: Vec<Fragment>,
     /// Base paths minted by this operation. Kept apart from the manifest's own
@@ -159,7 +161,9 @@ pub(super) struct ApplyState<'a> {
     /// committed on top of.
     new_bases: Vec<BasePath>,
     existing_base_paths: HashMap<u32, BasePath>,
-    /// The index segments of the version being committed on top of.
+    /// The index segments, as the actions have left them so far. Index
+    /// actions edit this list; the assembly then prunes whatever the data
+    /// actions invalidated.
     indices: Vec<IndexMetadata>,
     /// The manifest's string maps. Unlike the schema and the fragment list,
     /// these are inherited wholesale by the manifest assembly, so an edit has
@@ -203,10 +207,6 @@ pub(super) struct ApplyState<'a> {
     /// by fragment and field, so a re-encode can be checked to re-bind what it
     /// tombstoned.
     tombstoned_fields: HashMap<(u64, i32), TombstonedField>,
-
-    /// Whether the table was reset, which discards every index outright rather
-    /// than pruning fragments out of them.
-    reset: bool,
 }
 
 /// A field a [`TombstoneFieldData`](super::TombstoneFieldData) freed.
@@ -218,10 +218,16 @@ struct TombstonedField {
 }
 
 impl<'a> ApplyState<'a> {
-    fn new(manifest: &'a Manifest, indices: Vec<IndexMetadata>, read_marks: ReadMarks) -> Self {
+    fn new(
+        manifest: &'a Manifest,
+        indices: Vec<IndexMetadata>,
+        build_config: &'a ManifestBuildConfig,
+        read_marks: ReadMarks,
+    ) -> Self {
         Self {
             current_manifest: manifest,
             read_marks,
+            build_config,
             schema: manifest.schema.clone(),
             fragments: manifest.fragments.as_ref().clone(),
             indices,
@@ -240,7 +246,6 @@ impl<'a> ApplyState<'a> {
             reserved_row_ids: 0,
             rebound_fields: HashMap::new(),
             tombstoned_fields: HashMap::new(),
-            reset: false,
         }
     }
 
@@ -249,11 +254,11 @@ impl<'a> ApplyState<'a> {
         mut self,
         transaction: &Transaction,
         transaction_file_path: &str,
-        config: &ManifestBuildConfig,
         mem_wal_segments_before: Option<&LogicalIndexSegments>,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let current_manifest = self.current_manifest;
+        let config = self.build_config;
         let new_version = current_manifest.version + 1;
 
         self.check_spilled_lineage_is_bound()?;
@@ -272,7 +277,6 @@ impl<'a> ApplyState<'a> {
             mut indices,
             new_bases,
             rebound_fields,
-            reset,
             fragment_high_water,
             field_high_water,
             config: dataset_config,
@@ -280,9 +284,6 @@ impl<'a> ApplyState<'a> {
             ..
         } = self;
 
-        if reset {
-            indices.clear();
-        }
         prune_rebound_fields_from_indices(&mut indices, &rebound_fields, &current_manifest.schema)?;
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
@@ -455,10 +456,10 @@ impl<'a> ApplyState<'a> {
         self.schema.fields.clear();
         self.schema.metadata.clear();
         self.fragments.clear();
+        self.indices.clear();
         self.new_fragments.clear();
         self.rebound_fields.clear();
         self.tombstoned_fields.clear();
-        self.reset = true;
     }
 
     /// The base paths this apply can see: the current manifest's, plus the ones
