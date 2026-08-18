@@ -33,6 +33,39 @@
 //! contract, and a transaction carrying a [`CompositeOperation`] is rejected outright
 //! by libraries that predate it.
 
+/// The action vocabulary, as one list.
+///
+/// Every per-variant `match` over an [`Action`] -- the enum itself, its
+/// forwarding methods, and both directions of its wire encoding -- is generated
+/// from this, so an action is added by writing its module and adding one name
+/// here. A module that does not supply the full set of methods fails to
+/// compile.
+///
+/// The variant name doubles as the protobuf `oneof` variant name and as the
+/// action's name in errors and logs, so the three cannot drift apart.
+///
+/// This is defined ahead of the modules below so it is in scope for all of
+/// them; `macro_rules!` visibility runs from the definition to the end of the
+/// enclosing module, children included.
+macro_rules! for_each_action {
+    ($emit:ident) => {
+        $emit! {
+            AddFragment,
+            AddDataFile,
+            AddField,
+            AddBase,
+            TombstoneFieldData,
+            RemoveFragment,
+            SetDeletionFile,
+            AlterField,
+            DropField,
+            ReserveFragmentIds,
+            ResetTable,
+            ConfigUpdate,
+        }
+    };
+}
+
 mod add_base;
 mod add_data_file;
 mod add_field;
@@ -153,107 +186,56 @@ impl UserAction {
     }
 }
 
-/// A single granular change to the manifest.
-///
-/// The drafted vocabulary is larger than this; the variants here are the ones
-/// this build implements end to end. Each one is defined, applied, and encoded
-/// in the module named after it.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub enum Action {
-    AddFragment(AddFragment),
-    AddDataFile(AddDataFile),
-    AddField(AddField),
-    AddBase(AddBase),
-    TombstoneFieldData(TombstoneFieldData),
-    RemoveFragment(RemoveFragment),
-    SetDeletionFile(SetDeletionFile),
-    AlterField(AlterField),
-    DropField(DropField),
-    ReserveFragmentIds(ReserveFragmentIds),
-    ResetTable(ResetTable),
-    ConfigUpdate(ConfigUpdate),
+macro_rules! define_action {
+    ($($variant:ident,)*) => {
+        /// A single granular change to the manifest.
+        ///
+        /// The drafted vocabulary is larger than this; the variants here are the
+        /// ones this build implements end to end. Each one is defined, applied,
+        /// and encoded in the module named after it, and appears here only
+        /// because it is listed in `for_each_action!`.
+        #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+        pub enum Action {
+            $($variant($variant),)*
+        }
+
+        impl Action {
+            pub fn name(&self) -> &'static str {
+                match self {
+                    $(Self::$variant(_) => stringify!($variant),)*
+                }
+            }
+
+            /// Whether this action changes the data a reader would see, as
+            /// opposed to rearranging how it is stored (compaction, a segment
+            /// rebuild).
+            ///
+            /// CDC and streaming consumers use this to skip commits that cannot
+            /// have changed any row's value.
+            pub fn is_data_change(&self) -> bool {
+                match self {
+                    $(Self::$variant(action) => action.is_data_change(),)*
+                }
+            }
+
+            /// Fold this action into the state the next manifest is built from.
+            fn apply(&self, state: &mut ApplyState) -> Result<()> {
+                match self {
+                    $(Self::$variant(action) => action.apply(state),)*
+                }
+            }
+
+            /// Record the coordinates this action writes.
+            fn footprint(&self, footprint: &mut Footprint) {
+                match self {
+                    $(Self::$variant(action) => action.footprint(footprint),)*
+                }
+            }
+        }
+    };
 }
 
-impl Action {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::AddFragment(_) => "AddFragment",
-            Self::AddDataFile(_) => "AddDataFile",
-            Self::AddField(_) => "AddField",
-            Self::AddBase(_) => "AddBase",
-            Self::TombstoneFieldData(_) => "TombstoneFieldData",
-            Self::RemoveFragment(_) => "RemoveFragment",
-            Self::SetDeletionFile(_) => "SetDeletionFile",
-            Self::AlterField(_) => "AlterField",
-            Self::DropField(_) => "DropField",
-            Self::ReserveFragmentIds(_) => "ReserveFragmentIds",
-            Self::ResetTable(_) => "ResetTable",
-            Self::ConfigUpdate(_) => "ConfigUpdate",
-        }
-    }
-
-    /// Whether this action changes the data a reader would see, as opposed to
-    /// rearranging how it is stored (compaction, a segment rebuild).
-    ///
-    /// CDC and streaming consumers use this to skip commits that cannot have
-    /// changed any row's value.
-    pub fn is_data_change(&self) -> bool {
-        match self {
-            Self::AddFragment(action) => action.data_change,
-            Self::AddDataFile(action) => action.data_change,
-            Self::TombstoneFieldData(action) => action.data_change,
-            Self::RemoveFragment(action) => action.data_change,
-            Self::SetDeletionFile(action) => action.data_change,
-            // Dropping a field discards the values it held.
-            Self::DropField(_) => true,
-            // Other schema and base-path changes touch no row values.
-            // Emptying the table discards every row it held.
-            Self::ResetTable(_) => true,
-            // Reserving ids writes no rows either.
-            Self::AddField(_)
-            | Self::AddBase(_)
-            | Self::AlterField(_)
-            | Self::ReserveFragmentIds(_)
-            | Self::ConfigUpdate(_) => false,
-        }
-    }
-
-    /// Fold this action into the state the next manifest is built from.
-    fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        match self {
-            Self::AddFragment(action) => action.apply(state),
-            Self::AddDataFile(action) => action.apply(state),
-            Self::AddField(action) => action.apply(state),
-            Self::AddBase(action) => action.apply(state),
-            Self::TombstoneFieldData(action) => action.apply(state),
-            Self::RemoveFragment(action) => action.apply(state),
-            Self::SetDeletionFile(action) => action.apply(state),
-            Self::AlterField(action) => action.apply(state),
-            Self::DropField(action) => action.apply(state),
-            Self::ReserveFragmentIds(action) => action.apply(state),
-            Self::ResetTable(action) => action.apply(state),
-            Self::ConfigUpdate(action) => action.apply(state),
-        }
-    }
-
-    /// Record the coordinates this action writes.
-    fn footprint(&self, footprint: &mut Footprint) {
-        match self {
-            Self::AddFragment(action) => action.footprint(footprint),
-            Self::AddDataFile(action) => action.footprint(footprint),
-            Self::AddField(action) => action.footprint(footprint),
-            Self::AddBase(action) => action.footprint(footprint),
-            Self::TombstoneFieldData(action) => action.footprint(footprint),
-            Self::RemoveFragment(action) => action.footprint(footprint),
-            Self::SetDeletionFile(action) => action.footprint(footprint),
-            Self::AlterField(action) => action.footprint(footprint),
-            Self::DropField(action) => action.footprint(footprint),
-            Self::ReserveFragmentIds(action) => action.footprint(footprint),
-            Self::ResetTable(action) => action.footprint(footprint),
-            Self::ConfigUpdate(action) => action.footprint(footprint),
-        }
-    }
-}
+for_each_action!(define_action);
 
 impl std::fmt::Display for Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

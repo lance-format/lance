@@ -70,6 +70,10 @@ impl TombstoneFieldData {
         Ok(())
     }
 
+    pub(super) fn is_data_change(&self) -> bool {
+        self.data_change
+    }
+
     /// The data of each named field in this fragment, and nothing else: another
     /// field's data in the same fragment is untouched.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {

@@ -101,6 +101,11 @@ impl ConfigUpdate {
         )
     }
 
+    /// The config and metadata maps hold no row values.
+    pub(super) fn is_data_change(&self) -> bool {
+        false
+    }
+
     /// The keys this update names, or the whole map when it replaces one. A
     /// field's metadata belongs to the field, so dropping the field also
     /// collides with an update to it.

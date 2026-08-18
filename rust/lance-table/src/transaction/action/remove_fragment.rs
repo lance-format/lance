@@ -30,6 +30,10 @@ impl RemoveFragment {
         Ok(())
     }
 
+    pub(super) fn is_data_change(&self) -> bool {
+        self.data_change
+    }
+
     /// Every coordinate inside the fragment, which cannot be enumerated, so the
     /// removal is recorded as such and matched by fragment id.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
