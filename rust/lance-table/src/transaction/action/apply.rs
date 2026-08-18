@@ -52,12 +52,12 @@ impl Transaction {
             ));
         }
 
-        let mut state = ApplyState::new(current_manifest);
+        let mut state = ApplyState::new(current_manifest, current_indices, config);
         for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
         }
 
-        state.into_manifest(self, current_indices, transaction_file_path, config)
+        state.into_manifest(self, transaction_file_path)
     }
 }
 
@@ -66,12 +66,18 @@ impl Transaction {
 pub(super) struct ApplyState<'a> {
     /// The read version this delta applies to.
     current_manifest: &'a Manifest,
+    /// How the manifest this delta produces is to be assembled.
+    build_config: &'a ManifestBuildConfig,
     schema: Schema,
     fragments: Vec<Fragment>,
     /// Base paths minted by this operation. Kept apart from the manifest's own
     /// base paths, which the manifest assembly inherits from the read version.
     new_bases: Vec<BasePath>,
     existing_base_paths: HashMap<u32, BasePath>,
+    /// The index segments, as the actions have left them so far. Index
+    /// actions edit this list; the assembly then prunes whatever the data
+    /// actions invalidated.
+    indices: Vec<IndexMetadata>,
     /// The manifest's string maps. Unlike the schema and the fragment list,
     /// these are inherited wholesale by the manifest assembly, so an edit has
     /// to be written back over the assembled manifest.
@@ -98,18 +104,20 @@ pub(super) struct ApplyState<'a> {
     /// Fields whose backing data changed, per fragment. An index covering such
     /// a field no longer describes that fragment's contents.
     rebound_fields: HashMap<u64, HashSet<i32>>,
-
-    /// Whether the table was reset, which discards every index outright rather
-    /// than pruning fragments out of them.
-    reset: bool,
 }
 
 impl<'a> ApplyState<'a> {
-    fn new(manifest: &'a Manifest) -> Self {
+    fn new(
+        manifest: &'a Manifest,
+        indices: Vec<IndexMetadata>,
+        build_config: &'a ManifestBuildConfig,
+    ) -> Self {
         Self {
             current_manifest: manifest,
+            build_config,
             schema: manifest.schema.clone(),
             fragments: manifest.fragments.as_ref().clone(),
+            indices,
             new_bases: Vec::new(),
             existing_base_paths: manifest.base_paths.clone(),
             config: manifest.config.clone(),
@@ -128,7 +136,6 @@ impl<'a> ApplyState<'a> {
             minted_fragments: HashSet::new(),
             reserved_fragment_ids: None,
             rebound_fields: HashMap::new(),
-            reset: false,
         }
     }
 
@@ -136,11 +143,10 @@ impl<'a> ApplyState<'a> {
     fn into_manifest(
         mut self,
         transaction: &Transaction,
-        current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
-        config: &ManifestBuildConfig,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let current_manifest = self.current_manifest;
+        let config = self.build_config;
         let new_version = current_manifest.version + 1;
 
         let mut next_row_id = current_manifest
@@ -151,19 +157,15 @@ impl<'a> ApplyState<'a> {
         let ApplyState {
             schema,
             mut fragments,
+            mut indices,
             new_bases,
             rebound_fields,
             reserved_fragment_ids,
-            reset,
             config: dataset_config,
             table_metadata,
             ..
         } = self;
 
-        let mut indices = current_indices;
-        if reset {
-            indices.clear();
-        }
         prune_rebound_fields_from_indices(&mut indices, &rebound_fields);
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
@@ -265,9 +267,9 @@ impl<'a> ApplyState<'a> {
         self.schema.fields.clear();
         self.schema.metadata.clear();
         self.fragments.clear();
+        self.indices.clear();
         self.minted_fragments.clear();
         self.rebound_fields.clear();
-        self.reset = true;
     }
 
     /// The base paths this apply can see: the read version's, plus the ones
