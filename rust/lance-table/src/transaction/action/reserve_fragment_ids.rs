@@ -28,6 +28,11 @@ impl ReserveFragmentIds {
         Ok(())
     }
 
+    /// A reserved id backs no rows until something is written to it.
+    pub(super) fn is_data_change(&self) -> bool {
+        false
+    }
+
     /// Nothing. Ids come off a monotonic counter, so two operations reserving
     /// at once get disjoint ranges rather than colliding.
     pub(super) fn footprint(&self, _footprint: &mut Footprint) {}

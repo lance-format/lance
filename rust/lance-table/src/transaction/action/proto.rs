@@ -126,80 +126,44 @@ impl TryFrom<pb::UserAction> for UserAction {
     }
 }
 
-impl From<&Action> for pb::Action {
-    fn from(value: &Action) -> Self {
-        let action = match value {
-            Action::AddFragment(action) => pb::action::Action::AddFragment(action.into()),
-            Action::AddDataFile(action) => pb::action::Action::AddDataFile(action.into()),
-            Action::AddField(action) => pb::action::Action::AddField(action.into()),
-            Action::AddBase(action) => pb::action::Action::AddBase(action.into()),
-            Action::TombstoneFieldData(action) => {
-                pb::action::Action::TombstoneFieldData(action.into())
+macro_rules! define_action_proto {
+    ($($variant:ident,)*) => {
+        impl From<&Action> for pb::Action {
+            fn from(value: &Action) -> Self {
+                let action = match value {
+                    $(Action::$variant(action) => pb::action::Action::$variant(action.into()),)*
+                };
+                Self {
+                    action: Some(action),
+                }
             }
-            Action::RemoveFragment(action) => pb::action::Action::RemoveFragment(action.into()),
-            Action::SetDeletionFile(action) => pb::action::Action::SetDeletionFile(action.into()),
-            Action::AlterField(action) => pb::action::Action::AlterField(action.into()),
-            Action::DropField(action) => pb::action::Action::DropField(action.into()),
-            Action::ReserveFragmentIds(action) => {
-                pb::action::Action::ReserveFragmentIds(action.into())
-            }
-            Action::ResetTable(action) => pb::action::Action::ResetTable(action.into()),
-            Action::ConfigUpdate(action) => pb::action::Action::ConfigUpdate(action.into()),
-        };
-        Self {
-            action: Some(action),
         }
-    }
+
+        impl TryFrom<pb::Action> for Action {
+            type Error = Error;
+
+            fn try_from(message: pb::Action) -> Result<Self> {
+                match message.action {
+                    $(Some(pb::action::Action::$variant(action)) => {
+                        Ok(Self::$variant(action.try_into()?))
+                    })*
+                    // The drafted vocabulary is larger than what is implemented.
+                    // Reject rather than skip: silently dropping an action would
+                    // apply a partial transaction.
+                    Some(other) => Err(Error::not_supported(format!(
+                        "the action-based transaction uses action {other:?}, which is drafted \
+                         but not implemented by this version of Lance",
+                    ))),
+                    None => Err(Error::invalid_input(
+                        "an Action in a user operation was empty",
+                    )),
+                }
+            }
+        }
+    };
 }
 
-impl TryFrom<pb::Action> for Action {
-    type Error = Error;
-
-    fn try_from(message: pb::Action) -> Result<Self> {
-        match message.action {
-            Some(pb::action::Action::AddFragment(action)) => {
-                Ok(Self::AddFragment(action.try_into()?))
-            }
-            Some(pb::action::Action::AddDataFile(action)) => {
-                Ok(Self::AddDataFile(action.try_into()?))
-            }
-            Some(pb::action::Action::AddField(action)) => Ok(Self::AddField(action.try_into()?)),
-            Some(pb::action::Action::AddBase(action)) => Ok(Self::AddBase(action.try_into()?)),
-            Some(pb::action::Action::TombstoneFieldData(action)) => {
-                Ok(Self::TombstoneFieldData(action.try_into()?))
-            }
-            Some(pb::action::Action::RemoveFragment(action)) => {
-                Ok(Self::RemoveFragment(action.try_into()?))
-            }
-            Some(pb::action::Action::SetDeletionFile(action)) => {
-                Ok(Self::SetDeletionFile(action.try_into()?))
-            }
-            Some(pb::action::Action::AlterField(action)) => {
-                Ok(Self::AlterField(action.try_into()?))
-            }
-            Some(pb::action::Action::DropField(action)) => Ok(Self::DropField(action.try_into()?)),
-            Some(pb::action::Action::ReserveFragmentIds(action)) => {
-                Ok(Self::ReserveFragmentIds(action.try_into()?))
-            }
-            Some(pb::action::Action::ResetTable(action)) => {
-                Ok(Self::ResetTable(action.try_into()?))
-            }
-            Some(pb::action::Action::ConfigUpdate(action)) => {
-                Ok(Self::ConfigUpdate(action.try_into()?))
-            }
-            // The drafted vocabulary is larger than what is implemented. Reject
-            // rather than skip: silently dropping an action would apply a
-            // partial transaction.
-            Some(other) => Err(Error::not_supported(format!(
-                "the action-based transaction uses action {other:?}, which is drafted but not \
-                 implemented by this version of Lance",
-            ))),
-            None => Err(Error::invalid_input(
-                "an Action in a user operation was empty",
-            )),
-        }
-    }
-}
+for_each_action!(define_action_proto);
 
 #[cfg(test)]
 mod tests {

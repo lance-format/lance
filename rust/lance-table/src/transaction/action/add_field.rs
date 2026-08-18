@@ -62,6 +62,12 @@ impl AddField {
         Ok(())
     }
 
+    /// A new field starts empty; an
+    /// [`AddDataFile`](super::AddDataFile) is what gives it values.
+    pub(super) fn is_data_change(&self) -> bool {
+        false
+    }
+
     /// Nothing: the field does not exist in the read version. Attaching it
     /// under a committed parent does not rewrite the parent's definition.
     pub(super) fn footprint(&self, _footprint: &mut Footprint) {}

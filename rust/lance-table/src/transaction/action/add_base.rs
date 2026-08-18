@@ -40,6 +40,11 @@ impl AddBase {
         Ok(())
     }
 
+    /// A base path is a location, not data.
+    pub(super) fn is_data_change(&self) -> bool {
+        false
+    }
+
     /// The base id is minted, but the name and location are not: the manifest
     /// requires both to be unique, so two operations claiming either collide.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
