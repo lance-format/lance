@@ -18,9 +18,13 @@ use lance_core::{Error, Result};
 /// derived by diffing against the read version rather than serialized.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct SetDeletionFile {
-    /// The fragment, by committed id. Unlike its sibling fragment actions this
-    /// takes no [`Ref`](super::Ref): a fragment minted in the same operation has
-    /// no committed rows to delete.
+    /// The fragment, by committed id.
+    ///
+    /// Unlike its sibling fragment actions this takes no [`Ref`](super::Ref).
+    /// A deletion file's path is `{fragment_id}-{read_version}-{id}.{suffix}`
+    /// (see [`deletion_file_path`](crate::io::deletion::deletion_file_path)),
+    /// so the writer has to know the committed fragment id before it can write
+    /// the file at all, and a minted id does not exist until apply.
     pub fragment: u64,
     /// The new deletion file, or `None` to clear the fragment's deletions.
     pub deletion_file: Option<DeletionFile>,
