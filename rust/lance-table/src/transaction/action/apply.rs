@@ -52,16 +52,101 @@ impl Transaction {
             ));
         }
 
-        let new_version = current_manifest.version + 1;
         let mut state = ApplyState::new(current_manifest);
         for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
         }
 
+        state.into_manifest(self, current_indices, transaction_file_path, config)
+    }
+}
+
+/// The read-version state an action set is applied against, plus the id
+/// allocations made so far.
+pub(super) struct ApplyState<'a> {
+    /// The read version this delta applies to.
+    current_manifest: &'a Manifest,
+    schema: Schema,
+    fragments: Vec<Fragment>,
+    /// Base paths minted by this operation. Kept apart from the manifest's own
+    /// base paths, which the manifest assembly inherits from the read version.
+    new_bases: Vec<BasePath>,
+    existing_base_paths: HashMap<u32, BasePath>,
+    /// The manifest's string maps. Unlike the schema and the fragment list,
+    /// these are inherited wholesale by the manifest assembly, so an edit has
+    /// to be written back over the assembled manifest.
+    config: HashMap<String, String>,
+    table_metadata: HashMap<String, String>,
+
+    next_fragment_id: u64,
+    next_field_id: i32,
+    next_base_id: u32,
+
+    /// Local token -> the id minted for it, one map per id space.
+    fragment_tokens: HashMap<u32, u64>,
+    field_tokens: HashMap<u32, i32>,
+    base_tokens: HashMap<u32, u32>,
+
+    /// Ids of the fragments this operation minted.
+    minted_fragments: HashSet<u64>,
+
+    /// The highest fragment id this operation reserved for a later writer, if
+    /// it reserved any. No fragment backs it, so the manifest assembly cannot
+    /// infer it from the fragment list.
+    reserved_fragment_ids: Option<u64>,
+
+    /// Fields whose backing data changed, per fragment. An index covering such
+    /// a field no longer describes that fragment's contents.
+    rebound_fields: HashMap<u64, HashSet<i32>>,
+
+    /// Whether the table was reset, which discards every index outright rather
+    /// than pruning fragments out of them.
+    reset: bool,
+}
+
+impl<'a> ApplyState<'a> {
+    fn new(manifest: &'a Manifest) -> Self {
+        Self {
+            current_manifest: manifest,
+            schema: manifest.schema.clone(),
+            fragments: manifest.fragments.as_ref().clone(),
+            new_bases: Vec::new(),
+            existing_base_paths: manifest.base_paths.clone(),
+            config: manifest.config.clone(),
+            table_metadata: manifest.table_metadata.clone(),
+            next_fragment_id: manifest.max_fragment_id().map(|id| id + 1).unwrap_or(0),
+            next_field_id: manifest.max_field_id() + 1,
+            next_base_id: manifest
+                .base_paths
+                .keys()
+                .max()
+                .map(|id| id + 1)
+                .unwrap_or(1),
+            fragment_tokens: HashMap::new(),
+            field_tokens: HashMap::new(),
+            base_tokens: HashMap::new(),
+            minted_fragments: HashSet::new(),
+            reserved_fragment_ids: None,
+            rebound_fields: HashMap::new(),
+            reset: false,
+        }
+    }
+
+    /// Assemble the next manifest from the state the actions left behind.
+    fn into_manifest(
+        mut self,
+        transaction: &Transaction,
+        current_indices: Vec<IndexMetadata>,
+        transaction_file_path: &str,
+        config: &ManifestBuildConfig,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        let current_manifest = self.current_manifest;
+        let new_version = current_manifest.version + 1;
+
         let mut next_row_id = current_manifest
             .uses_stable_row_ids()
             .then_some(current_manifest.next_row_id);
-        state.assign_row_ids_to_minted_fragments(&mut next_row_id, new_version)?;
+        self.assign_row_ids_to_minted_fragments(&mut next_row_id, new_version)?;
 
         let ApplyState {
             schema,
@@ -73,17 +158,17 @@ impl Transaction {
             config: dataset_config,
             table_metadata,
             ..
-        } = state;
+        } = self;
 
         let mut indices = current_indices;
         if reset {
             indices.clear();
         }
         prune_rebound_fields_from_indices(&mut indices, &rebound_fields);
-        Self::retain_relevant_indices(&mut indices, &schema, &fragments);
+        Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        Self::normalize_fragments(&mut fragments)?;
-        let mut manifest = self.assemble_manifest(
+        Transaction::normalize_fragments(&mut fragments)?;
+        let mut manifest = transaction.assemble_manifest(
             Some(current_manifest),
             schema,
             fragments,
@@ -123,75 +208,6 @@ impl Transaction {
         }
 
         Ok((manifest, indices))
-    }
-}
-
-/// The read-version state an action set is applied against, plus the id
-/// allocations made so far.
-pub(super) struct ApplyState {
-    schema: Schema,
-    fragments: Vec<Fragment>,
-    /// Base paths minted by this operation. Kept apart from the manifest's own
-    /// base paths, which the manifest assembly inherits from the read version.
-    new_bases: Vec<BasePath>,
-    existing_base_paths: HashMap<u32, BasePath>,
-    /// The manifest's string maps. Unlike the schema and the fragment list,
-    /// these are inherited wholesale by the manifest assembly, so an edit has
-    /// to be written back over the assembled manifest.
-    config: HashMap<String, String>,
-    table_metadata: HashMap<String, String>,
-
-    next_fragment_id: u64,
-    next_field_id: i32,
-    next_base_id: u32,
-
-    /// Local token -> the id minted for it, one map per id space.
-    fragment_tokens: HashMap<u32, u64>,
-    field_tokens: HashMap<u32, i32>,
-    base_tokens: HashMap<u32, u32>,
-
-    /// Ids of the fragments this operation minted.
-    minted_fragments: HashSet<u64>,
-
-    /// The highest fragment id this operation reserved for a later writer, if
-    /// it reserved any. No fragment backs it, so the manifest assembly cannot
-    /// infer it from the fragment list.
-    reserved_fragment_ids: Option<u64>,
-
-    /// Fields whose backing data changed, per fragment. An index covering such
-    /// a field no longer describes that fragment's contents.
-    rebound_fields: HashMap<u64, HashSet<i32>>,
-
-    /// Whether the table was reset, which discards every index outright rather
-    /// than pruning fragments out of them.
-    reset: bool,
-}
-
-impl ApplyState {
-    fn new(manifest: &Manifest) -> Self {
-        Self {
-            schema: manifest.schema.clone(),
-            fragments: manifest.fragments.as_ref().clone(),
-            new_bases: Vec::new(),
-            existing_base_paths: manifest.base_paths.clone(),
-            config: manifest.config.clone(),
-            table_metadata: manifest.table_metadata.clone(),
-            next_fragment_id: manifest.max_fragment_id().map(|id| id + 1).unwrap_or(0),
-            next_field_id: manifest.max_field_id() + 1,
-            next_base_id: manifest
-                .base_paths
-                .keys()
-                .max()
-                .map(|id| id + 1)
-                .unwrap_or(1),
-            fragment_tokens: HashMap::new(),
-            field_tokens: HashMap::new(),
-            base_tokens: HashMap::new(),
-            minted_fragments: HashSet::new(),
-            reserved_fragment_ids: None,
-            rebound_fields: HashMap::new(),
-            reset: false,
-        }
     }
 
     pub(super) fn schema(&self) -> &Schema {
