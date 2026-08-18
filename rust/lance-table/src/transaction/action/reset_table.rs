@@ -134,13 +134,12 @@ mod tests {
 
     #[test]
     fn test_reset_conflicts_with_everything() {
-        use crate::transaction::action::{Footprint, UserAction, UserOperation};
+        use crate::transaction::action::{CompositeOperation, Footprint, UserAction};
 
         let footprint = |actions| {
-            Footprint::from(&UserOperation::new(
-                "test",
-                vec![UserAction::new("step", actions)],
-            ))
+            Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+                "step", actions,
+            )]))
         };
 
         let reset = footprint(vec![reset()]);

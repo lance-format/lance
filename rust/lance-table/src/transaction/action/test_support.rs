@@ -3,7 +3,7 @@
 
 //! Fixtures shared by the per-action test modules.
 
-use super::{Action, UserAction, UserOperation};
+use super::{Action, CompositeOperation, UserAction};
 use crate::format::{DataFile, Fragment, IndexMetadata, Manifest};
 use crate::transaction::test_support::{default_build_config, sample_manifest};
 use crate::transaction::{Operation, Transaction};
@@ -23,10 +23,9 @@ pub(super) fn apply_with_indices(
 ) -> Result<(Manifest, Vec<IndexMetadata>)> {
     let transaction = Transaction::new(
         manifest.version,
-        Operation::UserOperation(UserOperation::new(
-            "test",
-            vec![UserAction::new("step", actions)],
-        )),
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+            "step", actions,
+        )])),
         None,
     );
     transaction.build_manifest(Some(manifest), indices, "tx.txn", &default_build_config())
