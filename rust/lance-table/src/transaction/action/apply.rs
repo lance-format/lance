@@ -39,6 +39,7 @@ use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
 
 /// The field id written into a data file's field list once the file no longer
 /// backs that field. A file whose every slot is tombstoned is dropped.
@@ -373,6 +374,20 @@ impl<'a> ApplyState<'a> {
             )));
         }
         self.indices.push(segment);
+        Ok(())
+    }
+
+    /// Drop an index segment by uuid. A removal that names a segment the
+    /// dataset does not have is a mistake rather than a no-op: it means the
+    /// operation was planned against a different set of segments.
+    pub(super) fn remove_index_segment(&mut self, uuid: Uuid) -> Result<()> {
+        let before = self.indices.len();
+        self.indices.retain(|index| index.uuid != uuid);
+        if self.indices.len() == before {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} is not part of the dataset, so it cannot be removed"
+            )));
+        }
         Ok(())
     }
 
