@@ -25,7 +25,11 @@ pub struct TombstoneFieldData {
     pub fragment: Ref,
     /// Committed field ids whose current backing is tombstoned.
     pub field_ids: Vec<i32>,
-    /// See [`AddFragment::data_change`](super::AddFragment::data_change).
+    /// `false` marks a tombstone whose data is re-added by an
+    /// [`AddDataFile`](super::AddDataFile) for the same fields in the same
+    /// operation, i.e. a re-encode that moves the bytes without changing any
+    /// row's value. A tombstone with no matching re-add nulls the column out
+    /// and is a data change.
     pub data_change: bool,
 }
 
