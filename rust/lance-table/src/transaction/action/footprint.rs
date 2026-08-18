@@ -54,6 +54,10 @@ pub enum Coordinate {
     /// once, on one set of fields, so two writers declaring it on fields of
     /// their own collide even though they name different fields' metadata.
     UnenforcedKey(UnenforcedKey),
+    /// A logical index, by name. Segments are named by uuid, which the writer
+    /// picks and no one else can guess, so the name is the only index
+    /// coordinate two writers can arrive at independently.
+    IndexName(String),
 }
 
 /// One of the string maps a manifest carries.
@@ -88,7 +92,8 @@ impl Coordinate {
             | Self::BaseName(_)
             | Self::BaseLocation(_)
             | Self::ConfigEntry { .. }
-            | Self::UnenforcedKey(_) => None,
+            | Self::UnenforcedKey(_)
+            | Self::IndexName(_) => None,
         }
     }
 
