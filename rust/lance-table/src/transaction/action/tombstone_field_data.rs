@@ -4,10 +4,7 @@
 //! Tombstone the data-file binding of committed fields within one fragment.
 
 use super::apply::{ApplyState, TOMBSTONED_FIELD};
-use super::proto::{
-    data_change_from_wire, data_change_to_wire, field_id_from_wire, field_id_to_wire,
-    required,
-};
+use super::proto::{data_change_from_wire, data_change_to_wire, required};
 use super::{Footprint, Ref};
 use crate::format::pb;
 use lance_core::deepsize::DeepSizeOf;
@@ -23,8 +20,8 @@ use lance_core::{Error, Result};
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct TombstoneFieldData {
     pub fragment: Ref,
-    /// Committed field ids whose current backing is tombstoned.
-    pub field_ids: Vec<i32>,
+    /// The fields whose current backing is tombstoned.
+    pub field_ids: Vec<Ref>,
     /// `false` marks a tombstone whose data is re-added by an
     /// [`AddDataFile`](super::AddDataFile) for the same fields in the same
     /// operation, i.e. a re-encode that moves the bytes without changing any
@@ -36,9 +33,14 @@ pub struct TombstoneFieldData {
 impl TombstoneFieldData {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
+        let field_ids = self
+            .field_ids
+            .iter()
+            .map(|field| state.resolve_field(*field))
+            .collect::<Result<Vec<_>>>()?;
         let fragment = state.fragment_mut(fragment_id, "TombstoneFieldData")?;
 
-        for &field_id in &self.field_ids {
+        for &field_id in &field_ids {
             let mut found = false;
             for file in fragment.files.iter_mut() {
                 let Some(position) = file.fields.iter().position(|id| *id == field_id) else {
@@ -59,14 +61,13 @@ impl TombstoneFieldData {
 
         // New values for these fields supersede any overlay still shadowing
         // them, so the drop is not silently masked by stale overlay cells.
-        let overlaid: Vec<u32> = self
-            .field_ids
+        let overlaid: Vec<u32> = field_ids
             .iter()
             .filter_map(|id| u32::try_from(*id).ok())
             .collect();
         crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
 
-        state.rebind_fields(fragment_id, self.field_ids.iter().copied());
+        state.rebind_fields(fragment_id, field_ids.iter().copied());
         Ok(())
     }
 
@@ -85,7 +86,7 @@ impl From<&TombstoneFieldData> for pb::TombstoneFieldData {
     fn from(value: &TombstoneFieldData) -> Self {
         Self {
             fragment: Some(value.fragment.into()),
-            field_ids: value.field_ids.iter().map(|id| field_id_to_wire(*id)).collect(),
+            field_ids: value.field_ids.iter().map(|id| (*id).into()).collect(),
             data_change: data_change_to_wire(value.data_change),
         }
     }
@@ -100,7 +101,7 @@ impl TryFrom<pb::TombstoneFieldData> for TombstoneFieldData {
             field_ids: message
                 .field_ids
                 .into_iter()
-                .map(field_id_from_wire)
+                .map(Ref::try_from)
                 .collect::<Result<Vec<_>>>()?,
             data_change: data_change_from_wire(message.data_change),
         })
@@ -119,7 +120,7 @@ mod tests {
     fn tombstone_field_zero() -> Action {
         Action::TombstoneFieldData(TombstoneFieldData {
             fragment: Ref::Committed(0),
-            field_ids: vec![0],
+            field_ids: vec![Ref::Committed(0)],
             data_change: true,
         })
     }
@@ -166,7 +167,7 @@ mod tests {
             &backed_manifest(),
             vec![Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(0),
-                field_ids: vec![7],
+                field_ids: vec![Ref::Committed(7)],
                 data_change: true,
             })],
         )
@@ -174,5 +175,46 @@ mod tests {
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("field 7"), "{error}");
+    }
+
+    #[test]
+    fn test_tombstone_field_data_can_name_a_field_minted_in_the_same_operation() {
+        // A squash of "add column with data" and "re-encode that column" lowers
+        // to exactly this, and has no committed id to name the field by.
+        use crate::transaction::action::test_support::added_field;
+        use crate::transaction::action::{AddDataFile, AddField};
+
+        let next = apply(
+            &backed_manifest(),
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: added_field("fresh"),
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(0),
+                    file: DataFile::new_unstarted("data/fresh.lance", 1, 0),
+                    field_ids: vec![Ref::Local(0)],
+                    data_change: true,
+                }),
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(0),
+                    field_ids: vec![Ref::Local(0)],
+                    data_change: false,
+                }),
+            ],
+        )
+        .unwrap();
+
+        // The file that backed only the minted field is left backing nothing
+        // and is pruned, so the fragment keeps just its original file.
+        assert_eq!(next.fragments[0].files.len(), 1);
+        assert!(
+            !next.fragments[0]
+                .files
+                .iter()
+                .any(|file| file.path == "data/fresh.lance")
+        );
     }
 }

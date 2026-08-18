@@ -258,9 +258,10 @@ mod tests {
     #[test]
     fn test_data_change_defaults_by_action_kind() {
         let alter = Action::AlterField(AlterField {
-            field: 1,
+            field: Ref::Committed(1),
             name: Some("renamed".into()),
-            ..Default::default()
+            logical_type: None,
+            nullable: None,
         });
         assert!(!alter.is_data_change(), "a rename changes no row values");
 
