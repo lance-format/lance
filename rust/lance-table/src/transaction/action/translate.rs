@@ -176,7 +176,7 @@ mod tests {
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::Transaction;
-    use crate::transaction::action::UserOperation;
+    use crate::transaction::action::CompositeOperation;
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, sample_manifest,
     };
@@ -190,7 +190,7 @@ mod tests {
         let actions = Vec::<UserAction>::try_from(&operation).unwrap();
         let (translated, translated_indices) = build(
             manifest,
-            Operation::UserOperation(UserOperation::new("translated", actions)),
+            Operation::CompositeOperation(CompositeOperation::new(actions)),
         );
 
         // Data files are addressed by field, so the two paths are allowed to
@@ -388,7 +388,7 @@ mod tests {
         let actions = Vec::<UserAction>::try_from(&operation).unwrap();
         let error = Transaction::new(
             manifest.version,
-            Operation::UserOperation(UserOperation::new("translated", actions)),
+            Operation::CompositeOperation(CompositeOperation::new(actions)),
             None,
         )
         .build_manifest(

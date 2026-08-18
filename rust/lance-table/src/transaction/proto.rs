@@ -12,7 +12,7 @@ use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::pb;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
-use crate::transaction::action::UserOperation;
+use crate::transaction::action::CompositeOperation;
 use crate::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
@@ -417,14 +417,14 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
-            Some(pb::transaction::Operation::CompositeOperation(user_operation)) => {
+            Some(pb::transaction::Operation::CompositeOperation(composite_operation)) => {
                 // Action-based transactions (Transaction V2) are a draft wire
                 // format (OSS-1530). Parsing is fail-closed: an action this build
                 // does not implement is an error, never a skipped element.
                 // load_and_sort_new_transactions collects concurrent transactions
                 // with try_collect, so such a transaction aborts the commit rather
                 // than being silently treated as a no-op. Do NOT make this lenient.
-                Operation::UserOperation(UserOperation::try_from(user_operation)?)
+                Operation::CompositeOperation(CompositeOperation::try_from(composite_operation)?)
             }
             None => {
                 return Err(Error::internal(
@@ -729,8 +729,8 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<pb::BasePath>>(),
                 })
             }
-            Operation::UserOperation(user_operation) => {
-                let mut message = pb::CompositeOperation::from(user_operation);
+            Operation::CompositeOperation(composite_operation) => {
+                let mut message = pb::CompositeOperation::from(composite_operation);
                 // The operation's identity and read version are the enclosing
                 // transaction's; the wire carries them in both places so a
                 // squashed operation keeps its own provenance.
@@ -889,14 +889,13 @@ mod tests {
     }
 
     #[test]
-    fn test_user_operation_round_trips_through_transaction() {
+    fn test_composite_operation_round_trips_through_transaction() {
         let uuid = Uuid::new_v4().to_string();
         let transaction = Transaction {
             read_version: 4,
             uuid: uuid.clone(),
-            operation: Operation::UserOperation(UserOperation::new(
-                "INSERT INTO t VALUES (1)",
-                vec![UserAction::new(
+            operation: Operation::CompositeOperation(CompositeOperation::new(vec![
+                UserAction::new(
                     "append batch",
                     vec![Action::AddFragment(AddFragment {
                         local: 0,
@@ -906,8 +905,8 @@ mod tests {
                         created_at_version_meta: None,
                         data_change: true,
                     })],
-                )],
-            )),
+                ),
+            ])),
             tag: None,
             transaction_properties: None,
         };
@@ -916,11 +915,11 @@ mod tests {
         // The operation repeats the envelope's identity so a squashed operation
         // keeps the provenance of the commit it came from.
         match &message.operation {
-            Some(pb::transaction::Operation::CompositeOperation(user_operation)) => {
-                assert_eq!(user_operation.uuid, uuid);
-                assert_eq!(user_operation.read_version, 4);
+            Some(pb::transaction::Operation::CompositeOperation(composite_operation)) => {
+                assert_eq!(composite_operation.uuid, uuid);
+                assert_eq!(composite_operation.read_version, 4);
             }
-            other => panic!("expected UserOperation, got {other:?}"),
+            other => panic!("expected CompositeOperation, got {other:?}"),
         }
 
         assert_eq!(Transaction::try_from(message).unwrap(), transaction);

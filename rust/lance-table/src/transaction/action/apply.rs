@@ -14,7 +14,7 @@
 //! modules program against. What each action does with it lives in that action's
 //! own module.
 
-use super::{Ref, UserOperation};
+use super::{CompositeOperation, Ref};
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig};
 use crate::rowids::version::build_version_meta;
 use crate::transaction::Transaction;
@@ -34,7 +34,7 @@ impl Transaction {
     /// when the dataset does not exist yet.
     pub(in crate::transaction) fn build_manifest_from_actions(
         &self,
-        user_operation: &UserOperation,
+        composite_operation: &CompositeOperation,
         current_manifest: Option<&Manifest>,
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
@@ -54,7 +54,7 @@ impl Transaction {
 
         let new_version = current_manifest.version + 1;
         let mut state = ApplyState::new(current_manifest);
-        for action in user_operation.iter_actions() {
+        for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
         }
 
@@ -500,7 +500,7 @@ mod tests {
     fn test_action_set_cannot_create_a_dataset() {
         let transaction = Transaction::new(
             0,
-            Operation::UserOperation(UserOperation::new("test", vec![])),
+            Operation::CompositeOperation(CompositeOperation::new(vec![])),
             None,
         );
         let error = transaction
