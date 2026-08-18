@@ -26,7 +26,14 @@ pub struct AddFragment {
     /// on datasets that have them but where the ids are assigned at apply.
     pub row_id_meta: Option<RowIdMeta>,
     /// Per-row version metadata, carried exactly as on
-    /// [`Fragment`](crate::format::Fragment). `None` means "stamp at apply".
+    /// [`Fragment`](crate::format::Fragment).
+    ///
+    /// `None` means "stamp at apply", which fills both with a uniform sequence
+    /// at the commit version. That is right for an append, but not for the two
+    /// producers whose rows carry versions from before this commit, so they set
+    /// the fields explicitly: an update resolves each row's `created_at` from
+    /// the fragment the row came from, and a compaction rechunks both sequences
+    /// off the fragments it merged, since moving a row does not update it.
     pub last_updated_at_version_meta: Option<RowDatasetVersionMeta>,
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
     /// `false` marks a pure rearrangement, e.g. a compaction rewrite.
