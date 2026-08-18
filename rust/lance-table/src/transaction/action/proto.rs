@@ -17,28 +17,6 @@ use crate::format::pb;
 use crate::format::pb_transaction;
 use lance_core::{Error, Result};
 
-/// A field on the wire is a [`Ref`], so an action can name a field the same
-/// operation is minting. The actions that resolve one against the manifest come
-/// later; until then only a committed reference means anything here.
-pub(super) fn field_id_from_wire(field: pb_transaction::Ref) -> Result<i32> {
-    match Ref::try_from(field)? {
-        Ref::Committed(id) => i32::try_from(id).map_err(|_| {
-            Error::invalid_input(format!(
-                "field id {id} in an action exceeds the maximum field id ({})",
-                i32::MAX
-            ))
-        }),
-        Ref::Local(token) => Err(Error::invalid_input(format!(
-            "an action names field {token}, which the same operation is minting; this build \
-             resolves only committed field references"
-        ))),
-    }
-}
-
-pub(super) fn field_id_to_wire(id: i32) -> pb_transaction::Ref {
-    Ref::Committed(id as u64).into()
-}
-
 /// `data_change` is absent-means-true on the wire, so only the `false` case is
 /// written out.
 pub(super) fn data_change_to_wire(data_change: bool) -> Option<bool> {
@@ -222,7 +200,7 @@ mod tests {
             }),
             Action::TombstoneFieldData(TombstoneFieldData {
                 fragment: Ref::Committed(4),
-                field_ids: vec![7, 8],
+                field_ids: vec![Ref::Committed(7), Ref::Committed(8)],
                 data_change: true,
             }),
             Action::RemoveFragment(RemoveFragment {
@@ -241,12 +219,14 @@ mod tests {
                 data_change: true,
             }),
             Action::AlterField(AlterField {
-                field: 2,
+                field: Ref::Committed(2),
                 name: Some("renamed".into()),
                 logical_type: Some("int64".into()),
                 nullable: Some(false),
             }),
-            Action::DropField(DropField { field: 3 }),
+            Action::DropField(DropField {
+                field: Ref::Committed(3),
+            }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ResetTable(ResetTable),
             Action::ConfigUpdate(ConfigUpdate {
@@ -329,15 +309,6 @@ mod tests {
         let error = Ref::try_from(pb_transaction::Ref { kind: None }).unwrap_err();
         assert!(
             error.to_string().contains("committed or local"),
-            "unexpected message: {error}"
-        );
-    }
-
-    #[test]
-    fn test_field_id_out_of_range_is_rejected() {
-        let error = field_id_from_wire(u64::from(u32::MAX) + 1).unwrap_err();
-        assert!(
-            error.to_string().contains("exceeds the maximum field id"),
             "unexpected message: {error}"
         );
     }
