@@ -176,10 +176,12 @@ impl Footprint {
 
     /// The data of each field within `fragment`.
     ///
-    /// A fragment this operation mints has no id a concurrent writer could
-    /// name, so its cells are not written coordinates -- but the fields the
-    /// data belongs to are still required to exist.
-    pub(super) fn add_field_data(&mut self, fragment: Ref, fields: impl IntoIterator<Item = i32>) {
+    /// A field this operation mints records nothing -- no concurrent writer can
+    /// be naming one. Nor does a fragment this operation mints write a
+    /// coordinate; but the committed fields the data belongs to are still
+    /// required to be there when it lands.
+    pub(super) fn add_field_data(&mut self, fragment: Ref, fields: impl IntoIterator<Item = Ref>) {
+        let fields = fields.into_iter().filter_map(committed_field);
         match fragment.committed() {
             Some(fragment) => {
                 for field in fields {
@@ -187,6 +189,13 @@ impl Footprint {
                 }
             }
             None => self.required_fields.extend(fields),
+        }
+    }
+
+    /// A field's entry in the schema.
+    pub(super) fn add_field_definition(&mut self, field: Ref) {
+        if let Some(field) = committed_field(field) {
+            self.add(Coordinate::FieldDefinition(field));
         }
     }
 
@@ -216,10 +225,18 @@ impl Footprint {
         self.exclusive = true;
     }
 
-    pub(super) fn remove_field(&mut self, field: i32) {
-        self.add(Coordinate::FieldDefinition(field));
-        self.removed_fields.insert(field);
+    pub(super) fn remove_field(&mut self, field: Ref) {
+        if let Some(field) = committed_field(field) {
+            self.add(Coordinate::FieldDefinition(field));
+            self.removed_fields.insert(field);
+        }
     }
+}
+
+/// A field id a concurrent writer could also be naming, or `None` for a field
+/// this operation mints, which no one else can see yet.
+fn committed_field(reference: Ref) -> Option<i32> {
+    i32::try_from(reference.committed()?).ok()
 }
 
 impl From<&CompositeOperation> for Footprint {
@@ -276,7 +293,7 @@ mod tests {
     fn tombstone(fragment: u64, fields: &[i32]) -> Action {
         Action::TombstoneFieldData(TombstoneFieldData {
             fragment: Ref::Committed(fragment),
-            field_ids: fields.to_vec(),
+            field_ids: fields.iter().map(|id| Ref::Committed(*id as u64)).collect(),
             data_change: true,
         })
     }
@@ -356,32 +373,32 @@ mod tests {
         false,
     )]
     #[case::same_field_definition(
-        vec![Action::AlterField(AlterField { field: 1, name: Some("a".into()), ..Default::default() })],
-        vec![Action::AlterField(AlterField { field: 1, nullable: Some(true), ..Default::default() })],
+        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: Some("a".into()), logical_type: None, nullable: None })],
+        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, logical_type: None, nullable: Some(true) })],
         true,
     )]
     #[case::different_field_definitions(
-        vec![Action::AlterField(AlterField { field: 1, ..Default::default() })],
-        vec![Action::AlterField(AlterField { field: 2, ..Default::default() })],
+        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, logical_type: None, nullable: None })],
+        vec![Action::AlterField(AlterField { field: Ref::Committed(2), name: None, logical_type: None, nullable: None })],
         false,
     )]
     #[case::dropping_a_field_collides_with_altering_it(
-        vec![Action::DropField(DropField { field: 1 })],
-        vec![Action::AlterField(AlterField { field: 1, nullable: Some(true), ..Default::default() })],
+        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
+        vec![Action::AlterField(AlterField { field: Ref::Committed(1), name: None, logical_type: None, nullable: Some(true) })],
         true,
     )]
     #[case::dropping_a_field_collides_with_rewriting_its_data(
-        vec![Action::DropField(DropField { field: 1 })],
+        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
         vec![tombstone(0, &[1])],
         true,
     )]
     #[case::dropping_a_field_leaves_other_fields_alone(
-        vec![Action::DropField(DropField { field: 1 })],
+        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
         vec![tombstone(0, &[2])],
         false,
     )]
     #[case::dropping_a_field_leaves_deletions_alone(
-        vec![Action::DropField(DropField { field: 1 })],
+        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
         vec![set_deletion_file(0)],
         false,
     )]
