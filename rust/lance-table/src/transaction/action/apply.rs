@@ -355,6 +355,27 @@ impl<'a> ApplyState<'a> {
         self.current_manifest.uses_stable_row_ids()
     }
 
+    /// The version this delta applies to, which is the newest data an index
+    /// segment added by this operation can have been built from.
+    pub(super) fn read_version(&self) -> u64 {
+        self.current_manifest.version
+    }
+
+    /// Add an index segment. A segment's uuid identifies it, so re-adding one
+    /// that is already there is a mistake rather than a replacement -- swapping
+    /// a segment out is a [`RemoveIndexSegment`](super::RemoveIndexSegment)
+    /// followed by an add.
+    pub(super) fn add_index_segment(&mut self, segment: IndexMetadata) -> Result<()> {
+        if self.indices.iter().any(|index| index.uuid == segment.uuid) {
+            return Err(Error::invalid_input(format!(
+                "index segment {} is already part of the dataset; a segment is added once",
+                segment.uuid
+            )));
+        }
+        self.indices.push(segment);
+        Ok(())
+    }
+
     pub(super) fn schema(&self) -> &Schema {
         &self.schema
     }

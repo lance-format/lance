@@ -166,18 +166,22 @@ for_each_action!(define_action_proto);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, RowIdMeta};
+    use crate::format::{
+        BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta, pb,
+    };
     use crate::rowids::version::RowDatasetVersionMeta;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AlterField, ConfigUpdate, DropField,
-        FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds, ReserveRowIds, ResetTable,
-        SetDeletionFile, TombstoneFieldData,
+        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AlterField, ConfigUpdate,
+        DropField, FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds, ReserveRowIds,
+        ResetTable, SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
+    use chrono::DateTime;
     use lance_core::datatypes::Field;
     use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn sample_data_file() -> DataFile {
         DataFile::new_unstarted("data/1.lance", ConcreteFileVersion::V2_0)
@@ -239,6 +243,26 @@ mod tests {
             }),
             Action::DropField(DropField {
                 field: FieldRef::Committed(3),
+            }),
+            Action::AddIndexSegment(AddIndexSegment {
+                uuid: Uuid::from_u128(7),
+                name: "by_a".into(),
+                fields: vec![Ref::Committed(1), Ref::Local(3)],
+                index_details: Some(Arc::new(prost_types::Any {
+                    type_url: "type.googleapis.com/lance.table.MemWalIndexDetails".into(),
+                    value: vec![1, 2, 3],
+                })),
+                index_version: 2,
+                covered_fragments: Some(vec![Ref::Committed(4), Ref::Local(0)]),
+                files: vec![IndexFile {
+                    path: "index.idx".into(),
+                    size_bytes: 512,
+                    file_metadata_size_bytes: std::num::NonZero::new(128),
+                }],
+                base: Some(Ref::Local(1)),
+                created_at: DateTime::from_timestamp_millis(1_700_000_000_000),
+                dataset_version: Some(3),
+                data_change: false,
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ReserveRowIds(ReserveRowIds { count: 40 }),
