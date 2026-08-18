@@ -56,6 +56,10 @@ impl AddFragment {
         Ok(())
     }
 
+    pub(super) fn is_data_change(&self) -> bool {
+        self.data_change
+    }
+
     /// Nothing: the fragment does not exist in the read version, so no
     /// concurrent writer can be naming it.
     pub(super) fn footprint(&self, _footprint: &mut Footprint) {}

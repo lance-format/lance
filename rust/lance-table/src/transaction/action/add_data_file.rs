@@ -52,6 +52,10 @@ impl AddDataFile {
         Ok(())
     }
 
+    pub(super) fn is_data_change(&self) -> bool {
+        self.data_change
+    }
+
     /// The data of every committed field the file backs, in the fragment it is
     /// attached to. A file backing only minted fields writes nothing.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
