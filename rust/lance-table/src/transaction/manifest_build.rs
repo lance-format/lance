@@ -725,9 +725,9 @@ impl Transaction {
             config.migration_next_row_id,
         )?;
         let (original_indices, prepared_indices, frag_reuse) = prepared.into_parts();
-        if let Operation::UserOperation(user_operation) = &self.operation {
+        if let Operation::CompositeOperation(composite_operation) = &self.operation {
             return self.build_manifest_from_actions(
-                user_operation,
+                composite_operation,
                 current_manifest,
                 original_indices,
                 transaction_file_path,
@@ -1841,7 +1841,7 @@ impl Transaction {
                 // Base paths are handled in the manifest creation section below
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
-            Operation::UserOperation(_) => {
+            Operation::CompositeOperation(_) => {
                 // Handled by build_manifest_from_actions before this match.
                 return Err(Error::internal(
                     "an action-based operation reached the legacy manifest build".to_string(),

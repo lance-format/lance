@@ -4,7 +4,7 @@
 //! The envelope around the per-action protobuf encodings.
 //!
 //! Each action encodes itself, in its own module; this module carries the
-//! [`Ref`], [`UserOperation`], and [`UserAction`] wrappers, the dispatch over
+//! [`Ref`], [`CompositeOperation`], and [`UserAction`] wrappers, the dispatch over
 //! the `oneof`, and the helpers the per-action conversions share.
 //!
 //! Reading is fail-closed: an action this build does not implement is an error,
@@ -12,7 +12,7 @@
 //! transactions with `try_collect`, so a transaction carrying an unknown action
 //! must abort the commit rather than be treated as a no-op.
 
-use super::{Action, Ref, UserAction, UserOperation};
+use super::{Action, CompositeOperation, Ref, UserAction};
 use crate::format::pb;
 use crate::format::pb_transaction;
 use lance_core::{Error, Result};
@@ -77,8 +77,8 @@ impl TryFrom<pb_transaction::Ref> for Ref {
     }
 }
 
-impl From<&UserOperation> for pb_transaction::CompositeOperation {
-    fn from(value: &UserOperation) -> Self {
+impl From<&CompositeOperation> for pb_transaction::CompositeOperation {
+    fn from(value: &CompositeOperation) -> Self {
         Self {
             // uuid and read_version mirror the enclosing Transaction and are
             // stamped in by its conversion.
@@ -93,12 +93,11 @@ impl From<&UserOperation> for pb_transaction::CompositeOperation {
     }
 }
 
-impl TryFrom<pb_transaction::CompositeOperation> for UserOperation {
+impl TryFrom<pb_transaction::CompositeOperation> for CompositeOperation {
     type Error = Error;
 
     fn try_from(message: pb_transaction::CompositeOperation) -> Result<Self> {
         Ok(Self {
-            description: String::new(),
             actions: message
                 .actions
                 .into_iter()
@@ -324,17 +323,14 @@ mod tests {
     }
 
     #[test]
-    fn test_user_operation_round_trips() {
-        let operation = UserOperation::new(
-            "compound commit",
-            vec![
-                UserAction::new("everything", all_actions()),
-                UserAction::new("nothing", vec![]),
-            ],
-        );
+    fn test_composite_operation_round_trips() {
+        let operation = CompositeOperation::new(vec![
+            UserAction::new("everything", all_actions()),
+            UserAction::new("nothing", vec![]),
+        ]);
 
         let message = pb_transaction::CompositeOperation::from(&operation);
-        let round_tripped = UserOperation::try_from(message).unwrap();
+        let round_tripped = CompositeOperation::try_from(message).unwrap();
 
         assert_eq!(round_tripped, operation);
     }
