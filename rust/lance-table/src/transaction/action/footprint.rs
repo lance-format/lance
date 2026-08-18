@@ -19,6 +19,7 @@
 use super::{CompositeOperation, Ref};
 use crate::transaction::UpdateMap;
 use std::collections::HashSet;
+use uuid::Uuid;
 
 /// One thing an action set writes.
 ///
@@ -45,6 +46,8 @@ pub enum Coordinate {
     /// picks and no one else can guess, so the name is the only index
     /// coordinate two writers can arrive at independently.
     IndexName(String),
+    /// One index segment, by uuid.
+    IndexSegment(Uuid),
 }
 
 /// One of the string maps a manifest carries.
@@ -70,7 +73,8 @@ impl Coordinate {
             | Self::BaseName(_)
             | Self::BaseLocation(_)
             | Self::ConfigEntry { .. }
-            | Self::IndexName(_) => None,
+            | Self::IndexName(_)
+            | Self::IndexSegment(_) => None,
         }
     }
 
@@ -90,7 +94,8 @@ impl Coordinate {
             | Self::BaseName(_)
             | Self::BaseLocation(_)
             | Self::ConfigEntry { .. }
-            | Self::IndexName(_) => None,
+            | Self::IndexName(_)
+            | Self::IndexSegment(_) => None,
         }
     }
 

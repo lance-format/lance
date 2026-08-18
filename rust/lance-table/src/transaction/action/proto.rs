@@ -153,8 +153,8 @@ mod tests {
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
         AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AlterField, ConfigUpdate,
-        DropField, FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds, ResetTable,
-        SetDeletionFile, TombstoneFieldData,
+        DropField, FieldMetadataUpdate, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds,
+        ResetTable, SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
@@ -241,6 +241,10 @@ mod tests {
                 created_at: DateTime::from_timestamp_millis(1_700_000_000_000),
                 dataset_version: Some(3),
                 data_change: false,
+            }),
+            Action::RemoveIndexSegment(RemoveIndexSegment {
+                uuid: Uuid::from_u128(8),
+                data_change: true,
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ResetTable(ResetTable),
