@@ -59,12 +59,7 @@ impl AddDataFile {
     /// The data of every committed field the file backs, in the fragment it is
     /// attached to. A file backing only minted fields writes nothing.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.add_field_data(
-            self.fragment,
-            self.field_ids
-                .iter()
-                .filter_map(|field| field.committed().and_then(|id| i32::try_from(id).ok())),
-        );
+        footprint.add_field_data(self.fragment, self.field_ids.iter().copied());
     }
 }
 

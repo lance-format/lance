@@ -4,8 +4,8 @@
 //! Alter facets of an existing field in place.
 
 use super::apply::ApplyState;
-use super::proto::{field_id_from_wire, field_id_to_wire, required};
-use super::{Coordinate, Footprint};
+use super::proto::required;
+use super::{Footprint, Ref};
 use crate::format::pb;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -17,9 +17,9 @@ use lance_core::{Error, Result};
 /// the same field commute. A cast additionally needs a
 /// [`TombstoneFieldData`](super::TombstoneFieldData) plus a fresh
 /// [`AddDataFile`](super::AddDataFile) to rewrite the data.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf, Default)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AlterField {
-    pub field: i32,
+    pub field: Ref,
     pub name: Option<String>,
     /// The new Arrow logical type. The cast.
     pub logical_type: Option<String>,
@@ -28,13 +28,13 @@ pub struct AlterField {
 
 impl AlterField {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        let field_id = state.resolve_field(self.field)?;
         let field = state
             .schema_mut()
-            .field_by_id_mut(self.field)
+            .field_by_id_mut(field_id)
             .ok_or_else(|| {
                 Error::invalid_input(format!(
-                    "AlterField names field {}, which does not exist",
-                    self.field
+                    "AlterField names field {field_id}, which does not exist"
                 ))
             })?;
         if let Some(name) = &self.name {
@@ -48,7 +48,7 @@ impl AlterField {
             // The cast leaves any index on the field describing the old type.
             // The data rewrite itself is separate actions; this only records
             // that every fragment's view of the field changed.
-            state.rebind_field_everywhere(self.field);
+            state.rebind_field_everywhere(field_id);
         }
         Ok(())
     }
@@ -62,14 +62,14 @@ impl AlterField {
     /// The field's definition. The data rewrite a cast needs is separate
     /// actions, which record their own coordinates.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.add(Coordinate::FieldDefinition(self.field));
+        footprint.add_field_definition(self.field);
     }
 }
 
 impl From<&AlterField> for pb::AlterField {
     fn from(value: &AlterField) -> Self {
         Self {
-            field: Some(field_id_to_wire(value.field)),
+            field: Some(value.field.into()),
             name: value.name.clone(),
             logical_type: value.logical_type.clone(),
             nullable: value.nullable,
@@ -82,7 +82,7 @@ impl TryFrom<pb::AlterField> for AlterField {
 
     fn try_from(message: pb::AlterField) -> Result<Self> {
         Ok(Self {
-            field: field_id_from_wire(required(message.field, "AlterField.field")?)?,
+            field: required(message.field, "AlterField.field")?.try_into()?,
             name: message.name,
             logical_type: message.logical_type,
             nullable: message.nullable,
@@ -102,7 +102,7 @@ mod tests {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
             vec![Action::AlterField(AlterField {
-                field: 0,
+                field: Ref::Committed(0),
                 name: Some("renamed".into()),
                 logical_type: None,
                 nullable: Some(true),
@@ -123,7 +123,7 @@ mod tests {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
             vec![Action::AlterField(AlterField {
-                field: 0,
+                field: Ref::Committed(0),
                 name: None,
                 logical_type: Some("int64".into()),
                 nullable: None,
@@ -144,14 +144,44 @@ mod tests {
         let error = apply(
             &backed_manifest(),
             vec![Action::AlterField(AlterField {
-                field: 7,
+                field: Ref::Committed(7),
                 name: Some("nope".into()),
-                ..Default::default()
+                logical_type: None,
+                nullable: None,
             })],
         )
         .unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("field 7"), "{error}");
+    }
+
+    #[test]
+    fn test_alter_field_can_name_a_field_minted_in_the_same_operation() {
+        // A squash of "add column" and "rename column" lowers to exactly this,
+        // and has no committed id to name the field by.
+        use crate::transaction::action::AddField;
+        use crate::transaction::action::test_support::added_field;
+
+        let next = apply(
+            &backed_manifest(),
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: added_field("before"),
+                }),
+                Action::AlterField(AlterField {
+                    field: Ref::Local(0),
+                    name: Some("after".into()),
+                    logical_type: None,
+                    nullable: None,
+                }),
+            ],
+        )
+        .unwrap();
+
+        assert!(next.schema.field("before").is_none());
+        assert!(next.schema.field("after").is_some());
     }
 }

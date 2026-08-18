@@ -3,9 +3,9 @@
 
 //! Remove a field from the schema.
 
-use super::Footprint;
 use super::apply::{ApplyState, TOMBSTONED_FIELD};
-use super::proto::{field_id_from_wire, field_id_to_wire, required};
+use super::proto::required;
+use super::{Footprint, Ref};
 use crate::format::pb;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
@@ -19,21 +19,21 @@ use std::collections::HashSet;
 /// index over a removed field is discarded.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DropField {
-    pub field: i32,
+    pub field: Ref,
 }
 
 impl DropField {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        let field = state.schema().field_by_id(self.field).ok_or_else(|| {
+        let field_id = state.resolve_field(self.field)?;
+        let field = state.schema().field_by_id(field_id).ok_or_else(|| {
             Error::invalid_input(format!(
-                "DropField names field {}, which does not exist",
-                self.field
+                "DropField names field {field_id}, which does not exist"
             ))
         })?;
         // A struct's children cannot outlive it, so the whole subtree goes.
         let mut dropped = HashSet::new();
         collect_subtree_ids(field, &mut dropped);
-        remove_field(&mut state.schema_mut().fields, self.field);
+        remove_field(&mut state.schema_mut().fields, field_id);
 
         // The fields are gone from the schema, so the slots that backed them in
         // each data file are dead. Tombstoning rather than rewriting the field
@@ -105,7 +105,7 @@ fn remove_field(fields: &mut Vec<Field>, field_id: i32) {
 impl From<&DropField> for pb::DropField {
     fn from(value: &DropField) -> Self {
         Self {
-            field: Some(field_id_to_wire(value.field)),
+            field: Some(value.field.into()),
         }
     }
 }
@@ -115,7 +115,7 @@ impl TryFrom<pb::DropField> for DropField {
 
     fn try_from(message: pb::DropField) -> Result<Self> {
         Ok(Self {
-            field: field_id_from_wire(required(message.field, "DropField.field")?)?,
+            field: required(message.field, "DropField.field")?.try_into()?,
         })
     }
 }
@@ -136,7 +136,9 @@ mod tests {
     fn test_drop_field_removes_it_and_its_data() {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
-            vec![Action::DropField(DropField { field: 0 })],
+            vec![Action::DropField(DropField {
+                field: Ref::Committed(0),
+            })],
             vec![sample_index_metadata("idx")],
         )
         .unwrap();
@@ -158,7 +160,13 @@ mod tests {
         fragment.files[0] = DataFile::new("data/0.lance", vec![0, 1], vec![0, 1], 2, 0, None, None);
         manifest.fragments = Arc::new(vec![fragment]);
 
-        let next = apply(&manifest, vec![Action::DropField(DropField { field: 0 })]).unwrap();
+        let next = apply(
+            &manifest,
+            vec![Action::DropField(DropField {
+                field: Ref::Committed(0),
+            })],
+        )
+        .unwrap();
 
         assert!(next.schema.field_by_id(0).is_none());
         assert!(next.schema.field_by_id(1).is_some());
@@ -180,7 +188,13 @@ mod tests {
         parent.children.push(child);
         manifest.schema.fields.push(parent);
 
-        let next = apply(&manifest, vec![Action::DropField(DropField { field: 1 })]).unwrap();
+        let next = apply(
+            &manifest,
+            vec![Action::DropField(DropField {
+                field: Ref::Committed(1),
+            })],
+        )
+        .unwrap();
 
         assert!(next.schema.field_by_id(1).is_none());
         assert!(
@@ -193,7 +207,9 @@ mod tests {
     fn test_drop_field_rejects_a_missing_field() {
         let error = apply(
             &backed_manifest(),
-            vec![Action::DropField(DropField { field: 7 })],
+            vec![Action::DropField(DropField {
+                field: Ref::Committed(7),
+            })],
         )
         .unwrap_err();
 
@@ -206,7 +222,9 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::DropField(DropField { field: 0 }),
+                Action::DropField(DropField {
+                    field: Ref::Committed(0),
+                }),
                 Action::AddField(AddField {
                     local: 0,
                     parent: None,
@@ -224,5 +242,42 @@ mod tests {
             .map(|field| field.id)
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![1]);
+    }
+
+    #[test]
+    fn test_drop_field_rejects_a_field_id_out_of_range() {
+        let error = apply(
+            &backed_manifest(),
+            vec![Action::DropField(DropField {
+                field: Ref::Committed(u64::from(u32::MAX) + 1),
+            })],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("out of range"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn test_drop_field_can_name_a_field_minted_in_the_same_operation() {
+        // A squash of "add column" and "drop column" lowers to exactly this,
+        // and has no committed id to name the field by.
+        let next = apply(
+            &backed_manifest(),
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: added_field("transient"),
+                }),
+                Action::DropField(DropField {
+                    field: Ref::Local(0),
+                }),
+            ],
+        )
+        .unwrap();
+
+        assert!(next.schema.field("transient").is_none());
     }
 }
