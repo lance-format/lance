@@ -41,6 +41,10 @@ pub enum Coordinate {
     BaseLocation(String),
     /// One key in one of the manifest's string maps.
     ConfigEntry { map: ConfigMap, key: String },
+    /// A logical index, by name. Segments are named by uuid, which the writer
+    /// picks and no one else can guess, so the name is the only index
+    /// coordinate two writers can arrive at independently.
+    IndexName(String),
 }
 
 /// One of the string maps a manifest carries.
@@ -65,7 +69,8 @@ impl Coordinate {
             Self::FieldDefinition(_)
             | Self::BaseName(_)
             | Self::BaseLocation(_)
-            | Self::ConfigEntry { .. } => None,
+            | Self::ConfigEntry { .. }
+            | Self::IndexName(_) => None,
         }
     }
 
@@ -84,7 +89,8 @@ impl Coordinate {
             | Self::FragmentDeletions(_)
             | Self::BaseName(_)
             | Self::BaseLocation(_)
-            | Self::ConfigEntry { .. } => None,
+            | Self::ConfigEntry { .. }
+            | Self::IndexName(_) => None,
         }
     }
 
