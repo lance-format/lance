@@ -4294,10 +4294,10 @@ mod tests {
         )
     }
 
-    fn tombstone_txn(fragment: u64, field: i32) -> Transaction {
+    fn tombstone_txn(fragment: u64, field: u64) -> Transaction {
         action_txn(vec![TxnAction::TombstoneFieldData(TombstoneFieldData {
             fragment: ActionRef::Committed(fragment),
-            field_ids: vec![field],
+            field_ids: vec![ActionRef::Committed(field)],
             data_change: true,
         })])
     }

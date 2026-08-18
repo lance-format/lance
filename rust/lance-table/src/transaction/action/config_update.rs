@@ -482,8 +482,12 @@ mod tests {
             }],
             ..Default::default()
         })]);
-        let dropped = footprint(vec![Action::DropField(DropField { field: 1 })]);
-        let other = footprint(vec![Action::DropField(DropField { field: 2 })]);
+        let dropped = footprint(vec![Action::DropField(DropField {
+            field: Ref::Committed(1),
+        })]);
+        let other = footprint(vec![Action::DropField(DropField {
+            field: Ref::Committed(2),
+        })]);
 
         assert!(dropped.conflicts_with(&metadata));
         assert!(metadata.conflicts_with(&dropped));

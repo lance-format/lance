@@ -141,7 +141,7 @@ fn data_replacement_actions(replacements: &[DataReplacementGroup]) -> Result<Vec
         let fragment = Ref::Committed(*fragment_id);
         actions.push(Action::TombstoneFieldData(TombstoneFieldData {
             fragment,
-            field_ids: new_file.fields.to_vec(),
+            field_ids: committed_field_refs(new_file.fields.as_ref())?,
             data_change: true,
         }));
         actions.push(Action::AddDataFile(AddDataFile {
