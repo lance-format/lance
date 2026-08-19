@@ -194,9 +194,12 @@ pub struct Footprint {
     regions: HashMap<Region, Mode>,
     /// Fragments this set needs to still be there, without writing anything a
     /// concurrent set could name inside them. Data for a field this set mints,
-    /// written into a committed fragment, is the case this exists for: the
-    /// field id is invisible to a concurrent writer, so the cells are not a
-    /// coordinate, but they are gone if the fragment is.
+    /// written into a committed fragment, is one case: the field id is
+    /// invisible to a concurrent writer, so the cells are not a coordinate, but
+    /// they are gone if the fragment is. An overlay is the other: two
+    /// concurrent overlays over the same cells both land and the newer one
+    /// wins, so they must not collide with each other -- but neither survives a
+    /// concurrent writer dropping the fragment out from under them.
     ///
     /// Not a `Requires` claim on the region, because the check is symmetric: a
     /// removal that lands second destroys the cells just as surely as one that
