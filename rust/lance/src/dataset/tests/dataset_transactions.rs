@@ -1423,7 +1423,8 @@ mod composite {
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use lance_table::rowids::{RowIdSequence, write_row_ids};
     use lance_table::system_index::mem_wal::{
-        CompactedSsTable, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
+        CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndexDetails, load_mem_wal_index_details,
+        new_mem_wal_index_meta,
     };
     use lance_table::transaction::action::{
         Action, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
@@ -2097,6 +2098,24 @@ mod composite {
         let dataset = test_dataset(false).await;
         let shard = Uuid::new_v4();
 
+        // Progress is only recordable against a table that already carries the
+        // index, so put one there the way the MemWAL writer would.
+        let read_version = dataset.version().version;
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices: vec![
+                        new_mem_wal_index_meta(read_version, MemWalIndexDetails::default())
+                            .unwrap(),
+                    ],
+                    removed_indices: Vec::new(),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+
         let dataset = commit(
             dataset,
             vec![Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
@@ -2109,7 +2128,7 @@ mod composite {
         let mem_wal = indices
             .iter()
             .find(|index| index.name == MEM_WAL_INDEX_NAME)
-            .expect("the MemWAL index should have been created");
+            .expect("the MemWAL index should still be there");
         let details = load_mem_wal_index_details((*mem_wal).clone()).unwrap();
         assert_eq!(details.compacted_sstables.len(), 1);
         assert_eq!(details.compacted_sstables[0].shard_id, shard);
