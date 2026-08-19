@@ -141,11 +141,17 @@ impl AddIndexSegment {
 
 impl DeepSizeOf for AddIndexSegment {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        // `index_details` is an opaque protobuf whose size the deepsize crate
-        // cannot reach, matching how `IndexMetadata` accounts for itself.
+        // `prost_types::Any` does not implement DeepSizeOf, but it is only a
+        // type url and a byte string, so both are measured directly.
+        let index_details = self.index_details.as_ref().map_or(0, |details| {
+            std::mem::size_of::<prost_types::Any>()
+                + details.type_url.capacity()
+                + details.value.capacity()
+        });
         self.uuid.as_bytes().deep_size_of_children(context)
             + self.name.deep_size_of_children(context)
             + self.fields.deep_size_of_children(context)
+            + index_details
             + self.covered_fragments.deep_size_of_children(context)
             + self.files.deep_size_of_children(context)
     }
