@@ -4362,6 +4362,90 @@ mod tests {
         assert_conflict(&dataset, tombstone_txn(0, 0), append, false).await;
     }
 
+    /// An update that only moves rows between fragments, which is what a merge
+    /// insert commits. It translates, so it is compared by footprint rather
+    /// than conservatively rejected.
+    fn vertical_update_txn(dataset: &Dataset, fragment: usize) -> Transaction {
+        Transaction::new_from_version(
+            1,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![dataset.fragments()[fragment].clone()],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: None,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn test_an_action_txn_is_compared_against_a_concurrent_update_by_footprint() {
+        let dataset = test_dataset(10, 2).await;
+        let removal = |fragment| {
+            action_txn(vec![TxnAction::RemoveFragment(RemoveFragment {
+                fragment: ActionRef::Committed(fragment),
+                data_change: true,
+            })])
+        };
+
+        // The update writes fragment 0's deletion file, so it cannot run
+        // alongside an action set taking that fragment away -- but it has no
+        // quarrel with one taking a different fragment away.
+        assert_conflict(&dataset, removal(0), vertical_update_txn(&dataset, 0), true).await;
+        assert_conflict(
+            &dataset,
+            removal(1),
+            vertical_update_txn(&dataset, 0),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_an_update_does_not_conflict_with_a_column_rewrite_of_the_same_fragment() {
+        let dataset = test_dataset(10, 2).await;
+
+        // Which rows are gone and what a column holds are separate facts about
+        // a fragment, so writing a deletion file and rebinding a field's data
+        // both land. The legacy pairing had to reject this.
+        assert_conflict(
+            &dataset,
+            tombstone_txn(0, 0),
+            vertical_update_txn(&dataset, 0),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_an_update_that_rewrites_rows_stays_conservative() {
+        let dataset = test_dataset(10, 2).await;
+
+        // Which indices survive a row rewrite is a decision this conversion
+        // cannot make, so the operation does not translate and the comparison
+        // falls back to rejecting.
+        let rewrite = Transaction::new_from_version(
+            1,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![dataset.fragments()[1].clone()],
+                new_fragments: vec![],
+                fields_modified: vec![],
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+        );
+
+        assert_conflict(&dataset, tombstone_txn(0, 0), rewrite, true).await;
+    }
+
     #[tokio::test]
     async fn test_an_untranslatable_operation_stays_conservative() {
         let dataset = test_dataset(10, 2).await;

@@ -19,22 +19,26 @@
 //! `Project` is a set of [`DropField`](super::DropField)s and `Merge` a set of
 //! [`AddField`](super::AddField)s plus their data files.
 //!
-//! `Update` is not translated yet, for no reason but the size of the recipe.
-//! Every part of it has an action -- the deletion files it writes over the
-//! fragments it updates, the fragments and data files it mints, the fragments
-//! it removes, the field data it tombstones, the SSTable progress it records,
-//! the coverage its indices keep, and the key filter it carries -- but it is
-//! the one operation that draws on nearly the whole vocabulary at once, and
-//! which parts it uses depends on whether the update is vertical or
-//! horizontal. It gets its own change rather than riding along with the
-//! actions it is assembled from.
+//! `Update` translates in its vertical form -- rows leaving the fragments they
+//! were in and arriving in new ones -- which is a `Delete` and an `Append` in
+//! one step, plus the key assertion and SSTable progress it carries. Its other
+//! forms are rejected, and for the same reason `Merge` and `Project` are: they
+//! turn on what the read version holds. A row rewrite decides which indices
+//! still cover the rows it moved by reading the current indices, schema and
+//! overlays; a column rewrite tombstones overlaid fields by reading the
+//! overlays the fragment carries now; and in-place field modification would
+//! have to diff against the read version to tell the data files it wrote from
+//! the ones already there.
 
 use super::{
-    Action, AddBase, AddDataFile, AddFragment, AddIndexSegment, AddOverlays, Ref, RemoveFragment,
-    RemoveIndexSegment, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables, UserAction,
+    Action, AddBase, AddDataFile, AddFragment, AddIndexSegment, AddOverlays, AssertUniqueKeys, Ref,
+    RemoveFragment, RemoveIndexSegment, SetDeletionFile, TombstoneFieldData,
+    UpdateCompactedSsTables, UserAction,
 };
+use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::{Fragment, IndexMetadata};
-use crate::transaction::{DataReplacementGroup, Operation};
+use crate::system_index::mem_wal::CompactedSsTable;
+use crate::transaction::{DataReplacementGroup, Operation, UpdateMode, UpdatedFragmentOffsets};
 use lance_core::{Error, Result};
 
 impl TryFrom<&Operation> for Vec<UserAction> {
@@ -111,6 +115,35 @@ impl TryFrom<&Operation> for Vec<UserAction> {
                     })]
                 },
             )]),
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                fields_modified,
+                compacted_sstables,
+                update_mode,
+                inserted_rows_filter,
+                updated_fragment_offsets,
+                // Read only by the index coverage preservation that
+                // `RewriteRows` asks for, which is rejected below.
+                fields_for_preserving_frag_bitmap: _,
+            } => {
+                reject_untranslatable_update(
+                    update_mode,
+                    fields_modified,
+                    updated_fragment_offsets,
+                )?;
+                Ok(vec![UserAction::new(
+                    describe_update(updated_fragments, new_fragments, removed_fragment_ids),
+                    update_actions(
+                        updated_fragments,
+                        removed_fragment_ids,
+                        new_fragments,
+                        compacted_sstables,
+                        inserted_rows_filter.as_ref(),
+                    )?,
+                )])
+            }
             Operation::DataReplacement { replacements } => Ok(vec![UserAction::new(
                 format!("replace data files in {} fragments", replacements.len()),
                 data_replacement_actions(replacements)?,
@@ -182,6 +215,110 @@ fn delete_actions(updated_fragments: &[Fragment], deleted_fragment_ids: &[u64]) 
         }));
     }
     actions
+}
+
+/// The parts of an `Update` that cannot be recovered from the operation alone.
+///
+/// Each of these is a decision the legacy path makes by reading the version
+/// being committed against. Rejecting them keeps the translation honest: a
+/// silent omission would not fail the commit, it would leave an index quietly
+/// uncovered or a row's version stamp quietly stale.
+fn reject_untranslatable_update(
+    update_mode: &Option<UpdateMode>,
+    fields_modified: &[u32],
+    updated_fragment_offsets: &Option<UpdatedFragmentOffsets>,
+) -> Result<()> {
+    match update_mode {
+        // A pure row rewrite lets an index keep covering rows that moved into a
+        // new fragment, but only when the rewrite provably left the indexed
+        // columns alone. Deciding that reads the read version's indices, its
+        // schema, and the overlays the original fragments carried.
+        Some(UpdateMode::RewriteRows) => Err(Error::not_supported(
+            "translating a row-rewriting update into actions, which would have to decide from \
+             the read version which indices still cover the rewritten rows",
+        )),
+        // An in-place column rewrite tombstones the overlaid fields its fresh
+        // base values supersede, which needs the overlays the fragment carries
+        // in the read version rather than the ones the operation restates.
+        Some(UpdateMode::RewriteColumns) => Err(Error::not_supported(
+            "translating a column-rewriting update into actions, which would have to read the \
+             overlays the read version's fragments carry",
+        )),
+        None if !fields_modified.is_empty() => Err(Error::not_supported(
+            "translating an update that modifies fields in place into actions, which would have \
+             to diff against the read version to tell the data files it wrote from the ones \
+             already there",
+        )),
+        None if updated_fragment_offsets
+            .as_ref()
+            .is_some_and(|offsets| !offsets.0.is_empty()) =>
+        {
+            Err(Error::not_supported(
+                "translating an update that restamps part of a fragment into actions; \
+                 RefreshRowVersionMetadata restamps every row of the fragments it names",
+            ))
+        }
+        None => Ok(()),
+    }
+}
+
+fn describe_update(
+    updated_fragments: &[Fragment],
+    new_fragments: &[Fragment],
+    removed_fragment_ids: &[u64],
+) -> String {
+    format!(
+        "update {} fragments, adding {} and removing {}",
+        updated_fragments.len(),
+        new_fragments.len(),
+        removed_fragment_ids.len()
+    )
+}
+
+/// What an update does to the fragment list, plus the precondition and the
+/// bookkeeping it carries.
+///
+/// The structural part is a delete and an append: rows leave the fragments they
+/// were in, by deletion file or by the fragment going away entirely, and arrive
+/// in fragments the operation mints. Those are the same changes `Delete` and
+/// `Append` describe, so this reuses their recipes rather than restating them.
+///
+/// The assertion goes first, so a commit rejected for a key collision is
+/// rejected before anything else is read.
+fn update_actions(
+    updated_fragments: &[Fragment],
+    removed_fragment_ids: &[u64],
+    new_fragments: &[Fragment],
+    compacted_sstables: &[CompactedSsTable],
+    inserted_rows_filter: Option<&KeyExistenceFilter>,
+) -> Result<Vec<Action>> {
+    let mut actions = Vec::with_capacity(
+        updated_fragments.len() + removed_fragment_ids.len() + new_fragments.len() * 2 + 2,
+    );
+
+    if let Some(filter) = inserted_rows_filter {
+        if filter.field_ids.is_empty() {
+            return Err(Error::invalid_input(
+                "an update carries a filter of inserted keys that names no key column, so \
+                 nothing says which keys the filter is over",
+            ));
+        }
+        actions.push(Action::AssertUniqueKeys(AssertUniqueKeys {
+            key_fields: committed_field_refs(&filter.field_ids)?,
+            filter: filter.clone(),
+        }));
+    }
+
+    actions.extend(delete_actions(updated_fragments, removed_fragment_ids));
+    actions.extend(append_actions(new_fragments)?);
+
+    if !compacted_sstables.is_empty() {
+        actions.push(Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
+            compacted_sstables: compacted_sstables.to_vec(),
+        }));
+    }
+
+    Ok(actions)
 }
 
 /// Replacing a field's data is a drop of the old backing file followed by an
@@ -283,6 +420,7 @@ fn committed_field_refs(field_ids: &[i32]) -> Result<Vec<Ref>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::key_existence::KeyExistenceFilterBuilder;
     use crate::format::{
         BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, Manifest, RowIdMeta,
     };
@@ -299,6 +437,8 @@ mod tests {
         sample_index_metadata, sample_manifest,
     };
     use lance_file::version::ConcreteFileVersion;
+    use roaring::RoaringBitmap;
+    use rstest::rstest;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -768,5 +908,216 @@ mod tests {
 
         assert_eq!(actions.len(), 1);
         assert!(actions[0].actions.is_empty());
+    }
+    /// The parts of an `Update` these tests vary, so each one can name only
+    /// what it is about. Defaults to an update that does nothing.
+    #[derive(Default)]
+    struct Update {
+        updated_fragments: Vec<Fragment>,
+        removed_fragment_ids: Vec<u64>,
+        new_fragments: Vec<Fragment>,
+        fields_modified: Vec<u32>,
+        compacted_sstables: Vec<CompactedSsTable>,
+        update_mode: Option<UpdateMode>,
+        inserted_rows_filter: Option<KeyExistenceFilter>,
+        updated_fragment_offsets: Option<UpdatedFragmentOffsets>,
+    }
+
+    impl From<Update> for Operation {
+        fn from(update: Update) -> Self {
+            Self::Update {
+                removed_fragment_ids: update.removed_fragment_ids,
+                updated_fragments: update.updated_fragments,
+                new_fragments: update.new_fragments,
+                fields_modified: update.fields_modified,
+                compacted_sstables: update.compacted_sstables,
+                update_mode: update.update_mode,
+                inserted_rows_filter: update.inserted_rows_filter,
+                updated_fragment_offsets: update.updated_fragment_offsets,
+                // Only read by the coverage preservation a row rewrite asks
+                // for, and no test here gets far enough to use it.
+                fields_for_preserving_frag_bitmap: vec![],
+            }
+        }
+    }
+
+    fn deleted(mut fragment: Fragment, read_version: u64) -> Fragment {
+        fragment.deletion_file = Some(DeletionFile {
+            read_version,
+            id: 7,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(3),
+            base_id: None,
+        });
+        fragment
+    }
+
+    #[test]
+    fn test_update_matches_the_legacy_path() {
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance"), {
+            let mut fragment = appendable_fragment("data/1.lance");
+            fragment.id = 1;
+            fragment
+        }]);
+
+        let next = assert_parity(
+            &manifest,
+            Update {
+                updated_fragments: vec![deleted(manifest.fragments[0].clone(), manifest.version)],
+                removed_fragment_ids: vec![1],
+                new_fragments: vec![appendable_fragment("data/2.lance")],
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        // The fragment that kept some rows, and the one the update wrote them
+        // into. Fragment 1 gave up all of its rows and is gone.
+        assert_eq!(next.fragments.len(), 2);
+        assert!(next.fragments[0].deletion_file.is_some());
+        assert_eq!(next.fragments[1].files[0].path, "data/2.lance");
+    }
+
+    #[test]
+    fn test_an_update_that_only_deletes_matches_the_legacy_path() {
+        // The shape merge insert commits when the source only matches rows to
+        // delete: fragments lose rows, and nothing is written.
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
+        let next = assert_parity(
+            &manifest,
+            Update {
+                updated_fragments: vec![deleted(manifest.fragments[0].clone(), manifest.version)],
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        assert!(next.fragments[0].deletion_file.is_some());
+    }
+
+    #[test]
+    fn test_an_update_carries_its_inserted_keys_into_an_assertion() {
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
+        let filter =
+            KeyExistenceFilter::from_bloom_filter(&KeyExistenceFilterBuilder::new(vec![0]));
+        let operation: Operation = Update {
+            inserted_rows_filter: Some(filter.clone()),
+            new_fragments: vec![appendable_fragment("data/1.lance")],
+            ..Default::default()
+        }
+        .into();
+
+        let actions = Vec::<UserAction>::try_from(&operation).unwrap();
+        let assertion = actions[0]
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                Action::AssertUniqueKeys(assertion) => Some(assertion),
+                _ => None,
+            })
+            .expect("the filter should have become an assertion");
+
+        assert_eq!(assertion.key_fields, vec![Ref::Committed(0)]);
+        assert_eq!(assertion.filter, filter);
+        // The assertion is a precondition, so it changes nothing about the
+        // manifest either path builds.
+        assert_parity(&manifest, operation);
+    }
+
+    #[test]
+    fn test_an_update_whose_key_filter_names_no_column_is_rejected() {
+        let operation: Operation = Update {
+            inserted_rows_filter: Some(KeyExistenceFilter::from_bloom_filter(
+                &KeyExistenceFilterBuilder::new(vec![]),
+            )),
+            ..Default::default()
+        }
+        .into();
+
+        let error = Vec::<UserAction>::try_from(&operation).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("names no key column"), "{error}");
+    }
+
+    #[test]
+    fn test_an_update_records_mem_wal_compaction_progress() {
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
+        let operation: Operation = Update {
+            compacted_sstables: vec![CompactedSsTable::new(Uuid::from_u128(1), 4)],
+            updated_fragments: vec![deleted(manifest.fragments[0].clone(), manifest.version)],
+            ..Default::default()
+        }
+        .into();
+
+        // Both paths re-mint the MemWAL index with a fresh uuid and timestamp,
+        // so the indices are compared by the progress they record.
+        let existing =
+            vec![new_mem_wal_index_meta(manifest.version, MemWalIndexDetails::default()).unwrap()];
+        let (legacy, legacy_indices) = build(&manifest, operation.clone(), existing.clone());
+        let actions = Vec::<UserAction>::try_from(&operation).unwrap();
+        let (translated, translated_indices) = build(
+            &manifest,
+            Operation::CompositeOperation(CompositeOperation::new(actions)),
+            existing,
+        );
+
+        let progress = |indices: &[IndexMetadata]| {
+            let mem_wal = indices
+                .iter()
+                .find(|index| index.name == MEM_WAL_INDEX_NAME)
+                .expect("the MemWAL index should be there");
+            load_mem_wal_index_details(mem_wal.clone())
+                .unwrap()
+                .compacted_sstables
+        };
+        assert_eq!(progress(&translated_indices).len(), 1);
+        assert_eq!(progress(&translated_indices), progress(&legacy_indices));
+        assert_eq!(translated.fragments, legacy.fragments);
+    }
+
+    /// Every form of `Update` whose recipe depends on the version being
+    /// committed against, which this conversion does not have.
+    #[rstest]
+    #[case::rewriting_rows(
+        Update { update_mode: Some(UpdateMode::RewriteRows), ..Default::default() },
+        "which indices still cover the rewritten rows"
+    )]
+    #[case::rewriting_columns(
+        Update { update_mode: Some(UpdateMode::RewriteColumns), ..Default::default() },
+        "the overlays the read version's fragments carry"
+    )]
+    #[case::modifying_fields_in_place(
+        Update { fields_modified: vec![0], ..Default::default() },
+        "tell the data files it wrote from the ones already there"
+    )]
+    #[case::restamping_part_of_a_fragment(
+        Update {
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(
+                [(0, RoaringBitmap::from_iter([0_u32, 1]))].into_iter().collect(),
+            )),
+            ..Default::default()
+        },
+        "restamps every row of the fragments it names"
+    )]
+    fn test_an_update_the_operation_does_not_fully_describe_is_rejected(
+        #[case] update: Update,
+        #[case] expected: &str,
+    ) {
+        let operation = Operation::from(update);
+        let error = Vec::<UserAction>::try_from(&operation).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    /// Offsets nobody filled in are not a partial restamp.
+    #[test]
+    fn test_an_update_carrying_empty_offsets_still_translates() {
+        let operation: Operation = Update {
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(Default::default())),
+            ..Default::default()
+        }
+        .into();
+
+        assert!(Vec::<UserAction>::try_from(&operation).is_ok());
     }
 }
