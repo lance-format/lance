@@ -53,7 +53,7 @@ impl RefreshRowVersionMetadata {
 
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         for fragment_id in &self.fragment_ids {
-            footprint.add(Coordinate::FragmentRowVersions(*fragment_id));
+            footprint.write(Coordinate::FragmentRowVersions(*fragment_id));
         }
     }
 }

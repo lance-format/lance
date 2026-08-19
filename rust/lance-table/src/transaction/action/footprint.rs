@@ -487,6 +487,16 @@ impl Footprint {
         });
     }
 
+    /// Record that this set rewrites `name` in a way whose reach it cannot
+    /// state, colliding with any concurrent write to the same index.
+    pub(super) fn rewrite_index(&mut self, name: String) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: None,
+            coverage: None,
+        });
+    }
+
     /// Record that this set removes `fragment` outright: its existence, and
     /// with it every coordinate inside it.
     pub(super) fn remove_fragment(&mut self, fragment: u64) {
