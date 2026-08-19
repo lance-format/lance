@@ -919,11 +919,12 @@ mod tests {
             operation: Some(pb::transaction::Operation::CompositeOperation(
                 pb::CompositeOperation {
                     actions: vec![pb::UserAction {
-                        description: "refresh row versions".to_string(),
+                        description: "assert unique keys".to_string(),
                         actions: vec![pb::Action {
-                            action: Some(pb::action::Action::RefreshRowVersionMetadata(
-                                pb::RefreshRowVersionMetadata {
-                                    fragment_ids: vec![1],
+                            action: Some(pb::action::Action::AssertUniqueKeys(
+                                pb::AssertUniqueKeys {
+                                    key_fields: vec![],
+                                    filter: None,
                                 },
                             )),
                         }],
