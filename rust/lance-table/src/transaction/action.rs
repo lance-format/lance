@@ -64,6 +64,7 @@ macro_rules! for_each_action {
             RemoveFragment,
             SetDeletionFile,
             AddOverlays,
+            RefreshRowVersionMetadata,
             AlterField,
             DropField,
             AddIndexSegment,
@@ -93,6 +94,7 @@ mod drop_index;
 mod footprint;
 mod proto;
 mod query_contract;
+mod refresh_row_version_metadata;
 mod remove_fragment;
 mod remove_index_segment;
 mod reserve_fragment_ids;
@@ -116,6 +118,7 @@ pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
 pub use drop_index::DropIndex;
 pub use footprint::{ConfigMap, Coordinate, Footprint};
+pub use refresh_row_version_metadata::RefreshRowVersionMetadata;
 pub use remove_fragment::RemoveFragment;
 pub use remove_index_segment::RemoveIndexSegment;
 pub use reserve_fragment_ids::ReserveFragmentIds;

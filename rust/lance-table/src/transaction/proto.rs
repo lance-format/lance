@@ -1012,11 +1012,12 @@ mod tests {
             operation: Some(pb::transaction::Operation::CompositeOperation(
                 pb_actions::CompositeOperation {
                     steps: vec![pb_actions::UserStep {
-                        description: "refresh row versions".to_string(),
+                        description: "assert unique keys".to_string(),
                         actions: vec![pb_actions::Action {
-                            action: Some(pb_actions::action::Action::RefreshRowVersionMetadata(
-                                pb_actions::RefreshRowVersionMetadata {
-                                    fragment_ids: vec![1],
+                            action: Some(pb_actions::action::Action::AssertUniqueKeys(
+                                pb_actions::AssertUniqueKeys {
+                                    key_fields: vec![],
+                                    filter: None,
                                 },
                             )),
                         }],
