@@ -1419,11 +1419,17 @@ mod composite {
     use arrow_schema::{DataType, Field, Schema};
     use lance_table::format::DataFile;
     use lance_table::format::RowIdMeta;
+    use lance_table::format::key_existence::{FilterType, KeyExistenceFilter};
+    use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use lance_table::rowids::{RowIdSequence, write_row_ids};
+    use lance_table::system_index::mem_wal::{
+        CompactedSsTable, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
+    };
     use lance_table::transaction::action::{
-        Action, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
-        CompositeOperation, DropField, Ref, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds,
-        TombstoneFieldData, UserAction,
+        Action, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
+        AdjustIndexCoverage, AssertUniqueKeys, CompositeOperation, DropField, Ref,
+        RefreshRowVersionMetadata, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds,
+        TombstoneFieldData, UpdateCompactedSsTables, UserAction,
     };
     use lance_table::transaction::{Operation, Transaction};
     use uuid::Uuid;
@@ -1993,5 +1999,161 @@ mod composite {
         .await;
 
         assert_eq!(index_coverage(&dataset, "by_a").await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_appends_and_overlays_what_was_already_there() {
+        let dataset = test_dataset(false).await;
+        let overlaid = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 0);
+        let overlay_file = existing_data_file(&dataset, 1);
+        let expected_version = dataset.version().version + 1;
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![Ref::Committed(0)],
+                    data_change: true,
+                }),
+                Action::AddOverlays(AddOverlays {
+                    fragment: Ref::Committed(overlaid),
+                    overlays: vec![DataOverlayFile {
+                        data_file: overlay_file,
+                        coverage: OverlayCoverage::dense([0u32, 2].into_iter().collect()),
+                        // Left for the commit to stamp.
+                        committed_version: 0,
+                    }],
+                    data_change: true,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(dataset.fragments().len(), 3);
+        let fragment = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == overlaid)
+            .unwrap();
+        assert_eq!(fragment.overlays.len(), 1);
+        assert_eq!(fragment.overlays[0].committed_version, expected_version);
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_restamps_row_versions_for_a_fragment_it_rewrote() {
+        let dataset = test_dataset(true).await;
+        let rewritten = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 1);
+        let expected_version = dataset.version().version + 1;
+
+        let dataset = commit(
+            dataset,
+            vec![
+                // Rewriting a column in place leaves the rows where they are, so
+                // nothing else in the commit says when they last changed.
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(rewritten),
+                    file,
+                    field_ids: vec![Ref::Committed(0)],
+                    data_change: true,
+                }),
+                Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
+                    fragment_ids: vec![rewritten],
+                }),
+            ],
+        )
+        .await;
+
+        let fragment = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == rewritten)
+            .unwrap();
+        let sequence = fragment
+            .last_updated_at_version_meta
+            .as_ref()
+            .expect("the rewritten fragment should carry a last-updated sequence")
+            .load_sequence()
+            .unwrap();
+        let versions = (0..fragment.physical_rows.unwrap())
+            .map(|offset| sequence.version_at(offset).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(versions, vec![expected_version; versions.len()]);
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_records_mem_wal_compaction_progress() {
+        let dataset = test_dataset(false).await;
+        let shard = Uuid::new_v4();
+
+        let dataset = commit(
+            dataset,
+            vec![Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 3)],
+            })],
+        )
+        .await;
+
+        let indices = dataset.load_indices().await.unwrap();
+        let mem_wal = indices
+            .iter()
+            .find(|index| index.name == MEM_WAL_INDEX_NAME)
+            .expect("the MemWAL index should have been created");
+        let details = load_mem_wal_index_details((*mem_wal).clone()).unwrap();
+        assert_eq!(details.compacted_sstables.len(), 1);
+        assert_eq!(details.compacted_sstables[0].shard_id, shard);
+        assert_eq!(details.compacted_sstables[0].generation, 3);
+
+        // The data is untouched: recording where rows live is not a change to
+        // them.
+        assert_eq!(dataset.fragments().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_carrying_a_key_assertion_changes_nothing_itself() {
+        let dataset = test_dataset(false).await;
+        let file = existing_data_file(&dataset, 0);
+        let before = dataset.fragments().len();
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![Ref::Committed(0)],
+                    data_change: true,
+                }),
+                Action::AssertUniqueKeys(AssertUniqueKeys {
+                    key_fields: vec![Ref::Committed(0)],
+                    filter: KeyExistenceFilter {
+                        field_ids: Vec::new(),
+                        filter: FilterType::ExactSet([11u64, 12].into_iter().collect()),
+                    },
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(dataset.fragments().len(), before + 1);
     }
 }
