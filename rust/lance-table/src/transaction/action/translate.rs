@@ -180,6 +180,7 @@ mod tests {
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, sample_manifest,
     };
+    use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
 
     /// Build the same manifest twice -- once down the legacy path, once by
@@ -237,9 +238,14 @@ mod tests {
     fn appendable_fragment(path: &str) -> Fragment {
         let mut fragment = Fragment::new(0);
         fragment.physical_rows = Some(10);
-        fragment
-            .files
-            .push(DataFile::new(path, vec![0], vec![0], 2, 0, None, None));
+        fragment.files.push(DataFile::new(
+            path,
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        ));
         fragment
     }
 
@@ -274,9 +280,9 @@ mod tests {
     fn test_append_assigns_stable_row_ids_like_the_legacy_path() {
         let mut existing = appendable_fragment("data/1.lance");
         existing.id = 1;
-        existing.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&RowIdSequence::from(
-            0u64..10,
-        ))));
+        existing.row_id_meta = Some(RowIdMeta::Inline(
+            write_row_ids(&RowIdSequence::from(0u64..10)).into(),
+        ));
         let manifest = make_stable_row_id_manifest(vec![existing]);
 
         let next = assert_parity(
@@ -354,14 +360,20 @@ mod tests {
             "data/0b.lance",
             vec![1],
             vec![0],
-            2,
-            0,
+            ConcreteFileVersion::V2_0,
             None,
             None,
         ));
         let manifest = manifest_with_fragments(vec![fragment]);
 
-        let replacement = DataFile::new("data/0-new.lance", vec![0], vec![0], 2, 0, None, None);
+        let replacement = DataFile::new(
+            "data/0-new.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
         let next = assert_parity(
             &manifest,
             Operation::DataReplacement {
@@ -382,7 +394,14 @@ mod tests {
         let operation = Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(
                 0,
-                DataFile::new("data/0-new.lance", vec![9], vec![0], 2, 0, None, None),
+                DataFile::new(
+                    "data/0-new.lance",
+                    vec![9],
+                    vec![0],
+                    ConcreteFileVersion::V2_0,
+                    None,
+                    None,
+                ),
             )],
         };
         let actions = Vec::<UserAction>::try_from(&operation).unwrap();

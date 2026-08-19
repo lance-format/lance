@@ -464,6 +464,7 @@ mod tests {
     use crate::transaction::action::test_support::{added_field, apply, backed_manifest};
     use crate::transaction::action::{Action, AddDataFile, AddField, AddFragment};
     use crate::transaction::test_support::default_build_config;
+    use lance_file::version::ConcreteFileVersion;
 
     #[test]
     fn test_an_action_set_relocates_onto_a_newer_version() {
@@ -483,7 +484,7 @@ mod tests {
             }),
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(0),
-                file: DataFile::new_unstarted("data/new.lance", 2, 0),
+                file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
                 field_ids: vec![Ref::Local(0)],
                 data_change: true,
             }),
