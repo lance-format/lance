@@ -1373,7 +1373,6 @@ impl Transaction {
             manifest.writer_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
         }
 
-
         match &self.operation {
             Operation::Overwrite {
                 config_upsert_values: Some(tm),

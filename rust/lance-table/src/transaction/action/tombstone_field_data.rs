@@ -115,6 +115,7 @@ mod tests {
     use crate::transaction::action::Action;
     use crate::transaction::action::test_support::{apply, apply_with_indices, backed_manifest};
     use crate::transaction::test_support::sample_index_metadata;
+    use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
 
     fn tombstone_field_zero() -> Action {
@@ -137,7 +138,14 @@ mod tests {
     fn test_tombstone_field_data_keeps_a_file_with_a_live_field() {
         let mut manifest = backed_manifest();
         let mut fragment = manifest.fragments[0].clone();
-        fragment.files[0] = DataFile::new("data/0.lance", vec![0, 1], vec![0, 1], 2, 0, None, None);
+        fragment.files[0] = DataFile::new(
+            "data/0.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
         manifest.fragments = Arc::new(vec![fragment]);
 
         let next = apply(&manifest, vec![tombstone_field_zero()]).unwrap();
@@ -194,7 +202,7 @@ mod tests {
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(0),
-                    file: DataFile::new_unstarted("data/fresh.lance", 1, 0),
+                    file: DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V1),
                     field_ids: vec![Ref::Local(0)],
                     data_change: true,
                 }),

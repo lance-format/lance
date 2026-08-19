@@ -10,6 +10,7 @@ use crate::transaction::{Operation, Transaction};
 use arrow_schema::{DataType, Field as ArrowField};
 use lance_core::Result;
 use lance_core::datatypes::Field;
+use lance_file::version::ConcreteFileVersion;
 use std::sync::Arc;
 
 pub(super) fn apply(manifest: &Manifest, actions: Vec<Action>) -> Result<Manifest> {
@@ -45,8 +46,7 @@ pub(super) fn backed_manifest() -> Manifest {
         "data/0.lance",
         vec![0],
         vec![0],
-        2,
-        0,
+        ConcreteFileVersion::V2_0,
         None,
         None,
     ));

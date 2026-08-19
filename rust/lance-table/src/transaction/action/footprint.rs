@@ -242,6 +242,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::Field;
+    use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
 
     fn footprint(actions: Vec<Action>) -> Footprint {
@@ -264,7 +265,7 @@ mod tests {
     fn add_data_file(fragment: Ref, fields: &[i32]) -> Action {
         Action::AddDataFile(AddDataFile {
             fragment,
-            file: DataFile::new_unstarted("data/x.lance", 2, 0),
+            file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
             field_ids: fields
                 .iter()
                 .map(|field| Ref::Committed(*field as u64))

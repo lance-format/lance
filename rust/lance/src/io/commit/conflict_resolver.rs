@@ -4369,6 +4369,7 @@ mod tests {
             1,
             Operation::Project {
                 schema: dataset.schema().clone(),
+                preserves_nullability: false,
             },
         );
 
