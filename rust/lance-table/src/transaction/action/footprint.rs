@@ -381,6 +381,16 @@ impl Footprint {
         });
     }
 
+    /// Record that this set rewrites `name` in a way whose reach it cannot
+    /// state, colliding with any concurrent write to the same index.
+    pub(super) fn rewrite_index(&mut self, name: String) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: None,
+            coverage: None,
+        });
+    }
+
     /// Note that this set only works if `fragment` is still part of the dataset,
     /// without claiming anything inside it.
     pub(super) fn require_fragment(&mut self, fragment: u64) {
