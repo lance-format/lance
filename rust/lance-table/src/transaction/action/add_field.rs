@@ -104,6 +104,7 @@ mod tests {
     use crate::transaction::action::{Action, AddDataFile};
     use crate::transaction::test_support::sample_manifest;
     use arrow_schema::{DataType, Field as ArrowField};
+    use lance_file::version::ConcreteFileVersion;
 
     #[test]
     fn test_two_add_fields_mint_distinct_ids() {
@@ -149,7 +150,7 @@ mod tests {
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Committed(0),
-                    file: DataFile::new_unstarted("data/added.lance", 2, 0),
+                    file: DataFile::new_unstarted("data/added.lance", ConcreteFileVersion::V2_0),
                     field_ids: vec![Ref::Local(7)],
                     data_change: true,
                 }),
