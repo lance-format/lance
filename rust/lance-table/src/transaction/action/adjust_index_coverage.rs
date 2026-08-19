@@ -22,12 +22,27 @@ use uuid::Uuid;
 ///
 /// Additions are applied before removals, so a fragment named on both sides ends
 /// up outside the coverage.
+///
+/// # When a fragment may be added
+///
+/// Coverage says which fragments a segment's existing index files describe, so a
+/// fragment may only be added when they already describe its rows. In practice
+/// that means one case: a rewrite -- compaction, or an in-place column rewrite --
+/// moved rows the segment already covered into a new fragment, and the segment
+/// reaches them through the fragment-reuse remapping. The matching removal of the
+/// old fragment ids belongs in the same action.
+///
+/// Adding a fragment of genuinely new rows is a writer error, even though nothing
+/// here can detect it: the segment has no entries for those rows, so a query
+/// served by the index would silently miss them. New rows are covered by building
+/// a segment over them ([`AddIndexSegment`](super::AddIndexSegment)), not by
+/// widening an existing one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdjustIndexCoverage {
     pub uuid: Uuid,
     /// Fragments to bring into the coverage. A [`Ref::Local`] names one this
-    /// operation minted, which is how a segment comes to cover data written
-    /// alongside it.
+    /// operation minted, which is how a segment follows its rows into the
+    /// fragment a rewrite in the same operation moved them to.
     pub add_fragments: Vec<Ref>,
     /// Committed fragment ids to drop from the coverage. Unlike the additions
     /// these take no [`Ref`]: a fragment minted in this same operation was not
