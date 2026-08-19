@@ -140,6 +140,12 @@ pub struct Footprint {
     /// were replaced underneath it. Unlike a write, two sets may require the
     /// same coordinate -- two readers of one column do not collide.
     requires: HashSet<Coordinate>,
+    /// Fragments this set needs to still be there, without writing anything
+    /// exclusive inside them. An overlay is the case this exists for: two
+    /// concurrent overlays over the same cells both land and the newer one
+    /// wins, so they must not collide with each other -- but neither survives a
+    /// concurrent writer dropping the fragment out from under them.
+    required_fragments: HashSet<u64>,
     /// String maps this set replaces outright rather than merging into. Like a
     /// fragment removal, this writes every key in the map, including keys it
     /// does not name, so it is matched by map rather than by key.
@@ -262,6 +268,12 @@ impl Footprint {
         if !self.removed_fields.is_disjoint(&other.required_fields) {
             return true;
         }
+        if !self
+            .removed_fragments
+            .is_disjoint(&other.required_fragments)
+        {
+            return true;
+        }
         other.writes.iter().any(|coordinate| {
             coordinate
                 .fragment()
@@ -362,6 +374,12 @@ impl Footprint {
             identity: None,
             coverage: Some(committed_fragments(fragments)),
         });
+    }
+
+    /// Note that this set only works if `fragment` is still part of the dataset,
+    /// without claiming anything inside it.
+    pub(super) fn require_fragment(&mut self, fragment: u64) {
+        self.required_fragments.insert(fragment);
     }
 
     pub(super) fn remove_fragment(&mut self, fragment: u64) {
