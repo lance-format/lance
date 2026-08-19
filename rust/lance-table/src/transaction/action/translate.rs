@@ -20,8 +20,8 @@
 //! [`AddField`](super::AddField)s plus their data files.
 
 use super::{
-    Action, AddBase, AddDataFile, AddFragment, AddIndexSegment, Ref, RemoveFragment,
-    RemoveIndexSegment, SetDeletionFile, TombstoneFieldData, UserAction,
+    Action, AddBase, AddDataFile, AddFragment, AddIndexSegment, AddOverlays, Ref, RemoveFragment,
+    RemoveIndexSegment, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables, UserAction,
 };
 use crate::format::{Fragment, IndexMetadata};
 use crate::transaction::{DataReplacementGroup, Operation};
@@ -63,6 +63,32 @@ impl TryFrom<&Operation> for Vec<UserAction> {
             } => Ok(vec![UserAction::new(
                 describe_index_change(new_indices, removed_indices),
                 create_index_actions(new_indices, removed_indices)?,
+            )]),
+            Operation::DataOverlay { groups } => Ok(vec![UserAction::new(
+                format!("overlay {} fragments", groups.len()),
+                groups
+                    .iter()
+                    .map(|group| {
+                        Action::AddOverlays(AddOverlays {
+                            fragment: Ref::Committed(group.fragment_id),
+                            overlays: group.overlays.clone(),
+                            data_change: true,
+                        })
+                    })
+                    .collect(),
+            )]),
+            // An empty list is a no-op the legacy path tolerates, and an
+            // UpdateCompactedSsTables naming no SSTable is rejected, so it
+            // translates to a step with nothing in it rather than an action.
+            Operation::UpdateMemWalState { compacted_sstables } => Ok(vec![UserAction::new(
+                format!("compact {} MemWAL SSTables", compacted_sstables.len()),
+                if compacted_sstables.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
+                        compacted_sstables: compacted_sstables.clone(),
+                    })]
+                },
             )]),
             Operation::DataReplacement { replacements } => Ok(vec![UserAction::new(
                 format!("replace data files in {} fragments", replacements.len()),
@@ -240,13 +266,19 @@ mod tests {
         BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, Manifest, RowIdMeta,
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
+    use crate::system_index::mem_wal::{
+        CompactedSsTable, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
+    };
+    use crate::transaction::DataOverlayGroup;
     use crate::transaction::Transaction;
     use crate::transaction::action::CompositeOperation;
     use crate::transaction::test_support::{
-        default_build_config, make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
+        default_build_config, make_stable_row_id_manifest, overlay_with_field,
+        sample_index_metadata, sample_manifest,
     };
     use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     /// Build the same manifest twice -- once down the legacy path, once by
     /// translating the operation to actions -- and assert they agree.
@@ -584,5 +616,132 @@ mod tests {
         let error = Vec::<UserAction>::try_from(&operation).unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
         assert!(error.to_string().contains("ReserveFragments"), "{error}");
+    }
+
+    #[test]
+    fn test_data_overlay_matches_the_legacy_path() {
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance"), {
+            let mut fragment = appendable_fragment("data/1.lance");
+            fragment.id = 1;
+            fragment
+        }]);
+
+        let next = assert_parity(
+            &manifest,
+            Operation::DataOverlay {
+                groups: vec![
+                    DataOverlayGroup {
+                        fragment_id: 0,
+                        overlays: vec![overlay_with_field(0, 0)],
+                    },
+                    DataOverlayGroup {
+                        fragment_id: 1,
+                        overlays: vec![overlay_with_field(0, 0)],
+                    },
+                ],
+            },
+        );
+
+        // Both paths stamp the version the commit produces over whatever the
+        // writer left in `committed_version`.
+        for fragment in next.fragments.iter() {
+            assert_eq!(fragment.overlays.len(), 1);
+            assert_eq!(fragment.overlays[0].committed_version, manifest.version + 1);
+        }
+    }
+
+    #[test]
+    fn test_data_overlay_groups_for_one_fragment_are_appended_in_order() {
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
+
+        let group = |field| DataOverlayGroup {
+            fragment_id: 0,
+            overlays: vec![overlay_with_field(field, 0)],
+        };
+        let next = assert_parity(
+            &manifest,
+            Operation::DataOverlay {
+                groups: vec![group(0), group(1)],
+            },
+        );
+
+        let fields = next.fragments[0]
+            .overlays
+            .iter()
+            .map(|overlay| overlay.data_file.fields.to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(fields, vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn test_overlaying_a_fragment_that_is_not_there_is_rejected() {
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
+        let operation = Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id: 7,
+                overlays: vec![overlay_with_field(0, 0)],
+            }],
+        };
+
+        let actions = Vec::<UserAction>::try_from(&operation).unwrap();
+        let error = Transaction::new(
+            manifest.version,
+            Operation::CompositeOperation(CompositeOperation::new(actions)),
+            None,
+        )
+        .build_manifest(
+            Some(&manifest),
+            Vec::new(),
+            "tx.txn",
+            &default_build_config(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    }
+
+    /// The legacy `UpdateMemWalState` arm never carries the read version's
+    /// fragments into the manifest it builds, so it empties the table. The
+    /// translated path leaves the data alone, which is what the operation
+    /// means, so the two agree on the indices but not on the fragments.
+    #[test]
+    fn test_update_mem_wal_state_records_the_same_progress_as_the_legacy_path() {
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
+        let operation = Operation::UpdateMemWalState {
+            compacted_sstables: vec![CompactedSsTable::new(Uuid::from_u128(1), 4)],
+        };
+
+        let (legacy, legacy_indices) = build(&manifest, operation.clone(), Vec::new());
+        let actions = Vec::<UserAction>::try_from(&operation).unwrap();
+        let (translated, translated_indices) = build(
+            &manifest,
+            Operation::CompositeOperation(CompositeOperation::new(actions)),
+            Vec::new(),
+        );
+
+        let progress = |indices: &[IndexMetadata]| {
+            let mem_wal = indices
+                .iter()
+                .find(|index| index.name == MEM_WAL_INDEX_NAME)
+                .expect("the MemWAL index should be there");
+            load_mem_wal_index_details(mem_wal.clone())
+                .unwrap()
+                .compacted_sstables
+        };
+        assert_eq!(progress(&translated_indices), progress(&legacy_indices));
+
+        assert!(legacy.fragments.is_empty());
+        assert_eq!(translated.fragments.len(), 1);
+    }
+
+    #[test]
+    fn test_update_mem_wal_state_with_no_sstables_translates_to_no_actions() {
+        let operation = Operation::UpdateMemWalState {
+            compacted_sstables: Vec::new(),
+        };
+        let actions = Vec::<UserAction>::try_from(&operation).unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].actions.is_empty());
     }
 }
