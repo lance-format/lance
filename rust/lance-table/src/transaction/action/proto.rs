@@ -30,7 +30,18 @@ pub(super) fn required<T>(value: Option<T>, what: &str) -> Result<T> {
     value.ok_or_else(|| Error::invalid_input(format!("{what} is required but was not set")))
 }
 
-impl From<Ref> for pb_actions::Ref {
+/// A required string field. Protobuf gives an unset string the empty value, so
+/// the two cases cannot be told apart and neither is usable.
+pub(super) fn non_empty(value: String, what: &str) -> Result<String> {
+    if value.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "{what} is required but was empty"
+        )));
+    }
+    Ok(value)
+}
+
+impl From<Ref> for pb_transaction::Ref {
     fn from(value: Ref) -> Self {
         let kind = match value {
             Ref::Committed(id) => pb_actions::r#ref::Kind::Committed(id),
@@ -181,6 +192,7 @@ mod tests {
     use chrono::DateTime;
     use lance_core::datatypes::Field;
     use lance_file::version::ConcreteFileVersion;
+    use rstest::rstest;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -267,10 +279,12 @@ mod tests {
             }),
             Action::RemoveIndexSegment(RemoveIndexSegment {
                 uuid: Uuid::from_u128(8),
+                name: "by_a".into(),
                 data_change: true,
             }),
             Action::AdjustIndexCoverage(AdjustIndexCoverage {
                 uuid: Uuid::from_u128(9),
+                name: "by_b".into(),
                 add_fragments: vec![Ref::Committed(1), Ref::Local(0)],
                 remove_fragments: vec![2, 3],
             }),
@@ -348,6 +362,44 @@ mod tests {
         let error = Action::try_from(pb_actions::Action { action: None }).unwrap_err();
         assert!(
             error.to_string().contains("was empty"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[rstest]
+    #[case::addition(pb_transaction::Action {
+        action: Some(pb_transaction::action::Action::AddIndexSegment(pb_transaction::AddIndexSegment {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            ..Default::default()
+        })),
+    }, "AddIndexSegment.name")]
+    #[case::removal(pb_transaction::Action {
+        action: Some(pb_transaction::action::Action::RemoveIndexSegment(pb_transaction::RemoveIndexSegment {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            data_change: None,
+        })),
+    }, "RemoveIndexSegment.name")]
+    #[case::coverage(pb_transaction::Action {
+        action: Some(pb_transaction::action::Action::AdjustIndexCoverage(pb_transaction::AdjustIndexCoverage {
+            uuid: Some((&Uuid::from_u128(1)).into()),
+            name: String::new(),
+            add_fragments: Vec::new(),
+            remove_fragments: Vec::new(),
+        })),
+    }, "AdjustIndexCoverage.name")]
+    fn test_an_index_action_without_a_name_is_rejected(
+        #[case] message: pb_transaction::Action,
+        #[case] expected: &str,
+    ) {
+        // Protobuf cannot tell an unset string from an empty one, and an index
+        // action that does not say which index it edits cannot be checked for
+        // conflicts.
+        let error = Action::try_from(message).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(expected),
             "unexpected message: {error}"
         );
     }
