@@ -34,7 +34,9 @@ use crate::rowids::read_row_ids;
 use crate::rowids::version::build_version_meta;
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
-use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
+use crate::system_index::mem_wal::{
+    CompactedSsTable, MEM_WAL_INDEX_NAME, update_mem_wal_index_compacted_sstables,
+};
 use crate::transaction::validate::schema_fragments_valid;
 use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
@@ -424,6 +426,17 @@ impl<'a> ApplyState<'a> {
             )));
         }
         Ok(())
+    }
+
+    /// Record MemWAL SSTable compaction progress against the table's existing
+    /// MemWAL index, which has to already be there -- progress against an index
+    /// no one built is rejected rather than inventing the metadata.
+    pub(super) fn update_compacted_sstables(
+        &mut self,
+        compacted_sstables: Vec<CompactedSsTable>,
+    ) -> Result<()> {
+        let new_version = self.new_version();
+        update_mem_wal_index_compacted_sstables(&mut self.indices, new_version, compacted_sstables)
     }
 
     /// Where the segment `uuid` lives, checking on the way that it really
