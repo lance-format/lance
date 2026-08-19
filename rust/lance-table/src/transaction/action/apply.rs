@@ -298,6 +298,12 @@ impl<'a> ApplyState<'a> {
         Ok(&mut self.indices[position])
     }
 
+    /// Whether the dataset carries stable row ids, and with them the per-row
+    /// version sequences.
+    pub(super) fn uses_stable_row_ids(&self) -> bool {
+        self.current_manifest.uses_stable_row_ids()
+    }
+
     pub(super) fn schema(&self) -> &Schema {
         &self.schema
     }

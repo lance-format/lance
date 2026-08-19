@@ -166,9 +166,8 @@ mod tests {
     use crate::transaction::action::{
         AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
         AdjustIndexCoverage, AlterField, ConfigUpdate, DropField, FieldMetadataUpdate,
-        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
-        SetDeletionFile,
-        TombstoneFieldData,
+        RefreshRowVersionMetadata, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds,
+        ReserveRowIds, ResetTable, SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
@@ -240,6 +239,9 @@ mod tests {
                     committed_version: 11,
                 }],
                 data_change: true,
+            }),
+            Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
+                fragment_ids: vec![4, 6],
             }),
             Action::AlterField(AlterField {
                 field: Ref::Committed(2),
@@ -332,11 +334,10 @@ mod tests {
     #[test]
     fn test_unimplemented_action_is_rejected() {
         let message = pb::Action {
-            action: Some(pb::action::Action::RefreshRowVersionMetadata(
-                pb::RefreshRowVersionMetadata {
-                    fragment_ids: vec![1],
-                },
-            )),
+            action: Some(pb::action::Action::AssertUniqueKeys(pb::AssertUniqueKeys {
+                key_fields: vec![],
+                filter: None,
+            })),
         };
         let error = Action::try_from(message).unwrap_err();
         assert!(
