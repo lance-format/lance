@@ -18,6 +18,16 @@
 //! the operation, does not have. The actions themselves are sufficient:
 //! `Project` is a set of [`DropField`](super::DropField)s and `Merge` a set of
 //! [`AddField`](super::AddField)s plus their data files.
+//!
+//! `Update` is not translated yet, for no reason but the size of the recipe.
+//! Every part of it has an action -- the deletion files it writes over the
+//! fragments it updates, the fragments and data files it mints, the fragments
+//! it removes, the field data it tombstones, the SSTable progress it records,
+//! the coverage its indices keep, and the key filter it carries -- but it is
+//! the one operation that draws on nearly the whole vocabulary at once, and
+//! which parts it uses depends on whether the update is vertical or
+//! horizontal. It gets its own change rather than riding along with the
+//! actions it is assembled from.
 
 use super::{
     Action, AddBase, AddDataFile, AddFragment, AddIndexSegment, AddOverlays, Ref, RemoveFragment,
