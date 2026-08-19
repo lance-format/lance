@@ -20,10 +20,10 @@
 //! [`AddField`](super::AddField)s plus their data files.
 
 use super::{
-    Action, AddBase, AddDataFile, AddFragment, Ref, RemoveFragment, SetDeletionFile,
-    TombstoneFieldData, UserAction,
+    Action, AddBase, AddDataFile, AddFragment, AddIndexSegment, Ref, RemoveFragment,
+    RemoveIndexSegment, SetDeletionFile, TombstoneFieldData, UserAction,
 };
-use crate::format::Fragment;
+use crate::format::{Fragment, IndexMetadata};
 use crate::transaction::{DataReplacementGroup, Operation};
 use lance_core::{Error, Result};
 
@@ -56,6 +56,13 @@ impl TryFrom<&Operation> for Vec<UserAction> {
                         })
                     })
                     .collect(),
+            )]),
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            } => Ok(vec![UserAction::new(
+                describe_index_change(new_indices, removed_indices),
+                create_index_actions(new_indices, removed_indices)?,
             )]),
             Operation::DataReplacement { replacements } => Ok(vec![UserAction::new(
                 format!("replace data files in {} fragments", replacements.len()),
@@ -154,6 +161,63 @@ fn data_replacement_actions(replacements: &[DataReplacementGroup]) -> Result<Vec
     Ok(actions)
 }
 
+fn describe_index_change(new: &[IndexMetadata], removed: &[IndexMetadata]) -> String {
+    match (new.is_empty(), removed.is_empty()) {
+        (false, true) => format!("build {} index segments", new.len()),
+        (true, false) => format!("drop {} index segments", removed.len()),
+        _ => format!(
+            "replace {} index segments with {}",
+            removed.len(),
+            new.len()
+        ),
+    }
+}
+
+/// A legacy index change is a set of segment removals followed by a set of
+/// additions -- which is what it already was, since the operation carries the
+/// two lists separately.
+///
+/// Two edges the legacy path tolerates and this does not. It drops a named
+/// removal that is not in the manifest, and it drops an existing segment whose
+/// uuid a new one reuses; both are rejected here, because either one means the
+/// operation was planned against a different set of segments than it is landing
+/// on.
+fn create_index_actions(
+    new_indices: &[IndexMetadata],
+    removed_indices: &[IndexMetadata],
+) -> Result<Vec<Action>> {
+    let mut actions = Vec::with_capacity(new_indices.len() + removed_indices.len());
+    for index in removed_indices {
+        actions.push(Action::RemoveIndexSegment(RemoveIndexSegment {
+            uuid: index.uuid,
+            data_change: false,
+        }));
+    }
+    for index in new_indices {
+        actions.push(Action::AddIndexSegment(AddIndexSegment {
+            uuid: index.uuid,
+            name: index.name.clone(),
+            fields: committed_field_refs(&index.fields)?,
+            index_details: index.index_details.clone(),
+            index_version: index.index_version,
+            covered_fragments: index.fragment_bitmap.as_ref().map(|bitmap| {
+                bitmap
+                    .iter()
+                    .map(|fragment| Ref::Committed(u64::from(fragment)))
+                    .collect()
+            }),
+            files: index.files.clone().unwrap_or_default(),
+            base: index.base_id.map(|id| Ref::Committed(u64::from(id))),
+            created_at: index.created_at,
+            dataset_version: Some(index.dataset_version),
+            // The legacy operation carries no such marker, and an index is
+            // derived from data this operation does not touch.
+            data_change: false,
+        }));
+    }
+    Ok(actions)
+}
+
 fn committed_field_refs(field_ids: &[i32]) -> Result<Vec<Ref>> {
     field_ids
         .iter()
@@ -178,7 +242,7 @@ mod tests {
     use crate::transaction::Transaction;
     use crate::transaction::action::CompositeOperation;
     use crate::transaction::test_support::{
-        default_build_config, make_stable_row_id_manifest, sample_manifest,
+        default_build_config, make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
     };
     use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
@@ -186,12 +250,21 @@ mod tests {
     /// Build the same manifest twice -- once down the legacy path, once by
     /// translating the operation to actions -- and assert they agree.
     fn assert_parity(manifest: &Manifest, operation: Operation) -> Manifest {
-        let (legacy, legacy_indices) = build(manifest, operation.clone());
+        assert_parity_with_indices(manifest, operation, Vec::new()).0
+    }
+
+    fn assert_parity_with_indices(
+        manifest: &Manifest,
+        operation: Operation,
+        indices: Vec<IndexMetadata>,
+    ) -> (Manifest, Vec<IndexMetadata>) {
+        let (legacy, legacy_indices) = build(manifest, operation.clone(), indices.clone());
 
         let actions = Vec::<UserAction>::try_from(&operation).unwrap();
         let (translated, translated_indices) = build(
             manifest,
             Operation::CompositeOperation(CompositeOperation::new(actions)),
+            indices,
         );
 
         // Data files are addressed by field, so the two paths are allowed to
@@ -215,7 +288,7 @@ mod tests {
         assert_eq!(translated.next_row_id, legacy.next_row_id);
         assert_eq!(translated.max_fragment_id, legacy.max_fragment_id);
         assert_eq!(translated_indices, legacy_indices);
-        translated
+        (translated, translated_indices)
     }
 
     fn sorted_files(fragment: &Fragment) -> Vec<DataFile> {
@@ -224,14 +297,13 @@ mod tests {
         files
     }
 
-    fn build(manifest: &Manifest, operation: Operation) -> (Manifest, Vec<IndexMetadata>) {
+    fn build(
+        manifest: &Manifest,
+        operation: Operation,
+        indices: Vec<IndexMetadata>,
+    ) -> (Manifest, Vec<IndexMetadata>) {
         Transaction::new(manifest.version, operation, None)
-            .build_manifest(
-                Some(manifest),
-                Vec::new(),
-                "tx.txn",
-                &default_build_config(),
-            )
+            .build_manifest(Some(manifest), indices, "tx.txn", &default_build_config())
             .unwrap()
     }
 
@@ -420,6 +492,88 @@ mod tests {
 
         // The legacy path treats this as an all-NULL column gaining real data;
         // the action form has no way to say "drop this if it is there".
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn test_create_index_matches_the_legacy_path() {
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
+        let existing = sample_index_metadata("by_b");
+        let built = sample_index_metadata("by_a");
+
+        let (_, indices) = assert_parity_with_indices(
+            &manifest,
+            Operation::CreateIndex {
+                new_indices: vec![built.clone()],
+                removed_indices: Vec::new(),
+            },
+            vec![existing.clone()],
+        );
+
+        assert_eq!(indices.len(), 2);
+        assert!(indices.contains(&built));
+        assert!(indices.contains(&existing));
+    }
+
+    #[test]
+    fn test_dropping_an_index_matches_the_legacy_path() {
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
+        let dropped = sample_index_metadata("by_a");
+        let kept = sample_index_metadata("by_b");
+
+        let (_, indices) = assert_parity_with_indices(
+            &manifest,
+            Operation::CreateIndex {
+                new_indices: Vec::new(),
+                removed_indices: vec![dropped.clone()],
+            },
+            vec![dropped, kept.clone()],
+        );
+
+        assert_eq!(indices, vec![kept]);
+    }
+
+    #[test]
+    fn test_replacing_an_index_segment_matches_the_legacy_path() {
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
+        let old = sample_index_metadata("by_a");
+        let new = sample_index_metadata("by_a");
+
+        let (_, indices) = assert_parity_with_indices(
+            &manifest,
+            Operation::CreateIndex {
+                new_indices: vec![new.clone()],
+                removed_indices: vec![old.clone()],
+            },
+            vec![old],
+        );
+
+        assert_eq!(indices, vec![new]);
+    }
+
+    #[test]
+    fn test_removing_an_index_segment_the_dataset_does_not_have_is_rejected() {
+        // The legacy path silently drops such a removal; the action form says
+        // the operation was planned against a different set of segments.
+        let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
+        let operation = Operation::CreateIndex {
+            new_indices: Vec::new(),
+            removed_indices: vec![sample_index_metadata("by_a")],
+        };
+        let actions = Vec::<UserAction>::try_from(&operation).unwrap();
+        let error = Transaction::new(
+            manifest.version,
+            Operation::CompositeOperation(CompositeOperation::new(actions)),
+            None,
+        )
+        .build_manifest(
+            Some(&manifest),
+            Vec::new(),
+            "tx.txn",
+            &default_build_config(),
+        )
+        .unwrap_err();
+
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
     }
 
