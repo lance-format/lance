@@ -141,9 +141,16 @@ pub struct Footprint {
     /// it is tracked as a flag rather than enumerated.
     exclusive: bool,
     /// Whether this set brings rows into the dataset that were not there
-    /// before. Rows are not a coordinate -- a row a concurrent writer inserts
-    /// has no id anyone could name -- so what the key assertions below compare
-    /// is this flag plus the filters.
+    /// before. Coordinates cannot answer what the key assertions ask: two
+    /// writers inserting the same key write it into fragments of their own, so
+    /// their coordinates stay disjoint however badly the keys collide. Key
+    /// uniqueness is a claim about values, not about structure, so it is
+    /// checked by comparing this flag against the filters below.
+    ///
+    /// Set by any [`AddFragment`](super::AddFragment) that is a data change,
+    /// which over-approximates: the rows a merge insert updates arrive in a new
+    /// fragment too, and those carry no new key. The cost is a conflict between
+    /// two writers who only ever touched keys that were already there.
     inserts_rows: bool,
     /// The unique-key preconditions this set carries, one per
     /// [`AssertUniqueKeys`](super::AssertUniqueKeys).
