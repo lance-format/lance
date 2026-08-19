@@ -157,15 +157,17 @@ for_each_action!(define_action_proto);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{
         BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta, pb,
     };
     use crate::rowids::version::RowDatasetVersionMeta;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
-        AlterField, ConfigUpdate, DropField, FieldMetadataUpdate, RemoveFragment,
-        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, SetDeletionFile,
+        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
+        AdjustIndexCoverage, AlterField, ConfigUpdate, DropField, FieldMetadataUpdate,
+        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
+        SetDeletionFile,
         TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
@@ -226,6 +228,17 @@ mod tests {
                     num_deleted_rows: Some(4),
                     base_id: None,
                 }),
+                data_change: true,
+            }),
+            Action::AddOverlays(AddOverlays {
+                fragment: Ref::Committed(6),
+                overlays: vec![DataOverlayFile {
+                    data_file: sample_data_file(),
+                    coverage: OverlayCoverage::PerField(vec![Arc::new(
+                        [1u32, 4].into_iter().collect::<RoaringBitmap>(),
+                    )]),
+                    committed_version: 11,
+                }],
                 data_change: true,
             }),
             Action::AlterField(AlterField {

@@ -57,6 +57,7 @@ macro_rules! for_each_action {
             TombstoneFieldData,
             RemoveFragment,
             SetDeletionFile,
+            AddOverlays,
             AlterField,
             DropField,
             AddIndexSegment,
@@ -75,6 +76,7 @@ mod add_data_file;
 mod add_field;
 mod add_fragment;
 mod add_index_segment;
+mod add_overlays;
 mod adjust_index_coverage;
 mod alter_field;
 mod apply;
@@ -99,6 +101,7 @@ pub use add_data_file::AddDataFile;
 pub use add_field::AddField;
 pub use add_fragment::AddFragment;
 pub use add_index_segment::AddIndexSegment;
+pub use add_overlays::AddOverlays;
 pub use adjust_index_coverage::AdjustIndexCoverage;
 pub use alter_field::AlterField;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
