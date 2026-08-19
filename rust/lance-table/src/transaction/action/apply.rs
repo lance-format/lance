@@ -17,6 +17,7 @@
 use super::{CompositeOperation, Ref};
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig};
 use crate::rowids::version::build_version_meta;
+use crate::system_index::mem_wal::{CompactedSsTable, update_mem_wal_index_compacted_sstables};
 use crate::transaction::Transaction;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
@@ -253,6 +254,16 @@ impl<'a> ApplyState<'a> {
         };
         self.indices.remove(position);
         Ok(())
+    }
+
+    /// Record MemWAL SSTable compaction progress, creating the MemWAL index
+    /// when the dataset does not have one yet.
+    pub(super) fn update_compacted_sstables(
+        &mut self,
+        compacted_sstables: Vec<CompactedSsTable>,
+    ) -> Result<()> {
+        let new_version = self.new_version();
+        update_mem_wal_index_compacted_sstables(&mut self.indices, new_version, compacted_sstables)
     }
 
     /// Where the segment `uuid` lives, checking on the way that it really
