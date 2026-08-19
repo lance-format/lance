@@ -60,9 +60,17 @@ impl AddFragment {
         self.data_change
     }
 
-    /// Nothing: the fragment does not exist in the read version, so no
-    /// concurrent writer can be naming it.
-    pub(super) fn footprint(&self, _footprint: &mut Footprint) {}
+    /// No coordinate: the fragment does not exist in the read version, so no
+    /// concurrent writer can be naming it. It does record that rows arrive,
+    /// which is the one thing about a minted fragment a concurrent
+    /// [`AssertUniqueKeys`](super::AssertUniqueKeys) has to know. A fragment
+    /// that is not a data change holds rows that were already in the dataset --
+    /// a compaction rewrite -- and brings in no new key.
+    pub(super) fn footprint(&self, footprint: &mut Footprint) {
+        if self.data_change {
+            footprint.insert_rows();
+        }
+    }
 }
 
 fn external_file_to_wire(file: &ExternalFile) -> pb::ExternalFile {

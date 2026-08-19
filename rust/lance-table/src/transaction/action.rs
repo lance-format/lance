@@ -11,8 +11,9 @@
 //!
 //! The wire format and the reasoning behind it live in
 //! `protos/transaction/actions.proto`; the two definitions must stay in step.
-//! Only the subset of the drafted vocabulary that is implemented appears here --
-//! an action this build does not know is rejected on load rather than skipped.
+//! Every action the draft defines is implemented here, so the two vocabularies
+//! now coincide -- an action a newer Lance writes is rejected on load rather
+//! than skipped.
 //!
 //! Each action lives in its own module and owns everything about itself: its
 //! definition, how it is applied, which coordinates it writes, and its wire
@@ -68,6 +69,7 @@ macro_rules! for_each_action {
             ReserveFragmentIds,
             ResetTable,
             ConfigUpdate,
+            AssertUniqueKeys,
         }
     };
 }
@@ -81,6 +83,7 @@ mod add_overlays;
 mod adjust_index_coverage;
 mod alter_field;
 mod apply;
+mod assert_unique_keys;
 mod config_update;
 mod drop_field;
 mod footprint;
@@ -106,6 +109,7 @@ pub use add_index_segment::AddIndexSegment;
 pub use add_overlays::AddOverlays;
 pub use adjust_index_coverage::AdjustIndexCoverage;
 pub use alter_field::AlterField;
+pub use assert_unique_keys::AssertUniqueKeys;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
 pub use footprint::{ConfigMap, Coordinate, Footprint};
@@ -206,12 +210,12 @@ impl UserAction {
 
 macro_rules! define_action {
     ($($variant:ident,)*) => {
-        /// A single granular change to the manifest.
+        /// A single granular change to the manifest, or an assertion about the
+        /// version it lands on.
         ///
-        /// The drafted vocabulary is larger than this; the variants here are the
-        /// ones this build implements end to end. Each one is defined, applied,
-        /// and encoded in the module named after it, and appears here only
-        /// because it is listed in `for_each_action!`.
+        /// Each variant is defined, applied, and encoded in the module named
+        /// after it, and appears here only because it is listed in
+        /// `for_each_action!`.
         #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
         pub enum Action {
             $($variant($variant),)*

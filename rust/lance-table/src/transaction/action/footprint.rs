@@ -17,6 +17,7 @@
 //! module. This module holds the coordinate space and the comparison.
 
 use super::{CompositeOperation, Ref};
+use crate::format::key_existence::KeyExistenceFilter;
 use crate::transaction::UpdateMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -139,10 +140,25 @@ pub struct Footprint {
     /// coordinate there is, including ones a concurrent set would only mint, so
     /// it is tracked as a flag rather than enumerated.
     exclusive: bool,
+    /// Whether this set brings rows into the dataset that were not there
+    /// before. Rows are not a coordinate -- a row a concurrent writer inserts
+    /// has no id anyone could name -- so what the key assertions below compare
+    /// is this flag plus the filters.
+    inserts_rows: bool,
+    /// The unique-key preconditions this set carries, one per
+    /// [`AssertUniqueKeys`](super::AssertUniqueKeys).
+    key_assertions: Vec<KeyAssertion>,
     /// What this set writes into logical indices. A segment's uuid is a
     /// coordinate, but the thing two writers can collide over is the index the
     /// segment joins, which is not a set of ids -- see [`IndexClaim`].
     index_claims: Vec<IndexClaim>,
+}
+
+/// A claim about which keys an action set inserts, and over which columns.
+#[derive(Debug, Clone, PartialEq)]
+struct KeyAssertion {
+    key_fields: Vec<Ref>,
+    filter: KeyExistenceFilter,
 }
 
 /// What an action set writes into one logical index.
@@ -213,6 +229,9 @@ impl Footprint {
         if !self.replaced_maps.is_disjoint(&other.replaced_maps) {
             return true;
         }
+        if self.key_assertion_violated_by(other) || other.key_assertion_violated_by(self) {
+            return true;
+        }
         if self.index_claims.iter().any(|ours| {
             other
                 .index_claims
@@ -222,6 +241,39 @@ impl Footprint {
             return true;
         }
         self.removes_something_touched_by(other) || other.removes_something_touched_by(self)
+    }
+
+    /// Whether `other` may have inserted a key this set asserts is not there.
+    ///
+    /// A set that asserts nothing has nothing to violate, and a set that
+    /// inserts no rows cannot have inserted a key. Otherwise the two are only
+    /// compatible if `other` says which keys it inserted, over the same columns,
+    /// and the two filters provably do not intersect. Anything less -- an
+    /// unqualified insert, different key columns, filters built with
+    /// incomparable parameters -- leaves the assertion unverifiable, which
+    /// counts as a conflict.
+    fn key_assertion_violated_by(&self, other: &Self) -> bool {
+        if self.key_assertions.is_empty() || !other.inserts_rows {
+            return false;
+        }
+        if other.key_assertions.is_empty() {
+            return true;
+        }
+        for ours in &self.key_assertions {
+            for theirs in &other.key_assertions {
+                if ours.key_fields != theirs.key_fields {
+                    return true;
+                }
+                match ours.filter.intersects(&theirs.filter) {
+                    Ok((false, _)) => {}
+                    // Either the keys really do overlap, or the two filters were
+                    // built with parameters that cannot be compared. Neither
+                    // clears the assertion.
+                    Ok((true, _)) | Err(_) => return true,
+                }
+            }
+        }
+        false
     }
 
     /// Whether this set wipes out something -- a fragment, a field, a whole
@@ -306,11 +358,23 @@ impl Footprint {
             identity: None,
             coverage: None,
         });
+    }
 
     /// Note that this set only works if `fragment` is still part of the dataset,
     /// without claiming anything inside it.
     pub(super) fn require_fragment(&mut self, fragment: u64) {
         self.required_fragments.insert(fragment);
+    }
+
+    /// Note that this set brings in rows that were not in the dataset before.
+    pub(super) fn insert_rows(&mut self) {
+        self.inserts_rows = true;
+    }
+
+    /// Record a precondition that no concurrent commit inserted a colliding key.
+    pub(super) fn assert_unique_keys(&mut self, key_fields: Vec<Ref>, filter: KeyExistenceFilter) {
+        self.key_assertions
+            .push(KeyAssertion { key_fields, filter });
     }
 
     pub(super) fn remove_fragment(&mut self, fragment: u64) {
