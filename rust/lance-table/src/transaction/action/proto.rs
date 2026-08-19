@@ -162,12 +162,13 @@ mod tests {
         BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta, pb,
     };
     use crate::rowids::version::RowDatasetVersionMeta;
+    use crate::system_index::mem_wal::CompactedSsTable;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
         AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
         AdjustIndexCoverage, AlterField, ConfigUpdate, DropField, FieldMetadataUpdate,
         RefreshRowVersionMetadata, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds,
-        ReserveRowIds, ResetTable, SetDeletionFile, TombstoneFieldData,
+        ReserveRowIds, ResetTable, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
@@ -281,6 +282,12 @@ mod tests {
                 name: "by_b".into(),
                 add_fragments: vec![Ref::Committed(1), Ref::Local(0)],
                 remove_fragments: vec![2, 3],
+            }),
+            Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
+                compacted_sstables: vec![
+                    CompactedSsTable::new(Uuid::from_u128(10), 2),
+                    CompactedSsTable::new(Uuid::from_u128(11), 5),
+                ],
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ReserveRowIds(ReserveRowIds { count: 40 }),
