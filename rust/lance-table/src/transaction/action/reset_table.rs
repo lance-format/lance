@@ -66,6 +66,7 @@ mod tests {
     };
     use crate::transaction::action::{Action, AddDataFile, AddField, AddFragment, Ref};
     use crate::transaction::test_support::sample_index_metadata;
+    use lance_file::version::ConcreteFileVersion;
 
     fn reset() -> Action {
         Action::ResetTable(ResetTable)
@@ -119,7 +120,7 @@ mod tests {
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
-                    file: DataFile::new_unstarted("data/fresh.lance", 2, 0),
+                    file: DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V2_0),
                     field_ids: vec![Ref::Local(0)],
                     data_change: true,
                 }),

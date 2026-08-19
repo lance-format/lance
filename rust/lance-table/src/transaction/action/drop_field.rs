@@ -130,6 +130,7 @@ mod tests {
     use crate::transaction::action::{Action, AddField};
     use crate::transaction::test_support::sample_index_metadata;
     use arrow_schema::{DataType, Field as ArrowField};
+    use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
 
     #[test]
@@ -157,7 +158,14 @@ mod tests {
         schema_field.id = 1;
         manifest.schema.fields.push(schema_field);
         let mut fragment = manifest.fragments[0].clone();
-        fragment.files[0] = DataFile::new("data/0.lance", vec![0, 1], vec![0, 1], 2, 0, None, None);
+        fragment.files[0] = DataFile::new(
+            "data/0.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
         manifest.fragments = Arc::new(vec![fragment]);
 
         let next = apply(

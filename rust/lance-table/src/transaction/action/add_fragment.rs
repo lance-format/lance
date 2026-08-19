@@ -88,7 +88,7 @@ impl From<&AddFragment> for pb::AddFragment {
             physical_rows: value.physical_rows,
             row_id_sequence: value.row_id_meta.as_ref().map(|meta| match meta {
                 RowIdMeta::Inline(data) => {
-                    pb::add_fragment::RowIdSequence::InlineRowIds(data.clone())
+                    pb::add_fragment::RowIdSequence::InlineRowIds(data.to_vec())
                 }
                 RowIdMeta::External(file) => {
                     pb::add_fragment::RowIdSequence::ExternalRowIds(external_file_to_wire(file))
@@ -137,7 +137,9 @@ impl TryFrom<pb::AddFragment> for AddFragment {
             local: message.local,
             physical_rows: message.physical_rows,
             row_id_meta: message.row_id_sequence.map(|sequence| match sequence {
-                pb::add_fragment::RowIdSequence::InlineRowIds(data) => RowIdMeta::Inline(data),
+                pb::add_fragment::RowIdSequence::InlineRowIds(data) => {
+                    RowIdMeta::Inline(data.into())
+                }
                 pb::add_fragment::RowIdSequence::ExternalRowIds(file) => {
                     RowIdMeta::External(external_file_from_wire(file))
                 }
@@ -176,6 +178,7 @@ mod tests {
     use crate::transaction::action::test_support::apply;
     use crate::transaction::action::{Action, AddDataFile, Ref};
     use crate::transaction::test_support::sample_manifest;
+    use lance_file::version::ConcreteFileVersion;
 
     #[test]
     fn test_add_fragment_and_data_file_mint_ids() {
@@ -193,7 +196,7 @@ mod tests {
                 }),
                 Action::AddDataFile(AddDataFile {
                     fragment: Ref::Local(0),
-                    file: DataFile::new_unstarted("data/new.lance", 2, 0),
+                    file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
                     field_ids: vec![Ref::Committed(0)],
                     data_change: true,
                 }),

@@ -156,10 +156,11 @@ mod tests {
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::Field;
+    use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
 
     fn sample_data_file() -> DataFile {
-        DataFile::new_unstarted("data/1.lance", 2, 0)
+        DataFile::new_unstarted("data/1.lance", ConcreteFileVersion::V2_0)
     }
 
     fn all_actions() -> Vec<Action> {
@@ -167,7 +168,7 @@ mod tests {
             Action::AddFragment(AddFragment {
                 local: 0,
                 physical_rows: 10,
-                row_id_meta: Some(RowIdMeta::Inline(vec![1, 2, 3])),
+                row_id_meta: Some(RowIdMeta::Inline(vec![1, 2, 3].into())),
                 last_updated_at_version_meta: Some(RowDatasetVersionMeta::Inline(Arc::from(
                     [4u8, 5].as_slice(),
                 ))),
