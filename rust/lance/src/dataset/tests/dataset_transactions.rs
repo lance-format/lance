@@ -1412,9 +1412,9 @@ mod composite {
 
     use std::sync::Arc;
 
-    use crate::Dataset;
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
     use crate::index::DatasetIndexExt;
+    use crate::{Dataset, Error, Result};
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_table::format::DataFile;
@@ -1810,6 +1810,7 @@ mod composite {
             vec![
                 Action::RemoveIndexSegment(RemoveIndexSegment {
                     uuid: old_uuid,
+                    name: "by_a".into(),
                     data_change: false,
                 }),
                 Action::AddIndexSegment(new),
@@ -1827,6 +1828,90 @@ mod composite {
         assert_eq!(uuids, vec![new_uuid]);
     }
 
+    /// Commit `actions` against `dataset` as it was, whatever has landed since.
+    /// This is what a concurrent writer does: it planned at that version and
+    /// arrives at the commit after someone else got there first.
+    async fn commit_from_stale(dataset: Arc<Dataset>, actions: Vec<Action>) -> Result<Dataset> {
+        let read_version = dataset.version().version;
+        CommitBuilder::new(dataset)
+            .execute(Transaction::new(
+                read_version,
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                    "step", actions,
+                )])),
+                None,
+            ))
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_two_writers_extend_one_index_over_disjoint_fragments() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+
+        // The first writer wins the race; the second arrives against a version
+        // it has not seen.
+        commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        let dataset = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(1)],
+            ))],
+        )
+        .await
+        .expect("segments over disjoint fragments both belong to the index");
+
+        let mut coverage = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "by_a")
+            .map(|index| index.fragment_bitmap.as_ref().unwrap().iter().collect())
+            .collect::<Vec<Vec<u32>>>();
+        coverage.sort();
+        assert_eq!(coverage, vec![vec![0], vec![1]]);
+    }
+
+    #[tokio::test]
+    async fn test_two_writers_indexing_the_same_fragment_conflict() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+
+        commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        let error = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await
+        .expect_err("two segments describing one fragment would double-count its rows");
+
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_a_commit_extends_an_index_segments_coverage() {
         let dataset = test_dataset(false).await;
@@ -1839,6 +1924,7 @@ mod composite {
             dataset,
             vec![Action::AdjustIndexCoverage(AdjustIndexCoverage {
                 uuid,
+                name: "by_a".into(),
                 add_fragments: vec![Ref::Committed(1)],
                 remove_fragments: vec![0],
             })],

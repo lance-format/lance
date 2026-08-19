@@ -190,6 +190,7 @@ fn create_index_actions(
     for index in removed_indices {
         actions.push(Action::RemoveIndexSegment(RemoveIndexSegment {
             uuid: index.uuid,
+            name: index.name.clone(),
             data_change: false,
         }));
     }
