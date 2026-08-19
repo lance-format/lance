@@ -219,6 +219,14 @@ impl<'a> ApplyState<'a> {
         self.current_manifest.version
     }
 
+    /// The version this delta produces, for the actions that stamp it into what
+    /// they write. Distinct from [`Self::read_version`]: a retry against a newer
+    /// manifest re-runs the apply, so anything stamped with this is re-stamped
+    /// rather than carried over.
+    pub(super) fn new_version(&self) -> u64 {
+        self.current_manifest.version + 1
+    }
+
     /// Add an index segment. A segment's uuid identifies it, so re-adding one
     /// that is already there is a mistake rather than a replacement -- swapping
     /// a segment out is a [`RemoveIndexSegment`](super::RemoveIndexSegment)

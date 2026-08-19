@@ -120,6 +120,12 @@ pub struct Footprint {
     /// is therefore not caught here and fails when it is applied against the
     /// version where the child no longer exists.
     removed_fields: HashSet<i32>,
+    /// Fragments this set needs to still be there, without writing anything
+    /// exclusive inside them. An overlay is the case this exists for: two
+    /// concurrent overlays over the same cells both land and the newer one
+    /// wins, so they must not collide with each other -- but neither survives a
+    /// concurrent writer dropping the fragment out from under them.
+    required_fragments: HashSet<u64>,
     /// String maps this set replaces outright rather than merging into. Like a
     /// fragment removal, this writes every key in the map, including keys it
     /// does not name, so it is matched by map rather than by key.
@@ -214,8 +220,14 @@ impl Footprint {
     }
 
     /// Whether this set wipes out something -- a fragment, a field, a whole
-    /// string map -- that `other` also writes to.
+    /// string map -- that `other` also writes to or needs to still be there.
     fn removes_something_touched_by(&self, other: &Self) -> bool {
+        if !self
+            .removed_fragments
+            .is_disjoint(&other.required_fragments)
+        {
+            return true;
+        }
         other.writes.iter().any(|coordinate| {
             coordinate
                 .fragment()
@@ -289,6 +301,11 @@ impl Footprint {
             identity: None,
             coverage: None,
         });
+
+    /// Note that this set only works if `fragment` is still part of the dataset,
+    /// without claiming anything inside it.
+    pub(super) fn require_fragment(&mut self, fragment: u64) {
+        self.required_fragments.insert(fragment);
     }
 
     pub(super) fn remove_fragment(&mut self, fragment: u64) {
