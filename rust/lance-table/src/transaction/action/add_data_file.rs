@@ -97,6 +97,7 @@ mod tests {
     use crate::transaction::action::Action;
     use crate::transaction::action::test_support::apply;
     use crate::transaction::test_support::sample_manifest;
+    use lance_file::version::ConcreteFileVersion;
 
     #[test]
     fn test_add_data_file_rejects_an_unbound_local_token() {
@@ -105,7 +106,7 @@ mod tests {
             &manifest,
             vec![Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(3),
-                file: DataFile::new_unstarted("data/x.lance", 2, 0),
+                file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
                 field_ids: vec![Ref::Committed(0)],
                 data_change: true,
             })],
@@ -120,7 +121,7 @@ mod tests {
     #[test]
     fn test_add_data_file_rejects_a_column_count_mismatch() {
         let manifest = sample_manifest();
-        let mut file = DataFile::new_unstarted("data/x.lance", 2, 0);
+        let mut file = DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0);
         file.column_indices = vec![0, 1].into();
 
         let error = apply(
@@ -148,7 +149,7 @@ mod tests {
             &manifest,
             vec![Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(7),
-                file: DataFile::new_unstarted("data/x.lance", 2, 0),
+                file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
                 field_ids: vec![Ref::Committed(0)],
                 data_change: true,
             })],
