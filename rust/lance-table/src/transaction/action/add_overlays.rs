@@ -97,12 +97,20 @@ mod tests {
     use crate::transaction::action::{
         Action, AddFragment, CompositeOperation, RemoveFragment, UserAction,
     };
+    use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
     use std::sync::Arc;
 
     fn overlay(path: &str, offsets: &[u32]) -> DataOverlayFile {
         DataOverlayFile {
-            data_file: DataFile::new(path, vec![0], vec![0], 2, 0, None, None),
+            data_file: DataFile::new(
+                path,
+                vec![0],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            ),
             coverage: OverlayCoverage::Shared(Arc::new(
                 offsets.iter().copied().collect::<RoaringBitmap>(),
             )),

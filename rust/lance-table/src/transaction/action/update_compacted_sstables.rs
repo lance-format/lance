@@ -13,9 +13,9 @@ use lance_core::{Error, Result};
 /// Mark MemWAL SSTables as compacted into the base table.
 ///
 /// The rows were already readable through the WAL, so this records where they
-/// are rather than changing them. Per shard the highest generation wins, so
-/// replaying an older commit over a newer one cannot walk the progress
-/// backwards.
+/// are rather than changing them. A shard's generation may only move forward,
+/// and the table must already carry a MemWAL index: progress against a shard
+/// nothing corroborates is rejected rather than invented.
 ///
 /// This is the one action that edits the MemWAL system index rather than the
 /// data, which is why it exists at all: the index is a segment like any other,
@@ -78,7 +78,9 @@ impl TryFrom<pb::UpdateCompactedSsTables> for UpdateCompactedSsTables {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system_index::mem_wal::load_mem_wal_index_details;
+    use crate::system_index::mem_wal::{
+        MemWalIndexDetails, load_mem_wal_index_details, new_mem_wal_index_meta,
+    };
     use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
     use crate::transaction::action::{Action, CompositeOperation, UserAction};
     use crate::transaction::test_support::sample_index_metadata;
@@ -112,19 +114,33 @@ mod tests {
         progress
     }
 
-    #[test]
-    fn test_recording_progress_creates_the_mem_wal_index_when_there_is_none() {
-        let (_, indices) =
-            apply_with_indices(&backed_manifest(), vec![update(vec![(1, 7)])], Vec::new()).unwrap();
+    /// A MemWAL index recording no compaction progress yet, which recording
+    /// progress requires the table to already have.
+    fn empty_mem_wal_index() -> crate::format::IndexMetadata {
+        new_mem_wal_index_meta(1, MemWalIndexDetails::default()).unwrap()
+    }
 
-        assert_eq!(progress(&indices), vec![(1, 7)]);
+    #[test]
+    fn test_recording_progress_without_a_mem_wal_index_is_rejected() {
+        let error = apply_with_indices(&backed_manifest(), vec![update(vec![(1, 7)])], Vec::new())
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("does not exist on this table"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
     fn test_a_later_generation_supersedes_the_one_recorded_for_that_shard() {
         let manifest = backed_manifest();
-        let (_, indices) =
-            apply_with_indices(&manifest, vec![update(vec![(1, 3)])], Vec::new()).unwrap();
+        let (_, indices) = apply_with_indices(
+            &manifest,
+            vec![update(vec![(1, 3)])],
+            vec![empty_mem_wal_index()],
+        )
+        .unwrap();
         let (_, indices) =
             apply_with_indices(&manifest, vec![update(vec![(1, 9)])], indices).unwrap();
 
@@ -132,21 +148,31 @@ mod tests {
     }
 
     #[test]
-    fn test_an_earlier_generation_does_not_walk_a_shard_backwards() {
+    fn test_an_earlier_generation_is_rejected_rather_than_walking_a_shard_backwards() {
         let manifest = backed_manifest();
-        let (_, indices) =
-            apply_with_indices(&manifest, vec![update(vec![(1, 9)])], Vec::new()).unwrap();
-        let (_, indices) =
-            apply_with_indices(&manifest, vec![update(vec![(1, 3)])], indices).unwrap();
+        let (_, indices) = apply_with_indices(
+            &manifest,
+            vec![update(vec![(1, 9)])],
+            vec![empty_mem_wal_index()],
+        )
+        .unwrap();
+        let error = apply_with_indices(&manifest, vec![update(vec![(1, 3)])], indices).unwrap_err();
 
-        assert_eq!(progress(&indices), vec![(1, 9)]);
+        assert!(
+            error.to_string().contains("Stale SSTable compaction"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
     fn test_shards_are_tracked_independently() {
         let manifest = backed_manifest();
-        let (_, indices) =
-            apply_with_indices(&manifest, vec![update(vec![(1, 3)])], Vec::new()).unwrap();
+        let (_, indices) = apply_with_indices(
+            &manifest,
+            vec![update(vec![(1, 3)])],
+            vec![empty_mem_wal_index()],
+        )
+        .unwrap();
         let (_, indices) =
             apply_with_indices(&manifest, vec![update(vec![(2, 5)])], indices).unwrap();
 
@@ -155,8 +181,12 @@ mod tests {
 
     #[test]
     fn test_recording_no_sstables_is_rejected() {
-        let error =
-            apply_with_indices(&backed_manifest(), vec![update(vec![])], Vec::new()).unwrap_err();
+        let error = apply_with_indices(
+            &backed_manifest(),
+            vec![update(vec![])],
+            vec![empty_mem_wal_index()],
+        )
+        .unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(
@@ -171,7 +201,7 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &backed_manifest(),
             vec![update(vec![(1, 7)])],
-            vec![kept.clone()],
+            vec![kept.clone(), empty_mem_wal_index()],
         )
         .unwrap();
 

@@ -80,7 +80,18 @@ impl TryFrom<&Operation> for Vec<UserAction> {
             // An empty list is a no-op the legacy path tolerates, and an
             // UpdateCompactedSsTables naming no SSTable is rejected, so it
             // translates to a step with nothing in it rather than an action.
-            Operation::UpdateMemWalState { compacted_sstables } => Ok(vec![UserAction::new(
+            // Requiring index catch-up is a one-way feature-flag migration with
+            // no action of its own, so an operation asking for it does not
+            // translate.
+            Operation::UpdateMemWalState {
+                require_index_catchup: true,
+                ..
+            } => Err(Error::not_supported(
+                "translating a MemWAL state update that requires index catch-up into actions",
+            )),
+            Operation::UpdateMemWalState {
+                compacted_sstables, ..
+            } => Ok(vec![UserAction::new(
                 format!("compact {} MemWAL SSTables", compacted_sstables.len()),
                 if compacted_sstables.is_empty() {
                     Vec::new()
@@ -267,7 +278,8 @@ mod tests {
     };
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::system_index::mem_wal::{
-        CompactedSsTable, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
+        CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndexDetails, load_mem_wal_index_details,
+        new_mem_wal_index_meta,
     };
     use crate::transaction::DataOverlayGroup;
     use crate::transaction::Transaction;
@@ -708,15 +720,19 @@ mod tests {
     fn test_update_mem_wal_state_records_the_same_progress_as_the_legacy_path() {
         let manifest = manifest_with_fragments(vec![appendable_fragment("data/0.lance")]);
         let operation = Operation::UpdateMemWalState {
+            require_index_catchup: false,
             compacted_sstables: vec![CompactedSsTable::new(Uuid::from_u128(1), 4)],
         };
 
-        let (legacy, legacy_indices) = build(&manifest, operation.clone(), Vec::new());
+        // Recording progress requires the table to already carry the index.
+        let existing =
+            vec![new_mem_wal_index_meta(manifest.version, MemWalIndexDetails::default()).unwrap()];
+        let (legacy, legacy_indices) = build(&manifest, operation.clone(), existing.clone());
         let actions = Vec::<UserAction>::try_from(&operation).unwrap();
         let (translated, translated_indices) = build(
             &manifest,
             Operation::CompositeOperation(CompositeOperation::new(actions)),
-            Vec::new(),
+            existing,
         );
 
         let progress = |indices: &[IndexMetadata]| {
@@ -729,14 +745,13 @@ mod tests {
                 .compacted_sstables
         };
         assert_eq!(progress(&translated_indices), progress(&legacy_indices));
-
-        assert!(legacy.fragments.is_empty());
-        assert_eq!(translated.fragments.len(), 1);
+        assert_eq!(translated.fragments, legacy.fragments);
     }
 
     #[test]
     fn test_update_mem_wal_state_with_no_sstables_translates_to_no_actions() {
         let operation = Operation::UpdateMemWalState {
+            require_index_catchup: false,
             compacted_sstables: Vec::new(),
         };
         let actions = Vec::<UserAction>::try_from(&operation).unwrap();
