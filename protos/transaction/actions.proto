@@ -13,7 +13,7 @@ package lance.table;
 /*
  * Action-based transactions (Transaction V2) — DRAFT.
  *
- * A `UserOperation` replaces the single legacy `Operation` (see
+ * A `CompositeOperation` replaces the single legacy `Operation` (see
  * transaction.proto) with an ordered list of granular `Action`s that commit
  * atomically as one manifest change. This file is the wire draft only.
  *
@@ -21,7 +21,7 @@ package lance.table;
  * ------
  * The messages and field numbers here are NOT yet a stable contract. Library
  * support is read-side fail-closed only: a transaction carrying a
- * `UserOperation` is rejected on load, and there is no write path. Apply,
+ * `CompositeOperation` is rejected on load, and there is no write path. Apply,
  * id translation, and conflict resolution are intentionally absent.
  *
  * DESIGN RATIONALE
@@ -106,10 +106,10 @@ package lance.table;
  * id) that may not be committed yet.
  *
  * `committed` is an already-assigned id. `local` is a placeholder token minted
- * by an `Add*` action earlier in the same `UserOperation`; it resolves to a
+ * by an `Add*` action earlier in the same `CompositeOperation`; it resolves to a
  * freshly-allocated committed id at apply, and re-resolves against the target's
  * counters on merge/rebase. `local` tokens are scoped to a single
- * `UserOperation` and must be distinct within it (validated by the writer once
+ * `CompositeOperation` and must be distinct within it (validated by the writer once
  * the write path exists).
  */
 message Ref {
@@ -123,23 +123,21 @@ message Ref {
  * A user-facing, composable transaction: an ordered list of user actions that
  * commit atomically as a single manifest change.
  */
-message UserOperation {
-  // Human-readable description, e.g. "INSERT INTO t VALUES (1)".
-  string description = 1;
+message CompositeOperation {
   // Unique identifier for this operation (matches Transaction.uuid semantics).
-  string uuid = 2;
+  string uuid = 1;
   // The dataset version this operation was planned against.
-  uint64 read_version = 3;
+  uint64 read_version = 2;
   // The ordered list of user actions applied by this operation.
-  repeated UserAction actions = 4;
+  repeated UserAction actions = 3;
 }
 
 /*
- * A single user-recognizable step within a UserOperation (e.g. "append batch",
+ * A single user-recognizable step within a CompositeOperation (e.g. "append batch",
  * "rebuild index").
  *
  * The description keeps the transaction history human-readable. When a range of
- * transactions is squashed, each original UserOperation collapses into one
+ * transactions is squashed, each original CompositeOperation collapses into one
  * UserAction so the readable sequence survives; the action lists are flattened
  * when applied to the manifest.
  */
@@ -173,7 +171,9 @@ message Action {
     ConfigUpdate config_update = 8;
     AddOverlays add_overlays = 9;
     RefreshRowVersionMetadata refresh_row_version_metadata = 10;
-    UpdateCompactedSsTables update_compacted_sstables = 11;
+    // Named `update_compacted_ss_tables` rather than `..._sstables` so the
+    // generated oneof variant matches the message name.
+    UpdateCompactedSsTables update_compacted_ss_tables = 11;
     // -- Schema (field-level; no wholesale SetSchema) --
     DropField drop_field = 12;
     AlterField alter_field = 13;
@@ -286,8 +286,8 @@ message AddBase {
  */
 message TombstoneFieldData {
   Ref fragment = 1;
-  // Committed field ids whose current backing is tombstoned.
-  repeated uint64 field_ids = 2;
+  // The fields whose current backing is tombstoned.
+  repeated Ref field_ids = 2;
   // Data-change marker; see AddFragment.data_change.
   optional bool data_change = 3;
 }
@@ -376,7 +376,7 @@ message UpdateCompactedSsTables {
  * no live fields). References an existing committed field id.
  */
 message DropField {
-  uint64 field = 1;
+  Ref field = 1;
 }
 
 /*
@@ -389,7 +389,7 @@ message DropField {
  * AddDataFile to rewrite the data. New facets are added as optional fields.
  */
 message AlterField {
-  uint64 field = 1;
+  Ref field = 1;
   optional string name = 2;
   // New Arrow logical type (see Field.logical_type). The cast.
   optional string logical_type = 3;
@@ -411,9 +411,15 @@ message AddIndexSegment {
   optional int32 index_version = 5;
   /*
    * Fragments covered by this segment (resolved to a fragment_bitmap at apply,
-   * and remapped under fragment relocation). Committed or same-op Local.
+   * and remapped under fragment relocation).
+   *
+   * Absent means the coverage is unknown, which is what the system indices
+   * (MemWAL, fragment reuse) carry and what pre-bitmap segments read back as.
+   * That is a different statement from a present-but-empty list, which says the
+   * segment covers no fragment at all -- the query path serves a segment of
+   * unknown coverage and skips one that covers nothing.
    */
-  repeated Ref covered_fragments = 6;
+  optional FragmentCoverage covered_fragments = 6;
   /*
    * Index files with sizes, when produced by the writer (e.g. a compaction that
    * rewrites the segment). Empty when unavailable.
@@ -422,6 +428,37 @@ message AddIndexSegment {
   // Data-change marker; see AddFragment.data_change. false marks a segment
   // rebuild/compaction that does not reflect any change to the indexed data.
   optional bool data_change = 8;
+  /*
+   * The base path this segment's files live under, for a segment imported from
+   * another dataset. Committed, or Local for a base minted by an AddBase in the
+   * same operation. Absent => the dataset's own index directory.
+   */
+  optional Ref base = 9;
+  /*
+   * When this segment was built, in milliseconds since the Unix epoch. Absent
+   * for a segment whose build time was not recorded.
+   */
+  optional uint64 created_at = 10;
+  /*
+   * The dataset version whose data this segment reflects.
+   *
+   * This is a correctness gate, not provenance: an overlay committed at or
+   * before it is treated as already folded into the index. A segment merged
+   * from several older ones reflects only as much as its oldest input, so this
+   * is genuinely below the version the operation reads and cannot be derived
+   * from it. Absent means the version the operation reads, which is what a
+   * freshly built segment reflects. It may never exceed that version.
+   */
+  optional uint64 dataset_version = 11;
+}
+
+/*
+ * A list of fragments, wrapped so that "no coverage recorded" is distinguishable
+ * from "covers nothing" (a bare `repeated` field cannot tell them apart).
+ */
+message FragmentCoverage {
+  // Committed, or Local for a fragment minted in the same operation.
+  repeated Ref fragments = 1;
 }
 
 /*
@@ -432,6 +469,12 @@ message RemoveIndexSegment {
   // Data-change marker; see AddFragment.data_change. false marks removal of a
   // segment superseded by compaction, not a change to the indexed data.
   optional bool data_change = 2;
+  /*
+   * The logical index the segment belongs to. Carried so apply can check the
+   * removal was planned against the segment it actually names; a mismatch means
+   * the operation was built against a different set of segments.
+   */
+  string name = 3;
 }
 
 /*
@@ -448,6 +491,13 @@ message AdjustIndexCoverage {
   repeated Ref add_fragments = 2;
   // Committed fragment ids to drop from the segment's coverage.
   repeated uint64 remove_fragments = 3;
+  /*
+   * The logical index the segment belongs to. Conflict detection compares
+   * coverage across the segments of one index, so it needs the index this
+   * adjustment widens, not just the segment. Apply also checks the named
+   * segment really carries this name.
+   */
+  string name = 4;
 }
 
 /*

@@ -416,7 +416,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
-            Some(pb::transaction::Operation::UserOperation(_)) => {
+            Some(pb::transaction::Operation::CompositeOperation(_)) => {
                 // Action-based transactions (Transaction V2) are a draft wire
                 // format (OSS-1530). This version of Lance recognizes the message
                 // but has no support for it: reject on load, fail-closed. Because
@@ -882,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn test_user_operation_rejected_on_load() {
+    fn test_composite_operation_rejected_on_load() {
         // Action-based transactions (Transaction V2) are a draft wire format that
         // this version of Lance does not support. Loading one must fail closed
         // (never be silently skipped or leniently parsed), so that a concurrent
@@ -890,9 +890,8 @@ mod tests {
         let message = pb::Transaction {
             read_version: 1,
             uuid: Uuid::new_v4().to_string(),
-            operation: Some(pb::transaction::Operation::UserOperation(
-                pb::UserOperation {
-                    description: "INSERT INTO t VALUES (1)".to_string(),
+            operation: Some(pb::transaction::Operation::CompositeOperation(
+                pb::CompositeOperation {
                     uuid: Uuid::new_v4().to_string(),
                     read_version: 1,
                     actions: vec![pb::UserAction {

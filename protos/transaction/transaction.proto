@@ -343,7 +343,7 @@ message Transaction {
     DataOverlay data_overlay = 115;
     // Action-based transaction (Transaction V2). See actions.proto.
     // DRAFT: currently rejected on load; no write path.
-    UserOperation user_operation = 116;
+    CompositeOperation composite_operation = 116;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
