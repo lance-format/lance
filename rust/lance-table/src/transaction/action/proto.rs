@@ -177,19 +177,20 @@ for_each_action!(define_action_proto);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta};
+    use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use crate::format::{
+        BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta, pb,
+    };
     use crate::rowids::version::RowDatasetVersionMeta;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
-        AlterField, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate, RemoveFragment,
-        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, SetDeletionFile,
-        TombstoneFieldData,
+        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays, AdjustIndexCoverage, AlterField, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
     use lance_core::datatypes::Field;
     use lance_file::version::ConcreteFileVersion;
+    use roaring::RoaringBitmap;
     use rstest::rstest;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -246,6 +247,17 @@ mod tests {
                 }),
                 data_change: true,
                 base: Some(Ref::Committed(2)),
+            }),
+            Action::AddOverlays(AddOverlays {
+                fragment: Ref::Committed(6),
+                overlays: vec![DataOverlayFile {
+                    data_file: sample_data_file(),
+                    coverage: OverlayCoverage::PerField(vec![Arc::new(
+                        [1u32, 4].into_iter().collect::<RoaringBitmap>(),
+                    )]),
+                    committed_version: 11,
+                }],
+                data_change: true,
             }),
             Action::AlterField(AlterField {
                 field: FieldRef::Committed(2),
