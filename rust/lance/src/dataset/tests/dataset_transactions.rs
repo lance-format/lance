@@ -1414,14 +1414,16 @@ mod composite {
 
     use crate::Dataset;
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
+    use crate::index::DatasetIndexExt;
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_table::format::DataFile;
     use lance_table::transaction::action::{
-        Action, AddDataFile, AddField, AddFragment, CompositeOperation, DropField, Ref,
-        TombstoneFieldData, UserAction,
+        Action, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
+        CompositeOperation, DropField, Ref, RemoveIndexSegment, TombstoneFieldData, UserAction,
     };
     use lance_table::transaction::{Operation, Transaction};
+    use uuid::Uuid;
 
     /// A two-fragment dataset, so its two data files can stand in for the files an
     /// action set would otherwise have had to write.
@@ -1720,5 +1722,129 @@ mod composite {
             error.to_string().contains("preempted"),
             "unexpected error: {error}"
         );
+    }
+
+    /// An index segment naming `covered`, with no files of its own -- these
+    /// tests inspect the manifest's index section rather than opening the index.
+    fn index_segment(name: &str, covered: Vec<Ref>) -> AddIndexSegment {
+        AddIndexSegment {
+            uuid: Uuid::new_v4(),
+            name: name.into(),
+            fields: vec![Ref::Committed(0)],
+            index_details: None,
+            index_version: 1,
+            covered_fragments: Some(covered),
+            files: Vec::new(),
+            base: None,
+            created_at: None,
+            dataset_version: None,
+            data_change: false,
+        }
+    }
+
+    async fn index_coverage(dataset: &Dataset, name: &str) -> Vec<u32> {
+        let indices = dataset.load_indices().await.unwrap();
+        let segment = indices
+            .iter()
+            .find(|index| index.name == name)
+            .expect("index segment should be committed");
+        segment
+            .fragment_bitmap
+            .as_ref()
+            .expect("coverage should be recorded")
+            .iter()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_appends_and_indexes_what_it_appended() {
+        let dataset = test_dataset(false).await;
+        let existing = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 0);
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    local: 0,
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![Ref::Committed(0)],
+                    data_change: true,
+                }),
+                // The index covers the fragment this same commit minted, which
+                // has no id until the commit lands.
+                Action::AddIndexSegment(index_segment(
+                    "by_a",
+                    vec![Ref::Committed(existing), Ref::Local(0)],
+                )),
+            ],
+        )
+        .await;
+
+        let appended = dataset.fragments().last().unwrap().id;
+        assert_eq!(
+            index_coverage(&dataset, "by_a").await,
+            vec![existing as u32, appended as u32]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_replaces_an_index_segment() {
+        let dataset = test_dataset(false).await;
+        let old = index_segment("by_a", vec![Ref::Committed(0)]);
+        let old_uuid = old.uuid;
+        let dataset = commit(dataset, vec![Action::AddIndexSegment(old)]).await;
+
+        let new = index_segment("by_a", vec![Ref::Committed(0), Ref::Committed(1)]);
+        let new_uuid = new.uuid;
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::RemoveIndexSegment(RemoveIndexSegment {
+                    uuid: old_uuid,
+                    data_change: false,
+                }),
+                Action::AddIndexSegment(new),
+            ],
+        )
+        .await;
+
+        let uuids = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.uuid)
+            .collect::<Vec<_>>();
+        assert_eq!(uuids, vec![new_uuid]);
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_extends_an_index_segments_coverage() {
+        let dataset = test_dataset(false).await;
+        let segment = index_segment("by_a", vec![Ref::Committed(0)]);
+        let uuid = segment.uuid;
+        let dataset = commit(dataset, vec![Action::AddIndexSegment(segment)]).await;
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![0]);
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AdjustIndexCoverage(AdjustIndexCoverage {
+                uuid,
+                add_fragments: vec![Ref::Committed(1)],
+                remove_fragments: vec![0],
+            })],
+        )
+        .await;
+
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![1]);
     }
 }
