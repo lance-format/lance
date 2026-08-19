@@ -33,6 +33,8 @@ pub enum Coordinate {
     FragmentExistence(u64),
     /// A committed fragment's deletion file.
     FragmentDeletions(u64),
+    /// A committed fragment's per-row version sequences.
+    FragmentRowVersions(u64),
     /// The data backing one field within one committed fragment.
     FieldData { fragment: u64, field: i32 },
     /// A field's definition in the schema.
@@ -64,7 +66,9 @@ impl Coordinate {
     /// The fragment this coordinate lives in, if it is fragment-scoped.
     fn fragment(&self) -> Option<u64> {
         match self {
-            Self::FragmentExistence(id) | Self::FragmentDeletions(id) => Some(*id),
+            Self::FragmentExistence(id)
+            | Self::FragmentDeletions(id)
+            | Self::FragmentRowVersions(id) => Some(*id),
             Self::FieldData { fragment, .. } => Some(*fragment),
             Self::FieldDefinition(_)
             | Self::BaseName(_)
@@ -87,6 +91,7 @@ impl Coordinate {
             } => Some(*id),
             Self::FragmentExistence(_)
             | Self::FragmentDeletions(_)
+            | Self::FragmentRowVersions(_)
             | Self::BaseName(_)
             | Self::BaseLocation(_)
             | Self::ConfigEntry { .. }
