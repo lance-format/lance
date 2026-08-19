@@ -84,6 +84,7 @@ mod tests {
     use crate::transaction::action::test_support::{apply, backed_manifest};
     use crate::transaction::action::{Action, CompositeOperation, UserAction};
     use crate::transaction::test_support::make_stable_row_id_manifest;
+    use lance_file::version::ConcreteFileVersion;
     use std::sync::Arc;
 
     fn refresh(fragment_ids: Vec<u64>) -> Action {
@@ -100,14 +101,13 @@ mod tests {
                 "data.lance",
                 vec![0],
                 vec![0],
-                2,
-                0,
+                ConcreteFileVersion::V2_0,
                 None,
                 None,
             )],
             overlays: vec![],
             deletion_file: None,
-            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids))),
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids).into())),
             physical_rows: Some(rows),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
