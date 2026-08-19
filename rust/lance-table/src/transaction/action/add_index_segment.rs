@@ -4,8 +4,9 @@
 //! Add an index segment.
 
 use super::apply::ApplyState;
+use super::footprint::IndexIdentity;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
-use super::{Coordinate, Footprint, Ref};
+use super::{Footprint, Ref};
 use crate::format::{IndexFile, IndexMetadata, pb};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
@@ -97,7 +98,9 @@ impl AddIndexSegment {
         };
         if version > read_version {
             return Err(Error::invalid_input(format!(
-                "AddIndexSegment for index '{}' reflects dataset version {version}, which is newer                  than the version {read_version} this operation reads; a segment cannot reflect                  data it could not have seen",
+                "AddIndexSegment for index '{}' reflects dataset version {version}, which is \
+                 newer than the version {read_version} this operation reads; a segment cannot \
+                 reflect data it could not have seen",
                 self.name
             )));
         }
@@ -128,14 +131,25 @@ impl AddIndexSegment {
         self.data_change
     }
 
-    /// The logical index, by name. Two writers may add segments to *different*
-    /// indices at once, and may extend one index concurrently with any change to
-    /// the data it covers -- an index is derived state, and a segment that has
-    /// fallen behind is pruned rather than being wrong. What they may not do is
-    /// both build the same index, which would leave two segments each claiming
-    /// to cover the same fragments.
+    /// A claim on the logical index: this is what the index is, and these are
+    /// the fragments the new segment describes.
+    ///
+    /// An index is derived state whose segments the query path unions, so two
+    /// writers may extend the same index at once, and either may run alongside
+    /// any change to the data it covers -- a segment that has fallen behind is
+    /// pruned rather than being wrong. What they may not do is describe the same
+    /// fragment twice, which would double-count rows, or disagree about what the
+    /// index is.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.add(Coordinate::IndexName(self.name.clone()));
+        footprint.build_index(
+            self.name.clone(),
+            IndexIdentity {
+                fields: self.fields.clone(),
+                details: self.index_details.clone(),
+                index_version: self.index_version,
+            },
+            self.covered_fragments.clone(),
+        );
     }
 }
 
@@ -249,8 +263,11 @@ mod tests {
     use crate::transaction::action::test_support::{
         added_field, apply_with_indices, backed_manifest,
     };
-    use crate::transaction::action::{Action, AddField, AddFragment, DropField};
+    use crate::transaction::action::{
+        Action, AddField, AddFragment, CompositeOperation, DropField, Footprint, UserAction,
+    };
     use crate::transaction::test_support::sample_index_metadata;
+    use rstest::rstest;
 
     fn segment(name: &str, fields: Vec<Ref>) -> AddIndexSegment {
         AddIndexSegment {
@@ -477,22 +494,86 @@ mod tests {
         assert!(indices.is_empty());
     }
 
-    #[test]
-    fn test_two_writers_building_the_same_index_conflict() {
-        use crate::transaction::action::{CompositeOperation, Footprint, UserAction};
+    fn index_footprint(action: AddIndexSegment) -> Footprint {
+        Footprint::from(&CompositeOperation::new(vec![UserAction::new(
+            "step",
+            vec![Action::AddIndexSegment(action)],
+        )]))
+    }
 
-        let footprint = |action: AddIndexSegment| {
-            Footprint::from(&CompositeOperation::new(vec![UserAction::new(
-                "step",
-                vec![Action::AddIndexSegment(action)],
-            )]))
+    fn covering(name: &str, fragments: Option<Vec<u64>>) -> AddIndexSegment {
+        AddIndexSegment {
+            covered_fragments: fragments
+                .map(|ids| ids.into_iter().map(Ref::Committed).collect::<Vec<_>>()),
+            ..segment(name, vec![Ref::Committed(0)])
+        }
+    }
+
+    #[rstest]
+    #[case::disjoint_coverage_of_one_index(
+        covering("by_a", Some(vec![0, 1])),
+        covering("by_a", Some(vec![2, 3])),
+        false,
+    )]
+    #[case::overlapping_coverage_of_one_index(
+        covering("by_a", Some(vec![0, 1])),
+        covering("by_a", Some(vec![1, 2])),
+        true,
+    )]
+    #[case::different_indices(
+        covering("by_a", Some(vec![0, 1])),
+        covering("by_b", Some(vec![0, 1])),
+        false,
+    )]
+    #[case::unstated_coverage_reaches_everywhere(
+        covering("by_a", None),
+        covering("by_a", Some(vec![7])),
+        true,
+    )]
+    #[case::two_segments_of_unstated_coverage(covering("by_a", None), covering("by_a", None), true)]
+    #[case::disagreeing_about_which_fields_the_index_is_over(
+        AddIndexSegment { fields: vec![Ref::Committed(1)], ..covering("by_a", Some(vec![0])) },
+        covering("by_a", Some(vec![2])),
+        true,
+    )]
+    #[case::disagreeing_about_the_index_config(
+        AddIndexSegment {
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/lance.index.pb.VectorIndexDetails".into(),
+                value: vec![1, 2, 3],
+            })),
+            ..covering("by_a", Some(vec![0]))
+        },
+        covering("by_a", Some(vec![2])),
+        true,
+    )]
+    #[case::disagreeing_about_the_index_version(
+        AddIndexSegment { index_version: 2, ..covering("by_a", Some(vec![0])) },
+        covering("by_a", Some(vec![2])),
+        true,
+    )]
+    fn test_two_writers_extending_one_index(
+        #[case] ours: AddIndexSegment,
+        #[case] theirs: AddIndexSegment,
+        #[case] expected: bool,
+    ) {
+        let ours = index_footprint(ours);
+        let theirs = index_footprint(theirs);
+        assert_eq!(ours.conflicts_with(&theirs), expected);
+        assert_eq!(theirs.conflicts_with(&ours), expected);
+    }
+
+    #[test]
+    fn test_two_writers_indexing_what_they_each_just_wrote_do_not_conflict() {
+        // Neither segment names a committed fragment, and the fragments they do
+        // name get distinct ids once both commits are ordered.
+        let local = AddIndexSegment {
+            covered_fragments: Some(vec![Ref::Local(0)]),
+            ..segment("by_a", vec![Ref::Committed(0)])
         };
 
-        let ours = footprint(segment("by_a", vec![Ref::Committed(0)]));
-        let same_name = footprint(segment("by_a", vec![Ref::Committed(0)]));
-        let other_name = footprint(segment("by_b", vec![Ref::Committed(1)]));
-
-        assert!(ours.conflicts_with(&same_name));
-        assert!(!ours.conflicts_with(&other_name));
+        let ours = index_footprint(local.clone());
+        let theirs = index_footprint(local);
+        assert!(!ours.conflicts_with(&theirs));
     }
 }
