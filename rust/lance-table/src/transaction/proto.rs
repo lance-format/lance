@@ -1000,27 +1000,21 @@ mod tests {
     }
 
     #[test]
-    fn test_unimplemented_action_fails_closed_on_load() {
-        // The vocabulary is larger than what is implemented. Loading a
-        // transaction that uses an unimplemented action must fail rather than
-        // parse leniently: load_and_sort_new_transactions collects concurrent
-        // transactions with try_collect, so this aborts an in-flight commit
-        // instead of letting it proceed against a change it cannot see.
+    fn test_unrecognized_action_fails_closed_on_load() {
+        // An action a newer Lance wrote decodes to no known variant, because
+        // protobuf drops the field this build does not know. Loading it must
+        // fail rather than parse leniently: load_and_sort_new_transactions
+        // collects concurrent transactions with try_collect, so this aborts an
+        // in-flight commit instead of letting it proceed against a change it
+        // cannot see.
         let message = pb::Transaction {
             read_version: 1,
             uuid: Uuid::new_v4().to_string(),
             operation: Some(pb::transaction::Operation::CompositeOperation(
                 pb_actions::CompositeOperation {
                     steps: vec![pb_actions::UserStep {
-                        description: "assert unique keys".to_string(),
-                        actions: vec![pb_actions::Action {
-                            action: Some(pb_actions::action::Action::AssertUniqueKeys(
-                                pb_actions::AssertUniqueKeys {
-                                    key_fields: vec![],
-                                    filter: None,
-                                },
-                            )),
-                        }],
+                        description: "something from the future".to_string(),
+                        actions: vec![pb_actions::Action { action: None }],
                     }],
                 },
             )),
