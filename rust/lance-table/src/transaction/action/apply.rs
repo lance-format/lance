@@ -17,6 +17,7 @@
 use super::{CompositeOperation, Ref};
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig};
 use crate::rowids::version::build_version_meta;
+use crate::system_index::mem_wal::{CompactedSsTable, update_mem_wal_index_compacted_sstables};
 use crate::transaction::Transaction;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
@@ -219,6 +220,14 @@ impl<'a> ApplyState<'a> {
         self.current_manifest.version
     }
 
+    /// The version this delta produces, for the actions that stamp it into what
+    /// they write. Distinct from [`Self::read_version`]: a retry against a newer
+    /// manifest re-runs the apply, so anything stamped with this is re-stamped
+    /// rather than carried over.
+    pub(super) fn new_version(&self) -> u64 {
+        self.current_manifest.version + 1
+    }
+
     /// Add an index segment. A segment's uuid identifies it, so re-adding one
     /// that is already there is a mistake rather than a replacement -- swapping
     /// a segment out is a [`RemoveIndexSegment`](super::RemoveIndexSegment)
@@ -245,6 +254,16 @@ impl<'a> ApplyState<'a> {
         };
         self.indices.remove(position);
         Ok(())
+    }
+
+    /// Record MemWAL SSTable compaction progress, creating the MemWAL index
+    /// when the dataset does not have one yet.
+    pub(super) fn update_compacted_sstables(
+        &mut self,
+        compacted_sstables: Vec<CompactedSsTable>,
+    ) -> Result<()> {
+        let new_version = self.new_version();
+        update_mem_wal_index_compacted_sstables(&mut self.indices, new_version, compacted_sstables)
     }
 
     /// Where the segment `uuid` lives, checking on the way that it really
@@ -275,6 +294,12 @@ impl<'a> ApplyState<'a> {
             )));
         };
         Ok(&mut self.indices[position])
+    }
+
+    /// Whether the dataset carries stable row ids, and with them the per-row
+    /// version sequences.
+    pub(super) fn uses_stable_row_ids(&self) -> bool {
+        self.current_manifest.uses_stable_row_ids()
     }
 
     pub(super) fn schema(&self) -> &Schema {
