@@ -21,6 +21,7 @@ use crate::transaction::Transaction;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
 
 /// The field id written into a data file's field list once the file no longer
 /// backs that field. A file whose every slot is tombstoned is dropped.
@@ -52,12 +53,12 @@ impl Transaction {
             ));
         }
 
-        let mut state = ApplyState::new(current_manifest);
+        let mut state = ApplyState::new(current_manifest, current_indices, config);
         for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
         }
 
-        state.into_manifest(self, current_indices, transaction_file_path, config)
+        state.into_manifest(self, transaction_file_path)
     }
 }
 
@@ -66,12 +67,18 @@ impl Transaction {
 pub(super) struct ApplyState<'a> {
     /// The read version this delta applies to.
     current_manifest: &'a Manifest,
+    /// How the manifest this delta produces is to be assembled.
+    build_config: &'a ManifestBuildConfig,
     schema: Schema,
     fragments: Vec<Fragment>,
     /// Base paths minted by this operation. Kept apart from the manifest's own
     /// base paths, which the manifest assembly inherits from the read version.
     new_bases: Vec<BasePath>,
     existing_base_paths: HashMap<u32, BasePath>,
+    /// The index segments, as the actions have left them so far. Index
+    /// actions edit this list; the assembly then prunes whatever the data
+    /// actions invalidated.
+    indices: Vec<IndexMetadata>,
     /// The manifest's string maps. Unlike the schema and the fragment list,
     /// these are inherited wholesale by the manifest assembly, so an edit has
     /// to be written back over the assembled manifest.
@@ -98,18 +105,20 @@ pub(super) struct ApplyState<'a> {
     /// Fields whose backing data changed, per fragment. An index covering such
     /// a field no longer describes that fragment's contents.
     rebound_fields: HashMap<u64, HashSet<i32>>,
-
-    /// Whether the table was reset, which discards every index outright rather
-    /// than pruning fragments out of them.
-    reset: bool,
 }
 
 impl<'a> ApplyState<'a> {
-    fn new(manifest: &'a Manifest) -> Self {
+    fn new(
+        manifest: &'a Manifest,
+        indices: Vec<IndexMetadata>,
+        build_config: &'a ManifestBuildConfig,
+    ) -> Self {
         Self {
             current_manifest: manifest,
+            build_config,
             schema: manifest.schema.clone(),
             fragments: manifest.fragments.as_ref().clone(),
+            indices,
             new_bases: Vec::new(),
             existing_base_paths: manifest.base_paths.clone(),
             config: manifest.config.clone(),
@@ -128,7 +137,6 @@ impl<'a> ApplyState<'a> {
             minted_fragments: HashSet::new(),
             reserved_fragment_ids: None,
             rebound_fields: HashMap::new(),
-            reset: false,
         }
     }
 
@@ -136,11 +144,10 @@ impl<'a> ApplyState<'a> {
     fn into_manifest(
         mut self,
         transaction: &Transaction,
-        current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
-        config: &ManifestBuildConfig,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let current_manifest = self.current_manifest;
+        let config = self.build_config;
         let new_version = current_manifest.version + 1;
 
         let mut next_row_id = current_manifest
@@ -151,19 +158,15 @@ impl<'a> ApplyState<'a> {
         let ApplyState {
             schema,
             mut fragments,
+            mut indices,
             new_bases,
             rebound_fields,
             reserved_fragment_ids,
-            reset,
             config: dataset_config,
             table_metadata,
             ..
         } = self;
 
-        let mut indices = current_indices;
-        if reset {
-            indices.clear();
-        }
         prune_rebound_fields_from_indices(&mut indices, &rebound_fields);
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
@@ -208,6 +211,70 @@ impl<'a> ApplyState<'a> {
         }
 
         Ok((manifest, indices))
+    }
+
+    /// The version this delta applies to, which is the newest data an index
+    /// segment added by this operation can have been built from.
+    pub(super) fn read_version(&self) -> u64 {
+        self.current_manifest.version
+    }
+
+    /// Add an index segment. A segment's uuid identifies it, so re-adding one
+    /// that is already there is a mistake rather than a replacement -- swapping
+    /// a segment out is a [`RemoveIndexSegment`](super::RemoveIndexSegment)
+    /// followed by an add.
+    pub(super) fn add_index_segment(&mut self, segment: IndexMetadata) -> Result<()> {
+        if self.indices.iter().any(|index| index.uuid == segment.uuid) {
+            return Err(Error::invalid_input(format!(
+                "index segment {} is already part of the dataset; a segment is added once",
+                segment.uuid
+            )));
+        }
+        self.indices.push(segment);
+        Ok(())
+    }
+
+    /// Drop an index segment by uuid. A removal that names a segment the
+    /// dataset does not have is a mistake rather than a no-op: it means the
+    /// operation was planned against a different set of segments.
+    pub(super) fn remove_index_segment(&mut self, uuid: Uuid, name: &str) -> Result<()> {
+        let Some(position) = self.index_segment_position(uuid, name)? else {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} is not part of the dataset, so it cannot be removed"
+            )));
+        };
+        self.indices.remove(position);
+        Ok(())
+    }
+
+    /// Where the segment `uuid` lives, checking on the way that it really
+    /// belongs to `name`. A mismatch means the operation was planned against a
+    /// different set of segments, the same way a missing segment does.
+    fn index_segment_position(&self, uuid: Uuid, name: &str) -> Result<Option<usize>> {
+        let Some(position) = self.indices.iter().position(|index| index.uuid == uuid) else {
+            return Ok(None);
+        };
+        let found = &self.indices[position].name;
+        if found != name {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} belongs to index '{found}', but the action names it as part \
+                 of index '{name}'"
+            )));
+        }
+        Ok(Some(position))
+    }
+
+    pub(super) fn index_segment_mut(
+        &mut self,
+        uuid: Uuid,
+        name: &str,
+    ) -> Result<&mut IndexMetadata> {
+        let Some(position) = self.index_segment_position(uuid, name)? else {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} is not part of the dataset, so it cannot be adjusted"
+            )));
+        };
+        Ok(&mut self.indices[position])
     }
 
     pub(super) fn schema(&self) -> &Schema {
@@ -265,9 +332,9 @@ impl<'a> ApplyState<'a> {
         self.schema.fields.clear();
         self.schema.metadata.clear();
         self.fragments.clear();
+        self.indices.clear();
         self.minted_fragments.clear();
         self.rebound_fields.clear();
-        self.reset = true;
     }
 
     /// The base paths this apply can see: the read version's, plus the ones
@@ -332,6 +399,19 @@ impl<'a> ApplyState<'a> {
                 .get(&token)
                 .copied()
                 .ok_or_else(|| unbound_token_err("fragment", token)),
+        }
+    }
+
+    pub(super) fn resolve_base(&self, reference: Ref) -> Result<u32> {
+        match reference {
+            Ref::Committed(id) => u32::try_from(id).map_err(|_| {
+                Error::invalid_input(format!("base id {id} in an action is out of range"))
+            }),
+            Ref::Local(token) => self
+                .base_tokens
+                .get(&token)
+                .copied()
+                .ok_or_else(|| unbound_token_err("base", token)),
         }
     }
 
