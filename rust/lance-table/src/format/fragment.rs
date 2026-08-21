@@ -455,6 +455,22 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
     }
 }
 
+impl From<&DeletionFile> for pb::DeletionFile {
+    fn from(value: &DeletionFile) -> Self {
+        let file_type = match value.file_type {
+            DeletionFileType::Array => pb::deletion_file::DeletionFileType::ArrowArray,
+            DeletionFileType::Bitmap => pb::deletion_file::DeletionFileType::Bitmap,
+        };
+        Self {
+            read_version: value.read_version,
+            id: value.id,
+            file_type: file_type.into(),
+            num_deleted_rows: value.num_deleted_rows.unwrap_or_default() as u64,
+            base_id: value.base_id,
+        }
+    }
+}
+
 /// Data fragment.
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
@@ -716,19 +732,7 @@ impl TryFrom<pb::DataFragment> for Fragment {
 
 impl From<&Fragment> for pb::DataFragment {
     fn from(f: &Fragment) -> Self {
-        let deletion_file = f.deletion_file.as_ref().map(|f| {
-            let file_type = match f.file_type {
-                DeletionFileType::Array => pb::deletion_file::DeletionFileType::ArrowArray,
-                DeletionFileType::Bitmap => pb::deletion_file::DeletionFileType::Bitmap,
-            };
-            pb::DeletionFile {
-                read_version: f.read_version,
-                id: f.id,
-                file_type: file_type.into(),
-                num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
-                base_id: f.base_id,
-            }
-        });
+        let deletion_file = f.deletion_file.as_ref().map(pb::DeletionFile::from);
 
         let row_id_sequence = f.row_id_meta.as_ref().map(|m| match m {
             RowIdMeta::Inline(data) => {

@@ -863,6 +863,8 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
+            (Self::CompositeOperation(a), Self::CompositeOperation(b)) => a == b,
+            (Self::CompositeOperation(_), _) | (_, Self::CompositeOperation(_)) => false,
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
         }
     }
