@@ -5,6 +5,8 @@ syntax = "proto3";
 
 import "file.proto";
 import "table.proto";
+import "transaction/actions.proto";
+import "transaction/common.proto";
 import "google/protobuf/any.proto";
 
 package lance.table;
@@ -199,46 +201,6 @@ message Transaction {
     optional string branch_name = 5;
   }
   
-  // Exact set of key hashes for conflict detection.
-  // Used when the number of inserted rows is small.
-  message ExactKeySetFilter {
-    // 64-bit hashes of the inserted row keys.
-    repeated uint64 key_hashes = 1;
-  }
-
-  // Bloom filter for key existence tests.
-  // Used when the number of rows is large.
-  message BloomFilter {
-    // Bitset backing the bloom filter (SBBF format).
-    bytes bitmap = 1;
-    // Number of bits in the bitmap.
-    uint32 num_bits = 2;
-    // Number of items the filter was sized for.
-    // Used for intersection validation (filters with different sizes cannot be compared).
-    // Default: 8192
-    uint64 number_of_items = 3;
-    // False positive probability the filter was sized for.
-    // Used for intersection validation (filters with different parameters cannot be compared).
-    // Default: 0.00057
-    double probability = 4;
-  }
-
-  // A filter for checking key existence in set of rows inserted by a merge insert operation.
-  // Only created when the merge insert's ON columns match the schema's unenforced primary key.
-  // The presence of this filter indicates strict primary key conflict detection should be used.
-  // Can use either an exact set (for small row counts) or a Bloom filter (for large row counts).
-  message KeyExistenceFilter {
-    // Field IDs of columns participating in the key (must match unenforced primary key).
-    repeated int32 field_ids = 1;
-    // The underlying data structure storing the key hashes.
-    oneof data {
-      // Exact set of key hashes (used for small number of rows).
-      ExactKeySetFilter exact = 2;
-      // Bloom filter (used for large number of rows).
-      BloomFilter bloom = 3;
-    }
-  }
-
   // Serialized as sorted distinct local physical row offsets within the fragment (0-based).
   message UInt32List {
     repeated uint32 values = 1;
@@ -288,21 +250,6 @@ message Transaction {
     REWRITE_COLUMNS = 1;
   }
 
-  // An entry for a map update. If value is not set, the key will be removed from the map.
-  message UpdateMapEntry {
-    // The key of the map entry to update.
-    string key = 1;
-    // The value to set for the key.
-    optional string value = 2;
-  }
-
-  message UpdateMap {
-    repeated UpdateMapEntry update_entries = 1;
-    // If true, the map will be replaced entirely with the new entries.
-    // If false, the new entries will be merged with the existing map.
-    bool replace = 2;
-  }
-  
   // An operation that updates the table config, table metadata, schema metadata,
   // or field metadata.
   message UpdateConfig {
@@ -394,6 +341,9 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
+    // Action-based transaction (Transaction V2). See actions.proto.
+    // DRAFT: currently rejected on load; no write path.
+    CompositeOperation composite_operation = 116;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.
