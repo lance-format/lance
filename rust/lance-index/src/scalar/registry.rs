@@ -4,6 +4,7 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
@@ -11,7 +12,7 @@ use futures::future::BoxFuture;
 use lance_core::{
     Result,
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey},
-    deepsize::DeepSizeOf,
+    deepsize::{Context, DeepSizeOf},
 };
 
 use crate::progress::IndexBuildProgress;
@@ -184,9 +185,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         let Some(entry) = cache.get_unsized_with_key(&ScalarIndexCacheKey).await else {
             return Ok(None);
         };
-        Ok(index_store
-            .is_same_storage_binding(entry.index_store.as_ref())
-            .then(|| entry.index.clone()))
+        Ok(entry.index_for_store(&index_store))
     }
 
     /// Store a freshly-opened index in the cache.
@@ -372,8 +371,15 @@ pub(crate) async fn single_flight_store_bound_open(
         })
         .await?;
 
-    if index_store.is_same_storage_binding(entry.index_store.as_ref()) {
-        return Ok(entry.index());
+    if let Some(index) = entry.index_for_store(&index_store) {
+        return Ok(index);
+    }
+
+    // The cache slot stays stable across rotations. Serialize replacements and
+    // recheck after locking so same-binding waiters reuse the first reload.
+    let _replacement_guard = entry.replacement_guard.lock().await;
+    if let Some(index) = entry.index_for_store(&index_store) {
+        return Ok(index);
     }
 
     let Some(load) = take_scalar_index_load(&pending_load)? else {
@@ -383,15 +389,7 @@ pub(crate) async fn single_flight_store_bound_open(
         return Ok(entry.index());
     };
     let index = load.await?;
-    cache
-        .insert_unsized_with_key(
-            &ScalarIndexCacheKey,
-            Arc::new(StoreBoundScalarIndexCacheEntry::new(
-                index_store,
-                index.clone(),
-            )),
-        )
-        .await;
+    entry.replace(index_store, index.clone());
     Ok(index)
 }
 
@@ -408,19 +406,48 @@ fn take_scalar_index_load<'a>(
 
 /// A live scalar index together with the store binding used to open it.
 #[derive(DeepSizeOf)]
-pub struct StoreBoundScalarIndexCacheEntry {
+struct StoreBoundScalarIndexBinding {
     index_store: Arc<dyn IndexStore>,
     index: Arc<dyn ScalarIndex>,
 }
 
+/// A stable cache slot for one live, store-bound scalar index.
+pub struct StoreBoundScalarIndexCacheEntry {
+    binding: ArcSwap<StoreBoundScalarIndexBinding>,
+    replacement_guard: tokio::sync::Mutex<()>,
+}
+
+impl DeepSizeOf for StoreBoundScalarIndexCacheEntry {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.binding.load_full().deep_size_of_children(context)
+    }
+}
+
 impl StoreBoundScalarIndexCacheEntry {
     fn new(index_store: Arc<dyn IndexStore>, index: Arc<dyn ScalarIndex>) -> Self {
-        Self { index_store, index }
+        Self {
+            binding: ArcSwap::from_pointee(StoreBoundScalarIndexBinding { index_store, index }),
+            replacement_guard: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    fn index_for_store(&self, index_store: &Arc<dyn IndexStore>) -> Option<Arc<dyn ScalarIndex>> {
+        let binding = self.binding.load();
+        index_store
+            .is_same_storage_binding(binding.index_store.as_ref())
+            .then(|| binding.index.clone())
+    }
+
+    fn replace(&self, index_store: Arc<dyn IndexStore>, index: Arc<dyn ScalarIndex>) {
+        self.binding.store(Arc::new(StoreBoundScalarIndexBinding {
+            index_store,
+            index,
+        }));
     }
 
     /// Return a shared handle to the cached scalar index.
     pub fn index(&self) -> Arc<dyn ScalarIndex> {
-        self.index.clone()
+        self.binding.load().index.clone()
     }
 }
 

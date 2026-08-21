@@ -3547,11 +3547,12 @@ mod tests {
         FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema};
-    use futures::stream::TryStreamExt;
+    use futures::{future::try_join_all, stream::TryStreamExt};
     use lance_arrow::*;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
+    use lance_index::metrics::LocalMetricsCollector;
     use lance_index::pbold::{BTreeIndexDetails, InvertedIndexDetails};
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
@@ -3577,7 +3578,10 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
     use object_store::ObjectStoreExt;
     use rstest::rstest;
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::atomic::Ordering,
+    };
 
     async fn write_vector_segment_metadata(
         dataset: &Dataset,
@@ -3758,6 +3762,20 @@ mod tests {
                 .iter()
                 .any(|request| request.path.as_ref().contains(&index_path_fragment)),
             "the same store binding should reuse the live scalar index: {warm_store_stats:#?}"
+        );
+
+        let rotation_metrics = LocalMetricsCollector::default();
+        let opened = try_join_all(
+            (0..8)
+                .map(|_| dataset_b.open_scalar_index("text", &index_meta.uuid, &rotation_metrics)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened.len(), 8);
+        assert_eq!(
+            rotation_metrics.index_loads.load(Ordering::Relaxed),
+            1,
+            "concurrent opens after rotation should coalesce onto one store-B load"
         );
 
         assert_eq!(search_ids(&dataset_b, "beta").await, vec![1, 4, 7]);
