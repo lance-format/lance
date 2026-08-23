@@ -3,7 +3,8 @@
 
 use super::DocumentGranularity;
 use super::query::{
-    BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
+    BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur,
+    Operator, PhraseQuery,
 };
 use lance_core::{Error, Result};
 use serde_json::Value;
@@ -128,6 +129,54 @@ impl JsonParser for MultiMatchQuery {
     }
 }
 
+impl JsonParser for CombinedFieldsQuery {
+    fn from_json(value: &Value) -> Result<Self> {
+        let terms = value["query"]
+            .as_str()
+            .ok_or_else(|| Error::invalid_input("missing query in combined_fields query"))?
+            .to_string();
+        let columns = value["columns"]
+            .as_array()
+            .ok_or_else(|| Error::invalid_input("missing columns in combined_fields query"))?
+            .iter()
+            .map(|v| {
+                v.as_str().map(String::from).ok_or_else(|| {
+                    Error::invalid_input(
+                        "columns must be an array of strings in combined_fields query",
+                    )
+                })
+            })
+            .collect::<Result<Vec<String>>>()?;
+
+        let query = Self::try_new(terms, columns)?;
+
+        let query = match value.get("boost") {
+            Some(Value::Array(boosts)) => {
+                let boosts = boosts
+                    .iter()
+                    .map(|v| {
+                        v.as_f64().map(|f| f as f32).ok_or_else(|| {
+                            Error::invalid_input(
+                                "boost must be an array of numbers in combined_fields query",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<f32>>>()?;
+                query.try_with_boosts(boosts)?
+            }
+            _ => query,
+        };
+
+        let operator = value["operator"]
+            .as_str()
+            .map(Operator::try_from)
+            .transpose()?
+            .unwrap_or_default();
+
+        Ok(query.with_operator(operator))
+    }
+}
+
 impl JsonParser for BooleanQuery {
     fn from_json(value: &Value) -> Result<Self> {
         let mut clauses = Vec::new();
@@ -171,6 +220,9 @@ fn from_json_value(value: &Value) -> Result<FtsQuery> {
         "phrase" => Ok(FtsQuery::Phrase(PhraseQuery::from_json(query_val)?)),
         "boost" => Ok(FtsQuery::Boost(BoostQuery::from_json(query_val)?)),
         "multi_match" => Ok(FtsQuery::MultiMatch(MultiMatchQuery::from_json(query_val)?)),
+        "combined_fields" => Ok(FtsQuery::CombinedFields(CombinedFieldsQuery::from_json(
+            query_val,
+        )?)),
         "boolean" => Ok(FtsQuery::Boolean(BooleanQuery::from_json(query_val)?)),
         _ => Err(Error::invalid_input(format!(
             "unknown fts query type: {}",
@@ -343,5 +395,55 @@ mod tests {
             (Occur::Should, should_query),
         ]));
         assert_eq!(fts_query, expected_query);
+    }
+
+    #[test]
+    fn test_from_json_combined_fields() {
+        let json = r#"
+        {
+            "combined_fields": {
+                "query": "hello world",
+                "columns": ["title", "body"],
+                "boost": [2.0, 1.0],
+                "operator": "and"
+            }
+        }"#;
+        let fts_query = from_json(json).unwrap();
+        let expected = CombinedFieldsQuery::try_new(
+            "hello world".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap()
+        .try_with_boosts(vec![2.0, 1.0])
+        .unwrap()
+        .with_operator(Operator::And);
+        assert_eq!(fts_query, FtsQuery::CombinedFields(expected));
+    }
+
+    #[test]
+    fn test_from_json_combined_fields_defaults_and_validation() {
+        // boost + operator omitted: weights default to 1.0, operator to Or.
+        let json = r#"{ "combined_fields": { "query": "hi", "columns": ["a", "b"] } }"#;
+        let FtsQuery::CombinedFields(query) = from_json(json).unwrap() else {
+            panic!("expected combined_fields query");
+        };
+        assert_eq!(
+            query.weighted_columns().collect::<Vec<_>>(),
+            vec![("a", 1.0), ("b", 1.0)]
+        );
+        assert_eq!(query.operator(), Operator::Or);
+
+        // A weight below 1 is rejected.
+        let json = r#"{ "combined_fields": { "query": "hi", "columns": ["a", "b"], "boost": [0.5, 1.0] } }"#;
+        assert!(from_json(json).is_err());
+
+        // So is a weight above the upper bound that keeps the blended length
+        // finite.
+        let json = r#"{ "combined_fields": { "query": "hi", "columns": ["a", "b"], "boost": [1.0, 1e30] } }"#;
+        assert!(from_json(json).is_err());
+
+        // Empty columns are rejected.
+        let json = r#"{ "combined_fields": { "query": "hi", "columns": [] } }"#;
+        assert!(from_json(json).is_err());
     }
 }

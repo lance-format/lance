@@ -10,6 +10,7 @@ use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
+use roaring::RoaringBitmap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -46,15 +47,12 @@ pub enum PreFilterSource {
     None,
 }
 
-pub(crate) fn build_prefilter(
+fn prefilter_loader(
     context: Arc<datafusion::execution::TaskContext>,
     partition: usize,
     prefilter_source: &PreFilterSource,
-    ds: Arc<Dataset>,
-    index_meta: &[IndexMetadata],
-    overlay_block: Option<RowAddrMask>,
-) -> Result<Arc<DatasetPreFilter>> {
-    let prefilter_loader = match &prefilter_source {
+) -> Result<Option<Box<dyn FilterLoader>>> {
+    Ok(match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
             let stream = src_node.execute(partition, context)?;
             Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
@@ -64,12 +62,39 @@ pub(crate) fn build_prefilter(
             Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
         }
         PreFilterSource::None => None,
-    };
-    let mut prefilter = DatasetPreFilter::new(ds, index_meta, prefilter_loader);
+    })
+}
+
+pub(crate) fn build_prefilter(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    index_meta: &[IndexMetadata],
+    overlay_block: Option<RowAddrMask>,
+) -> Result<Arc<DatasetPreFilter>> {
+    let loader = prefilter_loader(context, partition, prefilter_source)?;
+    let mut prefilter = DatasetPreFilter::new(ds, index_meta, loader);
     if let Some(overlay_block) = overlay_block {
         prefilter = prefilter.with_overlay_block(overlay_block);
     }
     Ok(Arc::new(prefilter))
+}
+
+/// Build a prefilter restricted to `fragments` rather than to the union of
+/// `index_meta`'s fragment bitmaps. See
+/// [`DatasetPreFilter::new_restricted_to_fragments`].
+pub(crate) fn build_prefilter_restricted_to_fragments(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    fragments: RoaringBitmap,
+) -> Result<Arc<DatasetPreFilter>> {
+    let loader = prefilter_loader(context, partition, prefilter_source)?;
+    Ok(Arc::new(DatasetPreFilter::new_restricted_to_fragments(
+        ds, fragments, loader,
+    )))
 }
 
 // Utility to convert an input (containing row ids) into a prefilter

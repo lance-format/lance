@@ -94,6 +94,9 @@ jieba-rs = ["tokenizer-jieba"]
 lindera = ["tokenizer-lindera"]
 tokenizer-lindera = ["lance-tokenizer/tokenizer-lindera"]
 tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
+# Exposes `scalar::inverted::oracle`, the brute-force scoring reference, to
+# downstream test and bench targets. Enable it as a dev-dependency feature only.
+test-oracle = []
 
 [build-dependencies]
 prost-build.workspace = true

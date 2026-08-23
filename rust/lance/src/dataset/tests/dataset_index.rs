@@ -69,7 +69,7 @@ use datafusion::common::{assert_contains, assert_not_contains};
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::json::ARROW_JSON_EXT_NAME;
-use lance_index::scalar::inverted::query::{FtsQuery, MultiMatchQuery};
+use lance_index::scalar::inverted::query::{CombinedFieldsQuery, FtsQuery, MultiMatchQuery};
 use lance_testing::datagen::generate_random_array;
 use rand::Rng;
 use rstest::rstest;
@@ -1291,8 +1291,69 @@ async fn create_fragmented_fts_index_with_groups(
     assert_eq!(segments.len(), expected_segments);
 }
 
+/// Three fragments over two indexed text columns, each column indexed as one
+/// segment per fragment.
+///
+/// Rows 3 and 4 carry the same text in both columns, so any query that scores
+/// them symmetrically produces an exact score tie and exposes tie ordering.
+async fn compound_fts_dataset() -> Dataset {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "common",
+                "common filler filler filler filler filler filler filler",
+                "irrelevant",
+                "common tie",
+                "common tie",
+                "irrelevant"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            [
+                "penalty",
+                "special",
+                "common",
+                "neutral",
+                "neutral",
+                "common filler filler filler penalty"
+            ]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    create_fragmented_fts_index(&mut dataset, "title", false).await;
+    create_fragmented_fts_index(&mut dataset, "body", false).await;
+    dataset
+}
+
 fn compound_multimatch_query() -> FtsQuery {
     MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![10.0, 1.0])
+    .unwrap()
+    .into()
+}
+
+fn compound_combined_fields_query() -> FtsQuery {
+    CombinedFieldsQuery::try_new(
         "common".to_owned(),
         vec!["title".to_owned(), "body".to_owned()],
     )
@@ -1452,6 +1513,12 @@ fn independent_compound_fts_oracle<'a>(
                     }
                 }
                 result
+            }
+            // This oracle scores each leaf against its own column's statistics,
+            // which is exactly what BM25F does not do. combined_fields never
+            // reaches the cross-column compound path.
+            FtsQuery::CombinedFields(_) => {
+                unreachable!("combined_fields is not a cross-column compound leaf")
             }
         }
     })
@@ -2145,47 +2212,7 @@ async fn test_boolean_must_scores_sum_across_execution_paths() {
 
 #[tokio::test]
 async fn test_nested_multimatch_limit_propagation() {
-    let batch = arrow_array::record_batch!(
-        (
-            "title",
-            Utf8,
-            [
-                "common",
-                "common filler filler filler filler filler filler filler",
-                "irrelevant",
-                "common tie",
-                "common tie",
-                "irrelevant"
-            ]
-        ),
-        (
-            "body",
-            Utf8,
-            [
-                "penalty",
-                "special",
-                "common",
-                "neutral",
-                "neutral",
-                "common filler filler filler penalty"
-            ]
-        )
-    )
-    .unwrap();
-    let schema = batch.schema();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
-        "memory://",
-        Some(WriteParams {
-            max_rows_per_file: 2,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(dataset.get_fragments().len(), 3);
-    create_fragmented_fts_index(&mut dataset, "title", false).await;
-    create_fragmented_fts_index(&mut dataset, "body", false).await;
+    let dataset = compound_fts_dataset().await;
 
     let must_query: FtsQuery = BooleanQuery::new([
         (Occur::Must, compound_multimatch_query()),
@@ -2289,6 +2316,54 @@ async fn test_nested_multimatch_limit_propagation() {
         1,
     )
     .await;
+}
+
+/// `combined_fields` is planned recursively like every other FTS node, so it owes
+/// a compound parent the same contract a nested `MultiMatch` does (see
+/// `test_nested_multimatch_limit_propagation`): `FtsSearchParams::limit` decides
+/// completeness, and the ambient scanner limit must not reach the child. A child
+/// that applied the scanner limit itself would drop candidates before the parent
+/// finished composing scores.
+#[tokio::test]
+async fn test_nested_combined_fields_limit_propagation() {
+    let dataset = compound_fts_dataset().await;
+
+    let must_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_combined_fields_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    let must_results = compound_fts_results(&dataset, must_query.clone(), None).await;
+    assert!(
+        must_results
+            .windows(2)
+            .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
+        "the exhaustive result should include a deterministic score tie"
+    );
+    assert_compound_fts_top_k(&dataset, must_query, 2).await;
+
+    let should_query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_combined_fields_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, should_query, 2).await;
+
+    let boost_query: FtsQuery = BoostQuery::new(
+        compound_combined_fields_query(),
+        compound_match_query("penalty", "body", 100.0),
+        Some(1.0),
+    )
+    .into();
+    assert_compound_fts_top_k(&dataset, boost_query, 2).await;
+
+    assert_compound_fts_top_k(&dataset, compound_combined_fields_query(), 1).await;
 }
 
 #[tokio::test]
@@ -2626,7 +2701,7 @@ async fn test_compound_tie_uses_resolved_row_id() {
     );
 }
 
-fn nested_fts_batch(
+pub(super) fn nested_fts_batch(
     ids: Vec<u64>,
     a_values: Vec<Option<&str>>,
     b_values: Vec<Option<&str>>,

@@ -73,7 +73,8 @@ use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
-    BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
+    BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator,
+    PhraseQuery,
 };
 use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
@@ -5324,6 +5325,31 @@ impl PyFullTextQuery {
         operator: &str,
     ) -> PyResult<Self> {
         let q = MultiMatchQuery::try_new(query, columns)
+            .map_err(|e| PyValueError::new_err(format!("Invalid query: {}", e)))?;
+        let q = if let Some(boosts) = boosts {
+            q.try_with_boosts(boosts)
+                .map_err(|e| PyValueError::new_err(format!("Invalid boosts: {}", e)))?
+        } else {
+            q
+        };
+
+        let op = Operator::try_from(operator)
+            .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?;
+
+        Ok(Self {
+            inner: q.with_operator(op).into(),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (query, columns, boosts=None, operator="OR"))]
+    fn combined_fields_query(
+        query: String,
+        columns: Vec<String>,
+        boosts: Option<Vec<f32>>,
+        operator: &str,
+    ) -> PyResult<Self> {
+        let q = CombinedFieldsQuery::try_new(query, columns)
             .map_err(|e| PyValueError::new_err(format!("Invalid query: {}", e)))?;
         let q = if let Some(boosts) = boosts {
             q.try_with_boosts(boosts)
