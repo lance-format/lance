@@ -27,7 +27,7 @@ use datafusion::physical_plan::{
 };
 use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt, TryStreamExt};
-use lance_core::error::{CloneableResult, Error};
+use lance_core::error::Error;
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
@@ -175,14 +175,16 @@ impl DisplayAs for ReplayExec {
 
 // There's some annoying adapter-work that needs to happen here.  In order
 // to share a stream we need its items to be Clone and DataFusionError is
-// not Clone.  So we wrap the stream in a CloneableResult.  However, in order
-// for that shared stream to be a SendableRecordBatchStream, it needs to be
-// using DataFusionError.  So we need to adapt the stream back to a
-// SendableRecordBatchStream.
+// not Clone.  So we wrap errors in Arc<DataFusionError> (which is Clone).
+// In order for that shared stream to be a SendableRecordBatchStream it must
+// use DataFusionError, so the adapter unwraps the Arc via DataFusionError::Shared,
+// which preserves the typed source chain for both consumers.
 pub struct ShareableRecordBatchStream(pub SendableRecordBatchStream);
 
+type SharedBatchResult = std::result::Result<RecordBatch, std::sync::Arc<DataFusionError>>;
+
 impl Stream for ShareableRecordBatchStream {
-    type Item = CloneableResult<RecordBatch>;
+    type Item = SharedBatchResult;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -191,28 +193,25 @@ impl Stream for ShareableRecordBatchStream {
         match self.0.poll_next_unpin(cx) {
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
             std::task::Poll::Ready(Some(res)) => {
-                std::task::Poll::Ready(Some(CloneableResult::from(res.map_err(Error::from))))
+                std::task::Poll::Ready(Some(res.map_err(std::sync::Arc::new)))
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
 
-pub struct ShareableRecordBatchStreamAdapter<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin>
-{
+pub struct ShareableRecordBatchStreamAdapter<S: Stream<Item = SharedBatchResult> + Unpin> {
     schema: SchemaRef,
     stream: S,
 }
 
-impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> ShareableRecordBatchStreamAdapter<S> {
+impl<S: Stream<Item = SharedBatchResult> + Unpin> ShareableRecordBatchStreamAdapter<S> {
     pub fn new(schema: SchemaRef, stream: S) -> Self {
         Self { schema, stream }
     }
 }
 
-impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> Stream
-    for ShareableRecordBatchStreamAdapter<S>
-{
+impl<S: Stream<Item = SharedBatchResult> + Unpin> Stream for ShareableRecordBatchStreamAdapter<S> {
     type Item = DataFusionResult<RecordBatch>;
 
     fn poll_next(
@@ -222,15 +221,14 @@ impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> Stream
         match self.stream.poll_next_unpin(cx) {
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
             std::task::Poll::Ready(Some(res)) => std::task::Poll::Ready(Some(
-                res.0
-                    .map_err(|e| DataFusionError::External(e.0.to_string().into())),
+                res.map_err(DataFusionError::Shared),
             )),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
 
-impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> RecordBatchStream
+impl<S: Stream<Item = SharedBatchResult> + Unpin> RecordBatchStream
     for ShareableRecordBatchStreamAdapter<S>
 {
     fn schema(&self) -> SchemaRef {
@@ -745,6 +743,63 @@ mod tests {
             // We don't test much here but shouldn't really need to.  The join and stream sharing
             // are tested on their own.  We just need to make sure they get hooked up correctly
             assert_eq!(batch.unwrap().num_columns(), 2);
+        }
+    }
+
+    /// Verify that a typed error survives both consumers of a `ReplayExec`.
+    #[tokio::test]
+    async fn test_replay_preserves_typed_error() {
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::SendableRecordBatchStream;
+
+        // A marker type that we will look for in the source chain.
+        #[derive(Debug)]
+        struct MarkerError;
+        impl std::fmt::Display for MarkerError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "marker error")
+            }
+        }
+        impl std::error::Error for MarkerError {}
+
+        let schema = Arc::new(arrow_schema::Schema::empty());
+
+        // Build a stream that immediately yields a typed external DataFusion error.
+        let typed_err = DataFusionError::External(Box::new(MarkerError));
+        let err_stream: SendableRecordBatchStream = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::once(async move { Err(typed_err) }),
+            ),
+        );
+
+        let input = Arc::new(OneShotExec::new(err_stream));
+        let shared = Arc::new(ReplayExec::new(Capacity::Bounded(4), input));
+
+        let ctx = Arc::new(datafusion::execution::TaskContext::default());
+
+        // Both consumers must receive an error whose source chain includes MarkerError.
+        for partition in 0..2 {
+            let mut stream = shared.execute(partition, ctx.clone()).unwrap();
+            let err = stream
+                .next()
+                .await
+                .expect("stream should yield an error item")
+                .expect_err("expected error");
+
+            let mut found = false;
+            let mut src: Option<&dyn std::error::Error> = Some(&err);
+            while let Some(e) = src {
+                if e.downcast_ref::<MarkerError>().is_some() {
+                    found = true;
+                    break;
+                }
+                src = e.source();
+            }
+            assert!(
+                found,
+                "partition {partition}: MarkerError not found in source chain: {err}"
+            );
         }
     }
 }

@@ -967,11 +967,17 @@ impl From<datafusion_common::DataFusionError> for Error {
                 // DataFusion shares an error across consumers (e.g. a join's
                 // build-side error fanned out to every probe partition) behind an
                 // `Arc`. If we are the sole owner we can recurse for full fidelity;
-                // otherwise the inner error can't be moved out, so we preserve its
-                // message under the execution category (its concrete type is lost).
+                // otherwise re-wrap in `Shared` so the concrete error type is still
+                // reachable via `Error::source` / `downcast_ref`.
                 match std::sync::Arc::try_unwrap(shared) {
                     Ok(inner) => Self::from(inner),
-                    Err(shared) => Self::execution(shared.to_string()),
+                    Err(shared) => {
+                        let rewrapped =
+                            datafusion_common::DataFusionError::Shared(shared);
+                        Self::External {
+                            source: box_error(rewrapped),
+                        }
+                    }
                 }
             }
             datafusion_common::DataFusionError::External(source) => {
@@ -1438,6 +1444,39 @@ mod test {
             }
             _ => panic!("Expected InvalidInput variant, got {:?}", recovered),
         }
+    }
+
+    /// Test that a typed error survives a multiply-owned `DataFusionError::Shared`.
+    ///
+    /// When DataFusion fans one error out to multiple consumers via `Arc`, we
+    /// cannot move the inner error out.  The typed source must still be
+    /// reachable after conversion to `lance_core::Error`.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_datafusion_shared_multi_owner_preserves_type() {
+        let custom_err = MyCustomError {
+            code: 42,
+            message: "shared typed error".to_string(),
+        };
+        let marker = datafusion_common::DataFusionError::External(Box::new(custom_err));
+        // Put it in an Arc and keep a second owner so try_unwrap fails.
+        let arc = std::sync::Arc::new(marker);
+        let _arc2 = arc.clone();
+        let shared = datafusion_common::DataFusionError::Shared(arc);
+
+        let lance_err: Error = shared.into();
+
+        // The concrete error must be discoverable via source chain.
+        let mut found = false;
+        let mut src: Option<&dyn std::error::Error> = Some(&lance_err);
+        while let Some(e) = src {
+            if e.downcast_ref::<MyCustomError>().is_some() {
+                found = true;
+                break;
+            }
+            src = e.source();
+        }
+        assert!(found, "MyCustomError not found in source chain: {lance_err:?}");
     }
 
     #[test]
