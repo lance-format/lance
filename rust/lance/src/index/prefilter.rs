@@ -94,6 +94,34 @@ impl DatasetPreFilter {
         }
     }
 
+    /// Like [`Self::new`], but restricted to an explicit fragment set instead of
+    /// the union of the indices' fragment bitmaps.
+    ///
+    /// `combined_fields` needs the intersection of its target columns' coverage: a
+    /// cross-field BM25F score is only complete when every column's index holds the
+    /// row, so the union [`Self::new`] derives would admit rows that only some
+    /// columns cover. Routing through [`Self::create_restricted_deletion_mask`]
+    /// keeps the restriction in whichever id space the indices actually store,
+    /// stable row ids or row addresses, which a fragment-address block list cannot
+    /// do.
+    pub fn new_restricted_to_fragments(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+        filter: Option<Box<dyn FilterLoader>>,
+    ) -> Self {
+        let deleted_ids = Self::create_restricted_deletion_mask(dataset, fragments)
+            .map(SharedPrerequisite::spawn);
+        let filtered_ids = filter
+            .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
+        Self {
+            deleted_ids,
+            filtered_ids,
+            deleted_fragments: None,
+            overlay_block: None,
+            final_mask: Mutex::new(OnceCell::new()),
+        }
+    }
+
     #[instrument(level = "debug", skip_all)]
     async fn do_create_deletion_mask(
         dataset: Arc<Dataset>,

@@ -237,6 +237,9 @@ pub struct DocSet {
     // partitions never set the flag and keep exact scoring.
     pub(super) scoring_quantized: bool,
     pub(super) norms: Arc<std::sync::OnceLock<Box<[u8]>>>,
+    // Memoized answer to `row_ids_strictly_ascending`. Filled on first query use;
+    // build-time appends happen before any query touches it.
+    row_ids_ascending: Arc<std::sync::OnceLock<bool>>,
 }
 
 impl DeepSizeOf for DocSet {
@@ -251,6 +254,21 @@ impl DeepSizeOf for DocSet {
                 .map(|slab| std::mem::size_of_val(slab.as_ref()))
                 .unwrap_or(0)
     }
+}
+
+/// Count the runs of equal values in a sequence sorted by row id, i.e. the
+/// number of distinct row ids it contains. Row addresses sort the same way, so
+/// the address-keyed document view shares it.
+pub(in crate::scalar::inverted) fn count_row_id_runs(row_ids: impl Iterator<Item = u64>) -> usize {
+    let mut distinct = 0;
+    let mut previous = None;
+    for row_id in row_ids {
+        if previous != Some(row_id) {
+            distinct += 1;
+            previous = Some(row_id);
+        }
+    }
+    distinct
 }
 
 impl DocSet {
@@ -307,13 +325,66 @@ impl DocSet {
         self.doc_indices.len()
     }
 
+    /// True iff `row_id(doc_id)` is strictly increasing in `doc_id`, i.e. the
+    /// per-doc `row_ids` array is sorted with no duplicates. This is the exact
+    /// condition the combined_fields read-pruning fast path requires: doc-id
+    /// order equals row-id order (so a posting block's row-id span is an
+    /// interval, letting a row-id seek skip whole blocks) and every row owns a
+    /// single doc (no list-element or legacy list multiplicity, so a term
+    /// contributes at most one posting per partition per row).
+    ///
+    /// This checks ascension only, not liveness. A tombstoned slot holds
+    /// [`RowAddress::TOMBSTONE_ROW`] (`u64::MAX`), which breaks ascension wherever
+    /// another slot follows it but not when it is the last one, so a set whose
+    /// final document is tombstoned still reports `true`. Only the build-side sets
+    /// (`PartitionDocuments::load_build_docset`) tombstone in place, and
+    /// `combined_fields_search` forces the full-read fallback for legacy
+    /// partitions regardless of this answer.
+    ///
+    /// Computed once per loaded set and memoized (shared across clones). An empty
+    /// set is vacuously ascending, matching
+    /// `AddressKeyedDocuments::addresses_strictly_ascending`.
+    pub fn row_ids_strictly_ascending(&self) -> bool {
+        *self
+            .row_ids_ascending
+            .get_or_init(|| self.row_ids.windows(2).all(|w| w[0] < w[1]))
+    }
+
+    /// Number of distinct row ids this set covers, which row-granularity BM25F
+    /// statistics need.
+    ///
+    /// Equal to [`Self::len`] whenever each row owns a single document, and
+    /// strictly smaller on an `inv`-keyed set where a row owns a run of documents
+    /// (see [`Self::doc_ids`]).
+    ///
+    /// Linear in the number of documents, over an already-loaded set: both `inv`
+    /// and the legacy `row_ids` array are sorted by row id, so the documents of
+    /// one row form a contiguous run. Tombstoned (frag-reuse deleted) documents
+    /// are absent from `inv` and therefore uncounted, matching
+    /// [`Self::doc_length_by_row_id`], which reports 0 for them.
+    pub fn num_distinct_rows(&self) -> usize {
+        // Memoized and shared with the combined_fields fast-path check, so the
+        // one-document-per-row case answers without a scan after the first query.
+        if self.row_ids_strictly_ascending() {
+            return self.len();
+        }
+        if !self.inv.is_empty() {
+            return count_row_id_runs(self.inv.iter().map(|entry| entry.0));
+        }
+        count_row_id_runs(self.row_ids.iter().copied())
+    }
+
     /// Resolve a `row_id` to every `doc_id` it owns.
     ///
     /// Row-document indexes map each row to a single document. Element-document
     /// indexes (and older list indexes) can map one row to several documents,
     /// so a single `row_id` may own multiple `doc_id`s sharing that key in `inv`.
     /// The prefilter path (`flat_search`) walks an allow-list of row_ids and
-    /// must evaluate all legacy documents for that row.
+    /// must evaluate all of those documents for that row.
+    ///
+    /// Only the `inv` branch answers with several. A no-metadata legacy set
+    /// holds one document per row, so the branch below resolves it with a single
+    /// binary search.
     pub fn doc_ids(&self, row_id: u64) -> impl Iterator<Item = u64> + '_ {
         if self.inv.is_empty() {
             // in legacy format, the row id is doc id (one document per row)
@@ -455,6 +526,7 @@ impl DocSet {
             total_tokens,
             scoring_quantized: false,
             norms: Arc::new(std::sync::OnceLock::new()),
+            row_ids_ascending: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -519,6 +591,7 @@ impl DocSet {
                 total_tokens,
                 scoring_quantized: false,
                 norms: Arc::new(std::sync::OnceLock::new()),
+                row_ids_ascending: Arc::new(std::sync::OnceLock::new()),
             });
         }
 
@@ -563,6 +636,7 @@ impl DocSet {
                 total_tokens,
                 scoring_quantized: false,
                 norms: Arc::new(std::sync::OnceLock::new()),
+                row_ids_ascending: Arc::new(std::sync::OnceLock::new()),
             });
         }
 
@@ -585,6 +659,7 @@ impl DocSet {
             total_tokens,
             scoring_quantized: false,
             norms: Arc::new(std::sync::OnceLock::new()),
+            row_ids_ascending: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -602,6 +677,7 @@ impl DocSet {
             .map(|_| Vec::with_capacity(len))
             .collect();
         self.invalidate_norms();
+        self.invalidate_row_ids_ascending();
         self.total_tokens = 0;
         for (doc_id, (row_id, num_token)) in std::iter::zip(row_ids, num_tokens).enumerate() {
             match mapping.get(row_id) {
@@ -681,6 +757,41 @@ impl DocSet {
             .unwrap_or(0)
     }
 
+    /// Total document length of `row_id`: the sum of `num_tokens` over every
+    /// document the row owns, or `0` when the row is absent (e.g. an empty or
+    /// null field that was never indexed).
+    ///
+    /// Lets cross-field BM25F read a candidate's per-column length with a
+    /// targeted lookup instead of scanning the whole `DocSet`. The result is
+    /// exact against a full `iter()` scan filtered to the row: every document
+    /// the row owns contributes, whether the row is resolved through the sorted
+    /// `inv` index or, on a legacy set, through the run of equal `row_ids`.
+    ///
+    /// A row owns several documents only on the `inv` path (see [`Self::doc_ids`]).
+    /// A no-metadata legacy set cannot reach that state, because the writer of that
+    /// era keyed its documents by row id in a map, so the elements of one row
+    /// collapsed before they were written. The legacy branch below sums a run
+    /// anyway, so the two paths answer alike whatever they are handed.
+    #[inline]
+    pub fn doc_length_by_row_id(&self, row_id: u64) -> u64 {
+        if self.inv.is_empty() {
+            // Legacy: row id == doc id, `row_ids` is sorted; duplicate row ids
+            // (one per indexed list element) form a contiguous run.
+            let lo = self.row_ids.partition_point(|&id| id < row_id);
+            let hi = self.row_ids.partition_point(|&id| id <= row_id);
+            (lo..hi).map(|doc_id| self.num_tokens[doc_id] as u64).sum()
+        } else {
+            // Compressed: `inv` is sorted by row id and holds one entry per
+            // document owned by the row.
+            let lo = self.inv.partition_point(|entry| entry.0 < row_id);
+            let hi = self.inv.partition_point(|entry| entry.0 <= row_id);
+            self.inv[lo..hi]
+                .iter()
+                .map(|entry| self.num_tokens[entry.1 as usize] as u64)
+                .sum()
+        }
+    }
+
     // append a document to the doc set
     // returns the doc_id (the number of documents before appending)
     pub fn append(&mut self, row_id: u64, num_tokens: u32) -> u32 {
@@ -688,6 +799,7 @@ impl DocSet {
         self.num_tokens.push(num_tokens);
         self.total_tokens += num_tokens as u64;
         self.invalidate_norms();
+        self.invalidate_row_ids_ascending();
         self.row_ids.len() as u32 - 1
     }
 
@@ -714,6 +826,7 @@ impl DocSet {
         }
         self.total_tokens += num_tokens as u64;
         self.invalidate_norms();
+        self.invalidate_row_ids_ascending();
         Ok(self.row_ids.len() as u32 - 1)
     }
 
@@ -722,6 +835,14 @@ impl DocSet {
     fn invalidate_norms(&mut self) {
         if self.norms.get().is_some() {
             self.norms = Arc::new(std::sync::OnceLock::new());
+        }
+    }
+
+    // Drop the memoized ascending-row_ids answer after a mutation; it
+    // recomputes on the next query use.
+    fn invalidate_row_ids_ascending(&mut self) {
+        if self.row_ids_ascending.get().is_some() {
+            self.row_ids_ascending = Arc::new(std::sync::OnceLock::new());
         }
     }
 

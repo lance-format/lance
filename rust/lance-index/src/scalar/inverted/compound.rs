@@ -644,6 +644,7 @@ impl CompoundScorerPlan {
                     .map(|query| Self::from_query(query, num_leaves))
                     .collect::<Result<Vec<_>>>()?,
             }),
+            FtsQuery::CombinedFields(_) => Err(combined_fields_unsupported()),
         }
     }
 
@@ -3413,8 +3414,22 @@ pub(super) fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>
                 collect_leaf_queries(child, leaves)?;
             }
         }
+        FtsQuery::CombinedFields(_) => return Err(combined_fields_unsupported()),
     }
     Ok(())
+}
+
+/// A `combined_fields` node reaching the compound scorer is a planner bug.
+///
+/// Every leaf here draws its postings from one column's index and scores them
+/// with a `MemBM25Scorer`, whereas BM25F blends `tf'`/`dl'`/`docFreq'` across
+/// several columns before scoring. The planner keeps such trees out via
+/// `supports_compound_scorer`, so this is an explicit error.
+fn combined_fields_unsupported() -> Error {
+    Error::not_supported(
+        "the compound FTS scorer cannot score a combined_fields (BM25F) node: its statistics \
+         are blended across columns and do not fit the single-index leaf protocol",
+    )
 }
 
 struct PreparedLeaf {

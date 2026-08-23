@@ -725,6 +725,65 @@ impl InvertedIndexParams {
         Ok(self)
     }
 
+    /// Whether `self` and `other` tokenize text identically.
+    ///
+    /// Compares only the fields that affect how documents are turned into tokens
+    /// (tokenizer, language, casing, stemming, stop words, n-gram bounds,
+    /// code-analyzer splitting, ...). Storage/layout and build-time fields
+    /// (`with_position`, `block_size`, worker/memory/format settings) are ignored:
+    /// two columns can differ there yet still be safe to combine in a
+    /// `combined_fields` (BM25F) query. Used by cross-field FTS validation.
+    pub(crate) fn same_tokenization(&self, other: &Self) -> bool {
+        // Destructure exhaustively so that adding a new field forces an explicit
+        // decision here about whether it affects tokenization.
+        let Self {
+            lance_tokenizer,
+            base_tokenizer,
+            language,
+            max_token_length,
+            lower_case,
+            stem,
+            remove_stop_words,
+            custom_stop_words,
+            ascii_folding,
+            min_ngram_length,
+            max_ngram_length,
+            prefix_only,
+            // Code-analyzer tokenization options: change the emitted token stream.
+            split_identifiers,
+            split_on_numerics,
+            preserve_original,
+            index_operators,
+            // Not tokenization-affecting (storage/layout/build-time only):
+            with_position: _,
+            block_size: _,
+            memory_limit_mb: _,
+            num_workers: _,
+            format_version: _,
+            // Decides what a document is, not how its text is tokenized. Cross-field
+            // FTS checks it separately because it needs a different answer: the
+            // blend is per row, so a list-element index is rejected outright rather
+            // than merely required to match its siblings.
+            document_granularity: _,
+        } = self;
+        lance_tokenizer == &other.lance_tokenizer
+            && base_tokenizer == &other.base_tokenizer
+            && language == &other.language
+            && max_token_length == &other.max_token_length
+            && lower_case == &other.lower_case
+            && stem == &other.stem
+            && remove_stop_words == &other.remove_stop_words
+            && custom_stop_words == &other.custom_stop_words
+            && ascii_folding == &other.ascii_folding
+            && min_ngram_length == &other.min_ngram_length
+            && max_ngram_length == &other.max_ngram_length
+            && prefix_only == &other.prefix_only
+            && split_identifiers == &other.split_identifiers
+            && split_on_numerics == &other.split_on_numerics
+            && preserve_original == &other.preserve_original
+            && index_operators == &other.index_operators
+    }
+
     pub fn lance_tokenizer(mut self, lance_tokenizer: String) -> Self {
         self.lance_tokenizer = Some(lance_tokenizer);
         self
@@ -1164,6 +1223,22 @@ mod tests {
         assert!(json.get("memory_limit").is_none());
         assert!(json.get("num_workers").is_none());
         assert!(json.get("format_version").is_none());
+    }
+
+    #[test]
+    fn test_same_tokenization_ignores_storage_only_fields() {
+        let base = InvertedIndexParams::new("simple".to_string(), Language::English);
+
+        // Storage/layout-only differences keep the same tokenization.
+        assert!(base.same_tokenization(&base.clone().with_position(true)));
+
+        // Tokenizer-affecting differences are detected.
+        assert!(!base.same_tokenization(&base.clone().stem(!base.stem)));
+        assert!(!base.same_tokenization(&base.clone().lower_case(!base.lower_case)));
+        assert!(!base.same_tokenization(&InvertedIndexParams::new(
+            "whitespace".to_string(),
+            Language::English,
+        )));
     }
 
     #[test]
