@@ -90,6 +90,55 @@ class LanceScannerFullTextSearchTest {
   }
 
   @Test
+  void testCombinedFields() throws Exception {
+    // "hello" appears in doc or title of every row, so all 3 match.
+    FullTextQuery combined = FullTextQuery.combinedFields("hello", Arrays.asList("doc", "title"));
+    runFtsQuery("memory://fts_java_combined", combined, 3);
+  }
+
+  @Test
+  void testCombinedFieldsWithBoosts() throws Exception {
+    FullTextQuery combined =
+        FullTextQuery.combinedFields(
+            "hello",
+            Arrays.asList("doc", "title"),
+            Arrays.asList(2.0f, 1.0f),
+            FullTextQuery.Operator.OR);
+    runFtsQuery("memory://fts_java_combined_boosts", combined, 3);
+  }
+
+  @Test
+  void testCombinedFieldsInvalidBoostPropagates() throws Exception {
+    // Per-column weights must be >= 1. The check lives in the Rust core and must
+    // surface across the JNI boundary when the query runs.
+    FullTextQuery combined =
+        FullTextQuery.combinedFields(
+            "hello",
+            Arrays.asList("doc", "title"),
+            Arrays.asList(0.5f, 1.0f),
+            FullTextQuery.Operator.OR);
+    withIndexedDataset(
+        "memory://fts_java_combined_bad_boost",
+        dataset -> {
+          ScanOptions scanOptions = new ScanOptions.Builder().fullTextQuery(combined).build();
+          IllegalArgumentException ex =
+              assertThrows(
+                  IllegalArgumentException.class,
+                  () -> {
+                    try (LanceScanner scanner = dataset.newScan(scanOptions);
+                        ArrowReader arrowReader = scanner.scanBatches()) {
+                      while (arrowReader.loadNextBatch()) {
+                        // Drain batches to force query execution.
+                      }
+                    }
+                  });
+          assertTrue(
+              ex.getMessage().contains("combined_fields boost for column 'doc'"),
+              "expected invalid-boost validation error, got: " + ex.getMessage());
+        });
+  }
+
+  @Test
   void testBooleanQuery() throws Exception {
     FullTextQuery.MatchQuery shouldMatch =
         (FullTextQuery.MatchQuery) FullTextQuery.match("hello", "doc");
@@ -108,7 +157,29 @@ class LanceScannerFullTextSearchTest {
   }
 
   private void runFtsQuery(String uri, FullTextQuery query, long expectedTotal) throws Exception {
+    withIndexedDataset(
+        uri,
+        dataset -> {
+          ScanOptions scanOptions = new ScanOptions.Builder().fullTextQuery(query).build();
 
+          try (LanceScanner scanner = dataset.newScan(scanOptions)) {
+            long total = 0L;
+            try (ArrowReader arrowReader = scanner.scanBatches()) {
+              while (arrowReader.loadNextBatch()) {
+                total += arrowReader.getVectorSchemaRoot().getRowCount();
+              }
+            }
+            assertEquals(expectedTotal, total);
+          }
+        });
+  }
+
+  /**
+   * Create an in-memory dataset with two text columns ({@code doc}, {@code title}), each backed by
+   * an inverted index, and hand it to {@code consumer}. Resources are released when the consumer
+   * returns.
+   */
+  private void withIndexedDataset(String uri, IndexedDatasetConsumer consumer) throws Exception {
     Schema schema =
         new Schema(
             Arrays.asList(
@@ -169,20 +240,15 @@ class LanceScannerFullTextSearchTest {
                     .withIndexName("title_idx")
                     .build());
 
-            ScanOptions scanOptions = new ScanOptions.Builder().fullTextQuery(query).build();
-
-            try (LanceScanner scanner = dataset.newScan(scanOptions)) {
-              long total = 0L;
-              try (ArrowReader arrowReader = scanner.scanBatches()) {
-                while (arrowReader.loadNextBatch()) {
-                  total += arrowReader.getVectorSchemaRoot().getRowCount();
-                }
-              }
-              assertEquals(expectedTotal, total);
-            }
+            consumer.accept(dataset);
           }
         }
       }
     }
+  }
+
+  @FunctionalInterface
+  private interface IndexedDatasetConsumer {
+    void accept(Dataset dataset) throws Exception;
   }
 }

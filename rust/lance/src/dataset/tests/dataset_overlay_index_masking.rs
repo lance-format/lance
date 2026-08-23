@@ -795,14 +795,28 @@ async fn build_text_fts_index_with_positions(dataset: &mut Dataset) {
         .unwrap();
 }
 
-/// Collect sorted IDs of rows returned by an FTS query on `text`.
+/// Collect sorted IDs of rows returned by an FTS query.
 async fn fts_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i32> {
-    let results = dataset
-        .scan()
+    fts_ids_opts(dataset, query, false).await
+}
+
+/// Like [`fts_ids`] but lets a test enable `fast_search()`, which restricts the
+/// answer to what the indexes can supply.
+async fn fts_ids_opts(
+    dataset: &Dataset,
+    query: FullTextSearchQuery,
+    fast_search: bool,
+) -> Vec<i32> {
+    let mut scanner = dataset.scan();
+    scanner
         .full_text_search(query)
         .unwrap()
         .project(&["id"])
-        .unwrap()
+        .unwrap();
+    if fast_search {
+        scanner.fast_search();
+    }
+    let results = scanner
         .try_into_stream()
         .await
         .unwrap()
@@ -1471,6 +1485,577 @@ async fn test_fts_overlay_unrelated_field_not_excluded() {
     // reflects the overlay even though the FTS index correctly returned that row.
     assert_eq!(fts_ids_matching(&dataset, "apple").await, vec![0, 999]);
     assert_eq!(fts_ids_matching(&dataset, "banana").await, vec![3, 999]);
+}
+
+fn combined_fields_query(terms: &str, columns: &[&str]) -> FullTextSearchQuery {
+    use lance_index::scalar::inverted::query::{CombinedFieldsQuery, FtsQuery};
+
+    FullTextSearchQuery::new_query(FtsQuery::CombinedFields(
+        CombinedFieldsQuery::try_new(
+            terms.to_owned(),
+            columns.iter().map(|column| column.to_string()).collect(),
+        )
+        .unwrap(),
+    ))
+}
+
+/// Sorted `id` values a cross-field (BM25F) `combined_fields` query returns.
+async fn fts_combined_ids(dataset: &Dataset, terms: &str, columns: &[&str]) -> Vec<i32> {
+    fts_ids(dataset, combined_fields_query(terms, columns)).await
+}
+
+/// Like [`fts_combined_ids`] but index-only (`fast_search`), so nothing re-reads
+/// the fragments the indexed scan had to skip.
+async fn fts_combined_ids_fast_search(
+    dataset: &Dataset,
+    terms: &str,
+    columns: &[&str],
+) -> Vec<i32> {
+    fts_ids_opts(dataset, combined_fields_query(terms, columns), true).await
+}
+
+/// Sorted `id` values a single-column `MatchQuery` returns. This is the reference
+/// answer `combined_fields` must agree with: an `Or` combined-fields query matches
+/// a document when a query term appears in at least one target column, so the
+/// combined result is the union of the per-column match results.
+async fn fts_match_ids(dataset: &Dataset, term: &str, column: &str) -> Vec<i32> {
+    use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery};
+
+    let query = FullTextSearchQuery::new_query(FtsQuery::Match(
+        MatchQuery::new(term.to_owned()).with_column(Some(column.to_owned())),
+    ));
+    fts_ids(dataset, query).await
+}
+
+/// Union of the per-column `MatchQuery` results for `term`, sorted.
+async fn fts_match_union_ids(dataset: &Dataset, term: &str, columns: &[&str]) -> Vec<i32> {
+    let mut ids = Vec::new();
+    for column in columns {
+        ids.extend(fts_match_ids(dataset, term, column).await);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Build an FTS index on `column` as one segment per fragment, the multi-segment
+/// counterpart of the whole-index single segment `build_text_fts_index` produces.
+/// An overlay-stale fragment is excluded from the indexed scan either way, so both
+/// layouts run the indexed and the flat side; only the number of segments the
+/// indexed side opens differs.
+async fn build_per_fragment_fts_index(dataset: &mut Dataset, column: &str) {
+    let params = InvertedIndexParams::default();
+    let name = format!("{column}_fts");
+    let fragment_ids = dataset
+        .get_fragments()
+        .into_iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    let mut segments = Vec::with_capacity(fragment_ids.len());
+    for fragment_id in fragment_ids {
+        segments.push(
+            CreateIndexBuilder::new(dataset, &[column], IndexType::Inverted, &params)
+                .name(name.clone())
+                .fragments(vec![fragment_id])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments(&name, column, segments)
+        .await
+        .unwrap();
+}
+
+/// `combined_fields` must honour the same data-overlay contract as `match`: a
+/// fragment holding an overlay-stale row is dropped from the indexed scan and
+/// re-evaluated on the flat path. Without that the indexed scan answers from the
+/// pre-overlay index, so it both returns stale hits and misses new matches.
+///
+/// `match` blocks the individual stale row addresses instead (see
+/// `plan_combined_fields_query` for why BM25F cannot), but the answer must be the
+/// same either way.
+///
+/// Parametrized over the segment layout: one segment for the whole index, and one
+/// segment per fragment.
+#[rstest]
+#[tokio::test]
+async fn test_fts_combined_fields_overlay_agrees_with_match(
+    #[values(false, true)] per_fragment_segments: bool,
+) {
+    let mut dataset = create_text_dataset(false).await;
+    if per_fragment_segments {
+        build_per_fragment_fts_index(&mut dataset, "text").await;
+    } else {
+        build_text_fts_index(&mut dataset).await;
+    }
+
+    // fragment 0, row offset 1 (id=1): "apple banana" → "cherry mango".
+    // Field ID 1 is the `text` column.
+    let dataset = commit_overlay(
+        dataset,
+        "combined_text_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    // Both directions: "apple"/"banana" must lose the stale id=1 hit, and
+    // "cherry"/"mango" must gain it.
+    for (term, expected) in [
+        ("apple", vec![0]),
+        ("banana", vec![3]),
+        ("cherry", vec![1, 2]),
+        ("mango", vec![1, 6]),
+    ] {
+        let combined = fts_combined_ids(&dataset, term, &["text"]).await;
+        assert_eq!(
+            combined,
+            fts_match_ids(&dataset, term, "text").await,
+            "combined_fields disagrees with match for '{term}'"
+        );
+        assert_eq!(combined, expected, "wrong rows for '{term}'");
+    }
+}
+
+/// The overlay term must be findable even when no indexed posting list holds it.
+///
+/// Taking the column's `docFreq_f` from the pre-overlay index alone leaves a term the
+/// overlay introduced at `docFreq' == 0`, so `query_weight` is `0.0`, the row scores
+/// zero and the flat scan drops it.
+#[tokio::test]
+async fn test_fts_combined_fields_overlay_new_term_absent_from_index_stats() {
+    let mut dataset = create_text_dataset(false).await;
+    build_text_fts_index(&mut dataset).await;
+
+    // fragment 0, row offset 1 (id=1): "apple banana" → "quasarunique", a term that
+    // occurs in no other row and so in no indexed posting list.
+    let dataset = commit_overlay(
+        dataset,
+        "combined_unique_text_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("quasarunique")]))],
+    )
+    .await;
+
+    assert_eq!(
+        fts_match_ids(&dataset, "quasarunique", "text").await,
+        vec![1]
+    );
+    assert_eq!(
+        fts_combined_ids(&dataset, "quasarunique", &["text"]).await,
+        vec![1]
+    );
+}
+
+/// `id`/`text` dataset, `id` being the row offset, `rows_per_file` rows per fragment.
+async fn create_text_dataset_from(texts: Vec<&str>, rows_per_file: usize) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..texts.len() as i32)),
+            Arc::new(StringArray::from(texts)),
+        ],
+    )
+    .unwrap();
+    let write_params = WriteParams {
+        max_rows_per_file: rows_per_file,
+        ..Default::default()
+    };
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    Dataset::write(reader, "memory://", Some(write_params))
+        .await
+        .unwrap()
+}
+
+/// Top-`limit` ids of a prefiltered `combined_fields` query, in score order.
+async fn fts_combined_prefiltered_ids(
+    dataset: &Dataset,
+    terms: &str,
+    filter: &str,
+    limit: i64,
+) -> Vec<i32> {
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .filter(filter)
+        .unwrap()
+        .full_text_search(combined_fields_query(terms, &["text"]).limit(Some(limit)))
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    ids_from_batches(&[scanner.try_into_batch().await.unwrap()])
+}
+
+/// A same-value overlay must not move top-k: it leaves every searchable value alone, so
+/// the corpus the ranking is measured against must not change either.
+///
+/// The prefilter prunes the flat scan, so statistics folded from that scan describe the
+/// filtered subset, while the indexed plan an overlay-free dataset takes uses the whole index.
+///
+/// `beta` is the rare term globally, so id 1 outranks id 0. Over the filtered pair the
+/// two terms have equal `docFreq` and the scores tie, which is enough to lose id 1.
+#[tokio::test]
+async fn test_fts_combined_fields_overlay_preserves_prefilter_corpus() {
+    let mut dataset = create_text_dataset_from(
+        vec![
+            "alpha", "beta", "alpha", "alpha", "alpha", "alpha", "alpha", "alpha", "alpha",
+            "alpha", "alpha", "alpha",
+        ],
+        12,
+    )
+    .await;
+    build_text_fts_index(&mut dataset).await;
+
+    assert_eq!(
+        fts_combined_prefiltered_ids(&dataset, "alpha beta", "id < 2", 1).await,
+        vec![1]
+    );
+
+    // Row offset 2 rewritten with the value it already holds, and the filter excludes it.
+    let dataset = commit_overlay(
+        dataset,
+        "combined_prefilter_same_value_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([2])),
+        vec![Arc::new(StringArray::from(vec![Some("alpha")]))],
+    )
+    .await;
+    assert_eq!(
+        fts_combined_prefiltered_ids(&dataset, "alpha beta", "id < 2", 1).await,
+        vec![1]
+    );
+}
+
+/// [`test_fts_combined_fields_overlay_preserves_prefilter_corpus`] without the tie: the
+/// filtered subset inverts which term is rarer, so the ranking flips on a strict
+/// inequality rather than on tie order.
+///
+/// Globally `df(alpha) = 10` against `df(beta) = 2`, so id 1 wins. Over ids 0..2 it is
+/// `df(alpha) = 1` against `df(beta) = 2`, which puts id 0 ahead by roughly 2x. Id 2
+/// carries filler tokens purely to lengthen it, so it never ties with id 1.
+#[tokio::test]
+async fn test_fts_combined_fields_overlay_preserves_prefilter_corpus_strictly() {
+    let mut dataset = create_text_dataset_from(
+        vec![
+            "alpha",
+            "beta",
+            "beta gamma delta",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+        ],
+        12,
+    )
+    .await;
+    build_text_fts_index(&mut dataset).await;
+
+    assert_eq!(
+        fts_combined_prefiltered_ids(&dataset, "alpha beta", "id < 3", 1).await,
+        vec![1]
+    );
+
+    let dataset = commit_overlay(
+        dataset,
+        "combined_prefilter_strict_same_value_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([5])),
+        vec![Arc::new(StringArray::from(vec![Some("alpha")]))],
+    )
+    .await;
+    assert_eq!(
+        fts_combined_prefiltered_ids(&dataset, "alpha beta", "id < 3", 1).await,
+        vec![1]
+    );
+}
+
+/// Top-`limit` ids of a `combined_fields` query restricted to `fragment_ids`.
+async fn fts_combined_fragment_ids(
+    dataset: &Dataset,
+    terms: &str,
+    fragment_ids: &[u32],
+    limit: i64,
+) -> Vec<i32> {
+    let fragments = dataset
+        .fragments()
+        .iter()
+        .filter(|fragment| fragment_ids.contains(&(fragment.id as u32)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut scanner = dataset.scan();
+    scanner
+        .with_fragments(fragments)
+        .full_text_search(combined_fields_query(terms, &["text"]).limit(Some(limit)))
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    ids_from_batches(&[scanner.try_into_batch().await.unwrap()])
+}
+
+/// Fragment selection must restrict which rows are returned, not which corpus they
+/// are scored against. A same-value overlay inside the selection leaves every
+/// searchable value alone, so top-k must not move.
+#[tokio::test]
+async fn test_fts_combined_fields_overlay_preserves_fragment_corpus() {
+    // Fragment 0 holds the only `beta` rows; the nine `alpha` rows behind it are what
+    // make `beta` the rare term, and they are outside the selection.
+    let mut dataset = create_text_dataset_from(
+        vec![
+            "alpha",
+            "beta",
+            "beta gamma delta",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+            "alpha",
+        ],
+        3,
+    )
+    .await;
+    build_text_fts_index(&mut dataset).await;
+
+    assert_eq!(
+        fts_combined_fragment_ids(&dataset, "alpha beta", &[0], 1).await,
+        vec![1]
+    );
+
+    // Row offset 2 rewritten with the value it already holds.
+    let dataset = commit_overlay(
+        dataset,
+        "combined_fragment_same_value_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([2])),
+        vec![Arc::new(StringArray::from(vec![Some("beta gamma delta")]))],
+    )
+    .await;
+    assert_eq!(
+        fts_combined_fragment_ids(&dataset, "alpha beta", &[0], 1).await,
+        vec![1]
+    );
+}
+
+/// An overlay must cost only the fragments it touched. Folding the stale rows on top
+/// of the index keeps the corpus global, so the untouched fragments stay on the
+/// indexed side instead of the whole table going through a full scan.
+#[tokio::test]
+async fn test_fts_combined_fields_overlay_keeps_clean_fragments_indexed() {
+    let mut dataset = create_text_dataset(false).await;
+    build_text_fts_index(&mut dataset).await;
+
+    // Fragment 0 only; fragment 1 (ids 6..11) is untouched.
+    let dataset = commit_overlay(
+        dataset,
+        "combined_partial_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    let mut scan = dataset.scan();
+    scan.project(&["id"])
+        .unwrap()
+        .full_text_search(combined_fields_query("cherry", &["text"]))
+        .unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("CombinedFieldsQuery"),
+        "fragment 1 has no stale entry, so it must stay on the indexed side:\n{plan}"
+    );
+    assert!(
+        plan.contains("FlatCombinedFields"),
+        "fragment 0 must be re-read on the flat side:\n{plan}"
+    );
+}
+
+/// Two-fragment dataset with two indexable text columns: `id`, `title`, `body`.
+/// Field IDs are 0 (`id`), 1 (`title`), 2 (`body`).
+async fn create_two_column_text_dataset() -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("title", DataType::Utf8, true),
+        ArrowField::new("body", DataType::Utf8, true),
+    ]));
+    let titles: Vec<&str> = vec![
+        "apple pie",
+        "apple banana", // row 1, fragment 0, overlaid in tests
+        "cherry cake",
+        "banana split",
+        "orange juice",
+        "grape vine",
+        "mango sorbet", // fragment 1 starts here
+        "pear tart",
+        "lemon curd",
+        "peach cobbler",
+        "plum pudding",
+        "fig newton",
+    ];
+    // `dessert` spans both fragments, and `fruit` sits on the overlaid row plus a
+    // row in the other fragment, so a body term exercises the flat and the indexed
+    // side of the union at once.
+    let bodies: Vec<&str> = vec![
+        "sweet dessert",
+        "yellow fruit",
+        "red dessert",
+        "frozen treat",
+        "citrus drink",
+        "purple cluster",
+        "tropical ice",
+        "green fruit",
+        "sour spread",
+        "warm bake",
+        "dark dessert",
+        "dry biscuit",
+    ];
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..12)),
+            Arc::new(StringArray::from(titles)),
+            Arc::new(StringArray::from(bodies)),
+        ],
+    )
+    .unwrap();
+    let write_params = WriteParams {
+        max_rows_per_file: 6,
+        ..Default::default()
+    };
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    Dataset::write(reader, "memory://", Some(write_params))
+        .await
+        .unwrap()
+}
+
+/// The multi-column shape of the contract above. An overlay on one target column
+/// makes the whole fragment unscorable from the indexes: a stale row poisons the
+/// blended `dl'`/`tf'` of every target column, not just the overlaid one, so the
+/// fragment has to be re-evaluated flat across all of them.
+///
+/// Only `title` is overlaid, so `body`'s index still covers the fragment. The
+/// indexed scan has to skip it for both columns anyway, the case where a missing
+/// fragment allow list emits the fragment twice, once per side of the union.
+#[rstest]
+#[tokio::test]
+async fn test_fts_combined_fields_multi_column_overlay_agrees_with_match(
+    #[values(false, true)] per_fragment_segments: bool,
+) {
+    let mut dataset = create_two_column_text_dataset().await;
+    for column in ["title", "body"] {
+        if per_fragment_segments {
+            build_per_fragment_fts_index(&mut dataset, column).await;
+        } else {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // Overlay `title` (field 1) of fragment 0, row offset 1 (id=1):
+    // "apple banana" → "cherry mango". `body` is untouched.
+    let dataset = commit_overlay(
+        dataset,
+        "combined_title_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    let columns = ["title", "body"];
+    for (term, expected) in [
+        // Stale title hits are dropped.
+        ("apple", vec![0]),
+        ("banana", vec![3]),
+        // New title matches are found.
+        ("cherry", vec![1, 2]),
+        ("mango", vec![1, 6]),
+        // A term of the untouched target column still resolves on both sides of the
+        // union: id=1 comes from the flat path, id=7 from the indexed path.
+        ("fruit", vec![1, 7]),
+        ("dessert", vec![0, 2, 10]),
+    ] {
+        let combined = fts_combined_ids(&dataset, term, &columns).await;
+        assert_eq!(
+            combined,
+            fts_match_union_ids(&dataset, term, &columns).await,
+            "combined_fields disagrees with match for '{term}'"
+        );
+        assert_eq!(combined, expected, "wrong rows for '{term}'");
+    }
+}
+
+/// `fast_search` is index-only, so the overlay-stale fragment is dropped instead of
+/// re-evaluated: the stale hit still must not come back, and the new value stays
+/// invisible until compaction folds the overlay into the base. Every other fragment
+/// keeps answering, whichever segment layout holds it.
+#[rstest]
+#[tokio::test]
+async fn test_fts_combined_fields_overlay_under_fast_search(
+    #[values(false, true)] per_fragment_segments: bool,
+) {
+    let mut dataset = create_text_dataset(false).await;
+    if per_fragment_segments {
+        build_per_fragment_fts_index(&mut dataset, "text").await;
+    } else {
+        build_text_fts_index(&mut dataset).await;
+    }
+    let dataset = commit_overlay(
+        dataset,
+        "combined_fast_search_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    // Fragment 0 is stale either way, so nothing it holds is answerable: no stale
+    // "apple"/"banana" hit and no new "cherry" hit.
+    for term in ["apple", "banana", "cherry"] {
+        assert_eq!(
+            fts_combined_ids_fast_search(&dataset, term, &["text"]).await,
+            Vec::<i32>::new(),
+            "fast_search returned a row from the stale fragment for '{term}'"
+        );
+    }
+    // Fragment 1 holds no stale row, so it stays on the indexed side and answers
+    // even though the whole-index segment layout also covers the stale fragment.
+    assert_eq!(
+        fts_combined_ids_fast_search(&dataset, "mango", &["text"]).await,
+        vec![6]
+    );
 }
 
 /// Benchmark: measure query latency for BTree, FTS, and vector ANN with 0/4/16 overlay layers.

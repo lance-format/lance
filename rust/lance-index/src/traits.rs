@@ -246,6 +246,9 @@ impl Display for FtsPrewarmPartitionStatus {
         if !self.documents.reverse_lookup_ready {
             missing.push("reverse document lookup");
         }
+        if !self.documents.ascending_addresses_ready {
+            missing.push("memoized ascending-address gate");
+        }
         if !self.documents.projection_resident {
             missing.push("resident row-address projection");
         }
@@ -278,6 +281,11 @@ pub struct FtsPrewarmDocumentStatus {
     pub prewarm_complete: bool,
     pub scoring_ready: bool,
     pub reverse_lookup_ready: bool,
+    /// Whether the memoized "are the stored addresses strictly ascending?"
+    /// answer is populated. Cross-field search reads it on every query, so a
+    /// prewarmed partition that left it empty would still pay an O(num_docs)
+    /// address scan on its first query.
+    pub ascending_addresses_ready: bool,
     pub projection_resident: bool,
 }
 
@@ -286,6 +294,7 @@ impl FtsPrewarmDocumentStatus {
         self.prewarm_complete
             && self.scoring_ready
             && self.reverse_lookup_ready
+            && self.ascending_addresses_ready
             && self.projection_resident
     }
 }
