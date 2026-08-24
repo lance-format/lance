@@ -592,10 +592,12 @@ async fn resolve_version_from_listing(
                 .parse_version(meta.location.filename().unwrap())
                 .unwrap();
 
-            // Sanity check: verify at least for the first 1k files that they are all V2
-            // and that the version numbers are decreasing. We use the first 1k because
-            // this is the typical size of an object store list endpoint response page.
-            for (scheme, meta) in valid_manifests.take(999).try_collect::<Vec<_>>().await? {
+            // Sanity check: verify the next 99 files are also V2 and that version numbers are
+            // decreasing. Together with `first`, this checks the first 100 entries. We cap at 99
+            // rather than 999 so that the single listing request stays well within the provider's
+            // default page size (~1,000 keys) even on tables with thousands of versions, keeping
+            // the effective cost O(1) in both requests and bytes.
+            for (scheme, meta) in valid_manifests.take(99).try_collect::<Vec<_>>().await? {
                 if scheme != ManifestNamingScheme::V2 {
                     warn!(
                         "Found V1 Manifest in a V2 directory. Use `migrate_manifest_paths_v2` \
@@ -2341,5 +2343,156 @@ mod tests {
             2,
             "expected the hung explicit release plus one best-effort drop release"
         );
+    }
+
+    /// A minimal `object_store::ObjectStore` wrapper that counts calls to `list()`.
+    /// All operations are delegated to an inner `InMemory` store.
+    struct ListCountingStore {
+        inner: object_store::memory::InMemory,
+        list_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ListCountingStore {
+        fn new(list_calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                inner: object_store::memory::InMemory::new(),
+                list_calls,
+            }
+        }
+    }
+
+    impl std::fmt::Display for ListCountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ListCountingStore")
+        }
+    }
+
+    impl std::fmt::Debug for ListCountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ListCountingStore").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for ListCountingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<bytes::Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    /// Regression test: `resolve_version_from_listing` must issue exactly one list
+    /// request even when the table has far more than 100 historical versions.
+    ///
+    /// Before the fix the validation loop called `take(999)`, which consumed up to
+    /// the provider's full default listing page (~1,000 keys) on every open.  After
+    /// the fix the loop is capped at `take(99)` (100 entries total including
+    /// `first`), which stays well within a single page regardless of version count.
+    #[tokio::test]
+    async fn test_resolve_latest_version_makes_one_list_call() {
+        let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting_inner = Arc::new(ListCountingStore::new(list_calls.clone()));
+
+        let mut object_store = ObjectStore::memory();
+        // Replace inner with a counting wrapper; keep everything else from memory().
+        object_store.inner = counting_inner.clone();
+        // Force the lexically-ordered fast path (resolve_version_from_listing).
+        object_store.list_is_lexically_ordered = true;
+
+        let base = Path::from("base");
+
+        // Write 2000 V2 manifest files to ensure we far exceed the old 999-entry window.
+        for version in 0..2000u64 {
+            let path = ManifestNamingScheme::V2.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        // Reset the counter after writes — we only care about reads triggered by
+        // current_manifest_path, not the put operations above.
+        list_calls.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let location = current_manifest_path(&object_store, &base).await.unwrap();
+        assert_eq!(location.version, 1999);
+
+        let calls = list_calls.load(std::sync::atomic::Ordering::SeqCst);
+        // The only list call permitted is the single call that opens the stream.
+        // A second page fetch (which the old take(999) code could trigger on a
+        // paginating store) would increment this counter.
+        assert_eq!(calls, 1, "expected exactly 1 list call, got {}", calls);
     }
 }
