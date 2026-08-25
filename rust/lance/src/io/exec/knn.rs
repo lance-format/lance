@@ -2184,6 +2184,9 @@ impl ANNIvfSubIndexExec {
             if let Some(max_results) = max_results
                 && found_so_far < max_results
                 && max_results <= query.k
+                // Quantized refinement must score every returned row and apply its
+                // distance bounds, so it cannot emit unscored rows from this shortcut.
+                && quantized_refine_factor.is_none()
             {
                 // In this case there are fewer than k results matching the prefilter so
                 // just return the prefilter ids and don't bother searching any further

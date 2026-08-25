@@ -20652,6 +20652,37 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[tokio::test]
+    async fn test_quantized_refinement_scores_selective_prefilter_shortcut_rows() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_rq_vector_index(4).await.unwrap();
+        let query_vector = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .minimum_nprobes(1)
+            .maximum_nprobes(2)
+            .prefilter(true)
+            .filter("i = 0 OR i = 399")
+            .unwrap()
+            .quantized_refine(2)
+            .distance_range(None, Some(f32::MAX));
+        let results = scanner.try_into_batch().await.unwrap();
+
+        assert_eq!(results.num_rows(), 2);
+        assert!(
+            results[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|distance| distance.is_finite())
+        );
+    }
+
+    #[tokio::test]
     async fn test_quantized_refinement_rejects_non_rq_index() {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
