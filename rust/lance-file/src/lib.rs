@@ -15,6 +15,7 @@ pub mod writer;
 mod compatibility_tests;
 
 pub use io::LanceEncodingsIo;
+pub use reader::BatchSizeEstimate;
 
 use format::MAGIC;
 use lance_core::{Error, Result};
