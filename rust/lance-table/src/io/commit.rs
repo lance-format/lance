@@ -2345,36 +2345,51 @@ mod tests {
         );
     }
 
-    /// A minimal `object_store::ObjectStore` wrapper that counts calls to `list()`.
-    /// All operations are delegated to an inner `InMemory` store.
-    struct ListCountingStore {
-        inner: object_store::memory::InMemory,
-        list_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// A minimal `object_store::ObjectStore` wrapper that simulates paginated
+    /// listing with a configurable page size and counts how many pages are fetched.
+    ///
+    /// This is used to verify that `resolve_version_from_listing` stays within a
+    /// single listing page even when the table has many historical versions. The
+    /// inner store's `list()` returns all objects at once (no real pagination); this
+    /// wrapper slices the results into `page_size`-sized chunks and calls
+    /// `list_with_offset` on the inner store for each subsequent chunk, incrementing
+    /// `page_count` on every such fetch. A real paginating object store (e.g. S3)
+    /// behaves the same way: each page is a separate network round-trip, and
+    /// consuming more items than fit in one page triggers an extra round-trip.
+    struct PaginatingCountingStore {
+        inner: Arc<dyn OSObjectStore>,
+        page_size: usize,
+        page_count: Arc<AtomicUsize>,
     }
 
-    impl ListCountingStore {
-        fn new(list_calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    impl PaginatingCountingStore {
+        fn new(
+            inner: Arc<dyn OSObjectStore>,
+            page_size: usize,
+            page_count: Arc<AtomicUsize>,
+        ) -> Self {
             Self {
-                inner: object_store::memory::InMemory::new(),
-                list_calls,
+                inner,
+                page_size,
+                page_count,
             }
         }
     }
 
-    impl std::fmt::Display for ListCountingStore {
+    impl std::fmt::Display for PaginatingCountingStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "ListCountingStore")
+            write!(f, "PaginatingCountingStore")
         }
     }
 
-    impl std::fmt::Debug for ListCountingStore {
+    impl std::fmt::Debug for PaginatingCountingStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("ListCountingStore").finish()
+            f.debug_struct("PaginatingCountingStore").finish()
         }
     }
 
     #[async_trait::async_trait]
-    impl object_store::ObjectStore for ListCountingStore {
+    impl object_store::ObjectStore for PaginatingCountingStore {
         async fn put_opts(
             &self,
             location: &Path,
@@ -2410,22 +2425,64 @@ mod tests {
 
         fn delete_stream(
             &self,
-            locations: futures::stream::BoxStream<
-                'static,
-                object_store::Result<Path>,
-            >,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
         ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
             self.inner.delete_stream(locations)
         }
 
+        /// Returns a paginated stream that fetches `page_size` items per page,
+        /// calling `list_with_offset` on the inner store for each subsequent page.
+        /// Each page fetch increments `page_count`, mirroring the cost of a real
+        /// S3 `ListObjectsV2` round-trip.
         fn list(
             &self,
             prefix: Option<&Path>,
         ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
-            self.list_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.list(prefix)
+            use futures::StreamExt as _;
+            let page_size = self.page_size;
+            let inner = self.inner.clone();
+            let page_count = self.page_count.clone();
+            let prefix = prefix.cloned();
+
+            // State: Some(None) = first page, Some(Some(k)) = next page after k, None = done.
+            futures::stream::unfold(
+                Some(Option::<Path>::None),
+                move |state| {
+                    let inner = inner.clone();
+                    let page_count = page_count.clone();
+                    let prefix = prefix.clone();
+                    async move {
+                        let Some(last_key) = state else {
+                            return None;
+                        };
+                        page_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let stream = match &last_key {
+                            None => inner.list(prefix.as_ref()),
+                            Some(k) => inner.list_with_offset(prefix.as_ref(), k),
+                        };
+                        let page: Vec<object_store::Result<object_store::ObjectMeta>> =
+                            stream.take(page_size).collect().await;
+                        if page.is_empty() {
+                            return None;
+                        }
+                        let last_key = page
+                            .iter()
+                            .filter_map(|r| r.as_ref().ok())
+                            .map(|m| m.location.clone())
+                            .last();
+                        // If the page was full there may be more items; stop otherwise.
+                        let next_state = if page.len() == page_size {
+                            Some(last_key)
+                        } else {
+                            None
+                        };
+                        Some((futures::stream::iter(page), next_state))
+                    }
+                },
+            )
+            .flatten()
+            .boxed()
         }
 
         fn list_with_offset(
@@ -2434,8 +2491,6 @@ mod tests {
             offset: &Path,
         ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
-            self.list_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.list_with_offset(prefix, offset)
         }
 
@@ -2456,43 +2511,48 @@ mod tests {
         }
     }
 
-    /// Regression test: `resolve_version_from_listing` must issue exactly one list
-    /// request even when the table has far more than 100 historical versions.
+    /// Regression test: `resolve_version_from_listing` must stay within a single
+    /// listing page even when the table has far more than 100 historical versions.
     ///
-    /// Before the fix the validation loop called `take(999)`, which consumed up to
-    /// the provider's full default listing page (~1,000 keys) on every open.  After
-    /// the fix the loop is capped at `take(99)` (100 entries total including
-    /// `first`), which stays well within a single page regardless of version count.
+    /// The test wraps an in-memory store in `PaginatingCountingStore` (page_size = 200)
+    /// to simulate a paginating object store such as S3.  With 1 000 V2 manifest
+    /// files and `take(99)` the consumer reads only 100 items (< 200 per page) so
+    /// exactly one page is fetched.  The companion integration test
+    /// `test_resolve_latest_version_single_list_page` in `s3_test.rs` exercises the
+    /// same code path against LocalStack to confirm the behaviour holds for real S3
+    /// pagination.
     #[tokio::test]
-    async fn test_resolve_latest_version_makes_one_list_call() {
-        let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counting_inner = Arc::new(ListCountingStore::new(list_calls.clone()));
-
+    async fn test_resolve_latest_version_single_page() {
         let mut object_store = ObjectStore::memory();
-        // Replace inner with a counting wrapper; keep everything else from memory().
-        object_store.inner = counting_inner.clone();
-        // Force the lexically-ordered fast path (resolve_version_from_listing).
         object_store.list_is_lexically_ordered = true;
 
         let base = Path::from("base");
 
-        // Write 2000 V2 manifest files to ensure we far exceed the old 999-entry window.
-        for version in 0..2000u64 {
+        // Write 1000 V2 manifest files while the store still has a plain inner.
+        for version in 0..1000u64 {
             let path = ManifestNamingScheme::V2.manifest_path(&base, version);
             object_store.put(&path, b"".as_slice()).await.unwrap();
         }
 
-        // Reset the counter after writes — we only care about reads triggered by
-        // current_manifest_path, not the put operations above.
-        list_calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        // Now wrap the inner store with a paginating counter (page_size = 200).
+        // The consumer reads at most 100 items (1 from `first` + 99 from `take`),
+        // which fits within the first 200-item page → page_count must stay at 1.
+        let page_count = Arc::new(AtomicUsize::new(0));
+        object_store.inner = Arc::new(PaginatingCountingStore::new(
+            object_store.inner.clone(),
+            200,
+            page_count.clone(),
+        ));
 
         let location = current_manifest_path(&object_store, &base).await.unwrap();
-        assert_eq!(location.version, 1999);
+        assert_eq!(location.version, 999);
 
-        let calls = list_calls.load(std::sync::atomic::Ordering::SeqCst);
-        // The only list call permitted is the single call that opens the stream.
-        // A second page fetch (which the old take(999) code could trigger on a
-        // paginating store) would increment this counter.
-        assert_eq!(calls, 1, "expected exactly 1 list call, got {}", calls);
+        let count = page_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            count,
+            1,
+            "expected exactly 1 page fetch (≤ 200 items consumed), got {}",
+            count
+        );
     }
 }

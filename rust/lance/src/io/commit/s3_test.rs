@@ -8,7 +8,7 @@ use crate::{
     dataset::{
         CommitBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder,
     },
-    io::{ObjectStoreParams, StorageOptionsAccessor},
+    io::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor},
 };
 use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -412,4 +412,242 @@ async fn test_ddb_open_iops() {
     // while the manifest body is served from the Session metadata cache.
     assert_io_eq!(io_stats, read_iops, 1);
     assert_io_eq!(io_stats, write_iops, 0);
+}
+
+/// A minimal `object_store::ObjectStore` wrapper that simulates paginated listing
+/// with a configurable page size and counts how many pages are fetched.
+///
+/// All non-listing operations are forwarded to the inner store unchanged.
+/// `list()` slices the inner store's results into `page_size`-sized chunks and
+/// calls `list_with_offset` on the inner store for each subsequent chunk,
+/// incrementing `page_count` on every fetch — just as each real S3
+/// `ListObjectsV2` network request increments the cost.
+struct PaginatingCountingStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    page_size: usize,
+    page_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::fmt::Display for PaginatingCountingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PaginatingCountingStore")
+    }
+}
+
+impl std::fmt::Debug for PaginatingCountingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaginatingCountingStore").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for PaginatingCountingStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        bytes: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, bytes, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &object_store::path::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    /// Returns a paginated stream that fetches `page_size` items per page from
+    /// the inner store using `list_with_offset`, counting each page fetch.
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<
+        'static,
+        object_store::Result<object_store::ObjectMeta>,
+    > {
+        use futures::StreamExt as _;
+        let page_size = self.page_size;
+        let inner = self.inner.clone();
+        let page_count = self.page_count.clone();
+        let prefix = prefix.cloned();
+
+        // State: Some(None)      = first page (call `list`)
+        //        Some(Some(key)) = subsequent page (call `list_with_offset`)
+        //        None            = done
+        futures::stream::unfold(
+            Some(Option::<object_store::path::Path>::None),
+            move |state| {
+                let inner = inner.clone();
+                let page_count = page_count.clone();
+                let prefix = prefix.clone();
+                async move {
+                    let Some(last_key) = state else {
+                        return None;
+                    };
+                    page_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let stream = match &last_key {
+                        None => inner.list(prefix.as_ref()),
+                        Some(k) => inner.list_with_offset(prefix.as_ref(), k),
+                    };
+                    let page: Vec<object_store::Result<object_store::ObjectMeta>> =
+                        stream.take(page_size).collect().await;
+                    if page.is_empty() {
+                        return None;
+                    }
+                    let last_key = page
+                        .iter()
+                        .filter_map(|r| r.as_ref().ok())
+                        .map(|m| m.location.clone())
+                        .last();
+                    let next_state = if page.len() == page_size {
+                        Some(last_key)
+                    } else {
+                        None
+                    };
+                    Some((futures::stream::iter(page), next_state))
+                }
+            },
+        )
+        .flatten()
+        .boxed()
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<
+        'static,
+        object_store::Result<object_store::ObjectMeta>,
+    > {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// Integration regression test: `resolve_version_from_listing` must stay within
+/// a single listing page even when the table has many historical versions.
+///
+/// The test uploads 1 000 V2 manifest files to a real LocalStack S3 bucket, then
+/// wraps the S3 `ObjectStore` in a `PaginatingCountingStore` (page_size = 200) that
+/// simulates S3's per-request page limit. With `take(99)` the consumer reads only
+/// 100 items — well within one 200-item page — so `page_count` must stay at 1.
+///
+/// Without the fix (`take(999)`), the consumer would read 1 000 items across five
+/// pages and `page_count` would be 5, failing the assertion. The companion unit
+/// test `test_resolve_latest_version_single_page` in `lance-table` exercises the
+/// same code path against an in-memory store with identical pagination simulation.
+#[tokio::test]
+async fn test_resolve_latest_version_single_list_page() {
+    use futures::StreamExt as _;
+    use lance_table::io::commit::{CommitHandler, ConditionalPutCommitHandler, ManifestNamingScheme};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let bucket = S3Bucket::new("test-resolve-listing-page-count").await;
+    let dataset_path = "dataset.lance";
+    let bucket_uri = format!("s3://{}/{}", bucket.0, dataset_path);
+
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            CONFIG
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        ))),
+        ..Default::default()
+    };
+    let registry = Arc::new(ObjectStoreRegistry::default());
+    let (s3_store, base_path) =
+        ObjectStore::from_uri_and_params(registry, &bucket_uri, &store_params)
+            .await
+            .unwrap();
+
+    // Upload 1 000 V2 manifest files in parallel (50 concurrent).
+    // These represent historical versions of the dataset.
+    futures::stream::iter(0..1000u64)
+        .map(|version| {
+            let store = s3_store.clone();
+            let base = base_path.clone();
+            async move {
+                let path = ManifestNamingScheme::V2.manifest_path(&base, version);
+                store.put(&path, b"".as_slice()).await
+            }
+        })
+        .buffer_unordered(50)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    // Wrap the S3 store's inner with a paginating counter (page_size = 200).
+    // Each "page" corresponds to one S3 ListObjectsV2 network round-trip.
+    let page_count = Arc::new(AtomicUsize::new(0));
+    let mut test_store = (*s3_store).clone();
+    test_store.inner = Arc::new(PaginatingCountingStore {
+        inner: s3_store.inner.clone(),
+        page_size: 200,
+        page_count: page_count.clone(),
+    });
+
+    // resolve_latest_location → current_manifest_path → resolve_version_from_listing
+    let location = ConditionalPutCommitHandler
+        .resolve_latest_location(&base_path, &test_store)
+        .await
+        .unwrap();
+
+    assert_eq!(location.version, 999, "expected the newest version (999)");
+
+    let count = page_count.load(Ordering::Relaxed);
+    assert_eq!(
+        count,
+        1,
+        "resolve_version_from_listing must stay within 1 listing page (≤ 200 items consumed); \
+         got {} page(s). Without the take(99) cap the old take(999) code would consume ≥5 pages.",
+        count
+    );
 }
