@@ -900,6 +900,35 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
         None
     }
+
+    /// Returns a pessimistic upper bound on the decoded byte count for `num_rows` values
+    /// in this chunk starting at `offset_in_chunk`, without decompressing the values.
+    ///
+    /// `chunk_buffers` is the raw buffer data for this chunk (as stored in the file).
+    /// `offset_in_chunk` is the number of rows already consumed from the start of the chunk.
+    ///
+    /// The default implementation returns `None`, indicating the byte count is not available
+    /// without decompression. Implementations for variable-width types (e.g. binary) should
+    /// override this to read the offset table from `chunk_buffers` directly.
+    ///
+    /// # Known gaps (byte-budget planning accuracy)
+    ///
+    /// The following mini-block decoders currently return `None`, causing the byte budget
+    /// to fall back to schema-based estimates:
+    ///
+    /// - **`PackedStructFixedWidthMiniBlockDecompressor`**: all child fields are
+    ///   fixed-width so the total decoded size is the sum of `bits_per_values` × rows,
+    ///   but this is not yet wired through `decoded_bytes_from_chunk`.  (The schema-based
+    ///   fallback is exact for fixed-width types, so this gap has no practical impact on
+    ///   budget accuracy today — it is listed for completeness.)
+    fn decoded_bytes_from_chunk(
+        &self,
+        _chunk_buffers: &[crate::buffer::LanceBuffer],
+        _offset_in_chunk: u64,
+        _num_rows: u64,
+    ) -> Option<u64> {
+        None
+    }
 }
 
 pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
@@ -924,6 +953,46 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
+
+    /// Returns a pessimistic upper bound on the total decompressed size for a
+    /// slice of `num_values` compressed values.
+    ///
+    /// `data` is the raw byte buffer covering exactly those values (pre-rebased,
+    /// i.e. `data_starts[start]..data_starts[end]` from [`VariableFullZipDecoder`]).
+    /// `offsets_bytes` is the corresponding slice of the offsets buffer
+    /// (`offset_starts[start]..offset_starts[end] + bytes_per_offset`), and
+    /// `bits_per_offset` is either 32 or 64.
+    ///
+    /// The offsets let implementations iterate per-value frames to read embedded
+    /// size headers (LZ4, Zstd), or apply a fixed multiplier (FSST, plain).
+    ///
+    /// Returns `None` when neither approach is available; the caller falls back to
+    /// the compressed size as a (potentially underestimating) proxy.
+    ///
+    /// # Known gaps (byte-budget planning accuracy)
+    ///
+    /// The following cases currently return `None` or an approximate bound, causing
+    /// the byte budget to fall back to schema-based estimates or compressed sizes:
+    ///
+    /// - **`PackedStructVariablePerValueDecompressor`** (full-zip path): packed struct
+    ///   layout is a column-to-row transformation rather than compression, so the
+    ///   decompressed size equals the sum of per-field decoded sizes.  We do not yet
+    ///   walk the field descriptors to compute this; the decompressor currently
+    ///   returns `None`.
+    ///
+    /// - **FSST wrapping a block compressor** (full-zip path): the 8× pessimistic
+    ///   multiplier is applied to the inner decompressor's output size.  When the
+    ///   inner decompressor also returns `None` (e.g. an unimplemented combination),
+    ///   the 8× is applied to the raw compressed bytes instead, which may
+    ///   underestimate the true decoded size if the inner ratio exceeds 1×.
+    fn decompressed_size(
+        &self,
+        _data: &[u8],
+        _offsets_bytes: &[u8],
+        _bits_per_offset: u8,
+    ) -> Option<u64> {
+        None
+    }
 }
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
