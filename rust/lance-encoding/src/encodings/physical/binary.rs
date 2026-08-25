@@ -318,6 +318,51 @@ fn chunk_offset_violation_error<T: Copy + Into<u64>>(offsets: &[T], chunk_len: u
 }
 
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
+    /// Returns the exact decoded byte count for `num_rows` binary values starting at
+    /// `offset_in_chunk` within the chunk.
+    ///
+    /// The binary mini-block format stores all offsets at the front of the single-element
+    /// buffer followed by the value bytes. The byte count for a slice of values is simply
+    /// `offset[offset_in_chunk + num_rows] - offset[offset_in_chunk]` (string data bytes)
+    /// plus `(num_rows + 1) × bytes_per_offset` (the offset array slice itself).
+    fn decoded_bytes_from_chunk(
+        &self,
+        chunk_buffers: &[crate::buffer::LanceBuffer],
+        offset_in_chunk: u64,
+        num_rows: u64,
+    ) -> Option<u64> {
+        if chunk_buffers.len() != 1 {
+            return None;
+        }
+        let data = &chunk_buffers[0];
+        let bytes_per_offset = self.bits_per_offset as usize / 8;
+        let start = offset_in_chunk as usize;
+        let end = (offset_in_chunk + num_rows) as usize;
+        // Need at least end + 1 offset entries to read [start..=end].
+        let needed = (end + 1) * bytes_per_offset;
+        if data.len() < needed {
+            return None;
+        }
+        let data_bytes = if self.bits_per_offset == 64 {
+            let offsets = data.borrow_to_typed_slice::<u64>();
+            let slice = offsets.as_ref();
+            if slice.len() <= end {
+                return None;
+            }
+            slice[end].wrapping_sub(slice[start])
+        } else {
+            let offsets = data.borrow_to_typed_slice::<u32>();
+            let slice = offsets.as_ref();
+            if slice.len() <= end {
+                return None;
+            }
+            (slice[end].wrapping_sub(slice[start])) as u64
+        };
+        // Total: the string data bytes + the slice of offset entries (num_rows + 1 offsets).
+        let offset_bytes = (num_rows + 1) * bytes_per_offset as u64;
+        Some(data_bytes + offset_bytes)
+    }
+
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
     // to the number of values this MiniBlock has, BinaryMiniBlock doesn't store `the number of values`
     // it has so assertion can not be done here and the caller of `decompress` must ensure
@@ -554,6 +599,11 @@ pub struct VariableDecoder {}
 impl VariablePerValueDecompressor for VariableDecoder {
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         Ok(DataBlock::VariableWidth(data))
+    }
+
+    fn decompressed_size(&self, data: &[u8], _offsets_bytes: &[u8], _bits_per_offset: u8) -> Option<u64> {
+        // Plain encoding: stored bytes == decoded bytes.
+        Some(data.len() as u64)
     }
 }
 
