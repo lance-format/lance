@@ -4545,6 +4545,35 @@ impl StructuralPrimitiveFieldDecoder {
             rows_drained_in_current: 0,
         }
     }
+
+    fn decoded_bytes_for_rows(&self, rows: u64) -> lance_core::Result<u64> {
+        use crate::decoder::estimate_bytes_per_row;
+        let mut remaining = rows;
+        let mut total = 0u64;
+        for (page_num, page) in self.page_decoders.iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            let available = if page_num == 0 {
+                page.num_rows().saturating_sub(self.rows_drained_in_current)
+            } else {
+                page.num_rows()
+            };
+            let take = available.min(remaining);
+            let page_bytes = match page.decoded_bytes(take) {
+                Ok(bytes) => bytes,
+                // Page decoder has no exact size info (e.g. miniblock-encoded
+                // variable-width data) — fall back to the schema-based estimate.
+                Err(Error::NotSupported { .. }) => {
+                    (take as f64 * estimate_bytes_per_row(self.field.data_type())) as u64
+                }
+                Err(e) => return Err(e),
+            };
+            total += page_bytes;
+            remaining -= take;
+        }
+        Ok(total)
+    }
 }
 
 impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
@@ -4594,6 +4623,44 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
 
     fn data_type(&self) -> &DataType {
         self.field.data_type()
+    }
+
+    fn plan_decoded_bytes(&self, rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
+        use crate::decoder::CANDIDATE_BATCH_SIZES;
+        let data_type = self.field.data_type();
+
+        // Fixed-width: exact from type metadata, no page inspection needed.
+        if let Some(byte_width) = data_type.byte_width_opt() {
+            let mut out = [0u64; 8];
+            for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+                let rows = (c as u64).min(rows_remaining);
+                out[i] = rows * byte_width as u64;
+            }
+            return Ok(out);
+        }
+
+        // Boolean: bit-packed, 1 bit per value.
+        if matches!(data_type, DataType::Boolean) {
+            let mut out = [0u64; 8];
+            for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+                let rows = (c as u64).min(rows_remaining);
+                out[i] = rows.div_ceil(8);
+            }
+            return Ok(out);
+        }
+
+        // Null type: no data bytes.
+        if matches!(data_type, DataType::Null) {
+            return Ok([0u64; 8]);
+        }
+
+        // Variable-width: walk page decoders for exact byte counts.
+        let mut out = [0u64; 8];
+        for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+            let rows = (c as u64).min(rows_remaining);
+            out[i] = self.decoded_bytes_for_rows(rows)?;
+        }
+        Ok(out)
     }
 }
 
