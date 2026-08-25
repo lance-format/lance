@@ -340,8 +340,8 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// Search one partition and preserve the local offsets of emitted rows.
     ///
-    /// Implementations may reject this operation. The initial results-cache
-    /// integration uses it only for flat IVF_RQ and IVF_SQ sub-indices.
+    /// Implementations may reject this operation. Quantized refinement uses it
+    /// only for flat IVF_RQ sub-indices.
     async fn search_in_partition_with_candidates(
         &self,
         _partition_id: usize,
@@ -358,8 +358,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// The returned rows preserve the order of `offsets_in_partition`. This
     /// operation does not apply a pre-filter or distance bounds; callers must
-    /// validate cached candidate identity and apply query result shaping around
-    /// it.
+    /// validate candidate identity and apply query result shaping around it.
     async fn score_partition_candidates(
         &self,
         _partition_id: usize,

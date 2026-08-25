@@ -2872,12 +2872,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         metrics: &dyn MetricsCollector,
         candidate_limit: usize,
     ) -> Result<PartitionSearchResult> {
-        if S::name() != "FLAT"
-            || !matches!(
-                Q::quantization_type(),
-                QuantizationType::Rabit | QuantizationType::Scalar
-            )
-        {
+        if S::name() != "FLAT" || Q::quantization_type() != QuantizationType::Rabit {
             return Err(Error::not_supported(format!(
                 "candidate-producing search is not supported for IVF_{}_{}",
                 S::name(),
@@ -2952,12 +2947,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         offsets_in_partition: &[u32],
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        if S::name() != "FLAT"
-            || !matches!(
-                Q::quantization_type(),
-                QuantizationType::Rabit | QuantizationType::Scalar
-            )
-        {
+        if S::name() != "FLAT" || Q::quantization_type() != QuantizationType::Rabit {
             return Err(Error::not_supported(format!(
                 "selected-candidate scoring is not supported for IVF_{}_{}",
                 S::name(),

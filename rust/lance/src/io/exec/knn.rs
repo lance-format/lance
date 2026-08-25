@@ -47,14 +47,15 @@ use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
 };
+use lance_index::IndexType;
 use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::minhash_lsh::{MinHashHit, TopHits};
 use lance_index::vector::DIST_Q_C_COLUMN;
 use lance_index::vector::graph::OrderedFloat;
 use lance_index::vector::{
-    DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, PartitionSearchControl, Query, VectorIndex,
-    flat::compute_distance,
+    ApproxMode, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, PartitionSearchControl, Query,
+    VectorIndex, flat::compute_distance,
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
@@ -72,7 +73,6 @@ use crate::session::index_caches::SegmentOwnershipMaskKey;
 use crate::{Error, Result};
 use lance_arrow::*;
 
-use super::knn_results_cache;
 use super::row_addr_mask::MaskAndLoader;
 use super::utils::{
     FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterMasks,
@@ -112,21 +112,14 @@ impl AnnPartitionMetrics {
 pub struct AnnIndexMetrics {
     index_metrics: IndexMetrics,
     partitions_searched: Count,
-    results_cache_hits: Count,
-    results_cache_misses: Count,
     baseline_metrics: BaselineMetrics,
 }
-
-const VECTOR_RESULTS_CACHE_HITS_METRIC: &str = "vector_results_cache_hits";
-const VECTOR_RESULTS_CACHE_MISSES_METRIC: &str = "vector_results_cache_misses";
 
 impl AnnIndexMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             index_metrics: IndexMetrics::new(metrics, partition),
             partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
-            results_cache_hits: metrics.new_count(VECTOR_RESULTS_CACHE_HITS_METRIC, partition),
-            results_cache_misses: metrics.new_count(VECTOR_RESULTS_CACHE_MISSES_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -1287,6 +1280,7 @@ pub fn new_knn_exec(
     prefilter_source: PreFilterSource,
     overlay_block: Option<RowAddrMask>,
     external_mask: Option<Arc<RowAddrMask>>,
+    quantized_refine_factor: Option<u32>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
@@ -1306,6 +1300,9 @@ pub fn new_knn_exec(
     }
     if external_mask.is_some() {
         sub_index = sub_index.with_external_mask(external_mask);
+    }
+    if let Some(factor) = quantized_refine_factor {
+        sub_index = sub_index.with_quantized_refine_factor(factor)?;
     }
 
     Ok(Arc::new(sub_index))
@@ -1582,8 +1579,8 @@ pub struct ANNIvfSubIndexExec {
 
     metrics: ExecutionPlanMetricsSet,
 
-    #[cfg(test)]
-    results_cache_enabled_override: Option<bool>,
+    /// Coarse-candidate overfetch factor for RQ Fast-to-Accurate refinement.
+    quantized_refine_factor: Option<u32>,
 }
 
 impl ANNIvfSubIndexExec {
@@ -1616,8 +1613,7 @@ impl ANNIvfSubIndexExec {
             external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-            #[cfg(test)]
-            results_cache_enabled_override: None,
+            quantized_refine_factor: None,
         })
     }
 
@@ -1633,6 +1629,17 @@ impl ANNIvfSubIndexExec {
     pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
         self.external_mask = mask;
         self
+    }
+
+    /// Refine RQ candidates from one-bit Fast scores to multi-bit Accurate scores.
+    pub fn with_quantized_refine_factor(mut self, factor: u32) -> Result<Self> {
+        if factor == 0 {
+            return Err(Error::invalid_input(
+                "quantized refine factor must be greater than zero",
+            ));
+        }
+        self.quantized_refine_factor = Some(factor);
+        Ok(self)
     }
 
     /// Returns a reference to the vector query.
@@ -1654,29 +1661,6 @@ impl ANNIvfSubIndexExec {
     pub fn prefilter_source(&self) -> &PreFilterSource {
         &self.prefilter_source
     }
-
-    fn is_results_cache_enabled(&self) -> bool {
-        #[cfg(test)]
-        if let Some(is_enabled) = self.results_cache_enabled_override {
-            return is_enabled;
-        }
-        knn_results_cache::is_enabled()
-    }
-
-    #[cfg(test)]
-    fn copy_with_results_cache_enabled_for_testing(&self, is_enabled: bool) -> Result<Self> {
-        let mut copy = Self::try_new(
-            self.input.clone(),
-            self.dataset.clone(),
-            self.indices.clone(),
-            self.query.clone(),
-            self.prefilter_source.clone(),
-        )?;
-        copy.overlay_block = self.overlay_block.clone();
-        copy.external_mask = self.external_mask.clone();
-        copy.results_cache_enabled_override = Some(is_enabled);
-        Ok(copy)
-    }
 }
 
 impl DisplayAs for ANNIvfSubIndexExec {
@@ -1694,8 +1678,12 @@ impl DisplayAs for ANNIvfSubIndexExec {
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                     self.indices.len(),
-                    metric_str
-                )
+                    metric_str,
+                )?;
+                if let Some(factor) = self.quantized_refine_factor {
+                    write!(f, ", quantized_refine_factor={factor}")?;
+                }
+                Ok(())
             }
             DisplayFormatType::TreeRender => {
                 write!(
@@ -1704,8 +1692,12 @@ impl DisplayAs for ANNIvfSubIndexExec {
                     self.indices[0].name,
                     self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                     self.indices.len(),
-                    metric_str
-                )
+                    metric_str,
+                )?;
+                if let Some(factor) = self.quantized_refine_factor {
+                    write!(f, "\nquantized_refine_factor={factor}")?;
+                }
+                Ok(())
             }
         }
     }
@@ -1930,6 +1922,84 @@ fn restrict_to_segment(
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
+struct RestrictedPreFilter {
+    inner: Arc<dyn PreFilter>,
+    restriction: Arc<RowAddrMask>,
+}
+
+#[async_trait::async_trait]
+impl PreFilter for RestrictedPreFilter {
+    async fn wait_for_ready(&self) -> Result<()> {
+        self.inner.wait_for_ready().await
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn mask(&self) -> Arc<RowAddrMask> {
+        Arc::new(self.inner.mask().as_ref().clone() & self.restriction.as_ref().clone())
+    }
+
+    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        self.mask().selected_indices(row_ids)
+    }
+}
+
+fn quantized_top_k(batch: &RecordBatch, query: &Query) -> Result<RecordBatch> {
+    let row_ids = batch
+        .column_by_name(ROW_ID)
+        .ok_or_else(|| Error::internal("quantized refinement result has no row-id column"))?
+        .as_primitive::<UInt64Type>();
+    let distances = batch
+        .column_by_name(DIST_COL)
+        .ok_or_else(|| Error::internal("quantized refinement result has no distance column"))?
+        .as_primitive::<Float32Type>();
+    if row_ids.len() != distances.len() {
+        return Err(Error::internal(format!(
+            "quantized refinement returned {} row ids and {} distances",
+            row_ids.len(),
+            distances.len()
+        )));
+    }
+
+    let lower_bound = query.lower_bound.unwrap_or(f32::MIN);
+    let upper_bound = query.upper_bound.unwrap_or(f32::MAX);
+    let mut top_results = BinaryHeap::with_capacity(query.k);
+    for row_idx in 0..row_ids.len() {
+        if row_ids.is_null(row_idx) || distances.is_null(row_idx) {
+            continue;
+        }
+        let distance = distances.value(row_idx);
+        if distance.is_nan() || distance < lower_bound || distance >= upper_bound {
+            continue;
+        }
+        let node = (OrderedFloat(distance), row_ids.value(row_idx));
+        if top_results.len() < query.k {
+            top_results.push(node);
+        } else if top_results.peek().is_some_and(|farthest| farthest > &node) {
+            top_results.pop();
+            top_results.push(node);
+        }
+    }
+
+    let mut ordered = top_results.into_vec();
+    ordered.sort_unstable();
+    let mut row_ids = Vec::with_capacity(ordered.len());
+    let mut distances = Vec::with_capacity(ordered.len());
+    for (distance, row_id) in ordered {
+        row_ids.push(row_id);
+        distances.push(distance.0);
+    }
+    Ok(RecordBatch::try_new(
+        KNN_INDEX_SCHEMA.clone(),
+        vec![
+            Arc::new(Float32Array::from(distances)),
+            Arc::new(UInt64Array::from(row_ids)),
+        ],
+    )?)
+}
+
 fn effective_query_parallelism(
     query: &Query,
     index: &dyn VectorIndex,
@@ -1967,12 +2037,73 @@ impl ANNIvfSubIndexExec {
         pre_filter: Arc<dyn PreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         seg_mask: Option<Arc<RowAddrMask>>,
+        quantized_refine_factor: Option<u32>,
     ) -> DataFusionResult<RecordBatch> {
-        let batch = index
-            .search_in_partition(part_id, &query, pre_filter, &metrics.index_metrics)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {}", e)))
-            .await?;
-        let batch = restrict_to_segment(batch, seg_mask.as_deref())?;
+        let batch = if let Some(factor) = quantized_refine_factor {
+            if index.index_type() != IndexType::IvfRq {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "quantized refinement requires an IVF_RQ flat index, got {}",
+                    index.index_type()
+                )));
+            }
+            let candidate_limit = query.k.checked_mul(factor as usize).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "quantized refinement candidate count overflows: k={} factor={factor}",
+                    query.k
+                ))
+            })?;
+            let mut coarse_query = query.clone();
+            coarse_query.approx_mode = ApproxMode::Fast;
+            coarse_query.refine_factor = None;
+            coarse_query.lower_bound = None;
+            coarse_query.upper_bound = None;
+            let candidate_prefilter: Arc<dyn PreFilter> = match &seg_mask {
+                Some(restriction) => Arc::new(RestrictedPreFilter {
+                    inner: pre_filter,
+                    restriction: restriction.clone(),
+                }),
+                None => pre_filter,
+            };
+            let candidates = index
+                .search_in_partition_with_candidates(
+                    part_id,
+                    &coarse_query,
+                    candidate_prefilter,
+                    &metrics.index_metrics,
+                    candidate_limit,
+                )
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "failed to discover quantized refinement candidates: {e}"
+                    ))
+                })?;
+            let offsets = candidates
+                .candidates
+                .iter()
+                .map(|candidate| candidate.offset_in_partition)
+                .collect::<Vec<_>>();
+            let scored = index
+                .score_partition_candidates(part_id, &query, &offsets, &metrics.index_metrics)
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "failed to score quantized refinement candidates: {e}"
+                    ))
+                })?;
+            let scored = restrict_to_segment(scored, seg_mask.as_deref())?;
+            quantized_top_k(&scored, &query).map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "failed to select quantized refinement results: {e}"
+                ))
+            })?
+        } else {
+            let batch = index
+                .search_in_partition(part_id, &query, pre_filter, &metrics.index_metrics)
+                .map_err(|e| DataFusionError::Execution(format!("Failed to calculate KNN: {e}")))
+                .await?;
+            restrict_to_segment(batch, seg_mask.as_deref())?
+        };
         metrics.baseline_metrics.record_output(batch.num_rows());
         Ok(batch)
     }
@@ -2012,6 +2143,7 @@ impl ANNIvfSubIndexExec {
         state: Arc<ANNIvfEarlySearchResults>,
         target_partitions: usize,
         seg_mask: Option<Arc<RowAddrMask>>,
+        quantized_refine_factor: Option<u32>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
             let max_nprobes = query
@@ -2105,7 +2237,7 @@ impl ANNIvfSubIndexExec {
 
             let query_parallelism =
                 effective_query_parallelism(&query, index.as_ref(), target_partitions);
-            if query_parallelism <= 1 {
+            if query_parallelism <= 1 && quantized_refine_factor.is_none() {
                 return stream::once(async move {
                     let prefilter: Arc<dyn PreFilter> = prefilter;
                     let index_metrics: Arc<dyn MetricsCollector> =
@@ -2154,6 +2286,7 @@ impl ANNIvfSubIndexExec {
                     let state = state.clone();
                     let index = index.clone();
                     let seg_mask = seg_mask.clone();
+                    let quantized_refine_factor = quantized_refine_factor;
                     async move {
                         metrics.partitions_searched.add(1);
                         let batch = Self::search_partition(
@@ -2163,6 +2296,7 @@ impl ANNIvfSubIndexExec {
                             pre_filter,
                             metrics,
                             seg_mask,
+                            quantized_refine_factor,
                         )
                         .await?;
                         state.record_late_batch(batch.num_rows());
@@ -2190,12 +2324,13 @@ impl ANNIvfSubIndexExec {
         state: Arc<ANNIvfEarlySearchResults>,
         target_partitions: usize,
         seg_mask: Option<Arc<RowAddrMask>>,
+        quantized_refine_factor: Option<u32>,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
 
         let query_parallelism =
             effective_query_parallelism(&query, index.as_ref(), target_partitions);
-        if query_parallelism <= 1 {
+        if query_parallelism <= 1 && quantized_refine_factor.is_none() {
             metrics.partitions_searched.add(minimum_nprobes);
             return stream::once(async move {
                 let prefilter: Arc<dyn PreFilter> = prefilter;
@@ -2242,6 +2377,7 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 let seg_mask = seg_mask.clone();
+                let quantized_refine_factor = quantized_refine_factor;
                 async move {
                     let batch = Self::search_partition(
                         index,
@@ -2250,6 +2386,7 @@ impl ANNIvfSubIndexExec {
                         pre_filter,
                         metrics,
                         seg_mask,
+                        quantized_refine_factor,
                     )
                     .await?;
                     state.record_batch(&batch);
@@ -2316,8 +2453,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 external_mask: self.external_mask.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
-                #[cfg(test)]
-                results_cache_enabled_override: self.results_cache_enabled_override,
+                quantized_refine_factor: self.quantized_refine_factor,
             }
         } else {
             return Err(DataFusionError::Internal(
@@ -2336,6 +2472,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let schema = self.schema();
         let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
+        let quantized_refine_factor = self.quantized_refine_factor;
         let ds = self.dataset.clone();
         let column = self.query.column.clone();
         let indices = self.indices.clone();
@@ -2351,19 +2488,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 HashSet::new()
             });
         let prefilter_source = self.prefilter_source.clone();
-        let has_prefilter =
-            !matches!(prefilter_source, PreFilterSource::None) || self.external_mask.is_some();
-        let has_overlay = self.overlay_block.is_some();
-        let results_cache_enabled = self.is_results_cache_enabled();
-        let index_metadata_by_uuid = results_cache_enabled.then(|| {
-            Arc::new(
-                indices
-                    .iter()
-                    .cloned()
-                    .map(|metadata| (metadata.uuid, metadata))
-                    .collect::<HashMap<_, _>>(),
-            )
-        });
         let metrics = Arc::new(AnnIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
         let timer = Instant::now();
@@ -2441,7 +2565,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let indices_by_uuid = indices_by_uuid.clone();
                     let state = state.clone();
                     let restricted_segments = restricted_segments.clone();
-                    let index_metadata_by_uuid = index_metadata_by_uuid.clone();
+                    let quantized_refine_factor = quantized_refine_factor;
                     let mut query = query.clone();
                     async move {
                         let index_metadata = indices_by_uuid.get(&index_uuid).ok_or_else(|| {
@@ -2477,68 +2601,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         } else {
                             None
                         };
-                        if results_cache_enabled
-                            && let Some(index_metadata) = index_metadata_by_uuid
-                                .as_ref()
-                                .and_then(|metadata| metadata.get(&index_uuid))
-                            && let Some(identity) = knn_results_cache::identity_for_query(
-                                ds.as_ref(),
-                                index_metadata,
-                                raw_index.as_ref(),
-                                &query,
-                                part_ids.values(),
-                                has_prefilter,
-                                has_overlay,
-                            )
-                            .await
-                        {
-                            let parallelism = effective_query_parallelism(
-                                &query,
-                                raw_index.as_ref(),
-                                target_partitions,
-                            );
-                            let index_metrics: Arc<dyn MetricsCollector> =
-                                Arc::new(metrics.index_metrics.clone());
-                            match knn_results_cache::search(
-                                knn_results_cache::ResultsCacheSearchParams {
-                                    cache: &ds.index_cache.0,
-                                    identity,
-                                    index: raw_index.clone(),
-                                    query: &query,
-                                    partitions: part_ids.clone(),
-                                    centroid_distances: q_c_dists.clone(),
-                                    prefilter: pre_filter.clone(),
-                                    segment_mask: seg_mask.clone(),
-                                    metrics: index_metrics,
-                                    parallelism,
-                                },
-                            )
-                            .await
-                            {
-                                Ok(cache_result) => {
-                                    if cache_result.was_hit {
-                                        metrics.results_cache_hits.add(1);
-                                    } else {
-                                        metrics.results_cache_misses.add(1);
-                                        metrics.partitions_searched.add(part_ids.len());
-                                    }
-                                    metrics
-                                        .baseline_metrics
-                                        .record_output(cache_result.batch.num_rows());
-                                    return DataFusionResult::Ok(
-                                        stream::once(async move { Ok(cache_result.batch) }).boxed(),
-                                    );
-                                }
-                                Err(error) => {
-                                    // The feature is experimental and best-effort. Any cache-only
-                                    // failure falls through to the existing ANN path.
-                                    metrics.results_cache_misses.add(1);
-                                    log::debug!(
-                                        "falling back after vector results cache failure: {error}"
-                                    );
-                                }
-                            }
-                        }
 
                         let early_search = Self::initial_search(
                             raw_index.clone(),
@@ -2550,6 +2612,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             state.clone(),
                             target_partitions,
                             seg_mask.clone(),
+                            quantized_refine_factor,
                         );
                         let late_search = Self::late_search(
                             raw_index.clone(),
@@ -2562,6 +2625,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             state,
                             target_partitions,
                             seg_mask,
+                            quantized_refine_factor,
                         );
                         DataFusionResult::Ok(early_search.chain(late_search).boxed())
                     }
@@ -3212,27 +3276,19 @@ mod tests {
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use async_trait::async_trait;
-    use datafusion::common::tree_node::{Transformed, TreeNode};
     use datafusion::error::Result as DataFusionResult;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts, execute_plan};
+    use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
     use lance_datagen::{BatchCount, RowCount, array};
-    use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::scalar::ScalarIndexParams;
-    use lance_index::vector::bq::{RQBuildParams, RQRotationType};
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::quantizer::QuantizationType;
-    use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::v3::subindex::SubIndexType;
-    use lance_index::vector::{
-        ApproxMode, DEFAULT_QUERY_PARALLELISM, PreparedPartitionSearchHandle,
-    };
+    use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, PreparedPartitionSearchHandle};
     use lance_index::{Index, IndexType};
     use lance_io::traits::Reader;
     use lance_linalg::distance::MetricType;
@@ -3242,12 +3298,10 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
 
-    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::index::vector::ivf::v2::STREAMING_SEARCH_BATCH_SIZE;
     use crate::io::exec::testing::TestingExec;
-    use crate::session::index_caches::{CachedVectorCandidate, VectorResultsCacheEntry};
 
     fn base_query() -> Query {
         Query {
@@ -4251,6 +4305,7 @@ mod tests {
             state,
             usize::MAX,
             None,
+            None,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4301,6 +4356,7 @@ mod tests {
             prepared_metrics(),
             state,
             usize::MAX,
+            None,
             None,
         )
         .try_collect::<Vec<_>>()
@@ -4365,6 +4421,7 @@ mod tests {
             prepared_metrics(),
             state.clone(),
             usize::MAX,
+            None,
             None,
         )
         .try_collect::<Vec<_>>()
@@ -4455,6 +4512,7 @@ mod tests {
             state.clone(),
             usize::MAX,
             Some(seg_mask.clone()),
+            None,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4488,6 +4546,7 @@ mod tests {
             state.clone(),
             usize::MAX,
             Some(seg_mask),
+            None,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4550,6 +4609,7 @@ mod tests {
             state.clone(),
             usize::MAX,
             Some(seg_mask.clone()),
+            None,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4567,6 +4627,7 @@ mod tests {
             state.clone(),
             usize::MAX,
             Some(seg_mask),
+            None,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -4600,6 +4661,7 @@ mod tests {
             state.clone(),
             usize::MAX,
             None,
+            None,
         )
         .try_collect::<Vec<_>>();
 
@@ -4618,6 +4680,7 @@ mod tests {
             prepared_metrics(),
             state,
             usize::MAX,
+            None,
             None,
         )
         .try_collect::<Vec<_>>();
@@ -5229,288 +5292,6 @@ mod tests {
         }
     }
 
-    struct ResultsCacheTestFixture {
-        dataset: Dataset,
-        centroids: ArrayRef,
-        query: ArrayRef,
-        metric_type: MetricType,
-        index_params: VectorIndexParams,
-        _tmp_dir: TempStrDir,
-    }
-
-    impl ResultsCacheTestFixture {
-        const NUM_PARTITIONS: usize = 4;
-        const K: usize = 8;
-        const ROWS_PER_FRAGMENT: usize = 32;
-        const NUM_FRAGMENTS: usize = 4;
-        const INITIAL_ROWS: usize = Self::ROWS_PER_FRAGMENT * Self::NUM_FRAGMENTS;
-        const RANK_SCALE_STEP: f32 = 0.01;
-        const RANK_ORTHOGONAL_STEP: f32 = 0.005;
-
-        fn data_batch(start_row: usize, num_rows: usize) -> RecordBatch {
-            let mut vectors = Vec::with_capacity(num_rows * 8);
-            for row in start_row..start_row + num_rows {
-                let centroid_id = row % Self::NUM_PARTITIONS;
-                let rank = row / Self::NUM_PARTITIONS;
-                // Both changes make larger ranks worse under L2, cosine, and dot,
-                // giving the quantized recall checks a reproducible top-k boundary.
-                let scale = 1.0 - rank as f32 * Self::RANK_SCALE_STEP;
-                let orthogonal_offset = rank as f32 * Self::RANK_ORTHOGONAL_STEP;
-                let mut vector = [0.0; 8];
-                match centroid_id {
-                    0 => vector[0] = scale,
-                    1 => vector[1] = scale,
-                    2 => vector[0] = -scale,
-                    3 => vector[1] = -scale,
-                    _ => unreachable!(),
-                }
-                vector[centroid_id + 2] = orthogonal_offset;
-                vectors.extend_from_slice(&vector);
-            }
-            let vectors = Arc::new(
-                FixedSizeListArray::try_new_from_values(Float32Array::from(vectors), 8).unwrap(),
-            );
-            let row_ids = Arc::new(UInt64Array::from_iter_values(
-                start_row as u64..(start_row + num_rows) as u64,
-            ));
-            let schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("vector", vectors.data_type().clone(), false),
-                ArrowField::new("row", DataType::UInt64, false),
-            ]));
-            RecordBatch::try_new(schema, vec![vectors, row_ids]).unwrap()
-        }
-
-        async fn new(rq_num_bits: Option<u8>) -> Self {
-            Self::with_metric(rq_num_bits, MetricType::L2).await
-        }
-
-        async fn with_metric(rq_num_bits: Option<u8>, metric_type: MetricType) -> Self {
-            let tmp_dir = TempStrDir::default();
-            let centroids: ArrayRef = Arc::new(
-                FixedSizeListArray::try_new_from_values(
-                    Float32Array::from(vec![
-                        1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // +x
-                        0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // +y
-                        -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // -x
-                        0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // -y
-                    ]),
-                    8,
-                )
-                .unwrap(),
-            );
-            let batches = (0..Self::NUM_FRAGMENTS)
-                .map(|fragment| {
-                    Ok(Self::data_batch(
-                        fragment * Self::ROWS_PER_FRAGMENT,
-                        Self::ROWS_PER_FRAGMENT,
-                    ))
-                })
-                .collect::<Vec<_>>();
-            let schema = batches[0].as_ref().unwrap().schema();
-            let reader = RecordBatchIterator::new(batches, schema);
-            let mut dataset = Dataset::write(
-                reader,
-                tmp_dir.as_str(),
-                Some(WriteParams {
-                    max_rows_per_file: Self::ROWS_PER_FRAGMENT,
-                    max_rows_per_group: Self::ROWS_PER_FRAGMENT,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-            assert_eq!(dataset.get_fragments().len(), Self::NUM_FRAGMENTS);
-
-            let ivf_params = IvfBuildParams::try_with_centroids(
-                Self::NUM_PARTITIONS,
-                Arc::new(centroids.as_fixed_size_list().clone()),
-            )
-            .unwrap();
-            let index_params = if let Some(num_bits) = rq_num_bits {
-                VectorIndexParams::with_ivf_rq_params(
-                    metric_type,
-                    ivf_params,
-                    RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
-                )
-            } else {
-                VectorIndexParams::with_ivf_sq_params(
-                    metric_type,
-                    ivf_params,
-                    SQBuildParams::default(),
-                )
-            };
-            dataset
-                .create_index(&["vector"], IndexType::Vector, None, &index_params, false)
-                .await
-                .unwrap();
-
-            let dataset = Dataset::open(tmp_dir.as_str()).await.unwrap();
-            let query = centroids.as_fixed_size_list().value(0);
-            Self {
-                dataset,
-                centroids,
-                query,
-                metric_type,
-                index_params,
-                _tmp_dir: tmp_dir,
-            }
-        }
-
-        async fn vector_index_uuids(&self) -> Vec<Uuid> {
-            self.dataset
-                .load_indices()
-                .await
-                .unwrap()
-                .iter()
-                .filter(|index| index.name != FRAG_REUSE_INDEX_NAME)
-                .map(|index| index.uuid)
-                .collect()
-        }
-
-        async fn fragment_reuse_uuid(&self) -> Option<Uuid> {
-            self.dataset
-                .load_indices()
-                .await
-                .unwrap()
-                .iter()
-                .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
-                .map(|index| index.uuid)
-        }
-
-        async fn append_index_segment(&mut self) -> Vec<Uuid> {
-            let batch = Self::data_batch(Self::INITIAL_ROWS, Self::ROWS_PER_FRAGMENT);
-            let schema = batch.schema();
-            self.dataset
-                .append(RecordBatchIterator::new([Ok(batch)], schema), None)
-                .await
-                .unwrap();
-            self.dataset
-                .optimize_indices(&OptimizeOptions::append())
-                .await
-                .unwrap();
-            self.vector_index_uuids().await
-        }
-
-        async fn delete_query_centroid_rows(&mut self) {
-            self.dataset.delete("row % 4 = 0").await.unwrap();
-        }
-
-        async fn compact_with_fragment_reuse(&mut self) -> Uuid {
-            let metrics = compact_files(
-                &mut self.dataset,
-                CompactionOptions {
-                    target_rows_per_fragment: Self::ROWS_PER_FRAGMENT * 2,
-                    defer_index_remap: true,
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap();
-            assert!(metrics.fragments_removed > 0);
-            assert!(metrics.fragments_added > 0);
-            self.fragment_reuse_uuid()
-                .await
-                .expect("deferred compaction should create a fragment-reuse index")
-        }
-
-        async fn replace_with_unsupported_flat_index(&mut self) {
-            let ivf_params = IvfBuildParams::try_with_centroids(
-                Self::NUM_PARTITIONS,
-                Arc::new(self.centroids.as_fixed_size_list().clone()),
-            )
-            .unwrap();
-            let index_params = VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf_params);
-            self.dataset
-                .create_index(&["vector"], IndexType::Vector, None, &index_params, true)
-                .await
-                .unwrap();
-        }
-
-        async fn create_row_scalar_index(&mut self) {
-            self.dataset
-                .create_index(
-                    &["row"],
-                    IndexType::Scalar,
-                    None,
-                    &ScalarIndexParams::default(),
-                    false,
-                )
-                .await
-                .unwrap();
-        }
-
-        async fn insert_out_of_range_results_cache_entry(&self) {
-            let indices = self.dataset.load_indices().await.unwrap();
-            let index_metadata = indices
-                .iter()
-                .find(|index| index.name != FRAG_REUSE_INDEX_NAME)
-                .unwrap();
-            let index = self
-                .dataset
-                .open_vector_index("vector", &index_metadata.uuid, &NoOpMetricsCollector)
-                .await
-                .unwrap();
-            let query = Query {
-                column: "vector".to_string(),
-                key: self.query.clone(),
-                k: Self::K,
-                lower_bound: None,
-                upper_bound: None,
-                minimum_nprobes: Self::NUM_PARTITIONS,
-                maximum_nprobes: Some(Self::NUM_PARTITIONS),
-                ef: None,
-                refine_factor: None,
-                metric_type: None,
-                use_index: true,
-                query_parallelism: DEFAULT_QUERY_PARALLELISM,
-                dist_q_c: 0.0,
-                approx_mode: ApproxMode::Accurate,
-            };
-            let (partitions, _) = index.find_partitions(&query).unwrap();
-            let identity = knn_results_cache::identity_for_query(
-                &self.dataset,
-                index_metadata,
-                index.as_ref(),
-                &query,
-                partitions.values(),
-                false,
-                false,
-            )
-            .await
-            .unwrap();
-            let entry = VectorResultsCacheEntry::try_new(
-                identity.clone(),
-                vec![CachedVectorCandidate::new(
-                    identity.partition_ids()[0],
-                    u32::MAX,
-                )],
-            )
-            .unwrap();
-            self.dataset
-                .index_cache
-                .0
-                .insert_with_key(&identity, Arc::new(entry))
-                .await;
-        }
-
-        async fn replace_index(&mut self) -> (Uuid, Uuid) {
-            let old_uuid = self.dataset.load_indices().await.unwrap()[0].uuid;
-            self.dataset
-                .create_index(
-                    &["vector"],
-                    IndexType::Vector,
-                    None,
-                    &self.index_params,
-                    true,
-                )
-                .await
-                .unwrap();
-            let new_uuid = self.dataset.load_indices().await.unwrap()[0].uuid;
-            (old_uuid, new_uuid)
-        }
-    }
-
     #[derive(Default)]
     struct StatsHolder {
         pub collected_stats: Arc<Mutex<Option<ExecutionSummaryCounts>>>,
@@ -5538,750 +5319,6 @@ mod tests {
                 .unwrap_or_default()
                 > 0
         );
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    enum ResultsCacheQueryMode {
-        Supported,
-        Prefilter,
-        ScalarPrefilter,
-        DistanceRange,
-        AdaptiveNprobes,
-        Overlay,
-    }
-
-    fn with_results_cache_test_options(
-        plan: Arc<dyn ExecutionPlan>,
-        is_enabled: bool,
-        has_overlay: bool,
-    ) -> Arc<dyn ExecutionPlan> {
-        plan.transform_down(|node| {
-            let Some(ann) = node.downcast_ref::<ANNIvfSubIndexExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            let mut replacement = ann
-                .copy_with_results_cache_enabled_for_testing(is_enabled)
-                .unwrap();
-            if has_overlay {
-                replacement = replacement.with_overlay_block(RowAddrMask::all_rows());
-            }
-            let replacement: Arc<dyn ExecutionPlan> = Arc::new(replacement);
-            Ok(Transformed::yes(replacement))
-        })
-        .unwrap()
-        .data
-    }
-
-    async fn run_results_cache_query(
-        fixture: &ResultsCacheTestFixture,
-        is_cache_enabled: bool,
-        refine_factor: Option<u32>,
-    ) -> (Vec<u64>, ExecutionSummaryCounts) {
-        run_results_cache_query_with_mode(
-            fixture,
-            is_cache_enabled,
-            refine_factor,
-            ResultsCacheQueryMode::Supported,
-        )
-        .await
-    }
-
-    async fn run_results_cache_query_with_mode(
-        fixture: &ResultsCacheTestFixture,
-        is_cache_enabled: bool,
-        refine_factor: Option<u32>,
-        query_mode: ResultsCacheQueryMode,
-    ) -> (Vec<u64>, ExecutionSummaryCounts) {
-        let (batch, stats) = run_results_cache_batch_with_mode(
-            fixture,
-            is_cache_enabled,
-            refine_factor,
-            query_mode,
-            ApproxMode::Accurate,
-        )
-        .await;
-        (
-            batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec(),
-            stats,
-        )
-    }
-
-    async fn run_results_cache_batch_with_mode(
-        fixture: &ResultsCacheTestFixture,
-        is_cache_enabled: bool,
-        refine_factor: Option<u32>,
-        query_mode: ResultsCacheQueryMode,
-        approx_mode: ApproxMode,
-    ) -> (RecordBatch, ExecutionSummaryCounts) {
-        let stats_holder = StatsHolder::default();
-        let mut scanner = fixture.dataset.scan();
-        scanner
-            .nearest("vector", fixture.query.as_ref(), ResultsCacheTestFixture::K)
-            .unwrap()
-            .distance_metric(fixture.metric_type)
-            .approx_mode(approx_mode);
-        match query_mode {
-            ResultsCacheQueryMode::Supported | ResultsCacheQueryMode::Overlay => {
-                scanner.nprobes(ResultsCacheTestFixture::NUM_PARTITIONS);
-            }
-            ResultsCacheQueryMode::Prefilter | ResultsCacheQueryMode::ScalarPrefilter => {
-                scanner
-                    .nprobes(ResultsCacheTestFixture::NUM_PARTITIONS)
-                    .filter("row >= 0")
-                    .unwrap()
-                    .prefilter(true);
-            }
-            ResultsCacheQueryMode::DistanceRange => {
-                scanner
-                    .nprobes(ResultsCacheTestFixture::NUM_PARTITIONS)
-                    .distance_range(None, Some(f32::MAX));
-            }
-            ResultsCacheQueryMode::AdaptiveNprobes => {
-                scanner
-                    .minimum_nprobes(1)
-                    .maximum_nprobes(ResultsCacheTestFixture::NUM_PARTITIONS);
-            }
-        }
-        scanner
-            .project(&Vec::<String>::new())
-            .unwrap()
-            .with_row_id()
-            .scan_stats_callback(stats_holder.get_setter());
-        if let Some(refine_factor) = refine_factor {
-            scanner.refine(refine_factor);
-        }
-
-        let plan = scanner.create_plan().await.unwrap();
-        if matches!(query_mode, ResultsCacheQueryMode::ScalarPrefilter) {
-            let rendered = format!(
-                "{}",
-                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
-            );
-            assert!(
-                rendered.contains("ScalarIndexQuery"),
-                "expected a scalar-index prefilter plan, got:\n{rendered}"
-            );
-        }
-        let plan = with_results_cache_test_options(
-            plan,
-            is_cache_enabled,
-            matches!(query_mode, ResultsCacheQueryMode::Overlay),
-        );
-        let batches = execute_plan(plan, scanner.execution_options())
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
-        (batch, stats_holder.consume())
-    }
-
-    async fn exact_result_batch(fixture: &ResultsCacheTestFixture) -> RecordBatch {
-        fixture
-            .dataset
-            .scan()
-            .nearest("vector", fixture.query.as_ref(), ResultsCacheTestFixture::K)
-            .unwrap()
-            .distance_metric(fixture.metric_type)
-            .use_index(false)
-            .project(&Vec::<String>::new())
-            .unwrap()
-            .with_row_id()
-            .try_into_batch()
-            .await
-            .unwrap()
-    }
-
-    async fn exact_results(fixture: &ResultsCacheTestFixture) -> Vec<u64> {
-        let batch = exact_result_batch(fixture).await;
-        batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec()
-    }
-
-    fn count_metric(stats: &ExecutionSummaryCounts, name: &str) -> usize {
-        stats.all_counts.get(name).copied().unwrap_or_default()
-    }
-
-    fn recall(actual: &[u64], expected: &[u64]) -> f32 {
-        actual
-            .iter()
-            .filter(|row_id| expected.contains(row_id))
-            .count() as f32
-            / expected.len() as f32
-    }
-
-    fn assert_valid_result_set(row_ids: &[u64]) {
-        assert_eq!(row_ids.len(), ResultsCacheTestFixture::K);
-        for (position, row_id) in row_ids.iter().enumerate() {
-            assert!(
-                !row_ids[..position].contains(row_id),
-                "result row id {row_id} occurs more than once in {row_ids:?}"
-            );
-        }
-    }
-
-    fn assert_result_batches_match(actual: &RecordBatch, expected: &RecordBatch) {
-        assert_eq!(actual.num_rows(), expected.num_rows());
-        let actual_row_ids = actual[ROW_ID].as_primitive::<UInt64Type>();
-        let expected_row_ids = expected[ROW_ID].as_primitive::<UInt64Type>();
-        let actual_distances = actual[DIST_COL].as_primitive::<Float32Type>();
-        let expected_distances = expected[DIST_COL].as_primitive::<Float32Type>();
-        for position in 0..actual.num_rows() {
-            assert_eq!(
-                actual_row_ids.value(position),
-                expected_row_ids.value(position)
-            );
-            let actual_distance = actual_distances.value(position);
-            let expected_distance = expected_distances.value(position);
-            let tolerance = 1.0e-5 * (1.0 + expected_distance.abs());
-            assert!(
-                actual_distance.is_finite()
-                    && (actual_distance - expected_distance).abs() <= tolerance,
-                "distance mismatch at position {position}: actual={actual_distance}, expected={expected_distance}"
-            );
-        }
-    }
-
-    fn assert_quantized_result_batches_agree(actual: &RecordBatch, expected: &RecordBatch) {
-        assert_eq!(actual.num_rows(), expected.num_rows());
-        let actual_row_ids = actual[ROW_ID]
-            .as_primitive::<UInt64Type>()
-            .values()
-            .to_vec();
-        let expected_row_ids = expected[ROW_ID]
-            .as_primitive::<UInt64Type>()
-            .values()
-            .to_vec();
-        assert_valid_result_set(&actual_row_ids);
-        assert_valid_result_set(&expected_row_ids);
-        assert!(recall(&actual_row_ids, &expected_row_ids) >= 0.5);
-
-        let actual_distances = actual[DIST_COL].as_primitive::<Float32Type>();
-        let expected_distances = expected[DIST_COL].as_primitive::<Float32Type>();
-        for position in 0..actual.num_rows() {
-            let actual_distance = actual_distances.value(position);
-            let expected_distance = expected_distances.value(position);
-            let tolerance = 1.0e-4 * (1.0 + expected_distance.abs());
-            assert!(
-                actual_distance.is_finite()
-                    && (actual_distance - expected_distance).abs() <= tolerance,
-                "quantized distance mismatch at position {position}: actual={actual_distance}, expected={expected_distance}"
-            );
-        }
-    }
-
-    fn complete_refine_factor(row_count: usize) -> u32 {
-        u32::try_from(row_count.div_ceil(ResultsCacheTestFixture::K)).unwrap()
-    }
-
-    #[rstest]
-    #[case::sq8(None)]
-    #[case::rq4(Some(4))]
-    #[case::rq8(Some(8))]
-    #[tokio::test]
-    async fn test_results_cache_end_to_end_and_index_replacement_invalidation(
-        #[case] rq_num_bits: Option<u8>,
-    ) {
-        let mut fixture = ResultsCacheTestFixture::new(rq_num_bits).await;
-        let expected = exact_results(&fixture).await;
-
-        let (cold, cold_stats) = run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&cold_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            0
-        );
-        assert_eq!(
-            count_metric(&cold_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            1
-        );
-        assert!(cold_stats.bytes_read > 0);
-        assert_valid_result_set(&cold);
-
-        let (warm, warm_stats) = run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&warm_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            1
-        );
-        assert_eq!(
-            count_metric(&warm_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            0
-        );
-        assert_eq!(warm_stats.bytes_read, 0);
-        assert_eq!(warm_stats.parts_loaded, 0);
-        assert_valid_result_set(&warm);
-
-        let refine_factor = Some(
-            (ResultsCacheTestFixture::ROWS_PER_FRAGMENT * ResultsCacheTestFixture::NUM_FRAGMENTS
-                / ResultsCacheTestFixture::K) as u32,
-        );
-        let (exact_cold, exact_cold_stats) =
-            run_results_cache_query(&fixture, true, refine_factor).await;
-        assert_eq!(
-            count_metric(&exact_cold_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            1
-        );
-        assert_eq!(recall(&exact_cold, &expected), 1.0);
-
-        let (exact_warm, exact_warm_stats) =
-            run_results_cache_query(&fixture, true, refine_factor).await;
-        assert_eq!(
-            count_metric(&exact_warm_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            1
-        );
-        assert_eq!(recall(&exact_warm, &expected), 1.0);
-
-        let (disabled, disabled_stats) =
-            run_results_cache_query(&fixture, false, refine_factor).await;
-        assert_eq!(
-            count_metric(&disabled_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            0
-        );
-        assert_eq!(
-            count_metric(&disabled_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            0
-        );
-        assert_eq!(recall(&disabled, &expected), 1.0);
-
-        let (old_uuid, new_uuid) = fixture.replace_index().await;
-        assert_ne!(old_uuid, new_uuid);
-        let (after_replacement, replacement_stats) =
-            run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&replacement_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            0
-        );
-        assert_eq!(
-            count_metric(&replacement_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            1
-        );
-        assert_valid_result_set(&after_replacement);
-    }
-
-    #[rstest]
-    #[case::sq8_l2(None, MetricType::L2)]
-    #[case::sq8_cosine(None, MetricType::Cosine)]
-    #[case::sq8_dot(None, MetricType::Dot)]
-    #[case::rq4_l2(Some(4), MetricType::L2)]
-    #[case::rq4_cosine(Some(4), MetricType::Cosine)]
-    #[case::rq4_dot(Some(4), MetricType::Dot)]
-    #[case::rq8_l2(Some(8), MetricType::L2)]
-    #[case::rq8_cosine(Some(8), MetricType::Cosine)]
-    #[case::rq8_dot(Some(8), MetricType::Dot)]
-    #[tokio::test]
-    async fn test_results_cache_scoring_matrix_matches_direct_native_and_exact_refinement(
-        #[case] rq_num_bits: Option<u8>,
-        #[case] metric_type: MetricType,
-    ) {
-        let fixture = ResultsCacheTestFixture::with_metric(rq_num_bits, metric_type).await;
-        let exact = exact_result_batch(&fixture).await;
-        let exact_row_ids = exact[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
-
-        let (_, cold_stats) = run_results_cache_batch_with_mode(
-            &fixture,
-            true,
-            None,
-            ResultsCacheQueryMode::Supported,
-            ApproxMode::Accurate,
-        )
-        .await;
-        assert_eq!(
-            count_metric(&cold_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            1
-        );
-        let (warm, warm_stats) = run_results_cache_batch_with_mode(
-            &fixture,
-            true,
-            None,
-            ResultsCacheQueryMode::Supported,
-            ApproxMode::Accurate,
-        )
-        .await;
-        assert_eq!(
-            count_metric(&warm_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            1
-        );
-        let direct = run_results_cache_batch_with_mode(
-            &fixture,
-            false,
-            None,
-            ResultsCacheQueryMode::Supported,
-            ApproxMode::Accurate,
-        )
-        .await
-        .0;
-        assert_quantized_result_batches_agree(&warm, &direct);
-        let warm_row_ids = warm[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
-        assert_valid_result_set(&warm_row_ids);
-        assert!(
-            recall(&warm_row_ids, &exact_row_ids) >= 0.5,
-            "{metric_type} warm-cache recall fell below 0.5: warm={warm_row_ids:?}, exact={exact_row_ids:?}"
-        );
-
-        let refine_factor = Some(complete_refine_factor(
-            ResultsCacheTestFixture::INITIAL_ROWS,
-        ));
-        let (exact_cold, exact_cold_stats) = run_results_cache_batch_with_mode(
-            &fixture,
-            true,
-            refine_factor,
-            ResultsCacheQueryMode::Supported,
-            ApproxMode::Accurate,
-        )
-        .await;
-        assert_eq!(
-            count_metric(&exact_cold_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            1
-        );
-        assert_result_batches_match(&exact_cold, &exact);
-        let (exact_warm, exact_warm_stats) = run_results_cache_batch_with_mode(
-            &fixture,
-            true,
-            refine_factor,
-            ResultsCacheQueryMode::Supported,
-            ApproxMode::Accurate,
-        )
-        .await;
-        assert_eq!(
-            count_metric(&exact_warm_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            1
-        );
-        assert_result_batches_match(&exact_warm, &exact);
-    }
-
-    #[rstest]
-    #[case::sq8(None)]
-    #[case::rq4(Some(4))]
-    #[case::rq8(Some(8))]
-    #[tokio::test]
-    async fn test_results_cache_dataset_append_and_multi_segment_invalidation(
-        #[case] rq_num_bits: Option<u8>,
-    ) {
-        let mut fixture = ResultsCacheTestFixture::new(rq_num_bits).await;
-        let original_version = fixture.dataset.version_id();
-        let original_index_uuids = fixture.vector_index_uuids().await;
-        assert_eq!(original_index_uuids.len(), 1);
-
-        let (_, cold_stats) = run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&cold_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            1
-        );
-        let (_, warm_stats) = run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&warm_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            1
-        );
-
-        let appended_index_uuids = fixture.append_index_segment().await;
-        assert!(fixture.dataset.version_id() > original_version);
-        assert_eq!(appended_index_uuids.len(), 2);
-        assert!(appended_index_uuids.contains(&original_index_uuids[0]));
-
-        let (after_append, after_append_stats) =
-            run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&after_append_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            appended_index_uuids.len()
-        );
-        assert_eq!(
-            count_metric(&after_append_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            0
-        );
-        assert_valid_result_set(&after_append);
-
-        let (after_append_warm, after_append_warm_stats) =
-            run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&after_append_warm_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            appended_index_uuids.len()
-        );
-        assert_eq!(
-            count_metric(&after_append_warm_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            0
-        );
-        assert_valid_result_set(&after_append_warm);
-
-        let expected = exact_results(&fixture).await;
-        let row_count = fixture.dataset.count_rows(None).await.unwrap();
-        let refine_factor = Some(complete_refine_factor(row_count));
-        let (exact_cold, exact_cold_stats) =
-            run_results_cache_query(&fixture, true, refine_factor).await;
-        assert_eq!(
-            count_metric(&exact_cold_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            appended_index_uuids.len()
-        );
-        assert_eq!(recall(&exact_cold, &expected), 1.0);
-
-        let (exact_warm, exact_warm_stats) =
-            run_results_cache_query(&fixture, true, refine_factor).await;
-        assert_eq!(
-            count_metric(&exact_warm_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            appended_index_uuids.len()
-        );
-        assert_eq!(recall(&exact_warm, &expected), 1.0);
-    }
-
-    #[rstest]
-    #[case::sq8(None)]
-    #[case::rq4(Some(4))]
-    #[case::rq8(Some(8))]
-    #[tokio::test]
-    async fn test_results_cache_deletion_and_fragment_reuse_invalidation(
-        #[case] rq_num_bits: Option<u8>,
-    ) {
-        let mut fixture = ResultsCacheTestFixture::new(rq_num_bits).await;
-        let deleted_row_ids = exact_results(&fixture).await;
-
-        let (_, initial_cold_stats) = run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&initial_cold_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            1
-        );
-        let (_, initial_warm_stats) = run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&initial_warm_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            1
-        );
-
-        let version_before_delete = fixture.dataset.version_id();
-        fixture.delete_query_centroid_rows().await;
-        assert!(fixture.dataset.version_id() > version_before_delete);
-
-        let (after_delete, after_delete_stats) =
-            run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&after_delete_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            1
-        );
-        assert_eq!(
-            count_metric(&after_delete_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            0
-        );
-        assert_valid_result_set(&after_delete);
-        assert!(
-            after_delete
-                .iter()
-                .all(|row_id| !deleted_row_ids.contains(row_id))
-        );
-
-        let (_, after_delete_warm_stats) = run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&after_delete_warm_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            1
-        );
-
-        let vector_index_uuid = fixture.vector_index_uuids().await[0];
-        assert_eq!(fixture.fragment_reuse_uuid().await, None);
-        let version_before_compaction = fixture.dataset.version_id();
-        let fragment_reuse_uuid = fixture.compact_with_fragment_reuse().await;
-        assert!(fixture.dataset.version_id() > version_before_compaction);
-        assert_eq!(fixture.vector_index_uuids().await, vec![vector_index_uuid]);
-        assert_eq!(
-            fixture.fragment_reuse_uuid().await,
-            Some(fragment_reuse_uuid)
-        );
-
-        let (after_compaction, after_compaction_stats) =
-            run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&after_compaction_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            1
-        );
-        assert_eq!(
-            count_metric(&after_compaction_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            0
-        );
-        assert_valid_result_set(&after_compaction);
-
-        let (_, after_compaction_warm_stats) = run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(
-                &after_compaction_warm_stats,
-                VECTOR_RESULTS_CACHE_HITS_METRIC
-            ),
-            1
-        );
-
-        let expected = exact_results(&fixture).await;
-        let row_count = fixture.dataset.count_rows(None).await.unwrap();
-        let refine_factor = Some(complete_refine_factor(row_count));
-        let (exact_cold, exact_cold_stats) =
-            run_results_cache_query(&fixture, true, refine_factor).await;
-        assert_eq!(
-            count_metric(&exact_cold_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            1
-        );
-        assert_eq!(recall(&exact_cold, &expected), 1.0);
-
-        let (exact_warm, exact_warm_stats) =
-            run_results_cache_query(&fixture, true, refine_factor).await;
-        assert_eq!(
-            count_metric(&exact_warm_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            1
-        );
-        assert_eq!(recall(&exact_warm, &expected), 1.0);
-    }
-
-    #[rstest]
-    #[case::prefilter(ResultsCacheQueryMode::Prefilter)]
-    #[case::scalar_prefilter(ResultsCacheQueryMode::ScalarPrefilter)]
-    #[case::distance_range(ResultsCacheQueryMode::DistanceRange)]
-    #[case::adaptive_nprobes(ResultsCacheQueryMode::AdaptiveNprobes)]
-    #[case::overlay(ResultsCacheQueryMode::Overlay)]
-    #[tokio::test]
-    async fn test_results_cache_bypasses_unsupported_query_shapes(
-        #[case] query_mode: ResultsCacheQueryMode,
-    ) {
-        let mut fixture = ResultsCacheTestFixture::new(None).await;
-        if matches!(query_mode, ResultsCacheQueryMode::ScalarPrefilter) {
-            fixture.create_row_scalar_index().await;
-        }
-        let row_count = fixture.dataset.count_rows(None).await.unwrap();
-        let refine_factor = Some(complete_refine_factor(row_count));
-        let (expected, disabled_stats) =
-            run_results_cache_query_with_mode(&fixture, false, refine_factor, query_mode).await;
-        assert_eq!(
-            count_metric(&disabled_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            0
-        );
-        assert_eq!(
-            count_metric(&disabled_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            0
-        );
-        assert_valid_result_set(&expected);
-        let exact = exact_results(&fixture).await;
-        assert!(recall(&expected, &exact) >= 0.5);
-        for _ in 0..2 {
-            let (row_ids, stats) =
-                run_results_cache_query_with_mode(&fixture, true, refine_factor, query_mode).await;
-            assert_eq!(
-                count_metric(&stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-                0,
-                "unsupported query mode {query_mode:?} recorded a cache hit"
-            );
-            assert_eq!(
-                count_metric(&stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-                0,
-                "unsupported query mode {query_mode:?} recorded a cache miss"
-            );
-            assert_eq!(row_ids, expected);
-        }
-    }
-
-    #[rstest]
-    #[case::rq4_fast(4, ApproxMode::Fast)]
-    #[case::rq4_normal(4, ApproxMode::Normal)]
-    #[case::rq8_fast(8, ApproxMode::Fast)]
-    #[case::rq8_normal(8, ApproxMode::Normal)]
-    #[tokio::test]
-    async fn test_results_cache_bypasses_non_accurate_rq(
-        #[case] rq_num_bits: u8,
-        #[case] approx_mode: ApproxMode,
-    ) {
-        let fixture = ResultsCacheTestFixture::new(Some(rq_num_bits)).await;
-        let (expected, disabled_stats) = run_results_cache_batch_with_mode(
-            &fixture,
-            false,
-            None,
-            ResultsCacheQueryMode::Supported,
-            approx_mode,
-        )
-        .await;
-        assert_eq!(
-            count_metric(&disabled_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            0
-        );
-        assert_eq!(
-            count_metric(&disabled_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            0
-        );
-
-        for _ in 0..2 {
-            let (actual, stats) = run_results_cache_batch_with_mode(
-                &fixture,
-                true,
-                None,
-                ResultsCacheQueryMode::Supported,
-                approx_mode,
-            )
-            .await;
-            assert_eq!(count_metric(&stats, VECTOR_RESULTS_CACHE_HITS_METRIC), 0);
-            assert_eq!(count_metric(&stats, VECTOR_RESULTS_CACHE_MISSES_METRIC), 0);
-            assert_result_batches_match(&actual, &expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_results_cache_bypasses_unsupported_index_type() {
-        let mut fixture = ResultsCacheTestFixture::new(None).await;
-        fixture.replace_with_unsupported_flat_index().await;
-
-        let row_count = fixture.dataset.count_rows(None).await.unwrap();
-        let refine_factor = Some(complete_refine_factor(row_count));
-        let (expected, disabled_stats) =
-            run_results_cache_query(&fixture, false, refine_factor).await;
-        assert_eq!(
-            count_metric(&disabled_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            0
-        );
-        assert_eq!(
-            count_metric(&disabled_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            0
-        );
-        assert_valid_result_set(&expected);
-        let exact = exact_results(&fixture).await;
-        assert!(recall(&expected, &exact) >= 0.5);
-        for _ in 0..2 {
-            let (row_ids, stats) = run_results_cache_query(&fixture, true, refine_factor).await;
-            assert_eq!(count_metric(&stats, VECTOR_RESULTS_CACHE_HITS_METRIC), 0);
-            assert_eq!(count_metric(&stats, VECTOR_RESULTS_CACHE_MISSES_METRIC), 0);
-            assert_eq!(row_ids, expected);
-        }
-    }
-
-    #[rstest]
-    #[case::sq8(None)]
-    #[case::rq4(Some(4))]
-    #[case::rq8(Some(8))]
-    #[tokio::test]
-    async fn test_results_cache_unusable_entry_falls_back_and_is_replaced(
-        #[case] rq_num_bits: Option<u8>,
-    ) {
-        let fixture = ResultsCacheTestFixture::new(rq_num_bits).await;
-        let (ordinary, disabled_stats) = run_results_cache_query(&fixture, false, None).await;
-        assert_eq!(
-            count_metric(&disabled_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            0
-        );
-        assert_eq!(
-            count_metric(&disabled_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            0
-        );
-        assert_valid_result_set(&ordinary);
-        fixture.insert_out_of_range_results_cache_entry().await;
-
-        let (fallback, fallback_stats) = run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&fallback_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            0
-        );
-        assert_eq!(
-            count_metric(&fallback_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            1
-        );
-        assert_valid_result_set(&fallback);
-        assert!(recall(&fallback, &ordinary) >= 0.5);
-
-        let (warm, warm_stats) = run_results_cache_query(&fixture, true, None).await;
-        assert_eq!(
-            count_metric(&warm_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
-            1
-        );
-        assert_eq!(
-            count_metric(&warm_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
-            0
-        );
-        assert_valid_result_set(&warm);
-        assert!(recall(&warm, &ordinary) >= 0.5);
     }
 
     #[rstest]

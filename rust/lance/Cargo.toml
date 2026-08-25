@@ -46,7 +46,6 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 async-recursion.workspace = true
 async-trait.workspace = true
-blake3.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
