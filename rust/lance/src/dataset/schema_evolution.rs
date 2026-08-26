@@ -3252,8 +3252,9 @@ mod test {
         )
         .await?;
 
-        // Build an IVF_PQ index on the vector column.
-        let params = VectorIndexParams::ivf_pq(4, 8, 8, MetricType::L2, 50);
+        // Any attached vector index blocks the cast; IVF_FLAT exercises that
+        // ownership contract without unrelated quantizer training.
+        let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
         dataset
             .create_index(&["vec"], IndexType::Vector, None, &params, false)
             .await?;

@@ -8333,7 +8333,7 @@ mod tests {
     #[rstest::rstest]
     #[case::all_success(Duration::from_secs(100_000))]
     #[case::timeout(Duration::from_millis(200))]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_merge_insert_concurrency(#[case] timeout: Duration) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt32, false),

@@ -925,7 +925,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_commit_timeout_triggers() {
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
@@ -964,7 +964,7 @@ mod tests {
         assert!(matches!(&err, Error::Timeout { .. }), "got {err:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_commit_timeout_applies_to_execute_batch() {
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
@@ -1008,7 +1008,7 @@ mod tests {
     /// `with_timeout(None)` must let a commit run unbounded. Uses a throttled
     /// store so the commit takes real wall-clock time — long enough that the
     /// 50ms timeout in `test_commit_timeout_triggers` would have fired.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_commit_timeout_none_disables() {
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
@@ -1150,7 +1150,7 @@ mod tests {
 
     /// On non-lexically-ordered stores (e.g. S3 Express) a commit should use the
     /// version hint (a few HEAD probes, O(k)) instead of a full O(n) listing.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_commit_uses_version_hint_on_non_lexical_store() {
         // Make `list` artificially slow per entry so a full listing would be
         // obvious; HEAD/GET/PUT stay fast.

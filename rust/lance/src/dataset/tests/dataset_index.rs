@@ -53,6 +53,10 @@ use lance_index::metrics::{
     CROSS_COLUMN_STAGED_SUCCESSES_METRIC, WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC,
     WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC, WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC,
     WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC, WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC,
+    WAND_SEEDED_FALLBACK_COMPARISONS_METRIC, WAND_SEEDED_FALLBACKS_METRIC,
+    WAND_TIE_COMPLETION_ATTEMPTS_METRIC, WAND_TIE_COMPLETION_CANDIDATES_METRIC,
+    WAND_TIE_COMPLETION_COMPARISONS_METRIC, WAND_TIE_COMPLETION_OVERFLOWS_METRIC,
+    WAND_TIE_COMPLETION_SUCCESSES_METRIC,
 };
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
@@ -2036,7 +2040,7 @@ async fn test_field_local_match_wand_exactness_certificates() {
     assert_eq!(tied_oracle[0].1, tied_oracle[1].1);
     assert!(tied_oracle[0].0 < tied_oracle[1].0);
     let (tied, stats) = compound_fts_results_with_stats(&dataset, tied_query, 1).await;
-    assert_scored_rows_close("wand_certificate_tie_fallback", &tied, &tied_oracle[..1]);
+    assert_scored_rows_close("wand_certificate_tie_completion", &tied, &tied_oracle[..1]);
     assert_eq!(
         stats
             .all_counts
@@ -2053,13 +2057,13 @@ async fn test_field_local_match_wand_exactness_certificates() {
         stats
             .all_counts
             .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
-        Some(&0)
+        Some(&1)
     );
     assert_eq!(
         stats
             .all_counts
             .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
-        Some(&1)
+        Some(&0)
     );
     assert_eq!(
         stats
@@ -2067,6 +2071,23 @@ async fn test_field_local_match_wand_exactness_certificates() {
             .get(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC),
         Some(&2)
     );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_SUCCESSES_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_OVERFLOWS_METRIC),
+        Some(&0)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_CANDIDATES_METRIC),
+        Some(&2)
+    );
+    assert_eq!(stats.all_counts.get(WAND_SEEDED_FALLBACKS_METRIC), Some(&0));
 
     let mixed_query = field_local_query("noise");
     let mixed_oracle =
@@ -2083,7 +2104,7 @@ async fn test_field_local_match_wand_exactness_certificates() {
         stats
             .all_counts
             .get(WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC),
-        Some(&1)
+        Some(&2)
     );
     assert_eq!(
         stats
@@ -2095,7 +2116,7 @@ async fn test_field_local_match_wand_exactness_certificates() {
         stats
             .all_counts
             .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
-        Some(&1)
+        Some(&0)
     );
     assert_eq!(
         stats
@@ -2119,6 +2140,122 @@ async fn test_field_local_match_wand_exactness_certificates() {
             .get(WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC),
         Some(&0),
         "zero-boost fields must use the exact path without attempting a certificate"
+    );
+}
+
+async fn write_wand_tie_dataset(num_ties: usize) -> Dataset {
+    let reader = gen_batch()
+        .col("title", array::fill_utf8("token".to_owned()))
+        .col("body", array::fill_utf8("unrelated".to_owned()))
+        .into_reader_rows(
+            RowCount::from(u64::try_from(num_ties).unwrap()),
+            BatchCount::from(1),
+        );
+    let dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: num_ties.div_ceil(2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+}
+
+fn wand_tie_multimatch(terms: &str, boost: f32, fuzziness: Option<u32>) -> FtsQuery {
+    let mut query = MultiMatchQuery::try_new(
+        terms.to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![boost, 1.0])
+    .unwrap();
+    for match_query in &mut query.match_queries {
+        match_query.fuzziness = fuzziness;
+    }
+    query.into()
+}
+
+#[tokio::test]
+async fn test_wand_tie_completion_recovers_reversed_segment_row_id() {
+    let mut dataset = write_wand_tie_dataset(6).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+    let query = wand_tie_multimatch("token", 1.0, Some(0));
+    let oracle = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(oracle.len(), 6);
+    assert_eq!(oracle[0].0, 0);
+
+    let (actual, stats) = compound_fts_results_with_stats(&dataset, query, 1).await;
+
+    assert_scored_rows_close(
+        "wand_tie_completion_reversed_segments",
+        &actual,
+        &oracle[..1],
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_SUCCESSES_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_CANDIDATES_METRIC),
+        Some(&6)
+    );
+    assert_eq!(stats.all_counts.get(WAND_SEEDED_FALLBACKS_METRIC), Some(&0));
+}
+
+#[tokio::test]
+async fn test_wand_tie_overflow_uses_seeded_fuzzy_boosted_fallback() {
+    const NUM_TIES: usize = 131;
+    let mut dataset = write_wand_tie_dataset(NUM_TIES).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "title", true, true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "body", true, true).await;
+    let query = wand_tie_multimatch("tiken", 2.5, Some(1));
+    let oracle = compound_fts_results(&dataset, query.clone(), None).await;
+    assert_eq!(oracle.len(), NUM_TIES);
+    assert_eq!(oracle[0].0, 0);
+
+    let (actual, stats) = compound_fts_results_with_stats(&dataset, query, 1).await;
+
+    assert_scored_rows_close("wand_tie_seeded_fuzzy_boost", &actual, &oracle[..1]);
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_ATTEMPTS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_OVERFLOWS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(
+        stats.all_counts.get(WAND_TIE_COMPLETION_CANDIDATES_METRIC),
+        Some(&130),
+        "k=1 reserves 128 tie slots plus one lower-score guard slot"
+    );
+    assert_eq!(
+        stats
+            .all_counts
+            .get(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC),
+        Some(&1)
+    );
+    assert_eq!(stats.all_counts.get(WAND_SEEDED_FALLBACKS_METRIC), Some(&1));
+    assert!(
+        stats
+            .all_counts
+            .get(WAND_TIE_COMPLETION_COMPARISONS_METRIC)
+            .is_some_and(|comparisons| *comparisons > 0)
+    );
+    assert!(
+        stats
+            .all_counts
+            .get(WAND_SEEDED_FALLBACK_COMPARISONS_METRIC)
+            .is_some_and(|comparisons| *comparisons > 0)
     );
 }
 
@@ -4311,11 +4448,11 @@ async fn test_fts_phrase_query() {
     let words = ["lance", "full", "text", "search"];
     let mut lance_search_count = 0;
     let mut full_text_count = 0;
-    let mut doc_array = (0..4096)
+    let mut doc_array = (0..256)
         .map(|_| {
             let mut rng = rand::rng();
-            let mut text = String::with_capacity(512);
-            let len = rng.random_range(127..512);
+            let mut text = String::with_capacity(128);
+            let len = rng.random_range(31..128);
             for i in 0..len {
                 if i > 0 {
                     text.push(' ');

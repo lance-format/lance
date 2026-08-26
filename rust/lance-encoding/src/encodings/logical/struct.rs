@@ -639,7 +639,9 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields};
 
     use super::StructuralStructDecoder;
-    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
+    use crate::testing::{
+        TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
+    };
 
     #[test]
     fn test_zero_dimension_fsl_decoder_errors() {
@@ -666,14 +668,25 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_simple_struct() {
+    async fn test_simple_struct(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
         ]));
         let field = Field::new("", data_type, false);
-        check_basic_random(field).await;
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -790,8 +803,19 @@ mod tests {
         .await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_struct_list() {
+    async fn test_struct_list(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new(
                 "inner_list",
@@ -801,20 +825,42 @@ mod tests {
             Field::new("outer_int", DataType::Int32, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_basic_random(field).await;
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_empty_struct() {
+    async fn test_empty_struct(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         // It's technically legal for a struct to have 0 children, need to
         // make sure we support that
         let data_type = DataType::Struct(Fields::from(Vec::<Field>::default()));
         let field = Field::new("row", data_type, false);
-        check_basic_random(field).await;
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_complicated_struct() {
+    async fn test_complicated_struct(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new("int", DataType::Int32, true),
             Field::new(
@@ -832,7 +878,7 @@ mod tests {
             Field::new("outer_binary", DataType::Binary, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_basic_random(field).await;
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[test_log::test(tokio::test)]

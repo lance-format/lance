@@ -5976,8 +5976,8 @@ mod tests {
         );
     }
 
-    /// Same as the local-fs test but against memory:// — closer to S3
-    /// semantics (conditional PUT, list-prefix consistency).
+    /// Regression for #6713 against memory://, which is closer to S3
+    /// semantics (conditional PUT and list-prefix consistency).
     #[tokio::test]
     async fn test_shard_writer_auto_flush_repeatedly_memory_store() {
         let base_uri = "memory:///bench_test_flush";
@@ -6002,17 +6002,20 @@ mod tests {
 
         let initial_gen = writer.memtable_stats().await.unwrap().generation;
 
-        for i in 0..1000 {
+        // The bug appeared on the second generation because repeated flushes
+        // reused the generation-1 path. Queue several flushes before draining
+        // so both path uniqueness and background sequencing are exercised.
+        for i in 0..8 {
             let batch = create_test_batch(&schema, i * 10, 10);
             writer.put(vec![batch]).await.unwrap();
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        writer.wait_for_flush_drain().await.unwrap();
 
         let stats = writer.memtable_stats().await.unwrap();
         assert!(
-            stats.generation >= initial_gen + 50,
-            "expected many flushes; generation went {} → {}",
+            stats.generation >= initial_gen + 3,
+            "expected repeated successful flushes; generation went {} → {}",
             initial_gen,
             stats.generation
         );
@@ -6025,7 +6028,7 @@ mod tests {
     /// hit "Dataset already exists: …_gen_1" once the second flush
     /// started.
     #[tokio::test]
-    async fn test_shard_writer_auto_flush_repeatedly_stress() {
+    async fn test_shard_writer_auto_flush_repeatedly_local_store() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
 
@@ -6047,21 +6050,20 @@ mod tests {
 
         let initial_gen = writer.memtable_stats().await.unwrap().generation;
 
-        // Every put crosses the size threshold, so each one queues a
-        // freeze. We want to catch any bug where two flushes collide on
-        // path/generation. Drive 1000 puts so we get ≥ 100 flushes —
-        // enough rope for the bug to show up.
-        for i in 0..1000 {
+        // Queue multiple generations before waiting. The original failure was
+        // deterministic on the second flush, so three committed generations
+        // are sufficient to prove that paths and generation IDs advance.
+        for i in 0..8 {
             let batch = create_test_batch(&schema, i * 10, 10);
             writer.put(vec![batch]).await.unwrap();
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        writer.wait_for_flush_drain().await.unwrap();
 
         let stats = writer.memtable_stats().await.unwrap();
         assert!(
-            stats.generation >= initial_gen + 50,
-            "expected many successful auto-flushes; generation went {} → {}",
+            stats.generation >= initial_gen + 3,
+            "expected repeated successful flushes; generation went {} → {}",
             initial_gen,
             stats.generation
         );
@@ -6212,58 +6214,6 @@ mod tests {
             task_executor.tasks.read().unwrap().is_empty(),
             "close must join background tasks before returning an error"
         );
-    }
-
-    /// Regression: the memtable flush should successfully fire many
-    /// times in a row. A bug where every flush wrote the same path was
-    /// caught by lance-format/lance#6713.
-    #[tokio::test]
-    async fn test_shard_writer_auto_flush_repeatedly() {
-        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
-        let schema = create_test_schema();
-
-        // durable_write=true matches the LSM `merge_insert` defaults and
-        // is the configuration that surfaced #6713 in the wild.
-        let config = ShardWriterConfig {
-            shard_id: Uuid::new_v4(),
-            shard_spec_id: 0,
-            durable_write: true,
-            max_wal_buffer_size: 1024 * 1024,
-            max_wal_flush_interval: Some(Duration::from_millis(10)),
-            // Tiny size threshold so a few batches cross it.
-            max_memtable_size: 1024,
-            manifest_scan_batch_size: 2,
-            ..Default::default()
-        };
-
-        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
-            .await
-            .unwrap();
-
-        let initial_gen = writer.memtable_stats().await.unwrap().generation;
-
-        // Drive enough write traffic to trigger several auto-flushes.
-        // durable_write=true means each put waits for the WAL flush, so
-        // we don't need explicit yields between puts.
-        for i in 0..200 {
-            let batch = create_test_batch(&schema, i * 10, 10);
-            writer.put(vec![batch]).await.unwrap();
-        }
-
-        // Wait for the background memtable flushes to drain.
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        // Generation should have advanced by at least 3 — i.e. we want to
-        // confirm multiple flushes succeeded back to back, not just one.
-        let stats = writer.memtable_stats().await.unwrap();
-        assert!(
-            stats.generation >= initial_gen + 3,
-            "expected ≥ 3 successful auto-flushes; generation went {} → {}",
-            initial_gen,
-            stats.generation
-        );
-
-        writer.close().await.unwrap();
     }
 
     /// Recompute what the shard is holding straight from `WriterState`, the
@@ -8793,7 +8743,7 @@ mod tests {
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
             // Short grace so the sweep is observable without a slow test.
-            frozen_memtable_grace: Duration::from_secs(1),
+            frozen_memtable_grace: Duration::from_millis(50),
             ..Default::default()
         };
         let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
@@ -8827,7 +8777,7 @@ mod tests {
         );
 
         // After the grace elapses (plus a sweep tick) the handle is evicted.
-        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let refs = writer.in_memory_memtable_refs().await.unwrap();
         assert!(
             refs.frozen.is_empty(),

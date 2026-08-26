@@ -54,7 +54,13 @@ use lance_index::metrics::{
     CROSS_COLUMN_STAGED_SUCCESSES_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
     WAND_EXACTNESS_CERTIFICATE_ATTEMPTS_METRIC, WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC,
     WAND_EXACTNESS_CERTIFICATE_EXHAUSTIVE_METRIC, WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC,
-    WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC,
+    WAND_EXACTNESS_CERTIFICATE_STRICT_METRIC, WAND_EXACTNESS_PROBE_COMPARISONS_METRIC,
+    WAND_EXACTNESS_PROBE_MS_METRIC, WAND_SEEDED_FALLBACK_COMPARISONS_METRIC,
+    WAND_SEEDED_FALLBACK_MS_METRIC, WAND_SEEDED_FALLBACKS_METRIC,
+    WAND_TIE_COMPLETION_ATTEMPTS_METRIC, WAND_TIE_COMPLETION_CANDIDATES_METRIC,
+    WAND_TIE_COMPLETION_COMPARISONS_METRIC, WAND_TIE_COMPLETION_MS_METRIC,
+    WAND_TIE_COMPLETION_OVERFLOWS_METRIC, WAND_TIE_COMPLETION_ROW_ID_REPLACEMENTS_METRIC,
+    WAND_TIE_COMPLETION_SUCCESSES_METRIC,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -67,13 +73,18 @@ use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex,
     MemBM25Scorer, SCORE_COL, Scorer, build_global_bm25_scorer, compound_search,
-    compound_search_with_base_scorer, cross_column_compound_search,
+    compound_search_with_base_scorer, compound_search_with_base_scorer_and_score_floor,
+    cross_column_compound_search, exclusive_scaled_score_floor,
     flat_bm25_search_stream_with_options_and_scorer, fts_schema,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 use uuid::Uuid;
+
+/// Maximum number of additional kth-score rows retained before exact replay.
+/// One extra probe slot is reserved for the strict lower-score guard.
+const WAND_TIE_COMPLETION_BUDGET: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TokenWithPosition {
@@ -297,6 +308,7 @@ async fn open_fts_segments(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn search_segments(
     indices: &[Arc<InvertedIndex>],
     tokens: Arc<Tokens>,
@@ -305,6 +317,7 @@ async fn search_segments(
     pre_filter: Arc<dyn PreFilter>,
     metrics: Arc<FtsIndexMetrics>,
     base_scorer: Arc<MemBM25Scorer>,
+    initial_score_floor: Option<f32>,
 ) -> Result<Vec<ScoredDoc>> {
     let limit = params.limit.unwrap_or(usize::MAX);
     let mut candidates = std::collections::BinaryHeap::new();
@@ -318,16 +331,30 @@ async fn search_segments(
             let metrics = metrics.clone();
             let base_scorer = base_scorer.clone();
             async move {
-                index
-                    .bm25_search_documents(
-                        tokens,
-                        params,
-                        operator,
-                        pre_filter,
-                        metrics,
-                        Some(base_scorer.as_ref()),
-                    )
-                    .await
+                if let Some(initial_score_floor) = initial_score_floor {
+                    index
+                        .bm25_search_documents_with_score_floor(
+                            tokens,
+                            params,
+                            operator,
+                            pre_filter,
+                            metrics,
+                            Some(base_scorer.as_ref()),
+                            initial_score_floor,
+                        )
+                        .await
+                } else {
+                    index
+                        .bm25_search_documents(
+                            tokens,
+                            params,
+                            operator,
+                            pre_filter,
+                            metrics,
+                            Some(base_scorer.as_ref()),
+                        )
+                        .await
+                }
             }
         })
         .collect::<Vec<_>>();
@@ -659,18 +686,22 @@ enum WandExactnessCertificate {
     Ambiguous,
 }
 
-/// Classify a globally merged k+1 Match WAND result.
+/// Classify a globally merged bounded Match WAND result.
 ///
 /// Sorting before classification is essential: per-segment WAND output is not
 /// a final cross-segment ordering. A strict score gap after result k proves
 /// that score-only pruning could not have discarded a row-id tie at the final
-/// boundary. Ties wholly inside top-k remain safe because all members of their
-/// score group are present before the strict boundary.
+/// boundary. Returning fewer rows than requested proves exhaustion. Merely
+/// observing a lower score during collection is not a proof because other
+/// partitions may still contain kth-score ties.
 fn classify_wand_exactness_certificate(
     documents: &mut [ScoredDoc],
     limit: usize,
+    probe_limit: usize,
 ) -> WandExactnessCertificate {
     if limit == 0
+        || probe_limit <= limit
+        || documents.len() > probe_limit
         || documents
             .iter()
             .any(|document| !document.score.0.is_finite())
@@ -684,17 +715,66 @@ fn classify_wand_exactness_certificate(
             .total_cmp(&left.score.0)
             .then_with(|| left.row_id.cmp(&right.row_id))
     });
-    if documents.len() <= limit {
+    if documents.len() < probe_limit {
         WandExactnessCertificate::Exhaustive
-    } else if documents[limit - 1]
-        .score
-        .0
-        .total_cmp(&documents[limit].score.0)
-        == Ordering::Greater
+    } else if documents[limit - 1].score.0.total_cmp(
+        &documents
+            .last()
+            .expect("a full bounded probe has a guard candidate")
+            .score
+            .0,
+    ) == Ordering::Greater
     {
         WandExactnessCertificate::Strict
     } else {
         WandExactnessCertificate::Ambiguous
+    }
+}
+
+fn finish_wand_documents(mut documents: Vec<ScoredDoc>, limit: usize) -> (Vec<u64>, Vec<f32>) {
+    documents.truncate(limit);
+    documents
+        .into_iter()
+        .map(|document| (document.row_id, document.score.0))
+        .unzip()
+}
+
+fn count_smaller_row_id_replacements(
+    initial: &[ScoredDoc],
+    completion: &[ScoredDoc],
+    limit: usize,
+) -> usize {
+    initial
+        .iter()
+        .zip(completion)
+        .take(limit)
+        .filter(|(initial, completed)| completed.row_id < initial.row_id)
+        .count()
+}
+
+async fn exact_match_fallback(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<FtsIndexMetrics>,
+    base_scorer: Arc<MemBM25Scorer>,
+    score_floor: Option<f32>,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    if let Some(score_floor) = score_floor {
+        compound_search_with_base_scorer_and_score_floor(
+            indices,
+            query,
+            params,
+            prefilter,
+            metrics,
+            base_scorer,
+            score_floor,
+        )
+        .await
+    } else {
+        compound_search_with_base_scorer(indices, query, params, prefilter, metrics, base_scorer)
+            .await
     }
 }
 
@@ -881,16 +961,17 @@ impl ExecutionPlan for CompoundQueryExec {
                 })?;
                 let mut tokenizer =
                     tokenizer_for_match_query(first_index.as_ref(), match_query.fuzziness);
-                let tokens = collect_query_tokens(&match_query.terms, &mut tokenizer);
-                let wand_params = MatchQueryExec::effective_params(&match_query, params.clone())
-                    .with_phrase_slop(None)
-                    .with_limit(Some(wand_limit));
+                let tokens = Arc::new(collect_query_tokens(&match_query.terms, &mut tokenizer));
+                let base_wand_params =
+                    MatchQueryExec::effective_params(&match_query, params.clone())
+                        .with_phrase_slop(None)
+                        .with_limit(Some(wand_limit));
                 let scorer_start = std::time::Instant::now();
                 let base_scorer = Arc::new(
                     build_global_bm25_scorer(
                         &indices,
-                        &tokens,
-                        &wand_params,
+                        tokens.as_ref(),
+                        &base_wand_params,
                         Some(metrics.as_ref()),
                     )
                     .await?,
@@ -917,48 +998,174 @@ impl ExecutionPlan for CompoundQueryExec {
                 } else {
                     metrics.record_wand_exactness_certificate_attempts(1);
                     prefilter.wait_for_ready().await?;
+                    let probe_start = std::time::Instant::now();
+                    let probe_comparisons = metrics.index_metrics.comparisons();
                     let mut documents = search_segments(
                         &indices,
-                        Arc::new(tokens),
-                        Arc::new(wand_params),
+                        tokens.clone(),
+                        Arc::new(base_wand_params.clone()),
                         match_query.operator,
                         prefilter.clone(),
                         metrics.clone(),
                         base_scorer.clone(),
+                        None,
                     )
                     .await?;
+                    metrics.record_wand_exactness_probe(probe_start.elapsed());
+                    metrics.record_wand_exactness_probe_comparisons(
+                        metrics
+                            .index_metrics
+                            .comparisons()
+                            .saturating_sub(probe_comparisons),
+                    );
                     documents.iter_mut().for_each(|document| {
                         document.score.0 *= match_query.boost;
                     });
                     metrics.record_wand_exactness_certificate_candidates(documents.len());
-                    match classify_wand_exactness_certificate(&mut documents, limit) {
+                    match classify_wand_exactness_certificate(&mut documents, limit, wand_limit) {
                         WandExactnessCertificate::Exhaustive => {
                             metrics.record_wand_exactness_certificate_exhaustive(1);
-                            documents.truncate(limit);
-                            documents
-                                .into_iter()
-                                .map(|document| (document.row_id, document.score.0))
-                                .unzip()
+                            finish_wand_documents(documents, limit)
                         }
                         WandExactnessCertificate::Strict => {
                             metrics.record_wand_exactness_certificate_strict(1);
-                            documents.truncate(limit);
-                            documents
-                                .into_iter()
-                                .map(|document| (document.row_id, document.score.0))
-                                .unzip()
+                            finish_wand_documents(documents, limit)
                         }
                         WandExactnessCertificate::Ambiguous => {
-                            metrics.record_wand_exactness_certificate_fallbacks(1);
-                            compound_search_with_base_scorer(
-                                &indices,
-                                &query,
-                                &params,
-                                prefilter,
-                                metrics.clone(),
-                                base_scorer,
-                            )
-                            .await?
+                            let score_floor = documents
+                                .get(limit - 1)
+                                .map(|document| document.score.0)
+                                .filter(|score| score.is_finite());
+                            let completion_limit = limit
+                                .checked_add(WAND_TIE_COMPLETION_BUDGET)
+                                .and_then(|limit| limit.checked_add(1));
+                            if let (Some(score_floor), Some(completion_limit)) =
+                                (score_floor, completion_limit)
+                            {
+                                metrics.record_wand_tie_completion_attempts(1);
+                                let completion_params = Arc::new(
+                                    base_wand_params.clone().with_limit(Some(completion_limit)),
+                                );
+                                let completion_start = std::time::Instant::now();
+                                let completion_comparisons = metrics.index_metrics.comparisons();
+                                let raw_score_floor =
+                                    exclusive_scaled_score_floor(score_floor, match_query.boost);
+                                let mut completion = search_segments(
+                                    &indices,
+                                    tokens,
+                                    completion_params,
+                                    match_query.operator,
+                                    prefilter.clone(),
+                                    metrics.clone(),
+                                    base_scorer.clone(),
+                                    raw_score_floor,
+                                )
+                                .await?;
+                                metrics.record_wand_tie_completion(completion_start.elapsed());
+                                metrics.record_wand_tie_completion_comparisons(
+                                    metrics
+                                        .index_metrics
+                                        .comparisons()
+                                        .saturating_sub(completion_comparisons),
+                                );
+                                completion.iter_mut().for_each(|document| {
+                                    document.score.0 *= match_query.boost;
+                                });
+                                metrics.record_wand_tie_completion_candidates(completion.len());
+                                match classify_wand_exactness_certificate(
+                                    &mut completion,
+                                    limit,
+                                    completion_limit,
+                                ) {
+                                    WandExactnessCertificate::Exhaustive => {
+                                        metrics.record_wand_tie_completion_successes(1);
+                                        metrics.record_wand_tie_completion_row_id_replacements(
+                                            count_smaller_row_id_replacements(
+                                                &documents,
+                                                &completion,
+                                                limit,
+                                            ),
+                                        );
+                                        metrics.record_wand_exactness_certificate_exhaustive(1);
+                                        finish_wand_documents(completion, limit)
+                                    }
+                                    WandExactnessCertificate::Strict => {
+                                        metrics.record_wand_tie_completion_successes(1);
+                                        metrics.record_wand_tie_completion_row_id_replacements(
+                                            count_smaller_row_id_replacements(
+                                                &documents,
+                                                &completion,
+                                                limit,
+                                            ),
+                                        );
+                                        metrics.record_wand_exactness_certificate_strict(1);
+                                        finish_wand_documents(completion, limit)
+                                    }
+                                    WandExactnessCertificate::Ambiguous => {
+                                        let seeded_floor = completion
+                                            .iter()
+                                            .all(|document| document.score.0.is_finite())
+                                            .then_some(score_floor);
+                                        metrics.record_wand_exactness_certificate_fallbacks(1);
+                                        if seeded_floor.is_some() {
+                                            metrics.record_wand_tie_completion_overflows(1);
+                                            metrics.record_wand_seeded_fallbacks(1);
+                                        }
+                                        let fallback_start = std::time::Instant::now();
+                                        let fallback_comparisons =
+                                            metrics.index_metrics.comparisons();
+                                        let results = exact_match_fallback(
+                                            &indices,
+                                            &query,
+                                            &params,
+                                            prefilter,
+                                            metrics.clone(),
+                                            base_scorer,
+                                            seeded_floor,
+                                        )
+                                        .await?;
+                                        if seeded_floor.is_some() {
+                                            metrics.record_wand_seeded_fallback(
+                                                fallback_start.elapsed(),
+                                            );
+                                            metrics.record_wand_seeded_fallback_comparisons(
+                                                metrics
+                                                    .index_metrics
+                                                    .comparisons()
+                                                    .saturating_sub(fallback_comparisons),
+                                            );
+                                        }
+                                        results
+                                    }
+                                }
+                            } else {
+                                metrics.record_wand_exactness_certificate_fallbacks(1);
+                                if score_floor.is_some() {
+                                    metrics.record_wand_seeded_fallbacks(1);
+                                }
+                                let fallback_start = std::time::Instant::now();
+                                let fallback_comparisons = metrics.index_metrics.comparisons();
+                                let results = exact_match_fallback(
+                                    &indices,
+                                    &query,
+                                    &params,
+                                    prefilter,
+                                    metrics.clone(),
+                                    base_scorer,
+                                    score_floor,
+                                )
+                                .await?;
+                                if score_floor.is_some() {
+                                    metrics.record_wand_seeded_fallback(fallback_start.elapsed());
+                                    metrics.record_wand_seeded_fallback_comparisons(
+                                        metrics
+                                            .index_metrics
+                                            .comparisons()
+                                            .saturating_sub(fallback_comparisons),
+                                    );
+                                }
+                                results
+                            }
                         }
                     }
                 }
@@ -1756,6 +1963,18 @@ pub struct FtsIndexMetrics {
     wand_exactness_certificate_exhaustive: Count,
     wand_exactness_certificate_fallbacks: Count,
     wand_exactness_certificate_candidates: Count,
+    wand_exactness_probe_ms: Gauge,
+    wand_exactness_probe_comparisons: Count,
+    wand_tie_completion_attempts: Count,
+    wand_tie_completion_successes: Count,
+    wand_tie_completion_overflows: Count,
+    wand_tie_completion_candidates: Count,
+    wand_tie_completion_row_id_replacements: Count,
+    wand_tie_completion_ms: Gauge,
+    wand_tie_completion_comparisons: Count,
+    wand_seeded_fallbacks: Count,
+    wand_seeded_fallback_ms: Gauge,
+    wand_seeded_fallback_comparisons: Count,
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
@@ -1811,6 +2030,26 @@ impl FtsIndexMetrics {
                 .new_count(WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC, partition),
             wand_exactness_certificate_candidates: metrics
                 .new_count(WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC, partition),
+            wand_exactness_probe_ms: metrics.new_gauge(WAND_EXACTNESS_PROBE_MS_METRIC, partition),
+            wand_exactness_probe_comparisons: metrics
+                .new_count(WAND_EXACTNESS_PROBE_COMPARISONS_METRIC, partition),
+            wand_tie_completion_attempts: metrics
+                .new_count(WAND_TIE_COMPLETION_ATTEMPTS_METRIC, partition),
+            wand_tie_completion_successes: metrics
+                .new_count(WAND_TIE_COMPLETION_SUCCESSES_METRIC, partition),
+            wand_tie_completion_overflows: metrics
+                .new_count(WAND_TIE_COMPLETION_OVERFLOWS_METRIC, partition),
+            wand_tie_completion_candidates: metrics
+                .new_count(WAND_TIE_COMPLETION_CANDIDATES_METRIC, partition),
+            wand_tie_completion_row_id_replacements: metrics
+                .new_count(WAND_TIE_COMPLETION_ROW_ID_REPLACEMENTS_METRIC, partition),
+            wand_tie_completion_ms: metrics.new_gauge(WAND_TIE_COMPLETION_MS_METRIC, partition),
+            wand_tie_completion_comparisons: metrics
+                .new_count(WAND_TIE_COMPLETION_COMPARISONS_METRIC, partition),
+            wand_seeded_fallbacks: metrics.new_count(WAND_SEEDED_FALLBACKS_METRIC, partition),
+            wand_seeded_fallback_ms: metrics.new_gauge(WAND_SEEDED_FALLBACK_MS_METRIC, partition),
+            wand_seeded_fallback_comparisons: metrics
+                .new_count(WAND_SEEDED_FALLBACK_COMPARISONS_METRIC, partition),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -1823,6 +2062,38 @@ impl FtsIndexMetrics {
 
     pub fn record_scorer_build(&self, elapsed: std::time::Duration) {
         self.scorer_build_ms.set(elapsed.as_millis() as usize);
+    }
+
+    fn record_wand_exactness_probe(&self, elapsed: std::time::Duration) {
+        self.wand_exactness_probe_ms
+            .set(elapsed.as_millis() as usize);
+    }
+
+    fn record_wand_exactness_probe_comparisons(&self, comparisons: usize) {
+        self.wand_exactness_probe_comparisons.add(comparisons);
+    }
+
+    fn record_wand_tie_completion(&self, elapsed: std::time::Duration) {
+        self.wand_tie_completion_ms
+            .set(elapsed.as_millis() as usize);
+    }
+
+    fn record_wand_tie_completion_comparisons(&self, comparisons: usize) {
+        self.wand_tie_completion_comparisons.add(comparisons);
+    }
+
+    fn record_wand_tie_completion_row_id_replacements(&self, replacements: usize) {
+        self.wand_tie_completion_row_id_replacements
+            .add(replacements);
+    }
+
+    fn record_wand_seeded_fallback(&self, elapsed: std::time::Duration) {
+        self.wand_seeded_fallback_ms
+            .set(elapsed.as_millis() as usize);
+    }
+
+    fn record_wand_seeded_fallback_comparisons(&self, comparisons: usize) {
+        self.wand_seeded_fallback_comparisons.add(comparisons);
     }
 }
 
@@ -1940,6 +2211,26 @@ impl MetricsCollector for FtsIndexMetrics {
     fn record_wand_exactness_certificate_candidates(&self, num_candidates: usize) {
         self.wand_exactness_certificate_candidates
             .add(num_candidates);
+    }
+
+    fn record_wand_tie_completion_attempts(&self, num_attempts: usize) {
+        self.wand_tie_completion_attempts.add(num_attempts);
+    }
+
+    fn record_wand_tie_completion_successes(&self, num_successes: usize) {
+        self.wand_tie_completion_successes.add(num_successes);
+    }
+
+    fn record_wand_tie_completion_overflows(&self, num_overflows: usize) {
+        self.wand_tie_completion_overflows.add(num_overflows);
+    }
+
+    fn record_wand_tie_completion_candidates(&self, num_candidates: usize) {
+        self.wand_tie_completion_candidates.add(num_candidates);
+    }
+
+    fn record_wand_seeded_fallbacks(&self, num_fallbacks: usize) {
+        self.wand_seeded_fallbacks.add(num_fallbacks);
     }
 }
 
@@ -2421,6 +2712,7 @@ impl ExecutionPlan for MatchQueryExec {
                 pre_filter,
                 metrics.clone(),
                 base_scorer,
+                None,
             )
             .await?;
             documents.iter_mut().for_each(|document| {
@@ -3719,6 +4011,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 pre_filter,
                 metrics.clone(),
                 base_scorer,
+                None,
             )
             .await?;
             metrics.baseline_metrics.record_output(documents.len());
@@ -4304,8 +4597,9 @@ mod tests {
     use super::{
         BoolSlot, BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
         FTS_SEGMENT_BIND_DURATION_METRIC, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
-        PhraseQueryExec, WandExactnessCertificate, build_boolean_query_children,
-        classify_wand_exactness_certificate, default_text_tokenizer, open_fts_segments,
+        PhraseQueryExec, WAND_TIE_COMPLETION_BUDGET, WandExactnessCertificate,
+        build_boolean_query_children, classify_wand_exactness_certificate,
+        count_smaller_row_id_replacements, default_text_tokenizer, open_fts_segments,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -4376,13 +4670,13 @@ mod tests {
 
         let mut exhaustive = documents(&[3.0, 2.0]);
         assert_eq!(
-            classify_wand_exactness_certificate(&mut exhaustive, 3),
+            classify_wand_exactness_certificate(&mut exhaustive, 3, 4),
             WandExactnessCertificate::Exhaustive
         );
 
         let mut strict = documents(&[4.0, 3.0, 3.0, 1.0]);
         assert_eq!(
-            classify_wand_exactness_certificate(&mut strict, 3),
+            classify_wand_exactness_certificate(&mut strict, 3, 4),
             WandExactnessCertificate::Strict
         );
         assert_eq!(
@@ -4396,20 +4690,73 @@ mod tests {
 
         let mut ambiguous = documents(&[4.0, 3.0, 2.0, 2.0]);
         assert_eq!(
-            classify_wand_exactness_certificate(&mut ambiguous, 3),
+            classify_wand_exactness_certificate(&mut ambiguous, 3, 4),
             WandExactnessCertificate::Ambiguous
         );
 
         let mut non_finite = documents(&[4.0, f32::INFINITY]);
         assert_eq!(
-            classify_wand_exactness_certificate(&mut non_finite, 1),
+            classify_wand_exactness_certificate(&mut non_finite, 1, 2),
             WandExactnessCertificate::Ambiguous
         );
 
         let mut zero_limit = documents(&[1.0]);
         assert_eq!(
-            classify_wand_exactness_certificate(&mut zero_limit, 0),
+            classify_wand_exactness_certificate(&mut zero_limit, 0, 1),
             WandExactnessCertificate::Ambiguous
+        );
+
+        let mut reversed_segments = vec![
+            ScoredDoc::new(99, 2.0),
+            ScoredDoc::new(50, 3.0),
+            ScoredDoc::new(1, 2.0),
+        ];
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut reversed_segments, 2, 4),
+            WandExactnessCertificate::Exhaustive
+        );
+        assert_eq!(
+            reversed_segments
+                .iter()
+                .map(|document| document.row_id)
+                .collect::<Vec<_>>(),
+            vec![50, 1, 99],
+            "completed ties must use final row-id order, not segment arrival order"
+        );
+
+        let completion_limit = 1 + WAND_TIE_COMPLETION_BUDGET + 1;
+        let mut at_budget = (0..=WAND_TIE_COMPLETION_BUDGET)
+            .rev()
+            .map(|row_id| ScoredDoc::new(row_id as u64, 2.0))
+            .chain(std::iter::once(ScoredDoc::new(u64::MAX, 1.0)))
+            .collect::<Vec<_>>();
+        assert_eq!(at_budget.len(), completion_limit);
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut at_budget, 1, completion_limit),
+            WandExactnessCertificate::Strict,
+            "the completion budget includes a slot for a strict lower-score guard"
+        );
+        assert_eq!(at_budget[0].row_id, 0);
+
+        let mut overflow = (0..completion_limit)
+            .rev()
+            .map(|row_id| ScoredDoc::new(row_id as u64, 2.0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            classify_wand_exactness_certificate(&mut overflow, 1, completion_limit),
+            WandExactnessCertificate::Ambiguous,
+            "a full probe with no lower-score guard must replay exactly"
+        );
+
+        let initial = vec![ScoredDoc::new(50, 3.0), ScoredDoc::new(99, 2.0)];
+        let completed = vec![ScoredDoc::new(50, 3.0), ScoredDoc::new(1, 2.0)];
+        assert_eq!(
+            count_smaller_row_id_replacements(&initial, &completed, 2),
+            1
+        );
+        assert_eq!(
+            count_smaller_row_id_replacements(&completed, &initial, 2),
+            0
         );
     }
 
@@ -4423,12 +4770,36 @@ mod tests {
         metrics.record_wand_exactness_certificate_exhaustive(5);
         metrics.record_wand_exactness_certificate_fallbacks(7);
         metrics.record_wand_exactness_certificate_candidates(11);
+        metrics.record_wand_tie_completion_attempts(13);
+        metrics.record_wand_tie_completion_successes(17);
+        metrics.record_wand_tie_completion_overflows(19);
+        metrics.record_wand_tie_completion_candidates(23);
+        metrics.record_wand_seeded_fallbacks(29);
+        metrics.record_wand_exactness_probe(std::time::Duration::from_millis(31));
+        metrics.record_wand_tie_completion(std::time::Duration::from_millis(37));
+        metrics.record_wand_seeded_fallback(std::time::Duration::from_millis(41));
+        metrics.record_wand_exactness_probe_comparisons(43);
+        metrics.record_wand_tie_completion_comparisons(47);
+        metrics.record_wand_seeded_fallback_comparisons(53);
+        metrics.record_wand_tie_completion_row_id_replacements(59);
 
         assert_eq!(metrics.wand_exactness_certificate_attempts.value(), 2);
         assert_eq!(metrics.wand_exactness_certificate_strict.value(), 3);
         assert_eq!(metrics.wand_exactness_certificate_exhaustive.value(), 5);
         assert_eq!(metrics.wand_exactness_certificate_fallbacks.value(), 7);
         assert_eq!(metrics.wand_exactness_certificate_candidates.value(), 11);
+        assert_eq!(metrics.wand_tie_completion_attempts.value(), 13);
+        assert_eq!(metrics.wand_tie_completion_successes.value(), 17);
+        assert_eq!(metrics.wand_tie_completion_overflows.value(), 19);
+        assert_eq!(metrics.wand_tie_completion_candidates.value(), 23);
+        assert_eq!(metrics.wand_seeded_fallbacks.value(), 29);
+        assert_eq!(metrics.wand_exactness_probe_ms.value(), 31);
+        assert_eq!(metrics.wand_tie_completion_ms.value(), 37);
+        assert_eq!(metrics.wand_seeded_fallback_ms.value(), 41);
+        assert_eq!(metrics.wand_exactness_probe_comparisons.value(), 43);
+        assert_eq!(metrics.wand_tie_completion_comparisons.value(), 47);
+        assert_eq!(metrics.wand_seeded_fallback_comparisons.value(), 53);
+        assert_eq!(metrics.wand_tie_completion_row_id_replacements.value(), 59);
     }
 
     async fn create_segment_selection_fixture() -> (Arc<Dataset>, Vec<IndexMetadata>, Vec<u32>) {

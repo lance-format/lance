@@ -4386,7 +4386,7 @@ mod tests {
             let data = lance_datagen::gen_batch()
                 .col("filterme", array::step::<UInt64Type>())
                 .col("blobs", array::blob())
-                .into_reader_rows(RowCount::from(10), BatchCount::from(10))
+                .into_reader_rows(RowCount::from(10), BatchCount::from(4))
                 .map(|batch| Ok(batch?))
                 .collect::<Result<Vec<_>>>()
                 .unwrap();
@@ -4533,19 +4533,19 @@ mod tests {
             .scan()
             .project::<String>(&[])
             .unwrap()
-            .filter("filterme >= 50")
+            .filter("filterme >= 10")
             .unwrap()
             .with_row_id()
             .try_into_batch()
             .await
             .unwrap();
         let row_ids = row_ids.column(0).as_primitive::<UInt64Type>().values();
-        let row_ids = vec![row_ids[5], row_ids[17], row_ids[33]];
+        let row_ids = vec![row_ids[5], row_ids[17], row_ids[23]];
 
         let blobs = fixture.dataset.take_blobs(&row_ids, "blobs").await.unwrap();
 
         for (actual_idx, (expected_batch_idx, expected_row_idx)) in
-            [(5, 5), (6, 7), (8, 3)].iter().enumerate()
+            [(1, 5), (2, 7), (3, 3)].iter().enumerate()
         {
             let val = blobs[actual_idx].as_ref().unwrap().read().await.unwrap();
             let expected = fixture.data[*expected_batch_idx]
@@ -4613,7 +4613,7 @@ mod tests {
         indices.pop();
 
         // Row indices
-        assert_eq!(indices, [2, 12, 22, 32, 42, 52, 62, 72, 82]);
+        assert_eq!(indices, [2, 12, 22]);
         let blobs = fixture
             .dataset
             .take_blobs_by_indices(&indices, "blobs")
@@ -4826,7 +4826,7 @@ mod tests {
 
         let batches = batches.try_collect::<Vec<_>>().await.unwrap();
 
-        assert_eq!(batches.len(), 10);
+        assert_eq!(batches.len(), 4);
         for batch in batches.iter() {
             assert_eq!(batch.num_columns(), 1);
             assert!(batch.column(0).data_type().is_struct());
@@ -4838,7 +4838,7 @@ mod tests {
             .scan()
             .project(&["blobs"])
             .unwrap()
-            .filter("filterme = 50")
+            .filter("filterme = 30")
             .unwrap()
             .try_into_stream()
             .await

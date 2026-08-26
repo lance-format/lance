@@ -216,6 +216,69 @@ impl InvertedIndex {
         metrics: Arc<dyn MetricsCollector>,
         base_scorer: Option<&MemBM25Scorer>,
     ) -> Result<Vec<ScoredDoc>> {
+        self.bm25_search_documents_impl(
+            tokens,
+            params,
+            operator,
+            prefilter,
+            metrics,
+            base_scorer,
+            None,
+        )
+        .await
+    }
+
+    /// Search logical FTS documents with an exclusive initial raw-score floor.
+    ///
+    /// This is an internal optimization hook for a repeated bounded WAND pass.
+    /// Callers must round the floor down far enough to retain every candidate
+    /// equal to their inclusive logical threshold.
+    #[doc(hidden)]
+    #[instrument(level = "debug", skip_all)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bm25_search_documents_with_score_floor(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        base_scorer: Option<&MemBM25Scorer>,
+        initial_score_floor: f32,
+    ) -> Result<Vec<ScoredDoc>> {
+        if self.is_legacy() {
+            return Err(Error::invalid_input(
+                "an initial Match WAND score floor requires a modern FTS index",
+            ));
+        }
+        if !initial_score_floor.is_finite() {
+            return Err(Error::invalid_input(format!(
+                "initial Match WAND score floor must be finite, got {initial_score_floor}"
+            )));
+        }
+        self.bm25_search_documents_impl(
+            tokens,
+            params,
+            operator,
+            prefilter,
+            metrics,
+            base_scorer,
+            Some(initial_score_floor),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bm25_search_documents_impl(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        base_scorer: Option<&MemBM25Scorer>,
+        initial_score_floor: Option<f32>,
+    ) -> Result<Vec<ScoredDoc>> {
         // Fuzzy expansion runs once here, with the global `max_expansions`
         // budget, instead of once per partition: partitions receive the
         // final token list, so the matched terms cannot depend on how the
@@ -286,6 +349,7 @@ impl InvertedIndex {
                 scorer,
                 impact_scorer,
                 limit,
+                initial_score_floor,
             })
             .await
         }
@@ -541,6 +605,7 @@ impl InvertedIndex {
             scorer,
             impact_scorer,
             limit,
+            initial_score_floor,
         } = request;
         if self.partitions.len() > u32::MAX as usize {
             return Err(Error::index(format!(
@@ -548,7 +613,9 @@ impl InvertedIndex {
                 self.partitions.len()
             )));
         }
-        let impact_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+        let impact_shared_threshold = Arc::new(AtomicU32::new(
+            initial_score_floor.unwrap_or(f32::NEG_INFINITY).to_bits(),
+        ));
         let io_parallelism = self.store.io_parallelism();
         let parts = self
             .partitions

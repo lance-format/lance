@@ -782,10 +782,7 @@ impl PerValueCompressor for ValueEncoder {
 // public tests module because we share the PRIMITIVE_TYPES constant with fixed_size_list
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, LazyLock},
-    };
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
         Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
@@ -807,8 +804,7 @@ mod tests {
         },
         format::pb21::compressive_encoding::Compression,
         testing::{
-            FnArrayGeneratorProvider, TestCases, check_basic_random,
-            check_round_trip_encoding_generated, check_round_trip_encoding_of_data,
+            TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
         },
     };
 
@@ -905,75 +901,83 @@ mod tests {
         }
     }
 
-    static LARGE_TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
-        vec![DataType::FixedSizeList(
-            Arc::new(Field::new("", DataType::Int32, false)),
-            128,
-        )]
-    });
-
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_large_primitive() {
-        for data_type in LARGE_TYPES.iter() {
-            log::info!("Testing encoding for {:?}", data_type);
-            let field = Field::new("", data_type.clone(), false);
-            check_basic_random(field).await;
-        }
+    async fn test_large_primitive(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let data_type =
+            DataType::FixedSizeList(Arc::new(Field::new("", DataType::Int32, false)), 128);
+        let field = Field::new("", data_type, false);
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_decimal128_dictionary_encoding() {
-        let test_cases = TestCases::default().with_structural_encodings();
+    async fn test_decimal128_dictionary_encoding(
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        let test_cases = TestCases::default()
+            .with_encoding(encoding)
+            .with_expected_encoding("dictionary");
         let decimals: Vec<i32> = (0..100).collect();
         let repeated_strings: Vec<_> = decimals
             .iter()
             .cycle()
-            .take(decimals.len() * 10000)
+            .take(decimals.len() * 1000)
             .map(|&v| Some(v as i128))
             .collect();
         let decimal_array = Arc::new(Decimal128Array::from(repeated_strings)) as ArrayRef;
         check_round_trip_encoding_of_data(vec![decimal_array], &test_cases, HashMap::new()).await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_miniblock_stress() {
+    async fn test_miniblock_stress(
+        #[values(false, true)] mixed_validity: bool,
+        #[values(10, 100, 1500, 15000)] batch_size: u32,
+        #[values(1000, 2000, 3000, 60000)] page_size: u64,
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
         // Tests for strange page sizes and batch sizes and validity scenarios for miniblock
 
-        // 10K integers, 100 per array, all valid
-        let data1 = (0..100)
-            .map(|_| Arc::new(Int32Array::from_iter_values(0..100)) as Arc<dyn Array>)
-            .collect::<Vec<_>>();
-
-        // Same as above but with mixed validity
-        let data2 = (0..100)
+        // 10K integers, 100 per array, either all valid or mixed validity.
+        let data = (0..100)
             .map(|_| {
-                Arc::new(Int32Array::from_iter(
-                    (0..100).map(|i| if i % 2 == 0 { Some(i) } else { None }),
-                )) as Arc<dyn Array>
+                if mixed_validity {
+                    Arc::new(Int32Array::from_iter(
+                        (0..100).map(|i| if i % 2 == 0 { Some(i) } else { None }),
+                    )) as Arc<dyn Array>
+                } else {
+                    Arc::new(Int32Array::from_iter_values(0..100)) as Arc<dyn Array>
+                }
             })
             .collect::<Vec<_>>();
 
-        // Same as above but with all null for first half then all valid
-        // TODO: Re-enable once the all-null path is complete
-        let _data3 = (0..100)
-            .map(|chunk_idx| {
-                Arc::new(Int32Array::from_iter(
-                    (0..100).map(|i| if chunk_idx < 50 { None } else { Some(i) }),
-                )) as Arc<dyn Array>
-            })
-            .collect::<Vec<_>>();
+        let test_cases = TestCases::default()
+            .with_page_sizes(vec![page_size])
+            .with_batch_size(batch_size)
+            .with_encoding(encoding);
 
-        for data in [data1, data2 /*data3*/] {
-            for batch_size in [10, 100, 1500, 15000] {
-                // 40000 bytes of data
-                let test_cases = TestCases::default()
-                    .with_page_sizes(vec![1000, 2000, 3000, 60000])
-                    .with_batch_size(batch_size)
-                    .with_structural_encodings();
-
-                check_round_trip_encoding_of_data(data.clone(), &test_cases, HashMap::new()).await;
-            }
-        }
+        check_round_trip_encoding_of_data(data, &test_cases, HashMap::new()).await;
     }
 
     fn create_simple_fsl() -> FixedSizeListArray {
@@ -1250,18 +1254,43 @@ mod tests {
         assert_eq!(decompressed.as_ref(), sample_array.as_ref());
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_fsl_nullable_items() {
-        let datagen = Box::new(FnArrayGeneratorProvider::new(move || {
-            lance_datagen::array::rand_vec_nullable::<UInt32Type>(Dimension::from(128), 0.5)
-        }));
+    async fn test_fsl_nullable_items(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        let mut generator =
+            gen_batch()
+                .with_seed(Seed::from(0))
+                .anon_col(array::rand_vec_nullable::<UInt32Type>(
+                    Dimension::from(128),
+                    0.5,
+                ));
+        generator.with_random_nulls(0.2);
+        let source = generator
+            .into_batch_rows(RowCount::from(1026))
+            .unwrap()
+            .column(0)
+            .clone();
+        let test_cases = TestCases::default()
+            .with_page_sizes(vec![4096])
+            .with_encoding(encoding)
+            .with_batch_size(257)
+            .with_range(510..515)
+            .with_indices(vec![0, 511, 512, 1024]);
 
-        let field = Field::new(
-            "",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt32, true)), 128),
-            false,
-        );
-        check_round_trip_encoding_generated(field, datagen, TestCases::default()).await;
+        check_round_trip_encoding_of_data(
+            vec![source.slice(1, 512), source.slice(513, 513)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]

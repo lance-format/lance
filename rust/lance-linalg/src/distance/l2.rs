@@ -1021,6 +1021,7 @@ mod tests {
 
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
+        dimension_shard, run_vector_pair_proptest,
     };
 
     #[test]
@@ -1158,6 +1159,40 @@ mod tests {
         do_l2_test(&x, &y).unwrap();
     }
 
+    #[rstest::rstest]
+    fn test_l2_distance_f32(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
+            do_l2_test(&x, &y)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_l2_distance_f64(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
+            do_l2_test(&x, &y)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_l2_f32_scalar_simd_parity(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
+            let scalar = x
+                .iter()
+                .zip(y.iter())
+                .map(|(&a, &b)| ((a as f64) - (b as f64)).powi(2))
+                .sum::<f64>() as f32;
+            let simd = <f32 as L2>::l2(&x, &y);
+            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            Ok(())
+        });
+    }
+
     // Test L2 distance over different types.
     // * L2 is valid over the entire range of f16.
     // * L2 is valid over f32 and bf16 in the range of +-1e12.
@@ -1173,16 +1208,6 @@ mod tests {
             do_l2_test(&x, &y)?;
         }
 
-        #[test]
-        fn test_l2_distance_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
-            do_l2_test(&x, &y)?;
-        }
-
-        #[test]
-        fn test_l2_distance_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
-            do_l2_test(&x, &y)?;
-        }
-
         /// Cross-backend parity: scalar fallback must match the dispatched
         /// SIMD path within numerical tolerance. Exercises `l2_f64_scalar`
         /// directly so the runtime fallback is exercised even on AVX2-capable
@@ -1195,25 +1220,6 @@ mod tests {
             let scalar = l2_f64_scalar(&x, &y);
             let simd = l2_f64_simd(&x, &y);
             prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-6));
-        }
-
-        /// Parity check for `l2_f32_dispatched` (Branch B exclusive: the
-        /// auto-vectorised scalar L2 path). The dispatched kernel must
-        /// agree with a portable f64-precision scalar reference within
-        /// numerical tolerance. The reference is hand-rolled here to keep
-        /// this test architecture-agnostic (the x86_64-only `l2_f64_scalar`
-        /// helper is gated above).
-        #[test]
-        fn test_l2_f32_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            let scalar = x
-                .iter()
-                .zip(y.iter())
-                .map(|(&a, &b)| ((a as f64) - (b as f64)).powi(2))
-                .sum::<f64>() as f32;
-            let simd = <f32 as L2>::l2(&x, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
         }
 
         /// AVX-512-direct parity: explicitly compares the scalar fallback

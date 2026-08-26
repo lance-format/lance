@@ -585,6 +585,11 @@ impl IndexMetrics {
     pub fn flush_io(&self) {
         self.io_metrics.record_stats(self.io_stats.snapshot());
     }
+
+    /// Return the cumulative comparison count for phase-level deltas.
+    pub fn comparisons(&self) -> usize {
+        self.index_comparisons.value()
+    }
 }
 
 impl MetricsCollector for IndexMetrics {

@@ -205,6 +205,37 @@ fn next_down(value: f32) -> f32 {
     }
 }
 
+/// Find the greatest finite non-negative raw score whose actual `f32`
+/// multiplication remains strictly below an inclusive scaled score floor.
+///
+/// Non-negative finite `f32` values have the same order as their bit patterns,
+/// and multiplication by a finite positive factor is monotonic. Binary search
+/// therefore proves the returned exclusive child floor cannot discard a raw
+/// score whose scaled value is equal to `scaled_score_floor`.
+#[doc(hidden)]
+pub fn exclusive_scaled_score_floor(scaled_score_floor: f32, factor: f32) -> Option<f32> {
+    if !scaled_score_floor.is_finite()
+        || scaled_score_floor <= 0.0
+        || !factor.is_finite()
+        || factor <= 0.0
+    {
+        return None;
+    }
+
+    let mut lower_bits = 0_u32;
+    let mut upper_bits = f32::MAX.to_bits();
+    while lower_bits < upper_bits {
+        let midpoint = lower_bits + (upper_bits - lower_bits).div_ceil(2);
+        let raw_score = f32::from_bits(midpoint);
+        if raw_score * factor < scaled_score_floor {
+            lower_bits = midpoint;
+        } else {
+            upper_bits = midpoint - 1;
+        }
+    }
+    Some(f32::from_bits(lower_bits))
+}
+
 fn checked_score(score: f32, context: &str) -> Result<f32> {
     if score.is_finite() {
         Ok(score)
@@ -2137,6 +2168,9 @@ impl ComposableScorer for EmptyScorer {
 struct ScaleScorer<'a> {
     child: BoxScorer<'a>,
     factor: f32,
+    last_parent_score_floor: f32,
+    #[cfg(test)]
+    score_floor_translations: usize,
 }
 
 impl<'a> ScaleScorer<'a> {
@@ -2146,7 +2180,13 @@ impl<'a> ScaleScorer<'a> {
                 "MatchQuery boost must be finite and non-negative, got {factor}"
             )));
         }
-        Ok(Self { child, factor })
+        Ok(Self {
+            child,
+            factor,
+            last_parent_score_floor: f32::NEG_INFINITY,
+            #[cfg(test)]
+            score_floor_translations: 0,
+        })
     }
 }
 
@@ -2198,10 +2238,22 @@ impl ComposableScorer for ScaleScorer<'_> {
     }
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
-        if self.factor > 0.0 {
-            self.child
-                .set_min_competitive_score(next_down(min_score / self.factor))?;
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive MatchQuery score cannot be NaN",
+            ));
         }
+        if min_score <= self.last_parent_score_floor {
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            self.score_floor_translations += 1;
+        }
+        if let Some(child_floor) = exclusive_scaled_score_floor(min_score, self.factor) {
+            self.child.set_min_competitive_score(child_floor)?;
+        }
+        self.last_parent_score_floor = min_score;
         Ok(())
     }
 
@@ -3904,7 +3956,7 @@ pub async fn compound_search(
     prefilter: Arc<dyn PreFilter>,
     metrics: Arc<dyn MetricsCollector>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
-    compound_search_impl(indices, query, params, prefilter, metrics, None).await
+    compound_search_impl(indices, query, params, prefilter, metrics, None, None).await
 }
 
 /// Search one-column compound FTS with caller-supplied corpus-wide BM25 statistics.
@@ -3927,6 +3979,33 @@ pub async fn compound_search_with_base_scorer(
         prefilter,
         metrics,
         Some(base_scorer),
+        None,
+    )
+    .await
+}
+
+/// Search one-column compound FTS with corpus-wide BM25 statistics and an
+/// inclusive initial score floor.
+///
+/// The floor may only remove scores strictly below it. Equal-score rows must
+/// still be visited because final ordering uses row id as its secondary key.
+pub async fn compound_search_with_base_scorer_and_score_floor(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+    base_scorer: Arc<MemBM25Scorer>,
+    score_floor: f32,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    compound_search_impl(
+        indices,
+        query,
+        params,
+        prefilter,
+        metrics,
+        Some(base_scorer),
+        Some(score_floor),
     )
     .await
 }
@@ -3938,6 +4017,7 @@ async fn compound_search_impl(
     prefilter: Arc<dyn PreFilter>,
     metrics: Arc<dyn MetricsCollector>,
     base_scorer: Option<Arc<MemBM25Scorer>>,
+    initial_score_floor: Option<f32>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
     let limit = params.limit.unwrap_or(usize::MAX);
     if limit == 0 {
@@ -3947,7 +4027,11 @@ async fn compound_search_impl(
         prepare_compound_query(indices, query, params, metrics.as_ref(), base_scorer).await?;
     prefilter.wait_for_ready().await?;
     let mask = prefilter.mask();
-    let mut collector = TopKCollector::new(limit);
+    let competitive_score = Arc::new(CompetitiveScore::default());
+    if let Some(score_floor) = initial_score_floor {
+        competitive_score.raise(checked_score(score_floor, "initial compound score floor")?);
+    }
+    let mut collector = TopKCollector::with_competitive_score(limit, competitive_score);
 
     for (segment_ordinal, index) in indices.iter().enumerate() {
         let loads =
@@ -4157,6 +4241,77 @@ mod tests {
     }
 
     #[test]
+    fn scaled_score_floor_is_maximal_and_preserves_equalities() {
+        let cases = [
+            (3.75_f32, 2.5_f32),
+            (f32::from_bits(1.0_f32.to_bits() + 1), 1.000_000_2_f32),
+            (2.0_f32, f32::MIN_POSITIVE),
+            (1.0_f32, f32::from_bits(1)),
+        ];
+        for (raw_score, factor) in cases {
+            let scaled_score = raw_score * factor;
+            assert!(scaled_score.is_finite() && scaled_score > 0.0);
+            let child_floor = exclusive_scaled_score_floor(scaled_score, factor).unwrap();
+            assert!(child_floor * factor < scaled_score);
+            assert!(child_floor < raw_score);
+            let next_raw = f32::from_bits(child_floor.to_bits() + 1);
+            assert!(next_raw * factor >= scaled_score);
+
+            let mut scorer = ScaleScorer::try_new(materialized(&[(0, raw_score)]), factor).unwrap();
+            scorer.set_min_competitive_score(scaled_score).unwrap();
+            assert_eq!(scorer.next().unwrap(), Some(0));
+            assert_eq!(scorer.score().unwrap(), scaled_score);
+        }
+
+        let subnormal_factor = f32::from_bits(1);
+        let raw_score = 0.25_f32;
+        let scaled_score = raw_score * subnormal_factor;
+        assert_eq!(scaled_score, 0.0);
+        assert_eq!(
+            exclusive_scaled_score_floor(scaled_score, subnormal_factor),
+            None
+        );
+        let mut scorer =
+            ScaleScorer::try_new(materialized(&[(0, raw_score)]), subnormal_factor).unwrap();
+        scorer.set_min_competitive_score(scaled_score).unwrap();
+        assert_eq!(scorer.next().unwrap(), Some(0));
+        assert_eq!(scorer.score().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn scale_scorer_only_translates_strictly_higher_floors() {
+        let (child, work) = instrumented(materialized(&[(0, 10.0)]));
+        let mut scorer = ScaleScorer::try_new(child, 2.0).unwrap();
+
+        scorer.set_min_competitive_score(4.0).unwrap();
+        scorer.set_min_competitive_score(4.0).unwrap();
+        scorer.set_min_competitive_score(3.0).unwrap();
+        assert_eq!(scorer.score_floor_translations, 1);
+        assert_eq!(work.floors.load(AtomicOrdering::Relaxed), 1);
+
+        scorer.set_min_competitive_score(5.0).unwrap();
+        assert_eq!(scorer.score_floor_translations, 2);
+        assert_eq!(work.floors.load(AtomicOrdering::Relaxed), 2);
+
+        let error = scorer.set_min_competitive_score(f32::NAN).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be NaN"));
+        assert_eq!(scorer.score_floor_translations, 2);
+
+        let subnormal_factor = f32::from_bits(1);
+        let (child, work) = instrumented(materialized(&[(0, 1.0)]));
+        let mut scorer = ScaleScorer::try_new(child, subnormal_factor).unwrap();
+        scorer.set_min_competitive_score(0.0).unwrap();
+        scorer.set_min_competitive_score(0.0).unwrap();
+        assert_eq!(scorer.score_floor_translations, 1);
+        assert_eq!(work.floors.load(AtomicOrdering::Relaxed), 0);
+
+        scorer.set_min_competitive_score(f32::from_bits(1)).unwrap();
+        assert_eq!(scorer.score_floor_translations, 2);
+        assert_eq!(work.floors.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
     fn materialized_scorer_precomputes_multi_block_bounds() {
         assert_eq!(std::mem::size_of::<ScoreBounds>(), 8);
         let values = [
@@ -4222,6 +4377,21 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn seeded_collector_keeps_floor_equalities_for_row_id_ordering() {
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(5.0);
+        let mut collector = TopKCollector::with_competitive_score(2, competitive_score);
+
+        let mut later_segment = MaterializedScorer::try_new(rows(&[(2, 4.0), (99, 5.0)])).unwrap();
+        collector.collect_mapped(&mut later_segment, Ok).unwrap();
+        let mut earlier_segment =
+            MaterializedScorer::try_new(rows(&[(1, 5.0), (50, 6.0)])).unwrap();
+        collector.collect_mapped(&mut earlier_segment, Ok).unwrap();
+
+        assert_eq!(collector.into_rows(), rows(&[(50, 6.0), (1, 5.0)]));
     }
 
     #[test]
