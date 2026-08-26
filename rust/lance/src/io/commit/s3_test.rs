@@ -573,14 +573,12 @@ impl object_store::ObjectStore for PaginatingCountingStore {
 /// a single listing page even when the table has many historical versions.
 ///
 /// The test uploads 1 000 V2 manifest files to a real LocalStack S3 bucket, then
-/// wraps the S3 `ObjectStore` in a `PaginatingCountingStore` (page_size = 200) that
-/// simulates S3's per-request page limit. With `take(99)` the consumer reads only
-/// 100 items — well within one 200-item page — so `page_count` must stay at 1.
+/// wraps the S3 `ObjectStore` in a `PaginatingCountingStore` (page_size = 2) that
+/// forces a new page fetch for every 2 items consumed. Since `resolve_version_from_listing`
+/// reads only the first item when the store is lexically ordered, `page_count` must stay at 1.
 ///
-/// Without the fix (`take(999)`), the consumer would read 1 000 items across five
-/// pages and `page_count` would be 5, failing the assertion. The companion unit
-/// test `test_resolve_latest_version_single_page` in `lance-table` exercises the
-/// same code path against an in-memory store with identical pagination simulation.
+/// The companion unit test `test_resolve_latest_version_single_page` in `lance-table`
+/// exercises the same code path against an in-memory store with identical pagination simulation.
 #[tokio::test]
 async fn test_resolve_latest_version_single_list_page() {
     use futures::StreamExt as _;
@@ -624,13 +622,14 @@ async fn test_resolve_latest_version_single_list_page() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
 
-    // Wrap the S3 store's inner with a paginating counter (page_size = 200).
-    // Each "page" corresponds to one S3 ListObjectsV2 network round-trip.
+    // Wrap the S3 store's inner with a tiny paginating counter (page_size = 2).
+    // Any read beyond the first 2 items triggers a second page, making this
+    // assertion catch regressions immediately.
     let page_count = Arc::new(AtomicUsize::new(0));
     let mut test_store = (*s3_store).clone();
     test_store.inner = Arc::new(PaginatingCountingStore {
         inner: s3_store.inner.clone(),
-        page_size: 200,
+        page_size: 2,
         page_count: page_count.clone(),
     });
 
@@ -646,8 +645,8 @@ async fn test_resolve_latest_version_single_list_page() {
     assert_eq!(
         count,
         1,
-        "resolve_version_from_listing must stay within 1 listing page (≤ 200 items consumed); \
-         got {} page(s). Without the take(99) cap the old take(999) code would consume ≥5 pages.",
+        "resolve_version_from_listing must consume only 1 item; \
+         got {} page(s) with page_size=2.",
         count
     );
 }

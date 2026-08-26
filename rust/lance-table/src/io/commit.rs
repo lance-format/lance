@@ -592,32 +592,6 @@ async fn resolve_version_from_listing(
                 .parse_version(meta.location.filename().unwrap())
                 .unwrap();
 
-            // Sanity check: verify the next 99 files are also V2 and that version numbers are
-            // decreasing. Together with `first`, this checks the first 100 entries. We cap at 99
-            // rather than 999 so that the single listing request stays well within the provider's
-            // default page size (~1,000 keys) even on tables with thousands of versions, keeping
-            // the effective cost O(1) in both requests and bytes.
-            for (scheme, meta) in valid_manifests.take(99).try_collect::<Vec<_>>().await? {
-                if scheme != ManifestNamingScheme::V2 {
-                    warn!(
-                        "Found V1 Manifest in a V2 directory. Use `migrate_manifest_paths_v2` \
-                         to migrate the directory."
-                    );
-                    break;
-                }
-                let next_version = scheme
-                    .parse_version(meta.location.filename().unwrap())
-                    .unwrap();
-                if next_version >= version {
-                    warn!(
-                        "List operation was expected to be lexically ordered, but was not. This \
-                         could mean a corrupt read. Please make a bug report on the lance-format/lance \
-                         GitHub repository."
-                    );
-                    break;
-                }
-            }
-
             Ok(ManifestLocation {
                 version,
                 path: meta.location,
@@ -2511,16 +2485,13 @@ mod tests {
         }
     }
 
-    /// Regression test: `resolve_version_from_listing` must stay within a single
-    /// listing page even when the table has far more than 100 historical versions.
+    /// Regression test: `resolve_version_from_listing` must consume only the first
+    /// listing entry when `list_is_lexically_ordered` is true, so it never triggers
+    /// a second page fetch even on tables with thousands of versions.
     ///
-    /// The test wraps an in-memory store in `PaginatingCountingStore` (page_size = 200)
-    /// to simulate a paginating object store such as S3.  With 1 000 V2 manifest
-    /// files and `take(99)` the consumer reads only 100 items (< 200 per page) so
-    /// exactly one page is fetched.  The companion integration test
-    /// `test_resolve_latest_version_single_list_page` in `s3_test.rs` exercises the
-    /// same code path against LocalStack to confirm the behaviour holds for real S3
-    /// pagination.
+    /// The test wraps an in-memory store in `PaginatingCountingStore` (page_size = 2)
+    /// so that any read beyond the first item forces a second page. With 1 000 V2
+    /// manifest files, if we only consume `first`, page_count stays at 1.
     #[tokio::test]
     async fn test_resolve_latest_version_single_page() {
         let mut object_store = ObjectStore::memory();
@@ -2534,13 +2505,12 @@ mod tests {
             object_store.put(&path, b"".as_slice()).await.unwrap();
         }
 
-        // Now wrap the inner store with a paginating counter (page_size = 200).
-        // The consumer reads at most 100 items (1 from `first` + 99 from `take`),
-        // which fits within the first 200-item page → page_count must stay at 1.
+        // Wrap with a tiny page size (2) so consuming any more than 2 items causes
+        // a second page fetch, making the assertion below catch regressions.
         let page_count = Arc::new(AtomicUsize::new(0));
         object_store.inner = Arc::new(PaginatingCountingStore::new(
             object_store.inner.clone(),
-            200,
+            2,
             page_count.clone(),
         ));
 
@@ -2551,7 +2521,7 @@ mod tests {
         assert_eq!(
             count,
             1,
-            "expected exactly 1 page fetch (≤ 200 items consumed), got {}",
+            "expected exactly 1 page fetch (only first item consumed), got {}",
             count
         );
     }
