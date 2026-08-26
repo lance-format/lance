@@ -958,6 +958,24 @@ mod tests {
     }
 
     #[rstest]
+    #[case::manual_accepts_manual(Vec::new(), MANUAL_SHARD_SPEC_ID, MANUAL_SHARD_SPEC_ID)]
+    #[case::automatic_resolves_default(vec![sharding_spec(1)], MANUAL_SHARD_SPEC_ID, 1)]
+    #[case::automatic_accepts_explicit_match(vec![sharding_spec(1)], 1, 1)]
+    fn test_writer_shard_spec_resolution_accepts_valid_identity(
+        #[case] sharding_specs: Vec<ShardingSpec>,
+        #[case] configured_spec_id: u32,
+        #[case] expected_spec_id: u32,
+    ) {
+        let details = MemWalIndexDetails {
+            sharding_specs,
+            ..Default::default()
+        };
+
+        let resolved = resolve_writer_shard_spec_id(&details, configured_spec_id).unwrap();
+        assert_eq!(resolved, expected_spec_id);
+    }
+
+    #[rstest]
     #[case::manual_rejects_automatic(Vec::new(), 1, "manual sharding", false)]
     #[case::automatic_rejects_other(vec![sharding_spec(1)], 2, "sharding spec id 1", false)]
     #[case::multiple_specs_are_unsupported(
