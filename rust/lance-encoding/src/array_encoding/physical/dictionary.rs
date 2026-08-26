@@ -422,7 +422,10 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
+    use crate::testing::{
+        TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
+    };
+    use rstest::rstest;
 
     use super::encode_dict_indices_and_items;
 
@@ -450,28 +453,29 @@ mod tests {
         assert_eq!(&dict_items, &expected_items);
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_utf8() {
-        let field = Field::new("", DataType::Utf8, false);
-        check_basic_random(field).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_binary() {
-        let field = Field::new("", DataType::Binary, false);
-        check_basic_random(field).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_large_binary() {
-        let field = Field::new("", DataType::LargeBinary, true);
-        check_basic_random(field).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_large_utf8() {
-        let field = Field::new("", DataType::LargeUtf8, true);
-        check_basic_random(field).await;
+    async fn test_random_dictionary(
+        #[values(
+            DataType::Utf8,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::LargeUtf8
+        )]
+        data_type: DataType,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let nullable = matches!(data_type, DataType::LargeBinary | DataType::LargeUtf8);
+        let field = Field::new("", data_type, nullable);
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -570,14 +574,25 @@ mod tests {
 
     // These tests cover the case where the input is already dictionary encoded
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_random_dictionary_input() {
+    async fn test_random_dictionary_input(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let dict_field = Field::new(
             "",
             DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
             false,
         );
-        check_basic_random(dict_field).await;
+        check_basic_random_case(dict_field, encoding, page_size, use_slicing).await;
     }
 
     #[test_log::test(tokio::test)]

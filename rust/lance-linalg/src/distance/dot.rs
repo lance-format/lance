@@ -838,6 +838,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{
         arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, arbitrary_vector_pair,
+        dimension_shard, run_vector_pair_proptest,
     };
     use num_traits::{Float, FromPrimitive};
     use proptest::prelude::*;
@@ -949,6 +950,39 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    fn test_dot_f32(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize) {
+        run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
+            do_dot_test(&x, &y)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_dot_f64(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize) {
+        run_vector_pair_proptest(arbitrary_f64, dimension_shard(shard), |x, y| {
+            do_dot_test(&x, &y)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_dot_f32_scalar_simd_parity(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_pair_proptest(arbitrary_f32, dimension_shard(shard), |x, y| {
+            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+            let scalar = x_f64
+                .iter()
+                .zip(y_f64.iter())
+                .map(|(&a, &b)| a * b)
+                .sum::<f64>() as f32;
+            let simd = <f32 as Dot>::dot(&x, &y);
+            let max_error = max_error::<f32>(&x_f64, &y_f64);
+            prop_assert!(approx::relative_eq!(scalar, simd, epsilon = max_error));
+            Ok(())
+        });
+    }
+
     proptest::proptest! {
         #[test]
         fn test_dot_f16((x, y) in arbitrary_vector_pair(arbitrary_f16, 4..4048)) {
@@ -957,16 +991,6 @@ mod tests {
 
         #[test]
         fn test_dot_bf16((x, y) in arbitrary_vector_pair(arbitrary_bf16, 4..4048)){
-            do_dot_test(&x, &y)?;
-        }
-
-        #[test]
-        fn test_dot_f32((x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)){
-            do_dot_test(&x, &y)?;
-        }
-
-        #[test]
-        fn test_dot_f64((x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)){
             do_dot_test(&x, &y)?;
         }
 
@@ -982,28 +1006,6 @@ mod tests {
             let scalar = dot_f64_scalar(&x, &y);
             let simd = dot_f64_simd(&x, &y);
             let max_error = max_error::<f64>(&x, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, epsilon = max_error));
-        }
-
-        /// Parity check for `dot_f32_dispatched` (Branch B exclusive: the
-        /// auto-vectorised scalar dot path). The dispatched kernel must
-        /// agree with a portable f64-precision scalar reference within
-        /// numerical tolerance. The reference is hand-rolled here to keep
-        /// this test architecture-agnostic (the x86_64-only `dot_f64_scalar`
-        /// helper is gated above).
-        #[test]
-        fn test_dot_f32_scalar_simd_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f32, 4..4048)
-        ) {
-            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            let y_f64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
-            let scalar = x_f64
-                .iter()
-                .zip(y_f64.iter())
-                .map(|(&a, &b)| a * b)
-                .sum::<f64>() as f32;
-            let simd = <f32 as Dot>::dot(&x, &y);
-            let max_error = max_error::<f32>(&x_f64, &y_f64);
             prop_assert!(approx::relative_eq!(scalar, simd, epsilon = max_error));
         }
 

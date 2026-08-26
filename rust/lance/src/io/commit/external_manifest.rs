@@ -4,10 +4,10 @@
 /// Keep the tests in `lance` crate because it has dependency on [Dataset].
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::ops::Range;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::{collections::HashMap, time::Duration};
 
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -26,7 +26,7 @@ mod test {
         ObjectStore as OSObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
         PutResult, RenameOptions, Result as OSResult, local::LocalFileSystem, path::Path,
     };
-    use tokio::sync::Mutex;
+    use tokio::sync::{Barrier, Mutex};
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::{
@@ -35,22 +35,30 @@ mod test {
     };
     use lance_core::utils::tempfile::TempStrDir;
 
-    // sleep for 1 second to simulate a slow external store on write
     #[derive(Debug)]
-    struct SleepyExternalManifestStore {
+    struct TestExternalManifestStore {
         store: Arc<Mutex<HashMap<(String, u64), String>>>,
+        contention: Option<(u64, Arc<Barrier>)>,
     }
 
-    impl SleepyExternalManifestStore {
+    impl TestExternalManifestStore {
         fn new() -> Self {
             Self {
                 store: Arc::new(Mutex::new(HashMap::new())),
+                contention: None,
+            }
+        }
+
+        fn with_contention(version: u64, participants: usize) -> Self {
+            Self {
+                contention: Some((version, Arc::new(Barrier::new(participants)))),
+                ..Self::new()
             }
         }
     }
 
     #[async_trait]
-    impl ExternalManifestStore for SleepyExternalManifestStore {
+    impl ExternalManifestStore for TestExternalManifestStore {
         /// Get the manifest path for a given uri and version
         async fn get(&self, uri: &str, version: u64) -> Result<String> {
             let store = self.store.lock().await;
@@ -86,7 +94,14 @@ mod test {
             _size: u64,
             _e_tag: Option<String>,
         ) -> Result<()> {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Some((contended_version, barrier)) = &self.contention
+                && version == *contended_version
+            {
+                // Every writer reaches the external compare-and-set with the same
+                // proposed version before any writer can publish it. This forces
+                // the retry path deterministically instead of relying on sleeps.
+                barrier.wait().await;
+            }
 
             let mut store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
@@ -110,8 +125,6 @@ mod test {
             _size: u64,
             _e_tag: Option<String>,
         ) -> Result<()> {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
             let mut store = self.store.lock().await;
             match store.get(&(uri.to_string(), version)) {
                 Some(_) => {
@@ -215,7 +228,7 @@ mod test {
 
     #[tokio::test]
     async fn finalized_external_manifest_location_is_head_checked() {
-        let sleepy_store = SleepyExternalManifestStore::new();
+        let sleepy_store = TestExternalManifestStore::new();
         let inner_store = sleepy_store.store.clone();
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(sleepy_store),
@@ -248,7 +261,7 @@ mod test {
 
     #[tokio::test]
     async fn finalized_external_manifest_location_falls_back_to_v1() {
-        let sleepy_store = SleepyExternalManifestStore::new();
+        let sleepy_store = TestExternalManifestStore::new();
         let inner_store = sleepy_store.store.clone();
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(sleepy_store),
@@ -470,7 +483,7 @@ mod test {
         Dataset::write(reader, ds_uri, None).await.unwrap();
 
         // Then try to load the dataset with external store handler set
-        let sleepy_store = SleepyExternalManifestStore::new();
+        let sleepy_store = TestExternalManifestStore::new();
         let handler = Arc::new(ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(sleepy_store),
         });
@@ -497,7 +510,7 @@ mod test {
     #[tokio::test]
     #[cfg(not(windows))]
     async fn test_can_create_dataset_with_external_store() {
-        let sleepy_store = SleepyExternalManifestStore::new();
+        let sleepy_store = TestExternalManifestStore::new();
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(sleepy_store),
         };
@@ -524,96 +537,96 @@ mod test {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn test_concurrent_commits_are_okay() {
-        // Run test 20 times to have a higher chance of catching race conditions
-        for _ in 0..20 {
-            let sleepy_store = SleepyExternalManifestStore::new();
-            let handler = ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(sleepy_store),
-            };
-            let handler = Arc::new(handler);
+        const NUM_WRITERS: usize = 5;
+        const CONTENDED_VERSION: u64 = 2;
+        let external_store =
+            TestExternalManifestStore::with_contention(CONTENDED_VERSION, NUM_WRITERS);
+        let handler = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(external_store),
+        });
 
-            let mut data_gen =
-                BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
-            let dir = TempStrDir::default();
-            let ds_uri = &dir;
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
+        let dir = TempStrDir::default();
+        let ds_uri = &dir;
 
-            Dataset::write(
-                data_gen.batch(10),
-                ds_uri,
-                Some(write_params(handler.clone())),
-            )
+        Dataset::write(
+            data_gen.batch(10),
+            ds_uri,
+            Some(write_params(handler.clone())),
+        )
+        .await
+        .unwrap();
+
+        // All writers first attempt version 2. One succeeds and the rest must
+        // observe the conflict, refresh, and commit distinct later versions.
+        let write_futs = (0..NUM_WRITERS)
+            .map(|_| data_gen.batch(10))
+            .map(|data| {
+                let mut params = write_params(handler.clone());
+                params.mode = WriteMode::Append;
+                Dataset::write(data, ds_uri, Some(params))
+            })
+            .collect::<Vec<_>>();
+
+        let res = join_all(write_futs).await;
+
+        let errors = res
+            .into_iter()
+            .filter(|r| r.is_err())
+            .map(|r| r.unwrap_err())
+            .collect::<Vec<_>>();
+
+        assert!(errors.is_empty(), "{:?}", errors);
+
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
             .await
             .unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
+        assert_eq!(ds.version().version, (NUM_WRITERS + 1) as u64);
 
-            // we have 5 retries by default, more than this will just fail
-            let write_futs = (0..5)
-                .map(|_| data_gen.batch(10))
-                .map(|data| {
-                    let mut params = write_params(handler.clone());
-                    params.mode = WriteMode::Append;
-                    Dataset::write(data, ds_uri, Some(params))
-                })
-                .collect::<Vec<_>>();
-
-            let res = join_all(write_futs).await;
-
-            let errors = res
-                .into_iter()
-                .filter(|r| r.is_err())
-                .map(|r| r.unwrap_err())
-                .collect::<Vec<_>>();
-
-            assert!(errors.is_empty(), "{:?}", errors);
-
-            // load the data and check the content
-            let ds = DatasetBuilder::from_uri(ds_uri)
-                .with_read_params(read_params(handler))
-                .load()
-                .await
-                .unwrap();
-            assert_eq!(ds.count_rows(None).await.unwrap(), 60);
-
-            // No temporary manifests left over
-            let manifest_path = format!("{}/{}", dir, "_versions/");
-            let unexpected_entries = std::fs::read_dir(manifest_path)
-                .unwrap()
-                .filter(|entry| {
-                    let entry = entry.as_ref().unwrap();
-                    !entry
-                        .file_name()
-                        .as_os_str()
-                        .to_string_lossy()
-                        .ends_with(".manifest")
-                })
-                // There is a bug in local fs where concurrent commits can leave behind
-                // temporary `x.manifest#n` files. This might be a bug in object-store.
-                // TODO: fix this.
-                .filter(|entry| {
-                    let entry = entry.as_ref().unwrap();
-                    !entry
-                        .file_name()
-                        .as_os_str()
-                        .to_string_lossy()
-                        .contains(".manifest#")
-                })
-                // The version hint file is expected to be present.
-                .filter(|entry| {
-                    let entry = entry.as_ref().unwrap();
-                    !entry
-                        .file_name()
-                        .as_os_str()
-                        .to_string_lossy()
-                        .starts_with("latest_version_hint")
-                })
-                .collect::<Vec<_>>();
-            assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
-        }
+        // No temporary manifests left over.
+        let manifest_path = format!("{}/{}", dir, "_versions/");
+        let unexpected_entries = std::fs::read_dir(manifest_path)
+            .unwrap()
+            .filter(|entry| {
+                let entry = entry.as_ref().unwrap();
+                !entry
+                    .file_name()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .ends_with(".manifest")
+            })
+            // There is a bug in local fs where concurrent commits can leave behind
+            // temporary `x.manifest#n` files. This might be a bug in object-store.
+            // TODO: fix this.
+            .filter(|entry| {
+                let entry = entry.as_ref().unwrap();
+                !entry
+                    .file_name()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .contains(".manifest#")
+            })
+            // The version hint file is expected to be present.
+            .filter(|entry| {
+                let entry = entry.as_ref().unwrap();
+                !entry
+                    .file_name()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .starts_with("latest_version_hint")
+            })
+            .collect::<Vec<_>>();
+        assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
     }
 
     #[tokio::test]
     #[cfg(not(windows))]
     async fn test_out_of_sync_dataset_can_recover() {
-        let sleepy_store = SleepyExternalManifestStore::new();
+        let sleepy_store = TestExternalManifestStore::new();
         let inner_store = sleepy_store.store.clone();
         let handler = ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(sleepy_store),
@@ -934,7 +947,7 @@ mod test {
 
         // Spin up an ExternalManifestStore and drive `put` (the same code
         // path the failing CTAS hits via ExternalManifestCommitHandler).
-        let external = SleepyExternalManifestStore::new();
+        let external = TestExternalManifestStore::new();
         let head_meta = capped.head(&staging_path).await.unwrap();
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
         // The fixture stores only a tiny body, so its source-size override must
@@ -1010,7 +1023,7 @@ mod test {
         // well below the 5 GB cap, so copy_size_aware must take the fast
         // path.
 
-        let external = SleepyExternalManifestStore::new();
+        let external = TestExternalManifestStore::new();
         let head_meta = capped.head(&staging_path).await.unwrap();
 
         external

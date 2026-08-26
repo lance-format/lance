@@ -32,6 +32,19 @@ pub const WAND_EXACTNESS_CERTIFICATE_FALLBACKS_METRIC: &str =
     "wand_exactness_certificate_fallbacks";
 pub const WAND_EXACTNESS_CERTIFICATE_CANDIDATES_METRIC: &str =
     "wand_exactness_certificate_candidates";
+pub const WAND_EXACTNESS_PROBE_MS_METRIC: &str = "wand_exactness_probe_ms";
+pub const WAND_EXACTNESS_PROBE_COMPARISONS_METRIC: &str = "wand_exactness_probe_comparisons";
+pub const WAND_TIE_COMPLETION_ATTEMPTS_METRIC: &str = "wand_tie_completion_attempts";
+pub const WAND_TIE_COMPLETION_SUCCESSES_METRIC: &str = "wand_tie_completion_successes";
+pub const WAND_TIE_COMPLETION_OVERFLOWS_METRIC: &str = "wand_tie_completion_overflows";
+pub const WAND_TIE_COMPLETION_CANDIDATES_METRIC: &str = "wand_tie_completion_candidates";
+pub const WAND_TIE_COMPLETION_ROW_ID_REPLACEMENTS_METRIC: &str =
+    "wand_tie_completion_row_id_replacements";
+pub const WAND_TIE_COMPLETION_MS_METRIC: &str = "wand_tie_completion_ms";
+pub const WAND_TIE_COMPLETION_COMPARISONS_METRIC: &str = "wand_tie_completion_comparisons";
+pub const WAND_SEEDED_FALLBACKS_METRIC: &str = "wand_seeded_fallbacks";
+pub const WAND_SEEDED_FALLBACK_MS_METRIC: &str = "wand_seeded_fallback_ms";
+pub const WAND_SEEDED_FALLBACK_COMPARISONS_METRIC: &str = "wand_seeded_fallback_comparisons";
 
 /// A trait used by the index to report metrics
 ///
@@ -163,6 +176,21 @@ pub trait MetricsCollector: Send + Sync {
 
     /// Record WAND candidates returned to the certificate classifier.
     fn record_wand_exactness_certificate_candidates(&self, _num_candidates: usize) {}
+
+    /// Record bounded WAND attempts to complete an ambiguous kth-score tie.
+    fn record_wand_tie_completion_attempts(&self, _num_attempts: usize) {}
+
+    /// Record kth-score ties completed without exact replay.
+    fn record_wand_tie_completion_successes(&self, _num_successes: usize) {}
+
+    /// Record kth-score ties that exceeded the bounded completion budget.
+    fn record_wand_tie_completion_overflows(&self, _num_overflows: usize) {}
+
+    /// Record candidates returned by bounded kth-score tie completion.
+    fn record_wand_tie_completion_candidates(&self, _num_candidates: usize) {}
+
+    /// Record exact replays seeded with an inclusive kth-score floor.
+    fn record_wand_seeded_fallbacks(&self, _num_fallbacks: usize) {}
 
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.

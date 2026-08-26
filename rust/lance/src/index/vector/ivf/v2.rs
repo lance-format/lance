@@ -2596,8 +2596,15 @@ mod tests {
     }
 
     fn lightweight_pq_params_with_bits(num_bits: usize) -> PQBuildParams {
+        let num_sub_vectors = if num_bits == 4 {
+            // M4 is only a 2-byte code, so random KMeans/HNSW can leave recall near
+            // the threshold. M32 restores the original 4-bit test capacity.
+            DIM
+        } else {
+            LIGHTWEIGHT_PQ_SUB_VECTORS
+        };
         PQBuildParams {
-            num_sub_vectors: LIGHTWEIGHT_PQ_SUB_VECTORS,
+            num_sub_vectors,
             num_bits,
             max_iters: 2,
             sample_rate: 16,
@@ -2667,6 +2674,7 @@ mod tests {
         ivf_params.max_iters = 2;
         ivf_params.sample_rate = 16;
         let pq_params = lightweight_pq_params_with_bits(num_bits);
+        let expected_num_sub_vectors = pq_params.num_sub_vectors;
         let params = if use_hnsw {
             VectorIndexParams::with_ivf_hnsw_pq_params(
                 distance_type,
@@ -2704,7 +2712,7 @@ mod tests {
         assert_eq!(stats["indices"][0]["sub_index"]["nbits"], num_bits);
         assert_eq!(
             stats["indices"][0]["sub_index"]["num_sub_vectors"],
-            LIGHTWEIGHT_PQ_SUB_VECTORS
+            expected_num_sub_vectors
         );
         if use_hnsw {
             let hnsw_params = &stats["indices"][0]["sub_index"]["params"];

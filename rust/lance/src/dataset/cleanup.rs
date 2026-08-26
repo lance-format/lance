@@ -4875,7 +4875,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_cleanup_with_rate_limit() {
         // Create multiple versions with data files that will be deleted.
         let fixture = MockDatasetFixture::try_new().unwrap();
@@ -4894,7 +4894,7 @@ mod tests {
             .unwrap()
             .build();
 
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let db = fixture.open().await.unwrap();
         let stats = cleanup_old_versions(&db, policy).await.unwrap();
         let elapsed = start.elapsed();

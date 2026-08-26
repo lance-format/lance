@@ -19,6 +19,8 @@ pub(super) struct ModernSearchRequest<'a> {
     pub(super) scorer: &'a MemBM25Scorer,
     pub(super) impact_scorer: Arc<MemBM25Scorer>,
     pub(super) limit: usize,
+    /// Exclusive raw-score floor used to seed standalone Match WAND.
+    pub(super) initial_score_floor: Option<f32>,
 }
 
 /// Typed identity for one modern candidate after partition-local scoring.

@@ -472,7 +472,10 @@ pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64};
+    use crate::test_utils::{
+        arbitrary_bf16, arbitrary_f16, arbitrary_f32, arbitrary_f64, dimension_shard,
+        run_vector_proptest,
+    };
     use arrow_array::{Float16Array, Float64Array, UInt8Array};
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::ToPrimitive;
@@ -498,6 +501,36 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    fn test_l2_norm_f32(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f32, dimension_shard(shard), |data| {
+            do_norm_l2_test(&data)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_l2_norm_f64(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f64, dimension_shard(shard), |data| {
+            do_norm_l2_test(&data)
+        });
+    }
+
+    #[rstest::rstest]
+    fn test_l2_norm_f32_scalar_simd_parity(
+        #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
+    ) {
+        run_vector_proptest(arbitrary_f32, dimension_shard(shard), |data| {
+            let scalar = data.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt() as f32;
+            let simd = <f32 as Normalize>::norm_l2(&data);
+            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
+            Ok(())
+        });
+    }
+
     proptest::proptest! {
         #[test]
         fn test_l2_norm_f16(data in prop::collection::vec(arbitrary_f16(), 4..4048)) {
@@ -506,16 +539,6 @@ mod tests {
 
         #[test]
         fn test_l2_norm_bf16(data in prop::collection::vec(arbitrary_bf16(), 4..4048)){
-            do_norm_l2_test(&data)?;
-        }
-
-        #[test]
-        fn test_l2_norm_f32(data in prop::collection::vec(arbitrary_f32(), 4..4048)){
-            do_norm_l2_test(&data)?;
-        }
-
-        #[test]
-        fn test_l2_norm_f64(data in prop::collection::vec(arbitrary_f64(), 4..4048)){
             do_norm_l2_test(&data)?;
         }
 
@@ -531,21 +554,6 @@ mod tests {
             let scalar = norm_l2_f64_scalar(&data);
             let simd = norm_l2_f64_simd(&data);
             prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-6));
-        }
-
-        /// Parity check for `norm_l2_f32_dispatched` (Branch B exclusive: the
-        /// auto-vectorised scalar L2-norm path). The dispatched kernel must
-        /// agree with a portable f64-precision scalar reference within
-        /// numerical tolerance. The reference is hand-rolled here to keep this
-        /// test architecture-agnostic (the x86_64-only `norm_l2_f64_scalar`
-        /// helper is gated above).
-        #[test]
-        fn test_l2_norm_f32_scalar_simd_parity(
-            data in prop::collection::vec(arbitrary_f32(), 4..4048)
-        ) {
-            let scalar = data.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt() as f32;
-            let simd = <f32 as Normalize>::norm_l2(&data);
-            prop_assert!(approx::relative_eq!(scalar, simd, max_relative = 1e-3));
         }
 
         /// AVX-512-direct parity: explicitly compares the scalar fallback

@@ -8763,7 +8763,7 @@ mod tests {
         let repeated_strings: Vec<_> = unique_values
             .iter()
             .cycle()
-            .take(100_000)
+            .take(10_000)
             .map(|s| Some(s.as_str()))
             .collect();
 

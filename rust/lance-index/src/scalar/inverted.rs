@@ -23,7 +23,10 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
-pub use compound::{compound_search, compound_search_with_base_scorer};
+pub use compound::{
+    compound_search, compound_search_with_base_scorer,
+    compound_search_with_base_scorer_and_score_floor, exclusive_scaled_score_floor,
+};
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
 use datafusion::execution::SendableRecordBatchStream;

@@ -735,13 +735,31 @@ mod tests {
     use std::{collections::HashMap, sync::Arc, vec};
 
     use crate::testing::{
-        FnArrayGeneratorProvider, TestCases, check_basic_random, check_round_trip_encoding_of_data,
+        FnArrayGeneratorProvider, TestCases, TestEncoding, check_basic_random_case,
+        check_round_trip_encoding_generated, check_round_trip_encoding_of_data,
     };
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_utf8_binary() {
+    async fn test_utf8_binary(
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let field = Field::new("", DataType::Utf8, false);
-        check_specific_random(field, TestCases::basic().with_structural_encodings()).await;
+        check_specific_random(
+            field,
+            TestCases::basic()
+                .with_encoding(encoding)
+                .with_page_sizes(vec![page_size])
+                .with_slicing_modes([use_slicing]),
+        )
+        .await;
     }
 
     #[rstest]
@@ -750,6 +768,15 @@ mod tests {
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
         #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
     ) {
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
@@ -758,7 +785,7 @@ mod tests {
         );
 
         let field = Field::new("", data_type, false).with_metadata(field_metadata);
-        check_basic_random(field).await;
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[rstest]
@@ -767,6 +794,14 @@ mod tests {
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
         #[values(DataType::Binary, DataType::Utf8)] data_type: DataType,
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
     ) {
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
@@ -776,7 +811,10 @@ mod tests {
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
         // TODO (https://github.com/lance-format/lance/issues/4783)
-        let test_cases = TestCases::default().with_structural_encodings();
+        let test_cases = TestCases::default()
+            .with_encoding(encoding)
+            .with_page_sizes(vec![page_size])
+            .with_slicing_modes([use_slicing]);
         check_specific_random(field, test_cases).await;
     }
 
@@ -786,6 +824,14 @@ mod tests {
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
         #[values(DataType::LargeBinary, DataType::LargeUtf8)] data_type: DataType,
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
     ) {
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
@@ -794,19 +840,32 @@ mod tests {
         );
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
-        check_specific_random(field, TestCases::basic().with_structural_encodings()).await;
+        check_specific_random(
+            field,
+            TestCases::basic()
+                .with_encoding(encoding)
+                .with_page_sizes(vec![page_size])
+                .with_slicing_modes([use_slicing]),
+        )
+        .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_large_binary() {
-        let field = Field::new("", DataType::LargeBinary, true);
-        check_basic_random(field).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_large_utf8() {
-        let field = Field::new("", DataType::LargeUtf8, true);
-        check_basic_random(field).await;
+    async fn test_large_binary_types(
+        #[values(DataType::LargeBinary, DataType::LargeUtf8)] data_type: DataType,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let field = Field::new("", data_type, true);
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[rstest]
@@ -814,20 +873,31 @@ mod tests {
     async fn test_small_strings(
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
     ) {
-        use crate::testing::check_basic_generated;
-
         let mut field_metadata = HashMap::new();
         field_metadata.insert(
             STRUCTURAL_ENCODING_META_KEY.to_string(),
             structural_encoding.into(),
         );
         let field = Field::new("", DataType::Utf8, true).with_metadata(field_metadata);
-        check_basic_generated(
+        check_round_trip_encoding_generated(
             field,
             Box::new(FnArrayGeneratorProvider::new(move || {
                 lance_datagen::array::utf8_prefix_plus_counter("user_", /*is_large=*/ false)
             })),
+            TestCases::basic()
+                .with_encoding(encoding)
+                .with_page_sizes(vec![page_size])
+                .with_slicing_modes([use_slicing]),
         )
         .await;
     }
@@ -878,10 +948,19 @@ mod tests {
         .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_bigger_than_max_page_size() {
-        // Create an array with one single 32MiB string
-        let big_string = String::from_iter((0..(32 * 1024 * 1024)).map(|_| '0'));
+    async fn test_value_bigger_than_max_page_size(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        // Create one value larger than the configured 1MiB page budget.
+        let big_string = String::from_iter((0..(2 * 1024 * 1024)).map(|_| '0'));
         let string_array = StringArray::from(vec![
             Some(big_string),
             Some("abc".to_string()),
@@ -891,7 +970,9 @@ mod tests {
         ]);
 
         // Drop the max page size to 1MiB
-        let test_cases = TestCases::default().with_max_page_size(1024 * 1024);
+        let test_cases = TestCases::default()
+            .with_max_page_size(1024 * 1024)
+            .with_encoding(encoding);
 
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
@@ -899,16 +980,29 @@ mod tests {
             HashMap::new(),
         )
         .await;
+    }
 
-        // This is a regression testing the case where a page with X rows is split into Y parts
-        // where the number of parts is not evenly divisible by the number of rows.  In this
-        // case we are splitting 90 rows into 4 parts.
-        let big_string = String::from_iter((0..(1000 * 1000)).map(|_| '0'));
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_page_split_parts_do_not_evenly_divide_rows(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        // Regression: split 90 rows into four parts, where the part count does
+        // not evenly divide the row count.
+        let big_string = String::from_iter((0..45_000).map(|_| '0'));
         let string_array = StringArray::from_iter_values((0..90).map(|_| big_string.clone()));
 
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
-            &TestCases::default(),
+            &TestCases::default()
+                .with_max_page_size(1024 * 1024)
+                .with_encoding(encoding),
             HashMap::new(),
         )
         .await;
