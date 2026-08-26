@@ -235,10 +235,11 @@ pub struct StructuralStructDecoder {
     child_fields: Fields,
     // The root decoder is slightly different because it cannot have nulls
     is_root: bool,
+    nullable: bool,
 }
 
 impl StructuralStructDecoder {
-    pub fn new(fields: Fields, should_validate: bool, is_root: bool) -> Result<Self> {
+    pub fn new(fields: Fields, should_validate: bool, is_root: bool, nullable: bool) -> Result<Self> {
         let children = fields
             .iter()
             .map(|field| Self::field_to_decoder(field, should_validate))
@@ -249,6 +250,7 @@ impl StructuralStructDecoder {
             children,
             child_fields: fields,
             is_root,
+            nullable: !is_root && nullable,
         })
     }
 
@@ -263,7 +265,12 @@ impl StructuralStructDecoder {
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
                     Ok(Box::new(decoder))
                 } else {
-                    Ok(Box::new(Self::new(fields.clone(), should_validate, false)?))
+                    Ok(Box::new(Self::new(
+                        fields.clone(),
+                        should_validate,
+                        false,
+                        field.is_nullable(),
+                    )?))
                 }
             }
             DataType::List(child_field) | DataType::LargeList(child_field) => {
@@ -347,6 +354,24 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
 
     fn data_type(&self) -> &DataType {
         &self.data_type
+    }
+
+    fn plan_decoded_bytes(&self, rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
+        use crate::decoder::CANDIDATE_BATCH_SIZES;
+        let mut out = [0u64; 8];
+        for child in &self.children {
+            let child_bytes = child.plan_decoded_bytes(rows_remaining)?;
+            for (o, c) in out.iter_mut().zip(child_bytes) {
+                *o += c;
+            }
+        }
+        if self.nullable {
+            for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+                let rows = (candidate as u64).min(rows_remaining);
+                out[i] += rows.div_ceil(8);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -639,6 +664,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields};
 
     use super::StructuralStructDecoder;
+    use crate::decoder::StructuralFieldDecoder;
     use crate::testing::{
         TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
     };
@@ -658,7 +684,7 @@ mod tests {
             true,
         )]);
 
-        let err = StructuralStructDecoder::new(fields, false, /*is_root=*/ true).unwrap_err();
+        let err = StructuralStructDecoder::new(fields, false, /*is_root=*/ true, /*nullable=*/ false).unwrap_err();
         assert!(matches!(err, lance_core::Error::Schema { .. }));
         assert!(
             err.to_string()
@@ -995,6 +1021,88 @@ mod tests {
             HashMap::new(),
         )
         .await;
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_struct_non_nullable_primitive() {
+        // Nullable struct containing a non-nullable i32 child.
+        // Only the struct-level bitmap contributes; the child has no bitmap.
+        //
+        // N == CANDIDATE_BATCH_SIZES[5] == 1024 so that all sizes are
+        // naturally aligned to Arrow's 64-byte allocation boundary.
+        use arrow_buffer::NullBuffer;
+
+        const N: usize = 1024;
+        let x_vals = Int32Array::from_iter_values(0..N as i32);
+        let struct_nulls = NullBuffer::from(
+            (0..N).map(|i| i % 2 == 0).collect::<Vec<_>>(),
+        );
+        let struct_field = Field::new("x", DataType::Int32, false);
+        let struct_array = StructArray::new(
+            Fields::from(vec![struct_field]),
+            vec![Arc::new(x_vals) as ArrayRef],
+            Some(struct_nulls),
+        );
+        let expected = struct_array.get_buffer_memory_size() as u64;
+
+        let child_field = Arc::new(Field::new("x", DataType::Int32, false));
+        let fields = Fields::from(vec![child_field]);
+        let decoder = StructuralStructDecoder::new(
+            fields,
+            false,
+            /*is_root=*/ false,
+            /*nullable=*/ true,
+        )
+        .unwrap();
+
+        let bytes = decoder.plan_decoded_bytes(N as u64).unwrap();
+        // bytes[5] corresponds to CANDIDATE_BATCH_SIZES[5] == 1024 == N
+        assert_eq!(
+            bytes[5],
+            expected,
+            "plan_decoded_bytes({N}) = {} but get_buffer_memory_size = {expected}",
+            bytes[5],
+        );
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_struct_nullable_primitive() {
+        // Nullable struct containing a nullable i32 child.
+        // Both the struct and the child contribute a validity bitmap.
+        use arrow_buffer::NullBuffer;
+
+        const N: usize = 1024;
+        let y_vals = Int32Array::from_iter((0..N as i32).map(|i| {
+            if i % 2 == 0 { Some(i) } else { None }
+        }));
+        let struct_nulls = NullBuffer::from(
+            (0..N).map(|i| i % 3 != 0).collect::<Vec<_>>(),
+        );
+        let struct_field = Field::new("y", DataType::Int32, true);
+        let struct_array = StructArray::new(
+            Fields::from(vec![struct_field]),
+            vec![Arc::new(y_vals) as ArrayRef],
+            Some(struct_nulls),
+        );
+        let expected = struct_array.get_buffer_memory_size() as u64;
+
+        let child_field = Arc::new(Field::new("y", DataType::Int32, true));
+        let fields = Fields::from(vec![child_field]);
+        let decoder = StructuralStructDecoder::new(
+            fields,
+            false,
+            /*is_root=*/ false,
+            /*nullable=*/ true,
+        )
+        .unwrap();
+
+        let bytes = decoder.plan_decoded_bytes(N as u64).unwrap();
+        assert_eq!(
+            bytes[5],
+            expected,
+            "plan_decoded_bytes({N}) = {} but get_buffer_memory_size = {expected}",
+            bytes[5],
+        );
     }
 
     #[test_log::test(tokio::test)]

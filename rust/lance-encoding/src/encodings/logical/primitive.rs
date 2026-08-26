@@ -4547,7 +4547,6 @@ impl StructuralPrimitiveFieldDecoder {
     }
 
     fn decoded_bytes_for_rows(&self, rows: u64) -> lance_core::Result<u64> {
-        use crate::decoder::estimate_bytes_per_row;
         let mut remaining = rows;
         let mut total = 0u64;
         for (page_num, page) in self.page_decoders.iter().enumerate() {
@@ -4560,16 +4559,7 @@ impl StructuralPrimitiveFieldDecoder {
                 page.num_rows()
             };
             let take = available.min(remaining);
-            let page_bytes = match page.decoded_bytes(take) {
-                Ok(bytes) => bytes,
-                // Page decoder has no exact size info (e.g. miniblock-encoded
-                // variable-width data) — fall back to the schema-based estimate.
-                Err(Error::NotSupported { .. }) => {
-                    (take as f64 * estimate_bytes_per_row(self.field.data_type())) as u64
-                }
-                Err(e) => return Err(e),
-            };
-            total += page_bytes;
+            total += page.decoded_bytes(take)?;
             remaining -= take;
         }
         Ok(total)
@@ -4628,6 +4618,7 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
     fn plan_decoded_bytes(&self, rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
         use crate::decoder::CANDIDATE_BATCH_SIZES;
         let data_type = self.field.data_type();
+        let is_nullable = self.field.is_nullable();
 
         // Fixed-width: exact from type metadata, no page inspection needed.
         if let Some(byte_width) = data_type.byte_width_opt() {
@@ -4635,6 +4626,9 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
             for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
                 let rows = (c as u64).min(rows_remaining);
                 out[i] = rows * byte_width as u64;
+                if is_nullable {
+                    out[i] += rows.div_ceil(8);
+                }
             }
             return Ok(out);
         }
@@ -4645,6 +4639,9 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
             for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
                 let rows = (c as u64).min(rows_remaining);
                 out[i] = rows.div_ceil(8);
+                if is_nullable {
+                    out[i] += rows.div_ceil(8);
+                }
             }
             return Ok(out);
         }
@@ -4659,6 +4656,9 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
         for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
             let rows = (c as u64).min(rows_remaining);
             out[i] = self.decoded_bytes_for_rows(rows)?;
+            if is_nullable {
+                out[i] += rows.div_ceil(8);
+            }
         }
         Ok(out)
     }
@@ -7472,6 +7472,75 @@ mod tests {
             assert!(
                 message.contains(expected),
                 "expected error to contain {expected:?}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_i32() {
+        use crate::decoder::CANDIDATE_BATCH_SIZES;
+
+        let field = Arc::new(ArrowField::new("x", DataType::Int32, false));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let rows_remaining = 100u64;
+        let bytes = decoder.plan_decoded_bytes(rows_remaining).unwrap();
+
+        for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+            let rows = (candidate as u64).min(rows_remaining);
+            assert_eq!(bytes[i], rows * 4, "candidate batch size {candidate}");
+        }
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_i32_with_nulls() {
+        use arrow_array::Int32Array;
+
+        // Use N == CANDIDATE_BATCH_SIZES[5] == 1024.  At this size both the
+        // values buffer (1024*4 = 4096 bytes) and the validity bitmap
+        // (ceil(1024/8) = 128 bytes) are naturally aligned to Arrow's 64-byte
+        // allocation boundary, so plan_decoded_bytes matches
+        // get_buffer_memory_size exactly without needing alignment arithmetic.
+        const N: i32 = 1024;
+        let array =
+            Int32Array::from_iter((0..N).map(|i| if i % 2 == 0 { Some(i) } else { None }));
+        let expected = array.get_buffer_memory_size() as u64;
+
+        let field = Arc::new(ArrowField::new("x", DataType::Int32, true));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let bytes = decoder.plan_decoded_bytes(N as u64).unwrap();
+        // bytes[5] corresponds to CANDIDATE_BATCH_SIZES[5] == 1024 == N
+        assert_eq!(
+            bytes[5],
+            expected,
+            "plan_decoded_bytes({N}) = {} but get_buffer_memory_size = {expected}",
+            bytes[5],
+        );
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_fixed_size_list_of_f32() {
+        use crate::decoder::CANDIDATE_BATCH_SIZES;
+
+        const DIMENSION: i32 = 8;
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let fsl_type = DataType::FixedSizeList(item_field, DIMENSION);
+        let field = Arc::new(ArrowField::new("vector", fsl_type, true));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let rows_remaining = 100u64;
+        let bytes = decoder.plan_decoded_bytes(rows_remaining).unwrap();
+
+        // Each FSL row is DIMENSION f32 values = DIMENSION * 4 bytes, plus
+        // 1 bit of validity bitmap (the field is nullable).
+        let bytes_per_row = DIMENSION as u64 * 4;
+        for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+            let rows = (candidate as u64).min(rows_remaining);
+            assert_eq!(
+                bytes[i],
+                rows * bytes_per_row + rows.div_ceil(8),
+                "candidate batch size {candidate}"
             );
         }
     }
