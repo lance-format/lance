@@ -2345,26 +2345,6 @@ mod tests {
         }
     }
 
-    struct MaskPreFilter {
-        mask: Arc<lance_select::RowAddrMask>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::prefilter::PreFilter for MaskPreFilter {
-        async fn wait_for_ready(&self) -> lance_core::Result<()> {
-            Ok(())
-        }
-        fn is_empty(&self) -> bool {
-            false
-        }
-        fn mask(&self) -> Arc<lance_select::RowAddrMask> {
-            self.mask.clone()
-        }
-        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-            self.mask.selected_indices(row_ids)
-        }
-    }
-
     fn masked_prefilter(allowed: Vec<u64>) -> Arc<dyn PreFilter> {
         Arc::new(MaskPreFilter {
             mask: Arc::new(lance_select::RowAddrMask::from_allowed(
@@ -3031,7 +3011,7 @@ mod tests {
         // The safe direction, and the matching one, both still search.
         let over = build_store(NODES * 2);
         for storage in [full.as_ref(), over.as_ref()] {
-            let results = hnsw
+            let (results, _) = hnsw
                 .search_basic(query.clone(), 10, &params, None, storage)
                 .expect("storage that covers the graph must search");
             assert!(!results.is_empty());
@@ -3146,7 +3126,7 @@ mod tests {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let results = loaded
+        let (results, _) = loaded
             .search_basic(query, 10, &params, None, store.as_ref())
             .expect("search must survive a dropped edge");
         assert!(!results.is_empty(), "the query still returns neighbors");
