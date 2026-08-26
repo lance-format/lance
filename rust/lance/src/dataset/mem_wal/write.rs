@@ -139,7 +139,7 @@ pub struct ShardWriterConfig {
     /// This value is ignored because manifest discovery now uses an internal
     /// adaptive batch size. It is retained for source compatibility.
     #[deprecated(
-        since = "11.0.0",
+        since = "12.0.0",
         note = "manifest scan concurrency is managed internally and this field is ignored"
     )]
     pub manifest_scan_batch_size: usize,
@@ -361,7 +361,7 @@ impl ShardWriterConfig {
     /// is ignored.
     #[allow(deprecated)]
     #[deprecated(
-        since = "11.0.0",
+        since = "12.0.0",
         note = "manifest scan concurrency is managed internally and this method has no effect"
     )]
     pub fn with_manifest_scan_batch_size(mut self, size: usize) -> Self {
