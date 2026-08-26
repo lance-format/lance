@@ -127,7 +127,7 @@ impl ShardManifestStore {
     /// `manifest_scan_batch_size` is retained for source compatibility and is
     /// ignored. Use [`Self::new_adaptive`] for new code.
     #[deprecated(
-        since = "11.0.0",
+        since = "12.0.0",
         note = "manifest scan concurrency is managed internally; use ShardManifestStore::new_adaptive"
     )]
     pub fn new(
