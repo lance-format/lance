@@ -239,7 +239,12 @@ pub struct StructuralStructDecoder {
 }
 
 impl StructuralStructDecoder {
-    pub fn new(fields: Fields, should_validate: bool, is_root: bool, nullable: bool) -> Result<Self> {
+    pub fn new(
+        fields: Fields,
+        should_validate: bool,
+        is_root: bool,
+        nullable: bool,
+    ) -> Result<Self> {
         let children = fields
             .iter()
             .map(|field| Self::field_to_decoder(field, should_validate))
@@ -684,7 +689,10 @@ mod tests {
             true,
         )]);
 
-        let err = StructuralStructDecoder::new(fields, false, /*is_root=*/ true, /*nullable=*/ false).unwrap_err();
+        let err = StructuralStructDecoder::new(
+            fields, false, /*is_root=*/ true, /*nullable=*/ false,
+        )
+        .unwrap_err();
         assert!(matches!(err, lance_core::Error::Schema { .. }));
         assert!(
             err.to_string()
@@ -1034,9 +1042,7 @@ mod tests {
 
         const N: usize = 1024;
         let x_vals = Int32Array::from_iter_values(0..N as i32);
-        let struct_nulls = NullBuffer::from(
-            (0..N).map(|i| i % 2 == 0).collect::<Vec<_>>(),
-        );
+        let struct_nulls = NullBuffer::from((0..N).map(|i| i % 2 == 0).collect::<Vec<_>>());
         let struct_field = Field::new("x", DataType::Int32, false);
         let struct_array = StructArray::new(
             Fields::from(vec![struct_field]),
@@ -1048,18 +1054,14 @@ mod tests {
         let child_field = Arc::new(Field::new("x", DataType::Int32, false));
         let fields = Fields::from(vec![child_field]);
         let decoder = StructuralStructDecoder::new(
-            fields,
-            false,
-            /*is_root=*/ false,
-            /*nullable=*/ true,
+            fields, false, /*is_root=*/ false, /*nullable=*/ true,
         )
         .unwrap();
 
         let bytes = decoder.plan_decoded_bytes(N as u64).unwrap();
         // bytes[5] corresponds to CANDIDATE_BATCH_SIZES[5] == 1024 == N
         assert_eq!(
-            bytes[5],
-            expected,
+            bytes[5], expected,
             "plan_decoded_bytes({N}) = {} but get_buffer_memory_size = {expected}",
             bytes[5],
         );
@@ -1072,12 +1074,9 @@ mod tests {
         use arrow_buffer::NullBuffer;
 
         const N: usize = 1024;
-        let y_vals = Int32Array::from_iter((0..N as i32).map(|i| {
-            if i % 2 == 0 { Some(i) } else { None }
-        }));
-        let struct_nulls = NullBuffer::from(
-            (0..N).map(|i| i % 3 != 0).collect::<Vec<_>>(),
-        );
+        let y_vals =
+            Int32Array::from_iter((0..N as i32).map(|i| if i % 2 == 0 { Some(i) } else { None }));
+        let struct_nulls = NullBuffer::from((0..N).map(|i| i % 3 != 0).collect::<Vec<_>>());
         let struct_field = Field::new("y", DataType::Int32, true);
         let struct_array = StructArray::new(
             Fields::from(vec![struct_field]),
@@ -1089,17 +1088,13 @@ mod tests {
         let child_field = Arc::new(Field::new("y", DataType::Int32, true));
         let fields = Fields::from(vec![child_field]);
         let decoder = StructuralStructDecoder::new(
-            fields,
-            false,
-            /*is_root=*/ false,
-            /*nullable=*/ true,
+            fields, false, /*is_root=*/ false, /*nullable=*/ true,
         )
         .unwrap();
 
         let bytes = decoder.plan_decoded_bytes(N as u64).unwrap();
         assert_eq!(
-            bytes[5],
-            expected,
+            bytes[5], expected,
             "plan_decoded_bytes({N}) = {} but get_buffer_memory_size = {expected}",
             bytes[5],
         );

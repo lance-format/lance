@@ -1617,10 +1617,10 @@ mod tests {
         // bytes depends on the per-row list lengths, which are not known at
         // planning time without inspecting page data.  For this PR we
         // explicitly reject the call rather than returning a wrong estimate.
-        use arrow_array::builder::{Int32Builder, ListBuilder};
-        use arrow_schema::Field;
         use crate::decoder::StructuralFieldDecoder;
         use crate::encodings::logical::primitive::StructuralPrimitiveFieldDecoder;
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+        use arrow_schema::Field;
 
         // Build a List<i32> array where every row has a random (variable) length
         // to illustrate the case we cannot plan for.
@@ -1643,7 +1643,9 @@ mod tests {
         let child = Box::new(StructuralPrimitiveFieldDecoder::new(&item_field, false));
         let decoder = super::StructuralListDecoder::new(child, list_type);
 
-        let err = decoder.plan_decoded_bytes(lengths.len() as u64).unwrap_err();
+        let err = decoder
+            .plan_decoded_bytes(lengths.len() as u64)
+            .unwrap_err();
         assert!(
             matches!(err, lance_core::Error::NotSupported { .. }),
             "expected NotSupported, got: {err:?}"

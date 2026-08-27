@@ -4528,6 +4528,26 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
     }
 }
 
+/// Returns the total bytes consumed by validity bitmaps of nested child fields
+/// for `rows` logical rows of `data_type`.
+///
+/// Only `FixedSizeList` types have nested children that contribute additional
+/// bitmaps; all other fixed-width leaf types return 0.
+fn fsl_child_bitmap_bytes(data_type: &arrow_schema::DataType, rows: u64) -> u64 {
+    match data_type {
+        arrow_schema::DataType::FixedSizeList(child_field, dimension) => {
+            let child_rows = rows * *dimension as u64;
+            let own = if child_field.is_nullable() {
+                child_rows.div_ceil(8)
+            } else {
+                0
+            };
+            own + fsl_child_bitmap_bytes(child_field.data_type(), child_rows)
+        }
+        _ => 0,
+    }
+}
+
 #[derive(Debug)]
 pub struct StructuralPrimitiveFieldDecoder {
     field: Arc<ArrowField>,
@@ -4561,6 +4581,13 @@ impl StructuralPrimitiveFieldDecoder {
             let take = available.min(remaining);
             total += page.decoded_bytes(take)?;
             remaining -= take;
+        }
+        if remaining > 0 {
+            return Err(lance_core::Error::not_supported(format!(
+                "plan_decoded_bytes: queued pages cover only {} of {} requested rows",
+                rows - remaining,
+                rows,
+            )));
         }
         Ok(total)
     }
@@ -4629,6 +4656,7 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
                 if is_nullable {
                     out[i] += rows.div_ceil(8);
                 }
+                out[i] += fsl_child_bitmap_bytes(data_type, rows);
             }
             return Ok(out);
         }
@@ -7502,8 +7530,7 @@ mod tests {
         // allocation boundary, so plan_decoded_bytes matches
         // get_buffer_memory_size exactly without needing alignment arithmetic.
         const N: i32 = 1024;
-        let array =
-            Int32Array::from_iter((0..N).map(|i| if i % 2 == 0 { Some(i) } else { None }));
+        let array = Int32Array::from_iter((0..N).map(|i| if i % 2 == 0 { Some(i) } else { None }));
         let expected = array.get_buffer_memory_size() as u64;
 
         let field = Arc::new(ArrowField::new("x", DataType::Int32, true));
@@ -7512,8 +7539,49 @@ mod tests {
         let bytes = decoder.plan_decoded_bytes(N as u64).unwrap();
         // bytes[5] corresponds to CANDIDATE_BATCH_SIZES[5] == 1024 == N
         assert_eq!(
+            bytes[5], expected,
+            "plan_decoded_bytes({N}) = {} but get_buffer_memory_size = {expected}",
             bytes[5],
-            expected,
+        );
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_nullable_fsl_with_nullable_items() {
+        // FixedSizeList<nullable i32, DIM> where the FSL itself is also nullable.
+        // Arrow allocates three buffers:
+        //   1. FSL null bitmap:       ceil(rows / 8)
+        //   2. Child i32 null bitmap: ceil(rows * DIM / 8)
+        //   3. Child i32 values:      rows * DIM * 4
+        //
+        // N=1024, DIM=4 keeps all three naturally 64-byte aligned so the
+        // comparison against get_buffer_memory_size() is exact.
+        use arrow_array::{FixedSizeListArray, Int32Array};
+        use arrow_buffer::NullBuffer;
+
+        const N: usize = 1024;
+        const DIM: i32 = 4;
+
+        let child_values = Int32Array::from_iter(
+            (0..(N as i32 * DIM)).map(|i| if i % 2 == 0 { Some(i) } else { None }),
+        );
+        let item_field = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let fsl_nulls = NullBuffer::from((0..N).map(|i| i % 3 != 0).collect::<Vec<_>>());
+        let fsl_array = FixedSizeListArray::new(
+            item_field.clone(),
+            DIM,
+            Arc::new(child_values),
+            Some(fsl_nulls),
+        );
+        let expected = fsl_array.get_buffer_memory_size() as u64;
+
+        let fsl_type = DataType::FixedSizeList(item_field, DIM);
+        let field = Arc::new(ArrowField::new("v", fsl_type, true));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let bytes = decoder.plan_decoded_bytes(N as u64).unwrap();
+        // bytes[5] corresponds to CANDIDATE_BATCH_SIZES[5] == 1024 == N
+        assert_eq!(
+            bytes[5], expected,
             "plan_decoded_bytes({N}) = {} but get_buffer_memory_size = {expected}",
             bytes[5],
         );
@@ -7524,7 +7592,8 @@ mod tests {
         use crate::decoder::CANDIDATE_BATCH_SIZES;
 
         const DIMENSION: i32 = 8;
-        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        // Items are non-nullable, which is the typical case for vector embeddings.
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, false));
         let fsl_type = DataType::FixedSizeList(item_field, DIMENSION);
         let field = Arc::new(ArrowField::new("vector", fsl_type, true));
         let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);

@@ -2223,8 +2223,12 @@ pub fn create_decode_iterator(
     let arrow_schema = Arc::new(ArrowSchema::from(schema));
     let root_fields = arrow_schema.fields.clone();
     if is_structural {
-        let simple_struct_decoder =
-            StructuralStructDecoder::new(root_fields, should_validate, /*is_root=*/ true, /*nullable=*/ false)?;
+        let simple_struct_decoder = StructuralStructDecoder::new(
+            root_fields,
+            should_validate,
+            /*is_root=*/ true,
+            /*nullable=*/ false,
+        )?;
         Ok(Box::new(BatchDecodeIterator::new(
             messages,
             batch_size,
@@ -3252,7 +3256,10 @@ mod tests {
         let batch_readahead = 2;
         let load_error_message = "simulated page load failure";
         let fields = Fields::from(vec![ArrowField::new("vector", DataType::Float32, true)]);
-        let root_decoder = StructuralStructDecoder::new(fields, false, /*is_root=*/ true, /*nullable=*/ false).unwrap();
+        let root_decoder = StructuralStructDecoder::new(
+            fields, false, /*is_root=*/ true, /*nullable=*/ false,
+        )
+        .unwrap();
         let (tx, rx) = unbounded_channel();
         let failed_page = async move { Err(Error::io(load_error_message)) }.boxed();
 
