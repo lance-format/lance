@@ -388,6 +388,10 @@ pub(crate) fn build_scanner_with_options<'a>(
             scanner.ef(ef);
         }
 
+        if let Some(centroid_ef) = env.get_optional_usize_from_method(&java_obj, "getCentroidEf")? {
+            scanner.centroid_ef(centroid_ef);
+        }
+
         if let Some(refine_factor) =
             env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?
         {

@@ -48,7 +48,7 @@ use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::hnsw::HNSW;
-use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::ivf::storage::{CentroidIndexCache, IvfModel};
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{
     QuantizationType, Quantizer, QuantizerMetadata, QuantizerStorage,
@@ -621,6 +621,8 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     index_cache: WeakLanceCache,
 
+    centroid_index: CentroidIndexCache,
+
     io_parallelism: usize,
     /// Cumulative I/O performed while opening this index (file footers, IVF
     /// centroids, quantization metadata).  Captured once in `try_new`; exposed
@@ -644,6 +646,7 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.storage.deep_size_of_children(context)
             + self.scratch_pool.deep_size_of_children(context)
+            + self.centroid_index.deep_size_of_children(context)
             + self
                 .rq_search_cache
                 .as_ref()
@@ -1125,6 +1128,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             sub_index_metadata,
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
+            centroid_index: CentroidIndexCache::default(),
             io_parallelism,
             open_io_stats,
             _marker: PhantomData,
@@ -1165,6 +1169,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             sub_index_metadata,
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
+            centroid_index: CentroidIndexCache::default(),
             io_parallelism,
             // Reconstruction from cached state re-opens readers on its own path;
             // the open-time I/O is not attributed here (it is a one-time cost,
@@ -1465,7 +1470,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         let max_nprobes = query.maximum_nprobes.unwrap_or(self.ivf.num_partitions());
 
-        self.ivf.find_partitions(&query.key, max_nprobes, dt)
+        self.ivf.find_partitions_with_centroid_index(
+            &query.key,
+            max_nprobes,
+            dt,
+            query.centroid_ef,
+            &self.centroid_index,
+        )
     }
 
     fn total_partitions(&self) -> usize {

@@ -112,6 +112,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         minimum_nprobes: Some(query.minimum_nprobes as u32),
         maximum_nprobes: query.maximum_nprobes.map(|n| n as u32),
         ef: query.ef.map(|n| n as u32),
+        centroid_ef: query.centroid_ef.map(|n| n as u32),
         refine_factor: query.refine_factor,
         metric_type,
         use_index: query.use_index,
@@ -142,6 +143,7 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         minimum_nprobes: proto.minimum_nprobes.unwrap_or(1) as usize,
         maximum_nprobes: proto.maximum_nprobes.map(|n| n as usize),
         ef: proto.ef.map(|n| n as usize),
+        centroid_ef: proto.centroid_ef.map(|n| n as usize),
         refine_factor: proto.refine_factor,
         metric_type,
         use_index: proto.use_index,
@@ -348,6 +350,7 @@ mod tests {
             minimum_nprobes: 4,
             maximum_nprobes: Some(16),
             ef: Some(64),
+            centroid_ef: Some(32),
             refine_factor: Some(2),
             metric_type: Some(DistanceType::Cosine),
             use_index: true,
@@ -366,6 +369,7 @@ mod tests {
         assert_eq!(query.minimum_nprobes, back.minimum_nprobes);
         assert_eq!(query.maximum_nprobes, back.maximum_nprobes);
         assert_eq!(query.ef, back.ef);
+        assert_eq!(query.centroid_ef, back.centroid_ef);
         assert_eq!(query.refine_factor, back.refine_factor);
         assert_eq!(query.metric_type, back.metric_type);
         assert_eq!(query.use_index, back.use_index);
@@ -388,6 +392,7 @@ mod tests {
             minimum_nprobes: 1,
             maximum_nprobes: None,
             ef: None,
+            centroid_ef: None,
             refine_factor: None,
             metric_type: None,
             use_index: false,
@@ -466,6 +471,7 @@ mod tests {
             minimum_nprobes: 2,
             maximum_nprobes: Some(4),
             ef: None,
+            centroid_ef: None,
             refine_factor: Some(2),
             metric_type: Some(DistanceType::L2),
             use_index: true,
@@ -514,6 +520,7 @@ mod tests {
             minimum_nprobes: 2,
             maximum_nprobes: Some(4),
             ef: None,
+            centroid_ef: None,
             refine_factor: Some(2),
             metric_type: Some(DistanceType::L2),
             use_index: true,
@@ -578,6 +585,7 @@ mod tests {
             minimum_nprobes: 2,
             maximum_nprobes: None,
             ef: None,
+            centroid_ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
             use_index: true,

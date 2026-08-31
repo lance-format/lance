@@ -73,7 +73,7 @@ use lance_index::vector::flat::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatS
 use lance_index::vector::hnsw::HnswMetadata;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
-use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::ivf::storage::{CentroidIndexCache, IvfModel};
 use lance_index::vector::kmeans::{KMeans, KMeansParams};
 use lance_index::vector::pq::storage::{
     PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage, transpose,
@@ -187,12 +187,16 @@ pub struct IVFIndex {
     pub metric_type: MetricType,
 
     index_cache: WeakLanceCache,
+
+    centroid_index: CentroidIndexCache,
 }
 
 impl DeepSizeOf for IVFIndex {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // `Uuid` is a fixed 16-byte struct with no heap children, so contributes 0.
-        self.reader.deep_size_of_children(context) + self.sub_index.deep_size_of_children(context)
+        self.reader.deep_size_of_children(context)
+            + self.sub_index.deep_size_of_children(context)
+            + self.centroid_index.deep_size_of_children(context)
     }
 }
 
@@ -222,6 +226,7 @@ impl IVFIndex {
             metric_type,
             partition_locks: PartitionLoadLock::new(num_partitions),
             index_cache: WeakLanceCache::from(&index_cache),
+            centroid_index: CentroidIndexCache::default(),
         })
     }
 
@@ -1382,7 +1387,13 @@ impl VectorIndex for IVFIndex {
 
         let max_nprobes = query.maximum_nprobes.unwrap_or(self.ivf.num_partitions());
 
-        self.ivf.find_partitions(&query.key, max_nprobes, mt)
+        self.ivf.find_partitions_with_centroid_index(
+            &query.key,
+            max_nprobes,
+            mt,
+            query.centroid_ef,
+            &self.centroid_index,
+        )
     }
 
     async fn search_in_partition(
@@ -5209,6 +5220,7 @@ mod tests {
                     minimum_nprobes: 1,
                     maximum_nprobes: None,
                     ef: None,
+                    centroid_ef: None,
                     refine_factor: None,
                     metric_type: Some(MetricType::L2),
                     use_index: true,

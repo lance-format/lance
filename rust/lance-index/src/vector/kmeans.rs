@@ -23,7 +23,6 @@ use arrow_array::{
     types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type, UInt8Type},
 };
 use arrow_array::{ArrowNumericType, UInt8Array};
-use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{ArrowError, DataType};
 use bitvec::prelude::*;
 use half::f16;
@@ -48,6 +47,7 @@ use {
     lance_linalg::kernels::argmin_value,
 };
 
+use crate::vector::graph::OrderedFloat;
 use crate::vector::utils::SimpleIndex;
 use lance_core::{Error, Result};
 
@@ -462,7 +462,7 @@ where
                     let query = PrimitiveArray::<T>::from_iter_values(vec.iter().copied());
                     // unable to use balance_factor here because index.search returns the closest centroid
                     index
-                        .search(Arc::new(query))
+                        .search_one(Arc::new(query))
                         .map(|(id, dist)| Some((id, dist)))
                         .unwrap()
                 })
@@ -1447,13 +1447,31 @@ fn smallest_nprobes(
     dists: Vec<f32>,
     nprobes: usize,
 ) -> arrow::error::Result<(UInt32Array, Float32Array)> {
-    // TODO: use heap to just keep nprobes smallest values.
-    let dists_arr = Float32Array::from(dists);
-    let indices = sort_to_indices(&dists_arr, None, Some(nprobes))?;
-    let dists = arrow::compute::take(&dists_arr, &indices, None)?
-        .as_primitive::<Float32Type>()
-        .clone();
-    Ok((indices, dists))
+    let limit = nprobes.min(dists.len());
+    let mut nearest = BinaryHeap::with_capacity(limit);
+    for (index, distance) in dists.into_iter().enumerate() {
+        let index = u32::try_from(index).map_err(|_| {
+            ArrowError::InvalidArgumentError(format!(
+                "centroid index {index} exceeds the supported u32 range"
+            ))
+        })?;
+        let candidate = (OrderedFloat(distance), index);
+        if nearest.len() < limit {
+            nearest.push(candidate);
+        } else if nearest.peek().is_some_and(|furthest| candidate < *furthest) {
+            nearest.pop();
+            nearest.push(candidate);
+        }
+    }
+
+    let nearest = nearest.into_sorted_vec();
+    let mut indices = Vec::with_capacity(nearest.len());
+    let mut distances = Vec::with_capacity(nearest.len());
+    for (distance, index) in nearest {
+        indices.push(index);
+        distances.push(distance.0);
+    }
+    Ok((indices.into(), distances.into()))
 }
 
 /// `Dot` distances from `query` to every centroid, through the AMX-FP16 kernel,
@@ -1549,13 +1567,7 @@ pub fn kmeans_find_partitions_binary(
         }
     };
 
-    // TODO: use heap to just keep nprobes smallest values.
-    let dists_arr = Float32Array::from(dists);
-    let indices = sort_to_indices(&dists_arr, None, Some(nprobes))?;
-    let dists = arrow::compute::take(&dists_arr, &indices, None)?
-        .as_primitive::<Float32Type>()
-        .clone();
-    Ok((indices, dists))
+    smallest_nprobes(dists, nprobes)
 }
 
 /// Compute partitions from Arrow FixedSizeListArray.
@@ -1758,6 +1770,13 @@ mod tests {
     use lance_linalg::distance::dot_f16::amx_fp16_supported;
     use lance_linalg::distance::l2;
     use lance_linalg::kernels::argmin;
+
+    #[test]
+    fn test_smallest_nprobes_uses_distance_then_partition_id_order() {
+        let (indices, distances) = smallest_nprobes(vec![3.0, 1.0, 2.0, 1.0], 3).unwrap();
+        assert_eq!(indices.values(), &[1, 3, 2]);
+        assert_eq!(distances.values(), &[1.0, 1.0, 2.0]);
+    }
 
     /// The AMX partition path must pick the same partitions as the scalar one.
     /// Exact equality on the distances is not required -- the kernel accumulates

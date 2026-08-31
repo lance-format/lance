@@ -2427,6 +2427,31 @@ def test_vector_index_with_nprobes(indexed_dataset):
     ).analyze_plan()
 
 
+def test_vector_index_with_centroid_ef(indexed_dataset):
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "nprobes": 7,
+            "centroid_ef": 28,
+        }
+    ).explain_plan()
+
+    assert "centroid_ef=Some(28)" in res
+
+    with pytest.raises(ValueError, match="centroid_ef must be >= maximum_nprobes"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "nprobes": 7,
+                "centroid_ef": 6,
+            }
+        )
+
+
 def test_vector_index_with_query_parallelism(indexed_dataset):
     q = np.random.randn(128)
 

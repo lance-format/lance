@@ -28,6 +28,7 @@ public class Query {
   private final int minimumNprobes;
   private final Optional<Integer> maximumNprobes;
   private final Optional<Integer> ef;
+  private final Optional<Integer> centroidEf;
   private final Optional<Integer> refineFactor;
   private final Optional<DistanceType> distanceType;
   private final boolean useIndex;
@@ -49,6 +50,12 @@ public class Query {
     this.minimumNprobes = builder.minimumNprobes;
     this.maximumNprobes = builder.maximumNprobes;
     this.ef = builder.ef;
+    Preconditions.checkArgument(
+        !builder.centroidEf.isPresent()
+            || !builder.maximumNprobes.isPresent()
+            || builder.centroidEf.get() >= builder.maximumNprobes.get(),
+        "Centroid ef must be greater than or equal to maximum Nprobes");
+    this.centroidEf = builder.centroidEf;
     this.refineFactor = builder.refineFactor;
     this.distanceType = builder.distanceType;
     this.useIndex = builder.useIndex;
@@ -78,6 +85,10 @@ public class Query {
 
   public Optional<Integer> getEf() {
     return ef;
+  }
+
+  public Optional<Integer> getCentroidEf() {
+    return centroidEf;
   }
 
   public Optional<Integer> getRefineFactor() {
@@ -117,6 +128,7 @@ public class Query {
         .add("minimumNprobes", minimumNprobes)
         .add("maximumNprobes", maximumNprobes.orElse(null))
         .add("ef", ef.orElse(null))
+        .add("centroidEf", centroidEf.orElse(null))
         .add("refineFactor", refineFactor.orElse(null))
         .add("distanceType", distanceType.orElse(null))
         .add("useIndex", useIndex)
@@ -132,6 +144,7 @@ public class Query {
     private int minimumNprobes = 1;
     private Optional<Integer> maximumNprobes = Optional.empty();
     private Optional<Integer> ef = Optional.empty();
+    private Optional<Integer> centroidEf = Optional.empty();
     private Optional<Integer> refineFactor = Optional.empty();
     private Optional<DistanceType> distanceType = Optional.empty();
     private boolean useIndex = true;
@@ -230,6 +243,21 @@ public class Query {
      */
     public Builder setEf(int ef) {
       this.ef = Optional.of(ef);
+      return this;
+    }
+
+    /**
+     * Enables HNSW routing over IVF centroids and sets its candidate beam size.
+     *
+     * <p>The value must be at least maximum Nprobes. Exact centroid routing is used when this is
+     * not set.
+     *
+     * @param centroidEf The number of centroid candidates to reserve.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setCentroidEf(int centroidEf) {
+      Preconditions.checkArgument(centroidEf > 0, "Centroid ef must be greater than 0");
+      this.centroidEf = Optional.of(centroidEf);
       return this;
     }
 

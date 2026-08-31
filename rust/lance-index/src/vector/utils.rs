@@ -10,6 +10,7 @@ use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, cast::AsArray};
 use arrow_schema::{DataType, Field};
 use lance_arrow::{BufferExt, DataTypeExt, FixedSizeListArrayExt};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::dot_f16::amx_fp16_available;
@@ -100,19 +101,53 @@ enum SimpleStore {
     Binary(FlatBinStorage),
 }
 
+impl DeepSizeOf for SimpleIndex {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        let store_size = match &self.store {
+            SimpleStore::Float(store) => store.deep_size_of_children(context),
+            SimpleStore::Binary(store) => store.deep_size_of_children(context),
+        };
+        store_size + self.index.deep_size_of_children(context)
+    }
+}
+
 impl SimpleIndex {
-    fn try_new(store: SimpleStore) -> Result<Self> {
+    fn try_new_with_params(store: SimpleStore, params: HnswBuildParams) -> Result<Self> {
         let hnsw = match &store {
-            SimpleStore::Float(store) => HNSW::index_vectors(
-                store,
-                HnswBuildParams::default().ef_construction(15).num_edges(12),
-            )?,
-            SimpleStore::Binary(store) => HNSW::index_vectors(
-                store,
-                HnswBuildParams::default().ef_construction(15).num_edges(12),
-            )?,
+            SimpleStore::Float(store) => HNSW::index_vectors(store, params)?,
+            SimpleStore::Binary(store) => HNSW::index_vectors(store, params)?,
         };
         Ok(Self { store, index: hnsw })
+    }
+
+    fn try_new(store: SimpleStore) -> Result<Self> {
+        Self::try_new_with_params(
+            store,
+            HnswBuildParams::default().ef_construction(15).num_edges(12),
+        )
+    }
+
+    /// Build a query-quality HNSW graph over IVF centroids.
+    ///
+    /// Returns `None` for unsupported vector type and metric combinations so callers can
+    /// transparently fall back to exact centroid scanning.
+    pub fn try_new_centroid_index(
+        centroids: ArrayRef,
+        dimension: usize,
+        distance_type: DistanceType,
+    ) -> Result<Option<Self>> {
+        let store = match (centroids.data_type(), distance_type) {
+            (DataType::Float16 | DataType::Float32 | DataType::Float64, _) => {
+                let vectors = FixedSizeListArray::try_new_from_values(centroids, dimension as i32)?;
+                SimpleStore::Float(FlatFloatStorage::new(vectors, distance_type))
+            }
+            (DataType::UInt8, DistanceType::Hamming) => {
+                let vectors = FixedSizeListArray::try_new_from_values(centroids, dimension as i32)?;
+                SimpleStore::Binary(FlatBinStorage::new(vectors, distance_type))
+            }
+            _ => return Ok(None),
+        };
+        Self::try_new_with_params(store, HnswBuildParams::default()).map(Some)
     }
 
     // train HNSW over the centroids to speed up finding the nearest clusters,
@@ -159,26 +194,56 @@ impl SimpleIndex {
         Self::try_new(store).map(Some)
     }
 
-    pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
+    /// Search the graph for the `k` nearest centroids.
+    ///
+    /// `ef` controls the size of the candidate beam and must be at least `k`.
+    pub fn search(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        ef: usize,
+    ) -> Result<(arrow_array::UInt32Array, arrow_array::Float32Array)> {
+        if ef < k {
+            return Err(Error::invalid_input(format!(
+                "SimpleIndex::search requires ef >= k, got ef={ef}, k={k}"
+            )));
+        }
         let params = HnswQueryParams {
-            ef: 15,
+            ef,
             lower_bound: None,
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
         };
         let res = match &self.store {
-            SimpleStore::Float(store) => self.index.search_basic(query, 1, &params, None, store)?,
+            SimpleStore::Float(store) => self.index.search_basic(query, k, &params, None, store)?,
             SimpleStore::Binary(store) => {
                 let query = if query.data_type() == &DataType::UInt8 {
                     query
                 } else {
                     cast(&query, &DataType::UInt8).map_err(|e| Error::index(e.to_string()))?
                 };
-                self.index.search_basic(query, 1, &params, None, store)?
+                self.index.search_basic(query, k, &params, None, store)?
             }
         };
-        Ok((res[0].id, res[0].dist.0))
+        let mut ids = Vec::with_capacity(res.len());
+        let mut distances = Vec::with_capacity(res.len());
+        for node in res {
+            ids.push(node.id);
+            distances.push(node.dist.0);
+        }
+        Ok((ids.into(), distances.into()))
+    }
+
+    pub(crate) fn search_one(&self, query: ArrayRef) -> Result<(u32, f32)> {
+        let (ids, distances) = self.search(query, 1, 15)?;
+        let Some(id) = ids.values().first() else {
+            return Err(Error::index("SimpleIndex::search returned no centroids"));
+        };
+        let Some(distance) = distances.values().first() else {
+            return Err(Error::index("SimpleIndex::search returned no distances"));
+        };
+        Ok((*id, *distance))
     }
 }
 
@@ -352,9 +417,12 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::identities::Zero;
     use rayon::ThreadPoolBuilder;
+    use std::collections::HashSet;
 
     use arrow::compute::cast;
     use rstest::rstest;
+
+    use crate::vector::kmeans::kmeans_find_partitions_arrow_array;
 
     fn build_index(centroids: ArrayRef, dim: usize) -> SimpleIndex {
         let f32_centroids = cast(&centroids, &DataType::Float32).unwrap();
@@ -385,7 +453,7 @@ mod tests {
         let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
         let index = thread_pool.install(|| build_index(centroids, 16));
         let query: ArrayRef = Arc::new(Float32Array::from(vec![query_val; 16]));
-        let (id, dist) = index.search(query).unwrap();
+        let (id, dist) = index.search_one(query).unwrap();
         assert_eq!(id, 42);
         assert_eq!(dist, 0.0);
     }
@@ -399,9 +467,87 @@ mod tests {
         ));
         let index = build_binary_index(centroids, 16);
         let query: ArrayRef = Arc::new(UInt8Array::from(vec![42u8; 16]));
-        let (id, dist) = index.search(query).unwrap();
+        let (id, dist) = index.search_one(query).unwrap();
         assert_eq!(id, 42);
         assert_eq!(dist, 0.0);
+    }
+
+    #[rstest]
+    #[case::l2(DistanceType::L2, 1)]
+    #[case::l2_multiple(DistanceType::L2, 16)]
+    #[case::dot(DistanceType::Dot, 4)]
+    #[case::dot_multiple(DistanceType::Dot, 16)]
+    #[case::hamming(DistanceType::Hamming, 4)]
+    #[case::hamming_multiple(DistanceType::Hamming, 16)]
+    fn test_simple_index_top_k_recall(#[case] distance_type: DistanceType, #[case] nprobes: usize) {
+        const NUM_CENTROIDS: usize = 128;
+        const DIMENSION: usize = 8;
+        let (centroid_values, query): (ArrayRef, ArrayRef) = match distance_type {
+            DistanceType::Hamming => (
+                Arc::new(UInt8Array::from(
+                    (0..NUM_CENTROIDS * DIMENSION)
+                        .map(|i| ((i * 17 + i / DIMENSION * 13) % 256) as u8)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt8Array::from(
+                    (0..DIMENSION)
+                        .map(|i| ((i * 29 + 7) % 256) as u8)
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            _ => (
+                Arc::new(Float32Array::from(
+                    (0..NUM_CENTROIDS * DIMENSION)
+                        .map(|i| ((i * 17 + i / DIMENSION * 13) % 101) as f32 / 100.0)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Float32Array::from(
+                    (0..DIMENSION)
+                        .map(|i| ((i * 29 + 7) % 101) as f32 / 100.0)
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+        };
+        let centroids =
+            FixedSizeListArray::try_new_from_values(centroid_values.clone(), DIMENSION as i32)
+                .unwrap();
+        let index = SimpleIndex::try_new_centroid_index(centroid_values, DIMENSION, distance_type)
+            .unwrap()
+            .unwrap();
+
+        let (actual_ids, actual_distances) =
+            index.search(query.clone(), nprobes, NUM_CENTROIDS).unwrap();
+        let (expected_ids, _) =
+            kmeans_find_partitions_arrow_array(&centroids, query.as_ref(), nprobes, distance_type)
+                .unwrap();
+
+        let expected = expected_ids
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let matches = actual_ids
+            .values()
+            .iter()
+            .filter(|id| expected.contains(id))
+            .count();
+        let recall = matches as f32 / nprobes as f32;
+        assert!(recall >= 0.5, "recall={recall}, metric={distance_type}");
+        assert!(
+            actual_distances
+                .values()
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+        );
+    }
+
+    #[test]
+    fn test_simple_index_rejects_ef_below_k() {
+        let index = build_index(Arc::new(Float32Array::from(vec![0.0; 1600])), 16);
+        let query: ArrayRef = Arc::new(Float32Array::from(vec![0.0; 16]));
+        let error = index.search(query, 10, 9).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("ef >= k"));
     }
 
     #[test]

@@ -62,6 +62,7 @@ public class JNITest {
                 .setK(10)
                 .setNprobes(20)
                 .setEf(30)
+                .setCentroidEf(30)
                 .setRefineFactor(40)
                 .setDistanceType(DistanceType.L2)
                 .setUseIndex(true)

@@ -43,6 +43,9 @@ message VectorQueryProto {
   // Query-time approximation mode. Currently only affects RQ-quantized vector
   // indexes, such as IVF_RQ. Other index types ignore this setting.
   VectorApproxMode approx_mode = 14;
+  // Candidate beam size for HNSW routing over IVF centroids. Absent keeps exact
+  // centroid routing. When present, it must be at least maximum_nprobes.
+  optional uint32 centroid_ef = 15;
 }
 
 // Serializable form of ANNIvfSubIndexExec — the IVF sub-index search node.

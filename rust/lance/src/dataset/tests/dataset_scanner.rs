@@ -276,6 +276,7 @@ async fn test_vector_filter_fts_search() {
         minimum_nprobes: 20,
         maximum_nprobes: None,
         ef: None,
+        centroid_ef: None,
         refine_factor: None,
         metric_type: Some(MetricType::L2),
         use_index: true,

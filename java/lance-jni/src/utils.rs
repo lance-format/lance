@@ -272,6 +272,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNprobes")?;
 
         let ef = env.get_optional_usize_from_method(&java_obj, "getEf")?;
+        let centroid_ef = env.get_optional_usize_from_method(&java_obj, "getCentroidEf")?;
 
         let refine_factor = env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?;
 
@@ -299,6 +300,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             minimum_nprobes,
             maximum_nprobes,
             ef,
+            centroid_ef,
             refine_factor,
             metric_type: distance_type,
             use_index,

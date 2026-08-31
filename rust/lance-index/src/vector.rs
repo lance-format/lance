@@ -135,6 +135,12 @@ pub struct Query {
     /// this is an optional parameter for HNSW related index types.
     pub ef: Option<usize>,
 
+    /// Candidate beam size for the optional HNSW router over IVF centroids.
+    ///
+    /// `None` keeps exact centroid routing. When set, the value must be at least
+    /// [`Self::maximum_nprobes`], or the total number of partitions if no maximum is set.
+    pub centroid_ef: Option<usize>,
+
     /// If presented, apply a refine step.
     /// TODO: should we support fraction / float number here?
     pub refine_factor: Option<u32>,

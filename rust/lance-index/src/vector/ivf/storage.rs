@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ops::Range;
+use std::{ops::Range, sync::OnceLock};
 
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt32Array};
 use itertools::Itertools;
@@ -18,6 +18,7 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 
 use crate::pb::Ivf as PbIvf;
+use crate::vector::utils::SimpleIndex;
 
 pub const IVF_METADATA_KEY: &str = "lance:ivf";
 pub const IVF_PARTITION_KEY: &str = "lance:ivf:partition";
@@ -38,6 +39,36 @@ pub struct IvfModel {
 
     /// Kmeans loss
     pub loss: Option<f64>,
+}
+
+#[derive(Debug)]
+struct CachedCentroidIndex {
+    distance_type: DistanceType,
+    index: Option<SimpleIndex>,
+}
+
+/// The existing build-time centroid HNSW benchmark crosses over near one million scalar values.
+/// Keep exact routing below that point until the query-time benchmark justifies a new threshold.
+const MIN_CENTROID_INDEX_VALUES: usize = 1_000_000;
+
+/// Session-local cache for an optional HNSW graph over IVF centroids.
+///
+/// The cache is deliberately owned by the loaded vector index instead of [`IvfModel`], so it is
+/// never serialized and does not change the IVF file format.
+#[derive(Debug, Default)]
+pub struct CentroidIndexCache {
+    index: OnceLock<std::result::Result<CachedCentroidIndex, String>>,
+}
+
+impl DeepSizeOf for CentroidIndexCache {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.index
+            .get()
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|cached| cached.index.as_ref())
+            .map(|index| index.deep_size_of_children(context))
+            .unwrap_or_default()
+    }
 }
 
 impl DeepSizeOf for IvfModel {
@@ -115,6 +146,80 @@ impl IvfModel {
             vec![],
         );
         internal.find_partitions(query, nprobes)
+    }
+
+    /// Find IVF partitions, optionally using a lazily cached HNSW graph over centroids.
+    ///
+    /// Exact scanning remains the default. When `centroid_ef` is set, it must be at least
+    /// `nprobes`. Small centroid sets, unsupported types, and a cache built for a different
+    /// distance metric fall back to exact scanning.
+    pub fn find_partitions_with_centroid_index(
+        &self,
+        query: &dyn Array,
+        nprobes: usize,
+        distance_type: DistanceType,
+        centroid_ef: Option<usize>,
+        centroid_index: &CentroidIndexCache,
+    ) -> Result<(UInt32Array, Float32Array)> {
+        let Some(centroid_ef) = centroid_ef else {
+            return self.find_partitions(query, nprobes, distance_type);
+        };
+        if centroid_ef < nprobes {
+            return Err(Error::invalid_input(format!(
+                "centroid_ef must be >= maximum_nprobes, got centroid_ef={centroid_ef}, maximum_nprobes={nprobes}"
+            )));
+        }
+
+        let Some(centroids) = self.centroids.as_ref() else {
+            return self.find_partitions(query, nprobes, distance_type);
+        };
+        if centroids.values().len() < MIN_CENTROID_INDEX_VALUES {
+            return self.find_partitions(query, nprobes, distance_type);
+        }
+
+        self.find_partitions_with_hnsw(query, nprobes, distance_type, centroid_ef, centroid_index)
+    }
+
+    fn find_partitions_with_hnsw(
+        &self,
+        query: &dyn Array,
+        nprobes: usize,
+        distance_type: DistanceType,
+        centroid_ef: usize,
+        centroid_index: &CentroidIndexCache,
+    ) -> Result<(UInt32Array, Float32Array)> {
+        let centroids = self
+            .centroids
+            .as_ref()
+            .ok_or_else(|| Error::index("IVF centroids are not available for centroid routing"))?;
+        let cached = centroid_index.index.get_or_init(|| {
+            SimpleIndex::try_new_centroid_index(
+                centroids.values().clone(),
+                centroids.value_length() as usize,
+                distance_type,
+            )
+            .map(|index| CachedCentroidIndex {
+                distance_type,
+                index,
+            })
+            .map_err(|error| error.to_string())
+        });
+        let cached = cached.as_ref().map_err(|message| {
+            Error::index(format!("failed to build centroid HNSW index: {message}"))
+        })?;
+        let Some(index) = cached
+            .index
+            .as_ref()
+            .filter(|_| cached.distance_type == distance_type)
+        else {
+            return self.find_partitions(query, nprobes, distance_type);
+        };
+        let result = index.search(query.slice(0, query.len()), nprobes, centroid_ef)?;
+        let expected = nprobes.min(centroids.len());
+        if result.0.len() < expected {
+            return self.find_partitions(query, nprobes, distance_type);
+        }
+        Ok(result)
     }
 
     /// Add the offset and length of one partition.
@@ -251,6 +356,7 @@ struct IvfMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use arrow_array::{Float32Array, RecordBatch};
@@ -272,6 +378,104 @@ mod tests {
 
         assert_eq!(ivf.row_range(0), 0..20);
         assert_eq!(ivf.row_range(1), 20..70);
+    }
+
+    #[test]
+    fn test_centroid_ef_must_cover_maximum_nprobes() {
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..16).map(|value| value as f32).collect::<Vec<_>>()),
+            2,
+        )
+        .unwrap();
+        let ivf = IvfModel::new(centroids, None);
+        let query = Float32Array::from(vec![0.0, 1.0]);
+        let error = ivf
+            .find_partitions_with_centroid_index(
+                &query,
+                4,
+                DistanceType::L2,
+                Some(3),
+                &CentroidIndexCache::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "centroid_ef must be >= maximum_nprobes, got centroid_ef=3, maximum_nprobes=4"
+        ));
+    }
+
+    #[test]
+    fn test_small_centroid_set_falls_back_to_exact_routing() {
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..32).map(|value| value as f32).collect::<Vec<_>>()),
+            2,
+        )
+        .unwrap();
+        let ivf = IvfModel::new(centroids, None);
+        let query = Float32Array::from(vec![9.0, 10.0]);
+        let cache = CentroidIndexCache::default();
+
+        for nprobes in [1, 3, 8] {
+            let exact = ivf
+                .find_partitions(&query, nprobes, DistanceType::L2)
+                .unwrap();
+            let routed = ivf
+                .find_partitions_with_centroid_index(
+                    &query,
+                    nprobes,
+                    DistanceType::L2,
+                    Some(nprobes),
+                    &cache,
+                )
+                .unwrap();
+            assert_eq!(routed, exact);
+        }
+        assert!(cache.index.get().is_none());
+    }
+
+    #[test]
+    fn test_centroid_hnsw_routing_recall_and_cache() {
+        const NUM_CENTROIDS: usize = 128;
+        const DIMENSION: usize = 8;
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..NUM_CENTROIDS * DIMENSION)
+                    .map(|i| ((i * 17 + i / DIMENSION * 13) % 101) as f32 / 100.0)
+                    .collect::<Vec<_>>(),
+            ),
+            DIMENSION as i32,
+        )
+        .unwrap();
+        let ivf = IvfModel::new(centroids, None);
+        // Query an existing centroid so the nprobes=1 assertion is stable even though
+        // parallel HNSW construction may choose different, equally valid graph edges.
+        let query = ivf.centroid(42).unwrap();
+        let cache = CentroidIndexCache::default();
+
+        for nprobes in [1, 4, 16] {
+            let (expected, _) = ivf
+                .find_partitions(query.as_ref(), nprobes, DistanceType::L2)
+                .unwrap();
+            let (actual, distances) = ivf
+                .find_partitions_with_hnsw(
+                    query.as_ref(),
+                    nprobes,
+                    DistanceType::L2,
+                    NUM_CENTROIDS,
+                    &cache,
+                )
+                .unwrap();
+            let expected = expected.values().iter().copied().collect::<HashSet<_>>();
+            let matches = actual
+                .values()
+                .iter()
+                .filter(|id| expected.contains(id))
+                .count();
+            let recall = matches as f32 / nprobes as f32;
+            assert!(recall >= 0.5, "nprobes={nprobes}, recall={recall}");
+            assert!(distances.values().windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+        assert!(cache.index.get().is_some());
     }
 
     #[tokio::test]

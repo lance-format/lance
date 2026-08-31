@@ -106,7 +106,7 @@ impl Transformer for PartitionTransformer {
                 .iter()
                 .map(|vec| match vec {
                     Some(v) => {
-                        let (id, dist) = index.search(v).unwrap();
+                        let (id, dist) = index.search_one(v).unwrap();
                         (Some(id), Some(dist))
                     }
                     None => (None, None),

@@ -590,6 +590,7 @@ async fn run_checkpoint(
                     minimum_nprobes: 1,
                     maximum_nprobes: Some(1),
                     ef: Some(ef),
+                    centroid_ef: None,
                     refine_factor: None,
                     metric_type: Some(DistanceType::Cosine),
                     use_index: true,

@@ -1990,6 +1990,7 @@ impl Scanner {
             minimum_nprobes: 1,
             maximum_nprobes: None,
             ef: None,
+            centroid_ef: None,
             refine_factor: None,
             metric_type: None,
             use_index: true,
@@ -2088,6 +2089,19 @@ impl Scanner {
     pub fn ef(&mut self, ef: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.ef = Some(ef);
+        }
+        self
+    }
+
+    /// Enables HNSW routing over IVF centroids with the given candidate beam size.
+    ///
+    /// The value must be at least `maximum_nprobes`. By default centroid routing scans all
+    /// centroids exactly. Small centroid sets and unsupported vector types still use exact routing.
+    pub fn centroid_ef(&mut self, centroid_ef: usize) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.centroid_ef = Some(centroid_ef);
+        } else {
+            log::warn!("centroid_ef is not set because nearest has not been called yet");
         }
         self
     }

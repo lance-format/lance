@@ -1209,22 +1209,24 @@ impl DisplayAs for ANNIvfPartitionExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "ANNIvfPartition: uuid={}, minimum_nprobes={}, maximum_nprobes={:?}, deltas={}",
-                    self.index_uuids[0],
-                    self.query.minimum_nprobes,
-                    self.query.maximum_nprobes,
-                    self.index_uuids.len()
-                )
+                    "ANNIvfPartition: uuid={}, minimum_nprobes={}, maximum_nprobes={:?}",
+                    self.index_uuids[0], self.query.minimum_nprobes, self.query.maximum_nprobes
+                )?;
+                if self.query.centroid_ef.is_some() {
+                    write!(f, ", centroid_ef={:?}", self.query.centroid_ef)?;
+                }
+                write!(f, ", deltas={}", self.index_uuids.len())
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "ANNIvfPartition\nuuid={}\nminimum_nprobes={}\nmaximum_nprobes={:?}\ndeltas={}",
-                    self.index_uuids[0],
-                    self.query.minimum_nprobes,
-                    self.query.maximum_nprobes,
-                    self.index_uuids.len()
-                )
+                    "ANNIvfPartition\nuuid={}\nminimum_nprobes={}\nmaximum_nprobes={:?}",
+                    self.index_uuids[0], self.query.minimum_nprobes, self.query.maximum_nprobes
+                )?;
+                if self.query.centroid_ef.is_some() {
+                    write!(f, "\ncentroid_ef={:?}", self.query.centroid_ef)?;
+                }
+                write!(f, "\ndeltas={}", self.index_uuids.len())
             }
         }
     }
@@ -2495,6 +2497,7 @@ mod tests {
             minimum_nprobes: 1,
             maximum_nprobes: None,
             ef: None,
+            centroid_ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
             use_index: true,
@@ -3851,6 +3854,7 @@ mod tests {
             minimum_nprobes: 1,
             maximum_nprobes: None,
             ef: None,
+            centroid_ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::Cosine),
             use_index: true,

@@ -1503,6 +1503,7 @@ impl Dataset {
                 refine_factor,
                 use_index,
                 ef,
+                centroid_ef,
                 query_parallelism,
                 approx_mode,
             ) = vector_query_params_from_dict(nearest, default_k)?;
@@ -1569,6 +1570,9 @@ impl Dataset {
                     }
                     if let Some(ef) = ef {
                         s = s.ef(ef);
+                    }
+                    if let Some(centroid_ef) = centroid_ef {
+                        s = s.centroid_ef(centroid_ef);
                     }
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
@@ -5428,6 +5432,7 @@ type VectorQueryParams = (
     Option<u32>,
     bool,
     Option<usize>,
+    Option<usize>,
     i32,
     ApproxMode,
 );
@@ -5573,6 +5578,16 @@ fn vector_query_params_from_dict(
         None
     };
 
+    let centroid_ef: Option<usize> = if let Some(centroid_ef_obj) = dict.get_item("centroid_ef")? {
+        if centroid_ef_obj.is_none() {
+            None
+        } else {
+            centroid_ef_obj.extract()?
+        }
+    } else {
+        None
+    };
+
     let query_parallelism = vector_query_query_parallelism_from_dict(dict)?;
     let approx_mode = vector_query_approx_mode_from_dict(dict)?;
 
@@ -5586,6 +5601,7 @@ fn vector_query_params_from_dict(
         refine_factor,
         use_index,
         ef,
+        centroid_ef,
         query_parallelism,
         approx_mode,
     ))
@@ -5623,6 +5639,7 @@ impl PySearchFilter {
             refine_factor,
             use_index,
             ef,
+            centroid_ef,
             query_parallelism,
             approx_mode,
         ) = vector_query_params_from_dict(query, default_k)?;
@@ -5638,6 +5655,7 @@ impl PySearchFilter {
             minimum_nprobes,
             maximum_nprobes,
             ef,
+            centroid_ef,
             refine_factor,
             metric_type,
             use_index,
