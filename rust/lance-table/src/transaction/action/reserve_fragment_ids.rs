@@ -59,7 +59,7 @@ impl TryFrom<pb_transaction::ReserveFragmentIds> for ReserveFragmentIds {
 mod tests {
     use super::*;
     use crate::transaction::action::test_support::{apply, backed_manifest};
-    use crate::transaction::action::{Action, AddFragment};
+    use crate::transaction::action::{Action, AddFragment, Ref};
 
     fn reserve(count: u32) -> Action {
         Action::ReserveFragmentIds(ReserveFragmentIds { count })
@@ -67,7 +67,7 @@ mod tests {
 
     fn add_fragment(local: u32) -> Action {
         Action::AddFragment(AddFragment {
-            local,
+            id: Ref::Local(local),
             physical_rows: 10,
             row_id_meta: None,
             last_updated_at_version_meta: None,

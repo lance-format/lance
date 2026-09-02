@@ -859,7 +859,7 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
-    use crate::transaction::action::{Action, AddFragment, UserAction};
+    use crate::transaction::action::{Action, AddFragment, Ref, UserAction};
 
     #[test]
     fn test_rewrite_frag_reuse_update_stays_in_memory() {
@@ -969,7 +969,7 @@ mod tests {
                 UserAction::new(
                     "append batch",
                     vec![Action::AddFragment(AddFragment {
-                        local: 0,
+                        id: Ref::Local(0),
                         physical_rows: 1,
                         row_id_meta: None,
                         last_updated_at_version_meta: None,
