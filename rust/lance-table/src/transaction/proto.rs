@@ -965,14 +965,14 @@ mod tests {
                     actions: vec![pb_transaction::UserAction {
                         description: "append batch".to_string(),
                         actions: vec![pb_transaction::Action {
-                            action: Some(pb_transaction::action::Action::AddFragment(
-                                pb_transaction::AddFragment {
-                                    local: 0,
-                                    physical_rows: 1,
-                                    data_change: Some(true),
-                                    ..Default::default()
-                                },
-                            )),
+                            action: Some(pb_transaction::action::Action::AddFragment(pb_transaction::AddFragment {
+                                id: Some(pb_transaction::Ref {
+                                    kind: Some(pb_transaction::r#ref::Kind::Local(0)),
+                                }),
+                                physical_rows: 1,
+                                data_change: Some(true),
+                                ..Default::default()
+                            })),
                         }],
                     }],
                 },
