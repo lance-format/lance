@@ -87,8 +87,9 @@ pub(super) struct ApplyState<'a> {
     field_tokens: HashMap<u32, i32>,
     base_tokens: HashMap<u32, u32>,
 
-    /// Ids of the fragments this operation minted.
-    minted_fragments: HashSet<u64>,
+    /// Ids of the fragments this operation added, whether minted from the
+    /// counter or claimed out of a reservation.
+    new_fragments: HashSet<u64>,
 
     /// The highest fragment id this operation reserved for a later writer, if
     /// it reserved any. No fragment backs it, so the manifest assembly cannot
@@ -125,7 +126,7 @@ impl<'a> ApplyState<'a> {
             fragment_tokens: HashMap::new(),
             field_tokens: HashMap::new(),
             base_tokens: HashMap::new(),
-            minted_fragments: HashSet::new(),
+            new_fragments: HashSet::new(),
             reserved_fragment_ids: None,
             rebound_fields: HashMap::new(),
             reset: false,
@@ -146,7 +147,7 @@ impl<'a> ApplyState<'a> {
         let mut next_row_id = current_manifest
             .uses_stable_row_ids()
             .then_some(current_manifest.next_row_id);
-        self.assign_row_ids_to_minted_fragments(&mut next_row_id, new_version)?;
+        self.assign_row_ids_to_new_fragments(&mut next_row_id, new_version)?;
 
         let ApplyState {
             schema,
@@ -253,7 +254,7 @@ impl<'a> ApplyState<'a> {
         if self.fragments.len() == before {
             return false;
         }
-        self.minted_fragments.remove(&fragment_id);
+        self.new_fragments.remove(&fragment_id);
         self.rebound_fields.remove(&fragment_id);
         true
     }
@@ -265,7 +266,7 @@ impl<'a> ApplyState<'a> {
         self.schema.fields.clear();
         self.schema.metadata.clear();
         self.fragments.clear();
-        self.minted_fragments.clear();
+        self.new_fragments.clear();
         self.rebound_fields.clear();
         self.reset = true;
     }
@@ -282,14 +283,47 @@ impl<'a> ApplyState<'a> {
         self.new_bases.push(base);
     }
 
-    pub(super) fn mint_fragment(&mut self, token: u32) -> Result<u64> {
+    /// The id to add a new fragment at: minted off the counter for a local
+    /// token, or claimed out of a reservation for a committed id.
+    pub(super) fn add_fragment_id(&mut self, reference: Ref) -> Result<u64> {
+        match reference {
+            Ref::Local(token) => self.mint_fragment(token),
+            Ref::Committed(id) => self.claim_reserved_fragment_id(id),
+        }
+    }
+
+    fn mint_fragment(&mut self, token: u32) -> Result<u64> {
         if self.fragment_tokens.contains_key(&token) {
             return Err(duplicate_token_err("fragment", token));
         }
         let id = self.next_fragment_id;
         self.next_fragment_id += 1;
         self.fragment_tokens.insert(token, id);
-        self.minted_fragments.insert(id);
+        self.new_fragments.insert(id);
+        Ok(id)
+    }
+
+    /// Claim an id an earlier commit set aside with
+    /// [`ReserveFragmentIds`](super::ReserveFragmentIds).
+    ///
+    /// Only ids already below the counter can be claimed. Anything at or above
+    /// it is an id a later mint would hand out again, so a writer that guessed
+    /// rather than reserved is rejected here instead of colliding later.
+    fn claim_reserved_fragment_id(&mut self, id: u64) -> Result<u64> {
+        if id >= self.next_fragment_id {
+            return Err(Error::invalid_input(format!(
+                "AddFragment adds a fragment at id {id}, which no commit has reserved: only ids \
+                 below {} are reserved. Reserve a range with ReserveFragmentIds and read the \
+                 committed manifest's high-water mark back before naming an id.",
+                self.next_fragment_id
+            )));
+        }
+        if self.fragments.iter().any(|fragment| fragment.id == id) {
+            return Err(Error::invalid_input(format!(
+                "AddFragment adds a fragment at id {id}, which already exists"
+            )));
+        }
+        self.new_fragments.insert(id);
         Ok(id)
     }
 
@@ -379,7 +413,7 @@ impl<'a> ApplyState<'a> {
 
     /// Stamp row ids and version metadata onto the fragments this operation
     /// minted, matching what an Append does for its new fragments.
-    fn assign_row_ids_to_minted_fragments(
+    fn assign_row_ids_to_new_fragments(
         &mut self,
         next_row_id: &mut Option<u64>,
         new_version: u64,
@@ -387,7 +421,7 @@ impl<'a> ApplyState<'a> {
         let Some(next_row_id) = next_row_id.as_mut() else {
             return Ok(());
         };
-        let minted_ids = std::mem::take(&mut self.minted_fragments);
+        let minted_ids = std::mem::take(&mut self.new_fragments);
         // The manifest assembly sorts fragments by id, so partitioning them here
         // does not disturb the final order.
         let (mut minted, existing): (Vec<Fragment>, Vec<Fragment>) = self
@@ -410,7 +444,7 @@ impl<'a> ApplyState<'a> {
 
         self.fragments = existing;
         self.fragments.extend(minted);
-        self.minted_fragments = minted_ids;
+        self.new_fragments = minted_ids;
         Ok(())
     }
 }
@@ -475,7 +509,7 @@ mod tests {
                 def: added_field("added"),
             }),
             Action::AddFragment(AddFragment {
-                local: 0,
+                id: Ref::Local(0),
                 physical_rows: 10,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,

@@ -251,9 +251,9 @@ mod tests {
         )]))
     }
 
-    fn add_fragment(local: u32) -> Action {
+    fn add_fragment(id: Ref) -> Action {
         Action::AddFragment(AddFragment {
-            local,
+            id,
             physical_rows: 10,
             row_id_meta: None,
             last_updated_at_version_meta: None,
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn test_minting_actions_write_nothing() {
         let minting = footprint(vec![
-            add_fragment(0),
+            add_fragment(Ref::Local(0)),
             Action::AddField(AddField {
                 local: 1,
                 parent: None,
@@ -400,6 +400,23 @@ mod tests {
         vec![add_base(0, "a", "s3://bucket/one")],
         vec![add_base(0, "b", "s3://bucket/two")],
         false,
+    )]
+    // A reservation is meant to be one writer's alone, but nothing in the
+    // format enforces that, so claiming a reserved id has to be a write.
+    #[case::the_same_reserved_fragment_id(
+        vec![add_fragment(Ref::Committed(1))],
+        vec![add_fragment(Ref::Committed(1))],
+        true,
+    )]
+    #[case::different_reserved_fragment_ids(
+        vec![add_fragment(Ref::Committed(1))],
+        vec![add_fragment(Ref::Committed(2))],
+        false,
+    )]
+    #[case::claiming_a_reserved_id_a_concurrent_set_removes(
+        vec![add_fragment(Ref::Committed(1))],
+        vec![remove_fragment(1)],
+        true,
     )]
     fn test_conflicts(
         #[case] ours: Vec<Action>,

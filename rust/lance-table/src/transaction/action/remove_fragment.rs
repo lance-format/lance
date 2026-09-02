@@ -89,7 +89,7 @@ mod tests {
             &backed_manifest(),
             vec![
                 Action::AddFragment(AddFragment {
-                    local: 0,
+                    id: Ref::Local(0),
                     physical_rows: 10,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,

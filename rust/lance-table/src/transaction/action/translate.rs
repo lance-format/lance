@@ -90,7 +90,7 @@ fn append_actions(fragments: &[Fragment]) -> Result<Vec<Action>> {
         }
 
         actions.push(Action::AddFragment(AddFragment {
-            local,
+            id: Ref::Local(local),
             physical_rows: physical_rows as u64,
             row_id_meta: fragment.row_id_meta.clone(),
             last_updated_at_version_meta: fragment.last_updated_at_version_meta.clone(),

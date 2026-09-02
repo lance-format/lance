@@ -1,25 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Mint a new, empty fragment.
+//! Add a new, empty fragment.
 
-use super::Footprint;
 use super::apply::ApplyState;
-use super::proto::{data_change_from_wire, data_change_to_wire};
+use super::proto::{data_change_from_wire, data_change_to_wire, required};
+use super::{Coordinate, Footprint, Ref};
 use crate::format::{ExternalFile, Fragment, RowIdMeta, pb};
 use crate::rowids::version::RowDatasetVersionMeta;
 use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 
-/// Mint a new, empty fragment.
+/// Add a new, empty fragment.
 ///
 /// Its data files arrive via [`AddDataFile`](super::AddDataFile) actions naming
-/// this fragment's local token. A freshly-minted fragment has no deletion
+/// this fragment by the same [`Ref`]. A newly added fragment has no deletion
 /// vector: it has no committed rows to delete yet.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AddFragment {
-    /// Token standing in for the fragment id until it is allocated at apply.
-    pub local: u32,
+    /// The id to add the fragment at.
+    ///
+    /// [`Ref::Local`] is the usual form: a token standing in for an id
+    /// allocated at apply, which re-allocates when the operation is replayed
+    /// onto a newer version.
+    ///
+    /// [`Ref::Committed`] names an id out of a range an earlier commit reserved
+    /// with [`ReserveFragmentIds`](super::ReserveFragmentIds). It exists for a
+    /// writer that has to know the id before it commits, because it bakes row
+    /// addresses into an index it writes in the same commit. Such an id is the
+    /// writer's alone and stays valid at every later version, so it does not
+    /// move under replay -- but it is also not the writer's to choose freely:
+    /// apply rejects an id that is not reserved or is already in use.
+    pub id: Ref,
     /// Physical rows in the fragment, including rows later tombstoned.
     pub physical_rows: u64,
     /// Stable row id sequence. `None` on datasets without stable row ids, and
@@ -42,7 +54,7 @@ pub struct AddFragment {
 
 impl AddFragment {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        let id = state.mint_fragment(self.local)?;
+        let id = state.add_fragment_id(self.id)?;
         state.push_fragment(Fragment {
             id,
             files: Vec::new(),
@@ -60,9 +72,18 @@ impl AddFragment {
         self.data_change
     }
 
-    /// Nothing: the fragment does not exist in the read version, so no
-    /// concurrent writer can be naming it.
-    pub(super) fn footprint(&self, _footprint: &mut Footprint) {}
+    /// Nothing for a local token: the fragment does not exist in the read
+    /// version, so no concurrent writer can be naming it.
+    ///
+    /// A committed id does write one coordinate. A reservation is meant to be
+    /// one writer's alone, but nothing in the format enforces that, so two
+    /// operations handed the same range would otherwise each add a fragment at
+    /// the same id and the second commit would silently win.
+    pub(super) fn footprint(&self, footprint: &mut Footprint) {
+        if let Some(id) = self.id.committed() {
+            footprint.add(Coordinate::FragmentExistence(id));
+        }
+    }
 }
 
 fn external_file_to_wire(file: &ExternalFile) -> pb::ExternalFile {
@@ -84,7 +105,7 @@ fn external_file_from_wire(file: pb::ExternalFile) -> ExternalFile {
 impl From<&AddFragment> for pb::AddFragment {
     fn from(value: &AddFragment) -> Self {
         Self {
-            local: value.local,
+            id: Some(value.id.into()),
             physical_rows: value.physical_rows,
             row_id_sequence: value.row_id_meta.as_ref().map(|meta| match meta {
                 RowIdMeta::Inline(data) => {
@@ -134,7 +155,7 @@ impl TryFrom<pb::AddFragment> for AddFragment {
 
     fn try_from(message: pb::AddFragment) -> Result<Self> {
         Ok(Self {
-            local: message.local,
+            id: required(message.id, "AddFragment.id")?.try_into()?,
             physical_rows: message.physical_rows,
             row_id_meta: message.row_id_sequence.map(|sequence| match sequence {
                 pb::add_fragment::RowIdSequence::InlineRowIds(data) => {
@@ -176,9 +197,20 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::transaction::action::test_support::apply;
-    use crate::transaction::action::{Action, AddDataFile, Ref};
+    use crate::transaction::action::{Action, AddDataFile, ReserveFragmentIds};
     use crate::transaction::test_support::sample_manifest;
     use lance_file::version::ConcreteFileVersion;
+
+    fn add_fragment(id: Ref) -> Action {
+        Action::AddFragment(AddFragment {
+            id,
+            physical_rows: 10,
+            row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        })
+    }
 
     #[test]
     fn test_add_fragment_and_data_file_mint_ids() {
@@ -187,7 +219,7 @@ mod tests {
             &manifest,
             vec![
                 Action::AddFragment(AddFragment {
-                    local: 0,
+                    id: Ref::Local(0),
                     physical_rows: 10,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
@@ -215,5 +247,90 @@ mod tests {
         // The file's field list is stamped in from the action's refs.
         assert_eq!(minted.files[0].fields.as_ref(), &[0]);
         assert_eq!(next.max_fragment_id(), Some(1));
+    }
+
+    #[test]
+    fn test_a_fragment_can_be_added_at_a_reserved_id() {
+        // What a writer that needs the id up front does: reserve in one commit,
+        // read the high-water mark back, then name the id in the next.
+        let reserved = apply(
+            &sample_manifest(),
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+        )
+        .unwrap();
+        assert_eq!(reserved.max_fragment_id(), Some(2));
+
+        let next = apply(&reserved, vec![add_fragment(Ref::Committed(1))]).unwrap();
+
+        assert_eq!(
+            next.fragments.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        // The rest of the reservation stays reserved: the high-water mark does
+        // not fall back to the ids actually in use.
+        assert_eq!(next.max_fragment_id(), Some(2));
+    }
+
+    #[test]
+    fn test_an_unreserved_id_is_rejected() {
+        // sample_manifest holds fragment 0 and nothing is reserved, so 1 is the
+        // next id a mint would hand out -- claiming it would collide.
+        let error = apply(&sample_manifest(), vec![add_fragment(Ref::Committed(1))]).unwrap_err();
+
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("no commit has reserved"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_an_id_already_in_use_is_rejected() {
+        let reserved = apply(
+            &sample_manifest(),
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+        )
+        .unwrap();
+
+        // Reserved, but claimed twice in the one operation.
+        let error = apply(
+            &reserved,
+            vec![
+                add_fragment(Ref::Committed(1)),
+                add_fragment(Ref::Committed(1)),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("already exists"), "{error}");
+    }
+
+    #[test]
+    fn test_a_reserved_id_can_back_a_data_file_in_the_same_operation() {
+        let reserved = apply(
+            &sample_manifest(),
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 })],
+        )
+        .unwrap();
+
+        let next = apply(
+            &reserved,
+            vec![
+                add_fragment(Ref::Committed(1)),
+                Action::AddDataFile(AddDataFile {
+                    // The same reference the AddFragment carried, so a writer
+                    // does not need a local token alongside the reserved id.
+                    fragment: Ref::Committed(1),
+                    file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                    field_ids: vec![Ref::Committed(0)],
+                    data_change: true,
+                }),
+            ],
+        )
+        .unwrap();
+
+        let added = next.fragments.iter().find(|f| f.id == 1).unwrap();
+        assert_eq!(added.files.len(), 1);
+        assert_eq!(added.files[0].fields.as_ref(), &[0]);
     }
 }
