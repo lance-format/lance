@@ -111,7 +111,7 @@ mod tests {
                     def: added_field("fresh"),
                 }),
                 Action::AddFragment(AddFragment {
-                    local: 0,
+                    id: Ref::Local(0),
                     physical_rows: 4,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
@@ -153,7 +153,7 @@ mod tests {
         // preempted: its rows would either vanish or survive the reset
         // depending on which commit landed first.
         let append = footprint(vec![Action::AddFragment(AddFragment {
-            local: 0,
+            id: Ref::Local(0),
             physical_rows: 4,
             row_id_meta: None,
             last_updated_at_version_meta: None,
