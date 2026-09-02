@@ -45,6 +45,16 @@ package lance.table;
  *    coordinates (a fragment's deletion vector, a config key); their target is
  *    unambiguous, so they may safely carry a post-image at rest.
  *
+ *    The exception is a writer that has to know an id *before* it commits,
+ *    because it bakes that id into a file it writes in the same commit — an
+ *    index whose payload holds row addresses or row ids cannot be written
+ *    against a `Local` token. Such a writer takes ids from a range an earlier
+ *    commit reserved (`ReserveFragmentIds`) and names them as
+ *    `Committed`. The reservation is what makes that safe: the ids are the
+ *    writer's alone, so they stay valid at every later version and nothing has
+ *    to be re-resolved when the operation is replayed. It costs an extra
+ *    commit, which is why it is the exception and not the rule.
+ *
  * 3. One reference type, `Ref = Committed | Local`. `Committed` is a concrete,
  *    already-assigned id. `Local` is a placeholder minted by an earlier `Add*`
  *    action in the same operation. `Local` resolves to a freshly-allocated
@@ -190,16 +200,26 @@ message Action {
 }
 
 /*
- * Mint a new, empty fragment.
+ * Add a new, empty fragment.
  *
- * Its data files arrive via AddDataFile actions referencing this fragment's
- * `local` token. A freshly-minted fragment has no deletion vector; deletions
- * are applied by a later operation via SetDeletionFile, once the fragment has a
- * committed id.
+ * Its data files arrive via AddDataFile actions referencing this fragment by
+ * the same `id`. A newly added fragment has no deletion vector; deletions are
+ * applied by a later operation via SetDeletionFile.
  */
 message AddFragment {
-  // Placeholder token for the fragment id, resolved to a committed id at apply.
-  uint32 local = 1;
+  /*
+   * The id to add the fragment at.
+   *
+   * Local is the usual form: a placeholder token resolved to a freshly
+   * allocated id at apply. Committed names an id out of a range an earlier
+   * commit reserved with ReserveFragmentIds, for a writer that must know the
+   * fragment's id before committing (see rationale 2); apply rejects an id
+   * that is not reserved or is already in use.
+   *
+   * AddField and AddBase have no Committed form, because no reservation
+   * mechanism exists for field or base ids.
+   */
+  Ref id = 1;
   // Number of physical rows (including rows later tombstoned).
   uint64 physical_rows = 2;
   /*

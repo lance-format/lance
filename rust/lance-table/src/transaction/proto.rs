@@ -898,7 +898,9 @@ mod tests {
                         description: "append batch".to_string(),
                         actions: vec![pb::Action {
                             action: Some(pb::action::Action::AddFragment(pb::AddFragment {
-                                local: 0,
+                                id: Some(pb::Ref {
+                                    kind: Some(pb::r#ref::Kind::Local(0)),
+                                }),
                                 physical_rows: 1,
                                 data_change: Some(true),
                                 ..Default::default()
