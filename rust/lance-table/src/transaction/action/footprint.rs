@@ -268,9 +268,9 @@ mod tests {
         )]))
     }
 
-    fn add_fragment(local: u32) -> Action {
+    fn add_fragment(id: Ref) -> Action {
         Action::AddFragment(AddFragment {
-            local,
+            id,
             physical_rows: 10,
             row_id_meta: None,
             last_updated_at_version_meta: None,
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn test_minting_actions_write_nothing() {
         let minting = footprint(vec![
-            add_fragment(0),
+            add_fragment(Ref::Local(0)),
             Action::AddField(AddField {
                 local: 1,
                 parent: None,
@@ -409,13 +409,13 @@ mod tests {
     // under it would leave the new fragment holding data for a field the
     // manifest no longer has.
     #[case::dropping_a_field_a_concurrent_append_writes_data_for(
-        vec![Action::DropField(DropField { field: 1 })],
-        vec![add_fragment(0), add_data_file(Ref::Local(0), &[1])],
+        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
         true,
     )]
     #[case::dropping_a_field_a_concurrent_append_does_not_write(
-        vec![Action::DropField(DropField { field: 1 })],
-        vec![add_fragment(0), add_data_file(Ref::Local(0), &[2])],
+        vec![Action::DropField(DropField { field: Ref::Committed(1) })],
+        vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[2])],
         false,
     )]
     #[case::bases_with_the_same_name(
@@ -432,6 +432,23 @@ mod tests {
         vec![add_base(0, "a", "s3://bucket/one")],
         vec![add_base(0, "b", "s3://bucket/two")],
         false,
+    )]
+    // A reservation is meant to be one writer's alone, but nothing in the
+    // format enforces that, so claiming a reserved id has to be a write.
+    #[case::the_same_reserved_fragment_id(
+        vec![add_fragment(Ref::Committed(1))],
+        vec![add_fragment(Ref::Committed(1))],
+        true,
+    )]
+    #[case::different_reserved_fragment_ids(
+        vec![add_fragment(Ref::Committed(1))],
+        vec![add_fragment(Ref::Committed(2))],
+        false,
+    )]
+    #[case::claiming_a_reserved_id_a_concurrent_set_removes(
+        vec![add_fragment(Ref::Committed(1))],
+        vec![remove_fragment(1)],
+        true,
     )]
     fn test_conflicts(
         #[case] ours: Vec<Action>,
