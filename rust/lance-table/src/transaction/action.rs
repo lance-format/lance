@@ -60,6 +60,7 @@ macro_rules! for_each_action {
             AlterField,
             DropField,
             ReserveFragmentIds,
+            ReserveRowIds,
             ResetTable,
             ConfigUpdate,
         }
@@ -78,6 +79,7 @@ mod footprint;
 mod proto;
 mod remove_fragment;
 mod reserve_fragment_ids;
+mod reserve_row_ids;
 mod reset_table;
 mod set_deletion_file;
 mod tombstone_field_data;
@@ -96,6 +98,7 @@ pub use drop_field::DropField;
 pub use footprint::{ConfigMap, Coordinate, Footprint};
 pub use remove_fragment::RemoveFragment;
 pub use reserve_fragment_ids::ReserveFragmentIds;
+pub use reserve_row_ids::ReserveRowIds;
 pub use reset_table::ResetTable;
 pub use set_deletion_file::SetDeletionFile;
 pub use tombstone_field_data::TombstoneFieldData;

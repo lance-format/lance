@@ -151,8 +151,8 @@ mod tests {
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
         AddBase, AddDataFile, AddField, AddFragment, AlterField, ConfigUpdate, DropField,
-        FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds, ResetTable, SetDeletionFile,
-        TombstoneFieldData,
+        FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds, ReserveRowIds, ResetTable,
+        SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::Field;
@@ -220,6 +220,7 @@ mod tests {
                 field: Ref::Committed(3),
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
+            Action::ReserveRowIds(ReserveRowIds { count: 40 }),
             Action::ResetTable(ResetTable),
             Action::ConfigUpdate(ConfigUpdate {
                 config: Some(UpdateMap {

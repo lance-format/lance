@@ -1417,9 +1417,11 @@ mod composite {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_table::format::DataFile;
+    use lance_table::format::RowIdMeta;
+    use lance_table::rowids::{RowIdSequence, write_row_ids};
     use lance_table::transaction::action::{
         Action, AddDataFile, AddField, AddFragment, CompositeOperation, DropField, Ref,
-        TombstoneFieldData, UserAction,
+        ReserveFragmentIds, ReserveRowIds, TombstoneFieldData, UserAction,
     };
     use lance_table::transaction::{Operation, Transaction};
 
@@ -1636,6 +1638,64 @@ mod composite {
             );
             assert!(fragment.created_at_version_meta.is_some());
         }
+    }
+
+    /// The flow a writer needs when it has to know ids before it commits --
+    /// because it is baking them into an index it writes in the same commit as
+    /// the data. One reservation commit, then one commit carrying both.
+    #[tokio::test]
+    async fn test_a_reservation_lets_a_later_commit_name_its_ids() {
+        let dataset = test_dataset(true).await;
+        let file = existing_data_file(&dataset, 0);
+        assert_eq!(dataset.manifest.max_fragment_id, Some(1));
+        assert_eq!(dataset.manifest.next_row_id, 10);
+
+        let reserved = commit(
+            dataset,
+            vec![
+                Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 }),
+                Action::ReserveRowIds(ReserveRowIds { count: 5 }),
+            ],
+        )
+        .await;
+
+        // The writer reads its range off the committed high-water marks: one
+        // fragment id ending at 2, and five row ids ending at 15.
+        assert_eq!(reserved.manifest.max_fragment_id, Some(2));
+        assert_eq!(reserved.manifest.next_row_id, 15);
+
+        let written = commit(
+            reserved,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Committed(2),
+                    physical_rows: 5,
+                    row_id_meta: Some(RowIdMeta::Inline(
+                        write_row_ids(&RowIdSequence::from(10u64..15)).into(),
+                    )),
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(2),
+                    file,
+                    field_ids: vec![Ref::Committed(0)],
+                    data_change: true,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            written.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // Both reservations were consumed rather than added to: the fragment
+        // landed on the id it named, and the rows kept the ids they arrived
+        // with instead of being numbered again.
+        assert_eq!(written.manifest.max_fragment_id, Some(2));
+        assert_eq!(written.manifest.next_row_id, 15);
     }
 
     #[tokio::test]

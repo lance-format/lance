@@ -10,12 +10,17 @@
 //! Replaying the same action set against a different version therefore produces
 //! different ids without any of the actions changing.
 //!
+//! An action naming an id an earlier commit reserved is the exception: that id
+//! is already allocated, so apply checks the claim rather than making one, and
+//! replay leaves it alone.
+//!
 //! [`ApplyState`] is that working copy, and its methods are the API the action
 //! modules program against. What each action does with it lives in that action's
 //! own module.
 
 use super::{CompositeOperation, Ref};
-use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig};
+use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta};
+use crate::rowids::read_row_ids;
 use crate::rowids::version::build_version_meta;
 use crate::transaction::Transaction;
 use lance_core::datatypes::Schema;
@@ -96,6 +101,11 @@ pub(super) struct ApplyState<'a> {
     /// infer it from the fragment list.
     reserved_fragment_ids: Option<u64>,
 
+    /// How many row ids this operation reserved for a later writer. Taken off
+    /// the counter after this operation's own fragments are numbered, so the
+    /// reserved range is always the top `count` ids of the resulting watermark.
+    reserved_row_ids: u64,
+
     /// Fields whose backing data changed, per fragment. An index covering such
     /// a field no longer describes that fragment's contents.
     rebound_fields: HashMap<u64, HashSet<i32>>,
@@ -128,6 +138,7 @@ impl<'a> ApplyState<'a> {
             base_tokens: HashMap::new(),
             new_fragments: HashSet::new(),
             reserved_fragment_ids: None,
+            reserved_row_ids: 0,
             rebound_fields: HashMap::new(),
             reset: false,
         }
@@ -148,6 +159,7 @@ impl<'a> ApplyState<'a> {
             .uses_stable_row_ids()
             .then_some(current_manifest.next_row_id);
         self.assign_row_ids_to_new_fragments(&mut next_row_id, new_version)?;
+        self.take_row_id_reservation(&mut next_row_id)?;
 
         let ApplyState {
             schema,
@@ -338,6 +350,12 @@ impl<'a> ApplyState<'a> {
         self.reserved_fragment_ids = Some(self.next_fragment_id - 1);
     }
 
+    /// Set `count` row ids aside for a later writer, on top of any this
+    /// operation already reserved.
+    pub(super) fn reserve_row_ids(&mut self, count: u64) {
+        self.reserved_row_ids += count;
+    }
+
     pub(super) fn mint_field(&mut self, token: u32) -> Result<i32> {
         if self.field_tokens.contains_key(&token) {
             return Err(duplicate_token_err("field", token));
@@ -421,6 +439,7 @@ impl<'a> ApplyState<'a> {
         let Some(next_row_id) = next_row_id.as_mut() else {
             return Ok(());
         };
+        self.validate_supplied_row_ids(*next_row_id)?;
         let minted_ids = std::mem::take(&mut self.new_fragments);
         // The manifest assembly sorts fragments by id, so partitioning them here
         // does not disturb the final order.
@@ -445,6 +464,65 @@ impl<'a> ApplyState<'a> {
         self.fragments = existing;
         self.fragments.extend(minted);
         self.new_fragments = minted_ids;
+        Ok(())
+    }
+
+    /// Reject row ids a new fragment arrived with that no commit reserved.
+    ///
+    /// [`Transaction::assign_row_ids`] honors a sequence a fragment carries and
+    /// leaves the counter where it found it, which is right for a compaction:
+    /// its rows keep ids that are already below the watermark. A writer
+    /// supplying *fresh* ids must have set them aside with
+    /// [`ReserveRowIds`](super::ReserveRowIds), which moved the watermark past
+    /// them. An id at or above the watermark was never reserved, and the next
+    /// append would hand it out a second time.
+    fn validate_supplied_row_ids(&self, next_row_id: u64) -> Result<()> {
+        for fragment in &self.fragments {
+            if !self.new_fragments.contains(&fragment.id) {
+                continue;
+            }
+            // An external sequence lives in a file, which this synchronous path
+            // has no way to read; it goes unchecked.
+            let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
+                continue;
+            };
+            let Some(range) = read_row_ids(data)?.row_id_range() else {
+                continue;
+            };
+            if *range.end() >= next_row_id {
+                return Err(Error::invalid_input(format!(
+                    "fragment {} is added carrying row id {}, which no commit has reserved: \
+                     only ids below {next_row_id} are reserved. Reserve a range with \
+                     ReserveRowIds and read the committed manifest's next_row_id back before \
+                     supplying row ids.",
+                    fragment.id,
+                    range.end()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Take this operation's row id reservation off the counter, after its own
+    /// fragments have been numbered, so the reserved range is always the top
+    /// `count` ids of the committed watermark.
+    fn take_row_id_reservation(&self, next_row_id: &mut Option<u64>) -> Result<()> {
+        if self.reserved_row_ids == 0 {
+            return Ok(());
+        }
+        let Some(next_row_id) = next_row_id.as_mut() else {
+            return Err(Error::invalid_input(
+                "ReserveRowIds needs a row id counter to reserve from, and this dataset does \
+                 not use stable row ids",
+            ));
+        };
+        let current = *next_row_id;
+        *next_row_id = current.checked_add(self.reserved_row_ids).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "reserving {} row ids overflows the row id counter at {current}",
+                self.reserved_row_ids
+            ))
+        })?;
         Ok(())
     }
 }
