@@ -134,9 +134,9 @@ pub(super) fn resolve_update_version_metadata(
     for fragment in new_fragments.iter_mut() {
         let row_ids = match &fragment.row_id_meta {
             Some(RowIdMeta::Inline(data)) => read_row_ids(data).ok(),
-            Some(RowIdMeta::External(_)) => {
+            Some(RowIdMeta::External(_) | RowIdMeta::Column(_)) => {
                 log::warn!(
-                    "Fragment {} has external row ID metadata; \
+                    "Fragment {} holds its row ID sequence outside the manifest; \
                      version tracking will use defaults",
                     fragment.id,
                 );
