@@ -49,7 +49,7 @@ package lance.table;
  *    because it bakes that id into a file it writes in the same commit — an
  *    index whose payload holds row addresses or row ids cannot be written
  *    against a `Local` token. Such a writer takes ids from a range an earlier
- *    commit reserved (`ReserveFragmentIds`) and names them as
+ *    commit reserved (`ReserveFragmentIds`, `ReserveRowIds`) and names them as
  *    `Committed`. The reservation is what makes that safe: the ids are the
  *    writer's alone, so they stay valid at every later version and nothing has
  *    to be re-resolved when the operation is replayed. It costs an extra
@@ -194,6 +194,7 @@ message Action {
     // -- Wholesale-within-operation --
     ResetTable reset_table = 17;
     ReserveFragmentIds reserve_fragment_ids = 18;
+    ReserveRowIds reserve_row_ids = 20;
     // -- Assertions (preconditions, not deltas) --
     AssertUniqueKeys assert_unique_keys = 19;
   }
@@ -540,6 +541,27 @@ message ResetTable {}
  */
 message ReserveFragmentIds {
   uint32 count = 1;
+}
+
+/*
+ * Reserve a contiguous range of stable row ids from the counter, for a later
+ * writer to populate.
+ *
+ * The counterpart of ReserveFragmentIds for the row id space, and needed
+ * alongside it: reserving a fragment id fixes the high half of a row address,
+ * but on a dataset with stable row ids an index records row ids instead, and
+ * those come off their own counter.
+ *
+ * The reserved range is the `count` ids ending at the committed manifest's
+ * next_row_id, so the reserving writer learns which ids it got by reading that
+ * back. A fragment written against the range carries those ids in its row id
+ * sequence, which apply then leaves as it finds them.
+ *
+ * An error on a dataset that does not use stable row ids, which has no row id
+ * counter to reserve from.
+ */
+message ReserveRowIds {
+  uint64 count = 1;
 }
 
 /*
