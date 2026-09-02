@@ -171,6 +171,42 @@ fn bench_inverted(c: &mut Criterion) {
         }
         queries.push(Arc::new(Tokens::new(query_tokens, DocType::Text)));
     }
+    // Keep a small, verified set of in-vocabulary conjunctions whose final
+    // cardinality is below k. Every query comes from one indexed document, so
+    // it has at least one hit; using 15 distinct terms makes the conjunction
+    // selective without exercising the cheaper missing-token fast path.
+    const UNDERFILLED_QUERY_SET_SIZE: usize = 64;
+    let underfilled_and_queries = doc_col
+        .iter()
+        .flatten()
+        .filter_map(|doc| {
+            let tokens = doc
+                .split_whitespace()
+                .unique()
+                .take(TOKENS_PER_QUERY)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if tokens.len() != TOKENS_PER_QUERY {
+                return None;
+            }
+            let query = Arc::new(Tokens::new(tokens, DocType::Text));
+            let num_hits = rt
+                .block_on(invert_index.bm25_search(
+                    query.clone(),
+                    params.clone().into(),
+                    Operator::And,
+                    no_filter.clone(),
+                    Arc::new(NoOpMetricsCollector),
+                    None,
+                ))
+                .unwrap()
+                .0
+                .len();
+            (1..10).contains(&num_hits).then_some(query)
+        })
+        .take(UNDERFILLED_QUERY_SET_SIZE)
+        .collect::<Vec<_>>();
+    assert_eq!(underfilled_and_queries.len(), UNDERFILLED_QUERY_SET_SIZE);
     let mut query_idx = 0usize;
 
     c.bench_function(format!("invert_search({TOTAL})").as_str(), |b| {
@@ -198,6 +234,37 @@ fn bench_inverted(c: &mut Criterion) {
             }
         })
     });
+
+    let mut underfilled_and_query_idx = 0usize;
+    c.bench_function(
+        format!("invert_underfilled_and_search({TOTAL})").as_str(),
+        |b| {
+            b.to_async(&rt).iter(|| {
+                let query = underfilled_and_queries
+                    [underfilled_and_query_idx % underfilled_and_queries.len()]
+                .clone();
+                underfilled_and_query_idx = underfilled_and_query_idx.wrapping_add(1);
+                let invert_index = invert_index.clone();
+                let params = params.clone();
+                let no_filter = no_filter.clone();
+                async move {
+                    black_box(
+                        invert_index
+                            .bm25_search(
+                                query,
+                                params.into(),
+                                Operator::And,
+                                no_filter,
+                                Arc::new(NoOpMetricsCollector),
+                                None,
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                }
+            })
+        },
+    );
 
     let phrase_params = FtsSearchParams::new()
         .with_limit(Some(10))

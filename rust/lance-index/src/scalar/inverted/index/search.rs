@@ -739,10 +739,10 @@ impl InvertedIndex {
         }
         // For new-format indexes, aggregate_corpus_stats reads corpus stats from
         // persisted schema metadata (O(1)) without loading doc lengths as a side
-        // effect. Pre-load lengths in parallel now for partitions that contain at
-        // least one query token, so the scoring phase gets cache hits instead of
-        // issuing sequential per-partition IO.  Partitions with no matching terms
-        // are skipped to preserve the no-load optimization for no-hit queries.
+        // effect. Pre-load lengths in parallel now only for partitions whose
+        // dictionaries can satisfy the query leaf, so required-token misses avoid
+        // reading the full length column. The scoring phase then gets cache hits
+        // instead of issuing sequential per-partition IO.
         let io_parallelism = self.store.io_parallelism();
         let uncached_lengths = self
             .partitions
@@ -752,9 +752,12 @@ impl InvertedIndex {
                 if docs.cached_lengths().is_some() {
                     return None;
                 }
-                let has_match = (0..request.tokens.len())
-                    .any(|i| part.tokens.get(request.tokens.get_token(i)).is_some());
-                has_match.then_some(async move { docs.lengths().await.map(|_| ()) })
+                part.may_match_tokens(
+                    request.tokens.as_ref(),
+                    request.operator,
+                    request.params.phrase_slop.is_some(),
+                )
+                .then_some(async move { docs.lengths().await.map(|_| ()) })
             })
             .collect::<Vec<_>>();
         if !uncached_lengths.is_empty() {

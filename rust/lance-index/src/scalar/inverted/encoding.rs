@@ -1007,29 +1007,59 @@ pub fn decompress_posting_block(
     frequencies: &mut Vec<u32>,
     block_size: usize,
 ) {
+    let frequency_offset = decompress_posting_block_doc_ids(block, buffer, doc_ids, block_size);
+    decompress_posting_block_frequencies(block, frequency_offset, buffer, frequencies, block_size);
+}
+
+/// Decode only the document-id stream of a full posting block and return the
+/// byte offset at which the frequency stream starts.
+pub(super) fn decompress_posting_block_doc_ids(
+    block: &[u8],
+    buffer: &mut [u32],
+    doc_ids: &mut Vec<u32>,
+    block_size: usize,
+) -> usize {
     debug_assert!(validate_block_size(block_size).is_ok());
     debug_assert!(buffer.len() >= block_size);
-    // skip the block max score prefix (128-doc blocks only)
-    let mut block = &block[posting_block_score_prefix_len(block_size)..];
-    match block_size {
+    let prefix_len = posting_block_score_prefix_len(block_size);
+    let payload = &block[prefix_len..];
+    prefix_len
+        + match block_size {
+            BitPacker4x::BLOCK_LEN => {
+                decompress_sorted_block_with::<BitPacker4x>(payload, buffer, doc_ids)
+            }
+            BitPacker8x::BLOCK_LEN => {
+                decompress_sorted_block_with::<BitPacker8x>(payload, buffer, doc_ids)
+            }
+            _ => unreachable!("validated posting block size should be supported"),
+        }
+}
+
+/// Decode the frequency stream of a full posting block from the offset
+/// returned by [`decompress_posting_block_doc_ids`].
+pub(super) fn decompress_posting_block_frequencies(
+    block: &[u8],
+    frequency_offset: usize,
+    buffer: &mut [u32],
+    frequencies: &mut Vec<u32>,
+    block_size: usize,
+) {
+    debug_assert!(validate_block_size(block_size).is_ok());
+    debug_assert!(buffer.len() >= block_size);
+    let frequency_block = &block[frequency_offset..];
+    let num_bytes = match block_size {
         BitPacker4x::BLOCK_LEN => {
-            let num_bytes = decompress_sorted_block_with::<BitPacker4x>(block, buffer, doc_ids);
-            block = &block[num_bytes..];
-            let num_bytes = decompress_block_with::<BitPacker4x>(block, buffer, frequencies);
-            block = &block[num_bytes..];
+            decompress_block_with::<BitPacker4x>(frequency_block, buffer, frequencies)
         }
         BitPacker8x::BLOCK_LEN => {
-            let num_bytes = decompress_sorted_block_with::<BitPacker8x>(block, buffer, doc_ids);
-            block = &block[num_bytes..];
-            let num_bytes = decompress_pfor_block_with::<BitPacker8x>(block, buffer, frequencies);
-            block = &block[num_bytes..];
+            decompress_pfor_block_with::<BitPacker8x>(frequency_block, buffer, frequencies)
         }
         _ => unreachable!("validated posting block size should be supported"),
-    }
+    };
     debug_assert!(
-        block.is_empty(),
+        frequency_offset + num_bytes == block.len(),
         "posting block has {} trailing bytes after decoding",
-        block.len()
+        block.len().saturating_sub(frequency_offset + num_bytes)
     );
 }
 
@@ -1041,17 +1071,32 @@ pub fn decompress_posting_remainder(
     doc_ids: &mut Vec<u32>,
     frequencies: &mut Vec<u32>,
 ) {
-    let block = &block[posting_block_score_prefix_len(block_size)..];
+    let frequency_offset =
+        decompress_posting_remainder_doc_ids(block, n, codec, block_size, doc_ids);
+    decompress_posting_remainder_frequencies(block, frequency_offset, n, codec, frequencies);
+}
+
+/// Decode only the document-id stream of a posting tail and return the byte
+/// offset at which its frequency stream starts.
+pub(super) fn decompress_posting_remainder_doc_ids(
+    block: &[u8],
+    n: usize,
+    codec: PostingTailCodec,
+    block_size: usize,
+    doc_ids: &mut Vec<u32>,
+) -> usize {
+    let prefix_len = posting_block_score_prefix_len(block_size);
+    let payload = &block[prefix_len..];
     match codec {
         PostingTailCodec::Fixed32 => {
-            decompress_raw_remainder(block, n, doc_ids);
-            decompress_raw_remainder(&block[n * 4..], n, frequencies);
+            decompress_raw_remainder(payload, n, doc_ids);
+            prefix_len + n * 4
         }
         PostingTailCodec::VarintDelta => {
             let mut offset = 0usize;
             let mut previous = 0u32;
             for index in 0..n {
-                let delta = decode_varint_u32(block, &mut offset)
+                let delta = decode_varint_u32(payload, &mut offset)
                     .expect("posting tail doc ids should contain valid varints");
                 let doc_id = if index == 0 {
                     delta
@@ -1063,16 +1108,38 @@ pub fn decompress_posting_remainder(
                 doc_ids.push(doc_id);
                 previous = doc_id;
             }
+            prefix_len + offset
+        }
+    }
+}
+
+/// Decode the frequency stream of a posting tail from the offset returned by
+/// [`decompress_posting_remainder_doc_ids`].
+pub(super) fn decompress_posting_remainder_frequencies(
+    block: &[u8],
+    frequency_offset: usize,
+    n: usize,
+    codec: PostingTailCodec,
+    frequencies: &mut Vec<u32>,
+) {
+    let frequency_block = &block[frequency_offset..];
+    match codec {
+        PostingTailCodec::Fixed32 => {
+            decompress_raw_remainder(frequency_block, n, frequencies);
+            debug_assert_eq!(frequency_offset + n * 4, block.len());
+        }
+        PostingTailCodec::VarintDelta => {
+            let mut offset = 0usize;
             for _ in 0..n {
-                let frequency = decode_varint_u32(block, &mut offset)
+                let frequency = decode_varint_u32(frequency_block, &mut offset)
                     .expect("posting tail frequencies should contain valid varints");
                 frequencies.push(frequency);
             }
             assert_eq!(
-                offset,
+                frequency_offset + offset,
                 block.len(),
                 "posting tail block has {} trailing bytes after decoding",
-                block.len() - offset
+                block.len() - frequency_offset - offset
             );
         }
     }
@@ -1224,6 +1291,77 @@ mod tests {
                 )?;
             assert_eq!(decoded_doc_ids, doc_ids);
             assert_eq!(decoded_frequencies, frequencies);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_posting_doc_ids_and_frequencies_decode_independently() -> Result<()> {
+        for block_size in [BitPacker4x::BLOCK_LEN, BitPacker8x::BLOCK_LEN] {
+            let doc_ids = (0..block_size as u32)
+                .map(|doc| doc * 3)
+                .collect::<Vec<_>>();
+            let frequencies = (0..block_size as u32)
+                .map(|value| value % 17 + 1)
+                .collect::<Vec<_>>();
+            let posting_list = compress_posting_list_with_tail_codec_and_block_size(
+                doc_ids.len(),
+                doc_ids.iter(),
+                frequencies.iter(),
+                std::iter::once(1.0),
+                PostingTailCodec::VarintDelta,
+                block_size,
+            )?;
+            let block = posting_list.value(0);
+            let mut buffer = [0; MAX_POSTING_BLOCK_SIZE];
+            let mut decoded_doc_ids = Vec::new();
+            let frequency_offset = decompress_posting_block_doc_ids(
+                block,
+                &mut buffer,
+                &mut decoded_doc_ids,
+                block_size,
+            );
+            assert_eq!(decoded_doc_ids, doc_ids);
+            let mut decoded_frequencies = Vec::new();
+            decompress_posting_block_frequencies(
+                block,
+                frequency_offset,
+                &mut buffer,
+                &mut decoded_frequencies,
+                block_size,
+            );
+            assert_eq!(decoded_frequencies, frequencies);
+
+            for codec in [PostingTailCodec::Fixed32, PostingTailCodec::VarintDelta] {
+                let tail_doc_ids = vec![2, 9, 27, 81, 82, 120, 511];
+                let tail_frequencies = vec![1, 3, 1, 8, 2, 21, 5];
+                let mut tail = Vec::new();
+                encode_remainder_posting_block_into(
+                    &tail_doc_ids,
+                    &tail_frequencies,
+                    codec,
+                    block_size,
+                    &mut tail,
+                )?;
+                let mut decoded_tail_doc_ids = Vec::new();
+                let frequency_offset = decompress_posting_remainder_doc_ids(
+                    &tail,
+                    tail_doc_ids.len(),
+                    codec,
+                    block_size,
+                    &mut decoded_tail_doc_ids,
+                );
+                assert_eq!(decoded_tail_doc_ids, tail_doc_ids);
+                let mut decoded_tail_frequencies = Vec::new();
+                decompress_posting_remainder_frequencies(
+                    &tail,
+                    frequency_offset,
+                    tail_doc_ids.len(),
+                    codec,
+                    &mut decoded_tail_frequencies,
+                );
+                assert_eq!(decoded_tail_frequencies, tail_frequencies);
+            }
         }
         Ok(())
     }

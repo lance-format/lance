@@ -445,6 +445,30 @@ async fn test_no_hit_partition_does_not_load_document_columns() {
     assert!(scores.is_empty());
     assert!(!documents.lengths_loaded());
     assert!(!documents.projection_loaded());
+
+    let tokens = Arc::new(Tokens::new(
+        vec!["t0".to_owned(), "missing-token".to_owned()],
+        DocType::Text,
+    ));
+    let (row_ids, scores) = index
+        .bm25_search(
+            tokens,
+            Arc::new(FtsSearchParams::new().with_limit(Some(10))),
+            Operator::And,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(row_ids.is_empty());
+    assert!(scores.is_empty());
+    assert!(
+        !documents.lengths_loaded(),
+        "a missing required token must gate the full document-length read"
+    );
+    assert!(!documents.projection_loaded());
 }
 
 #[tokio::test]

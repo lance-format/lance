@@ -33,7 +33,9 @@ use super::{
     builder::ScoredDoc,
     encoding::{
         MAX_POSTING_BLOCK_SIZE, decode_position_stream_block, decompress_positions,
-        decompress_posting_block, decompress_posting_remainder, seek_packed_doc_positions,
+        decompress_posting_block_doc_ids, decompress_posting_block_frequencies,
+        decompress_posting_remainder_doc_ids, decompress_posting_remainder_frequencies,
+        seek_packed_doc_positions,
     },
     query::FtsSearchParams,
     scorer::Scorer,
@@ -434,6 +436,12 @@ struct CompressedState {
     block_idx: usize,
     doc_ids: Vec<u32>,
     freqs: Vec<u32>,
+    frequency_offset: usize,
+    frequency_block_idx: Option<usize>,
+    #[cfg(test)]
+    frequency_blocks_decoded: usize,
+    #[cfg(test)]
+    impact_bound_computations: usize,
     buffer: Box<[u32; MAX_POSTING_BLOCK_SIZE]>,
     position_block_idx: Option<usize>,
     position_values: Vec<u32>,
@@ -462,6 +470,12 @@ impl CompressedState {
             block_idx: 0,
             doc_ids: Vec::with_capacity(block_size),
             freqs: Vec::with_capacity(block_size),
+            frequency_offset: 0,
+            frequency_block_idx: None,
+            #[cfg(test)]
+            frequency_blocks_decoded: 0,
+            #[cfg(test)]
+            impact_bound_computations: 0,
             buffer: Box::new([0; MAX_POSTING_BLOCK_SIZE]),
             position_block_idx: None,
             position_values: Vec::new(),
@@ -478,7 +492,7 @@ impl CompressedState {
     }
 
     #[inline]
-    fn decompress(
+    fn decompress_doc_ids(
         &mut self,
         block: &[u8],
         block_idx: usize,
@@ -489,30 +503,69 @@ impl CompressedState {
     ) {
         self.doc_ids.clear();
         self.freqs.clear();
+        self.frequency_block_idx = None;
 
         let remainder = length as usize % block_size;
-        if block_idx + 1 == num_blocks && remainder != 0 {
-            decompress_posting_remainder(
+        self.frequency_offset = if block_idx + 1 == num_blocks && remainder != 0 {
+            decompress_posting_remainder_doc_ids(
                 block,
                 remainder,
                 tail_codec,
                 block_size,
                 &mut self.doc_ids,
-                &mut self.freqs,
-            );
+            )
         } else {
-            decompress_posting_block(
+            decompress_posting_block_doc_ids(
                 block,
                 &mut self.buffer[..],
                 &mut self.doc_ids,
-                &mut self.freqs,
                 block_size,
-            );
-        }
+            )
+        };
         self.block_idx = block_idx;
         self.position_block_idx = None;
         self.position_values.clear();
         self.position_offsets.clear();
+    }
+
+    #[inline]
+    fn decompress_frequencies(
+        &mut self,
+        block: &[u8],
+        block_idx: usize,
+        num_blocks: usize,
+        length: u32,
+        tail_codec: super::PostingTailCodec,
+        block_size: usize,
+    ) {
+        debug_assert_eq!(self.block_idx, block_idx);
+        if self.frequency_block_idx == Some(block_idx) {
+            return;
+        }
+        self.freqs.clear();
+        let remainder = length as usize % block_size;
+        if block_idx + 1 == num_blocks && remainder != 0 {
+            decompress_posting_remainder_frequencies(
+                block,
+                self.frequency_offset,
+                remainder,
+                tail_codec,
+                &mut self.freqs,
+            );
+        } else {
+            decompress_posting_block_frequencies(
+                block,
+                self.frequency_offset,
+                &mut self.buffer[..],
+                &mut self.freqs,
+                block_size,
+            );
+        }
+        self.frequency_block_idx = Some(block_idx);
+        #[cfg(test)]
+        {
+            self.frequency_blocks_decoded += 1;
+        }
     }
 }
 
@@ -800,10 +853,31 @@ impl PostingIterator {
         list: &CompressedPostingList,
         block_idx: usize,
     ) -> *mut CompressedState {
+        let compressed = unsafe { &mut *self.ensure_compressed_doc_ids_ptr(list, block_idx) };
+        if compressed.frequency_block_idx != Some(block_idx) {
+            let block = list.blocks.value(block_idx);
+            compressed.decompress_frequencies(
+                block,
+                block_idx,
+                list.blocks.len(),
+                list.length,
+                list.posting_tail_codec,
+                list.block_size,
+            );
+        }
+        compressed as *mut CompressedState
+    }
+
+    #[inline]
+    fn ensure_compressed_doc_ids_ptr(
+        &self,
+        list: &CompressedPostingList,
+        block_idx: usize,
+    ) -> *mut CompressedState {
         let compressed = unsafe { &mut *self.compressed_state_ptr() };
         if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
             let block = list.blocks.value(block_idx);
-            compressed.decompress(
+            compressed.decompress_doc_ids(
                 block,
                 block_idx,
                 list.blocks.len(),
@@ -1011,7 +1085,38 @@ impl PostingIterator {
 
     #[inline]
     fn doc(&self) -> Option<DocInfo> {
-        self.current_doc
+        let current_doc = self.current_doc?;
+        match self.list {
+            PostingList::Compressed(ref list) => {
+                if current_doc.frequency() != 0 {
+                    return Some(current_doc);
+                }
+                let block_idx = self.index >> list.block_shift();
+                let block_offset = self.index & list.block_mask();
+                let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+                Some(DocInfo::Raw(RawDocInfo {
+                    doc_id: current_doc.doc_id() as u32,
+                    frequency: compressed.freqs[block_offset],
+                }))
+            }
+            PostingList::Plain(_) => Some(current_doc),
+        }
+    }
+
+    #[cfg(test)]
+    fn frequency_blocks_decoded(&self) -> usize {
+        self.compressed
+            .as_ref()
+            .map(|compressed| unsafe { &*compressed.get() }.frequency_blocks_decoded)
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn impact_bound_computations(&self) -> usize {
+        self.compressed
+            .as_ref()
+            .map(|compressed| unsafe { &*compressed.get() }.impact_bound_computations)
+            .unwrap_or_default()
     }
 
     /// The posting's current local document before it is moved into a scorer.
@@ -1034,12 +1139,16 @@ impl PostingIterator {
             PostingList::Compressed(ref list) => {
                 let block_idx = self.index >> list.block_shift();
                 let block_offset = self.index & list.block_mask();
-                let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+                let compressed =
+                    unsafe { &mut *self.ensure_compressed_doc_ids_ptr(list, block_idx) };
 
-                // Read from the decompressed block
+                // Frequency decoding is deferred until a scoring or position
+                // consumer calls `doc()` / `ensure_compressed_block_ptr`.
                 let doc_id = compressed.doc_ids[block_offset];
-                let frequency = compressed.freqs[block_offset];
-                let doc = DocInfo::Raw(RawDocInfo { doc_id, frequency });
+                let doc = DocInfo::Raw(RawDocInfo {
+                    doc_id,
+                    frequency: 0,
+                });
                 Some(doc)
             }
             PostingList::Plain(ref list) => Some(DocInfo::Located(list.doc(self.index))),
@@ -1239,6 +1348,52 @@ impl PostingIterator {
         }
     }
 
+    /// Move to the next document without materializing its frequency. AND
+    /// intersection uses this until a document survives every required list.
+    fn next_doc_id(&mut self, least_id: u64) {
+        match self.list {
+            PostingList::Compressed(ref list) => {
+                debug_assert!(least_id <= u32::MAX as u64);
+                let least_id = least_id as u32;
+                let shift = list.block_shift();
+                let block_idx = self.block_idx_for_doc(list, self.index >> shift, least_id);
+                self.index = self.index.max(block_idx << shift);
+                let length = list.length as usize;
+                while self.index < length {
+                    let block_idx = self.index >> shift;
+                    let block_offset = self.index & list.block_mask();
+                    let compressed =
+                        unsafe { &mut *self.ensure_compressed_doc_ids_ptr(list, block_idx) };
+                    let in_block = &compressed.doc_ids[block_offset..];
+                    let offset_in_block = in_block.partition_point(|&doc_id| doc_id < least_id);
+                    let new_offset = block_offset + offset_in_block;
+                    if new_offset < compressed.doc_ids.len() {
+                        self.index = (block_idx << shift) + new_offset;
+                        self.block_idx = block_idx;
+                        self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                            doc_id: compressed.doc_ids[new_offset],
+                            frequency: 0,
+                        }));
+                        return;
+                    }
+                    if block_idx + 1 >= list.blocks.len() {
+                        self.index = length;
+                        self.block_idx = self.index >> shift;
+                        self.current_doc = None;
+                        break;
+                    }
+                    self.index = (block_idx + 1) << shift;
+                }
+                self.block_idx = self.index >> shift;
+                self.current_doc = None;
+            }
+            PostingList::Plain(ref list) => {
+                self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
+                self.current_doc = (!self.empty()).then(|| DocInfo::Located(list.doc(self.index)));
+            }
+        }
+    }
+
     fn shallow_next(&mut self, least_id: u64) {
         match self.list {
             PostingList::Compressed(ref list) => {
@@ -1276,6 +1431,10 @@ impl PostingIterator {
             scorer,
             &mut compressed.block_max_window.impact_score_cache,
         );
+        #[cfg(test)]
+        {
+            compressed.impact_bound_computations += 1;
+        }
         compressed.level0_cache = Some((self.block_idx, doc_up_to, score));
         (doc_up_to, score)
     }
@@ -1302,6 +1461,10 @@ impl PostingIterator {
             scorer,
             &mut compressed.block_max_window.impact_score_cache,
         );
+        #[cfg(test)]
+        {
+            compressed.impact_bound_computations += 1;
+        }
         compressed.level1_cache = Some((group_idx, doc_up_to, score));
         (doc_up_to, score)
     }
@@ -1554,7 +1717,7 @@ pub(super) fn validate_modern_posting_doc_ids(
         ))
     })?;
     let mut state = CompressedState::new(list.block_size);
-    state.decompress(
+    state.decompress_doc_ids(
         list.blocks.value(last_block_idx),
         last_block_idx,
         list.blocks.len(),
@@ -2134,7 +2297,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut head = BinaryHeap::new();
         let mut lead = Vec::new();
         for posting in postings {
-            if posting.doc().is_none() {
+            if posting.current_doc_id().is_none() {
                 continue;
             }
             let posting = Box::new(posting);
@@ -3194,45 +3357,43 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             && self
                 .lead
                 .first()
-                .and_then(|posting| posting.doc())
-                .map(|doc| doc.doc_id())
+                .and_then(|posting| posting.current_doc_id())
                 == Some(last_doc)
         {
             let next_target = self.and_advance_target(last_doc + 1);
             if next_target == TERMINATED_DOC_ID {
                 return None;
             }
-            self.lead[0].next(next_target);
+            self.lead[0].next_doc_id(next_target);
         }
 
         'advance_head: loop {
             let doc = self
                 .lead
                 .first()
-                .and_then(|posting| posting.doc())?
-                .doc_id();
+                .and_then(|posting| posting.current_doc_id())?;
             if self.up_to.is_none_or(|up_to| doc > up_to) {
                 let next_target = self.and_advance_target(doc);
                 if next_target == TERMINATED_DOC_ID {
                     return None;
                 }
                 if next_target != doc {
-                    self.lead[0].next(next_target);
+                    self.lead[0].next_doc_id(next_target);
                     continue;
                 }
             }
 
             for posting in self.lead.iter_mut().skip(1) {
-                if posting.doc()?.doc_id() < doc {
-                    posting.next(doc);
+                if posting.current_doc_id()? < doc {
+                    posting.next_doc_id(doc);
                 }
-                let next = posting.doc()?.doc_id();
+                let next = posting.current_doc_id()?;
                 if next > doc {
                     let next_target = self.and_advance_target(next);
                     if next_target == TERMINATED_DOC_ID {
                         return None;
                     }
-                    self.lead[0].next(next_target);
+                    self.lead[0].next_doc_id(next_target);
                     continue 'advance_head;
                 }
             }
@@ -3244,7 +3405,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if next_target == TERMINATED_DOC_ID {
                     return None;
                 }
-                self.lead[0].next(next_target);
+                self.lead[0].next_doc_id(next_target);
                 continue;
             }
 
@@ -3315,7 +3476,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // the clause sup), so every skipped doc would also fail the exact
         // per-candidate prune: results are unchanged, the work never happens.
         macro_rules! merge_kernels {
-            ($name2:ident, $name3:ident, $geq:ident $(, #[$feat:meta])?) => {
+            ($name2:ident, $name3:ident, $docs_name2:ident, $docs_name3:ident, $geq:ident $(, #[$feat:meta])?) => {
                 $(#[$feat])?
                 unsafe fn $name2(
                     wins: &[WindowList],
@@ -3396,13 +3557,88 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         }
                     }
                 }
+
+                $(#[$feat])?
+                unsafe fn $docs_name2(
+                    wins: &[WindowList],
+                    docs_out: &mut Vec<u32>,
+                    offs_out: &mut Vec<u8>,
+                ) {
+                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                    let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
+                    unsafe {
+                        while p0 < e0 {
+                            let doc = *d0.add(p0);
+                            p1 = $geq(d1, p1, e1, doc);
+                            if p1 >= e1 {
+                                return;
+                            }
+                            let second = *d1.add(p1);
+                            if second > doc {
+                                p0 = $geq(d0, p0 + 1, e0, second);
+                                continue;
+                            }
+                            docs_out.push(doc);
+                            offs_out.push(p0 as u8);
+                            offs_out.push(p1 as u8);
+                            p0 += 1;
+                        }
+                    }
+                }
+
+                $(#[$feat])?
+                unsafe fn $docs_name3(
+                    wins: &[WindowList],
+                    docs_out: &mut Vec<u32>,
+                    offs_out: &mut Vec<u8>,
+                ) {
+                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                    let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
+                    let (d2, mut p2, e2) = (wins[2].docs, wins[2].pos, wins[2].end);
+                    unsafe {
+                        'outer: while p0 < e0 {
+                            let doc = *d0.add(p0);
+                            p1 = $geq(d1, p1, e1, doc);
+                            if p1 >= e1 {
+                                return;
+                            }
+                            let second = *d1.add(p1);
+                            if second > doc {
+                                p0 = $geq(d0, p0 + 1, e0, second);
+                                continue 'outer;
+                            }
+                            p2 = $geq(d2, p2, e2, doc);
+                            if p2 >= e2 {
+                                return;
+                            }
+                            let third = *d2.add(p2);
+                            if third > doc {
+                                p0 = $geq(d0, p0 + 1, e0, third);
+                                continue 'outer;
+                            }
+                            docs_out.push(doc);
+                            offs_out.push(p0 as u8);
+                            offs_out.push(p1 as u8);
+                            offs_out.push(p2 as u8);
+                            p0 += 1;
+                        }
+                    }
+                }
             };
         }
-        merge_kernels!(merge_window_2, merge_window_3, find_next_geq_scalar);
+        merge_kernels!(
+            merge_window_2,
+            merge_window_3,
+            merge_window_docs_2,
+            merge_window_docs_3,
+            find_next_geq_scalar
+        );
         #[cfg(target_arch = "x86_64")]
         merge_kernels!(
             merge_window_2_avx2,
             merge_window_3_avx2,
+            merge_window_docs_2_avx2,
+            merge_window_docs_3_avx2,
             find_next_geq_avx2,
             #[target_feature(enable = "avx2")]
         );
@@ -3458,6 +3694,40 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
         }
 
+        #[inline]
+        fn merge_window_docs_n(
+            wins: &[WindowList],
+            cursors: &mut Vec<usize>,
+            docs_out: &mut Vec<u32>,
+            offs_out: &mut Vec<u8>,
+        ) {
+            cursors.clear();
+            cursors.extend(wins.iter().map(|win| win.pos));
+            'outer: while cursors[0] < wins[0].end {
+                let doc = unsafe { *wins[0].docs.add(cursors[0]) };
+                for j in 1..wins.len() {
+                    let win = &wins[j];
+                    let pos = unsafe { find_next_geq(win.docs, cursors[j], win.end, doc) };
+                    cursors[j] = pos;
+                    if pos >= win.end {
+                        return;
+                    }
+                    let clause_doc = unsafe { *win.docs.add(pos) };
+                    if clause_doc > doc {
+                        cursors[0] = unsafe {
+                            find_next_geq(wins[0].docs, cursors[0] + 1, wins[0].end, clause_doc)
+                        };
+                        continue 'outer;
+                    }
+                }
+                docs_out.push(doc);
+                for &pos in cursors.iter() {
+                    offs_out.push(pos as u8);
+                }
+                cursors[0] += 1;
+            }
+        }
+
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons: usize = 0;
         let mut wins: Vec<WindowList> = Vec::with_capacity(num_lists);
@@ -3473,10 +3743,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut cursor_scratch: Vec<usize> = Vec::with_capacity(num_lists);
         // Norm cache: one byte-norm load plus a cached addend replaces the
         // per-clause BM25 denominator recompute in pass B.
-        let norm_k = self.norm_k_cache();
-        let norm_k_ref = norm_k
-            .as_ref()
-            .map(|(norms, cache)| (*norms, cache.as_ref()));
+        let mut norm_k = None;
+        let mut norm_k_initialized = false;
 
         // Per-window prune LUT for the merge kernels: an upper bound of the
         // first (rarest) clause's score by clamped frequency. Lead docs whose
@@ -3488,31 +3756,30 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // stays a valid upper bound. Skips only avoid work; every emitted
         // candidate still goes through the exact per-candidate prune below.
         const FREQ_LUT_BUCKETS: usize = 64;
-        let mut freq_bound_lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
-        for (freq, slot) in freq_bound_lut
-            .iter_mut()
-            .enumerate()
-            .take(FREQ_LUT_BUCKETS - 1)
-        {
-            *slot = self.lead[0].score(&self.scorer, freq as u32, 0);
-        }
-        // The clamp bucket must bound every frequency it absorbs; the
-        // clause-wide sup does.
-        freq_bound_lut[FREQ_LUT_BUCKETS - 1] =
-            self.lead[0].frequency_clamp_upper_bound(&self.scorer);
+        let mut freq_bound_lut: Option<[f32; FREQ_LUT_BUCKETS]> = None;
 
         // The conjunction can only start at the max of the clauses' first docs.
         let mut target: u64 = 0;
         for posting in &self.lead {
-            match posting.doc() {
-                Some(doc) => target = target.max(doc.doc_id()),
+            match posting.current_doc_id() {
+                Some(doc) => target = target.max(doc),
                 None => return Ok(vec![]),
             }
         }
 
         'window: loop {
             self.raise_to_shared_floor(params.wand_factor);
-            if self.threshold > 0.0 {
+            let window_started_with_floor = self.threshold > 0.0;
+            if window_started_with_floor {
+                if num_lists >= 2 && freq_bound_lut.is_none() {
+                    let mut lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
+                    for (freq, slot) in lut.iter_mut().enumerate().take(FREQ_LUT_BUCKETS - 1) {
+                        *slot = self.lead[0].score(&self.scorer, freq as u32, 0);
+                    }
+                    lut[FREQ_LUT_BUCKETS - 1] =
+                        self.lead[0].frequency_clamp_upper_bound(&self.scorer);
+                    freq_bound_lut = Some(lut);
+                }
                 let advanced = self.and_advance_target(target);
                 if advanced == TERMINATED_DOC_ID {
                     break;
@@ -3553,7 +3820,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     unreachable!("bulk AND requires compressed postings");
                 };
                 let block_idx = posting.block_idx;
-                let state = unsafe { &mut *posting.ensure_compressed_block_ptr(list, block_idx) };
+                let state = unsafe { &mut *posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
                 let lo = state.doc_ids.partition_point(|&doc| doc < target32);
                 let hi = if win_end32 == u32::MAX {
                     state.doc_ids.len()
@@ -3575,7 +3842,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 wins.push(WindowList {
                     docs: state.doc_ids.as_ptr(),
-                    freqs: state.freqs.as_ptr(),
+                    freqs: std::ptr::null(),
                     pos: lo,
                     end: hi,
                     block_start: block_idx << list.block_shift(),
@@ -3588,21 +3855,38 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 // Constant within the window (block-anchored); mirrors
                 // `and_candidate_cannot_beat_threshold`'s remaining-clause
                 // bound of first-clause-exact + rest-block-max.
-                let others_block_max = self.lead[1..]
-                    .iter()
-                    .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
-                    .sum::<f64>();
+                let mut others_block_max = if window_started_with_floor {
+                    Some(
+                        self.lead[1..]
+                            .iter()
+                            .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+                            .sum::<f64>(),
+                    )
+                } else {
+                    None
+                };
 
                 batch_docs.clear();
                 batch_offs.clear();
                 // Precompute the conservative decision once per frequency
                 // bucket so the scalar and SIMD merge kernels stay
                 // floating-point-free.
-                let freq_cannot_beat = if self.threshold > 0.0 && num_lists >= 2 {
+                let freq_cannot_beat = if window_started_with_floor && num_lists >= 2 {
+                    let posting = &self.lead[0];
+                    let PostingList::Compressed(ref list) = posting.list else {
+                        unreachable!("bulk AND requires compressed postings");
+                    };
+                    let state = unsafe {
+                        &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx)
+                    };
+                    wins[0].freqs = state.freqs.as_ptr();
+                    let freq_bound_lut = freq_bound_lut
+                        .as_ref()
+                        .expect("positive threshold should initialize the frequency bound LUT");
                     std::array::from_fn(|frequency| {
                         score_sum_cannot_compete(
                             freq_bound_lut[frequency],
-                            others_block_max,
+                            others_block_max.expect("positive floor should initialize bounds"),
                             self.threshold,
                             score_sum_upper_bound_factor(num_lists),
                             CompetitiveFloorMode::Exclusive,
@@ -3615,10 +3899,30 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let use_avx2 = *HAS_AVX2;
                 #[cfg(not(target_arch = "x86_64"))]
                 let use_avx2 = false;
-                match (num_lists, use_avx2) {
-                    (1, _) => merge_window_1(&wins, &mut batch_docs, &mut batch_offs),
+                match (num_lists, use_avx2, window_started_with_floor) {
+                    (1, _, _) => merge_window_1(&wins, &mut batch_docs, &mut batch_offs),
                     #[cfg(target_arch = "x86_64")]
-                    (2, true) => unsafe {
+                    (2, true, false) => unsafe {
+                        merge_window_docs_2_avx2(&wins, &mut batch_docs, &mut batch_offs)
+                    },
+                    #[cfg(target_arch = "x86_64")]
+                    (3, true, false) => unsafe {
+                        merge_window_docs_3_avx2(&wins, &mut batch_docs, &mut batch_offs)
+                    },
+                    (2, _, false) => unsafe {
+                        merge_window_docs_2(&wins, &mut batch_docs, &mut batch_offs)
+                    },
+                    (3, _, false) => unsafe {
+                        merge_window_docs_3(&wins, &mut batch_docs, &mut batch_offs)
+                    },
+                    (_, _, false) => merge_window_docs_n(
+                        &wins,
+                        &mut cursor_scratch,
+                        &mut batch_docs,
+                        &mut batch_offs,
+                    ),
+                    #[cfg(target_arch = "x86_64")]
+                    (2, true, true) => unsafe {
                         merge_window_2_avx2(
                             &wins,
                             &freq_cannot_beat,
@@ -3627,7 +3931,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         )
                     },
                     #[cfg(target_arch = "x86_64")]
-                    (3, true) => unsafe {
+                    (3, true, true) => unsafe {
                         merge_window_3_avx2(
                             &wins,
                             &freq_cannot_beat,
@@ -3635,13 +3939,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             &mut batch_offs,
                         )
                     },
-                    (2, _) => unsafe {
+                    (2, _, true) => unsafe {
                         merge_window_2(&wins, &freq_cannot_beat, &mut batch_docs, &mut batch_offs)
                     },
-                    (3, _) => unsafe {
+                    (3, _, true) => unsafe {
                         merge_window_3(&wins, &freq_cannot_beat, &mut batch_docs, &mut batch_offs)
                     },
-                    _ => merge_window_n(
+                    (_, _, true) => merge_window_n(
                         &wins,
                         &freq_cannot_beat,
                         &mut cursor_scratch,
@@ -3650,12 +3954,31 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     ),
                 }
 
+                if !batch_docs.is_empty() {
+                    for (win, posting) in wins.iter_mut().zip(self.lead.iter()) {
+                        let PostingList::Compressed(ref list) = posting.list else {
+                            unreachable!("bulk AND requires compressed postings");
+                        };
+                        let state = unsafe {
+                            &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx)
+                        };
+                        win.freqs = state.freqs.as_ptr();
+                    }
+                    if !norm_k_initialized {
+                        norm_k = self.norm_k_cache();
+                        norm_k_initialized = true;
+                    }
+                }
+
                 // Pass A: gather doc norms/lengths for the whole batch up
                 // front so the loads issue back-to-back and their cache
                 // misses overlap. With the norm cache, only the byte code is
                 // gathered; the exact length decodes from a tiny LUT.
                 batch_lens.clear();
                 batch_norms.clear();
+                let norm_k_ref = norm_k
+                    .as_ref()
+                    .map(|(norms, cache)| (*norms, cache.as_ref()));
                 match norm_k_ref {
                     Some((norms, _)) => {
                         for &doc in batch_docs.iter() {
@@ -3687,7 +4010,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         None => (None, batch_lens[index]),
                     };
                     let offs = &batch_offs[index * num_lists..(index + 1) * num_lists];
-                    if self.threshold > 0.0 && num_lists >= 2 {
+                    if self.threshold > 0.0 && num_lists >= 2 && others_block_max.is_none() {
+                        others_block_max = Some(
+                            self.lead[1..]
+                                .iter()
+                                .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+                                .sum::<f64>(),
+                        );
+                    }
+                    if self.threshold > 0.0
+                        && num_lists >= 2
+                        && let Some(others_block_max) = others_block_max
+                    {
                         let first_freq = unsafe { *wins[0].freqs.add(offs[0] as usize) };
                         let first_score = match norm_addend {
                             Some(addend) => {
@@ -7625,5 +7959,222 @@ mod tests {
         assert!(!bulk.is_empty(), "test corpus should produce matches");
         assert_eq!(bulk, classic);
         assert_eq!(auto, classic);
+    }
+
+    #[rstest]
+    #[case::bulk_two(BulkAndMode::On, 2)]
+    #[case::classic_four(BulkAndMode::Off, 4)]
+    fn underfilled_disjoint_and_decodes_no_frequencies_or_bounds(
+        #[case] mode: BulkAndMode,
+        #[case] num_clauses: usize,
+    ) {
+        let num_docs = (BLOCK_SIZE * 3) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 1);
+        }
+        let even = (0..num_docs).filter(|doc| doc % 2 == 0).collect::<Vec<_>>();
+        let odd = (0..num_docs).filter(|doc| doc % 2 == 1).collect::<Vec<_>>();
+        let all = (0..num_docs).collect::<Vec<_>>();
+        let postings = (0..num_clauses)
+            .map(|term| {
+                let doc_ids = match term {
+                    0 => even.clone(),
+                    1 => odd.clone(),
+                    _ => all.clone(),
+                };
+                let len = doc_ids.len();
+                PostingIterator::with_query_weight(
+                    format!("t{term}"),
+                    term as u32,
+                    term as u32,
+                    1.0,
+                    generate_impact_posting_list_with_freqs(doc_ids, vec![1; len], vec![1; len]),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let scored = Arc::new(AtomicUsize::new(0));
+        let mut wand = Wand::new(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            CountingScorer {
+                scored: scored.clone(),
+            },
+        )
+        .with_bulk_and_mode(mode);
+
+        let hits = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert!(hits.is_empty());
+        assert_eq!(scored.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            wand.lead
+                .iter()
+                .map(|posting| posting.frequency_blocks_decoded())
+                .sum::<usize>(),
+            0
+        );
+        assert_eq!(
+            wand.lead
+                .iter()
+                .map(|posting| posting.impact_bound_computations())
+                .sum::<usize>(),
+            0
+        );
+    }
+
+    #[rstest]
+    #[case::legacy_full(crate::scalar::inverted::LEGACY_BLOCK_SIZE, 0)]
+    #[case::legacy_tail(crate::scalar::inverted::LEGACY_BLOCK_SIZE, 7)]
+    #[case::modern_full(MAX_POSTING_BLOCK_SIZE, 0)]
+    #[case::modern_tail(MAX_POSTING_BLOCK_SIZE, 7)]
+    fn underfilled_sparse_and_decodes_only_matching_frequency_blocks(
+        #[values(BulkAndMode::On, BulkAndMode::Off)] mode: BulkAndMode,
+        #[case] block_size: usize,
+        #[case] tail_len: usize,
+    ) {
+        let posting_len = block_size * 2 + tail_len;
+        let first = (0..posting_len)
+            .map(|index| (index * 2) as u32)
+            .collect::<Vec<_>>();
+        let mut second = (0..posting_len)
+            .map(|index| (index * 2 + 1) as u32)
+            .collect::<Vec<_>>();
+        let last_doc = *first.last().unwrap();
+        *second.last_mut().unwrap() = last_doc;
+        let num_docs = posting_len * 2;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(doc_id as u64, 1);
+        }
+        let postings = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(term, doc_ids)| {
+                let len = doc_ids.len();
+                PostingIterator::with_query_weight(
+                    format!("t{term}"),
+                    term as u32,
+                    term as u32,
+                    1.0,
+                    generate_impact_posting_list_with_freqs_and_block_size(
+                        doc_ids,
+                        vec![1; len],
+                        vec![1; len],
+                        block_size,
+                    ),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let scored = Arc::new(AtomicUsize::new(0));
+        let mut wand = Wand::new(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            CountingScorer {
+                scored: scored.clone(),
+            },
+        )
+        .with_bulk_and_mode(mode);
+
+        let hits = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document, u64::from(last_doc));
+        assert_eq!(scored.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            wand.lead
+                .iter()
+                .map(|posting| posting.frequency_blocks_decoded())
+                .sum::<usize>(),
+            2,
+            "only the two blocks containing the surviving match need frequencies"
+        );
+        assert_eq!(
+            wand.lead
+                .iter()
+                .map(|posting| posting.impact_bound_computations())
+                .sum::<usize>(),
+            0
+        );
+    }
+
+    #[test]
+    fn bulk_and_activates_frequencies_and_bounds_after_heap_fills() {
+        let num_docs = (BLOCK_SIZE * 2) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 1);
+        }
+        let frequencies = (0..num_docs)
+            .map(|doc| if doc < BLOCK_SIZE as u32 { 1 } else { 10 })
+            .collect::<Vec<_>>();
+        let postings = (0..2)
+            .map(|term| {
+                PostingIterator::with_query_weight(
+                    format!("t{term}"),
+                    term,
+                    term,
+                    1.0,
+                    generate_impact_posting_list_with_freqs(
+                        (0..num_docs).collect(),
+                        frequencies.clone(),
+                        vec![1; num_docs as usize],
+                    ),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let scored = Arc::new(AtomicUsize::new(0));
+        let mut wand = Wand::new(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            CountingScorer {
+                scored: scored.clone(),
+            },
+        )
+        .with_bulk_and_mode(BulkAndMode::On);
+
+        let hits = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(1)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document, BLOCK_SIZE as u64);
+        assert!(wand.threshold > 0.0);
+        assert!(
+            wand.lead
+                .iter()
+                .map(|posting| posting.frequency_blocks_decoded())
+                .sum::<usize>()
+                >= 4,
+            "the competitive second window must decode its frequency blocks"
+        );
+        assert!(
+            wand.lead
+                .iter()
+                .map(|posting| posting.impact_bound_computations())
+                .sum::<usize>()
+                > 0,
+            "impact bounds must activate on the first window after the heap fills"
+        );
+        assert!(scored.load(Ordering::Relaxed) > 0);
     }
 }
