@@ -299,7 +299,6 @@ static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_e
 static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
 
 /// First index in `[pos, end)` where `docs[index] >= target` (scalar).
-/// Posting-block doc ids stay below 2^31, which the AVX2 variant relies on.
 #[inline]
 unsafe fn find_next_geq_scalar(docs: *const u32, mut pos: usize, end: usize, target: u32) -> usize {
     unsafe {
@@ -311,25 +310,35 @@ unsafe fn find_next_geq_scalar(docs: *const u32, mut pos: usize, end: usize, tar
 }
 
 /// AVX2 `find_next_geq` (the analogue of Lucene's VectorUtil.findNextGEQ):
-/// branchless 8-wide compare+movemask kills the mispredicted exits that
-/// dominate the scalar catch-up scan on irregular doc gaps.
+/// scalar lookahead skips windows wholly before the target, then an 8-wide
+/// compare locates the first matching lane.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn find_next_geq_avx2(docs: *const u32, mut pos: usize, end: usize, target: u32) -> usize {
     use core::arch::x86_64::*;
-    debug_assert!(target <= i32::MAX as u32);
     unsafe {
-        let target_lanes = _mm256_set1_epi32(target as i32);
-        while pos + 8 <= end {
-            let docs_lanes = _mm256_loadu_si256(docs.add(pos) as *const __m256i);
-            // lane mask of docs[i] < target; doc ids < 2^31 keep the signed
-            // compare equivalent to unsigned.
+        // Bias unsigned values around the sign bit so the signed AVX2 compare
+        // preserves the ordering of the full u32 domain.
+        let sign_bit = _mm256_set1_epi32(i32::MIN);
+        let target_lanes = _mm256_xor_si256(_mm256_set1_epi32(target as i32), sign_bit);
+        while pos + 8 < end {
+            // Skip nine-document groups that end before the target. Only the
+            // group containing the lower bound needs a vector load/compare.
+            if *docs.add(pos + 8) < target {
+                pos += 9;
+                continue;
+            }
+            let docs_lanes = _mm256_xor_si256(
+                _mm256_loadu_si256(docs.add(pos) as *const __m256i),
+                sign_bit,
+            );
+            // Lane mask of docs[i] < target.
             let below = _mm256_cmpgt_epi32(target_lanes, docs_lanes);
             let mask = _mm256_movemask_ps(_mm256_castsi256_ps(below)) as u32;
             if mask != 0xFF {
                 return pos + mask.trailing_ones() as usize;
             }
-            pos += 8;
+            return pos + 8;
         }
         find_next_geq_scalar(docs, pos, end, target)
     }
@@ -342,6 +351,18 @@ unsafe fn find_next_geq(docs: *const u32, pos: usize, end: usize, target: u32) -
         return unsafe { find_next_geq_avx2(docs, pos, end, target) };
     }
     unsafe { find_next_geq_scalar(docs, pos, end, target) }
+}
+
+/// Search a sorted posting block using AVX2 when available. Keep the binary
+/// search fallback because linear catch-up is slower on targets without AVX2.
+#[inline]
+fn find_next_geq_in_block(docs: &[u32], pos: usize, target: u32) -> usize {
+    debug_assert!(pos <= docs.len());
+    #[cfg(target_arch = "x86_64")]
+    if *HAS_AVX2 {
+        return unsafe { find_next_geq_avx2(docs.as_ptr(), pos, docs.len(), target) };
+    }
+    pos + docs[pos..].partition_point(|&doc_id| doc_id < target)
 }
 
 #[inline]
@@ -1350,7 +1371,7 @@ impl PostingIterator {
 
     /// Move to the next document without materializing its frequency. AND
     /// intersection uses this until a document survives every required list.
-    fn next_doc_id(&mut self, least_id: u64) {
+    fn next_doc_id(&mut self, least_id: u64, is_vectorized_search_enabled: bool) {
         match self.list {
             PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
@@ -1364,9 +1385,13 @@ impl PostingIterator {
                     let block_offset = self.index & list.block_mask();
                     let compressed =
                         unsafe { &mut *self.ensure_compressed_doc_ids_ptr(list, block_idx) };
-                    let in_block = &compressed.doc_ids[block_offset..];
-                    let offset_in_block = in_block.partition_point(|&doc_id| doc_id < least_id);
-                    let new_offset = block_offset + offset_in_block;
+                    let new_offset = if is_vectorized_search_enabled {
+                        find_next_geq_in_block(&compressed.doc_ids, block_offset, least_id)
+                    } else {
+                        block_offset
+                            + compressed.doc_ids[block_offset..]
+                                .partition_point(|&doc_id| doc_id < least_id)
+                    };
                     if new_offset < compressed.doc_ids.len() {
                         self.index = (block_idx << shift) + new_offset;
                         self.block_idx = block_idx;
@@ -3353,6 +3378,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if self.lead.len() < self.num_terms {
             return None;
         }
+        // Two- and three-clause conjunctions use the bulk SIMD kernels by
+        // default. Restrict this classic-path optimization to four and five
+        // clauses, keeping one clause as the benchmark's drift control.
+        let is_vectorized_search_enabled = matches!(self.lead.len(), 4 | 5);
         if let Some(last_doc) = self.and_last_doc
             && self
                 .lead
@@ -3364,7 +3393,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             if next_target == TERMINATED_DOC_ID {
                 return None;
             }
-            self.lead[0].next_doc_id(next_target);
+            self.lead[0].next_doc_id(next_target, is_vectorized_search_enabled);
         }
 
         'advance_head: loop {
@@ -3378,14 +3407,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     return None;
                 }
                 if next_target != doc {
-                    self.lead[0].next_doc_id(next_target);
+                    self.lead[0].next_doc_id(next_target, is_vectorized_search_enabled);
                     continue;
                 }
             }
 
             for posting in self.lead.iter_mut().skip(1) {
                 if posting.current_doc_id()? < doc {
-                    posting.next_doc_id(doc);
+                    posting.next_doc_id(doc, is_vectorized_search_enabled);
                 }
                 let next = posting.current_doc_id()?;
                 if next > doc {
@@ -3393,7 +3422,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     if next_target == TERMINATED_DOC_ID {
                         return None;
                     }
-                    self.lead[0].next_doc_id(next_target);
+                    self.lead[0].next_doc_id(next_target, is_vectorized_search_enabled);
                     continue 'advance_head;
                 }
             }
@@ -3405,7 +3434,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if next_target == TERMINATED_DOC_ID {
                     return None;
                 }
-                self.lead[0].next_doc_id(next_target);
+                self.lead[0].next_doc_id(next_target, is_vectorized_search_enabled);
                 continue;
             }
 
@@ -5930,6 +5959,67 @@ mod tests {
         assert_eq!(mode.enabled_for(num_clauses), expected);
     }
 
+    #[test]
+    fn find_next_geq_matches_partition_point_for_full_u32_domain() {
+        let cases = [
+            vec![],
+            vec![7],
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+            (0..32).collect(),
+            vec![
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                i32::MAX as u32,
+                i32::MAX as u32 + 1,
+                i32::MAX as u32 + 2,
+                i32::MAX as u32 + 3,
+                i32::MAX as u32 + 4,
+                i32::MAX as u32 + 5,
+                i32::MAX as u32 + 6,
+                u32::MAX - 2,
+                u32::MAX - 1,
+                u32::MAX,
+            ],
+        ];
+        let targets = [
+            0,
+            1,
+            6,
+            7,
+            8,
+            i32::MAX as u32 - 1,
+            i32::MAX as u32,
+            i32::MAX as u32 + 1,
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+
+        for docs in &cases {
+            for pos in 0..=docs.len() {
+                for &target in &targets {
+                    let expected = pos + docs[pos..].partition_point(|&doc_id| doc_id < target);
+                    let actual = unsafe { find_next_geq(docs.as_ptr(), pos, docs.len(), target) };
+                    assert_eq!(
+                        actual, expected,
+                        "docs={docs:?}, pos={pos}, target={target}"
+                    );
+                    assert_eq!(
+                        find_next_geq_in_block(docs, pos, target),
+                        expected,
+                        "block search: docs={docs:?}, pos={pos}, target={target}"
+                    );
+                }
+            }
+        }
+    }
+
     struct PanicQueryWeightScorer;
 
     impl Scorer for PanicQueryWeightScorer {
@@ -7964,6 +8054,7 @@ mod tests {
     #[rstest]
     #[case::bulk_two(BulkAndMode::On, 2)]
     #[case::classic_four(BulkAndMode::Off, 4)]
+    #[case::classic_five(BulkAndMode::Off, 5)]
     fn underfilled_disjoint_and_decodes_no_frequencies_or_bounds(
         #[case] mode: BulkAndMode,
         #[case] num_clauses: usize,
