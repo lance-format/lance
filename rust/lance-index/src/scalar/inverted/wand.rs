@@ -241,7 +241,8 @@ impl CompetitiveFloorMode {
 // skipping plus a slice-level merge over decompressed blocks, replacing the
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
 // LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto enables the
-// bulk path only for its consistently faster two- and three-clause kernels.
+// bulk path for two/three-clause queries and for plain four/five-clause AND
+// queries, which have hand-specialized docs-only kernels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BulkAndMode {
     #[default]
@@ -264,9 +265,11 @@ impl BulkAndMode {
         }
     }
 
-    const fn enabled_for(self, num_clauses: usize) -> bool {
+    const fn enabled_for(self, num_clauses: usize, is_phrase_query: bool) -> bool {
         match self {
-            Self::Auto => matches!(num_clauses, 2 | 3),
+            Self::Auto => {
+                matches!(num_clauses, 2 | 3) || (!is_phrase_query && matches!(num_clauses, 4 | 5))
+            }
             Self::On => true,
             Self::Off => false,
         }
@@ -2477,7 +2480,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             && self
                 .bulk_and_mode_override
                 .unwrap_or_else(|| *BULK_AND_MODE)
-                .enabled_for(self.lead.len())
+                .enabled_for(self.lead.len(), params.phrase_slop.is_some())
         {
             #[cfg(test)]
             {
@@ -3491,8 +3494,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         // Merge kernels: intersect the window's per-clause slices and record
         // each match as (doc, per-clause block offsets). Hand-specialized for
-        // two and three clauses so cursors and bounds stay in registers; the
-        // generic kernel covers other widths. Offsets fit u8 because a block
+        // two and three clauses for positive-floor pruning, and two through
+        // five clauses for the docs-only path, so cursors stay in registers;
+        // the generic kernel covers other widths. Offsets fit u8 because a block
         // holds at most `MAX_POSTING_BLOCK_SIZE` (256) entries. The macro
         // stamps a scalar and an AVX2 variant — `#[target_feature]` must
         // cover the whole kernel for the vector catch-up scans to inline.
@@ -3661,6 +3665,138 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             merge_window_docs_2,
             merge_window_docs_3,
             find_next_geq_scalar
+        );
+
+        // Four- and five-clause queries are most useful before a competitive
+        // floor exists: underfilled conjunctions spend their time intersecting
+        // doc ids and never activate score-first pruning. Keep this separate
+        // from `merge_kernels` so positive-floor 4/5-clause queries continue to
+        // use the existing generic kernel.
+        macro_rules! merge_docs_kernels_4_5 {
+            ($name4:ident, $name5:ident, $geq:ident $(, #[$feat:meta])?) => {
+                $(#[$feat])?
+                unsafe fn $name4(
+                    wins: &[WindowList],
+                    docs_out: &mut Vec<u32>,
+                    offs_out: &mut Vec<u8>,
+                ) {
+                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                    let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
+                    let (d2, mut p2, e2) = (wins[2].docs, wins[2].pos, wins[2].end);
+                    let (d3, mut p3, e3) = (wins[3].docs, wins[3].pos, wins[3].end);
+                    unsafe {
+                        'outer: while p0 < e0 {
+                            let doc = *d0.add(p0);
+                            p1 = $geq(d1, p1, e1, doc);
+                            if p1 >= e1 {
+                                return;
+                            }
+                            let second = *d1.add(p1);
+                            if second > doc {
+                                p0 = $geq(d0, p0 + 1, e0, second);
+                                continue 'outer;
+                            }
+                            p2 = $geq(d2, p2, e2, doc);
+                            if p2 >= e2 {
+                                return;
+                            }
+                            let third = *d2.add(p2);
+                            if third > doc {
+                                p0 = $geq(d0, p0 + 1, e0, third);
+                                continue 'outer;
+                            }
+                            p3 = $geq(d3, p3, e3, doc);
+                            if p3 >= e3 {
+                                return;
+                            }
+                            let fourth = *d3.add(p3);
+                            if fourth > doc {
+                                p0 = $geq(d0, p0 + 1, e0, fourth);
+                                continue 'outer;
+                            }
+                            docs_out.push(doc);
+                            offs_out.push(p0 as u8);
+                            offs_out.push(p1 as u8);
+                            offs_out.push(p2 as u8);
+                            offs_out.push(p3 as u8);
+                            p0 += 1;
+                        }
+                    }
+                }
+
+                $(#[$feat])?
+                unsafe fn $name5(
+                    wins: &[WindowList],
+                    docs_out: &mut Vec<u32>,
+                    offs_out: &mut Vec<u8>,
+                ) {
+                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                    let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
+                    let (d2, mut p2, e2) = (wins[2].docs, wins[2].pos, wins[2].end);
+                    let (d3, mut p3, e3) = (wins[3].docs, wins[3].pos, wins[3].end);
+                    let (d4, mut p4, e4) = (wins[4].docs, wins[4].pos, wins[4].end);
+                    unsafe {
+                        'outer: while p0 < e0 {
+                            let doc = *d0.add(p0);
+                            p1 = $geq(d1, p1, e1, doc);
+                            if p1 >= e1 {
+                                return;
+                            }
+                            let second = *d1.add(p1);
+                            if second > doc {
+                                p0 = $geq(d0, p0 + 1, e0, second);
+                                continue 'outer;
+                            }
+                            p2 = $geq(d2, p2, e2, doc);
+                            if p2 >= e2 {
+                                return;
+                            }
+                            let third = *d2.add(p2);
+                            if third > doc {
+                                p0 = $geq(d0, p0 + 1, e0, third);
+                                continue 'outer;
+                            }
+                            p3 = $geq(d3, p3, e3, doc);
+                            if p3 >= e3 {
+                                return;
+                            }
+                            let fourth = *d3.add(p3);
+                            if fourth > doc {
+                                p0 = $geq(d0, p0 + 1, e0, fourth);
+                                continue 'outer;
+                            }
+                            p4 = $geq(d4, p4, e4, doc);
+                            if p4 >= e4 {
+                                return;
+                            }
+                            let fifth = *d4.add(p4);
+                            if fifth > doc {
+                                p0 = $geq(d0, p0 + 1, e0, fifth);
+                                continue 'outer;
+                            }
+                            docs_out.push(doc);
+                            offs_out.push(p0 as u8);
+                            offs_out.push(p1 as u8);
+                            offs_out.push(p2 as u8);
+                            offs_out.push(p3 as u8);
+                            offs_out.push(p4 as u8);
+                            p0 += 1;
+                        }
+                    }
+                }
+            };
+        }
+        merge_docs_kernels_4_5!(
+            merge_window_docs_4,
+            merge_window_docs_5,
+            find_next_geq_scalar
+        );
+        #[cfg(target_arch = "x86_64")]
+        merge_docs_kernels_4_5!(
+            merge_window_docs_4_avx2,
+            merge_window_docs_5_avx2,
+            find_next_geq_avx2,
+            #[target_feature(enable = "avx2")]
         );
         #[cfg(target_arch = "x86_64")]
         merge_kernels!(
@@ -3938,11 +4074,25 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (3, true, false) => unsafe {
                         merge_window_docs_3_avx2(&wins, &mut batch_docs, &mut batch_offs)
                     },
+                    #[cfg(target_arch = "x86_64")]
+                    (4, true, false) => unsafe {
+                        merge_window_docs_4_avx2(&wins, &mut batch_docs, &mut batch_offs)
+                    },
+                    #[cfg(target_arch = "x86_64")]
+                    (5, true, false) => unsafe {
+                        merge_window_docs_5_avx2(&wins, &mut batch_docs, &mut batch_offs)
+                    },
                     (2, _, false) => unsafe {
                         merge_window_docs_2(&wins, &mut batch_docs, &mut batch_offs)
                     },
                     (3, _, false) => unsafe {
                         merge_window_docs_3(&wins, &mut batch_docs, &mut batch_offs)
+                    },
+                    (4, _, false) => unsafe {
+                        merge_window_docs_4(&wins, &mut batch_docs, &mut batch_offs)
+                    },
+                    (5, _, false) => unsafe {
+                        merge_window_docs_5(&wins, &mut batch_docs, &mut batch_offs)
                     },
                     (_, _, false) => merge_window_docs_n(
                         &wins,
@@ -5812,15 +5962,35 @@ mod tests {
         assert_eq!(wand.maxscore_general_windows > 0, !single_essential);
     }
 
-    #[test]
-    fn bulk_and_and_classic_publish_identical_query_order_score_bits() {
-        let contributions = [0.002_972_301_6_f32, 0.001_982_450_7_f32, 0.001_882_293_f32];
-        let bounds = [0.002_99_f32, 0.001_99_f32, 0.003_f32];
-        // Different posting lengths force cost order 1, 2, 0 instead of query
-        // order 0, 1, 2.
-        let clause_docs = [vec![0, 1, 2], vec![0], vec![0, 1]];
+    #[rstest]
+    #[case::three_clauses(3)]
+    #[case::four_clauses(4)]
+    #[case::five_clauses(5)]
+    fn bulk_and_and_classic_publish_identical_query_order_score_bits(#[case] num_clauses: usize) {
+        let contributions = [
+            0.002_972_301_6_f32,
+            0.001_982_450_7_f32,
+            0.001_882_293_f32,
+            0.000_812_753_4_f32,
+            0.000_719_117_2_f32,
+        ];
+        let bounds = [
+            0.002_99_f32,
+            0.001_99_f32,
+            0.003_f32,
+            0.001_f32,
+            0.000_8_f32,
+        ];
+        // Different posting lengths force cost order away from query order.
+        let clause_docs = [
+            vec![0, 1, 2, 3, 4],
+            vec![0],
+            vec![0, 1],
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2],
+        ];
         let mut docs = DocSet::default();
-        for doc_id in 0..3 {
+        for doc_id in 0..5 {
             docs.append(doc_id, 1);
         }
 
@@ -5829,6 +5999,7 @@ mod tests {
                 .into_iter()
                 .zip(bounds)
                 .zip(clause_docs.iter())
+                .take(num_clauses)
                 .enumerate()
                 .map(|(position, ((query_weight, max_score), doc_ids))| {
                     PostingIterator::with_query_weight(
@@ -5866,7 +6037,11 @@ mod tests {
         assert_eq!(classic.len(), 1);
         assert_eq!(bulk[0].document, 0);
         assert_eq!(classic[0].document, 0);
-        assert_eq!(bulk_score, 0x3be0_094c);
+        let query_order_score = contributions[..num_clauses]
+            .iter()
+            .copied()
+            .fold(0.0_f32, |score, contribution| score + contribution);
+        assert_eq!(bulk_score, query_order_score.to_bits());
         assert_eq!(classic_score, bulk_score);
     }
 
@@ -5943,20 +6118,25 @@ mod tests {
     }
 
     #[rstest]
-    #[case::auto_one(BulkAndMode::Auto, 1, false)]
-    #[case::auto_two(BulkAndMode::Auto, 2, true)]
-    #[case::auto_three(BulkAndMode::Auto, 3, true)]
-    #[case::auto_four(BulkAndMode::Auto, 4, false)]
-    #[case::on_one(BulkAndMode::On, 1, true)]
-    #[case::on_five(BulkAndMode::On, 5, true)]
-    #[case::off_two(BulkAndMode::Off, 2, false)]
-    #[case::off_five(BulkAndMode::Off, 5, false)]
+    #[case::auto_one(BulkAndMode::Auto, 1, false, false)]
+    #[case::auto_two(BulkAndMode::Auto, 2, false, true)]
+    #[case::auto_three_phrase(BulkAndMode::Auto, 3, true, true)]
+    #[case::auto_four(BulkAndMode::Auto, 4, false, true)]
+    #[case::auto_five(BulkAndMode::Auto, 5, false, true)]
+    #[case::auto_four_phrase(BulkAndMode::Auto, 4, true, false)]
+    #[case::auto_five_phrase(BulkAndMode::Auto, 5, true, false)]
+    #[case::auto_six(BulkAndMode::Auto, 6, false, false)]
+    #[case::on_one_phrase(BulkAndMode::On, 1, true, true)]
+    #[case::on_five_phrase(BulkAndMode::On, 5, true, true)]
+    #[case::off_two(BulkAndMode::Off, 2, false, false)]
+    #[case::off_five(BulkAndMode::Off, 5, false, false)]
     fn test_bulk_and_mode_enabled_for(
         #[case] mode: BulkAndMode,
         #[case] num_clauses: usize,
+        #[case] is_phrase_query: bool,
         #[case] expected: bool,
     ) {
-        assert_eq!(mode.enabled_for(num_clauses), expected);
+        assert_eq!(mode.enabled_for(num_clauses, is_phrase_query), expected);
     }
 
     #[test]
@@ -7954,8 +8134,9 @@ mod tests {
         }
 
         // Clauses with different densities; membership comes from a cheap
-        // deterministic mix so docs scatter across blocks. Clause count picks
-        // the dedicated (1-3) or generic (4+) merge kernel.
+        // deterministic mix so docs scatter across blocks. Plain 2-5 clause
+        // queries use dedicated kernels; wider and 4/5 clause phrase queries
+        // retain the generic or classic paths.
         let clause_docs = |modulus: u32, salt: u32| -> Vec<u32> {
             (0..num_docs)
                 .filter(|doc| (doc.wrapping_mul(2654435761).wrapping_add(salt)) % modulus < 2)
@@ -8045,7 +8226,10 @@ mod tests {
         let (auto, auto_used) = run(BulkAndMode::Auto);
         assert!(bulk_used, "on should use bulk conjunction search");
         assert!(!classic_used, "off should use classic conjunction search");
-        assert_eq!(auto_used, matches!(num_clauses, 2 | 3));
+        assert_eq!(
+            auto_used,
+            matches!(num_clauses, 2 | 3) || (!phrase && matches!(num_clauses, 4 | 5))
+        );
         assert!(!bulk.is_empty(), "test corpus should produce matches");
         assert_eq!(bulk, classic);
         assert_eq!(auto, classic);
@@ -8053,6 +8237,8 @@ mod tests {
 
     #[rstest]
     #[case::bulk_two(BulkAndMode::On, 2)]
+    #[case::bulk_auto_four(BulkAndMode::Auto, 4)]
+    #[case::bulk_auto_five(BulkAndMode::Auto, 5)]
     #[case::classic_four(BulkAndMode::Off, 4)]
     #[case::classic_five(BulkAndMode::Off, 5)]
     fn underfilled_disjoint_and_decodes_no_frequencies_or_bounds(
@@ -8104,6 +8290,11 @@ mod tests {
             .unwrap();
 
         assert!(hits.is_empty());
+        assert_eq!(
+            wand.bulk_and_searches > 0,
+            mode != BulkAndMode::Off,
+            "Auto 4/5 should exercise the specialized bulk kernel while Off stays classic"
+        );
         assert_eq!(scored.load(Ordering::Relaxed), 0);
         assert_eq!(
             wand.lead
@@ -8122,12 +8313,73 @@ mod tests {
     }
 
     #[rstest]
+    fn underfilled_specialized_bulk_stops_when_follower_cursor_exhausts(
+        #[values(4, 5)] num_clauses: usize,
+    ) {
+        let num_docs = BLOCK_SIZE as u32 * 2;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 1);
+        }
+        let postings = (0..num_clauses)
+            .map(|term| {
+                let doc_ids = match term {
+                    // Cost sorting keeps t0 as the lead. At target=1 its next
+                    // doc is 100, beyond t1's tail, so the follower GEQ search
+                    // exhausts inside the specialized kernel.
+                    0 => vec![0, 100],
+                    1 => vec![1, 2, 3],
+                    _ => (0..num_docs).collect(),
+                };
+                let len = doc_ids.len();
+                PostingIterator::with_query_weight(
+                    format!("t{term}"),
+                    term as u32,
+                    term as u32,
+                    1.0,
+                    generate_impact_posting_list_with_freqs(doc_ids, vec![1; len], vec![1; len]),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let scored = Arc::new(AtomicUsize::new(0));
+        let mut wand = Wand::new(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            CountingScorer {
+                scored: scored.clone(),
+            },
+        )
+        .with_bulk_and_mode(BulkAndMode::Auto);
+
+        let hits = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert!(hits.is_empty());
+        assert!(wand.bulk_and_searches > 0);
+        assert_eq!(scored.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            wand.lead
+                .iter()
+                .map(|posting| posting.frequency_blocks_decoded())
+                .sum::<usize>(),
+            0
+        );
+    }
+
+    #[rstest]
     #[case::legacy_full(crate::scalar::inverted::LEGACY_BLOCK_SIZE, 0)]
     #[case::legacy_tail(crate::scalar::inverted::LEGACY_BLOCK_SIZE, 7)]
     #[case::modern_full(MAX_POSTING_BLOCK_SIZE, 0)]
     #[case::modern_tail(MAX_POSTING_BLOCK_SIZE, 7)]
     fn underfilled_sparse_and_decodes_only_matching_frequency_blocks(
-        #[values(BulkAndMode::On, BulkAndMode::Off)] mode: BulkAndMode,
+        #[values(BulkAndMode::Auto, BulkAndMode::Off)] mode: BulkAndMode,
+        #[values(2, 4, 5)] num_clauses: usize,
         #[case] block_size: usize,
         #[case] tail_len: usize,
     ) {
@@ -8145,10 +8397,13 @@ mod tests {
         for doc_id in 0..num_docs {
             docs.append(doc_id as u64, 1);
         }
-        let postings = [first, second]
-            .into_iter()
-            .enumerate()
-            .map(|(term, doc_ids)| {
+        let postings = (0..num_clauses)
+            .map(|term| {
+                let doc_ids = match term {
+                    0 => first.clone(),
+                    1 => second.clone(),
+                    _ => (0..num_docs as u32).collect(),
+                };
                 let len = doc_ids.len();
                 PostingIterator::with_query_weight(
                     format!("t{term}"),
@@ -8185,14 +8440,20 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].document, u64::from(last_doc));
-        assert_eq!(scored.load(Ordering::Relaxed), 2);
+        assert_eq!(hits[0].freqs.len(), num_clauses);
+        assert_eq!(
+            wand.bulk_and_searches > 0,
+            mode == BulkAndMode::Auto,
+            "Auto should exercise the specialized 4/5 bulk kernel while Off stays classic"
+        );
+        assert_eq!(scored.load(Ordering::Relaxed), num_clauses);
         assert_eq!(
             wand.lead
                 .iter()
                 .map(|posting| posting.frequency_blocks_decoded())
                 .sum::<usize>(),
-            2,
-            "only the two blocks containing the surviving match need frequencies"
+            num_clauses,
+            "only each clause's block containing the surviving match needs frequencies"
         );
         assert_eq!(
             wand.lead
