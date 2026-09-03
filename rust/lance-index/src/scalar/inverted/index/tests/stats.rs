@@ -374,6 +374,91 @@ async fn test_aggregate_corpus_stats_reuses_cached_value() {
 }
 
 #[tokio::test]
+async fn test_loaded_bm25_stats_are_all_or_nothing_and_preserve_oov() {
+    let (index, counter, _tmpdir) = load_counted_v2_index(10, LanceCache::no_cache()).await;
+    let posting_reader = &index.partitions[0].inverted_list;
+    let terms = ["t0".to_string(), "missing".to_string(), "t9".to_string()];
+
+    assert!(!posting_reader.posting_lengths_loaded());
+    assert_eq!(posting_reader.loaded_posting_len(0), None);
+    assert_eq!(
+        index.bm25_stats_for_terms_if_loaded(&terms).unwrap(),
+        None,
+        "absent corpus statistics must reject the synchronous path"
+    );
+
+    assert_eq!(index.aggregate_corpus_stats().await.unwrap(), (10, 10));
+    assert_eq!(
+        index.bm25_stats_for_terms_if_loaded(&terms).unwrap(),
+        None,
+        "an OOV term must not hide an unloaded modern length table"
+    );
+    assert_eq!(counter.metadata_rows_read(), 0);
+
+    posting_reader.ensure_metadata_loaded().await.unwrap();
+    assert!(posting_reader.posting_lengths_loaded());
+    assert_eq!(posting_reader.loaded_posting_len(0), Some(1));
+    assert_eq!(posting_reader.loaded_posting_len(9), Some(1));
+    assert_eq!(posting_reader.loaded_posting_len(10), None);
+
+    let loaded = index
+        .bm25_stats_for_terms_if_loaded(&terms)
+        .unwrap()
+        .unwrap();
+    let asynchronous = index.bm25_stats_for_terms(&terms, None).await.unwrap();
+    assert_eq!(loaded, (10, 10, vec![1, 0, 1]));
+    assert_eq!(loaded, asynchronous);
+}
+
+#[tokio::test]
+async fn test_loaded_bm25_stats_reports_invalid_loaded_token_id() {
+    let (mut index, _counter, _tmpdir) = load_counted_v2_index(1, LanceCache::no_cache()).await;
+    index.aggregate_corpus_stats().await.unwrap();
+    index.partitions[0]
+        .inverted_list
+        .ensure_metadata_loaded()
+        .await
+        .unwrap();
+
+    {
+        let index = Arc::get_mut(&mut index).expect("test index should have one owner");
+        let partition =
+            Arc::get_mut(&mut index.partitions[0]).expect("test partition should have one owner");
+        let posting_reader = Arc::get_mut(&mut partition.inverted_list)
+            .expect("test posting reader should have one owner");
+        let PostingMetadata::V2 { metadata } = &mut posting_reader.metadata else {
+            panic!("test requires modern posting metadata");
+        };
+        metadata
+            .get_mut()
+            .expect("metadata was loaded above")
+            .lengths
+            .clear();
+    }
+
+    let terms = ["t0".to_string()];
+    assert!(
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(
+            std::slice::from_ref(&index),
+            &terms,
+            false,
+        )
+        .unwrap()
+        .is_none(),
+        "the kill switch must short-circuit before loaded-metadata validation"
+    );
+
+    let error = index.bm25_stats_for_terms_if_loaded(&terms).unwrap_err();
+    assert!(matches!(error, Error::Index { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("token 't0' maps to invalid posting token id 0 in partition 0"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn test_persisted_stats_do_not_load_document_columns() {
     let (index, _counter, _tmpdir) = load_counted_v2_index(100, LanceCache::no_cache()).await;
     assert!(!index.is_legacy());

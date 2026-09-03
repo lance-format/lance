@@ -92,6 +92,57 @@ impl InvertedIndex {
         Ok((total_tokens, num_docs, token_docs))
     }
 
+    /// Return BM25 statistics synchronously when every required value is loaded.
+    ///
+    /// This is an all-or-nothing probe for the full-prewarm query path. It never
+    /// starts I/O: an absent segment corpus statistic or one absent modern
+    /// posting-length table returns `None` for the entire segment.
+    pub(in crate::scalar::inverted) fn bm25_stats_for_terms_if_loaded(
+        &self,
+        terms: &[String],
+    ) -> Result<Option<(u64, usize, Vec<usize>)>> {
+        // Keep the legacy reader on its frozen asynchronous compatibility
+        // path; this optimization targets current partitioned formats.
+        if self.is_legacy() {
+            return Ok(None);
+        }
+        let Some(&(total_tokens, num_docs)) = self.corpus_stats.get() else {
+            return Ok(None);
+        };
+        if self
+            .partitions
+            .iter()
+            .any(|partition| !partition.inverted_list.posting_lengths_loaded())
+        {
+            return Ok(None);
+        }
+        let mut token_docs = Vec::with_capacity(terms.len());
+        for term in terms {
+            let mut term_docs = 0_usize;
+            for partition in &self.partitions {
+                let Some(token_id) = partition.tokens.get(term) else {
+                    continue;
+                };
+                let posting_len = partition
+                    .inverted_list
+                    .loaded_posting_len(token_id)
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "FTS token '{term}' maps to invalid posting token id {token_id} in partition {}",
+                            partition.id()
+                        ))
+                    })?;
+                term_docs = term_docs.checked_add(posting_len).ok_or_else(|| {
+                    Error::index(format!(
+                        "FTS document frequency for term '{term}' overflows usize"
+                    ))
+                })?;
+            }
+            token_docs.push(term_docs);
+        }
+        Ok(Some((total_tokens, num_docs, token_docs)))
+    }
+
     /// Aggregate immutable per-partition corpus statistics.  New modern files
     /// read both values from the already-opened docs footer; older partitioned
     /// files scan `_num_tokens` once as a compatibility fallback.

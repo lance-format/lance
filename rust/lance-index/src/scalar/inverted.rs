@@ -18,7 +18,7 @@ pub mod tokenizer;
 mod wand;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
@@ -170,6 +170,104 @@ pub(crate) fn has_all_query_positions(query_tokens: &Tokens, final_tokens: &Toke
     (0..query_tokens.len()).all(|index| surviving_positions.contains(&query_tokens.position(index)))
 }
 
+const LANCE_FTS_SYNC_DF_ENV: &str = "LANCE_FTS_SYNC_DF";
+
+fn sync_df_enabled_from_value(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("off")
+    })
+}
+
+static LANCE_FTS_SYNC_DF_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    sync_df_enabled_from_value(std::env::var(LANCE_FTS_SYNC_DF_ENV).ok().as_deref())
+});
+
+/// Build the global scorer without futures when a completed full prewarm made
+/// every segment statistic and posting-length table synchronously available.
+/// Returning `None` leaves the existing asynchronous path entirely in charge.
+fn bm25_scorer_from_loaded_stats(
+    indices: &[Arc<InvertedIndex>],
+    terms: &[String],
+) -> Result<Option<Arc<MemBM25Scorer>>> {
+    bm25_scorer_from_loaded_stats_with_enabled(indices, terms, *LANCE_FTS_SYNC_DF_ENABLED)
+}
+
+fn bm25_scorer_from_loaded_stats_with_enabled(
+    indices: &[Arc<InvertedIndex>],
+    terms: &[String],
+    is_enabled: bool,
+) -> Result<Option<Arc<MemBM25Scorer>>> {
+    // Keep the kill switch first so an ablation does not even probe prewarm
+    // state or resident metadata.
+    if !is_enabled {
+        return Ok(None);
+    }
+
+    let mut loaded_stats = Vec::with_capacity(indices.len());
+    for index in indices {
+        let Some(stats) = index.bm25_stats_for_terms_if_loaded(terms)? else {
+            return Ok(None);
+        };
+        loaded_stats.push(stats);
+    }
+
+    merge_loaded_bm25_stats(terms, loaded_stats)
+}
+
+fn merge_loaded_bm25_stats(
+    terms: &[String],
+    loaded_stats: Vec<(u64, usize, Vec<usize>)>,
+) -> Result<Option<Arc<MemBM25Scorer>>> {
+    let mut loaded_stats = loaded_stats.into_iter();
+    let Some((mut total_tokens, mut num_docs, first_token_docs)) = loaded_stats.next() else {
+        return Ok(None);
+    };
+    if first_token_docs.len() != terms.len() {
+        return Err(lance_core::Error::internal(format!(
+            "loaded FTS document-frequency count is {}, expected {}",
+            first_token_docs.len(),
+            terms.len()
+        )));
+    }
+    let mut token_docs = HashMap::with_capacity(terms.len());
+    for (term, count) in terms.iter().cloned().zip(first_token_docs) {
+        token_docs.insert(term, count);
+    }
+    for (segment_total_tokens, segment_num_docs, segment_token_docs) in loaded_stats {
+        if segment_token_docs.len() != terms.len() {
+            return Err(lance_core::Error::internal(format!(
+                "loaded FTS document-frequency count is {}, expected {}",
+                segment_token_docs.len(),
+                terms.len()
+            )));
+        }
+        total_tokens = total_tokens
+            .checked_add(segment_total_tokens)
+            .ok_or_else(|| lance_core::Error::index("FTS corpus token count overflows u64"))?;
+        num_docs = num_docs
+            .checked_add(segment_num_docs)
+            .ok_or_else(|| lance_core::Error::index("FTS corpus document count overflows usize"))?;
+        for (term, count) in terms.iter().zip(segment_token_docs) {
+            let total = token_docs.get_mut(term).ok_or_else(|| {
+                lance_core::Error::internal(format!(
+                    "global scorer term '{term}' was not initialized"
+                ))
+            })?;
+            *total = total.checked_add(count).ok_or_else(|| {
+                lance_core::Error::index(format!(
+                    "FTS document frequency for term '{term}' overflows usize"
+                ))
+            })?;
+        }
+    }
+    Ok(Some(Arc::new(MemBM25Scorer::new(
+        total_tokens,
+        num_docs,
+        token_docs,
+    ))))
+}
+
 /// Expand and score one indexed query leaf exactly once across all segments.
 ///
 /// Expansion consumes one deterministic `max_expansions` budget in query
@@ -208,6 +306,8 @@ pub async fn prepare_bm25_query(
                 "injected BM25 scorer is missing compound FTS token '{missing}'"
             )));
         }
+        scorer
+    } else if let Some(scorer) = bm25_scorer_from_loaded_stats(indices, &terms)? {
         scorer
     } else {
         let (mut total_tokens, mut num_docs, first_token_docs) =
@@ -508,6 +608,56 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 mod tests {
     use super::*;
     use crate::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+    #[test]
+    fn test_sync_df_kill_switch_parser() {
+        for value in [None, Some(""), Some("1"), Some("on"), Some("false")] {
+            assert!(
+                sync_df_enabled_from_value(value),
+                "unexpected disable: {value:?}"
+            );
+        }
+        for value in [Some("0"), Some("off"), Some("OFF"), Some(" off ")] {
+            assert!(
+                !sync_df_enabled_from_value(value),
+                "unexpected enable: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sync_df_merge_reports_checked_overflow_and_invalid_shape() {
+        let terms = vec!["term".to_string()];
+        for (stats, expected) in [
+            (
+                vec![(u64::MAX, 1, vec![1]), (1, 1, vec![1])],
+                "corpus token count overflows u64",
+            ),
+            (
+                vec![(1, usize::MAX, vec![1]), (1, 1, vec![1])],
+                "corpus document count overflows usize",
+            ),
+            (
+                vec![(1, 1, vec![usize::MAX]), (1, 1, vec![1])],
+                "document frequency for term 'term' overflows usize",
+            ),
+        ] {
+            let error = merge_loaded_bm25_stats(&terms, stats).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error: {error}"
+            );
+        }
+
+        let error = merge_loaded_bm25_stats(&terms, vec![(1, 1, Vec::new())]).unwrap_err();
+        assert!(matches!(error, lance_core::Error::Internal { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("document-frequency count is 0, expected 1"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn test_plugin_version_tracks_v3_capability_gate() {
