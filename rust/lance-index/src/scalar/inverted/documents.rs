@@ -167,6 +167,10 @@ impl DocLengths {
         self.total_tokens
     }
 
+    pub(crate) fn uses_quantized_scoring(&self) -> bool {
+        self.quantized_scoring
+    }
+
     #[inline]
     pub(crate) fn exact(&self, doc_id: DocId) -> u32 {
         self.values[doc_id.as_usize()]

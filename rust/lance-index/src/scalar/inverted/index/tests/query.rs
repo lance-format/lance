@@ -324,6 +324,44 @@ async fn write_pair_partition(
     builder.write(store.as_ref()).await.unwrap();
 }
 
+async fn write_pair_partition_v3(
+    store: &Arc<LanceIndexStore>,
+    partition_id: u64,
+    documents: &[(&str, &str, u64)],
+) {
+    let params = InvertedIndexParams::default().block_size(256).unwrap();
+    let format_version = params.resolved_format_version();
+    let block_size = params.posting_block_size();
+    let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+        partition_id,
+        false,
+        TokenSetFormat::default(),
+        format_version,
+        block_size,
+    );
+    let mut postings = BTreeMap::<String, PostingListBuilder>::new();
+    for (left, right, row_id) in documents {
+        let doc_id = builder.docs.append(*row_id, 2);
+        for token in [left, right] {
+            postings
+                .entry((*token).to_owned())
+                .or_insert_with(|| {
+                    PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                        false,
+                        format_version.posting_tail_codec(),
+                        block_size,
+                    )
+                })
+                .add(doc_id, PositionRecorder::Count(1));
+        }
+    }
+    for (token, posting) in postings {
+        builder.tokens.add(token);
+        builder.posting_lists.push(posting);
+    }
+    builder.write(store.as_ref()).await.unwrap();
+}
+
 async fn load_test_index(
     store: Arc<LanceIndexStore>,
     partition_ids: Vec<u64>,
@@ -354,6 +392,35 @@ async fn prepared_results(
                 Operator::And,
                 Arc::new(NoFilter),
                 Arc::new(NoOpMetricsCollector),
+            )
+            .await
+            .unwrap();
+        results.extend(
+            documents
+                .into_iter()
+                .map(|document| (document.row_id, document.score.0.to_bits())),
+        );
+    }
+    results.sort_unstable();
+    results
+}
+
+async fn unshared_results(
+    indices: &[Arc<InvertedIndex>],
+    tokens: Arc<Tokens>,
+    scorer: &MemBM25Scorer,
+    params: Arc<FtsSearchParams>,
+) -> Vec<(u64, u32)> {
+    let mut results = Vec::new();
+    for index in indices {
+        let documents = index
+            .bm25_search_documents(
+                tokens.clone(),
+                params.clone(),
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                Some(scorer),
             )
             .await
             .unwrap();
@@ -511,6 +578,129 @@ async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
         prepared_results(&indices, slow_prepared, params).await,
         "the synchronous scorer must preserve final score bits"
     );
+}
+
+#[tokio::test]
+async fn test_shared_norm_lut_is_query_wide_across_v3_segments() {
+    let mut dirs = Vec::new();
+    let mut caches = Vec::new();
+    let mut indices = Vec::new();
+    for segment in 0..2_u64 {
+        let dir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        for partition in 0..2_u64 {
+            write_pair_partition_v3(
+                &store,
+                partition,
+                &[
+                    ("alpha", "beta", 100 + segment * 100 + partition * 10),
+                    ("gamma", "delta", 101 + segment * 100 + partition * 10),
+                ],
+            )
+            .await;
+        }
+        write_test_metadata(
+            &store,
+            vec![0, 1],
+            InvertedIndexParams::default().block_size(256).unwrap(),
+        )
+        .await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store, None, cache.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(index.format_version(), InvertedListFormatVersion::V3);
+        dirs.push(dir);
+        caches.push(cache);
+        indices.push(index);
+    }
+
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+    let deferred_prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            &indices,
+            Tokens::new(vec!["alpha".to_owned(), "beta".to_owned()], DocType::Text),
+            params.as_ref(),
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        prepared_results(&indices, deferred_prepared.clone(), params.clone())
+            .await
+            .len(),
+        4
+    );
+    assert!(
+        deferred_prepared.shared_norm_addends.get().is_none(),
+        "deferred search must discard the prepared-query borrow before initializing the sidecar"
+    );
+
+    for index in &indices {
+        index
+            .prewarm_with_options(&FtsPrewarmOptions::default())
+            .await
+            .unwrap();
+        assert!(index.has_resident_document_projections());
+    }
+
+    let hit_prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            &indices,
+            Tokens::new(vec!["alpha".to_owned(), "beta".to_owned()], DocType::Text),
+            params.as_ref(),
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(hit_prepared.shared_norm_addends.get().is_none());
+    let hit_results = prepared_results(&indices, hit_prepared.clone(), params.clone()).await;
+    assert_eq!(hit_results.len(), 4);
+    let hit_shared = hit_prepared.shared_norm_addends.get().unwrap();
+    assert_eq!(hit_shared.build_count(), 1);
+    let hit_tokens = Arc::new(Tokens::new(
+        vec!["alpha".to_owned(), "beta".to_owned()],
+        DocType::Text,
+    ));
+    assert_eq!(
+        hit_results,
+        unshared_results(
+            &indices,
+            hit_tokens,
+            hit_prepared.scorer().as_ref(),
+            params.clone()
+        )
+        .await,
+        "query-wide and per-WAND norm LUTs must preserve final score bits"
+    );
+
+    let empty_prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            &indices,
+            Tokens::new(vec!["beta".to_owned(), "gamma".to_owned()], DocType::Text),
+            params.as_ref(),
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(empty_prepared.shared_norm_addends.get().is_none());
+    assert!(
+        prepared_results(&indices, empty_prepared.clone(), params)
+            .await
+            .is_empty()
+    );
+    let empty_shared = empty_prepared.shared_norm_addends.get().unwrap();
+    assert_eq!(empty_shared.build_count(), 0);
 }
 
 #[tokio::test]

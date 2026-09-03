@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 use crate::metrics::MetricsCollector;
 
 use super::{
-    CompressedPositionStorage,
+    CompressedPositionStorage, QueryNormAddends,
     documents::{DocId, DocLengths, DocVisibility},
     impact::{IMPACT_LEVEL1_BLOCKS, ImpactScoreCache, ImpactSkipData},
     index::{PositionStreamCodec, dequantize_doc_length},
@@ -2291,10 +2291,25 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     maxscore_general_windows: usize,
     documents: &'a D,
     scorer: S,
+    shared_norm_addends: Option<Arc<QueryNormAddends>>,
     // Shared cross-partition top-k floor. Each partition publishes its local
     // k-th score (`atomic_store_max_f32`) and prunes against the running value
     // -- a lower bound on the global k-th, so it never drops a real top-k doc.
     shared_threshold: Option<Arc<AtomicU32>>,
+}
+
+enum NormAddendCache {
+    Owned(Box<[f32; 256]>),
+    Shared(Arc<[f32; 256]>),
+}
+
+impl AsRef<[f32; 256]> for NormAddendCache {
+    fn as_ref(&self) -> &[f32; 256] {
+        match self {
+            Self::Owned(addends) => addends.as_ref(),
+            Self::Shared(addends) => addends.as_ref(),
+        }
+    }
 }
 
 /// Monotonically raise an f32 stored in an `AtomicU32` to `val`. CAS loop (not a
@@ -2306,6 +2321,16 @@ fn atomic_store_max_f32(slot: &AtomicU32, val: f32) {
             Ok(_) => break,
             Err(actual) => cur = actual,
         }
+    }
+}
+
+impl<'a, D: WandDocuments> Wand<'a, Arc<MemBM25Scorer>, D> {
+    pub(crate) fn with_shared_norm_addends(
+        mut self,
+        shared_norm_addends: Option<Arc<QueryNormAddends>>,
+    ) -> Self {
+        self.shared_norm_addends = shared_norm_addends;
+        self
     }
 }
 
@@ -2366,6 +2391,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             maxscore_general_windows: 0,
             documents,
             scorer,
+            shared_norm_addends: None,
             shared_threshold: None,
         }
     }
@@ -2395,13 +2421,22 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     /// factors `doc_weight` as `(K1+1)*freq/(freq + addend)`. Scoring through
     /// the cache is bit-identical to `scorer.doc_weight`, because both
     /// evaluate the same expressions on the same quantized lengths.
-    fn norm_k_cache(&self) -> Option<(&'a [u8], Box<[f32; 256]>)> {
+    fn norm_k_cache(&self) -> Option<(&'a [u8], NormAddendCache)> {
         let norms = self.documents.scoring_norms()?;
+        if self.operator == Operator::And
+            && matches!(self.num_terms, 2 | 3)
+            && let Some(addends) = self
+                .shared_norm_addends
+                .as_ref()
+                .and_then(|shared| shared.get_or_init(&self.scorer))
+        {
+            return Some((norms, NormAddendCache::Shared(addends)));
+        }
         let mut cache = Box::new([0f32; 256]);
         for (code, slot) in cache.iter_mut().enumerate() {
             *slot = self.scorer.doc_norm(dequantize_doc_length(code as u8))?;
         }
-        Some((norms, cache))
+        Some((norms, NormAddendCache::Owned(cache)))
     }
 
     /// Set the pruning threshold from this partition's k-th best, raised to the
@@ -5363,6 +5398,7 @@ mod tests {
     use arrow::buffer::ScalarBuffer;
     use rstest::rstest;
 
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::super::documents::resident_row_address_projection_for_test;
@@ -5894,6 +5930,127 @@ mod tests {
         let wand = Wand::new(Operator::Or, std::iter::empty(), &docs, PartialNormScorer);
 
         assert!(wand.norm_k_cache().is_none());
+    }
+
+    fn shared_norm_test_postings(
+        clause_docs: &[Vec<u32>],
+        num_docs: usize,
+    ) -> Vec<PostingIterator> {
+        clause_docs
+            .iter()
+            .enumerate()
+            .map(|(position, docs)| {
+                PostingIterator::with_query_weight(
+                    format!("t{position}"),
+                    position as u32,
+                    position as u32,
+                    1.0,
+                    generate_posting_list(docs.clone(), 1.0, None, true),
+                    num_docs,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_shared_norm_cache_builds_once_across_wands_and_not_for_empty_intersection() {
+        let mut docs = DocSet::default();
+        for doc_id in 0..4_u32 {
+            docs.append(u64::from(doc_id), doc_id + 1);
+        }
+        docs.set_quantized_scoring(true);
+        let scorer = Arc::new(MemBM25Scorer::new(10, docs.len(), HashMap::new()));
+        let params = FtsSearchParams::default().with_limit(Some(10));
+
+        for num_terms in [2, 3] {
+            let shared = Arc::new(QueryNormAddends::new(
+                scorer.doc_weight_cache_key().unwrap(),
+            ));
+            let matching_docs = vec![vec![0, 2]; num_terms];
+            for _ in 0..2 {
+                let postings = shared_norm_test_postings(&matching_docs, docs.len());
+                let mut wand =
+                    Wand::new(Operator::And, postings.into_iter(), &docs, scorer.clone())
+                        .with_shared_norm_addends(Some(shared.clone()));
+                assert_eq!(
+                    wand.search(&params, &NoOpMetricsCollector).unwrap().len(),
+                    2
+                );
+            }
+            assert_eq!(shared.build_count(), 1);
+
+            let empty_shared = Arc::new(QueryNormAddends::new(
+                scorer.doc_weight_cache_key().unwrap(),
+            ));
+            let mut disjoint_docs = vec![vec![0, 2], vec![1, 3]];
+            disjoint_docs.resize(num_terms, vec![0, 1, 2, 3]);
+            let postings = shared_norm_test_postings(&disjoint_docs, docs.len());
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, scorer.clone())
+                .with_shared_norm_addends(Some(empty_shared.clone()));
+            assert!(
+                wand.search(&params, &NoOpMetricsCollector)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(empty_shared.build_count(), 0);
+        }
+    }
+
+    #[test]
+    fn test_shared_norm_cache_keeps_ineligible_wands_on_local_path() {
+        let mut quantized_docs = DocSet::default();
+        quantized_docs.append(0, 3);
+        quantized_docs.set_quantized_scoring(true);
+        let scorer = Arc::new(MemBM25Scorer::new(10, 1, HashMap::new()));
+
+        for (operator, num_terms) in [
+            (Operator::And, 1),
+            (Operator::And, 4),
+            (Operator::And, 5),
+            (Operator::Or, 2),
+        ] {
+            let shared = Arc::new(QueryNormAddends::new(
+                scorer.doc_weight_cache_key().unwrap(),
+            ));
+            let clause_docs = vec![vec![0]; num_terms];
+            let postings = shared_norm_test_postings(&clause_docs, quantized_docs.len());
+            let wand = Wand::new(
+                operator,
+                postings.into_iter(),
+                &quantized_docs,
+                scorer.clone(),
+            )
+            .with_shared_norm_addends(Some(shared.clone()));
+            assert!(wand.norm_k_cache().is_some());
+            assert_eq!(shared.build_count(), 0);
+        }
+
+        let mut exact_docs = DocSet::default();
+        exact_docs.append(0, 3);
+        let shared = Arc::new(QueryNormAddends::new(
+            scorer.doc_weight_cache_key().unwrap(),
+        ));
+        let postings = shared_norm_test_postings(&[vec![0], vec![0]], exact_docs.len());
+        let wand = Wand::new(
+            Operator::And,
+            postings.into_iter(),
+            &exact_docs,
+            scorer.clone(),
+        )
+        .with_shared_norm_addends(Some(shared.clone()));
+        assert!(wand.norm_k_cache().is_none());
+        assert_eq!(shared.build_count(), 0);
+
+        let mismatched = Arc::new(QueryNormAddends::new(
+            MemBM25Scorer::new(100, 1, HashMap::new())
+                .doc_weight_cache_key()
+                .unwrap(),
+        ));
+        let postings = shared_norm_test_postings(&[vec![0], vec![0]], quantized_docs.len());
+        let wand = Wand::new(Operator::And, postings.into_iter(), &quantized_docs, scorer)
+            .with_shared_norm_addends(Some(mismatched.clone()));
+        assert!(wand.norm_k_cache().is_some());
+        assert_eq!(mismatched.build_count(), 0);
     }
 
     #[test]

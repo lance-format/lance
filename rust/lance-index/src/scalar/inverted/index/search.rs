@@ -417,6 +417,7 @@ impl InvertedIndex {
             prefilter,
             metrics,
             scorer,
+            None,
             initial_score_floor,
         )
         .await
@@ -509,6 +510,15 @@ impl InvertedIndex {
         {
             return Ok(Vec::new());
         }
+        let shared_norm_query = prepared
+            .should_share_norm_addends(
+                self.format_version() == InvertedListFormatVersion::V3
+                    && self.params.posting_block_size() == MAX_POSTING_BLOCK_SIZE,
+                !uses_fuzzy_expansion(params.fuzziness),
+                operator,
+                params.phrase_slop.is_some(),
+            )
+            .then(|| prepared.as_ref());
         self.bm25_search_final_documents(
             prepared.tokens().clone(),
             params,
@@ -516,6 +526,7 @@ impl InvertedIndex {
             prefilter,
             metrics,
             prepared.scorer().as_ref(),
+            shared_norm_query,
             initial_score_floor,
         )
         .await
@@ -533,6 +544,7 @@ impl InvertedIndex {
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
         scorer: &MemBM25Scorer,
+        shared_norm_query: Option<&PreparedBm25Query>,
         initial_score_floor: Option<f32>,
     ) -> Result<Vec<ScoredDoc>> {
         // The wand only consults `scorer.doc_weight`, which is metadata-free.
@@ -573,6 +585,7 @@ impl InvertedIndex {
                 metrics,
                 scorer,
                 impact_scorer,
+                shared_norm_query,
                 limit,
                 initial_score_floor,
             })
@@ -730,7 +743,7 @@ impl InvertedIndex {
 
     pub(super) async fn bm25_search_modern(
         &self,
-        request: ModernSearchRequest<'_>,
+        mut request: ModernSearchRequest<'_>,
     ) -> Result<Vec<ScoredDoc>> {
         // Select a concrete completion path before candidate search.  The
         // fully resident future never builds deferred address-read state, while
@@ -738,6 +751,7 @@ impl InvertedIndex {
         if self.has_resident_document_projections() {
             self.bm25_search_modern_resident(request).await
         } else {
+            request.shared_norm_query = None;
             self.bm25_search_modern_deferred(request).await
         }
     }
@@ -833,6 +847,7 @@ impl InvertedIndex {
             metrics,
             scorer,
             impact_scorer,
+            shared_norm_query,
             limit,
             initial_score_floor,
         } = request;
@@ -935,6 +950,14 @@ impl InvertedIndex {
                                 Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
                             };
                             let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
+                            let can_share_norm_addends = can_share_partition_norm_addends(
+                                operator,
+                                params.phrase_slop.is_some(),
+                                postings.len(),
+                                wand_scorer.is_some(),
+                                !grouped_expansions.is_empty(),
+                                lengths.uses_quantized_scoring(),
+                            );
                             Result::Ok(Some((
                                 partition_ordinal,
                                 part,
@@ -942,6 +965,7 @@ impl InvertedIndex {
                                 visibility,
                                 postings,
                                 wand_scorer,
+                                can_share_norm_addends,
                                 threshold,
                                 tokens_by_position,
                                 grouped_expansions,
@@ -958,6 +982,15 @@ impl InvertedIndex {
                     if loaded.is_empty() {
                         return Result::Ok(Vec::new());
                     }
+                    let shared_norm_addends = loaded
+                        .iter()
+                        .any(|(_, _, _, _, _, _, can_share_norm_addends, _, _, _)| {
+                            *can_share_norm_addends
+                        })
+                        .then(|| {
+                            shared_norm_query.and_then(|prepared| prepared.shared_norm_addends())
+                        })
+                        .flatten();
 
                     let results = spawn_cpu(move || {
                         let mut results = Vec::with_capacity(loaded.len());
@@ -968,11 +1001,15 @@ impl InvertedIndex {
                             visibility,
                             postings,
                             wand_scorer,
+                            can_share_norm_addends,
                             threshold,
                             tokens_by_position,
                             grouped_expansions,
                         ) in loaded
                         {
+                            let wand_norm_addends = can_share_norm_addends
+                                .then(|| shared_norm_addends.clone())
+                                .flatten();
                             let candidates = part.bm25_search_modern(
                                 lengths.as_ref(),
                                 &visibility,
@@ -980,6 +1017,7 @@ impl InvertedIndex {
                                 operator,
                                 postings,
                                 wand_scorer,
+                                wand_norm_addends,
                                 metrics.as_ref(),
                                 threshold,
                             )?;

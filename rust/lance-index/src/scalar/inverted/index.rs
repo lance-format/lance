@@ -17,6 +17,7 @@ use std::{
 
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
+use crate::scalar::inverted::{PreparedBm25Query, QueryNormAddends};
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use crate::vector::graph::OrderedFloat;
 use arrow::array::{BooleanBuilder, FixedSizeListBuilder, Float32Builder, Int32Builder};

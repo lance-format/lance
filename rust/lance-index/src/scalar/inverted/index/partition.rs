@@ -1415,6 +1415,7 @@ impl InvertedPartition {
             operator,
             postings,
             impact_scorer,
+            None,
             metrics,
             shared_threshold,
         )
@@ -1429,6 +1430,7 @@ impl InvertedPartition {
         operator: Operator,
         postings: Vec<PostingIterator>,
         impact_scorer: Option<Arc<MemBM25Scorer>>,
+        shared_norm_addends: Option<Arc<QueryNormAddends>>,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
     ) -> Result<Vec<DocCandidate<DocId>>> {
@@ -1440,6 +1442,7 @@ impl InvertedPartition {
                 operator,
                 postings,
                 impact_scorer,
+                shared_norm_addends,
                 metrics,
                 shared_threshold,
             )
@@ -1451,6 +1454,7 @@ impl InvertedPartition {
                 operator,
                 postings,
                 impact_scorer,
+                shared_norm_addends,
                 metrics,
                 shared_threshold,
             )
@@ -1466,6 +1470,7 @@ impl InvertedPartition {
         operator: Operator,
         postings: Vec<PostingIterator>,
         impact_scorer: Option<Arc<MemBM25Scorer>>,
+        shared_norm_addends: Option<Arc<QueryNormAddends>>,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
     ) -> Result<Vec<DocCandidate<D::Candidate>>> {
@@ -1475,6 +1480,7 @@ impl InvertedPartition {
 
         let hits = if let Some(scorer) = impact_scorer {
             let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
+                .with_shared_norm_addends(shared_norm_addends)
                 .with_shared_threshold(shared_threshold);
             wand.search(params, metrics)?
         } else {

@@ -18,7 +18,9 @@ pub mod tokenizer;
 mod wand;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
@@ -51,6 +53,50 @@ pub struct PreparedBm25Query {
     tokens: Arc<Tokens>,
     scorer: Arc<MemBM25Scorer>,
     has_all_query_positions: bool,
+    shared_norm_addends: OnceLock<Arc<QueryNormAddends>>,
+}
+
+/// Query-wide cache for the 256 document-norm denominator addends used by
+/// quantized modern indexes. The key binds the cache to the immutable scorer
+/// snapshot stored in [`PreparedBm25Query`].
+pub(super) struct QueryNormAddends {
+    scorer_key: u64,
+    addends: OnceLock<Option<Arc<[f32; 256]>>>,
+    #[cfg(test)]
+    build_count: AtomicUsize,
+}
+
+impl QueryNormAddends {
+    fn new(scorer_key: u64) -> Self {
+        Self {
+            scorer_key,
+            addends: OnceLock::new(),
+            #[cfg(test)]
+            build_count: AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn get_or_init<S: Scorer>(&self, scorer: &S) -> Option<Arc<[f32; 256]>> {
+        if scorer.doc_weight_cache_key() != Some(self.scorer_key) {
+            return None;
+        }
+        self.addends
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.build_count.fetch_add(1, Ordering::Relaxed);
+                let mut addends = [0.0; 256];
+                for (code, addend) in addends.iter_mut().enumerate() {
+                    *addend = scorer.doc_norm(dequantize_doc_length(code as u8))?;
+                }
+                Some(Arc::new(addends))
+            })
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn build_count(&self) -> usize {
+        self.build_count.load(Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for PreparedBm25Query {
@@ -74,6 +120,7 @@ impl PreparedBm25Query {
             tokens,
             scorer,
             has_all_query_positions,
+            shared_norm_addends: OnceLock::new(),
         }
     }
 
@@ -90,7 +137,51 @@ impl PreparedBm25Query {
     pub(crate) fn has_all_query_positions(&self) -> bool {
         self.has_all_query_positions
     }
+
+    pub(super) fn should_share_norm_addends(
+        &self,
+        is_v3: bool,
+        is_exact: bool,
+        operator: query::Operator,
+        is_phrase: bool,
+    ) -> bool {
+        *SHARED_NORM_LUT_ENABLED
+            && is_v3
+            && is_exact
+            && operator == query::Operator::And
+            && !is_phrase
+            && matches!(self.tokens.len(), 2 | 3)
+    }
+
+    pub(super) fn shared_norm_addends(&self) -> Option<Arc<QueryNormAddends>> {
+        self.shared_norm_addends_with_enabled(*SHARED_NORM_LUT_ENABLED)
+    }
+
+    fn shared_norm_addends_with_enabled(&self, enabled: bool) -> Option<Arc<QueryNormAddends>> {
+        if !enabled {
+            return None;
+        }
+        let scorer_key = self.scorer.doc_weight_cache_key()?;
+        Some(
+            self.shared_norm_addends
+                .get_or_init(|| Arc::new(QueryNormAddends::new(scorer_key)))
+                .clone(),
+        )
+    }
 }
+
+const LANCE_FTS_SHARED_NORM_LUT_ENV: &str = "LANCE_FTS_SHARED_NORM_LUT";
+
+fn shared_norm_lut_enabled_from_value(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("off")
+    })
+}
+
+static SHARED_NORM_LUT_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    shared_norm_lut_enabled_from_value(std::env::var(LANCE_FTS_SHARED_NORM_LUT_ENV).ok().as_deref())
+});
 
 pub(crate) fn final_query_tokens(
     indices: &[Arc<InvertedIndex>],
@@ -346,6 +437,7 @@ pub async fn prepare_bm25_query(
         tokens,
         scorer,
         has_all_query_positions,
+        shared_norm_addends: OnceLock::new(),
     })
 }
 
@@ -607,7 +699,99 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::inverted::document_tokenizer::DocType;
+    use crate::scalar::inverted::scorer::bm25_doc_weight_with_norm;
     use crate::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+    #[test]
+    fn test_shared_norm_lut_kill_switch_parser() {
+        for value in [None, Some(""), Some("1"), Some("on"), Some("false")] {
+            assert!(
+                shared_norm_lut_enabled_from_value(value),
+                "unexpected disable: {value:?}"
+            );
+        }
+        for value in [Some("0"), Some("off"), Some("OFF"), Some(" off ")] {
+            assert!(
+                !shared_norm_lut_enabled_from_value(value),
+                "unexpected enable: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shared_norm_addends_are_bit_exact_and_built_once() {
+        let scorer = Arc::new(MemBM25Scorer::new(4_096, 64, HashMap::new()));
+        let key = scorer.doc_weight_cache_key().unwrap();
+        let shared = Arc::new(QueryNormAddends::new(key));
+        let threads = (0..8)
+            .map(|_| {
+                let scorer = scorer.clone();
+                let shared = shared.clone();
+                std::thread::spawn(move || shared.get_or_init(&scorer).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let built_addends = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(shared.build_count(), 1);
+        assert!(
+            built_addends[1..]
+                .iter()
+                .all(|addends| Arc::ptr_eq(&built_addends[0], addends))
+        );
+        for code in 0..=u8::MAX {
+            let doc_length = dequantize_doc_length(code);
+            for frequency in [0, 1, 2, 7, 255, u32::MAX] {
+                assert_eq!(
+                    bm25_doc_weight_with_norm(frequency, built_addends[0][code as usize]).to_bits(),
+                    scorer.doc_weight(frequency, doc_length).to_bits()
+                );
+            }
+        }
+
+        let mismatched = MemBM25Scorer::new(4_097, 64, HashMap::new());
+        assert!(shared.get_or_init(&mismatched).is_none());
+        assert_eq!(shared.build_count(), 1);
+    }
+
+    #[test]
+    fn test_shared_norm_addend_query_routing_and_snapshot_invalidation() {
+        let make_prepared = |num_terms, scorer: Arc<MemBM25Scorer>| {
+            let tokens = (0..num_terms).map(|term| format!("t{term}")).collect();
+            PreparedBm25Query::from_parts(
+                Arc::new(Tokens::new(tokens, DocType::Text)),
+                scorer,
+                true,
+            )
+        };
+        let scorer = Arc::new(MemBM25Scorer::new(100, 10, HashMap::new()));
+        for num_terms in [1, 4, 5] {
+            let prepared = make_prepared(num_terms, scorer.clone());
+            assert!(!prepared.should_share_norm_addends(true, true, query::Operator::And, false));
+            assert!(prepared.shared_norm_addends.get().is_none());
+        }
+
+        let prepared = make_prepared(2, scorer.clone());
+        assert!(!prepared.should_share_norm_addends(false, true, query::Operator::And, false));
+        assert!(!prepared.should_share_norm_addends(true, false, query::Operator::And, false));
+        assert!(!prepared.should_share_norm_addends(true, true, query::Operator::Or, false));
+        assert!(!prepared.should_share_norm_addends(true, true, query::Operator::And, true));
+        assert!(prepared.shared_norm_addends.get().is_none());
+        assert!(prepared.shared_norm_addends_with_enabled(false).is_none());
+        assert!(prepared.shared_norm_addends.get().is_none());
+        assert!(prepared.should_share_norm_addends(true, true, query::Operator::And, false));
+
+        let old_shared = prepared.shared_norm_addends().unwrap();
+        let mut updated_scorer = scorer.as_ref().clone();
+        updated_scorer.update(&HashMap::new(), 25);
+        let updated = make_prepared(2, Arc::new(updated_scorer));
+        let updated_shared = updated.shared_norm_addends().unwrap();
+        assert_ne!(old_shared.scorer_key, updated_shared.scorer_key);
+        assert!(!Arc::ptr_eq(&old_shared, &updated_shared));
+    }
 
     #[test]
     fn test_sync_df_kill_switch_parser() {

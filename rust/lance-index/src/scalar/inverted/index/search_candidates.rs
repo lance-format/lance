@@ -18,9 +18,26 @@ pub(super) struct ModernSearchRequest<'a> {
     pub(super) metrics: Arc<dyn MetricsCollector>,
     pub(super) scorer: &'a MemBM25Scorer,
     pub(super) impact_scorer: Arc<MemBM25Scorer>,
+    pub(super) shared_norm_query: Option<&'a PreparedBm25Query>,
     pub(super) limit: usize,
     /// Exclusive raw-score floor used to seed standalone Match WAND.
     pub(super) initial_score_floor: Option<f32>,
+}
+
+pub(super) fn can_share_partition_norm_addends(
+    operator: Operator,
+    is_phrase: bool,
+    num_clauses: usize,
+    uses_global_scorer: bool,
+    has_grouped_expansions: bool,
+    uses_quantized_scoring: bool,
+) -> bool {
+    operator == Operator::And
+        && !is_phrase
+        && matches!(num_clauses, 2 | 3)
+        && uses_global_scorer
+        && !has_grouped_expansions
+        && uses_quantized_scoring
 }
 
 /// Typed identity for one modern candidate after partition-local scoring.
@@ -243,4 +260,40 @@ impl LoadedPostings {
 pub(super) struct GroupedExpansionTerms {
     pub(super) position: u32,
     pub(super) terms: Arc<[GroupedTermScorer]>,
+}
+
+#[cfg(test)]
+mod shared_norm_tests {
+    use super::*;
+
+    #[test]
+    fn test_partition_shared_norm_routing() {
+        assert!(can_share_partition_norm_addends(
+            Operator::And,
+            false,
+            2,
+            true,
+            false,
+            true
+        ));
+        assert!(can_share_partition_norm_addends(
+            Operator::And,
+            false,
+            3,
+            true,
+            false,
+            true
+        ));
+        for ineligible in [
+            can_share_partition_norm_addends(Operator::Or, false, 2, true, false, true),
+            can_share_partition_norm_addends(Operator::And, true, 2, true, false, true),
+            can_share_partition_norm_addends(Operator::And, false, 1, true, false, true),
+            can_share_partition_norm_addends(Operator::And, false, 4, true, false, true),
+            can_share_partition_norm_addends(Operator::And, false, 2, false, false, true),
+            can_share_partition_norm_addends(Operator::And, false, 2, true, true, true),
+            can_share_partition_norm_addends(Operator::And, false, 2, true, false, false),
+        ] {
+            assert!(!ineligible);
+        }
+    }
 }

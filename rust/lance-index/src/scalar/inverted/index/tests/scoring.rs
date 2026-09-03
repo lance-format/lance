@@ -712,6 +712,7 @@ async fn search_test_impact_partition(
             Operator::Or,
             postings,
             Some(scorer),
+            None,
             &NoOpMetricsCollector,
             shared_threshold,
         )
@@ -865,6 +866,7 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
                     Operator::And,
                     postings,
                     Some(scorer.clone()),
+                    None,
                     &NoOpMetricsCollector,
                     shared_threshold.clone(),
                 )
