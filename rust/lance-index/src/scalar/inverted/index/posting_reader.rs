@@ -73,6 +73,10 @@ pub(super) enum PositionsLayout {
 pub(in super::super) enum PostingReadPolicy {
     ReadAhead,
     CacheAwareExact,
+    /// An explicit full prewarm says the read-ahead group should already be
+    /// resident. Probe it without constructing the singleflight loader, then
+    /// fall back to the normal read-ahead path if that hint became stale.
+    Prewarmed,
 }
 
 impl std::fmt::Debug for PostingListReader {
@@ -441,22 +445,37 @@ impl PostingListReader {
                         "posting token id {token_id} cannot form an exclusive singleton range"
                     ))
                 })?;
-                if read_policy == PostingReadPolicy::CacheAwareExact
-                    && (start != token_id || end != exact_end)
-                    && let Some(group) = self
-                        .index_cache
-                        .get_with_key(&posting_list_group_cache_key(start, end, self.has_impacts))
-                        .await
-                {
-                    // This cache-only probe never invokes the posting loader.
-                    // Report the group hit because it is the path that serves
-                    // the posting; a probe miss is not a query-cache miss.
+                let resident_group = match read_policy {
+                    PostingReadPolicy::CacheAwareExact if start != token_id || end != exact_end => {
+                        self.index_cache
+                            .get_with_key(&posting_list_group_cache_key(
+                                start,
+                                end,
+                                self.has_impacts,
+                            ))
+                            .await
+                    }
+                    PostingReadPolicy::Prewarmed => {
+                        self.index_cache
+                            .get_with_key_if_present(&posting_list_group_cache_key(
+                                start,
+                                end,
+                                self.has_impacts,
+                            ))
+                            .await
+                    }
+                    _ => None,
+                };
+                if let Some(group) = resident_group {
+                    // A stale prewarmed probe does not record a cache miss. It
+                    // falls through to the existing loader, which records the
+                    // one logical miss instead.
                     metrics.record_index_cache_hit();
                     self.posting_from_group(token_id, start, end, group.as_ref(), metrics)
                         .await?
                 } else {
                     let (selected_start, selected_end) = match read_policy {
-                        PostingReadPolicy::ReadAhead => (start, end),
+                        PostingReadPolicy::ReadAhead | PostingReadPolicy::Prewarmed => (start, end),
                         PostingReadPolicy::CacheAwareExact => (token_id, exact_end),
                     };
                     self.load_cached_posting_group(token_id, selected_start, selected_end, metrics)

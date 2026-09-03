@@ -4,6 +4,35 @@
 use super::partition::FuzzyAutomaton;
 use super::*;
 
+const PREWARMED_POSTING_FAST_HIT_ENV: &str = "LANCE_FTS_PREWARMED_POSTING_FAST_HIT";
+
+fn prewarmed_posting_fast_hit_enabled_from_env(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("off")
+    })
+}
+
+static PREWARMED_POSTING_FAST_HIT_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    prewarmed_posting_fast_hit_enabled_from_env(
+        std::env::var(PREWARMED_POSTING_FAST_HIT_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+fn posting_load_options_for_search(
+    prewarmed_query_state_ready: bool,
+    is_phrase_query: bool,
+    fast_hit_enabled: bool,
+) -> PostingLoadOptions {
+    if prewarmed_query_state_ready && !is_phrase_query && fast_hit_enabled {
+        PostingLoadOptions::prewarmed(false)
+    } else {
+        PostingLoadOptions::read_ahead(false)
+    }
+}
+
 impl InvertedIndex {
     /// Add this segment's lexicographically smallest fuzzy candidates for one
     /// compiled query-token automaton to a caller-owned cross-segment merge
@@ -794,6 +823,15 @@ impl InvertedIndex {
         let impact_shared_threshold = Arc::new(AtomicU32::new(
             initial_score_floor.unwrap_or(f32::NEG_INFINITY).to_bits(),
         ));
+        let is_phrase_query = params.phrase_slop.is_some();
+        let fast_hit_enabled = *PREWARMED_POSTING_FAST_HIT_ENABLED;
+        let prewarmed_query_state_ready =
+            fast_hit_enabled && !is_phrase_query && self.prewarmed_query_state_ready(false);
+        let posting_load_options = posting_load_options_for_search(
+            prewarmed_query_state_ready,
+            is_phrase_query,
+            fast_hit_enabled,
+        );
         let io_parallelism = self.store.io_parallelism();
         let parts = self
             .partitions
@@ -829,13 +867,13 @@ impl InvertedIndex {
                                 exact_scoring_required,
                                 ..
                             } = part
-                                .load_posting_lists(
+                                .load_posting_lists_with_policy(
                                     tokens.as_ref(),
                                     params.as_ref(),
                                     operator,
                                     impact_scorer.as_ref(),
                                     metrics.as_ref(),
-                                    false,
+                                    posting_load_options,
                                 )
                                 .await?;
                             if postings.is_empty() {
@@ -1068,5 +1106,40 @@ impl InvertedIndex {
             }
         }
         Ok(resolved_documents)
+    }
+}
+
+#[cfg(test)]
+mod prewarmed_posting_fast_hit_tests {
+    use super::*;
+
+    #[test]
+    fn kill_switch_values_disable_fast_hit() {
+        assert!(prewarmed_posting_fast_hit_enabled_from_env(None));
+        assert!(prewarmed_posting_fast_hit_enabled_from_env(Some("1")));
+        assert!(prewarmed_posting_fast_hit_enabled_from_env(Some("on")));
+        assert!(!prewarmed_posting_fast_hit_enabled_from_env(Some("0")));
+        assert!(!prewarmed_posting_fast_hit_enabled_from_env(Some("off")));
+        assert!(!prewarmed_posting_fast_hit_enabled_from_env(Some(" OFF ")));
+    }
+
+    #[test]
+    fn fast_hit_requires_non_phrase_prewarmed_query_state() {
+        assert_eq!(
+            posting_load_options_for_search(true, false, true),
+            PostingLoadOptions::prewarmed(false)
+        );
+        assert_eq!(
+            posting_load_options_for_search(false, false, true),
+            PostingLoadOptions::read_ahead(false)
+        );
+        assert_eq!(
+            posting_load_options_for_search(true, true, true),
+            PostingLoadOptions::read_ahead(false)
+        );
+        assert_eq!(
+            posting_load_options_for_search(true, false, false),
+            PostingLoadOptions::read_ahead(false)
+        );
     }
 }

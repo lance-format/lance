@@ -106,6 +106,73 @@ struct CountingStore {
     counter: Arc<PostingMetadataCounter>,
 }
 
+#[derive(Debug)]
+struct CountingCacheBackend {
+    inner: lance_core::cache::QuickCacheBackend,
+    gets: std::sync::atomic::AtomicUsize,
+    get_or_inserts: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingCacheBackend {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: lance_core::cache::QuickCacheBackend::with_capacity(capacity),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+            get_or_inserts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl lance_core::cache::CacheBackend for CountingCacheBackend {
+    async fn get(
+        &self,
+        key: &lance_core::cache::InternalCacheKey,
+        codec: Option<lance_core::cache::CacheCodec>,
+    ) -> Option<lance_core::cache::CacheEntry> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        lance_core::cache::CacheBackend::get(&self.inner, key, codec).await
+    }
+
+    async fn insert(
+        &self,
+        key: &lance_core::cache::InternalCacheKey,
+        entry: lance_core::cache::CacheEntry,
+        size_bytes: usize,
+        codec: Option<lance_core::cache::CacheCodec>,
+    ) {
+        lance_core::cache::CacheBackend::insert(&self.inner, key, entry, size_bytes, codec).await;
+    }
+
+    async fn get_or_insert<'a>(
+        &self,
+        key: &lance_core::cache::InternalCacheKey,
+        loader: std::pin::Pin<
+            Box<
+                dyn futures::Future<Output = Result<(lance_core::cache::CacheEntry, usize)>>
+                    + Send
+                    + 'a,
+            >,
+        >,
+        codec: Option<lance_core::cache::CacheCodec>,
+    ) -> Result<(lance_core::cache::CacheEntry, bool)> {
+        self.get_or_inserts.fetch_add(1, Ordering::Relaxed);
+        lance_core::cache::CacheBackend::get_or_insert(&self.inner, key, loader, codec).await
+    }
+
+    async fn clear(&self) {
+        lance_core::cache::CacheBackend::clear(&self.inner).await;
+    }
+
+    async fn num_entries(&self) -> usize {
+        lance_core::cache::CacheBackend::num_entries(&self.inner).await
+    }
+
+    async fn size_bytes(&self) -> usize {
+        lance_core::cache::CacheBackend::size_bytes(&self.inner).await
+    }
+}
+
 impl DeepSizeOf for CountingStore {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.inner.deep_size_of_children(context)
@@ -638,6 +705,85 @@ async fn test_cache_aware_exact_reuses_prewarmed_read_ahead_group() {
     assert_eq!(metrics.index_cache_hits(), 1);
     assert_eq!(metrics.index_cache_misses(), 0);
     assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn test_prewarmed_read_uses_group_fast_hit_once() {
+    let backend = Arc::new(CountingCacheBackend::new(1024 * 1024));
+    let cache = LanceCache::with_backend(backend.clone());
+    let (mut index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    set_test_posting_group_size(&mut index, 4);
+    let inverted_list = index.partitions[0].inverted_list.clone();
+    inverted_list.prewarm_posting_lists(false, 1).await.unwrap();
+    let calls_after_prewarm = counter.read_range_calls();
+    let cache_stats_before = cache.stats().await;
+    let gets_before = backend.gets.load(Ordering::Relaxed);
+    let get_or_inserts_before = backend.get_or_inserts.load(Ordering::Relaxed);
+    let metrics = LocalMetricsCollector::default();
+
+    let posting = inverted_list
+        .posting_list_with_policy(0, false, &metrics, PostingReadPolicy::Prewarmed)
+        .await
+        .unwrap();
+
+    assert_eq!(posting.len(), 1);
+    assert_eq!(counter.read_range_calls(), calls_after_prewarm);
+    assert_eq!(metrics.index_cache_hits(), 1);
+    assert_eq!(metrics.index_cache_misses(), 0);
+    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 0);
+    let cache_stats_after = cache.stats().await;
+    assert_eq!(cache_stats_after.hits - cache_stats_before.hits, 1);
+    assert_eq!(cache_stats_after.misses - cache_stats_before.misses, 0);
+    assert_eq!(backend.gets.load(Ordering::Relaxed) - gets_before, 1);
+    assert_eq!(
+        backend.get_or_inserts.load(Ordering::Relaxed) - get_or_inserts_before,
+        0,
+        "a full-prewarm hit must not construct or enter the singleflight loader path"
+    );
+}
+
+#[tokio::test]
+async fn test_prewarmed_read_stale_hint_falls_back_once() {
+    let backend = Arc::new(CountingCacheBackend::new(1024 * 1024));
+    let cache = LanceCache::with_backend(backend.clone());
+    let (mut index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    set_test_posting_group_size(&mut index, 4);
+    let inverted_list = index.partitions[0].inverted_list.clone();
+    inverted_list.prewarm_posting_lists(false, 1).await.unwrap();
+    cache.clear().await;
+    let calls_before_lookup = counter.read_range_calls();
+    let gets_before = backend.gets.load(Ordering::Relaxed);
+    let get_or_inserts_before = backend.get_or_inserts.load(Ordering::Relaxed);
+    let metrics = LocalMetricsCollector::default();
+
+    let posting = inverted_list
+        .posting_list_with_policy(0, false, &metrics, PostingReadPolicy::Prewarmed)
+        .await
+        .unwrap();
+
+    assert_eq!(posting.len(), 1);
+    assert_eq!(counter.read_range_calls() - calls_before_lookup, 1);
+    assert_eq!(metrics.index_cache_hits(), 0);
+    assert_eq!(metrics.index_cache_misses(), 1);
+    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+    let cache_stats = cache.stats().await;
+    assert_eq!((cache_stats.hits, cache_stats.misses), (0, 1));
+    assert_eq!(backend.gets.load(Ordering::Relaxed) - gets_before, 1);
+    assert_eq!(
+        backend.get_or_inserts.load(Ordering::Relaxed) - get_or_inserts_before,
+        1,
+        "a stale prewarm hint must enter the original singleflight fallback exactly once"
+    );
+
+    let warm_metrics = LocalMetricsCollector::default();
+    inverted_list
+        .posting_list_with_policy(0, false, &warm_metrics, PostingReadPolicy::Prewarmed)
+        .await
+        .unwrap();
+    assert_eq!(warm_metrics.index_cache_hits(), 1);
+    assert_eq!(warm_metrics.index_cache_misses(), 0);
+    let cache_stats = cache.stats().await;
+    assert_eq!((cache_stats.hits, cache_stats.misses), (1, 1));
 }
 
 #[tokio::test]
