@@ -396,34 +396,6 @@ impl LanceCache {
         }
     }
 
-    /// Look up a typed cache entry, recording a hit but not a miss.
-    ///
-    /// This is intended for optimistic routing hints where a miss is followed
-    /// by the normal cache loading path. That fallback remains responsible for
-    /// recording the single logical miss.
-    #[doc(hidden)]
-    pub async fn get_with_key_if_present<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
-    where
-        K: CacheKey,
-        K::ValueType: DeepSizeOf + Send + Sync + 'static,
-    {
-        let key = self.sized_key(cache_key);
-        let entry = self.state.backend.get(&key, K::codec()).await?;
-        match entry.downcast::<K::ValueType>() {
-            Ok(value) => {
-                self.state.hits.fetch_add(1, Ordering::Relaxed);
-                Some(value)
-            }
-            Err(_) => {
-                log::warn!(
-                    "cache backend returned a value with the wrong concrete type for key type {:?}",
-                    K::stable_type_id()
-                );
-                None
-            }
-        }
-    }
-
     pub async fn get_or_insert_with_key<K, F, Fut>(
         &self,
         cache_key: K,
@@ -621,16 +593,6 @@ impl WeakLanceCache {
         self.upgrade()?.get_with_key(cache_key).await
     }
 
-    /// Look up a typed cache entry, recording a hit but not a miss.
-    #[doc(hidden)]
-    pub async fn get_with_key_if_present<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
-    where
-        K: CacheKey,
-        K::ValueType: DeepSizeOf + Send + Sync + 'static,
-    {
-        self.upgrade()?.get_with_key_if_present(cache_key).await
-    }
-
     pub async fn insert_with_key<K>(&self, cache_key: &K, value: Arc<K::ValueType>) -> bool
     where
         K: CacheKey,
@@ -719,8 +681,7 @@ impl WeakLanceCache {
 
 #[derive(Debug, Clone)]
 pub struct CacheStats {
-    /// Number of times a cache lookup found an item, including optimistic
-    /// present-only lookups.
+    /// Number of times `get`, `get_unsized`, or `get_or_insert` found an item in the cache.
     pub hits: u64,
     /// Number of times `get`, `get_unsized`, or `get_or_insert` did not find an item in the cache.
     pub misses: u64,
@@ -1151,33 +1112,6 @@ mod tests {
             .unwrap();
         assert_eq!(*value, vec![1, 2, 3]);
         assert!(was_cached);
-    }
-
-    #[tokio::test]
-    async fn get_with_key_if_present_only_records_hits() {
-        let cache = LanceCache::with_capacity(4096);
-
-        assert!(
-            cache
-                .get_with_key_if_present(&TestKey::new(1))
-                .await
-                .is_none()
-        );
-        let stats = cache.stats().await;
-        assert_eq!((stats.hits, stats.misses), (0, 0));
-
-        cache
-            .insert_with_key(&TestKey::new(1), Arc::new(vec![1, 2, 3]))
-            .await;
-        assert_eq!(
-            cache
-                .get_with_key_if_present(&TestKey::new(1))
-                .await
-                .as_deref(),
-            Some(&vec![1, 2, 3])
-        );
-        let stats = cache.stats().await;
-        assert_eq!((stats.hits, stats.misses), (1, 0));
     }
 
     #[tokio::test]

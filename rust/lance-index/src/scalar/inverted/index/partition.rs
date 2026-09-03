@@ -472,14 +472,14 @@ struct PositionMatchSummary {
     every_position_matched: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(in super::super) struct PostingLoadOptions {
     force_global_scorer: bool,
     read_policy: PostingReadPolicy,
 }
 
 impl PostingLoadOptions {
-    pub(in super::super) const fn read_ahead(force_global_scorer: bool) -> Self {
+    const fn read_ahead(force_global_scorer: bool) -> Self {
         Self {
             force_global_scorer,
             read_policy: PostingReadPolicy::ReadAhead,
@@ -490,13 +490,6 @@ impl PostingLoadOptions {
         Self {
             force_global_scorer,
             read_policy: PostingReadPolicy::CacheAwareExact,
-        }
-    }
-
-    pub(in super::super) const fn prewarmed(force_global_scorer: bool) -> Self {
-        Self {
-            force_global_scorer,
-            read_policy: PostingReadPolicy::Prewarmed,
         }
     }
 }
@@ -601,9 +594,6 @@ fn effective_posting_read_policy(
 ) -> PostingReadPolicy {
     if requested_policy == PostingReadPolicy::ReadAhead {
         return PostingReadPolicy::ReadAhead;
-    }
-    if requested_policy == PostingReadPolicy::Prewarmed {
-        return PostingReadPolicy::Prewarmed;
     }
     let Some(group) = inverted_list.group_range_for_token(token_id) else {
         return PostingReadPolicy::CacheAwareExact;
@@ -1210,7 +1200,7 @@ impl InvertedPartition {
                                 .posting_list(token_id, is_phrase_query, metrics)
                                 .await?
                         }
-                        PostingReadPolicy::CacheAwareExact | PostingReadPolicy::Prewarmed => {
+                        PostingReadPolicy::CacheAwareExact => {
                             self.inverted_list
                                 .posting_list_with_policy(
                                     token_id,
