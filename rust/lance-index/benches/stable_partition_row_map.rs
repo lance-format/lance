@@ -9,6 +9,10 @@
 //! low-cardinality u16 column, so the Lance page dictionary path should land
 //! well under the nominal 10 bits (ceil(log2 1000)) per row.
 
+// The size probes report to the human running the bench; log targets nothing
+// useful here.
+#![allow(clippy::print_stdout)]
+
 use std::hint::black_box;
 use std::sync::{Arc, OnceLock};
 

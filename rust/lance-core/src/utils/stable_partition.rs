@@ -37,7 +37,7 @@
 //!   cumulative per-label row count through the end of that block, as a
 //!   dense `num_blocks * m` grid. A block is the unit of storage, IO and
 //!   caching for the label column. The grid size is exact and data
-//!   independent (~600 KB for 50M rows across 500 destinations, ~61 MB at a
+//!   independent (~1.5 MB for 50M rows across 500 destinations, ~61 MB at a
 //!   1B-row rewrite across 1000); the encoded header names the
 //!   representation so sparser encodings can be added later without breaking
 //!   readers.
