@@ -20,6 +20,8 @@ use lance_index::frag_reuse::row_map::{RowMapReader, RowMapWriter, SourceRows};
 use lance_index::scalar::IndexStore;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_io::object_store::ObjectStore;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use roaring::RoaringBitmap;
 
 const TOTAL_ROWS: u64 = 2_000_000;
@@ -32,18 +34,6 @@ struct Fixture {
 }
 
 static FIXTURE: OnceLock<Fixture> = OnceLock::new();
-
-struct Lcg(u64);
-
-impl Lcg {
-    fn next(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        self.0 >> 33
-    }
-}
 
 fn fixture() -> &'static Fixture {
     FIXTURE.get_or_init(|| {
@@ -66,10 +56,10 @@ fn fixture() -> &'static Fixture {
             lance_file::version::ConcreteFileVersion::V2_1,
         ));
 
-        let mut lcg = Lcg(97);
+        let mut rng = StdRng::seed_from_u64(97);
         let mut deleted = RoaringBitmap::new();
         for offset in 0..TOTAL_ROWS {
-            if lcg.next().is_multiple_of(8) {
+            if rng.random_ratio(1, 8) {
                 deleted.insert(offset as u32);
             }
         }
@@ -87,7 +77,7 @@ fn fixture() -> &'static Fixture {
             let mut writer = RowMapWriter::try_new(writer, sources, NUM_DESTINATIONS).unwrap();
             let mut pending = Vec::with_capacity(64 * 1024);
             for _ in 0..live_rows {
-                pending.push((lcg.next() % u64::from(NUM_DESTINATIONS)) as u16);
+                pending.push(rng.random_range(0..NUM_DESTINATIONS) as u16);
                 if pending.len() == pending.capacity() {
                     writer.append_labels(&pending).await.unwrap();
                     pending.clear();
@@ -125,7 +115,9 @@ fn fixture() -> &'static Fixture {
             let mut pending = Vec::with_capacity(64 * 1024);
             for row in 0..local_rows {
                 let window = (row / (64 * 1024)) * 16 % u64::from(NUM_DESTINATIONS);
-                pending.push(((window + lcg.next() % 16) % u64::from(NUM_DESTINATIONS)) as u16);
+                pending.push(
+                    ((window + rng.random_range(0..16)) % u64::from(NUM_DESTINATIONS)) as u16,
+                );
                 if pending.len() == pending.capacity() {
                     writer.append_labels(&pending).await.unwrap();
                     pending.clear();
@@ -136,7 +128,7 @@ fn fixture() -> &'static Fixture {
             let local_counts_bytes = local_counts.encode().len();
             println!(
                 "row map (16-destination block locality): {local_rows} rows -> \
-                 {} bytes file ({:.2} bits/row)",
+                 {} bytes file ({:.2} bits/row), {local_counts_bytes} bytes counts",
                 local_file.size_bytes,
                 (local_file
                     .size_bytes
@@ -160,10 +152,10 @@ fn fixture() -> &'static Fixture {
 
 fn bench_point_translate(c: &mut Criterion) {
     let fixture = fixture();
-    let mut lcg = Lcg(3);
+    let mut rng = StdRng::seed_from_u64(3);
     c.bench_function("row_map/translate_point", |b| {
         b.iter(|| {
-            let row = lcg.next() % TOTAL_ROWS;
+            let row = rng.random_range(0..TOTAL_ROWS);
             black_box(
                 fixture
                     .runtime
@@ -176,8 +168,8 @@ fn bench_point_translate(c: &mut Criterion) {
 
 fn bench_translate_many(c: &mut Criterion) {
     let fixture = fixture();
-    let mut lcg = Lcg(5);
-    let rows: Vec<u64> = (0..1024).map(|_| lcg.next() % TOTAL_ROWS).collect();
+    let mut rng = StdRng::seed_from_u64(5);
+    let rows: Vec<u64> = (0..1024).map(|_| rng.random_range(0..TOTAL_ROWS)).collect();
     c.bench_function("row_map/translate_many_1k", |b| {
         b.iter(|| {
             black_box(
@@ -214,9 +206,9 @@ fn bench_sweep(c: &mut Criterion) {
 fn bench_rank_in_block(c: &mut Criterion) {
     // The in-memory cost of one worst-case point lookup: ranking a label over
     // a full 64K block.
-    let mut lcg = Lcg(11);
+    let mut rng = StdRng::seed_from_u64(11);
     let values: Vec<u16> = (0..64 * 1024)
-        .map(|_| (lcg.next() % u64::from(NUM_DESTINATIONS)) as u16)
+        .map(|_| rng.random_range(0..NUM_DESTINATIONS) as u16)
         .collect();
     c.bench_function("row_map/rank_label_prefix_64k", |b| {
         b.iter(|| black_box(rank_label_prefix(&values, None, values.len(), 500)))
