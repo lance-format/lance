@@ -12,22 +12,15 @@
 //! * NULL — the row was deleted at the source; the rewrite moved it nowhere.
 //!
 //! The per-block cumulative counts
-//! ([`CountsMatrix`](lance_core::utils::stable_partition::CountsMatrix)) are
+//! ([`CountsMatrix`]) are
 //! serialized into a global buffer of the same file, so opening costs one tail
-//! read and no label IO. Point translations read one block of labels; sweeps
+//! read plus an in-memory consistency check of the counts; no label IO. Point translations read one block of labels; sweeps
 //! stream blocks in order. The translation arithmetic itself lives in
 //! [`lance_core::utils::stable_partition`].
 //!
 //! The writer is fed labels of *live* rows only, in source scan order, and
 //! interleaves the NULL rows itself from the source deletion vectors: the
 //! rewrite job scans with deletions applied, so it never sees a deleted row.
-//!
-//! Correctness rests on the stable-partition ordering contract spelled out
-//! in [`lance_core::utils::stable_partition`]: labels arrive in source
-//! physical-row order, each destination is written in that same order and
-//! never re-sorted, and the destination list is fixed for the rewrite. A
-//! job that routes rows through parallel writers must restore that order
-//! per destination before feeding this writer.
 //!
 //! Correctness rests on the stable-partition ordering contract spelled out
 //! in [`lance_core::utils::stable_partition`]: labels arrive in source
@@ -113,6 +106,9 @@ impl RowMapWriter {
         label_schema()
     }
 
+    /// Create a writer over `sources` (the rewrite's source fragments in
+    /// scan order) targeting `num_destinations` ordered destinations, with
+    /// the default 64K-row block size.
     pub fn try_new(
         writer: Box<dyn IndexWriter>,
         sources: Vec<SourceRows>,
@@ -121,6 +117,8 @@ impl RowMapWriter {
         Self::try_new_with_block_rows(writer, sources, num_destinations, DEFAULT_BLOCK_ROWS)
     }
 
+    /// [`Self::try_new`] with an explicit block size, the counts granularity
+    /// and label IO unit; tests use small blocks to exercise boundaries.
     pub fn try_new_with_block_rows(
         writer: Box<dyn IndexWriter>,
         sources: Vec<SourceRows>,
@@ -267,17 +265,23 @@ impl RowMapReader {
     /// must fail here rather than translate rows to wrong addresses.
     pub async fn open(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let schema = reader.schema();
-        let label_field = schema
-            .fields
-            .first()
-            .ok_or_else(|| Error::corrupt_file_named("row_map", "row map file has no columns"))?;
+        let [label_field] = schema.fields.as_slice() else {
+            return Err(Error::corrupt_file_named(
+                "row_map",
+                format!(
+                    "row map file must hold exactly one column, found {}",
+                    schema.fields.len()
+                ),
+            ));
+        };
         if label_field.name != LABEL_COLUMN
             || label_field.data_type() != arrow_schema::DataType::UInt16
+            || !label_field.nullable
         {
             return Err(Error::corrupt_file_named(
                 "row_map",
                 format!(
-                    "row map file must hold a single u16 {LABEL_COLUMN} column, found {} of type {}",
+                    "row map file must hold a single nullable u16 {LABEL_COLUMN} column, found {} of type {}",
                     label_field.name,
                     label_field.data_type()
                 ),
@@ -308,6 +312,8 @@ impl RowMapReader {
         Ok(Self { reader, counts })
     }
 
+    /// The validated counts matrix decoded at open: per-destination totals
+    /// and per-block counter bases without any label IO.
     pub fn counts(&self) -> &CountsMatrix {
         &self.counts
     }
@@ -401,6 +407,10 @@ impl RowMapReader {
         self.check_row(rows.end - 1)?;
         let start_block = self.counts.block_of(rows.start);
         let end_block = self.counts.block_of(rows.end - 1);
+        // Blocks are read one at a time on purpose: a sweep is bulk work and
+        // bounded memory matters more than per-block latency. Overlapping the
+        // next block's read with translation belongs to the read-integration
+        // follow-up.
         // The sweep counters start at a block boundary; rows before
         // `rows.start` in the first block are translated and discarded.
         let mut translator = SweepTranslator::new(&self.counts, start_block)?;
@@ -690,5 +700,59 @@ mod tests {
         writer.finish().await.unwrap();
         let reader = store.open_index_file("not_a_row_map.lance").await.unwrap();
         assert!(RowMapReader::open(reader).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_null_edge_cases() {
+        // Deterministic NULL/empty shapes: a fully-deleted source, a
+        // zero-physical-row source, and a deleted tail that only finish()
+        // drains. 7 physical rows, 2 live.
+        let sources = vec![
+            SourceRows {
+                physical_rows: 4,
+                deleted: Some(RoaringBitmap::from_iter(0u32..4)),
+            },
+            SourceRows {
+                physical_rows: 0,
+                deleted: None,
+            },
+            SourceRows {
+                physical_rows: 3,
+                deleted: Some(RoaringBitmap::from_iter([2u32])),
+            },
+        ];
+        let tempdir = TempDir::default();
+        let store = test_store(&tempdir);
+        let writer = store
+            .new_index_file("row_map.lance", RowMapWriter::schema())
+            .await
+            .unwrap();
+        let mut writer = RowMapWriter::try_new_with_block_rows(writer, sources, 2, 4).unwrap();
+        writer.append_labels(&[1, 0]).await.unwrap();
+        let (_, counts) = writer.finish().await.unwrap();
+        assert_eq!(counts.total_rows(), 7);
+        assert_eq!((counts.total(0), counts.total(1)), (1, 1));
+
+        let reader = RowMapReader::open(store.open_index_file("row_map.lance").await.unwrap())
+            .await
+            .unwrap();
+        let expected = [
+            None,
+            None,
+            None,
+            None,            // source 1: fully deleted
+            Some((1u16, 0)), // source 3 row 0
+            Some((0u16, 0)), // source 3 row 1
+            None,            // source 3 row 2: the deleted tail
+        ];
+        for (row, &expected) in expected.iter().enumerate() {
+            assert_eq!(reader.translate(row as u64).await.unwrap(), expected);
+        }
+        // Empty inputs are empty outputs.
+        assert!(reader.translate_many(&[]).await.unwrap().is_empty());
+        reader
+            .sweep(3..3, |_, _| panic!("empty sweep must visit nothing"))
+            .await
+            .unwrap();
     }
 }
