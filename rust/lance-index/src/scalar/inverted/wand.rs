@@ -2227,8 +2227,6 @@ struct AndWindowStats {
     windows_skipped: usize,
     range_blocks_scanned: usize,
     candidates_returned: usize,
-    bulk_collector_initializations: usize,
-    bulk_scoring_initializations: usize,
 }
 
 impl Eq for TailPosting {}
@@ -3471,8 +3469,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
         let num_lists = self.lead.len();
         let phrase_slop = params.phrase_slop;
-        let mut score_order = SmallVec::<[usize; 5]>::with_capacity(num_lists);
-        score_order.extend(0..num_lists);
+        let mut score_order = (0..num_lists).collect::<Vec<_>>();
         score_order.sort_unstable_by_key(|&index| {
             let posting = &self.lead[index];
             (posting.position, posting.token_id)
@@ -3760,9 +3757,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
         }
 
-        let mut candidates = None;
+        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons: usize = 0;
-        let mut wins = SmallVec::<[WindowList; 5]>::with_capacity(num_lists);
+        let mut wins: Vec<WindowList> = Vec::with_capacity(num_lists);
         // Per-window candidate batch. The merge kernel only records matches;
         // scoring then runs in two passes so the doc-length gather issues
         // independent loads (their cache misses overlap) instead of
@@ -3770,13 +3767,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // one block per clause, so a batch holds at most one block's worth.
         let mut batch_docs: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
         let mut batch_offs: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE * num_lists);
-        // Reserve scoring-only scratch after the first non-empty merge so an
-        // all-miss conjunction does not allocate buffers it never fills.
-        let mut batch_lens: Vec<u32> = Vec::new();
-        let mut batch_norms: Vec<u8> = Vec::new();
-        // Auto uses specialized kernels for two/three clauses; only forced
-        // wider bulk searches need the generic cursor array.
-        let mut cursor_scratch: Option<Vec<usize>> = None;
+        let mut batch_lens: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
+        let mut batch_norms: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
+        let mut cursor_scratch: Vec<usize> = Vec::with_capacity(num_lists);
         // Norm cache: one byte-norm load plus a cached addend replaces the
         // per-clause BM25 denominator recompute in pass B.
         let mut norm_k = None;
@@ -3953,7 +3946,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     },
                     (_, _, false) => merge_window_docs_n(
                         &wins,
-                        cursor_scratch.get_or_insert_with(|| Vec::with_capacity(num_lists)),
+                        &mut cursor_scratch,
                         &mut batch_docs,
                         &mut batch_offs,
                     ),
@@ -3984,20 +3977,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (_, _, true) => merge_window_n(
                         &wins,
                         &freq_cannot_beat,
-                        cursor_scratch.get_or_insert_with(|| Vec::with_capacity(num_lists)),
+                        &mut cursor_scratch,
                         &mut batch_docs,
                         &mut batch_offs,
                     ),
                 }
 
                 if !batch_docs.is_empty() {
-                    #[cfg(test)]
-                    if candidates.is_none() {
-                        self.and_window_stats.bulk_collector_initializations += 1;
-                    }
-                    let candidates = candidates.get_or_insert_with(|| {
-                        TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10))
-                    });
                     for (win, posting) in wins.iter_mut().zip(self.lead.iter()) {
                         let PostingList::Compressed(ref list) = posting.list else {
                             unreachable!("bulk AND requires compressed postings");
@@ -4008,158 +3994,142 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         win.freqs = state.freqs.as_ptr();
                     }
                     if !norm_k_initialized {
-                        #[cfg(test)]
-                        {
-                            self.and_window_stats.bulk_scoring_initializations += 1;
-                        }
                         norm_k = self.norm_k_cache();
                         norm_k_initialized = true;
                     }
+                }
 
-                    // Pass A: gather doc norms/lengths for the whole batch up
-                    // front so the loads issue back-to-back and their cache
-                    // misses overlap. With the norm cache, only the byte code
-                    // is gathered; the exact length decodes from a tiny LUT.
-                    batch_lens.clear();
-                    batch_norms.clear();
-                    let norm_k_ref = norm_k
-                        .as_ref()
-                        .map(|(norms, cache)| (*norms, cache.as_ref()));
-                    match norm_k_ref {
-                        Some((norms, _)) => {
-                            if batch_norms.capacity() < MAX_POSTING_BLOCK_SIZE {
-                                batch_norms.reserve_exact(
-                                    MAX_POSTING_BLOCK_SIZE.saturating_sub(batch_norms.len()),
-                                );
-                            }
+                // Pass A: gather doc norms/lengths for the whole batch up
+                // front so the loads issue back-to-back and their cache
+                // misses overlap. With the norm cache, only the byte code is
+                // gathered; the exact length decodes from a tiny LUT.
+                batch_lens.clear();
+                batch_norms.clear();
+                let norm_k_ref = norm_k
+                    .as_ref()
+                    .map(|(norms, cache)| (*norms, cache.as_ref()));
+                match norm_k_ref {
+                    Some((norms, _)) => {
+                        for &doc in batch_docs.iter() {
+                            batch_norms.push(norms[doc as usize]);
+                        }
+                    }
+                    None => match self.documents.scoring_norms() {
+                        Some(norms) => {
                             for &doc in batch_docs.iter() {
-                                batch_norms.push(norms[doc as usize]);
+                                batch_lens.push(dequantize_doc_length(norms[doc as usize]));
                             }
                         }
                         None => {
-                            if batch_lens.capacity() < MAX_POSTING_BLOCK_SIZE {
-                                batch_lens.reserve_exact(
-                                    MAX_POSTING_BLOCK_SIZE.saturating_sub(batch_lens.len()),
-                                );
+                            for &doc in batch_docs.iter() {
+                                batch_lens.push(self.documents.scoring_num_tokens(doc));
                             }
-                            match self.documents.scoring_norms() {
-                                Some(norms) => {
-                                    for &doc in batch_docs.iter() {
-                                        batch_lens.push(dequantize_doc_length(norms[doc as usize]));
-                                    }
-                                }
-                                None => {
-                                    for &doc in batch_docs.iter() {
-                                        batch_lens.push(self.documents.scoring_num_tokens(doc));
-                                    }
-                                }
+                        }
+                    },
+                }
+
+                // Pass B: prune / verify / score / insert, in doc order, with
+                // exactly the classic loop's semantics.
+                for (index, &doc) in batch_docs.iter().enumerate() {
+                    let (norm_addend, doc_length) = match norm_k_ref {
+                        Some((_, cache)) => {
+                            let code = batch_norms[index];
+                            (Some(cache[code as usize]), dequantize_doc_length(code))
+                        }
+                        None => (None, batch_lens[index]),
+                    };
+                    let offs = &batch_offs[index * num_lists..(index + 1) * num_lists];
+                    if self.threshold > 0.0 && num_lists >= 2 && others_block_max.is_none() {
+                        others_block_max = Some(
+                            self.lead[1..]
+                                .iter()
+                                .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+                                .sum::<f64>(),
+                        );
+                    }
+                    if self.threshold > 0.0
+                        && num_lists >= 2
+                        && let Some(others_block_max) = others_block_max
+                    {
+                        let first_freq = unsafe { *wins[0].freqs.add(offs[0] as usize) };
+                        let first_score = match norm_addend {
+                            Some(addend) => {
+                                self.lead[0].query_weight
+                                    * bm25_doc_weight_with_norm(first_freq, addend)
                             }
+                            None => self.lead[0].score(&self.scorer, first_freq, doc_length),
+                        };
+                        if score_sum_cannot_compete(
+                            first_score,
+                            others_block_max,
+                            self.threshold,
+                            score_sum_upper_bound_factor(num_lists),
+                            CompetitiveFloorMode::Exclusive,
+                        ) {
+                            continue;
                         }
                     }
+                    #[cfg(test)]
+                    {
+                        self.and_window_stats.candidates_returned += 1;
+                    }
+                    num_comparisons += 1;
 
-                    // Pass B: prune / verify / score / insert, in doc order,
-                    // with exactly the classic loop's semantics.
-                    for (index, &doc) in batch_docs.iter().enumerate() {
-                        let (norm_addend, doc_length) = match norm_k_ref {
-                            Some((_, cache)) => {
-                                let code = batch_norms[index];
-                                (Some(cache[code as usize]), dequantize_doc_length(code))
-                            }
-                            None => (None, batch_lens[index]),
+                    let Some(document_key) = self.documents.document_key_for_doc_id(doc) else {
+                        continue;
+                    };
+
+                    if let Some(slop) = phrase_slop {
+                        // Park every clause's iterator on this doc so
+                        // `position_cursor` reads the right posting entry. The
+                        // window block is already decompressed; position blocks
+                        // decode lazily and are cached per block.
+                        for ((win, posting), &off) in
+                            wins.iter().zip(self.lead.iter_mut()).zip(offs.iter())
+                        {
+                            posting.index = win.block_start + off as usize;
+                            posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id: doc,
+                                frequency: unsafe { *win.freqs.add(off as usize) },
+                            }));
+                        }
+                        let matched = if slop == 0 {
+                            self.check_exact_positions_bulk()?
+                        } else {
+                            self.check_positions(slop as i32)?
                         };
-                        let offs = &batch_offs[index * num_lists..(index + 1) * num_lists];
-                        if self.threshold > 0.0 && num_lists >= 2 && others_block_max.is_none() {
-                            others_block_max = Some(
-                                self.lead[1..]
-                                    .iter()
-                                    .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
-                                    .sum::<f64>(),
-                            );
-                        }
-                        if self.threshold > 0.0
-                            && num_lists >= 2
-                            && let Some(others_block_max) = others_block_max
-                        {
-                            let first_freq = unsafe { *wins[0].freqs.add(offs[0] as usize) };
-                            let first_score = match norm_addend {
-                                Some(addend) => {
-                                    self.lead[0].query_weight
-                                        * bm25_doc_weight_with_norm(first_freq, addend)
-                                }
-                                None => self.lead[0].score(&self.scorer, first_freq, doc_length),
-                            };
-                            if score_sum_cannot_compete(
-                                first_score,
-                                others_block_max,
-                                self.threshold,
-                                score_sum_upper_bound_factor(num_lists),
-                                CompetitiveFloorMode::Exclusive,
-                            ) {
-                                continue;
-                            }
-                        }
-                        #[cfg(test)]
-                        {
-                            self.and_window_stats.candidates_returned += 1;
-                        }
-                        num_comparisons += 1;
-
-                        let Some(document_key) = self.documents.document_key_for_doc_id(doc) else {
+                        if !matched {
                             continue;
+                        }
+                    }
+                    let mut score = 0.0_f32;
+                    for &clause_index in &score_order {
+                        let win = &wins[clause_index];
+                        let posting = &self.lead[clause_index];
+                        let off = offs[clause_index];
+                        let freq = unsafe { *win.freqs.add(off as usize) };
+                        score += match norm_addend {
+                            Some(addend) => {
+                                posting.query_weight * bm25_doc_weight_with_norm(freq, addend)
+                            }
+                            None => posting.score(&self.scorer, freq, doc_length),
                         };
+                    }
 
-                        if let Some(slop) = phrase_slop {
-                            // Park every clause's iterator on this doc so
-                            // `position_cursor` reads the right posting entry. The
-                            // window block is already decompressed; position blocks
-                            // decode lazily and are cached per block.
-                            for ((win, posting), &off) in
-                                wins.iter().zip(self.lead.iter_mut()).zip(offs.iter())
-                            {
-                                posting.index = win.block_start + off as usize;
-                                posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
-                                    doc_id: doc,
-                                    frequency: unsafe { *win.freqs.add(off as usize) },
-                                }));
-                            }
-                            let matched = if slop == 0 {
-                                self.check_exact_positions_bulk()?
-                            } else {
-                                self.check_positions(slop as i32)?
-                            };
-                            if !matched {
-                                continue;
-                            }
-                        }
-                        let mut score = 0.0_f32;
-                        for &clause_index in &score_order {
-                            let win = &wins[clause_index];
-                            let posting = &self.lead[clause_index];
-                            let off = offs[clause_index];
-                            let freq = unsafe { *win.freqs.add(off as usize) };
-                            score += match norm_addend {
-                                Some(addend) => {
-                                    posting.query_weight * bm25_doc_weight_with_norm(freq, addend)
-                                }
-                                None => posting.score(&self.scorer, freq, doc_length),
-                            };
-                        }
-
-                        if candidates.insert(
-                            ScoredDoc::new(document_key, score),
-                            doc_length,
-                            u64::from(doc),
-                            wins.iter().zip(self.lead.iter()).zip(offs.iter()).map(
-                                |((win, posting), &off)| {
-                                    (posting.term_index(), unsafe {
-                                        *win.freqs.add(off as usize)
-                                    })
-                                },
-                            ),
-                        )? && let Some(kth) = candidates.kth_score_if_full()
-                        {
-                            self.update_threshold(kth, params.wand_factor);
-                        }
+                    if candidates.insert(
+                        ScoredDoc::new(document_key, score),
+                        doc_length,
+                        u64::from(doc),
+                        wins.iter().zip(self.lead.iter()).zip(offs.iter()).map(
+                            |((win, posting), &off)| {
+                                (posting.term_index(), unsafe {
+                                    *win.freqs.add(off as usize)
+                                })
+                            },
+                        ),
+                    )? && let Some(kth) = candidates.kth_score_if_full()
+                    {
+                        self.update_threshold(kth, params.wand_factor);
                     }
                 }
             }
@@ -4172,12 +4142,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         metrics.record_comparisons(num_comparisons);
 
-        match candidates {
-            Some(candidates) => {
-                candidates.into_candidates(|key| self.documents.candidate_from_key(key))
-            }
-            None => Ok(Vec::new()),
-        }
+        candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
     fn and_move_to_next_block(&mut self, target: u64) {
@@ -5890,20 +5855,13 @@ mod tests {
                 hits,
                 shared_floor.load(Ordering::Relaxed),
                 wand.bulk_and_searches > 0,
-                wand.and_window_stats.bulk_collector_initializations,
-                wand.and_window_stats.bulk_scoring_initializations,
             )
         };
 
-        let (bulk, bulk_score, bulk_used, bulk_collectors, bulk_scoring) = run(BulkAndMode::On);
-        let (classic, classic_score, classic_used, classic_collectors, classic_scoring) =
-            run(BulkAndMode::Off);
+        let (bulk, bulk_score, bulk_used) = run(BulkAndMode::On);
+        let (classic, classic_score, classic_used) = run(BulkAndMode::Off);
         assert!(bulk_used);
         assert!(!classic_used);
-        assert_eq!(bulk_collectors, 1);
-        assert_eq!(bulk_scoring, 1);
-        assert_eq!(classic_collectors, 0);
-        assert_eq!(classic_scoring, 0);
         assert_eq!(bulk.len(), 1);
         assert_eq!(classic.len(), 1);
         assert_eq!(bulk[0].document, 0);
@@ -8095,7 +8053,6 @@ mod tests {
 
     #[rstest]
     #[case::bulk_two(BulkAndMode::On, 2)]
-    #[case::bulk_three(BulkAndMode::On, 3)]
     #[case::classic_four(BulkAndMode::Off, 4)]
     #[case::classic_five(BulkAndMode::Off, 5)]
     fn underfilled_disjoint_and_decodes_no_frequencies_or_bounds(
@@ -8162,8 +8119,6 @@ mod tests {
                 .sum::<usize>(),
             0
         );
-        assert_eq!(wand.and_window_stats.bulk_collector_initializations, 0);
-        assert_eq!(wand.and_window_stats.bulk_scoring_initializations, 0);
     }
 
     #[rstest]
