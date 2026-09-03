@@ -13,20 +13,40 @@
 //!   the index of its destination in the rewrite's ordered destination list.
 //! * A deleted source row is labeled NULL: it moved nowhere.
 //!
+//! Ordering:
+//!
+//! The labels do not carry destination offsets; offsets are reconstructed by
+//! counting, which is only correct when the rewrite obeys all of:
+//!
+//! * Labels are recorded in source physical-row order: fragments in scan
+//!   order, offsets ascending within each fragment.
+//! * Each destination receives its rows in that same source order, and rows
+//!   are never re-sorted within a destination afterwards.
+//! * The ordered destination list is fixed for the whole rewrite.
+//!
+//! A rewrite that routes rows through parallel writers must merge each
+//! destination's output back into source order before recording this
+//! mapping; otherwise the derived offsets address the wrong rows.
+//!
 //! Because each destination is filled in source scan order, the destination
 //! row offset of a live row equals the number of earlier source rows with the
 //! same label. This module provides that arithmetic without materializing an
 //! O(rows) address map:
 //!
 //! * [`CountsMatrix`] — for every fixed-size block of source rows, the
-//!   cumulative per-label row count through the end of that block. A block is
-//!   the unit of storage, IO and caching for the label column.
+//!   cumulative per-label row count through the end of that block, as a
+//!   dense `num_blocks * m` grid. A block is the unit of storage, IO and
+//!   caching for the label column. The grid size is exact and data
+//!   independent (~600 KB for 50M rows across 500 destinations, ~61 MB at a
+//!   1B-row rewrite across 1000); the encoded header names the
+//!   representation so sparser encodings can be added later without breaking
+//!   readers.
 //! * [`translate_in_block`] — point lookup: destination offset = cumulative
-//!   count before the row's block + the label's rank within the block prefix.
-//!   Touches one block of labels.
+//!   count before the row's block (one array read) + the label's rank within
+//!   the block prefix. Touches one block of labels.
 //! * [`SweepTranslator`] — sequential translation: per-label counters seeded
-//!   from a block boundary, then `offset = counter[label]++` per row. O(1) per
-//!   row, used for bulk remapping and whole-unit decodes.
+//!   from a block boundary, then `offset = counter[label]++` per row. O(1)
+//!   per row, used for bulk remapping and whole-unit decodes.
 //!
 //! Label storage and file IO live in `lance-index`; this module is pure
 //! arithmetic over decoded label blocks and the counts matrix.
@@ -45,11 +65,21 @@ pub const MAX_DESTINATIONS: u32 = u16::MAX as u32 + 1;
 
 const COUNTS_MAGIC: &[u8; 4] = b"LSPC";
 const COUNTS_VERSION: u32 = 1;
-const COUNTS_HEADER_BYTES: usize = 4 + 4 + 4 + 4 + 8;
+/// magic + version + repr + num_destinations + block_rows + total_rows
+const COUNTS_HEADER_BYTES: usize = 4 + 4 + 4 + 4 + 4 + 8;
+/// Representation tag in the encoded header. Only the dense grid is written
+/// today; other tag values are reserved for future representations (e.g.
+/// per-destination sparse postings) and rejected with a clear error by
+/// current readers.
+const REPR_DENSE: u32 = 0;
+
+fn corrupt(message: impl Into<String>) -> Error {
+    Error::corrupt_file_named("stable_partition_counts", message)
+}
 
 /// Cumulative per-destination row counts at every block boundary.
 ///
-/// Row `b` of the matrix holds, for each destination label `d`, the number of
+/// Row `b` of the grid holds, for each destination label `d`, the number of
 /// source rows labeled `d` in blocks `0..=b`. The final row therefore holds
 /// the total row count of every destination. Deleted (NULL-labeled) rows are
 /// not counted; the deleted count of a block is implied by
@@ -152,28 +182,27 @@ impl CountsMatrix {
 
     /// Check internal consistency: per-label counts must be non-decreasing
     /// across blocks and each block's live rows must fit its row range.
-    /// O(num_blocks * num_destinations); intended for commit validation and
-    /// tests, not the read path.
+    /// O(num_blocks * num_destinations), no label IO. Called when a row map
+    /// is opened, so a corrupt counts buffer fails loudly instead of
+    /// translating rows to wrong addresses.
     pub fn validate(&self) -> Result<()> {
         let mut prev_live = 0u64;
         for block in 0..self.num_blocks() {
             if block > 0 {
                 let (prev, cur) = (self.block_row(block - 1), self.block_row(block));
                 if prev.iter().zip(cur).any(|(p, c)| c < p) {
-                    return Err(Error::corrupt_file_named(
-                        "stable_partition_counts",
-                        format!("stable-partition counts decrease at block {block}"),
-                    ));
+                    return Err(corrupt(format!(
+                        "cumulative counts decrease at block {block}"
+                    )));
                 }
             }
             let live_through: u64 = self.block_row(block).iter().map(|&c| u64::from(c)).sum();
             let range = self.block_range(block);
             let block_len = range.end - range.start;
             if live_through - prev_live > block_len {
-                return Err(Error::corrupt_file_named(
-                    "stable_partition_counts",
-                    format!("stable-partition counts at block {block} exceed its {block_len} rows"),
-                ));
+                return Err(corrupt(format!(
+                    "block {block} accounts for more live rows than its {block_len} rows"
+                )));
             }
             prev_live = live_through;
         }
@@ -181,12 +210,13 @@ impl CountsMatrix {
     }
 
     /// Serialize to the on-disk form stored in the row map file's global
-    /// buffer: a fixed header followed by the cumulative counts as
-    /// little-endian u32.
+    /// buffer: a fixed header naming the representation, then the cumulative
+    /// counts as little-endian u32.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(COUNTS_HEADER_BYTES + self.cumulative.len() * 4);
         buf.extend_from_slice(COUNTS_MAGIC);
         buf.extend_from_slice(&COUNTS_VERSION.to_le_bytes());
+        buf.extend_from_slice(&REPR_DENSE.to_le_bytes());
         buf.extend_from_slice(&self.num_destinations.to_le_bytes());
         buf.extend_from_slice(&self.block_rows.to_le_bytes());
         buf.extend_from_slice(&self.total_rows.to_le_bytes());
@@ -196,51 +226,50 @@ impl CountsMatrix {
         buf
     }
 
-    /// Decode the on-disk form. Checks structure (magic, version, lengths)
-    /// only; see [`Self::validate`] for content invariants.
+    /// Decode the on-disk form, checking structure exactly: magic, version, a
+    /// supported representation, shape legality and precise payload length.
+    /// Content invariants (monotone counts, per-block row budgets) are
+    /// checked by [`Self::validate`].
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let header: &[u8; COUNTS_HEADER_BYTES] = buf
             .get(..COUNTS_HEADER_BYTES)
-            .and_then(|h| h.try_into().ok())
+            .and_then(|header| header.try_into().ok())
             .ok_or_else(|| {
-                Error::corrupt_file_named(
-                    "stable_partition_counts",
-                    format!(
-                    "stable-partition counts buffer is {} bytes, shorter than the {COUNTS_HEADER_BYTES}-byte header",
+                corrupt(format!(
+                    "counts buffer is {} bytes, shorter than the {COUNTS_HEADER_BYTES}-byte header",
                     buf.len()
                 ))
             })?;
         if &header[0..4] != COUNTS_MAGIC {
-            return Err(Error::corrupt_file_named(
-                "stable_partition_counts",
-                "stable-partition counts buffer has a bad magic number",
-            ));
+            return Err(corrupt("counts buffer has a bad magic number"));
         }
         let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
         if version != COUNTS_VERSION {
-            return Err(Error::corrupt_file_named(
-                "stable_partition_counts",
-                format!("unsupported stable-partition counts version {version}"),
-            ));
+            return Err(corrupt(format!("unsupported counts version {version}")));
         }
-        let num_destinations = u32::from_le_bytes(header[8..12].try_into().unwrap());
-        let block_rows = u32::from_le_bytes(header[12..16].try_into().unwrap());
-        let total_rows = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        let repr = u32::from_le_bytes(header[8..12].try_into().unwrap());
+        if repr != REPR_DENSE {
+            return Err(corrupt(format!(
+                "unsupported counts representation {repr}; this reader only supports the dense grid ({REPR_DENSE})"
+            )));
+        }
+        let num_destinations = u32::from_le_bytes(header[12..16].try_into().unwrap());
+        let block_rows = u32::from_le_bytes(header[16..20].try_into().unwrap());
+        let total_rows = u64::from_le_bytes(header[20..28].try_into().unwrap());
         Self::check_shape(num_destinations, block_rows)?;
         let num_blocks = total_rows.div_ceil(u64::from(block_rows));
-        let expected = num_blocks
+        num_blocks
             .checked_mul(u64::from(num_destinations))
-            .and_then(|counts| counts.checked_mul(4))
+            .and_then(|cells| cells.checked_mul(4))
             .filter(|&bytes| bytes == (buf.len() - COUNTS_HEADER_BYTES) as u64)
             .ok_or_else(|| {
-                Error::corrupt_file_named(
-                    "stable_partition_counts",
-                    format!(
-                    "stable-partition counts buffer of {} bytes does not match {num_blocks} blocks of {num_destinations} destinations",
+                corrupt(format!(
+                    "counts buffer of {} bytes does not match {num_blocks} blocks of {num_destinations} destinations",
                     buf.len()
                 ))
             })?;
-        let mut cumulative = Vec::with_capacity((expected / 4) as usize);
+        let mut cumulative =
+            Vec::with_capacity((num_blocks * u64::from(num_destinations)) as usize);
         for chunk in buf[COUNTS_HEADER_BYTES..].chunks_exact(4) {
             cumulative.push(u32::from_le_bytes(chunk.try_into().unwrap()));
         }
@@ -447,28 +476,20 @@ impl SweepTranslator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
 
-    /// Deterministic labels without a rand dependency: a simple LCG.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-
-        /// ~1/8 deleted rows, labels uniform over `m`.
-        fn label(&mut self, m: u32) -> Option<u16> {
-            let raw = self.next();
-            if raw.is_multiple_of(8) {
-                None
-            } else {
-                Some((raw % u64::from(m)) as u16)
-            }
-        }
+    /// ~1/8 deleted rows, labels uniform over `m`.
+    fn random_labels(rng: &mut StdRng, rows: usize, m: u32) -> Vec<Option<u16>> {
+        (0..rows)
+            .map(|_| {
+                if rng.random_ratio(1, 8) {
+                    None
+                } else {
+                    Some(rng.random_range(0..m) as u16)
+                }
+            })
+            .collect()
     }
 
     fn build(labels: &[Option<u16>], m: u32, block_rows: u32) -> CountsMatrix {
@@ -516,7 +537,8 @@ mod tests {
 
     #[test]
     fn test_counts_matrix_hand_example() {
-        // 10 rows, block_rows=4 -> blocks of 4, 4, 2. m=3.
+        // 10 rows, block_rows=4 -> blocks of 4, 4, 2. m=3, and destination 1
+        // receives nothing in blocks 0 and 2.
         let labels = [
             Some(0),
             Some(2),
@@ -538,6 +560,10 @@ mod tests {
         assert_eq!(counts.count_before(0, 2), 0);
         assert_eq!(counts.count_before(1, 2), 2);
         assert_eq!(counts.count_before(2, 0), 2);
+        // Destination 1 received nothing in blocks 0 and 2: lookups around
+        // the gap see the count of its last change (or 0).
+        assert_eq!(counts.count_before(1, 1), 0);
+        assert_eq!(counts.count_before(3, 1), 2);
         assert_eq!(
             (counts.total(0), counts.total(1), counts.total(2)),
             (3, 2, 3)
@@ -561,16 +587,18 @@ mod tests {
 
     #[test]
     fn test_encode_decode_round_trip() {
-        let mut lcg = Lcg(7);
-        let labels: Vec<_> = (0..1000).map(|_| lcg.label(5)).collect();
+        let mut rng = StdRng::seed_from_u64(7);
+        let labels = random_labels(&mut rng, 1000, 5);
         let counts = build(&labels, 5, 64);
         let decoded = CountsMatrix::decode(&counts.encode()).unwrap();
         assert_eq!(decoded, counts);
+        decoded.validate().unwrap();
 
         let empty = build(&[], 5, 64);
         assert_eq!(CountsMatrix::decode(&empty.encode()).unwrap(), empty);
 
-        // Structural corruption is caught at decode.
+        // Structural corruption is caught at decode: too short, bad magic,
+        // truncated payload, unknown representation tag.
         assert!(CountsMatrix::decode(&[]).is_err());
         let mut bad_magic = counts.encode();
         bad_magic[0] = b'X';
@@ -578,6 +606,9 @@ mod tests {
         let mut truncated = counts.encode();
         truncated.pop();
         assert!(CountsMatrix::decode(&truncated).is_err());
+        let mut bad_repr = counts.encode();
+        bad_repr[8] = 9;
+        assert!(CountsMatrix::decode(&bad_repr).is_err());
 
         // Content corruption is caught by validate: shrink a later block's
         // cumulative count below an earlier one.
@@ -605,8 +636,8 @@ mod tests {
     #[test]
     fn test_point_and_sweep_match_reference() {
         let m = 5u32;
-        let mut lcg = Lcg(42);
-        let labels: Vec<_> = (0..1000).map(|_| lcg.label(m)).collect();
+        let mut rng = StdRng::seed_from_u64(42);
+        let labels = random_labels(&mut rng, 1000, m);
         let counts = build(&labels, m, 64);
         counts.validate().unwrap();
         let expected = reference(&labels);

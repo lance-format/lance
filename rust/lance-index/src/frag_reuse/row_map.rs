@@ -21,6 +21,20 @@
 //! The writer is fed labels of *live* rows only, in source scan order, and
 //! interleaves the NULL rows itself from the source deletion vectors: the
 //! rewrite job scans with deletions applied, so it never sees a deleted row.
+//!
+//! Correctness rests on the stable-partition ordering contract spelled out
+//! in [`lance_core::utils::stable_partition`]: labels arrive in source
+//! physical-row order, each destination is written in that same order and
+//! never re-sorted, and the destination list is fixed for the rewrite. A
+//! job that routes rows through parallel writers must restore that order
+//! per destination before feeding this writer.
+//!
+//! Correctness rests on the stable-partition ordering contract spelled out
+//! in [`lance_core::utils::stable_partition`]: labels arrive in source
+//! physical-row order, each destination is written in that same order and
+//! never re-sorted, and the destination list is fixed for the rewrite. A
+//! job that routes rows through parallel writers must restore that order
+//! per destination before feeding this writer.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -52,6 +66,19 @@ fn label_schema() -> Arc<ArrowSchema> {
         DataType::UInt16,
         true,
     )]))
+}
+
+fn label_column(batch: &RecordBatch) -> Result<&UInt16Array> {
+    batch
+        .columns()
+        .first()
+        .and_then(|column| column.as_primitive_opt::<UInt16Type>())
+        .ok_or_else(|| {
+            Error::corrupt_file_named(
+                "row_map",
+                "row map read returned a batch without a u16 label column",
+            )
+        })
 }
 
 /// The physical layout of one source fragment, in scan order.
@@ -235,11 +262,28 @@ impl std::fmt::Debug for RowMapReader {
 }
 
 impl RowMapReader {
-    /// Open a row map file: decodes the counts matrix from its global buffer
-    /// without touching any label data.
+    /// Open a row map file: decodes and validates the counts matrix from its
+    /// global buffer without touching any label data. A corrupt counts buffer
+    /// must fail here rather than translate rows to wrong addresses.
     pub async fn open(reader: Arc<dyn IndexReader>) -> Result<Self> {
-        let buffer_index = reader
-            .schema()
+        let schema = reader.schema();
+        let label_field = schema
+            .fields
+            .first()
+            .ok_or_else(|| Error::corrupt_file_named("row_map", "row map file has no columns"))?;
+        if label_field.name != LABEL_COLUMN
+            || label_field.data_type() != arrow_schema::DataType::UInt16
+        {
+            return Err(Error::corrupt_file_named(
+                "row_map",
+                format!(
+                    "row map file must hold a single u16 {LABEL_COLUMN} column, found {} of type {}",
+                    label_field.name,
+                    label_field.data_type()
+                ),
+            ));
+        }
+        let buffer_index = schema
             .metadata
             .get(COUNTS_BUFFER_INDEX_KEY)
             .and_then(|index| index.parse::<u32>().ok())
@@ -250,6 +294,7 @@ impl RowMapReader {
                 )
             })?;
         let counts = CountsMatrix::decode(&reader.read_global_buffer(buffer_index).await?)?;
+        counts.validate()?;
         if reader.num_rows() as u64 != counts.total_rows() {
             return Err(Error::corrupt_file_named(
                 "row_map",
@@ -277,7 +322,7 @@ impl RowMapReader {
                 Some(&[LABEL_COLUMN]),
             )
             .await?;
-        Ok(batch.column(0).as_primitive::<UInt16Type>().clone())
+        Ok(label_column(&batch)?.clone())
     }
 
     /// Translate one physical source row (concatenated scan order). Returns
@@ -316,7 +361,7 @@ impl RowMapReader {
             .reader
             .read_ranges(&ranges, Some(&[LABEL_COLUMN]))
             .await?;
-        let labels = batch.column(0).as_primitive::<UInt16Type>();
+        let labels = label_column(&batch)?;
         let mut block_starts = Vec::with_capacity(blocks.len());
         let mut start = 0usize;
         for range in &ranges {
@@ -329,7 +374,7 @@ impl RowMapReader {
                 let slot = blocks.binary_search(&block).unwrap();
                 let range = &ranges[slot];
                 let block_labels = labels.slice(block_starts[slot], range.end - range.start);
-                let pos = row as usize - range.start;
+                let pos = (row - range.start as u64) as usize;
                 translate_in_block(
                     &self.counts,
                     block,
@@ -395,6 +440,8 @@ mod tests {
     use futures::FutureExt;
     use lance_core::utils::tempfile::TempDir;
     use lance_io::object_store::ObjectStore;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     use std::collections::HashMap;
 
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
@@ -409,19 +456,6 @@ mod tests {
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
-    /// Deterministic pseudo-random labels without a rand dependency.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-    }
-
     struct TestMap {
         sources: Vec<SourceRows>,
         /// Live-row labels in scan order: what the rewrite job feeds.
@@ -433,7 +467,7 @@ mod tests {
     /// Build sources with deterministic deletions and labels, plus the
     /// reference translation computed with per-destination counters.
     fn make_test_map(source_rows: &[u64], num_destinations: u32, seed: u64) -> TestMap {
-        let mut lcg = Lcg(seed);
+        let mut rng = StdRng::seed_from_u64(seed);
         let mut sources = Vec::new();
         let mut live_labels = Vec::new();
         let mut expected = Vec::new();
@@ -442,7 +476,7 @@ mod tests {
             let mut deleted = RoaringBitmap::new();
             for offset in 0..physical_rows {
                 // ~1/5 of rows deleted.
-                if lcg.next().is_multiple_of(5) {
+                if rng.random_ratio(1, 5) {
                     deleted.insert(offset as u32);
                 }
             }
@@ -450,7 +484,7 @@ mod tests {
                 if deleted.contains(offset as u32) {
                     expected.push(None);
                 } else {
-                    let label = (lcg.next() % u64::from(num_destinations)) as u16;
+                    let label = rng.random_range(0..num_destinations) as u16;
                     let counter = counters.entry(label).or_insert(0u32);
                     live_labels.push(label);
                     expected.push(Some((label, *counter)));
@@ -636,5 +670,25 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_wrong_schema() {
+        // Opening a file that is not a row map fails with an error instead of
+        // panicking on the column cast.
+        let tempdir = TempDir::default();
+        let store = test_store(&tempdir);
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "foo",
+            arrow_schema::DataType::Int32,
+            false,
+        )]));
+        let mut writer = store
+            .new_index_file("not_a_row_map.lance", schema)
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+        let reader = store.open_index_file("not_a_row_map.lance").await.unwrap();
+        assert!(RowMapReader::open(reader).await.is_err());
     }
 }
