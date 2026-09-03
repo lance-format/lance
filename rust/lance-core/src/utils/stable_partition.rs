@@ -28,6 +28,14 @@
 //! destination's output back into source order before recording this
 //! mapping; otherwise the derived offsets address the wrong rows.
 //!
+//! This contract is deliberate scope, not an oversight: the format
+//! represents stable partitions only. A rewrite that sorts rows *within* a
+//! destination is not representable here — with source rows `[a, b]`
+//! written to one destination as `[b, a]`, both labels are equal, and
+//! counting would assign the offsets backwards. Such a rewrite needs a
+//! per-row final-offset (permutation) encoding, which would be a separate
+//! format rather than a relaxation of this one.
+//!
 //! Because each destination is filled in source scan order, the destination
 //! row offset of a live row equals the number of earlier source rows with the
 //! same label. This module provides that arithmetic without materializing an
