@@ -1327,7 +1327,7 @@ async fn check_round_trip_encoding_inner(
         let mut mutable = MutableArrayData::with_capacities(array_data, false, capacities);
 
         for (i, a) in data.iter().enumerate() {
-            mutable.extend(i, 0, a.len())
+            mutable.try_extend(i, 0, a.len()).unwrap();
         }
 
         Some(make_array(mutable.freeze()))

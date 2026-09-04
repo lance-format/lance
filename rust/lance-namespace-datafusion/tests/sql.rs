@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
+use arrow_array::record_batch;
 use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::Schema;
-use datafusion::common::record_batch;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::SessionContext;
 use lance::Dataset;
