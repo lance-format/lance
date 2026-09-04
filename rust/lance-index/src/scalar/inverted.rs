@@ -40,6 +40,32 @@ pub use tokenizer::*;
 
 use crate::scalar::inverted::query::{FtsSearchParams, Tokens, uses_fuzzy_expansion};
 
+pub(crate) fn collapse_scored_rows(
+    rows: impl IntoIterator<Item = (u64, f32)>,
+    limit: usize,
+) -> Vec<(u64, f32)> {
+    let mut scores_by_row_id = HashMap::new();
+    for (row_id, score) in rows {
+        scores_by_row_id
+            .entry(row_id)
+            .and_modify(|existing| {
+                if score > *existing {
+                    *existing = score;
+                }
+            })
+            .or_insert(score);
+    }
+
+    let mut rows = scores_by_row_id.into_iter().collect::<Vec<_>>();
+    rows.sort_unstable_by(|(left_id, left_score), (right_id, right_score)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    rows.truncate(rows.len().min(limit));
+    rows
+}
+
 /// Canonical token vocabulary and BM25 statistics for one indexed query leaf.
 ///
 /// Keeping these values together prevents a search path from expanding one

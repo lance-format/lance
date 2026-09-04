@@ -32,6 +32,7 @@ use lance_select::RowSetOps;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -183,19 +184,13 @@ impl InvertedIndexBuilder {
     /// Constructed as `(fragment_id as u64) << 32`.
     /// When provided, ensures that generated IDs belong to the specified fragment.
     pub fn from_existing_index(
-        mut params: InvertedIndexParams,
+        params: InvertedIndexParams,
         store: Option<Arc<dyn IndexStore>>,
         partitions: Vec<u64>,
         token_set_format: TokenSetFormat,
         fragment_mask: Option<u64>,
         deleted_fragments: RoaringBitmap,
     ) -> Self {
-        if (store.is_some() || !partitions.is_empty())
-            && params.lance_tokenizer.as_deref() == Some("json")
-            && params.json_tokenizer_mode.is_none()
-        {
-            params.json_tokenizer_mode = Some(JsonTokenizerMode::SingleDocument);
-        }
         let format_version = params.resolved_format_version();
         Self {
             params,
@@ -211,14 +206,9 @@ impl InvertedIndexBuilder {
         }
     }
 
-    fn configure_json_tokenizer_mode_for_new_data(&mut self, doc_type: DocType) {
+    fn infer_lance_tokenizer(&mut self, doc_type: DocType) {
         if self.params.lance_tokenizer.is_none() {
             self.params.lance_tokenizer = Some(doc_type.as_ref().to_string());
-        }
-        if self.params.lance_tokenizer.as_deref() == Some("json")
-            && self.params.json_tokenizer_mode.is_none()
-        {
-            self.params.json_tokenizer_mode = Some(JsonTokenizerMode::FlattenedSubDocs);
         }
     }
 
@@ -265,7 +255,12 @@ impl InvertedIndexBuilder {
         // infer lance_tokenizer based on document type
         let field = schema.column_with_name(doc_col).expect_ok()?.1;
         let doc_type = DocType::try_from(field)?;
-        self.configure_json_tokenizer_mode_for_new_data(doc_type);
+        self.infer_lance_tokenizer(doc_type);
+        if self.params.lance_tokenizer.as_deref() == Some("json")
+            && self.params.json_tokenizer_mode.is_none()
+        {
+            self.params.json_tokenizer_mode = Some(JsonTokenizerMode::FlattenedSubDocs);
+        }
 
         let new_data = document_input(new_data, doc_col)?;
 
@@ -296,7 +291,7 @@ impl InvertedIndexBuilder {
 
         let field = schema.column_with_name(doc_col).expect_ok()?.1;
         let doc_type = DocType::try_from(field)?;
-        self.configure_json_tokenizer_mode_for_new_data(doc_type);
+        self.infer_lance_tokenizer(doc_type);
 
         let mut files = self
             .merge_existing_segments(dest_store, old_segments, old_data_filter.as_ref())
@@ -1593,12 +1588,14 @@ impl IndexWorker {
         doc_index: &[u32],
     ) -> Result<()> {
         let doc = match document {
-            DocumentSource::Text(doc) => doc.to_string(),
-            DocumentSource::StringList(elements) => Self::materialize_string_list(elements),
+            DocumentSource::Text(doc) => Cow::Borrowed(doc),
+            DocumentSource::StringList(elements) => {
+                Cow::Owned(Self::materialize_string_list(elements))
+            }
         };
         self.total_doc_length += doc.len();
         let with_position = self.has_position();
-        let sub_docs = self.tokenizer.token_streams_for_doc(&doc)?;
+        let sub_docs = self.tokenizer.token_streams_for_doc(doc.as_ref())?;
         for tokens in sub_docs {
             self.process_tokenized_doc(row_id, tokens, with_position, doc_index)
                 .await?;
@@ -1610,7 +1607,7 @@ impl IndexWorker {
     async fn process_tokenized_doc(
         &mut self,
         row_id: u64,
-        mut tokens: Vec<lance_tokenizer::Token>,
+        tokens: Vec<lance_tokenizer::Token>,
         with_position: bool,
         doc_index: &[u32],
     ) -> Result<()> {
@@ -1620,19 +1617,20 @@ impl IndexWorker {
         let doc_id = self.builder.docs.len() as u32;
         let mut token_num: u32 = 0;
         let mut posting_memory_delta = 0i64;
+        if self.token_ids.capacity() < self.last_token_count {
+            self.token_ids
+                .reserve(self.last_token_count - self.token_ids.capacity());
+        }
+        self.token_ids.clear();
+
         if with_position {
-            if self.token_ids.capacity() < self.last_token_count {
-                self.token_ids
-                    .reserve(self.last_token_count - self.token_ids.capacity());
-            }
-            self.token_ids.clear();
             let builder = &mut self.builder;
             let token_ids = &mut self.token_ids;
             let memory_size = &mut self.memory_size;
             let posting_tail_codec = builder.posting_tail_codec;
             let block_size = builder.block_size;
 
-            for token in &mut tokens {
+            for token in tokens {
                 let position = Self::checked_token_position(row_id, token.position)?;
                 let token_id = builder.tokens.get_or_add(&token.text);
                 if token_id as usize == builder.posting_lists.len() {
@@ -1666,12 +1664,6 @@ impl IndexWorker {
                 token_num += 1;
             }
         } else {
-            if self.token_ids.capacity() < self.last_token_count {
-                self.token_ids
-                    .reserve(self.last_token_count - self.token_ids.capacity());
-            }
-            self.token_ids.clear();
-
             for token in tokens {
                 let token_id = self.builder.tokens.get_or_add(&token.text);
                 self.token_ids.push(token_id);

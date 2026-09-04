@@ -131,10 +131,6 @@ pub trait LanceTokenizer: Send + Sync + std::fmt::Debug {
     fn json_tokenizer_mode(&self) -> Option<JsonTokenizerMode> {
         None
     }
-    /// Whether flattened JSON tokenization avoids cross-array unnesting.
-    fn disable_cross_array_unnest(&self) -> bool {
-        false
-    }
 }
 
 impl Clone for Box<dyn LanceTokenizer> {
@@ -186,16 +182,26 @@ pub struct JsonTokenizer {
 }
 
 impl JsonTokenizer {
-    pub fn new(
-        tokenizer: TextAnalyzer,
-        mode: JsonTokenizerMode,
-        disable_cross_array_unnest: bool,
-    ) -> Self {
+    pub fn new(tokenizer: TextAnalyzer) -> Self {
         Self {
             tokenizer,
-            mode,
-            disable_cross_array_unnest,
+            mode: JsonTokenizerMode::SingleDocument,
+            disable_cross_array_unnest: false,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_mode(mut self, mode: JsonTokenizerMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub(crate) fn with_disable_cross_array_unnest(
+        mut self,
+        disable_cross_array_unnest: bool,
+    ) -> Self {
+        self.disable_cross_array_unnest = disable_cross_array_unnest;
+        self
     }
 }
 
@@ -260,10 +266,6 @@ impl LanceTokenizer for JsonTokenizer {
 
     fn json_tokenizer_mode(&self) -> Option<JsonTokenizerMode> {
         Some(self.mode)
-    }
-
-    fn disable_cross_array_unnest(&self) -> bool {
-        self.disable_cross_array_unnest
     }
 }
 
@@ -439,9 +441,8 @@ fn flatten_json_sub_docs(
     tokenizer: &mut TextAnalyzer,
     disable_cross_array_unnest: bool,
 ) -> Vec<Vec<Token>> {
-    let token_texts =
-        flatten_json_sub_doc_terms(value, prefix, tokenizer, disable_cross_array_unnest);
-    token_texts
+    flatten_json_sub_doc_terms(value, prefix, tokenizer, disable_cross_array_unnest)
+        .sub_docs
         .into_iter()
         .map(|sub_doc| {
             sub_doc
@@ -459,12 +460,17 @@ fn flatten_json_sub_docs(
         .collect()
 }
 
+struct FlattenedJsonSubDocs {
+    sub_docs: Vec<Vec<String>>,
+    has_array: bool,
+}
+
 fn flatten_json_sub_doc_terms(
     value: &Value,
     prefix: &str,
     tokenizer: &mut TextAnalyzer,
     disable_cross_array_unnest: bool,
-) -> Vec<Vec<String>> {
+) -> FlattenedJsonSubDocs {
     match value {
         Value::Object(map) => {
             let mut non_nested = Vec::new();
@@ -482,27 +488,46 @@ fn flatten_json_sub_doc_terms(
                     tokenizer,
                     disable_cross_array_unnest,
                 );
-                match child_terms.len() {
+                match child_terms.sub_docs.len() {
                     0 => {}
-                    1 => non_nested.extend(child_terms.into_iter().next().unwrap()),
-                    _ => nested.push(child_terms),
+                    1 if !child_terms.has_array => {
+                        non_nested.extend(child_terms.sub_docs.into_iter().flatten())
+                    }
+                    _ => nested.push(child_terms.sub_docs),
                 }
             }
 
-            match nested.len() {
-                0 if non_nested.is_empty() => Vec::new(),
-                0 => vec![non_nested],
-                1 => nested
-                    .pop()
-                    .unwrap()
-                    .into_iter()
-                    .map(|mut sub_doc| {
-                        sub_doc.extend(non_nested.iter().cloned());
-                        sub_doc
-                    })
-                    .collect(),
-                _ if disable_cross_array_unnest => unnest_json_sub_docs(&nested, &non_nested),
-                _ => cross_join_json_sub_docs(&nested, &non_nested),
+            if nested.is_empty() {
+                return FlattenedJsonSubDocs {
+                    sub_docs: if non_nested.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![non_nested]
+                    },
+                    has_array: false,
+                };
+            }
+            if nested.len() == 1 {
+                return FlattenedJsonSubDocs {
+                    sub_docs: nested
+                        .into_iter()
+                        .flatten()
+                        .map(|mut sub_doc| {
+                            sub_doc.extend(non_nested.iter().cloned());
+                            sub_doc
+                        })
+                        .collect(),
+                    has_array: true,
+                };
+            }
+            let sub_docs = if disable_cross_array_unnest {
+                unnest_json_sub_docs(&nested, &non_nested)
+            } else {
+                cross_join_json_sub_docs(&nested, &non_nested)
+            };
+            FlattenedJsonSubDocs {
+                sub_docs,
+                has_array: true,
             }
         }
         Value::Array(arr) => {
@@ -515,12 +540,15 @@ fn flatten_json_sub_doc_terms(
                     tokenizer,
                     disable_cross_array_unnest,
                 );
-                for sub_doc in &mut child_terms {
+                for sub_doc in &mut child_terms.sub_docs {
                     sub_doc.push(format!("{prefix}$idx,number,{array_index}"));
                 }
-                sub_docs.extend(child_terms);
+                sub_docs.extend(child_terms.sub_docs);
             }
-            sub_docs
+            FlattenedJsonSubDocs {
+                sub_docs,
+                has_array: true,
+            }
         }
         Value::String(text) => {
             let mut token_texts = Vec::new();
@@ -528,21 +556,27 @@ fn flatten_json_sub_doc_terms(
             while let Some(token) = tokens.next() {
                 token_texts.push(format!("{prefix},str,{}", token.text));
             }
-            if token_texts.is_empty() {
-                Vec::new()
-            } else {
-                vec![token_texts]
+            FlattenedJsonSubDocs {
+                sub_docs: if token_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![token_texts]
+                },
+                has_array: false,
             }
         }
-        _ => {
-            let value_type = match value {
-                Value::Null => "null",
-                Value::Bool(_) => "bool",
-                Value::Number(_) => "number",
-                _ => unreachable!(),
-            };
-            vec![vec![format!("{prefix},{value_type},{value}")]]
-        }
+        Value::Null => FlattenedJsonSubDocs {
+            sub_docs: vec![vec![format!("{prefix},null,null")]],
+            has_array: false,
+        },
+        Value::Bool(value) => FlattenedJsonSubDocs {
+            sub_docs: vec![vec![format!("{prefix},bool,{value}")]],
+            has_array: false,
+        },
+        Value::Number(value) => FlattenedJsonSubDocs {
+            sub_docs: vec![vec![format!("{prefix},number,{value}")]],
+            has_array: false,
+        },
     }
 }
 
@@ -637,11 +671,8 @@ mod tests {
             {"c": "e"}
           ]
         }"#;
-        let mut tokenizer = JsonTokenizer::new(
-            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
-            JsonTokenizerMode::SingleDocument,
-            false,
-        );
+        let mut tokenizer =
+            JsonTokenizer::new(TextAnalyzer::builder(SimpleTokenizer::default()).build());
         let mut stream = tokenizer.token_stream_for_doc(text);
 
         let mut tokens: Vec<Token> = vec![];
@@ -703,35 +734,40 @@ mod tests {
     }
 
     #[test]
-    fn test_flattened_sub_docs_design_example() {
-        let doc0 = flattened_sub_doc_texts(r#"{"foo":[{"bar":["x","y"]}]}"#);
-        let doc1 = flattened_sub_doc_texts(r#"{"foo":[{"bar":["y"]},{"bar":"z"}]}"#);
-
-        assert_eq!(
-            doc0,
-            vec![
-                sorted_tokens([
-                    "foo$idx,number,0",
-                    "foo..bar$idx,number,0",
-                    "foo..bar.,str,x",
-                ]),
-                sorted_tokens([
-                    "foo$idx,number,0",
-                    "foo..bar$idx,number,1",
-                    "foo..bar.,str,y",
-                ]),
-            ]
+    fn test_flattened_sub_docs_examples() {
+        assert_sub_docs(
+            r#"{"foo":[{"bar":["x","y"]}]}"#,
+            false,
+            &[
+                "foo$idx,number,0;foo..bar$idx,number,0;foo..bar.,str,x",
+                "foo$idx,number,0;foo..bar$idx,number,1;foo..bar.,str,y",
+            ],
         );
-        assert_eq!(
-            doc1,
-            vec![
-                sorted_tokens([
-                    "foo$idx,number,0",
-                    "foo..bar$idx,number,0",
-                    "foo..bar.,str,y",
-                ]),
-                sorted_tokens(["foo$idx,number,1", "foo..bar,str,z"]),
-            ]
+        assert_sub_docs(
+            r#"{"foo":[{"bar":["y"]},{"bar":"z"}]}"#,
+            false,
+            &[
+                "foo$idx,number,0;foo..bar$idx,number,0;foo..bar.,str,y",
+                "foo$idx,number,1;foo..bar,str,z",
+            ],
+        );
+        assert_sub_docs(
+            r#"{"foo":[{"bar":["x","y"]},{"bar":["a","b"]}],"foo2":["u"]}"#,
+            false,
+            &[
+                "foo$idx,number,0;foo..bar$idx,number,0;foo..bar.,str,x;foo2$idx,number,0;foo2.,str,u",
+                "foo$idx,number,0;foo..bar$idx,number,1;foo..bar.,str,y;foo2$idx,number,0;foo2.,str,u",
+                "foo$idx,number,1;foo..bar$idx,number,0;foo..bar.,str,a;foo2$idx,number,0;foo2.,str,u",
+                "foo$idx,number,1;foo..bar$idx,number,1;foo..bar.,str,b;foo2$idx,number,0;foo2.,str,u",
+            ],
+        );
+        assert_sub_docs(
+            r#"{"foo":[{"bar":["y","z"]}],"foo2":["u"]}"#,
+            false,
+            &[
+                "foo$idx,number,0;foo..bar$idx,number,0;foo..bar.,str,y;foo2$idx,number,0;foo2.,str,u",
+                "foo$idx,number,0;foo..bar$idx,number,1;foo..bar.,str,z;foo2$idx,number,0;foo2.,str,u",
+            ],
         );
 
         let mut tokenizer = TextAnalyzer::builder(SimpleTokenizer::default()).build();
@@ -760,114 +796,35 @@ mod tests {
     }
 
     #[test]
-    fn test_flattened_sub_docs_sibling_array_example() {
-        let doc0 = flattened_sub_doc_texts(
-            r#"{"foo":[{"bar":["x","y"]},{"bar":["a","b"]}],"foo2":["u"]}"#,
-        );
-        let doc1 = flattened_sub_doc_texts(r#"{"foo":[{"bar":["y","z"]}],"foo2":["u"]}"#);
-
-        assert_eq!(
-            doc0,
-            vec![
-                sorted_tokens([
-                    "foo$idx,number,0",
-                    "foo..bar$idx,number,0",
-                    "foo..bar.,str,x",
-                    "foo2$idx,number,0",
-                    "foo2.,str,u",
-                ]),
-                sorted_tokens([
-                    "foo$idx,number,0",
-                    "foo..bar$idx,number,1",
-                    "foo..bar.,str,y",
-                    "foo2$idx,number,0",
-                    "foo2.,str,u",
-                ]),
-                sorted_tokens([
-                    "foo$idx,number,1",
-                    "foo..bar$idx,number,0",
-                    "foo..bar.,str,a",
-                    "foo2$idx,number,0",
-                    "foo2.,str,u",
-                ]),
-                sorted_tokens([
-                    "foo$idx,number,1",
-                    "foo..bar$idx,number,1",
-                    "foo..bar.,str,b",
-                    "foo2$idx,number,0",
-                    "foo2.,str,u",
-                ]),
-            ]
-        );
-        assert_eq!(
-            doc1,
-            vec![
-                sorted_tokens([
-                    "foo$idx,number,0",
-                    "foo..bar$idx,number,0",
-                    "foo..bar.,str,y",
-                    "foo2$idx,number,0",
-                    "foo2.,str,u",
-                ]),
-                sorted_tokens([
-                    "foo$idx,number,0",
-                    "foo..bar$idx,number,1",
-                    "foo..bar.,str,z",
-                    "foo2$idx,number,0",
-                    "foo2.,str,u",
-                ]),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_disable_cross_array_unnest_indexes_arrays_independently() {
-        let cross_joined = flattened_sub_doc_texts(r#"{"a":["x","y"],"b":["u","v"],"c":1}"#);
-        let disabled = flattened_sub_doc_texts_with_disable_cross_array_unnest(
+    fn test_disable_cross_array_unnest() {
+        assert_sub_docs(
             r#"{"a":["x","y"],"b":["u","v"],"c":1}"#,
+            false,
+            &[
+                "a$idx,number,0;a.,str,x;b$idx,number,0;b.,str,u;c,number,1",
+                "a$idx,number,0;a.,str,x;b$idx,number,1;b.,str,v;c,number,1",
+                "a$idx,number,1;a.,str,y;b$idx,number,0;b.,str,u;c,number,1",
+                "a$idx,number,1;a.,str,y;b$idx,number,1;b.,str,v;c,number,1",
+            ],
         );
-
-        assert_eq!(
-            sorted_sub_docs(cross_joined),
-            sorted_sub_docs(vec![
-                sorted_tokens([
-                    "a$idx,number,0",
-                    "a.,str,x",
-                    "b$idx,number,0",
-                    "b.,str,u",
-                    "c,number,1"
-                ]),
-                sorted_tokens([
-                    "a$idx,number,0",
-                    "a.,str,x",
-                    "b$idx,number,1",
-                    "b.,str,v",
-                    "c,number,1"
-                ]),
-                sorted_tokens([
-                    "a$idx,number,1",
-                    "a.,str,y",
-                    "b$idx,number,0",
-                    "b.,str,u",
-                    "c,number,1"
-                ]),
-                sorted_tokens([
-                    "a$idx,number,1",
-                    "a.,str,y",
-                    "b$idx,number,1",
-                    "b.,str,v",
-                    "c,number,1"
-                ]),
-            ])
+        assert_sub_docs(
+            r#"{"a":["x","y"],"b":["u","v"],"c":1}"#,
+            true,
+            &[
+                "a$idx,number,0;a.,str,x;c,number,1",
+                "a$idx,number,1;a.,str,y;c,number,1",
+                "b$idx,number,0;b.,str,u;c,number,1",
+                "b$idx,number,1;b.,str,v;c,number,1",
+            ],
         );
-        assert_eq!(
-            sorted_sub_docs(disabled),
-            sorted_sub_docs(vec![
-                sorted_tokens(["a$idx,number,0", "a.,str,x", "c,number,1"]),
-                sorted_tokens(["a$idx,number,1", "a.,str,y", "c,number,1"]),
-                sorted_tokens(["b$idx,number,0", "b.,str,u", "c,number,1"]),
-                sorted_tokens(["b$idx,number,1", "b.,str,v", "c,number,1"]),
-            ])
+        assert_sub_docs(
+            r#"{"a":["x"],"b":["u","v"],"c":null}"#,
+            true,
+            &[
+                "a$idx,number,0;a.,str,x;c,null,null",
+                "b$idx,number,0;b.,str,u;c,null,null",
+                "b$idx,number,1;b.,str,v;c,null,null",
+            ],
         );
     }
 
@@ -883,35 +840,27 @@ mod tests {
         );
     }
 
-    fn flattened_sub_doc_texts(json: &str) -> Vec<Vec<String>> {
-        flattened_sub_doc_texts_with_mode(json, false)
-    }
-
-    fn flattened_sub_doc_texts_with_disable_cross_array_unnest(json: &str) -> Vec<Vec<String>> {
-        flattened_sub_doc_texts_with_mode(json, true)
-    }
-
-    fn flattened_sub_doc_texts_with_mode(
-        json: &str,
-        disable_cross_array_unnest: bool,
-    ) -> Vec<Vec<String>> {
+    fn assert_sub_docs(json: &str, disable_cross_array_unnest: bool, expected: &[&str]) {
         let value: Value = serde_json::from_str(json).unwrap();
         let mut tokenizer = TextAnalyzer::builder(SimpleTokenizer::default()).build();
-        flatten_json_sub_docs(&value, "", &mut tokenizer, disable_cross_array_unnest)
-            .into_iter()
-            .map(|tokens| sorted_tokens(tokens.into_iter().map(|token| token.text)))
-            .collect()
+        let mut actual =
+            flatten_json_sub_docs(&value, "", &mut tokenizer, disable_cross_array_unnest)
+                .into_iter()
+                .map(|tokens| sorted_tokens(tokens.into_iter().map(|token| token.text)))
+                .collect::<Vec<_>>();
+        actual.sort();
+        let mut expected = expected
+            .iter()
+            .map(|sub_doc| sorted_tokens(sub_doc.split(';')))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(actual, expected);
     }
 
     fn sorted_tokens(tokens: impl IntoIterator<Item = impl Into<String>>) -> Vec<String> {
         let mut tokens = tokens.into_iter().map(Into::into).collect::<Vec<String>>();
         tokens.sort();
         tokens
-    }
-
-    fn sorted_sub_docs(mut sub_docs: Vec<Vec<String>>) -> Vec<Vec<String>> {
-        sub_docs.sort();
-        sub_docs
     }
 
     fn assert_token_texts(tokens: &[Token], expected: &[&str]) {

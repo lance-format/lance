@@ -3,6 +3,7 @@
 
 use super::partition::FuzzyAutomaton;
 use super::*;
+use crate::scalar::inverted::collapse_scored_rows;
 
 const LANCE_FTS_REUSE_PREPARED_SCORER_ENV: &str = "LANCE_FTS_REUSE_PREPARED_SCORER";
 
@@ -639,7 +640,15 @@ impl InvertedIndex {
             .await
         }?;
         if should_deduplicate_rows {
-            Ok(deduplicate_scored_documents(documents, requested_limit))
+            Ok(collapse_scored_rows(
+                documents
+                    .into_iter()
+                    .map(|document| (document.row_id, document.score.0)),
+                requested_limit,
+            )
+            .into_iter()
+            .map(|(row_id, score)| ScoredDoc::new(row_id, score))
+            .collect())
         } else {
             Ok(documents)
         }
@@ -1186,35 +1195,6 @@ impl InvertedIndex {
         Ok(resolved_documents)
     }
 }
-
-fn deduplicate_scored_documents(documents: Vec<ScoredDoc>, limit: usize) -> Vec<ScoredDoc> {
-    let mut scores_by_row_id: HashMap<u64, f32> = HashMap::with_capacity(documents.len());
-    for document in documents {
-        let score = document.score.0;
-        scores_by_row_id
-            .entry(document.row_id)
-            .and_modify(|existing| {
-                if score > *existing {
-                    *existing = score;
-                }
-            })
-            .or_insert(score);
-    }
-
-    let mut scored_documents = scores_by_row_id
-        .into_iter()
-        .map(|(row_id, score)| ScoredDoc::new(row_id, score))
-        .collect::<Vec<_>>();
-    scored_documents.sort_unstable_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.row_id.cmp(&right.row_id))
-    });
-    scored_documents.truncate(scored_documents.len().min(limit));
-    scored_documents
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

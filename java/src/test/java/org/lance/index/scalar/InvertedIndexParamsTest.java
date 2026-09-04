@@ -56,6 +56,14 @@ class InvertedIndexParamsTest {
   }
 
   @Test
+  void disableCrossArrayUnnestIsSerialized() {
+    ScalarIndexParams params = InvertedIndexParams.builder().disableCrossArrayUnnest(true).build();
+
+    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+    assertEquals(true, json.get("disable_cross_array_unnest"));
+  }
+
+  @Test
   void blockSizeIsSerialized() {
     ScalarIndexParams params = InvertedIndexParams.builder().blockSize(128).build();
 

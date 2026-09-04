@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::scalar::inverted::collapse_scored_rows;
 
 pub fn doc_index_storage_column(rank: usize) -> String {
     format!("{DOC_INDEX_STORAGE_PREFIX}{rank}")
@@ -137,28 +138,28 @@ pub(super) fn document_matches_flat_query(
         return Ok(has_query_token(document, tokenizer, query_tokens));
     };
 
-    let mut document_positions = (0..query_tokens.len())
-        .map(|_| Vec::new())
-        .collect::<Vec<_>>();
-    let mut stream = tokenizer.token_stream_for_doc(document);
-    while let Some(token) = stream.next() {
-        let position = u32::try_from(token.position).map_err(|_| {
-            Error::invalid_input(format!(
-                "flat FTS token position exceeds u32: {}",
-                token.position
-            ))
-        })?;
-        for (query_index, positions) in document_positions.iter_mut().enumerate() {
-            if query_tokens.get_token(query_index) == token.text {
-                positions.push(position);
+    for tokens in tokenizer.token_streams_for_doc(document)? {
+        let mut document_positions = (0..query_tokens.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
+        for token in tokens {
+            let position = u32::try_from(token.position).map_err(|_| {
+                Error::invalid_input(format!(
+                    "flat FTS token position exceeds u32: {}",
+                    token.position
+                ))
+            })?;
+            for (query_index, positions) in document_positions.iter_mut().enumerate() {
+                if query_tokens.get_token(query_index) == token.text {
+                    positions.push(position);
+                }
             }
         }
+        if phrase_matches_positions(query_tokens, &document_positions, slop) {
+            return Ok(true);
+        }
     }
-    Ok(phrase_matches_positions(
-        query_tokens,
-        &document_positions,
-        slop,
-    ))
+    Ok(false)
 }
 
 pub(super) const FLAT_ALL_TOKENS_COL: &str = "all_tokens";
@@ -572,40 +573,16 @@ pub(super) fn initialize_scorer(
     MemBM25Scorer::new(total_tokens, num_docs, token_counts_map)
 }
 
-fn deduplicate_scored_rows(
-    row_ids: Vec<u64>,
-    scores: Vec<f32>,
-    limit: usize,
-) -> (Vec<u64>, Vec<f32>) {
-    let mut scores_by_row_id: HashMap<u64, f32> = HashMap::with_capacity(row_ids.len());
-    for (row_id, score) in row_ids.into_iter().zip(scores) {
-        scores_by_row_id
-            .entry(row_id)
-            .and_modify(|existing| {
-                if score > *existing {
-                    *existing = score;
-                }
-            })
-            .or_insert(score);
-    }
-
-    let mut scored_rows = scores_by_row_id.into_iter().collect::<Vec<_>>();
-    scored_rows.sort_unstable_by(|(left_row_id, left_score), (right_row_id, right_score)| {
-        right_score
-            .total_cmp(left_score)
-            .then_with(|| left_row_id.cmp(right_row_id))
-    });
-    scored_rows.truncate(scored_rows.len().min(limit));
-    scored_rows.into_iter().unzip()
-}
-
-fn deduplicate_fts_batch(batch: RecordBatch, limit: usize) -> Result<RecordBatch> {
+fn collapse_flattened_rows(batch: RecordBatch) -> Result<RecordBatch> {
     let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
     let scores = batch[SCORE_COL]
         .as_primitive::<Float32Type>()
         .values()
         .to_vec();
-    let (row_ids, scores) = deduplicate_scored_rows(row_ids, scores, limit);
+    let (row_ids, scores): (Vec<_>, Vec<_>) =
+        collapse_scored_rows(row_ids.into_iter().zip(scores), usize::MAX)
+            .into_iter()
+            .unzip();
     Ok(RecordBatch::try_new(
         FTS_SCHEMA.clone(),
         vec![
@@ -623,7 +600,6 @@ pub(super) fn flat_bm25_score(
     operator: Operator,
     boost: f32,
     phrase_slop: Option<u32>,
-    require_all_query_tokens: bool,
 ) -> Result<RecordBatch> {
     let mut row_ids_builder = UInt64Builder::with_capacity(counted_input.num_rows());
     let mut scores_builder = Float32Builder::with_capacity(counted_input.num_rows());
@@ -709,16 +685,12 @@ pub(super) fn flat_bm25_score(
         }
         let doc_norm = K1 * (1.0 - B + B * num_tokens_in_doc as f32 / scorer.avg_doc_length());
         let mut score = 0.0;
-        let mut has_all_query_tokens = true;
         for (token, freq) in query_tokens.into_iter().zip(query_token_counts) {
             let freq = freq as f32;
-            if freq == 0.0 {
-                has_all_query_tokens = false;
-            }
             let idf = idf(scorer.num_docs_containing_token(token), scorer.num_docs());
             score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
         }
-        if score > 0.0 && (!require_all_query_tokens || has_all_query_tokens) {
+        if score > 0.0 {
             row_ids_builder.append_value(row_id);
             if let Some(builder) = doc_indices_builder.as_mut() {
                 for input_doc_index in &input_doc_indices {
@@ -911,11 +883,8 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     let query_tokens = Arc::new(collect_query_tokens(&query, &mut tokenizer));
     let should_deduplicate_rows =
         tokenizer.json_tokenizer_mode() == Some(JsonTokenizerMode::FlattenedSubDocs);
-    let require_all_query_tokens = should_deduplicate_rows
-        && query_tokens
-            .as_ref()
-            .into_iter()
-            .any(|token| token.contains("$idx,number,"));
+    let operator =
+        effective_json_query_operator(tokenizer.json_tokenizer_mode(), &query_tokens, operator);
 
     // A query that tokenizes to no terms (e.g. only stop words) has no
     // searchable content and matches nothing. Return early rather than
@@ -985,10 +954,9 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
         operator,
         boost,
         phrase_slop,
-        require_all_query_tokens,
     )?;
     if should_deduplicate_rows {
-        scores = deduplicate_fts_batch(scores, usize::MAX)?;
+        scores = collapse_flattened_rows(scores)?;
     }
 
     // Finally we emit batches according to the target batch size

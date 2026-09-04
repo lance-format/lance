@@ -2649,6 +2649,7 @@ impl Dataset {
                         "split_on_numerics",
                         "preserve_original",
                         "index_operators",
+                        "disable_cross_array_unnest",
                         "memory_limit",
                         "num_workers",
                         "format_version",
@@ -2681,18 +2682,6 @@ impl Dataset {
                         params = params
                             .block_size(block_size.extract()?)
                             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                    }
-                    if let Some(split_identifiers) = kwargs.get_item("split_identifiers")? {
-                        params = params.split_identifiers(split_identifiers.extract()?);
-                    }
-                    if let Some(split_on_numerics) = kwargs.get_item("split_on_numerics")? {
-                        params = params.split_on_numerics(split_on_numerics.extract()?);
-                    }
-                    if let Some(preserve_original) = kwargs.get_item("preserve_original")? {
-                        params = params.preserve_original(preserve_original.extract()?);
-                    }
-                    if let Some(index_operators) = kwargs.get_item("index_operators")? {
-                        params = params.index_operators(index_operators.extract()?);
                     }
                     if let Some(disable_cross_array_unnest) =
                         kwargs.get_item("disable_cross_array_unnest")?

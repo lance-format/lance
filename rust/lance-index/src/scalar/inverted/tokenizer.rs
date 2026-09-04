@@ -788,13 +788,19 @@ impl InvertedIndexParams {
         self.document_granularity
     }
 
-    /// Set how JSON documents are tokenized by the Lance JSON tokenizer.
-    pub fn json_tokenizer_mode(mut self, mode: JsonTokenizerMode) -> Self {
-        self.json_tokenizer_mode = Some(mode);
-        self
-    }
-
-    /// Set whether flattened JSON tokenization avoids cross-array unnesting.
+    /// Set whether flattened JSON tokenization indexes sibling arrays independently.
+    ///
+    /// This avoids the Cartesian product of sibling arrays at the cost of accuracy
+    /// for queries that constrain values across those arrays.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let params = InvertedIndexParams::default().disable_cross_array_unnest(true);
+    /// assert!(params.build().is_ok());
+    /// ```
     pub fn disable_cross_array_unnest(mut self, disable_cross_array_unnest: bool) -> Self {
         self.disable_cross_array_unnest = disable_cross_array_unnest;
         self
@@ -1090,12 +1096,14 @@ impl InvertedIndexParams {
 
         match self.lance_tokenizer {
             Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
-            Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(
-                tokenizer,
-                self.json_tokenizer_mode
-                    .unwrap_or(JsonTokenizerMode::SingleDocument),
-                self.disable_cross_array_unnest,
-            ))),
+            Some(ref t) if t == "json" => Ok(Box::new(
+                JsonTokenizer::new(tokenizer)
+                    .with_mode(
+                        self.json_tokenizer_mode
+                            .unwrap_or(JsonTokenizerMode::SingleDocument),
+                    )
+                    .with_disable_cross_array_unnest(self.disable_cross_array_unnest),
+            )),
             None => Ok(Box::new(TextTokenizer::new(tokenizer))),
             _ => Err(Error::invalid_input(format!(
                 "unknown lance tokenizer {}",

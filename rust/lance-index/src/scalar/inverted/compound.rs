@@ -16,7 +16,7 @@ use lance_select::RowAddrMask;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 
 use super::{
-    InvertedIndex, PreparedBm25Query,
+    InvertedIndex, PreparedBm25Query, collapse_scored_rows,
     document_tokenizer::{DocType, JsonTokenizer, JsonTokenizerMode, LanceTokenizer},
     documents::{
         CachedRowAddressOrder, DocId, DocLengths, DocVisibility, OrderedRowAddressProjection,
@@ -26,6 +26,7 @@ use super::{
     prepare_bm25_query,
     query::{
         FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens, collect_query_tokens,
+        effective_json_query_operator,
     },
     scorer::MemBM25Scorer,
     tokenizer::document_tokenizer::TextTokenizer,
@@ -3794,13 +3795,13 @@ pub(super) fn tokenize_leaf(
         let index_tokenizer = index.tokenizer();
         match index_tokenizer.doc_type() {
             DocType::Text => Box::new(TextTokenizer::new(analyzer)) as Box<dyn LanceTokenizer>,
-            DocType::Json => Box::new(JsonTokenizer::new(
-                analyzer,
-                index_tokenizer
-                    .json_tokenizer_mode()
-                    .unwrap_or(JsonTokenizerMode::SingleDocument),
-                index_tokenizer.disable_cross_array_unnest(),
-            )) as Box<dyn LanceTokenizer>,
+            DocType::Json => Box::new(
+                JsonTokenizer::new(analyzer).with_mode(
+                    index_tokenizer
+                        .json_tokenizer_mode()
+                        .unwrap_or(JsonTokenizerMode::SingleDocument),
+                ),
+            ) as Box<dyn LanceTokenizer>,
         }
     } else {
         index.tokenizer()
@@ -3839,6 +3840,11 @@ async fn prepare_compound_query(
     for leaf in leaf_queries {
         let effective_params = leaf.effective_params(params);
         let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
+        let operator = effective_json_query_operator(
+            first_index.params().json_tokenizer_mode,
+            &tokens,
+            leaf.operator(),
+        );
         let prepared = match &prepared_match {
             Some(prepared) => prepared.clone(),
             None => Arc::new(
@@ -3855,7 +3861,7 @@ async fn prepare_compound_query(
         leaves.push(PreparedLeaf {
             query: prepared,
             params: Arc::new(effective_params),
-            operator: leaf.operator(),
+            operator,
         });
     }
     Ok((plan, leaves))
@@ -4360,6 +4366,9 @@ async fn compound_search_impl(
     if limit == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
+    let should_collapse_rows = indices.first().is_some_and(|index| {
+        index.params().json_tokenizer_mode == Some(JsonTokenizerMode::FlattenedSubDocs)
+    });
     let (plan, leaves) = prepare_compound_query(
         indices,
         query,
@@ -4375,7 +4384,12 @@ async fn compound_search_impl(
     if let Some(score_floor) = initial_score_floor {
         competitive_score.raise(checked_score(score_floor, "initial compound score floor")?);
     }
-    let mut collector = TopKCollector::with_competitive_score(limit, competitive_score);
+    let collector_limit = if should_collapse_rows {
+        usize::MAX
+    } else {
+        limit
+    };
+    let mut collector = TopKCollector::with_competitive_score(collector_limit, competitive_score);
 
     for (segment_ordinal, index) in indices.iter().enumerate() {
         let loads =
@@ -4436,8 +4450,15 @@ async fn compound_search_impl(
         }
     }
 
-    let rows = collector.into_rows();
-    Ok(rows.into_iter().map(|row| (row.row_id, row.score)).unzip())
+    let rows = collector
+        .into_rows()
+        .into_iter()
+        .map(|row| (row.row_id, row.score));
+    if should_collapse_rows {
+        Ok(collapse_scored_rows(rows, limit).into_iter().unzip())
+    } else {
+        Ok(rows.unzip())
+    }
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::scalar::inverted::DocumentGranularity;
-use crate::scalar::inverted::document_tokenizer::DocType;
+use crate::scalar::inverted::document_tokenizer::{DocType, JsonTokenizerMode};
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
@@ -897,6 +897,25 @@ pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>)
         }
     }
     Tokens::with_positions(tokens, positions, token_type)
+}
+
+#[doc(hidden)]
+pub fn effective_json_query_operator(
+    mode: Option<JsonTokenizerMode>,
+    query_tokens: &Tokens,
+    operator: Operator,
+) -> Operator {
+    if mode == Some(JsonTokenizerMode::FlattenedSubDocs)
+        && query_tokens.into_iter().any(|token| {
+            token
+                .split_once(',')
+                .is_some_and(|(path, value)| path.ends_with("$idx") && value.starts_with("number,"))
+        })
+    {
+        Operator::And
+    } else {
+        operator
+    }
 }
 
 pub fn has_query_token(

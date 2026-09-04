@@ -56,7 +56,7 @@ use lance_index::scalar::inverted::document_tokenizer::{
 };
 use lance_index::scalar::inverted::query::{
     BoostQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens,
-    collect_query_tokens, has_query_token, uses_fuzzy_expansion,
+    collect_query_tokens, effective_json_query_operator, uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
@@ -2059,11 +2059,7 @@ fn tokenizer_for_match_query(
             let mode = index_tokenizer
                 .json_tokenizer_mode()
                 .unwrap_or(JsonTokenizerMode::SingleDocument);
-            Box::new(JsonTokenizer::new(
-                analyzer,
-                mode,
-                index_tokenizer.disable_cross_array_unnest(),
-            ))
+            Box::new(JsonTokenizer::new(analyzer).with_mode(mode))
         }
     }
 }
@@ -2418,28 +2414,6 @@ impl FtsSegmentSelection {
         }
         Ok(segments)
     }
-}
-
-fn query_has_concrete_json_array_index(query: &str) -> bool {
-    query.split(';').any(|triple| {
-        let path = triple
-            .split_once(',')
-            .map(|(path, _)| path)
-            .unwrap_or(triple);
-        let mut remaining = path;
-        while let Some(left_bracket) = remaining.find('[') {
-            let after_left = &remaining[left_bracket + 1..];
-            let Some(right_bracket) = after_left.find(']') else {
-                return false;
-            };
-            let array_index = &after_left[..right_bracket];
-            if !array_index.is_empty() && array_index != "*" {
-                return true;
-            }
-            remaining = &after_left[right_bracket + 1..];
-        }
-        false
-    })
 }
 
 pub struct FtsIndexMetrics {
@@ -2961,15 +2935,12 @@ impl ExecutionPlan for MatchQueryExec {
                 column
             )))?;
             let mut tokenizer = tokenizer_for_match_query(first_index, query.fuzziness);
-            let force_and_operator = tokenizer.json_tokenizer_mode()
-                == Some(JsonTokenizerMode::FlattenedSubDocs)
-                && query_has_concrete_json_array_index(&query.terms);
-            let operator = if force_and_operator {
-                Operator::And
-            } else {
-                query.operator
-            };
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+            let operator = effective_json_query_operator(
+                tokenizer.json_tokenizer_mode(),
+                &tokens,
+                query.operator,
+            );
             record_tokenized_query(&tokenized_query, &tokens);
             let prepared = if let Some(prepared_query) = preset_prepared_query {
                 Arc::new(PreparedMatch {
@@ -3075,8 +3046,13 @@ fn document_matches_query(
     query_tokens: &Tokens,
     operator: Operator,
 ) -> bool {
-    match operator {
-        Operator::Or => has_query_token(text, tokenizer, query_tokens),
+    let Ok(sub_docs) = tokenizer.token_streams_for_doc(text) else {
+        return false;
+    };
+    sub_docs.into_iter().any(|tokens| match operator {
+        Operator::Or => tokens
+            .iter()
+            .any(|token| query_tokens.contains(&token.text)),
         Operator::And => {
             let mut remaining_positions = (0..query_tokens.len())
                 .map(|index| query_tokens.position(index))
@@ -3084,8 +3060,7 @@ fn document_matches_query(
             if remaining_positions.is_empty() {
                 return false;
             }
-            let mut stream = tokenizer.token_stream_for_doc(text);
-            while let Some(token) = stream.next() {
+            for token in tokens {
                 for index in 0..query_tokens.len() {
                     if token.text == query_tokens.get_token(index) {
                         remaining_positions.remove(&query_tokens.position(index));
@@ -3097,7 +3072,7 @@ fn document_matches_query(
             }
             false
         }
-    }
+    })
 }
 
 impl DisplayAs for FlatMatchFilterExec {
@@ -3331,6 +3306,11 @@ impl FlatMatchFilterExec {
             }
         };
         let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
+        let query_operator = effective_json_query_operator(
+            tokenizer.json_tokenizer_mode(),
+            &query_tokens,
+            query.operator,
+        );
         record_tokenized_query(&tokenized_query, &query_tokens);
 
         let baseline = BaselineMetrics::new(&metrics_set, partition);
@@ -3341,7 +3321,6 @@ impl FlatMatchFilterExec {
             let mut tokenizer = tokenizer.box_clone();
             let elapsed_compute = elapsed_compute.clone();
             let resolved_field = resolved_field.clone();
-            let query_operator = query.operator;
             async move {
                 let batch = batch_result?;
                 let _t = elapsed_compute.timer();

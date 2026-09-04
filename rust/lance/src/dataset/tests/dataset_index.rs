@@ -6458,33 +6458,34 @@ async fn prepare_json_dataset() -> (Dataset, String) {
 }
 
 #[tokio::test]
-async fn test_json_inverted_flattened_sub_doc_array_paths() {
-    let ids = Arc::new(UInt64Array::from(vec![0, 1]));
+async fn test_json_inverted_flattened_sub_docs() {
     let json_col = "json_field".to_string();
-    let json_values = Arc::new(StringArray::from(vec![
-        r#"{"foo":[{"bar":["x","y"]},{"bar":["a","b"]}],"foo2":["u"]}"#,
-        r#"{"foo":[{"bar":["y","z"]}],"foo2":["u"]}"#,
-    ]));
-
     let mut metadata = HashMap::new();
     metadata.insert(
         ARROW_EXT_NAME_KEY.to_string(),
         ARROW_JSON_EXT_NAME.to_string(),
     );
-    let batch = RecordBatch::try_new(
-        arrow_schema::Schema::new(vec![
-            Field::new("id", DataType::UInt64, false),
-            Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata),
-        ])
-        .into(),
-        vec![ids as ArrayRef, json_values as ArrayRef],
-    )
-    .unwrap();
-    let schema = batch.schema();
-    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-    let mut dataset = Dataset::write(stream, "memory://test/flattened_json_array_paths", None)
-        .await
-        .unwrap();
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata),
+    ]));
+    let make_batch = |id, json| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![id])) as ArrayRef,
+                Arc::new(StringArray::from(vec![json])) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    let indexed_batch = make_batch(
+        0,
+        r#"{"cart":[{"product_type":"sneakers","attributes":{"color":"white"}},{"product_type":"t-shirt","attributes":{"color":"blue"}},{"product_type":"hat","attributes":{"color":"red"}}]}"#,
+    );
+    let stream = RecordBatchIterator::new(vec![Ok(indexed_batch)], schema.clone());
+    let mut dataset = Dataset::write(stream, "memory://", None).await.unwrap();
 
     dataset
         .create_index(
@@ -6500,110 +6501,43 @@ async fn test_json_inverted_flattened_sub_doc_array_paths() {
         .await
         .unwrap();
 
-    let exact_query = FullTextSearchQuery {
-        query: FtsQuery::Match(
-            MatchQuery::new("foo[0].bar[0],str,y".to_string()).with_column(Some(json_col.clone())),
-        ),
-        limit: None,
-        wand_factor: None,
-    };
-    let exact_batch = dataset
-        .scan()
-        .full_text_search(exact_query)
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let exact_ids = exact_batch["id"].as_primitive::<UInt64Type>().values();
-    assert_eq!(exact_ids, &[1]);
-
-    let wildcard_query = FullTextSearchQuery {
-        query: FtsQuery::Match(
-            MatchQuery::new("foo[0].bar[*],str,y".to_string()).with_column(Some(json_col.clone())),
-        ),
-        limit: None,
-        wand_factor: None,
-    };
-    let wildcard_batch = dataset
-        .scan()
-        .full_text_search(wildcard_query)
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let wildcard_ids = wildcard_batch["id"].as_primitive::<UInt64Type>().values();
-    assert_eq!(wildcard_batch.num_rows(), 2, "ids={wildcard_ids:?}");
-    assert!(wildcard_ids.contains(&0), "ids={wildcard_ids:?}");
-    assert!(wildcard_ids.contains(&1), "ids={wildcard_ids:?}");
-}
-
-#[tokio::test]
-async fn test_json_inverted_flattened_sub_doc_prevents_cross_object_match() {
-    let ids = Arc::new(UInt64Array::from(vec![0, 1]));
-    let json_col = "json_field".to_string();
-    let json_values = Arc::new(StringArray::from(vec![
-        r#"{"cart_id":3234234,"cart":[{"product_type":"sneakers","attributes":{"color":"white"}},{"product_type":"t-shirt","attributes":{"color":"red"}}]}"#,
-        r#"{"cart_id":3234235,"cart":[{"product_type":"sneakers","attributes":{"color":"red"}}]}"#,
-    ]));
-
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        ARROW_EXT_NAME_KEY.to_string(),
-        ARROW_JSON_EXT_NAME.to_string(),
+    let appended_batch = make_batch(
+        1,
+        r#"{"cart":[{"product_type":"t-shirt","attributes":{"color":"blue"}},{"product_type":"sneakers","attributes":{"color":"red"}}]}"#,
     );
-    let batch = RecordBatch::try_new(
-        arrow_schema::Schema::new(vec![
-            Field::new("id", DataType::UInt64, false),
-            Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata),
-        ])
-        .into(),
-        vec![ids as ArrayRef, json_values as ArrayRef],
-    )
-    .unwrap();
-    let schema = batch.schema();
-    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-    let mut dataset = Dataset::write(
-        stream,
-        "memory://test/flattened_json_cross_object_match",
-        None,
-    )
-    .await
-    .unwrap();
+    let stream = RecordBatchIterator::new(vec![Ok(appended_batch)], schema);
+    dataset.append(stream, None).await.unwrap();
 
-    dataset
-        .create_index(
-            &[&json_col],
-            IndexType::Inverted,
-            None,
-            &InvertedIndexParams::default()
-                .lance_tokenizer("json".to_string())
-                .stem(false)
-                .remove_stop_words(false),
-            true,
-        )
-        .await
-        .unwrap();
-
-    let query = FullTextSearchQuery {
-        query: FtsQuery::Match(
-            MatchQuery::new(
-                "cart[*].product_type,str,sneakers;cart[*].attributes.color,str,red".to_string(),
-            )
-            .with_column(Some(json_col.clone()))
-            .with_operator(Operator::And),
+    let cases = [
+        ("cart[1].attributes.color,str,red", Operator::Or, vec![1]),
+        ("cart[*].attributes.color,str,red", Operator::Or, vec![0, 1]),
+        (
+            "cart[*].product_type,str,sneakers;cart[*].attributes.color,str,red",
+            Operator::And,
+            vec![1],
         ),
-        limit: None,
-        wand_factor: None,
-    };
-    let batch = dataset
-        .scan()
-        .full_text_search(query)
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let ids = batch["id"].as_primitive::<UInt64Type>().values();
-    assert_eq!(ids, &[1]);
+    ];
+    for (terms, operator, expected_ids) in cases {
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new(terms.to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_operator(operator),
+            ),
+            limit: Some(2),
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut ids = batch["id"].as_primitive::<UInt64Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids, "query={terms}");
+    }
 }
 
 #[tokio::test]
