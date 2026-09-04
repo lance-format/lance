@@ -4,6 +4,9 @@
 //! Testing Node
 //!
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -46,6 +49,12 @@ impl DisplayAs for TestingExec {
 }
 
 impl ExecutionPlan for TestingExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "TestingExec"
     }
@@ -58,11 +67,22 @@ impl ExecutionPlan for TestingExec {
         vec![]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> datafusion::error::Result<std::sync::Arc<dyn ExecutionPlan>> {
         todo!()
+    }
+
+    fn with_new_children(
+        self: std::sync::Arc<Self>,
+        children: Vec<std::sync::Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<std::sync::Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(

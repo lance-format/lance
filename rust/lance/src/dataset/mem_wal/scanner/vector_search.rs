@@ -352,7 +352,7 @@ impl LsmVectorSearchPlanner {
         // task per input partition (one per union arm) via `spawn_buffered`, so
         // each arm's per-arm CPU (HNSW search, distance refine) runs on its own
         // task without an extra repartition.
-        let merged: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(knn_plans));
+        let merged: Arc<dyn ExecutionPlan> = UnionExec::try_new(knn_plans)?;
 
         let distance_idx = merged.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
             lance_core::Error::invalid_input(format!(

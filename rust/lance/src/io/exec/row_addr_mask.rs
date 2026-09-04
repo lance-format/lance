@@ -12,6 +12,9 @@
 //!     scans fragments not covered by the vector index and so never reaches the
 //!     index-side prefilter.
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use std::sync::Arc;
 
 use arrow::datatypes::UInt64Type;
@@ -90,6 +93,12 @@ impl DisplayAs for RowAddrMaskFilterExec {
 }
 
 impl ExecutionPlan for RowAddrMaskFilterExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "RowAddrMaskFilterExec"
     }
@@ -106,9 +115,10 @@ impl ExecutionPlan for RowAddrMaskFilterExec {
         vec![true]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(
@@ -119,6 +129,16 @@ impl ExecutionPlan for RowAddrMaskFilterExec {
             DataFusionError::Internal("RowAddrMaskFilterExec child unavailable".to_string())
         })?;
         Ok(Arc::new(Self::new(child, self.mask.clone())))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(

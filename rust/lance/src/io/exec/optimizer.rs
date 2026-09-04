@@ -10,6 +10,7 @@ use super::filtered_read::FilteredReadExec;
 use arrow_schema::Schema as ArrowSchema;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
@@ -81,7 +82,12 @@ impl CoalesceTake {
     ) -> Option<Arc<dyn ExecutionPlan>> {
         let inner_take_input = inner_take.children()[0].clone();
         let old_output_schema = outer_take.schema();
-        let collapsed = outer_exec.with_new_children(vec![inner_take_input]).ok()?;
+        let collapsed = outer_exec
+            .replace_children(
+                vec![inner_take_input],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .ok()?;
         let new_output_schema = collapsed.schema();
 
         if old_output_schema
@@ -215,7 +221,7 @@ pub fn get_physical_optimizer() -> PhysicalOptimizer {
         Arc::new(datafusion::physical_optimizer::limit_pushdown::LimitPushdown::new()),
         // Insert exchange nodes (RepartitionExec, CoalescePartitionsExec) where needed
         // to satisfy distribution requirements as exec nodes migrate to multi-partition output.
-        Arc::new(datafusion::physical_optimizer::enforce_distribution::EnforceDistribution::new()),
+        Arc::new(datafusion::physical_optimizer::ensure_requirements::EnsureRequirements::new()),
     ])
 }
 

@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{
+    ChildStats, ChildrenPropertiesMode, ReplaceChildrenOptions, StatisticsArgs,
+};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -616,6 +621,12 @@ impl TakeExec {
 }
 
 impl ExecutionPlan for TakeExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "TakeExec"
     }
@@ -637,9 +648,10 @@ impl ExecutionPlan for TakeExec {
     }
 
     /// This preserves the output schema.
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(
@@ -657,6 +669,16 @@ impl ExecutionPlan for TakeExec {
             // Is this legal or do we need to insert a no-op node?
             Ok(children[0].clone())
         }
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -700,12 +722,17 @@ impl ExecutionPlan for TakeExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
     ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
         Ok(Arc::new(Statistics {
-            num_rows: self.input.partition_statistics(partition)?.num_rows,
+            num_rows: input_stats[0].num_rows,
             ..Statistics::new_unknown(self.schema().as_ref())
         }))
     }
@@ -1316,7 +1343,10 @@ mod tests {
         );
 
         // with_new_children should preserve the output schema.
-        let edited = outer_take.with_new_children(vec![input])?;
+        let edited = outer_take.replace_children(
+            vec![input],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
         assert_eq!(edited.schema().field_names(), vec!["i", ROW_ID, "f", "s"],);
         Ok(())
     }

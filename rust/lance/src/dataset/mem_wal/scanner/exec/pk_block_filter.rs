@@ -27,6 +27,9 @@
 //! Already-blocked rows are dropped from the key set before probing older
 //! generations, preserving the per-row short-circuit.
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -104,6 +107,12 @@ impl DisplayAs for PkBlockFilterExec {
 }
 
 impl ExecutionPlan for PkBlockFilterExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "PkBlockFilterExec"
     }
@@ -120,9 +129,10 @@ impl ExecutionPlan for PkBlockFilterExec {
         vec![&self.input]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(
@@ -135,6 +145,16 @@ impl ExecutionPlan for PkBlockFilterExec {
             self.blocked.clone(),
             self.k,
         )))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(

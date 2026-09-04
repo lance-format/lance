@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::execution_plan::apply_expression_roots;
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, ReplaceChildrenOptions, StatisticsArgs, StatisticsContext,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3216,6 +3222,15 @@ impl DisplayAs for FilteredReadExec {
 }
 
 impl ExecutionPlan for FilteredReadExec {
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        apply_expression_roots(
+            self.options.physical_filters.iter().map(|(_, expr)| expr),
+            f,
+        )
+    }
     fn name(&self) -> &str {
         "FilteredReadExec"
     }
@@ -3242,14 +3257,23 @@ impl ExecutionPlan for FilteredReadExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        self.children()
+            .iter()
+            .map(|_| ChildStats::At(partition))
+            .collect()
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
     ) -> datafusion::error::Result<Arc<Statistics>> {
-        if let RowSelector::RowStream(source) = &self.input {
+        let partition = args.partition();
+        if let RowSelector::RowStream(_) = &self.input {
             // At most one output row per input row
             return Ok(Arc::new(Statistics {
-                num_rows: source.plan.partition_statistics(partition)?.num_rows,
+                num_rows: input_stats[0].num_rows,
                 ..Statistics::new_unknown(self.schema().as_ref())
             }));
         }
@@ -3329,7 +3353,10 @@ impl ExecutionPlan for FilteredReadExec {
             None,
         )?);
         let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
-        let mut df_stats = Arc::unwrap_or_clone(df_filter_exec.partition_statistics(partition)?);
+        let mut df_stats = Arc::unwrap_or_clone(StatisticsContext::new().compute(
+            &df_filter_exec,
+            &StatisticsArgs::new().with_partition(partition),
+        )?);
 
         // If we have an after-filter range, we should apply it to the stats (the before-filter range
         // is applied in the mock input)
@@ -3368,9 +3395,10 @@ impl ExecutionPlan for FilteredReadExec {
         Ok(Arc::new(df_stats))
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() > 1 {
             Err(DataFusionError::External(
@@ -3384,6 +3412,16 @@ impl ExecutionPlan for FilteredReadExec {
                 .map_err(|e| DataFusionError::External(e.into()))?;
             Ok(Arc::new(rebuilt))
         }
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -4635,7 +4673,9 @@ mod tests {
 
         let plan = fixture.make_plan(base_options.clone()).await;
 
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         // With no filter and no range we have an exact count
         assert_eq!(stats.num_rows, Precision::Exact(250));
 
@@ -4645,7 +4685,9 @@ mod tests {
             .with_scan_range_before_filter(25..125)
             .unwrap();
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(100));
 
         // With a filter, we don't know the exact count but DF can make some guesses
@@ -4656,7 +4698,9 @@ mod tests {
             .clone()
             .with_filter_plan(fixture.filter_plan("not_indexed >= 200", false).await);
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
 
         // In this case DF doesn't recognize the expression as simple and so it assumes a default
@@ -4665,7 +4709,9 @@ mod tests {
             .clone()
             .with_filter_plan(fixture.filter_plan("random() < 0.5", false).await);
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(50));
 
         // Filter columns not part of projection, make sure statistics using correct input schema
@@ -4682,7 +4728,9 @@ mod tests {
                     .unwrap(),
             );
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
         assert_eq!(stats.column_statistics.len(), 1);
     }
@@ -6740,7 +6788,13 @@ mod tests {
             let input = rows_input(vec![batch]);
             let plan: Arc<dyn ExecutionPlan> =
                 Arc::new(take_plan(&fixture.dataset, input.clone(), &["s"]).unwrap());
-            let rebuilt = plan.clone().with_new_children(vec![input]).unwrap();
+            let rebuilt = plan
+                .clone()
+                .replace_children(
+                    vec![input],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )
+                .unwrap();
             assert_eq!(plan.schema(), rebuilt.schema());
             assert!(
                 rebuilt
