@@ -58,7 +58,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
-use std::ffi::CString;
 use std::ptr::NonNull;
 
 pub(crate) mod arrow;
@@ -485,7 +484,6 @@ impl FFILanceTableProvider {
         py: Python<'py>,
         session: Bound<PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
-        let name = CString::new("datafusion_table_provider").unwrap();
         let a_lance_table_provider = Arc::new(LanceTableProvider::new(
             self.dataset.clone(),
             self.with_row_id,
@@ -499,7 +497,7 @@ impl FFILanceTableProvider {
             rt().get_runtime_handle(),
             codec,
         );
-        PyCapsule::new_with_value(py, ffi_provider, Some(name.clone()))
+        PyCapsule::new_with_value(py, ffi_provider, c"datafusion_table_provider")
     }
 }
 

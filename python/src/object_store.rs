@@ -183,7 +183,7 @@ impl PyObjectStoreProvider {
     fn _memory_capsule(py: Python<'_>) -> PyResult<Bound<'_, PyCapsule>> {
         let provider: Arc<dyn ObjectStoreProvider> =
             Arc::new(PyProviderBridge::Memory(MemoryStoreProvider));
-        PyCapsule::new_with_value(py, provider, Some(PROVIDER_CAPSULE_NAME.to_owned()))
+        PyCapsule::new_with_value(py, provider, PROVIDER_CAPSULE_NAME)
     }
 
     fn __repr__(&self) -> String {
