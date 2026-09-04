@@ -499,7 +499,7 @@ impl FFILanceTableProvider {
             rt().get_runtime_handle(),
             codec,
         );
-        PyCapsule::new(py, ffi_provider, Some(name.clone()))
+        PyCapsule::new_with_value(py, ffi_provider, Some(name.clone()))
     }
 }
 
