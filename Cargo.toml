@@ -82,19 +82,19 @@ lance-testing = { version = "=12.0.0-beta.15", path = "./rust/lance-testing" }
 all_asserts = "2.3.1"
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "58.0.0", optional = false, features = ["prettyprint"] }
-lance-arrow-scalar = { version = "=58.0.0", path = "./rust/arrow-scalar" }
-lance-arrow-stats = { version = "=58.0.0", path = "./rust/arrow-stats" }
-arrow-arith = "58.0.0"
-arrow-array = "58.0.0"
-arrow-buffer = "58.0.0"
-arrow-cast = "58.0.0"
-arrow-data = "58.0.0"
-arrow-ipc = { version = "58.0.0", features = ["zstd"] }
-arrow-ord = "58.0.0"
-arrow-row = "58.0.0"
-arrow-schema = "58.0.0"
-arrow-select = "58.0.0"
+arrow = { version = "59.3.0", optional = false, features = ["prettyprint"] }
+lance-arrow-scalar = { version = "=59.0.0", path = "./rust/arrow-scalar" }
+lance-arrow-stats = { version = "=59.0.0", path = "./rust/arrow-stats" }
+arrow-arith = "59.3.0"
+arrow-array = "59.3.0"
+arrow-buffer = "59.3.0"
+arrow-cast = "59.3.0"
+arrow-data = "59.3.0"
+arrow-ipc = { version = "59.3.0", features = ["zstd"] }
+arrow-ord = "59.3.0"
+arrow-row = "59.3.0"
+arrow-schema = "59.3.0"
+arrow-select = "59.3.0"
 async-recursion = "1.0"
 async-trait = "0.1"
 axum = "0.7"
@@ -130,7 +130,7 @@ criterion = { version = "0.8.2", features = [
 crossbeam-queue = "0.3"
 crossbeam-skiplist = "0.1"
 dashmap = "6"
-datafusion = { version = "54.0.0", default-features = false, features = [
+datafusion = { version = "55.0.0", default-features = false, features = [
     "crypto_expressions",
     "datetime_expressions",
     "encoding_expressions",
@@ -140,13 +140,13 @@ datafusion = { version = "54.0.0", default-features = false, features = [
     "string_expressions",
     "unicode_expressions",
 ] }
-datafusion-common = "54.0.0"
-datafusion-functions = { version = "54.0.0", default-features = false, features = ["regex_expressions"] }
-datafusion-sql = "54.0.0"
-datafusion-expr = "54.0.0"
-datafusion-physical-expr = "54.0.0"
-datafusion-physical-plan = "54.0.0"
-datafusion-substrait = { version = "54.0.0", default-features = false }
+datafusion-common = "55.0.0"
+datafusion-functions = { version = "55.0.0", default-features = false, features = ["regex_expressions"] }
+datafusion-sql = "55.0.0"
+datafusion-expr = "55.0.0"
+datafusion-physical-expr = "55.0.0"
+datafusion-physical-plan = "55.0.0"
+datafusion-substrait = { version = "55.0.0", default-features = false }
 dirs = "6.0.0"
 either = "1.0"
 env_logger = "0.11.7"
@@ -179,7 +179,7 @@ num-traits = "0.2"
 object_store = { version = "0.13.2" }
 opendal = { version = "0.58.1" }
 object_store_opendal = { version = "0.58" }
-parquet = { version = "58.0.0", default-features = false, features = [
+parquet = { version = "59.3.0", default-features = false, features = [
     "arrow",
     "async",
 ] }
