@@ -3892,7 +3892,11 @@ mod tests {
         ]));
         let first_fragment_rows = 20_000;
         let second_fragment_rows = 100;
-        let first_values = vec![0.0f32; first_fragment_rows * dimension as usize];
+        // A tiny per-row perturbation keeps the rows distinct, so the oversized
+        // partition can actually be split by k-means.
+        let first_values = (0..first_fragment_rows * dimension as usize)
+            .map(|i| (i / dimension as usize) as f32 * 0.0001)
+            .collect::<Vec<f32>>();
         let second_values = vec![100.0f32; second_fragment_rows * dimension as usize];
         let first_vectors =
             FixedSizeListArray::try_new_from_values(Float32Array::from(first_values), dimension)
@@ -4551,7 +4555,12 @@ mod tests {
             .num_partitions_per_segment()
             .into_iter()
             .collect::<HashMap<_, _>>();
-        assert_eq!(partitions_per_segment[&after_by_fragment[&vec![0]]], 3);
+        // The 20_000-row partition is split straight to the target size:
+        // ceil(20_000 / 4096) = 5 pieces, so 2 + 4 partitions.
+        assert_eq!(
+            partitions_per_segment[&after_by_fragment[&vec![0]]],
+            2 + 20_000_usize.div_ceil(IndexType::IvfFlat.target_partition_size()) - 1
+        );
         assert_eq!(partitions_per_segment[&after_by_fragment[&vec![1]]], 2);
     }
 

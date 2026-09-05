@@ -3,6 +3,7 @@
 
 //! IVF - Inverted File index.
 
+use super::details::target_partition_size_from_details;
 use super::{
     LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
@@ -384,30 +385,55 @@ pub(crate) fn index_type_for_segmented_optimize(index: &dyn VectorIndex) -> Resu
     IndexType::try_from(index_type_string(sub_index_type, quantization_type).as_str())
 }
 
-pub(crate) fn select_segment_for_single_rebalance(
+/// What a steady-state optimize (no new rows) should do to a logical IVF index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SteadyStateRebalance {
+    /// Rewrite this one segment alone: it holds oversized partitions.
+    Segment(Uuid),
+    /// Merge every segment: some partitions are undersized across the whole
+    /// logical index, which only a merge can repair.
+    MergeAll,
+}
+
+/// Pick the steady-state rebalance for a logical IVF index.
+///
+/// Splits are decided per segment, since an oversized partition lives in one
+/// segment's file. Joins are decided on the partition sizes summed over all
+/// segments: a delta segment's partitions are small on their own but normal
+/// once merged with the base segment, so joining them per segment would
+/// collapse every delta into a handful of partitions.
+pub(crate) fn select_steady_state_rebalance(
     logical_index: &LogicalIvfView<'_>,
-) -> Result<Option<Uuid>> {
+) -> Result<Option<SteadyStateRebalance>> {
     let mut best_split = None;
-    let mut best_join = None;
+    let mut summed_sizes: Vec<usize> = Vec::new();
+    let mut join_threshold = None;
 
     for (metadata, index) in logical_index.segments() {
         let index_type = index_type_for_segmented_optimize(index.as_ref())?;
-        let split_threshold = MAX_PARTITION_SIZE_FACTOR * index_type.target_partition_size();
-        let join_threshold = MIN_PARTITION_SIZE_PERCENT * index_type.target_partition_size() / 100;
+        let target_partition_size = metadata
+            .index_details
+            .as_deref()
+            .and_then(target_partition_size_from_details)
+            .unwrap_or_else(|| index_type.target_partition_size());
+        let split_threshold = MAX_PARTITION_SIZE_FACTOR * target_partition_size;
+        // The builder derives its thresholds from the first segment's target.
+        join_threshold.get_or_insert(MIN_PARTITION_SIZE_PERCENT * target_partition_size / 100);
         let num_partitions = index.ivf_model().num_partitions();
         if num_partitions == 0 {
             continue;
         }
+        if summed_sizes.len() < num_partitions {
+            summed_sizes.resize(num_partitions, 0);
+        }
 
         let mut split_partition_count = 0usize;
-        let mut join_partition_count = 0usize;
-        for partition_id in 0..num_partitions {
+        for (partition_id, summed_size) in summed_sizes.iter_mut().enumerate().take(num_partitions)
+        {
             let partition_size = index.partition_size(partition_id);
+            *summed_size += partition_size;
             if partition_size > split_threshold {
                 split_partition_count += 1;
-            }
-            if num_partitions > 1 && partition_size < join_threshold {
-                join_partition_count += 1;
             }
         }
 
@@ -426,21 +452,17 @@ pub(crate) fn select_segment_for_single_rebalance(
         {
             best_split = Some(candidate);
         }
-
-        let join_candidate = (join_partition_count > 0).then_some(SegmentRebalanceCandidate {
-            segment_id: metadata.uuid,
-            score: join_partition_count,
-            created_at_ms,
-        });
-        if let Some(candidate) = join_candidate
-            && candidate_is_better(candidate, best_join)
-        {
-            best_join = Some(candidate);
-        }
     }
 
-    let selected = best_split.or(best_join);
-    Ok(selected.map(|candidate| candidate.segment_id))
+    if let Some(candidate) = best_split {
+        return Ok(Some(SteadyStateRebalance::Segment(candidate.segment_id)));
+    }
+    let Some(join_threshold) = join_threshold else {
+        return Ok(None);
+    };
+    let has_join_candidate =
+        summed_sizes.len() > 1 && summed_sizes.iter().any(|&size| size < join_threshold);
+    Ok(has_join_candidate.then_some(SteadyStateRebalance::MergeAll))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,8 +685,20 @@ pub(crate) async fn optimize_vector_indices(
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
     if !existing_indices[0].as_any().is::<IVFIndex>() {
         let sources = existing_index_sources(&dataset, logical_index);
-        return optimize_vector_indices_v2(&dataset, unindexed, vector_column, &sources, options)
-            .await;
+        let target_partition_size = logical_index
+            .segments()
+            .next()
+            .and_then(|(metadata, _)| metadata.index_details.as_deref())
+            .and_then(target_partition_size_from_details);
+        return optimize_vector_indices_v2(
+            &dataset,
+            unindexed,
+            vector_column,
+            &sources,
+            options,
+            target_partition_size,
+        )
+        .await;
     }
 
     let new_uuid = Uuid::new_v4();
@@ -735,6 +769,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     vector_column: &str,
     existing_indices: &[ExistingIndex],
     options: &OptimizeOptions,
+    target_partition_size: Option<usize>,
 ) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
@@ -779,6 +814,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
+                .with_target_partition_size(target_partition_size)
                 .shuffle_data_input(unindexed)
                 .build()
                 .await?
@@ -797,6 +833,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
+                .with_target_partition_size(target_partition_size)
                 .shuffle_data_input(unindexed)
                 .build()
                 .await?
@@ -818,6 +855,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -838,6 +876,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -858,6 +897,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -877,6 +917,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -898,6 +939,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
+                .with_target_partition_size(target_partition_size)
                 .shuffle_data_input(unindexed)
                 .build()
                 .await?
@@ -916,6 +958,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_index_sources(existing_indices.clone())
                 .with_progress(options.progress.clone())
+                .with_target_partition_size(target_partition_size)
                 .shuffle_data_input(unindexed)
                 .build()
                 .await?
@@ -937,6 +980,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -957,6 +1001,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_quantizer(quantizer.try_into()?)
             .with_existing_index_sources(existing_indices.clone())
             .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
             .shuffle_data_input(unindexed)
             .build()
             .await?
@@ -5051,6 +5096,7 @@ mod tests {
             "vector",
             &sources,
             &OptimizeOptions::new(),
+            None,
         )
         .await
         .unwrap();
@@ -5066,6 +5112,7 @@ mod tests {
             "vector",
             &sources,
             &OptimizeOptions::merge(1),
+            None,
         )
         .await
         .unwrap();

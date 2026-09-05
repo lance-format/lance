@@ -3052,10 +3052,15 @@ mod tests {
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + total_rows as u64,
         ));
+        // A tiny per-row drift keeps the appended rows distinct (identical rows
+        // cannot be split by clustering) without moving them off their template's
+        // partition.
         let mut appended_values = Vec::with_capacity(total_rows * DIM);
         for template in templates {
-            for _ in 0..rows_per_template {
-                appended_values.extend_from_slice(template);
+            for row in 0..rows_per_template {
+                let mut values = template.clone();
+                values[0] += row as f32 * 0.0001;
+                appended_values.extend_from_slice(&values);
             }
         }
         let vectors = Arc::new(
@@ -6570,14 +6575,17 @@ mod tests {
         .await;
         expected_rows += NO_SPLIT_APPEND_ROWS;
 
+        // The oversized partition is split straight to the target size in one
+        // optimize: ceil(rows / target) pieces instead of a single halving.
+        let split_rows = expected_rows + SPLIT_APPEND_ROWS;
         append_and_verify_append_phase(
             &mut dataset,
             INDEX_NAME,
             &template_values,
             &mut next_id,
             SPLIT_APPEND_ROWS,
-            2,
-            expected_rows + SPLIT_APPEND_ROWS,
+            split_rows.div_ceil(IndexType::IvfPq.target_partition_size()),
+            split_rows,
             1,
             true,
         )
@@ -6623,17 +6631,21 @@ mod tests {
             .unwrap();
 
         let expected_rows = NUM_ROWS + APPEND_ROWS;
+        // Every vector of a row counts towards the partition size, and the split
+        // goes straight to the target size: ceil(vectors / target) pieces.
+        let expected_partitions =
+            (expected_rows * VECTORS_PER_ROW).div_ceil(IndexType::IvfPq.target_partition_size());
         let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
         assert_eq!(
             final_ctx.num_partitions(),
-            2,
-            "Expected one oversized multivector partition to split, stats: {}",
+            expected_partitions,
+            "Expected the oversized multivector partition to split into {expected_partitions}, stats: {}",
             final_ctx.stats_json()
         );
         let partitions = final_ctx.stats()["indices"][0]["partitions"]
             .as_array()
             .expect("partitions should be present");
-        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions.len(), expected_partitions);
         assert_eq!(
             partitions
                 .iter()
@@ -6724,10 +6736,14 @@ mod tests {
             .unwrap();
         dataset.validate().await.unwrap();
 
+        // Both partitions hold BASE + APPEND rows and are split straight to the
+        // target size in one optimize: ceil(rows / target) pieces each.
+        let pieces_per_partition = (BASE_ROWS_PER_PARTITION + APPEND_ROWS_PER_PARTITION)
+            .div_ceil(IndexType::IvfFlat.target_partition_size());
         let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
         assert_eq!(
             final_ctx.num_partitions(),
-            4,
+            2 * pieces_per_partition,
             "Expected both original partitions to split in one optimize, stats: {}",
             final_ctx.stats_json()
         );
@@ -6745,7 +6761,7 @@ mod tests {
         let partitions = indices[0]["partitions"]
             .as_array()
             .expect("partitions should be present");
-        assert_eq!(partitions.len(), 4);
+        assert_eq!(partitions.len(), 2 * pieces_per_partition);
         let expected_rows = 2 * BASE_ROWS_PER_PARTITION + 2 * APPEND_ROWS_PER_PARTITION;
         let total_partition_rows = partitions
             .iter()
@@ -7053,12 +7069,12 @@ mod tests {
     async fn test_optimize_join_after_delete_with_stable_row_ids() {
         // Regression test for https://github.com/lance-format/lance/issues/7701:
         // every partition (400 rows / 4) is under the IVF_FLAT join threshold,
-        // so optimize joins the smallest after a scattered delete.
+        // so one optimize joins all of them but the largest after a scattered delete.
         let run = optimize_after_delete(400, 4, "id % 3 = 0", "id % 3 != 0").await;
 
         assert_eq!(
-            run.num_partitions_after, 3,
-            "optimize should have joined the smallest partition, got stats: {}",
+            run.num_partitions_after, 1,
+            "optimize should have joined every undersized partition but one, got stats: {}",
             run.stats_json
         );
 
