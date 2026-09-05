@@ -75,6 +75,14 @@ use super::utils::{
     SelectionVectorToPrefilter,
 };
 
+mod adaptive_probe;
+
+use adaptive_probe::{
+    ExperimentalProbePolicy, QuakePartitionSearchControl, experimental_probe_policy,
+    quake_candidate_count, spann_nprobes, validate_experimental_probe_index,
+    validate_experimental_probe_plan,
+};
+
 pub const QUERY_INDEX_COL: &str = "query_index";
 
 pub fn query_index_field() -> Field {
@@ -1295,7 +1303,25 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
                         .await?;
                     // Normalize cosine queries once before partition ranking.
-                    let query = normalize_query_for_index(index.as_ref(), query.clone())?;
+                    let mut query = normalize_query_for_index(index.as_ref(), query.clone())?;
+
+                    if let ExperimentalProbePolicy::Quake {
+                        initial_fraction, ..
+                    } = experimental_probe_policy(&query)?
+                    {
+                        let candidate_count = quake_candidate_count(
+                            &query,
+                            index.total_partitions(),
+                            initial_fraction,
+                        );
+                        if candidate_count == 0 {
+                            return Err(DataFusionError::Execution(
+                                "Quake probing requires at least one candidate partition"
+                                    .to_string(),
+                            ));
+                        }
+                        query.maximum_nprobes = Some(candidate_count);
+                    }
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
@@ -2029,6 +2055,67 @@ impl ANNIvfSubIndexExec {
             .buffered(query_parallelism)
             .boxed()
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn quake_search(
+        index: Arc<dyn VectorIndex>,
+        query: Query,
+        partitions: Arc<UInt32Array>,
+        q_c_dists: Arc<Float32Array>,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<AnnIndexMetrics>,
+        recall_target: f32,
+    ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+        stream::once(async move {
+            let maximum_nprobes = query
+                .maximum_nprobes
+                .unwrap_or(partitions.len())
+                .min(partitions.len());
+            let minimum_nprobes = query.minimum_nprobes.min(maximum_nprobes);
+            let control = Arc::new(QuakePartitionSearchControl::try_new(
+                &query,
+                index.as_ref(),
+                &partitions,
+                minimum_nprobes,
+                recall_target,
+            )?);
+            let index_metrics: Arc<dyn MetricsCollector> = Arc::new(metrics.index_metrics.clone());
+            let stream = index
+                .search_partitions(
+                    query,
+                    partitions,
+                    q_c_dists,
+                    0,
+                    maximum_nprobes,
+                    prefilter,
+                    Some(control.clone()),
+                    index_metrics,
+                )
+                .await
+                .map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "Failed to search partitions with Quake probing: {error}"
+                    ))
+                })?;
+            Ok::<_, DataFusionError>(
+                stream
+                    .map(move |batch| {
+                        let batch = batch?;
+                        if control.callback_failed() {
+                            return Err(DataFusionError::Execution(
+                                "Quake probing callback state was unexpectedly concurrent"
+                                    .to_string(),
+                            ));
+                        }
+                        metrics.partitions_searched.add(1);
+                        metrics.baseline_metrics.record_output(batch.num_rows());
+                        Ok(batch)
+                    })
+                    .boxed(),
+            )
+        })
+        .try_flatten()
+    }
 }
 
 impl ExecutionPlan for ANNIvfSubIndexExec {
@@ -2100,6 +2187,15 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
+        let probe_policy = experimental_probe_policy(&self.query)?;
+        validate_experimental_probe_plan(
+            probe_policy,
+            &self.query,
+            self.indices.len(),
+            !matches!(&self.prefilter_source, PreFilterSource::None),
+            self.overlay_block.is_some(),
+            self.external_mask.is_some(),
+        )?;
         let input_stream = self.input.execute(partition, context.clone())?;
         let schema = self.schema();
         let target_partitions = context.session_config().target_partitions();
@@ -2214,8 +2310,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let state = state.clone();
                     let segment_bitmaps = segment_bitmaps.clone();
                     let mut query = query.clone();
-                    let pruned_nprobes = early_pruning(q_c_dists.values(), query.k);
-                    adjust_probes(&mut query, pruned_nprobes);
                     async move {
                         let index_metadata = indices_by_uuid.get(&index_uuid).ok_or_else(|| {
                             DataFusionError::Execution(format!(
@@ -2231,7 +2325,30 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
-                        let query = normalize_query_for_index(raw_index.as_ref(), query)?;
+                        let normalized_query =
+                            normalize_query_for_index(raw_index.as_ref(), query.clone())?;
+                        query = normalized_query;
+                        validate_experimental_probe_index(
+                            probe_policy,
+                            &query,
+                            raw_index.as_ref(),
+                        )?;
+
+                        match probe_policy {
+                            ExperimentalProbePolicy::Legacy => {
+                                let pruned_nprobes =
+                                    early_pruning(q_c_dists.values(), query.k);
+                                adjust_probes(&mut query, pruned_nprobes);
+                            }
+                            ExperimentalProbePolicy::Spann { ratio } => {
+                                // IVF centroid distances are squared L2 for both L2 and
+                                // normalized-cosine partition ranking. Apply SPANN's
+                                // d <= ratio * d0 comparison in that same squared-L2 unit.
+                                let pruned_nprobes = spann_nprobes(q_c_dists.values(), ratio);
+                                adjust_probes(&mut query, pruned_nprobes.max(1));
+                            }
+                            ExperimentalProbePolicy::Quake { .. } => {}
+                        }
 
                         // A segment's index file may still physically contain rows for
                         // fragments that were pruned from its fragment_bitmap (e.g. after an
@@ -2254,6 +2371,27 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             }
                             None => None,
                         };
+
+                        if let ExperimentalProbePolicy::Quake { recall_target, .. } = probe_policy {
+                            if seg_mask.is_some() {
+                                return Err(DataFusionError::Execution(
+                                    "Quake probing does not support per-segment row masks"
+                                        .to_string(),
+                                ));
+                            }
+                            return DataFusionResult::Ok(
+                                Self::quake_search(
+                                    raw_index,
+                                    query,
+                                    part_ids,
+                                    q_c_dists,
+                                    segment_pre_filter,
+                                    metrics,
+                                    recall_target,
+                                )
+                                .boxed(),
+                            );
+                        }
 
                         let early_search = Self::initial_search(
                             raw_index.clone(),

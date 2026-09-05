@@ -3883,6 +3883,7 @@ dependencies = [
  "lance-select",
  "lance-table",
  "lance-tokenizer",
+ "libm",
  "log",
  "moka",
  "object_store",
