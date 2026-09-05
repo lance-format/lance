@@ -4090,25 +4090,30 @@ fn inner_get_session_handle(env: &mut JNIEnv, java_dataset: JObject) -> Result<j
 // Zonemap Stats Methods       //
 /////////////////////////////////
 
+/// Reads zonemap stats and returns them as a single Arrow IPC stream byte
+/// array (one IPC stream containing 0..N RecordBatches, one per index segment,
+/// all sharing the canonical zonemap schema). The Java side decodes this with
+/// `ArrowStreamReader` and reconstructs the public `List<ZoneStats>`.
+///
+/// Returning bytes (instead of constructing N×ZoneStats Java objects in JNI)
+/// removes the per-row JNI marshalling cost that dominated CPU per profile.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_Dataset_nativeGetZonemapStats<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeGetZonemapStatsIpc<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
     jcolumn_name: JString,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_get_zonemap_stats(&mut env, java_dataset, jcolumn_name)
+        inner_get_zonemap_stats_ipc(&mut env, java_dataset, jcolumn_name)
     )
 }
 
-fn inner_get_zonemap_stats<'local>(
+fn inner_get_zonemap_stats_ipc<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
     jcolumn_name: JString,
 ) -> Result<JObject<'local>> {
-    use arrow_array::Array;
-    use datafusion_common::ScalarValue;
     use lance::dataset::index::LanceIndexStoreExt;
     use lance::index::DatasetIndexExt;
     use lance_index::scalar::IndexStore;
@@ -4117,7 +4122,7 @@ fn inner_get_zonemap_stats<'local>(
     let column_name: String = jcolumn_name.extract(env)?;
 
     // 1. Get the dataset and find every committed zonemap segment for this column
-    let zonemap_batches = {
+    let zonemap_batches: Vec<arrow_array::RecordBatch> = {
         let dataset = {
             let dataset_guard = unsafe {
                 env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
@@ -4193,99 +4198,27 @@ fn inner_get_zonemap_stats<'local>(
         })?
     };
 
-    // 3. Convert the RecordBatch rows to a Java ArrayList<ZoneStats>
-    let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    // 2. Empty result → empty byte[] (codec returns Collections.emptyList()).
     if zonemap_batches.is_empty() {
-        return Ok(array_list);
+        let empty: [u8; 0] = [];
+        let arr = env.byte_array_from_slice(&empty)?;
+        return Ok(arr.into());
     }
 
-    for record_batch in zonemap_batches {
-        let min_col = record_batch.column_by_name("min").ok_or_else(|| {
-            Error::input_error("ZoneMap index file missing 'min' column".to_string())
-        })?;
-        let max_col = record_batch.column_by_name("max").ok_or_else(|| {
-            Error::input_error("ZoneMap index file missing 'max' column".to_string())
-        })?;
-        let null_count_col = record_batch
-            .column_by_name("null_count")
-            .ok_or_else(|| {
-                Error::input_error("ZoneMap index file missing 'null_count' column".to_string())
-            })?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt32Array>()
-            .ok_or_else(|| {
-                Error::input_error("ZoneMap 'null_count' column is not UInt32".to_string())
-            })?;
-        let fragment_id_col = record_batch
-            .column_by_name("fragment_id")
-            .ok_or_else(|| {
-                Error::input_error("ZoneMap index file missing 'fragment_id' column".to_string())
-            })?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .ok_or_else(|| {
-                Error::input_error("ZoneMap 'fragment_id' column is not UInt64".to_string())
-            })?;
-        let zone_start_col = record_batch
-            .column_by_name("zone_start")
-            .ok_or_else(|| {
-                Error::input_error("ZoneMap index file missing 'zone_start' column".to_string())
-            })?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .ok_or_else(|| {
-                Error::input_error("ZoneMap 'zone_start' column is not UInt64".to_string())
-            })?;
-        let zone_length_col = record_batch
-            .column_by_name("zone_length")
-            .ok_or_else(|| {
-                Error::input_error("ZoneMap index file missing 'zone_length' column".to_string())
-            })?
-            .as_any()
-            .downcast_ref::<arrow_array::UInt64Array>()
-            .ok_or_else(|| {
-                Error::input_error("ZoneMap 'zone_length' column is not UInt64".to_string())
-            })?;
-
-        for i in 0..record_batch.num_rows() {
-            let fragment_id = fragment_id_col.value(i) as i32;
-            let zone_start = zone_start_col.value(i) as i64;
-            let zone_length = zone_length_col.value(i) as i64;
-            let null_count = null_count_col.value(i) as i64;
-
-            let min_scalar = ScalarValue::try_from_array(min_col, i).map_err(|e| {
-                Error::input_error(format!("Failed to read min value at row {}: {}", i, e))
-            })?;
-            let max_scalar = ScalarValue::try_from_array(max_col, i).map_err(|e| {
-                Error::input_error(format!("Failed to read max value at row {}: {}", i, e))
-            })?;
-
-            let j_min = crate::utils::scalar_value_to_java(env, &min_scalar)?;
-            let j_max = crate::utils::scalar_value_to_java(env, &max_scalar)?;
-
-            let zone_stats = env.new_object(
-                "org/lance/index/scalar/ZoneStats",
-                "(IJJLjava/lang/Comparable;Ljava/lang/Comparable;J)V",
-                &[
-                    JValue::Int(fragment_id),
-                    JValue::Long(zone_start),
-                    JValue::Long(zone_length),
-                    JValue::Object(&j_min),
-                    JValue::Object(&j_max),
-                    JValue::Long(null_count),
-                ],
-            )?;
-
-            env.call_method(
-                &array_list,
-                "add",
-                "(Ljava/lang/Object;)Z",
-                &[JValue::Object(&zone_stats)],
-            )?;
+    // 3. Serialize all batches as one IPC stream. Schema is taken from the
+    //    first batch — all segments share the canonical zonemap index schema.
+    let schema = zonemap_batches[0].schema();
+    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &schema)?;
+        for batch in &zonemap_batches {
+            writer.write(batch)?;
         }
+        writer.finish()?;
     }
 
-    Ok(array_list)
+    let arr = env.byte_array_from_slice(&buffer)?;
+    Ok(arr.into())
 }
 
 #[cfg(test)]

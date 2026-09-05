@@ -1721,11 +1721,16 @@ public class Dataset implements Closeable {
         columnName != null && !columnName.isEmpty(), "columnName cannot be null or empty");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeGetZonemapStats(columnName);
+      byte[] ipcBytes = nativeGetZonemapStatsIpc(columnName);
+      try {
+        return ZonemapStatsCodec.decode(ipcBytes, allocator);
+      } catch (IOException e) {
+        throw new RuntimeException("Failed to decode zonemap stats IPC", e);
+      }
     }
   }
 
-  private native List<ZoneStats> nativeGetZonemapStats(String columnName);
+  private native byte[] nativeGetZonemapStatsIpc(String columnName);
 
   /**
    * Get the table config of the dataset.

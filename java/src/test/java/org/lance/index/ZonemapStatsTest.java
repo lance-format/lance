@@ -23,11 +23,20 @@ import org.lance.index.scalar.ZoneStats;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.DateDayVector;
+import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.TimeStampMicroVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.DateUnit;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.Text;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -70,6 +79,128 @@ public class ZonemapStatsTest {
     }
     FragmentOperation.Append appendOp = new FragmentOperation.Append(metas);
     return Dataset.commit(allocator, path, appendOp, Optional.of(version));
+  }
+
+  /** Single-column schemas keyed by an arbitrary value type. */
+  private static Schema schemaWithValue(ArrowType valueType) {
+    return new Schema(
+        Arrays.asList(
+            Field.nullable("id", new ArrowType.Int(32, true)), Field.nullable("value", valueType)),
+        null);
+  }
+
+  private Dataset writeStringFragment(
+      BufferAllocator allocator, String path, long version, int rowCount) {
+    Schema schema = schemaWithValue(new ArrowType.Utf8());
+    List<FragmentMetadata> metas;
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector idVec = (IntVector) root.getVector("id");
+      VarCharVector valVec = (VarCharVector) root.getVector("value");
+      for (int i = 0; i < rowCount; i++) {
+        idVec.setSafe(i, i);
+        valVec.setSafe(i, new Text(String.format("v-%04d", i)));
+      }
+      root.setRowCount(rowCount);
+      metas = Fragment.create(path, allocator, root, new WriteParams.Builder().build());
+    }
+    return Dataset.commit(
+        allocator, path, new FragmentOperation.Append(metas), Optional.of(version));
+  }
+
+  private Dataset writeFloatFragment(
+      BufferAllocator allocator, String path, long version, int rowCount) {
+    Schema schema = schemaWithValue(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE));
+    List<FragmentMetadata> metas;
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector idVec = (IntVector) root.getVector("id");
+      Float8Vector valVec = (Float8Vector) root.getVector("value");
+      for (int i = 0; i < rowCount; i++) {
+        idVec.setSafe(i, i);
+        valVec.setSafe(i, i * 0.5);
+      }
+      root.setRowCount(rowCount);
+      metas = Fragment.create(path, allocator, root, new WriteParams.Builder().build());
+    }
+    return Dataset.commit(
+        allocator, path, new FragmentOperation.Append(metas), Optional.of(version));
+  }
+
+  private Dataset writeBooleanFragment(
+      BufferAllocator allocator, String path, long version, int rowCount) {
+    Schema schema = schemaWithValue(new ArrowType.Bool());
+    List<FragmentMetadata> metas;
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector idVec = (IntVector) root.getVector("id");
+      BitVector valVec = (BitVector) root.getVector("value");
+      for (int i = 0; i < rowCount; i++) {
+        idVec.setSafe(i, i);
+        valVec.setSafe(i, (i & 1) == 0 ? 1 : 0);
+      }
+      root.setRowCount(rowCount);
+      metas = Fragment.create(path, allocator, root, new WriteParams.Builder().build());
+    }
+    return Dataset.commit(
+        allocator, path, new FragmentOperation.Append(metas), Optional.of(version));
+  }
+
+  private Dataset writeDateFragment(
+      BufferAllocator allocator, String path, long version, int rowCount) {
+    Schema schema = schemaWithValue(new ArrowType.Date(DateUnit.DAY));
+    List<FragmentMetadata> metas;
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector idVec = (IntVector) root.getVector("id");
+      DateDayVector valVec = (DateDayVector) root.getVector("value");
+      for (int i = 0; i < rowCount; i++) {
+        idVec.setSafe(i, i);
+        valVec.setSafe(i, 19000 + i);
+      }
+      root.setRowCount(rowCount);
+      metas = Fragment.create(path, allocator, root, new WriteParams.Builder().build());
+    }
+    return Dataset.commit(
+        allocator, path, new FragmentOperation.Append(metas), Optional.of(version));
+  }
+
+  private Dataset writeTimestampMicroNonTzFragment(
+      BufferAllocator allocator, String path, long version, int rowCount) {
+    Schema schema = schemaWithValue(new ArrowType.Timestamp(TimeUnit.MICROSECOND, null));
+    List<FragmentMetadata> metas;
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector idVec = (IntVector) root.getVector("id");
+      TimeStampMicroVector valVec = (TimeStampMicroVector) root.getVector("value");
+      for (int i = 0; i < rowCount; i++) {
+        idVec.setSafe(i, i);
+        valVec.setSafe(i, 1_700_000_000_000_000L + i * 1_000_000L);
+      }
+      root.setRowCount(rowCount);
+      metas = Fragment.create(path, allocator, root, new WriteParams.Builder().build());
+    }
+    return Dataset.commit(
+        allocator, path, new FragmentOperation.Append(metas), Optional.of(version));
+  }
+
+  private Dataset writeAllNullValueFragment(
+      BufferAllocator allocator, String path, long version, int rowCount) {
+    Schema schema = schemaWithValue(new ArrowType.Int(32, true));
+    List<FragmentMetadata> metas;
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector idVec = (IntVector) root.getVector("id");
+      IntVector valVec = (IntVector) root.getVector("value");
+      for (int i = 0; i < rowCount; i++) {
+        idVec.setSafe(i, i);
+        valVec.setNull(i);
+      }
+      root.setRowCount(rowCount);
+      metas = Fragment.create(path, allocator, root, new WriteParams.Builder().build());
+    }
+    return Dataset.commit(
+        allocator, path, new FragmentOperation.Append(metas), Optional.of(version));
   }
 
   // -------------------------------------------------------
@@ -313,6 +444,151 @@ public class ZonemapStatsTest {
           Dataset.create(allocator, path, intSchema(), new WriteParams.Builder().build())) {
         assertThrows(IllegalArgumentException.class, () -> dataset.getZonemapStats(""));
       }
+    }
+  }
+
+  // -------------------------------------------------------
+  // Type-coverage integration tests (review finding #2)
+  // -------------------------------------------------------
+
+  private List<ZoneStats> zonemapStatsOnValue(BufferAllocator allocator, String path) {
+    try (Dataset dataset = Dataset.open(path, allocator)) {
+      ScalarIndexParams params = ScalarIndexParams.create("zonemap", "{}");
+      IndexParams indexParams = IndexParams.builder().setScalarIndexParams(params).build();
+      dataset.createIndex(
+          Collections.singletonList("value"),
+          IndexType.ZONEMAP,
+          Optional.of("value_zm"),
+          indexParams,
+          true);
+      return dataset.getZonemapStats("value");
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsStringColumn(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("string_col").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      try (Dataset ds =
+          Dataset.create(
+              allocator,
+              path,
+              schemaWithValue(new ArrowType.Utf8()),
+              new WriteParams.Builder().build())) {}
+      writeStringFragment(allocator, path, 1, 100).close();
+
+      List<ZoneStats> stats = zonemapStatsOnValue(allocator, path);
+      assertFalse(stats.isEmpty());
+      assertTrue(stats.get(0).getMin() instanceof String);
+      assertTrue(stats.get(0).getMax() instanceof String);
+      assertEquals("v-0000", stats.get(0).getMin());
+      assertEquals("v-0099", stats.get(stats.size() - 1).getMax());
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsFloatColumn(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("float_col").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      try (Dataset ds =
+          Dataset.create(
+              allocator,
+              path,
+              schemaWithValue(new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE)),
+              new WriteParams.Builder().build())) {}
+      writeFloatFragment(allocator, path, 1, 100).close();
+
+      List<ZoneStats> stats = zonemapStatsOnValue(allocator, path);
+      assertFalse(stats.isEmpty());
+      assertTrue(stats.get(0).getMin() instanceof Double);
+      assertEquals(0.0, stats.get(0).getMin());
+      assertEquals(49.5, stats.get(stats.size() - 1).getMax());
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsBooleanColumn(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("bool_col").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      try (Dataset ds =
+          Dataset.create(
+              allocator,
+              path,
+              schemaWithValue(new ArrowType.Bool()),
+              new WriteParams.Builder().build())) {}
+      writeBooleanFragment(allocator, path, 1, 100).close();
+
+      List<ZoneStats> stats = zonemapStatsOnValue(allocator, path);
+      assertFalse(stats.isEmpty());
+      assertTrue(stats.get(0).getMin() instanceof Boolean);
+      assertEquals(Boolean.FALSE, stats.get(0).getMin());
+      assertEquals(Boolean.TRUE, stats.get(0).getMax());
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsDateColumn(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("date_col").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      try (Dataset ds =
+          Dataset.create(
+              allocator,
+              path,
+              schemaWithValue(new ArrowType.Date(DateUnit.DAY)),
+              new WriteParams.Builder().build())) {}
+      writeDateFragment(allocator, path, 1, 100).close();
+
+      List<ZoneStats> stats = zonemapStatsOnValue(allocator, path);
+      assertFalse(stats.isEmpty());
+      assertTrue(stats.get(0).getMin() instanceof Long);
+      assertEquals(19000L, stats.get(0).getMin());
+      assertEquals(19099L, stats.get(stats.size() - 1).getMax());
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsTimestampNonTzColumn(@TempDir Path tempDir) throws Exception {
+    // Regression: pre-fix this crashed in toComparable with
+    // ClassCastException(LocalDateTime cannot be cast to Number).
+    String path = tempDir.resolve("ts_nontz_col").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      try (Dataset ds =
+          Dataset.create(
+              allocator,
+              path,
+              schemaWithValue(new ArrowType.Timestamp(TimeUnit.MICROSECOND, null)),
+              new WriteParams.Builder().build())) {}
+      writeTimestampMicroNonTzFragment(allocator, path, 1, 100).close();
+
+      List<ZoneStats> stats = zonemapStatsOnValue(allocator, path);
+      assertFalse(stats.isEmpty());
+      assertTrue(stats.get(0).getMin() instanceof Long);
+      assertEquals(1_700_000_000_000_000L, stats.get(0).getMin());
+      assertEquals(1_700_000_000_000_000L + 99 * 1_000_000L, stats.get(stats.size() - 1).getMax());
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsAllNullZone(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("all_null_zone").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      try (Dataset ds =
+          Dataset.create(
+              allocator,
+              path,
+              schemaWithValue(new ArrowType.Int(32, true)),
+              new WriteParams.Builder().build())) {}
+      writeAllNullValueFragment(allocator, path, 1, 64).close();
+
+      List<ZoneStats> stats = zonemapStatsOnValue(allocator, path);
+      assertFalse(stats.isEmpty());
+      ZoneStats first = stats.get(0);
+      assertNull(first.getMin(), "all-null zone must report null min");
+      assertNull(first.getMax(), "all-null zone must report null max");
+      assertEquals(
+          first.getZoneLength(),
+          first.getNullCount(),
+          "all-null zone null_count must equal zone_length");
     }
   }
 }
