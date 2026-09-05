@@ -78,10 +78,11 @@ use lance_namespace::models::{
     ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest,
-    RestoreTableResponse, TableExistsRequest, TableVersion, TagContents as ModelTagContents,
-    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
-    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
+    QueryTableRequest, QueryTableRequestColumns, QueryTableRequestVector, RenameTableRequest,
+    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
+    TableVersion, TagContents as ModelTagContents, UpdateTableRequest, UpdateTableResponse,
+    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
+    UpdateTableTagResponse,
 };
 
 use lance_core::utils::parse::str_to_bool;
@@ -3567,6 +3568,280 @@ impl LanceNamespace for DirectoryNamespace {
             id: request.id,
             location: Some(table_uri),
             ..Default::default()
+        })
+    }
+
+    async fn rename_table(&self, request: RenameTableRequest) -> Result<RenameTableResponse> {
+        self.record_op("rename_table");
+
+        let new_table_name = &request.new_table_name;
+
+        if new_table_name.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "new_table_name cannot be empty".to_string(),
+            }
+            .into());
+        }
+
+        let source_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required for rename".to_string(),
+            })
+        })?;
+        if source_id.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
+        }
+
+        // Cross-namespace rename cannot be performed by the directory backend
+        // itself, and the manifest backend does not implement `rename_table`
+        // either, so bail out with a clear `Unsupported` error rather than
+        // returning the generic "not implemented" from the trait default.
+        //
+        // `new_namespace_id` represents the *target* namespace: `None` means
+        // "same namespace", and a value equal to the source's parent path is
+        // the explicit same-namespace form some clients send. Only reject
+        // when the target actually differs from the source namespace.
+        let source_namespace: Vec<String> = if source_id.len() > 1 {
+            source_id[..source_id.len() - 1].to_vec()
+        } else {
+            Vec::new()
+        };
+        let target_namespace_differs = match &request.new_namespace_id {
+            None => false,
+            Some(new_ns) => new_ns.as_slice() != source_namespace.as_slice(),
+        };
+        if target_namespace_differs {
+            return Err(NamespaceError::Unsupported {
+                message: "Cross-namespace rename is not supported by DirectoryNamespace"
+                    .to_string(),
+            }
+            .into());
+        }
+
+        // Decide which mode this rename runs in, matching the routing used by
+        // `describe_table` / `create_table` / `table_exists` so that the row we
+        // read back after a rename is the one we actually mutated.
+        let is_root_level = source_id.len() == 1;
+        let skip_manifest_for_root = self.dir_listing_enabled
+            && is_root_level
+            && !self.dir_listing_to_manifest_migration_enabled;
+        let use_manifest = self.manifest_ns_for_read().is_some() && !skip_manifest_for_root;
+
+        // Verify source table exists (works with both manifest and dir-listing
+        // modes). Discarding the resolved URI is intentional: the mode-specific
+        // branches below re-derive the physical location they need.
+        let _source_uri = self.resolve_table_location(&request.id).await?;
+
+        // Check destination table does not already exist. Only treat an
+        // explicit `TableNotFound` as evidence that the destination is free;
+        // any other error (permission denied, throttling, transient IO, ...)
+        // must be surfaced instead of silently overwriting the target.
+        let dest_id: Vec<String> = if source_id.len() > 1 {
+            let mut d = source_id[..source_id.len() - 1].to_vec();
+            d.push(new_table_name.clone());
+            d
+        } else {
+            vec![new_table_name.clone()]
+        };
+        {
+            let mut exists_req = TableExistsRequest::new();
+            exists_req.id = Some(dest_id.clone());
+            match self.table_exists(exists_req).await {
+                Ok(()) => {
+                    return Err(NamespaceError::TableAlreadyExists {
+                        message: format!("Destination table '{}' already exists", new_table_name),
+                    }
+                    .into());
+                }
+                Err(e) => {
+                    let is_not_found = matches!(
+                        &e,
+                        lance_core::Error::Namespace { source, .. }
+                            if source
+                                .downcast_ref::<NamespaceError>()
+                                .is_some_and(|ns| matches!(ns, NamespaceError::TableNotFound { .. }))
+                    );
+                    if !is_not_found {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        if use_manifest {
+            // Manifest-tracked table: the rename is a metadata-only update on
+            // the manifest row. The physical `location` recorded in the
+            // manifest may point at any directory (root-level `<name>.lance`,
+            // a hashed dir under a child namespace, or a custom registered
+            // location), so we must not touch the underlying files or derive
+            // a new location from `new_table_name`. Delegating to
+            // `ManifestNamespace::rename_table_entry` preserves the original
+            // namespace path, storage location, and any user metadata.
+            let manifest_ns = self
+                .manifest_ns_for_write()
+                .await?
+                .expect("checked use_manifest");
+            manifest_ns
+                .rename_table_entry(source_id, new_table_name, None)
+                .await?;
+            return Ok(RenameTableResponse {
+                transaction_id: None,
+            });
+        }
+
+        // From here on we are in the directory-listing branch (root-level
+        // only). When `manifest_ns` is configured, the table may still have a
+        // manifest row left over from a previous mode (e.g. a `create_table`
+        // call that wrote the manifest row first, or a migration that left a
+        // duplicate entry behind). If we only move the physical directory
+        // here, the manifest keeps pointing at the old `object_id` while the
+        // data is now under the new name; manifest-delegated APIs (such as
+        // `drop_table`) and migration tooling can then lose track of the
+        // table or expose both the stale manifest name and the new directory
+        // name. So as long as a manifest exists, keep the manifest row in
+        // sync with the physical rename by delegating to the same primitive
+        // the manifest branch uses.
+        let manifest_ns_for_sync = self.manifest_ns_for_read().cloned();
+
+        // Directory-listing branch (root-level only): tables are discovered
+        // by listing `<name>.lance` directories under `base_path`. A rename
+        // must physically move the directory, otherwise the old name would
+        // still be visible via directory listing. Because there is no atomic
+        // rename primitive across all supported object stores, we copy first
+        // and then delete the source; if any step fails we roll back the
+        // partially copied destination so no half-written table is left
+        // behind.
+        let source_name = &source_id[0];
+        let source_path = self.table_path(source_name);
+        let dest_path = self.table_path(new_table_name);
+
+        // List all files in the source table directory.
+        let entries: Vec<object_store::ObjectMeta> = self
+            .object_store
+            .inner
+            .list(Some(&source_path))
+            .try_collect()
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to list source table '{}' files: {:?}",
+                        source_name, e
+                    ),
+                })
+            })?;
+
+        // Helper: best-effort cleanup of the destination directory used to
+        // roll back a partial copy.
+        let rollback_dest = |dest: Path| async move {
+            if let Err(cleanup_err) = self.object_store.remove_dir_all(dest).await {
+                log::warn!(
+                    "rename_table: failed to roll back destination directory '{}' after error: {:?}",
+                    new_table_name,
+                    cleanup_err
+                );
+            }
+        };
+
+        // Copy each file to the new location. On failure, roll back any files
+        // already written to the destination so we do not leave a half-copied
+        // table behind.
+        for entry in &entries {
+            let relative = entry
+                .location
+                .as_ref()
+                .strip_prefix(source_path.as_ref())
+                .unwrap_or(entry.location.as_ref());
+            let new_location = match Path::parse(format!(
+                "{}/{}",
+                dest_path.as_ref(),
+                relative.trim_start_matches('/')
+            )) {
+                Ok(p) => p,
+                Err(e) => {
+                    rollback_dest(dest_path.clone()).await;
+                    return Err(lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to construct destination path: {:?}", e),
+                    }));
+                }
+            };
+
+            if let Err(e) = self
+                .object_store
+                .inner
+                .copy(&entry.location, &new_location)
+                .await
+            {
+                let copy_err = lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to copy file '{}' to '{}': {:?}",
+                        entry.location, new_location, e
+                    ),
+                });
+                rollback_dest(dest_path.clone()).await;
+                return Err(copy_err);
+            }
+        }
+
+        // Remove the source directory. In directory-listing mode the source
+        // remains discoverable until this delete succeeds, so a failure here
+        // would leave both the old and the new table visible. Roll back the
+        // destination we just wrote and surface the error to the caller
+        // instead of returning a misleading `Ok`.
+        if let Err(e) = self.object_store.remove_dir_all(source_path).await {
+            let cleanup_err = lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to remove source table directory '{}' after copy: {:?}",
+                    source_name, e
+                ),
+            });
+            rollback_dest(dest_path).await;
+            return Err(cleanup_err);
+        }
+
+        // Keep the manifest in sync with the physical rename. The manifest row
+        // is updated last (after the data move) so a partial failure leaves a
+        // discoverable table on disk rather than a manifest pointer with no
+        // underlying data. If the table was not registered in the manifest,
+        // `rename_table_entry` returns `TableNotFound` and we silently treat
+        // that as a no-op so the physical move still succeeds.
+        //
+        // In directory-listing mode the table's data was physically moved from
+        // `<old_name>.lance` to `<new_name>.lance` above, so the manifest row's
+        // stored `location` must be rewritten to the new directory. Without
+        // this, manifest-routed operations (e.g. `drop_table`, migration) would
+        // still see the old path and either miss the table or point at
+        // now-deleted data.
+        if let Some(manifest_ns) = manifest_ns_for_sync {
+            let new_dir_name = format!("{}.lance", new_table_name);
+            match manifest_ns
+                .rename_table_entry(source_id, new_table_name, Some(new_dir_name))
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    let is_not_found = matches!(
+                        &e,
+                        lance_core::Error::Namespace { source, .. }
+                            if source
+                                .downcast_ref::<NamespaceError>()
+                                .is_some_and(|ns| matches!(
+                                    ns,
+                                    NamespaceError::TableNotFound { .. }
+                                ))
+                    );
+                    if !is_not_found {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Ok(RenameTableResponse {
+            transaction_id: None,
         })
     }
 
@@ -9454,6 +9729,270 @@ mod tests {
         // The operation might succeed or fail depending on implementation
         // But it should not panic
         let _ = result;
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_basic() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["original_table".to_string()]);
+        namespace
+            .create_table(create_request, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let mut rename_request = RenameTableRequest::new("renamed_table".to_string());
+        rename_request.id = Some(vec!["original_table".to_string()]);
+        let result = namespace.rename_table(rename_request).await;
+        assert!(result.is_ok());
+
+        let mut exists_request = TableExistsRequest::new();
+        exists_request.id = Some(vec!["original_table".to_string()]);
+        assert!(namespace.table_exists(exists_request).await.is_err());
+
+        let mut exists_request = TableExistsRequest::new();
+        exists_request.id = Some(vec!["renamed_table".to_string()]);
+        assert!(namespace.table_exists(exists_request).await.is_ok());
+
+        let mut describe_request = DescribeTableRequest::new();
+        describe_request.id = Some(vec!["renamed_table".to_string()]);
+        assert!(namespace.describe_table(describe_request).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rename_to_existing_table_should_fail() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["table_a".to_string()]);
+        namespace
+            .create_table(create_request, bytes::Bytes::from(ipc_data.clone()))
+            .await
+            .unwrap();
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["table_b".to_string()]);
+        namespace
+            .create_table(create_request, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let mut rename_request = RenameTableRequest::new("table_b".to_string());
+        rename_request.id = Some(vec!["table_a".to_string()]);
+        let result = namespace.rename_table(rename_request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_rename_nonexistent_table_should_fail() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let mut rename_request = RenameTableRequest::new("new_name".to_string());
+        rename_request.id = Some(vec!["nonexistent".to_string()]);
+        let result = namespace.rename_table(rename_request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_empty_name_should_fail() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["my_table".to_string()]);
+        namespace
+            .create_table(create_request, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let mut rename_request = RenameTableRequest::new("".to_string());
+        rename_request.id = Some(vec!["my_table".to_string()]);
+        let result = namespace.rename_table(rename_request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_cross_namespace_should_fail() {
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["my_table".to_string()]);
+        namespace
+            .create_table(create_request, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let mut rename_request = RenameTableRequest::new("new_name".to_string());
+        rename_request.id = Some(vec!["my_table".to_string()]);
+        rename_request.new_namespace_id = Some(vec!["other_ns".to_string()]);
+        let result = namespace.rename_table(rename_request).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Cross-namespace"));
+    }
+
+    /// `new_namespace_id` is the *target* namespace. Omitting it means
+    /// "same namespace"; explicitly setting it to the source namespace's
+    /// parent path means the same thing. Only a target that *differs* from
+    /// the source should be rejected as cross-namespace.
+    #[tokio::test]
+    async fn test_rename_table_explicit_same_namespace_root_succeeds() {
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["original_table".to_string()]);
+        namespace
+            .create_table(create_request, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let mut rename_request = RenameTableRequest::new("renamed_table".to_string());
+        rename_request.id = Some(vec!["original_table".to_string()]);
+        rename_request.new_namespace_id = Some(vec![]);
+        let result = namespace.rename_table(rename_request).await;
+        assert!(
+            result.is_ok(),
+            "explicit same-namespace rename should succeed"
+        );
+
+        let mut exists_request = TableExistsRequest::new();
+        exists_request.id = Some(vec!["renamed_table".to_string()]);
+        assert!(namespace.table_exists(exists_request).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_explicit_same_namespace_child_succeeds() {
+        use lance_namespace::models::CreateNamespaceRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let mut create_ns = CreateNamespaceRequest::new();
+        create_ns.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns).await.unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["workspace".to_string(), "original".to_string()]);
+        namespace
+            .create_table(create_request, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let mut rename_request = RenameTableRequest::new("renamed".to_string());
+        rename_request.id = Some(vec!["workspace".to_string(), "original".to_string()]);
+        rename_request.new_namespace_id = Some(vec!["workspace".to_string()]);
+        let result = namespace.rename_table(rename_request).await;
+        assert!(
+            result.is_ok(),
+            "explicit same-namespace child rename should succeed"
+        );
+
+        let mut exists_request = TableExistsRequest::new();
+        exists_request.id = Some(vec!["workspace".to_string(), "renamed".to_string()]);
+        assert!(namespace.table_exists(exists_request).await.is_ok());
+    }
+
+    /// In the hybrid root-table path the directory branch physically moves
+    /// `<old>.lance` to `<new>.lance` and then asks the manifest to keep
+    /// the row in sync. The manifest row's `location` must follow the data.
+    #[tokio::test]
+    async fn test_rename_table_hybrid_root_updates_manifest_location() {
+        use lance::dataset::builder::DatasetBuilder;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["original_table".to_string()]);
+        ns.create_table(create_request, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let hybrid_ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut rename_request = RenameTableRequest::new("renamed_table".to_string());
+        rename_request.id = Some(vec!["original_table".to_string()]);
+        hybrid_ns.rename_table(rename_request).await.unwrap();
+
+        let manifest_uri = format!("{}/{}", temp_path, "__manifest");
+        let manifest_ds = DatasetBuilder::from_uri(&manifest_uri)
+            .load()
+            .await
+            .unwrap();
+        let mut scanner = manifest_ds.scan();
+        scanner
+            .filter("object_id = 'renamed_table' AND object_type = 'table'")
+            .unwrap();
+        scanner.project(&["object_id", "location"]).unwrap();
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap();
+        let object_ids = batches.column_by_name("object_id").unwrap();
+        let locations = batches.column_by_name("location").unwrap();
+        assert_eq!(batches.num_rows(), 1, "expected one manifest row");
+        assert_eq!(
+            object_ids
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap()
+                .value(0),
+            "renamed_table"
+        );
+        assert_eq!(
+            locations
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap()
+                .value(0),
+            "renamed_table.lance",
+            "manifest location should follow the new physical directory"
+        );
     }
 
     #[tokio::test]
