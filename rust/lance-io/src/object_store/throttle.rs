@@ -31,7 +31,6 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use lance_core::utils::aimd::{AimdConfig, AimdController, RequestOutcome};
 use lance_core::utils::tracing::TRACE_OBJECT_STORE_THROTTLE;
-#[cfg(test)]
 use object_store::ObjectStoreExt;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::client::{
@@ -40,9 +39,9 @@ use object_store::client::{
 };
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
-    UploadPart,
+    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    RenameTargetMode, Result as OSResult, UploadPart,
 };
 use rand::Rng;
 use tokio::sync::Mutex;
@@ -1047,9 +1046,56 @@ impl ObjectStore for AimdThrottledStore {
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
-        self.write
-            .throttled(|| self.target.rename_opts(from, to, opts.clone()))
-            .await
+        let RenameOptions {
+            target_mode,
+            extensions,
+        } = opts;
+
+        match target_mode {
+            RenameTargetMode::Overwrite => {
+                // Delegate to the underlying store to preserve atomic rename
+                // semantics where the store supports them (e.g. local filesystem).
+                self.write
+                    .throttled(|| {
+                        self.target.rename_opts(
+                            from,
+                            to,
+                            RenameOptions {
+                                target_mode,
+                                extensions: extensions.clone(),
+                            },
+                        )
+                    })
+                    .await
+            }
+            RenameTargetMode::Create => {
+                // For rename_if_not_exists, the default object_store implementation
+                // is copy + delete. Perform the two steps under their respective
+                // throttles so they can be retried independently. If copy succeeds
+                // but delete is throttled, the caller's intent is satisfied: the
+                // destination now exists and the data has been committed.
+                let copy_options = CopyOptions {
+                    mode: CopyMode::Create,
+                    extensions: extensions.clone(),
+                };
+                self.write
+                    .throttled(|| self.target.copy_opts(from, to, copy_options.clone()))
+                    .await?;
+
+                // Best-effort cleanup of the source. Failure here does not change
+                // the outcome of the rename, so do not propagate the error.
+                if let Err(err) = self.delete.throttled(|| self.target.delete(from)).await {
+                    warn!(
+                        target: TRACE_OBJECT_STORE_THROTTLE,
+                        source = %from,
+                        destination = %to,
+                        error = %err,
+                        "rename_if_not_exists source cleanup failed after destination was created"
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -2252,5 +2298,231 @@ mod tests {
             "Parts were reordered! Got {:?} instead of AAAABBBB.",
             std::str::from_utf8(&bytes).unwrap_or("<non-utf8>"),
         );
+    }
+
+    #[tokio::test]
+    async fn test_rename_moves_object() {
+        let store = Arc::new(InMemory::new());
+        let config = AimdThrottleConfig::default();
+        let throttled = AimdThrottledStore::new(store, config).unwrap();
+
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        throttled
+            .put(&from, PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        throttled.rename(&from, &to).await.unwrap();
+
+        // Destination has the data and source is gone.
+        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+        assert!(matches!(
+            throttled.head(&from).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rename_if_not_exists_rejects_existing_target() {
+        let store = Arc::new(InMemory::new());
+        let config = AimdThrottleConfig::default();
+        let throttled = AimdThrottledStore::new(store, config).unwrap();
+
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        throttled
+            .put(&from, PutPayload::from_static(b"src"))
+            .await
+            .unwrap();
+        throttled
+            .put(&to, PutPayload::from_static(b"existing"))
+            .await
+            .unwrap();
+
+        // RenameTargetMode::Create must map to CopyMode::Create and reject the
+        // pre-existing destination.
+        let err = throttled
+            .rename_if_not_exists(&from, &to)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, object_store::Error::AlreadyExists { .. }),
+            "expected AlreadyExists, got {err:?}"
+        );
+
+        // The failed copy must not have deleted the source.
+        let bytes = throttled.get(&from).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"src");
+    }
+
+    /// A mock store that returns a configurable number of throttle errors on
+    /// `copy_opts` and `delete` independently before succeeding. Used to verify
+    /// that `rename_opts` retries the copy and the delete separately.
+    struct RenameRetryMockStore {
+        inner: InMemory,
+        copy_errors_remaining: std::sync::Mutex<usize>,
+        delete_errors_remaining: std::sync::Mutex<usize>,
+        copy_call_count: AtomicU64,
+        delete_call_count: AtomicU64,
+    }
+
+    impl RenameRetryMockStore {
+        fn new(copy_errors: usize, delete_errors: usize) -> Self {
+            Self {
+                inner: InMemory::new(),
+                copy_errors_remaining: std::sync::Mutex::new(copy_errors),
+                delete_errors_remaining: std::sync::Mutex::new(delete_errors),
+                copy_call_count: AtomicU64::new(0),
+                delete_call_count: AtomicU64::new(0),
+            }
+        }
+
+        fn should_error(counter: &std::sync::Mutex<usize>) -> bool {
+            let mut remaining = counter.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                true
+            } else {
+                false
+            }
+        }
+
+        fn throttle_error() -> object_store::Error {
+            object_store::Error::Generic {
+                store: "RenameRetryMock",
+                source: THROTTLE_ERROR_RESPONSE.into(),
+            }
+        }
+    }
+
+    impl Display for RenameRetryMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RenameRetryMockStore")
+        }
+    }
+
+    impl Debug for RenameRetryMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RenameRetryMockStore").finish()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RenameRetryMockStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        // `delete` is provided by `ObjectStoreExt` and delegates to
+        // `delete_stream`, so we inject throttle errors here to exercise the
+        // separate delete-retry path in `rename_opts`.
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.delete_call_count.fetch_add(1, Ordering::Relaxed);
+            if Self::should_error(&self.delete_errors_remaining) {
+                futures::stream::once(async { Err(Self::throttle_error()) }).boxed()
+            } else {
+                self.inner.delete_stream(locations)
+            }
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.copy_call_count.fetch_add(1, Ordering::Relaxed);
+            if Self::should_error(&self.copy_errors_remaining) {
+                Err(Self::throttle_error())
+            } else {
+                self.inner.copy_opts(from, to, opts).await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rename_if_not_exists_retries_copy_and_delete_independently() {
+        // Copy fails twice then succeeds; delete fails once then succeeds.
+        // Both are within max_retries=3, so the rename_if_not_exists should
+        // ultimately succeed, with copy and delete retried independently.
+        let mock = Arc::new(RenameRetryMockStore::new(2, 1));
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        mock.put(&from, PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let config = AimdThrottleConfig::default();
+        let throttled =
+            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+
+        throttled.rename_if_not_exists(&from, &to).await.unwrap();
+
+        // Copy: 2 failures + 1 success. Delete: 1 failure + 1 success.
+        assert_eq!(mock.copy_call_count.load(Ordering::Relaxed), 3);
+        assert_eq!(mock.delete_call_count.load(Ordering::Relaxed), 2);
+
+        // Source cleaned up, destination present.
+        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+        assert!(matches!(
+            throttled.head(&from).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rename_if_not_exists_succeeds_when_delete_throttled() {
+        // Copy succeeds, but delete is throttled beyond max_retries.
+        // The rename must still report success because the destination exists
+        // and the caller's intent has been satisfied.
+        let mock = Arc::new(RenameRetryMockStore::new(0, 10));
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        mock.put(&from, PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let config = AimdThrottleConfig::default();
+        let throttled =
+            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+
+        throttled.rename_if_not_exists(&from, &to).await.unwrap();
+
+        // Destination has the data.
+        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+        // Source was not cleaned up because delete kept failing.
+        let bytes = throttled.get(&from).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
     }
 }
