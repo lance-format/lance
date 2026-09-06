@@ -336,6 +336,7 @@ impl HNSW {
         Ok(())
     }
 
+    /// Returns the top-`k` results and the number of distances computed.
     #[allow(clippy::too_many_arguments)]
     pub fn search_inner(
         &self,
@@ -346,7 +347,7 @@ impl HNSW {
         visited_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
-    ) -> Result<Vec<OrderedNode>> {
+    ) -> Result<(Vec<OrderedNode>, usize)> {
         self.ensure_storage_covers_graph(storage)?;
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
@@ -357,7 +358,7 @@ impl HNSW {
         // generic over those view types so the loop is single-sourced:
         // each backend supplies a per-level view closure and a
         // bottom-level view.
-        let result = match &self.inner.graph {
+        let (result, comparisons) = match &self.inner.graph {
             HnswGraph::Built(nodes) => {
                 let nodes = nodes.as_slice();
                 self.run_search(
@@ -389,7 +390,8 @@ impl HNSW {
                 )
             }
         };
-        Ok(result)
+        // the entry point distance is computed above, outside the traversal
+        Ok((result, comparisons + 1))
     }
 
     /// Drives the shared HNSW query path over backend-specific graph
@@ -412,7 +414,7 @@ impl HNSW {
         dist_calc: &impl DistCalculator,
         make_level: impl Fn(u16) -> L,
         bottom: B,
-    ) -> Vec<OrderedNode>
+    ) -> (Vec<OrderedNode>, usize)
     where
         L: BorrowingGraph,
         B: BorrowingGraph,
@@ -423,17 +425,20 @@ impl HNSW {
         // minimum, which costs extra distance computations and measurably
         // hurts recall at low ef (https://github.com/lance-format/lance/issues/5208).
         let mut ep = ep;
+        let mut comparisons = 0;
         for level in (1..self.max_level()).rev() {
             let cur_level = make_level(level);
-            ep = greedy_search_borrowed(
+            let (next, level_comparisons) = greedy_search_borrowed(
                 &cur_level,
                 ep,
                 dist_calc,
                 self.inner.params.prefetch_distance,
             );
+            ep = next;
+            comparisons += level_comparisons;
         }
         let mut visited = visited_generator.generate(storage_len);
-        beam_search_borrowed(
+        let (results, beam_comparisons) = beam_search_borrowed(
             &bottom,
             &ep,
             params,
@@ -441,12 +446,15 @@ impl HNSW {
             bitset,
             prefetch_distance,
             &mut visited,
+        );
+        comparisons += beam_comparisons;
+        (
+            results.into_iter().take(k).collect::<Vec<OrderedNode>>(),
+            comparisons,
         )
-        .into_iter()
-        .take(k)
-        .collect::<Vec<OrderedNode>>()
     }
 
+    /// Returns the top-`k` results and the number of distances computed.
     #[instrument(level = "debug", skip(self, query, bitset, storage))]
     pub fn search_basic(
         &self,
@@ -455,7 +463,7 @@ impl HNSW {
         params: &HnswQueryParams,
         bitset: Option<Visited>,
         storage: &impl VectorStore,
-    ) -> Result<Vec<OrderedNode>> {
+    ) -> Result<(Vec<OrderedNode>, usize)> {
         let mut visited_generator = self
             .inner
             .visited_generator_queue
@@ -483,6 +491,8 @@ impl HNSW {
 
     /// Like [Self::search_basic] but the bottom level runs
     /// [beam_search_acorn], which only scores mask-passing nodes.
+    ///
+    /// Also returns the number of distances computed.
     pub fn search_acorn(
         &self,
         query: ArrayRef,
@@ -490,7 +500,7 @@ impl HNSW {
         params: &HnswQueryParams,
         bitset: &Visited,
         storage: &impl VectorStore,
-    ) -> Result<Vec<OrderedNode>> {
+    ) -> Result<(Vec<OrderedNode>, usize)> {
         let mut visited_generator = self
             .inner
             .visited_generator_queue
@@ -530,13 +540,13 @@ impl HNSW {
         expanded_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
-    ) -> Result<Vec<OrderedNode>> {
+    ) -> Result<(Vec<OrderedNode>, usize)> {
         self.ensure_storage_covers_graph(storage)?;
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
-        let result = match &self.inner.graph {
+        let (result, comparisons) = match &self.inner.graph {
             HnswGraph::Built(nodes) => {
                 let nodes = nodes.as_slice();
                 self.run_search_acorn(
@@ -568,7 +578,8 @@ impl HNSW {
                 )
             }
         };
-        Ok(result.into_iter().take(k).collect())
+        // the entry point distance is computed above, outside the traversal
+        Ok((result.into_iter().take(k).collect(), comparisons + 1))
     }
 
     /// [Self::run_search] for the ACORN traversal: same level descent, but
@@ -586,7 +597,7 @@ impl HNSW {
         dist_calc: &impl DistCalculator,
         make_level: impl Fn(u16) -> L,
         bottom: B,
-    ) -> Vec<OrderedNode>
+    ) -> (Vec<OrderedNode>, usize)
     where
         L: BorrowingGraph,
         B: BorrowingGraph,
@@ -594,18 +605,21 @@ impl HNSW {
         // Same level descent as [Self::run_search]: greedy stops at level 1
         // (see the comment there); level 0 is left to the beam below.
         let mut ep = ep;
+        let mut comparisons = 0;
         for level in (1..self.max_level()).rev() {
             let cur_level = make_level(level);
-            ep = greedy_search_borrowed(
+            let (next, level_comparisons) = greedy_search_borrowed(
                 &cur_level,
                 ep,
                 dist_calc,
                 self.inner.params.prefetch_distance,
             );
+            ep = next;
+            comparisons += level_comparisons;
         }
         let mut visited = visited_generator.generate(storage_len);
         let mut expanded = expanded_generator.generate(storage_len);
-        beam_search_acorn(
+        let (results, beam_comparisons) = beam_search_acorn(
             &bottom,
             &ep,
             params,
@@ -614,7 +628,8 @@ impl HNSW {
             prefetch_distance,
             &mut visited,
             &mut expanded,
-        )
+        );
+        (results, comparisons + beam_comparisons)
     }
 
     #[instrument(level = "debug", skip(self, storage, query, prefilter_bitset))]
@@ -625,9 +640,11 @@ impl HNSW {
         k: usize,
         prefilter_bitset: Visited,
         params: &HnswQueryParams,
-    ) -> Vec<OrderedNode> {
+    ) -> (Vec<OrderedNode>, usize) {
         let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
         let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
+        // every set bit gets exactly one distance on both branches below
+        let comparisons = prefilter_bitset.count_ones();
 
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
@@ -679,7 +696,7 @@ impl HNSW {
                 }
             }
         };
-        heap.into_sorted_vec()
+        (heap.into_sorted_vec(), comparisons)
     }
 
     /// Returns the metadata of this [`HNSW`].
@@ -837,7 +854,7 @@ impl HnswBuilder {
         // ```
         for level in (target_level + 1..=entry_level).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
+            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance).0;
         }
 
         let mut pruned_neighbors_per_level: Vec<Vec<_>> =
@@ -903,6 +920,7 @@ impl HnswBuilder {
             self.params.prefetch_distance,
             &mut visited,
         )
+        .0
     }
 
     fn prune(
@@ -1448,7 +1466,7 @@ impl IvfSubIndex for HNSW {
         Some(&[VECTOR_ID_COL, NEIGHBORS_COL])
     }
 
-    #[instrument(level = "debug", skip(self, query, storage, prefilter, _metrics))]
+    #[instrument(level = "debug", skip(self, query, storage, prefilter, metrics))]
     fn search(
         &self,
         query: ArrayRef,
@@ -1456,7 +1474,7 @@ impl IvfSubIndex for HNSW {
         params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
-        _metrics: &dyn MetricsCollector,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         if params.ef < k {
             return Err(Error::index(
@@ -1474,7 +1492,7 @@ impl IvfSubIndex for HNSW {
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let results = if prefilter.is_empty() {
+        let (results, comparisons) = if prefilter.is_empty() {
             self.search_basic(query, k, &params, None, storage)?
         } else {
             // the bitset must be moved into a callee on every path so its
@@ -1493,22 +1511,26 @@ impl IvfSubIndex for HNSW {
                 // few matching rows: brute force is cheaper and exact
                 self.flat_search(storage, query, k, prefilter_bitset, &params)
             } else if params.use_acorn {
-                let acorn_results =
+                let (acorn_results, acorn_comparisons) =
                     self.search_acorn(query.clone(), k, &params, &prefilter_bitset, storage)?;
                 // under-delivery means the budget ran out on a fragmented
                 // mask, except range-bounded queries which return short
                 // legitimately
                 let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
                 if !bounded && acorn_results.len() < k.min(remained) {
-                    self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
+                    // the abandoned ACORN traversal still cost its distances
+                    let (results, basic_comparisons) =
+                        self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?;
+                    (results, acorn_comparisons + basic_comparisons)
                 } else {
                     drop(prefilter_bitset);
-                    acorn_results
+                    (acorn_results, acorn_comparisons)
                 }
             } else {
                 self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
             }
         };
+        metrics.record_comparisons(comparisons);
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
 
@@ -1660,10 +1682,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow_array::cast::AsArray;
+    use arrow_array::types::Float32Type;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
     };
-    use arrow_schema::Schema;
+    use arrow_schema::{Schema, SchemaRef};
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::{Error, Result, deepsize::DeepSizeOf};
@@ -1676,7 +1699,7 @@ mod tests {
     use lance_select::{RowAddrMask, RowAddrTreeMap};
     use lance_table::format::SelfDescribingFileReader;
     use lance_table::io::manifest::ManifestDescribing;
-    use lance_testing::datagen::generate_random_array;
+    use lance_testing::datagen::{generate_random_array, generate_random_array_with_seed};
     use object_store::path::Path;
     use rand::{Rng, SeedableRng, rngs::SmallRng};
     use rstest::rstest;
@@ -1685,13 +1708,13 @@ mod tests {
         HNSW_LEVEL_RNG_SEED, HNSW_METADATA_KEY, HnswBuilder, HnswGraph, ImmutableHnswBottomView,
         ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
     };
-    use crate::metrics::NoOpMetricsCollector;
-    use crate::prefilter::PreFilter;
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
+    use crate::prefilter::{NoFilter, PreFilter};
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
-        flat::storage::{FlatBinStorage, FlatFloatStorage},
+        flat::storage::{FlatBinStorage, FlatFloatDistanceCalc, FlatFloatStorage},
         graph::{DISTS_FIELD, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
         hnsw::{
             HNSW, HnswMetadata, VECTOR_ID_FIELD,
@@ -1786,10 +1809,10 @@ mod tests {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let builder_results = builder
+        let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
-        let loaded_results = loaded_hnsw
+        let (loaded_results, _) = loaded_hnsw
             .search_basic(query, k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
@@ -1848,10 +1871,10 @@ mod tests {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let builder_results = builder
+        let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
-        let loaded_results = loaded_hnsw
+        let (loaded_results, _) = loaded_hnsw
             .search_basic(query, k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
@@ -1932,7 +1955,7 @@ mod tests {
                 .ef_construction(MIN_HNSW_M),
         )
         .unwrap();
-        let results = hnsw
+        let (results, _) = hnsw
             .search_basic(
                 vectors.value(0),
                 TOTAL,
@@ -2066,10 +2089,10 @@ mod tests {
         };
         let query = fsl.value(0);
 
-        let builder_results = builder
+        let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
-        let loaded_results = loaded
+        let (loaded_results, _) = loaded
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
@@ -2166,7 +2189,7 @@ mod tests {
         let ep = OrderedNode::new(0, dist_calc.distance(0).into());
         let mut visited_generator = VisitedGenerator::new(N);
 
-        let results = hnsw.run_search(
+        let (results, _) = hnsw.run_search(
             ep.clone(),
             3,
             &query_params,
@@ -2196,7 +2219,7 @@ mod tests {
         }
         let mut expanded_generator = VisitedGenerator::new(N);
         calls.store(0, Ordering::Relaxed);
-        let results = hnsw.run_search_acorn(
+        let (results, _) = hnsw.run_search_acorn(
             ep,
             &query_params,
             &mask,
@@ -2277,7 +2300,7 @@ mod tests {
             for id in (0..TOTAL as u32).step_by(2) {
                 bitset.insert(id);
             }
-            let results = hnsw
+            let (results, _) = hnsw
                 .search_acorn(query.clone(), k, &params, &bitset, store.as_ref())
                 .unwrap();
             assert_eq!(results.len(), k);
@@ -2305,7 +2328,7 @@ mod tests {
                 brute_force_topk_masked(store.as_ref(), query.clone(), k, passes)
                     .into_iter()
                     .collect();
-            let results = builder
+            let (results, _) = builder
                 .search_acorn(
                     query.clone(),
                     k,
@@ -2319,6 +2342,117 @@ mod tests {
             let hits = results.iter().filter(|n| truth.contains(&n.id)).count();
             let recall = hits as f32 / k as f32;
             assert!(recall >= 0.5, "recall {recall} below 0.5 (k={k})");
+        }
+    }
+
+    fn masked_prefilter(allowed: Vec<u64>) -> Arc<dyn PreFilter> {
+        Arc::new(MaskPreFilter {
+            mask: Arc::new(lance_select::RowAddrMask::from_allowed(
+                lance_select::RowAddrTreeMap::from_iter(allowed),
+            )),
+        })
+    }
+
+    /// Counts the distances a search actually computes, so a reported metric
+    /// can be checked against an independent oracle instead of a bound.
+    /// Prefetches are forwarded uncounted: they compute no distance, and the
+    /// default `prefetch_distance` keeps that path live.
+    #[derive(Clone)]
+    struct CountingStorage {
+        inner: FlatFloatStorage,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingStorage {
+        fn new(inner: FlatFloatStorage) -> Self {
+            Self {
+                inner,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// Distances computed since the previous call.
+        fn take(&self) -> usize {
+            self.calls.swap(0, Ordering::Relaxed)
+        }
+    }
+
+    struct CountingDistCalc<'a> {
+        inner: FlatFloatDistanceCalc<'a>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DistCalculator for CountingDistCalc<'_> {
+        fn distance(&self, id: u32) -> f32 {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.distance(id)
+        }
+
+        fn distance_all(&self, k_hint: usize) -> Vec<f32> {
+            let dists = self.inner.distance_all(k_hint);
+            self.calls.fetch_add(dists.len(), Ordering::Relaxed);
+            dists
+        }
+
+        fn prefetch(&self, id: u32) {
+            self.inner.prefetch(id);
+        }
+    }
+
+    impl VectorStore for CountingStorage {
+        type DistanceCalculator<'a> = CountingDistCalc<'a>;
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> &SchemaRef {
+            self.inner.schema()
+        }
+
+        fn to_batches(&self) -> lance_core::Result<impl Iterator<Item = RecordBatch> + Send> {
+            self.inner.to_batches()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn distance_type(&self) -> DistanceType {
+            self.inner.distance_type()
+        }
+
+        fn row_id(&self, id: u32) -> u64 {
+            self.inner.row_id(id)
+        }
+
+        fn row_ids(&self) -> impl Iterator<Item = &u64> {
+            self.inner.row_ids()
+        }
+
+        fn append_batch(
+            &self,
+            batch: RecordBatch,
+            vector_column: &str,
+        ) -> lance_core::Result<Self> {
+            Ok(Self {
+                inner: self.inner.append_batch(batch, vector_column)?,
+                calls: self.calls.clone(),
+            })
+        }
+
+        fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
+            CountingDistCalc {
+                inner: self.inner.dist_calculator(query, dist_q_c),
+                calls: self.calls.clone(),
+            }
+        }
+
+        fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+            CountingDistCalc {
+                inner: self.inner.dist_calculator_from_id(id),
+                calls: self.calls.clone(),
+            }
         }
     }
 
@@ -2349,18 +2483,13 @@ mod tests {
                 dist_q_c: 0.0,
                 use_acorn,
             };
-            let filter = Arc::new(MaskPreFilter {
-                mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
-                    allowed,
-                ))),
-            });
             let batch = hnsw
                 .search(
                     query_key.clone(),
                     k,
                     params,
                     store.as_ref(),
-                    filter,
+                    masked_prefilter(allowed),
                     &NoOpMetricsCollector,
                 )
                 .unwrap();
@@ -2380,7 +2509,7 @@ mod tests {
 
         // All-pass mask: shortcuts to the unfiltered path.
         let all: Vec<u64> = (0..TOTAL as u64).collect();
-        let unfiltered = hnsw
+        let (unfiltered, _) = hnsw
             .search_basic(
                 query_key.clone(),
                 k,
@@ -2471,6 +2600,178 @@ mod tests {
         // the graph. Both must include the lower bound and exclude the upper.
         assert_eq!(search_row_ids(vec![0, 1, 2]), vec![0]);
         assert_eq!(search_row_ids((0..60).collect()), vec![0]);
+    }
+
+    /// Every dispatch path reports exactly the distances it computed: the
+    /// metric is compared against a [CountingStorage] oracle, so a dropped or
+    /// double-counted call fails even though the reported number itself is
+    /// graph-dependent.
+    #[tokio::test]
+    async fn test_search_reports_distance_comparisons() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        // build through the plain storage, search through the counting one, so
+        // only query-time distances reach the oracle
+        let counting = CountingStorage::new(store);
+
+        let k = 10;
+        let query_key = fsl.value(0);
+        let reported = |prefilter: Arc<dyn PreFilter>, use_acorn: bool| {
+            counting.take();
+            let metrics = LocalMetricsCollector::default();
+            hnsw.search(
+                query_key.clone(),
+                k,
+                HnswQueryParams {
+                    ef: 50,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn,
+                },
+                &counting,
+                prefilter,
+                &metrics,
+            )
+            .unwrap();
+            let reported = metrics.comparisons.load(Ordering::Relaxed);
+            let computed = counting.take();
+            assert_eq!(
+                reported, computed,
+                "reported {reported} distances, computed {computed} (use_acorn={use_acorn})"
+            );
+            reported
+        };
+
+        // Unfiltered graph traversal: exact against the oracle, and the point
+        // of the graph is to stay under a full scan.
+        let unfiltered = reported(Arc::new(NoFilter), false);
+        assert!(
+            (k..TOTAL).contains(&unfiltered),
+            "unfiltered comparisons {unfiltered} outside [{k}, {TOTAL})"
+        );
+
+        // A mask that passes every row is dispatched as unfiltered, so it must
+        // cost exactly the same.
+        let all: Vec<u64> = (0..TOTAL as u64).collect();
+        assert_eq!(reported(masked_prefilter(all), false), unfiltered);
+
+        // Sparse mask takes the exact flat scan, which scores every passing row
+        // once, so the count is also known up front.
+        let sparse: Vec<u64> = (0..TOTAL as u64).step_by(25).collect();
+        assert_eq!(
+            reported(masked_prefilter(sparse.clone()), false),
+            sparse.len()
+        );
+
+        // Dense mask, both graph traversals.
+        let dense: Vec<u64> = (0..TOTAL as u64).step_by(2).collect();
+        for use_acorn in [false, true] {
+            reported(masked_prefilter(dense.clone()), use_acorn);
+        }
+    }
+
+    /// When ACORN under-delivers, the query re-runs the basic traversal and the
+    /// reported count is the sum of both: the abandoned work was still paid for.
+    #[tokio::test]
+    async fn test_acorn_fallback_reports_both_traversals() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        const STEP: usize = 5;
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        // A low degree fragments the mask-passing subgraph, which is what
+        // starves the ACORN frontier in the first place; `MIN_HNSW_M` is as low
+        // as the builder allows. How many passing nodes end up unreachable is a
+        // property of the graph, and insertion runs in parallel, so build on a
+        // single-threaded pool: with the level RNG already seeded that makes the
+        // graph reproducible and keeps the fallback from being a coin flip.
+        let hnsw = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                HNSW::index_vectors(
+                    &store,
+                    HnswBuildParams::default()
+                        .num_edges(MIN_HNSW_M)
+                        .ef_construction(MIN_HNSW_M),
+                )
+            })
+            .unwrap();
+        let counting = CountingStorage::new(store);
+
+        let passing: Vec<u64> = (0..TOTAL as u64).step_by(STEP).collect();
+        let remained = passing.len();
+        // above the flat-scan threshold, so the query is dispatched to ACORN
+        assert!((TOTAL * 10 / 100..TOTAL).contains(&remained));
+        // `k.min(remained) == remained` demands every passing node, which the
+        // fragmented traversal cannot reach in full, so the fallback fires
+        let k = remained;
+        let params = HnswQueryParams {
+            ef: k,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: true,
+        };
+        let query_key = fsl.value(0);
+
+        let mut generator = VisitedGenerator::new(TOTAL);
+        let mut bitset = generator.generate(TOTAL);
+        for id in &passing {
+            bitset.insert(*id as u32);
+        }
+        counting.take();
+        let (acorn_results, acorn_reported) = hnsw
+            .search_acorn(query_key.clone(), k, &params, &bitset, &counting)
+            .unwrap();
+        assert_eq!(acorn_reported, counting.take());
+        assert!(
+            acorn_results.len() < k.min(remained),
+            "ACORN delivered {} of {} demanded, so the fallback is no longer forced",
+            acorn_results.len(),
+            k.min(remained)
+        );
+        drop(bitset);
+
+        let mut bitset = generator.generate(TOTAL);
+        for id in &passing {
+            bitset.insert(*id as u32);
+        }
+        let (_, basic_reported) = hnsw
+            .search_basic(query_key.clone(), k, &params, Some(bitset), &counting)
+            .unwrap();
+        assert_eq!(basic_reported, counting.take());
+
+        let metrics = LocalMetricsCollector::default();
+        hnsw.search(
+            query_key,
+            k,
+            params,
+            &counting,
+            masked_prefilter(passing),
+            &metrics,
+        )
+        .unwrap();
+        let reported = metrics.comparisons.load(Ordering::Relaxed);
+        assert_eq!(reported, counting.take());
+        assert_eq!(reported, acorn_reported + basic_reported);
     }
 
     /// Every fresh `level_offsets` range must exactly delimit the rows emitted
@@ -2608,10 +2909,10 @@ mod tests {
         assert_eq!(query_indices.len(), 3);
         for query_index in query_indices {
             let query = fsl.value(query_index);
-            let builder_results = builder
+            let (builder_results, _) = builder
                 .search_basic(query.clone(), 10, &params, None, store.as_ref())
                 .unwrap();
-            let loaded_results = loaded
+            let (loaded_results, _) = loaded
                 .search_basic(query, 10, &params, None, store.as_ref())
                 .unwrap();
             assert_eq!(builder_results, loaded_results);
@@ -2710,7 +3011,7 @@ mod tests {
         // The safe direction, and the matching one, both still search.
         let over = build_store(NODES * 2);
         for storage in [full.as_ref(), over.as_ref()] {
-            let results = hnsw
+            let (results, _) = hnsw
                 .search_basic(query.clone(), 10, &params, None, storage)
                 .expect("storage that covers the graph must search");
             assert!(!results.is_empty());
@@ -2825,7 +3126,7 @@ mod tests {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let results = loaded
+        let (results, _) = loaded
             .search_basic(query, 10, &params, None, store.as_ref())
             .expect("search must survive a dropped edge");
         assert!(!results.is_empty(), "the query still returns neighbors");
@@ -2923,10 +3224,10 @@ mod tests {
             use_acorn: false,
         };
         let query = fsl.value(7);
-        let a = builder
+        let (a, _) = builder
             .search_basic(query.clone(), 10, &params, None, store.as_ref())
             .unwrap();
-        let b = reloaded
+        let (b, _) = reloaded
             .search_basic(query, 10, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(a, b);
