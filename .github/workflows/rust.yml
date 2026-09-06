@@ -16,6 +16,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - deny.toml
+      - ci/check_forbidden_deps.sh
 
 permissions:
   contents: read
@@ -101,6 +102,11 @@ jobs:
         with:
           log-level: warn
           command: check
+      # cargo-deny resolves with all features, so it cannot assert a crate is
+      # absent from a specific feature combo. This checks each non-AWS backend.
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - name: Check non-AWS builds stay free of aws-lc-rs/cmake
+        run: ci/check_forbidden_deps.sh
 
   linux-build:
     runs-on: "ubuntu-24.04-8x"

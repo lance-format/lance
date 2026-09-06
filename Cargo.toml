@@ -177,7 +177,15 @@ moka = { version = "0.12", features = ["future", "sync"] }
 ndarray = { version = "0.16.1", features = ["matrixmultiply-threading"] }
 num-traits = "0.2"
 object_store = { version = "0.13.2" }
-opendal = { version = "0.58.1" }
+# default-features = false drops opendal's aws-lc-rs TLS default; lance-io's tls-* features pick the transport.
+opendal = { version = "0.58.1", default-features = false, features = [
+    "auto-register-services",
+    "executors-tokio",
+    "layers-concurrent-limit",
+    "layers-logging",
+    "layers-retry",
+    "layers-timeout",
+] }
 object_store_opendal = { version = "0.58" }
 parquet = { version = "58.0.0", default-features = false, features = [
     "arrow",

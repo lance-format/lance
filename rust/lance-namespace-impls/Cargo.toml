@@ -12,7 +12,7 @@ categories.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["dir-aws", "dir-azure", "dir-gcp", "dir-oss", "dir-huggingface"]
+default = ["dir-aws", "dir-azure", "dir-gcp", "dir-oss", "dir-huggingface", "lance-io/tls-aws-lc-rs"]
 rest = ["dep:reqwest", "dep:serde"]
 rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
 # Cloud storage features for directory implementation - align with lance-io
