@@ -41,7 +41,7 @@ class CompactionOptions(TypedDict):
     Whether to compact fragments with soft deleted rows so they are no
     longer present in the file. (default: True)
     """
-    materialize_deletions_threadhold: Optional[float]
+    materialize_deletions_threshold: Optional[float]
     """
     The fraction of original rows that are soft deleted in a fragment
     before the fragment is a candidate for compaction.
