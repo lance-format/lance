@@ -176,6 +176,13 @@ impl StructuralFieldDecoder for StructuralListDecoder {
     fn data_type(&self) -> &DataType {
         &self.data_type
     }
+
+    fn plan_decoded_bytes(&self, _rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
+        Err(lance_core::Error::not_supported(
+            "plan_decoded_bytes is not yet supported for fields with repetition (list/repeated types)"
+                .to_string(),
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -1602,5 +1609,50 @@ mod tests {
             .unwrap();
         assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata).await;
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_list_i32_not_supported() {
+        // Lists encode items using repetition levels so the number of decoded
+        // bytes depends on the per-row list lengths, which are not known at
+        // planning time without inspecting page data.  For this PR we
+        // explicitly reject the call rather than returning a wrong estimate.
+        use crate::decoder::StructuralFieldDecoder;
+        use crate::encodings::logical::primitive::StructuralPrimitiveFieldDecoder;
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+        use arrow_schema::Field;
+
+        // Build a List<i32> array where every row has a random (variable) length
+        // to illustrate the case we cannot plan for.
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        let lengths = [0usize, 3, 1, 7, 2, 0, 5];
+        let mut value = 0i32;
+        for &len in &lengths {
+            for _ in 0..len {
+                builder.values().append_value(value);
+                value += 1;
+            }
+            builder.append(true);
+        }
+        let _list_array = builder.finish(); // variable-length rows confirmed
+
+        // Construct the decoder tree directly (no pages needed for this check).
+        let item_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_type = DataType::List(item_field.clone());
+
+        let child = Box::new(StructuralPrimitiveFieldDecoder::new(&item_field, false));
+        let decoder = super::StructuralListDecoder::new(child, list_type);
+
+        let err = decoder
+            .plan_decoded_bytes(lengths.len() as u64)
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::NotSupported { .. }),
+            "expected NotSupported, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("repetition"),
+            "error should mention repetition, got: {err}"
+        );
     }
 }
