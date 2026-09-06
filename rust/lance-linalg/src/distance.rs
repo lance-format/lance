@@ -15,6 +15,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type, UInt8Type};
 use arrow_array::{Array, ArrowPrimitiveType, FixedSizeListArray, Float32Array, ListArray};
 use arrow_schema::{ArrowError, DataType};
+use lance_core::utils::cpu::SimdSupport;
 
 pub mod cosine;
 pub mod cosine_u8;
@@ -49,6 +50,94 @@ fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
         0,
         "distance batch length must be divisible by dimension: batch={batch_len}, dimension={dimension}"
     );
+}
+
+/// Runtime backend shared by the f16 and bf16 C kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HalfBackend {
+    Avx512,
+    Avx2,
+    Neon,
+    Lsx,
+    Lasx,
+    Scalar,
+}
+
+/// Half-precision element type whose fallback kernel is being selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HalfType {
+    F16,
+    Bf16,
+}
+
+/// CPU features required by the x86 fallback objects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct X86HalfFeatures {
+    has_avx2: bool,
+    has_f16c: bool,
+    has_fma: bool,
+}
+
+/// Whether this target links the optional half-precision C objects.
+const HALF_KERNELS_COMPILED: bool = cfg!(all(
+    feature = "fp16kernels",
+    not(target_os = "windows"),
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "loongarch64"
+    )
+));
+
+/// Selects a half-precision backend without reading host or build state so the
+/// exclusive SIMD tier ladder can be tested on any machine.
+fn half_backend(
+    support: SimdSupport,
+    half_type: HalfType,
+    has_kernels: bool,
+    has_avx512_kernel: bool,
+    x86_features: X86HalfFeatures,
+) -> HalfBackend {
+    if !has_kernels {
+        return HalfBackend::Scalar;
+    }
+
+    match support {
+        SimdSupport::Avx512FP16 if has_avx512_kernel => HalfBackend::Avx512,
+        // SIMD_SUPPORT reports one exclusive tier. An AVX-512 host that cannot
+        // use the optional AVX-512 C object must therefore be named here to
+        // reach the always-built x86 fallback object.
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 | SimdSupport::Avx2
+            if x86_features.has_fma
+                && match half_type {
+                    HalfType::F16 => x86_features.has_f16c,
+                    HalfType::Bf16 => x86_features.has_avx2,
+                } =>
+        {
+            HalfBackend::Avx2
+        }
+        SimdSupport::Neon => HalfBackend::Neon,
+        SimdSupport::Lsx => HalfBackend::Lsx,
+        SimdSupport::Lasx => HalfBackend::Lasx,
+        _ => HalfBackend::Scalar,
+    }
+}
+
+/// Detects every feature emitted by the x86 fallback objects.
+#[inline]
+fn x86_half_features() -> X86HalfFeatures {
+    #[cfg(target_arch = "x86_64")]
+    {
+        X86HalfFeatures {
+            has_avx2: std::is_x86_feature_detected!("avx2"),
+            has_f16c: std::is_x86_feature_detected!("f16c"),
+            has_fma: std::is_x86_feature_detected!("fma"),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        X86HalfFeatures::default()
+    }
 }
 
 /// Largest number of maximal u8 product terms whose sum fits in a u32.
@@ -507,6 +596,143 @@ mod tests {
     use arrow_schema::Field;
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
+
+    const NO_X86_HALF_FEATURES: X86HalfFeatures = X86HalfFeatures {
+        has_avx2: false,
+        has_f16c: false,
+        has_fma: false,
+    };
+    const F16_X86_HALF_FEATURES: X86HalfFeatures = X86HalfFeatures {
+        has_avx2: false,
+        has_f16c: true,
+        has_fma: true,
+    };
+    const BF16_X86_HALF_FEATURES: X86HalfFeatures = X86HalfFeatures {
+        has_avx2: true,
+        has_f16c: false,
+        has_fma: true,
+    };
+    const ALL_X86_HALF_FEATURES: X86HalfFeatures = X86HalfFeatures {
+        has_avx2: true,
+        has_f16c: true,
+        has_fma: true,
+    };
+    const X86_HALF_FEATURES_WITHOUT_FMA: X86HalfFeatures = X86HalfFeatures {
+        has_avx2: true,
+        has_f16c: true,
+        has_fma: false,
+    };
+
+    #[rstest::rstest]
+    #[case::kernels_disabled(
+        SimdSupport::Avx512FP16,
+        HalfType::F16,
+        false,
+        false,
+        ALL_X86_HALF_FEATURES,
+        HalfBackend::Scalar
+    )]
+    #[case::avx512_kernel_ready(
+        SimdSupport::Avx512FP16,
+        HalfType::F16,
+        true,
+        true,
+        NO_X86_HALF_FEATURES,
+        HalfBackend::Avx512
+    )]
+    #[case::f16_fallback_from_avx512fp16(
+        SimdSupport::Avx512FP16,
+        HalfType::F16,
+        true,
+        false,
+        F16_X86_HALF_FEATURES,
+        HalfBackend::Avx2
+    )]
+    #[case::bf16_fallback_from_avx512fp16(
+        SimdSupport::Avx512FP16,
+        HalfType::Bf16,
+        true,
+        false,
+        BF16_X86_HALF_FEATURES,
+        HalfBackend::Avx2
+    )]
+    #[case::fallback_from_avx512(
+        SimdSupport::Avx512,
+        HalfType::Bf16,
+        true,
+        false,
+        BF16_X86_HALF_FEATURES,
+        HalfBackend::Avx2
+    )]
+    #[case::f16_missing_f16c(
+        SimdSupport::Avx512FP16,
+        HalfType::F16,
+        true,
+        false,
+        BF16_X86_HALF_FEATURES,
+        HalfBackend::Scalar
+    )]
+    #[case::bf16_missing_avx2(
+        SimdSupport::Avx512FP16,
+        HalfType::Bf16,
+        true,
+        false,
+        F16_X86_HALF_FEATURES,
+        HalfBackend::Scalar
+    )]
+    #[case::fallback_missing_fma(
+        SimdSupport::Avx512FP16,
+        HalfType::F16,
+        true,
+        false,
+        X86_HALF_FEATURES_WITHOUT_FMA,
+        HalfBackend::Scalar
+    )]
+    #[case::avx2_tier(
+        SimdSupport::Avx2,
+        HalfType::Bf16,
+        true,
+        false,
+        BF16_X86_HALF_FEATURES,
+        HalfBackend::Avx2
+    )]
+    #[case::neon(
+        SimdSupport::Neon,
+        HalfType::F16,
+        true,
+        false,
+        NO_X86_HALF_FEATURES,
+        HalfBackend::Neon
+    )]
+    #[case::lsx(
+        SimdSupport::Lsx,
+        HalfType::Bf16,
+        true,
+        false,
+        NO_X86_HALF_FEATURES,
+        HalfBackend::Lsx
+    )]
+    #[case::lasx(
+        SimdSupport::Lasx,
+        HalfType::Bf16,
+        true,
+        false,
+        NO_X86_HALF_FEATURES,
+        HalfBackend::Lasx
+    )]
+    fn half_backend_follows_exclusive_tier_and_feature_requirements(
+        #[case] support: SimdSupport,
+        #[case] half_type: HalfType,
+        #[case] has_kernels: bool,
+        #[case] has_avx512_kernel: bool,
+        #[case] features: X86HalfFeatures,
+        #[case] expected: HalfBackend,
+    ) {
+        assert_eq!(
+            half_backend(support, half_type, has_kernels, has_avx512_kernel, features),
+            expected
+        );
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]

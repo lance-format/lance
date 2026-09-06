@@ -24,8 +24,12 @@ use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 #[allow(unused_imports)]
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 
-use super::{Dot, norm_l2::norm_l2};
-use super::{Normalize, dot::dot};
+#[cfg(feature = "fp16kernels")]
+use super::HalfBackend;
+use super::{
+    Dot, HALF_KERNELS_COMPILED, HalfType, Normalize, assert_equal_lengths, dot::dot, half_backend,
+    norm_l2::norm_l2, x86_half_features,
+};
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 use crate::distance::BatchKind;
 #[allow(unused_imports)]
@@ -108,9 +112,16 @@ mod bf16_kernel {
 
 impl Cosine for bf16 {
     fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
-        match *SIMD_SUPPORT {
+        assert_equal_lengths(x.len(), y.len());
+        match half_backend(
+            *SIMD_SUPPORT,
+            HalfType::Bf16,
+            HALF_KERNELS_COMPILED,
+            cfg!(all(kernel_support = "avx512_bf16", target_arch = "x86_64")),
+            x86_half_features(),
+        ) {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            SimdSupport::Neon => unsafe {
+            HalfBackend::Neon => unsafe {
                 bf16_kernel::cosine_bf16_neon(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
             #[cfg(all(
@@ -118,19 +129,19 @@ impl Cosine for bf16 {
                 kernel_support = "avx512_bf16",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512FP16 => unsafe {
+            HalfBackend::Avx512 => unsafe {
                 bf16_kernel::cosine_bf16_avx512(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+            HalfBackend::Avx2 => unsafe {
                 bf16_kernel::cosine_bf16_avx2(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lasx => unsafe {
+            HalfBackend::Lasx => unsafe {
                 bf16_kernel::cosine_bf16_lasx(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lsx => unsafe {
+            HalfBackend::Lsx => unsafe {
                 bf16_kernel::cosine_bf16_lsx(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
             // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
@@ -164,9 +175,16 @@ mod kernel {
 
 impl Cosine for f16 {
     fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
-        match *SIMD_SUPPORT {
+        assert_equal_lengths(x.len(), y.len());
+        match half_backend(
+            *SIMD_SUPPORT,
+            HalfType::F16,
+            HALF_KERNELS_COMPILED,
+            cfg!(all(kernel_support = "avx512_f16", target_arch = "x86_64")),
+            x86_half_features(),
+        ) {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            SimdSupport::Neon => unsafe {
+            HalfBackend::Neon => unsafe {
                 kernel::cosine_f16_neon(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
             #[cfg(all(
@@ -174,24 +192,24 @@ impl Cosine for f16 {
                 kernel_support = "avx512_f16",
                 target_arch = "x86_64"
             ))]
-            SimdSupport::Avx512FP16 => unsafe {
+            HalfBackend::Avx512 => unsafe {
                 kernel::cosine_f16_avx512(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
+            HalfBackend::Avx2 => unsafe {
                 kernel::cosine_f16_avx2(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lasx => unsafe {
+            HalfBackend::Lasx => unsafe {
                 kernel::cosine_f16_lasx(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lsx => unsafe {
+            HalfBackend::Lsx => unsafe {
                 kernel::cosine_f16_lsx(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
-            // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
-            // the f16 C kernels are compiled with `-march=haswell` minimum
-            // (AVX2), so they cannot run on AVX-only or AVX+FMA hosts.
+            // SimdSupport::AvxFma and SimdSupport::Avx retain their scalar
+            // route; this fallback only extends the tiers the C kernel already
+            // served to Avx512FP16 after checking F16C and FMA.
             _ => cosine_scalar(x, x_norm, y),
         }
     }
@@ -1429,6 +1447,22 @@ mod tests {
         let x_sq = x.iter().map(|&xi| xi * xi).sum::<f32>().sqrt();
         let y_sq = y.iter().map(|&yi| yi * yi).sum::<f32>().sqrt();
         1.0 - xy / x_sq / y_sq
+    }
+
+    #[test]
+    fn half_cosine_rejects_mismatched_lengths_before_ffi() {
+        let f16_x = [f16::from_f32(1.0)];
+        let f16_y = [f16::from_f32(1.0), f16::from_f32(2.0)];
+        assert!(
+            std::panic::catch_unwind(|| <f16 as Cosine>::cosine_fast(&f16_x, 1.0, &f16_y)).is_err()
+        );
+
+        let bf16_x = [bf16::from_f32(1.0)];
+        let bf16_y = [bf16::from_f32(1.0), bf16::from_f32(2.0)];
+        assert!(
+            std::panic::catch_unwind(|| <bf16 as Cosine>::cosine_fast(&bf16_x, 1.0, &bf16_y))
+                .is_err()
+        );
     }
 
     #[test]
