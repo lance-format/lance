@@ -285,8 +285,8 @@ use crate::scalar::{
     CreatedIndex, RowIdRemapper, ScalarIndex,
     expression::{FtsQueryParser, ScalarQueryParser},
     registry::{
-        BasicTrainer, ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
-        TrainingOrdering, TrainingRequest,
+        BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+        TrainingRequest, single_flight_store_bound_open,
     },
 };
 
@@ -487,14 +487,12 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 
     async fn get_or_insert_in_cache(
         &self,
-        _index_store: Arc<dyn IndexStore>,
+        index_store: Arc<dyn IndexStore>,
         _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        cache
-            .get_or_insert_unsized_with_key(ScalarIndexCacheKey, || load)
-            .await
+        single_flight_store_bound_open(index_store, cache, load).await
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
