@@ -169,6 +169,9 @@ class CleanupExplanation:
     referenced_branches: List[CleanupReferencedBranch]
     warnings: List[str]
 
+class FragmentAddColumnsCleanup:
+    def cleanup(self) -> None: ...
+
 class LanceFileWriteSummary:
     num_rows: int
     size_bytes: int
@@ -747,12 +750,23 @@ class _Fragment:
         reader: ReaderLike,
         batch_size: Optional[int],
     ) -> Tuple[FragmentMetadata, LanceSchema]: ...
+    def add_columns_from_reader_with_cleanup(
+        self,
+        reader: ReaderLike,
+        batch_size: Optional[int] = None,
+    ) -> Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]: ...
     def add_columns(
         self,
         transforms: Dict[str, str] | BatchUDF | ReaderLike,
         read_columns: Optional[List[str]],
         batch_size: Optional[int],
     ) -> Tuple[FragmentMetadata, LanceSchema]: ...
+    def add_columns_with_cleanup(
+        self,
+        transforms: Dict[str, str] | BatchUDF | ReaderLike,
+        read_columns: Optional[List[str]] = None,
+        batch_size: Optional[int] = None,
+    ) -> Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]: ...
     def delete(self, predicate: str) -> Optional[_Fragment]: ...
     def delete_rows(self, offsets: List[int]) -> Optional[_Fragment]: ...
     def schema(self) -> pa.Schema: ...

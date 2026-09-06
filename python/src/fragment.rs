@@ -21,6 +21,7 @@ use arrow_array::RecordBatchReader;
 use futures::TryFutureExt;
 use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::dataset::fragment::FragmentAddColumnsCleanup as LanceFragmentAddColumnsCleanup;
 use lance::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
@@ -49,9 +50,58 @@ pub struct FileFragment {
     fragment: LanceFragment,
 }
 
+#[pyclass(name = "FragmentAddColumnsCleanup", module = "_lib")]
+pub struct FragmentAddColumnsCleanup {
+    cleanup: Option<LanceFragmentAddColumnsCleanup>,
+}
+
+type PyFragmentAddColumnsResult = (PyLance<Fragment>, LanceSchema, FragmentAddColumnsCleanup);
+
+#[pymethods]
+impl FragmentAddColumnsCleanup {
+    /// Remove the files staged by a fragment-level add-columns operation.
+    ///
+    /// This is intentionally explicit: call it only after establishing that
+    /// the outer merge commit did not land.
+    fn cleanup(&mut self) -> PyResult<()> {
+        let Some(cleanup) = self.cleanup.take() else {
+            return Ok(());
+        };
+        rt().spawn(None, async move {
+            cleanup.cleanup().await;
+            Ok::<(), Error>(())
+        })?
+        .infer_error()
+    }
+}
+
 impl FileFragment {
     pub fn new(frag: LanceFragment) -> Self {
         Self { fragment: frag }
+    }
+
+    fn add_columns_with_cleanup_inner(
+        &self,
+        transforms: NewColumnTransform,
+        read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
+    ) -> PyResult<PyFragmentAddColumnsResult> {
+        let fragment = self.fragment.clone();
+        let result = rt()
+            .spawn(None, async move {
+                fragment
+                    .add_columns_with_cleanup(transforms, read_columns, batch_size)
+                    .await
+            })?
+            .infer_error()?;
+
+        Ok((
+            PyLance(result.fragment),
+            LanceSchema(result.schema),
+            FragmentAddColumnsCleanup {
+                cleanup: Some(result.cleanup),
+            },
+        ))
     }
 }
 
@@ -343,17 +393,21 @@ impl FileFragment {
         batch_size: Option<u32>,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
-
         let transforms = NewColumnTransform::Reader(Box::new(batches));
+        let (fragment, schema, _cleanup) =
+            self.add_columns_with_cleanup_inner(transforms, None, batch_size)?;
+        Ok((fragment, schema))
+    }
 
-        let fragment = self.fragment.clone();
-        let (fragment, schema) = rt()
-            .spawn(None, async move {
-                fragment.add_columns(transforms, None, batch_size).await
-            })?
-            .infer_error()?;
-
-        Ok((PyLance(fragment), LanceSchema(schema)))
+    #[pyo3(signature=(reader, batch_size=None))]
+    fn add_columns_from_reader_with_cleanup(
+        &mut self,
+        reader: &Bound<PyAny>,
+        batch_size: Option<u32>,
+    ) -> PyResult<PyFragmentAddColumnsResult> {
+        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+        let transforms = NewColumnTransform::Reader(Box::new(batches));
+        self.add_columns_with_cleanup_inner(transforms, None, batch_size)
     }
 
     #[pyo3(signature=(transforms, read_columns=None, batch_size=None))]
@@ -365,17 +419,21 @@ impl FileFragment {
         batch_size: Option<u32>,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
         let transforms = transforms_from_python(py, transforms)?;
+        let (fragment, schema, _cleanup) =
+            self.add_columns_with_cleanup_inner(transforms, read_columns, batch_size)?;
+        Ok((fragment, schema))
+    }
 
-        let fragment = self.fragment.clone();
-        let (fragment, schema) = rt()
-            .spawn(None, async move {
-                fragment
-                    .add_columns(transforms, read_columns, batch_size)
-                    .await
-            })?
-            .infer_error()?;
-
-        Ok((PyLance(fragment), LanceSchema(schema)))
+    #[pyo3(signature=(transforms, read_columns=None, batch_size=None))]
+    fn add_columns_with_cleanup(
+        &mut self,
+        py: Python<'_>,
+        transforms: &Bound<'_, PyAny>,
+        read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
+    ) -> PyResult<PyFragmentAddColumnsResult> {
+        let transforms = transforms_from_python(py, transforms)?;
+        self.add_columns_with_cleanup_inner(transforms, read_columns, batch_size)
     }
 
     fn merge(

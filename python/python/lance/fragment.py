@@ -30,6 +30,12 @@ from .lance import (
     DeletionFile as DeletionFile,
 )
 from .lance import (
+    FragmentAddColumnsCleanup,
+    _Fragment,
+    _write_fragments,
+    _write_fragments_transaction,
+)
+from .lance import (
     RowDatasetVersionMeta as RowDatasetVersionMeta,
 )
 from .lance import (
@@ -38,7 +44,6 @@ from .lance import (
 from .lance import (
     RowIdSequence as RowIdSequence,
 )
-from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .lance import _Session as Session
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .types import _coerce_reader
@@ -977,7 +982,11 @@ class LanceFragment(pa.dataset.Fragment):
         columns: Optional[list[str]] = None,
         batch_size: Optional[int] = None,
         reader_schema: Optional[pa.Schema] = None,
-    ) -> Tuple[FragmentMetadata, LanceSchema]:
+        return_cleanup: bool = False,
+    ) -> (
+        Tuple[FragmentMetadata, LanceSchema]
+        | Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]
+    ):
         """Add columns to this Fragment.
 
         .. warning::
@@ -991,6 +1000,12 @@ class LanceFragment(pa.dataset.Fragment):
         fragment is created.  The new schema of the fragment is returned as well.
         These can be used in a later operation to commit the changes to the dataset.
 
+        Set ``return_cleanup=True`` to also return a cleanup token that owns only
+        the files staged by this operation. Retain the token until the outer merge
+        commits. If the commit definitively fails, call ``cleanup.cleanup()``.
+        Dropping the token does not remove files because a failed commit response
+        can have an ambiguous outcome.
+
         See Also
         --------
         lance.dataset.LanceOperation.Merge :
@@ -999,8 +1014,10 @@ class LanceFragment(pa.dataset.Fragment):
 
         Returns
         -------
-        Tuple[FragmentMetadata, LanceSchema]
-            A new fragment with the added column(s) and the final schema.
+        Tuple[FragmentMetadata, LanceSchema] or
+        Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]
+            A new fragment with the added column(s), the final schema, and, when
+            requested, an explicit cleanup token for the staged files.
         """
         transforms = normalize_transform(value_func, self, columns, reader_schema)
 
@@ -1013,15 +1030,17 @@ class LanceFragment(pa.dataset.Fragment):
                 )
 
         if isinstance(transforms, pa.RecordBatchReader):
-            metadata, schema = self._fragment.add_columns_from_reader(
-                transforms, batch_size
-            )
+            if return_cleanup:
+                return self._fragment.add_columns_from_reader_with_cleanup(
+                    transforms, batch_size
+                )
+            return self._fragment.add_columns_from_reader(transforms, batch_size)
         else:
-            metadata, schema = self._fragment.add_columns(
-                transforms, columns, batch_size
-            )
-
-        return metadata, schema
+            if return_cleanup:
+                return self._fragment.add_columns_with_cleanup(
+                    transforms, columns, batch_size
+                )
+            return self._fragment.add_columns(transforms, columns, batch_size)
 
     def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.

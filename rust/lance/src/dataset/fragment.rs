@@ -88,6 +88,51 @@ pub struct FragmentUpdateColumnsResult {
     pub matched_offsets: RoaringBitmap,
 }
 
+/// Cleanup ownership for files staged by [`FileFragment::add_columns_with_cleanup`].
+///
+/// Call [`Self::cleanup`] only after establishing that the outer commit did not
+/// land. Dropping this value does not remove any files because a failed commit
+/// response can have an ambiguous outcome.
+#[derive(Debug)]
+#[must_use = "retain this token until the outer fragment merge has committed"]
+pub struct FragmentAddColumnsCleanup {
+    original_fragment: FileFragment,
+    fragments_to_cleanup: Vec<Fragment>,
+}
+
+impl FragmentAddColumnsCleanup {
+    /// Remove only the files created by the fragment-level add-columns operation.
+    ///
+    /// Pre-existing fragment files and files stored in an external base are
+    /// preserved. Cleanup is best effort; failures are logged for later dataset
+    /// garbage collection.
+    pub async fn cleanup(self) {
+        schema_evolution::cleanup_new_column_data_files(
+            std::slice::from_ref(&self.original_fragment),
+            &self.fragments_to_cleanup,
+        )
+        .await;
+    }
+}
+
+/// A staged fragment-level add-columns result and its cleanup ownership.
+///
+/// The fragment and schema can be used to build an outer [`Operation::Merge`].
+/// Keep `cleanup` until that commit succeeds. If the commit definitively fails,
+/// invoking the token removes only files staged by this operation.
+///
+/// [`Operation::Merge`]: crate::dataset::transaction::Operation::Merge
+#[derive(Debug)]
+#[must_use = "the cleanup token must be retained until the outer merge commits"]
+pub struct FragmentAddColumnsResult {
+    /// Fragment metadata containing the staged columns.
+    pub fragment: Fragment,
+    /// Dataset schema containing the staged columns.
+    pub schema: Schema,
+    /// Ownership token for the files written by this operation.
+    pub cleanup: FragmentAddColumnsCleanup,
+}
+
 /// A Fragment of a Lance [`Dataset`].
 ///
 /// The interface is modeled after `pyarrow.dataset.Fragment`.
@@ -2249,22 +2294,79 @@ impl FileFragment {
     /// Append new columns to the fragment
     ///
     /// This is the fragment-level version of [`Dataset::add_columns`].
+    /// Call [`Self::add_columns_with_cleanup`] when the resulting files will be
+    /// committed by a separate fallible operation and explicit cleanup is needed.
     pub async fn add_columns(
         &self,
         transforms: NewColumnTransform,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> Result<(Fragment, Schema)> {
-        let (fragments, schema, _, _) = schema_evolution::add_columns_to_fragments(
-            self.dataset.as_ref(),
-            transforms,
-            read_columns,
-            std::slice::from_ref(self),
-            batch_size,
-        )
-        .await?;
-        assert_eq!(fragments.len(), 1);
-        Ok((fragments.into_iter().next().unwrap(), schema))
+        let result = self
+            .add_columns_with_cleanup(transforms, read_columns, batch_size)
+            .await?;
+        Ok((result.fragment, result.schema))
+    }
+
+    /// Append new columns while retaining ownership of the staged files.
+    ///
+    /// This variant is intended for distributed or multi-step callers that
+    /// perform the final [`Operation::Merge`] separately. The returned cleanup
+    /// token should be dropped after a successful commit and invoked only when
+    /// the caller can establish that the commit did not land.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::Result;
+    /// # use lance::dataset::{NewColumnTransform, fragment::FileFragment};
+    /// # async fn stage(
+    /// #     fragment: &FileFragment,
+    /// #     transform: NewColumnTransform,
+    /// # ) -> Result<()> {
+    /// let staged = fragment
+    ///     .add_columns_with_cleanup(transform, None, None)
+    ///     .await?;
+    ///
+    /// // Use staged.fragment and staged.schema in an outer Merge commit.
+    /// // If that commit definitively fails, release the staged files:
+    /// staged.cleanup.cleanup().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`Operation::Merge`]: crate::dataset::transaction::Operation::Merge
+    pub async fn add_columns_with_cleanup(
+        &self,
+        transforms: NewColumnTransform,
+        read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
+    ) -> Result<FragmentAddColumnsResult> {
+        let (fragments, schema, fragments_to_cleanup, _) =
+            schema_evolution::add_columns_to_fragments(
+                self.dataset.as_ref(),
+                transforms,
+                read_columns,
+                std::slice::from_ref(self),
+                batch_size,
+            )
+            .await?;
+        let fragment_count = fragments.len();
+        let Ok([fragment]) = <Vec<Fragment> as TryInto<[Fragment; 1]>>::try_into(fragments) else {
+            return Err(Error::internal(format!(
+                "fragment add-columns produced {} fragments for fragment {}",
+                fragment_count,
+                self.id()
+            )));
+        };
+        Ok(FragmentAddColumnsResult {
+            fragment,
+            schema,
+            cleanup: FragmentAddColumnsCleanup {
+                original_fragment: self.clone(),
+                fragments_to_cleanup,
+            },
+        })
     }
 
     fn schema_mismatch(&self, detail: impl std::fmt::Display) -> Error {
