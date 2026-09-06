@@ -91,10 +91,10 @@ class CompactionOptions(TypedDict):
     """
     max_source_fragments: Optional[int]
     """
-    Maximum number of source fragments to compact in a single run. Tasks
-    are included until adding the next task would exceed this limit,
-    allowing for incremental compaction (e.g., compact 20 fragments at a
-    time). Fragments are processed oldest first.
+    Maximum number of fragments whose identities may change in a single run.
+    This includes compacted source fragments and following fragments relabeled
+    to preserve row order. The planner selects candidates from a suffix within
+    this limit.
     (default: None, no limit)
     """
     max_source_rows: Optional[int]
@@ -118,6 +118,7 @@ class CompactionOptions(TypedDict):
     """
     Fragment IDs to exclude from compaction planning. Excluded fragments
     remain unchanged and act as boundaries, so fragments on opposite sides
-    are not combined into the same task. Duplicate and unknown IDs are
-    ignored. (default: None)
+    are not combined into the same task. To preserve row order, only candidates
+    after the last present excluded fragment are eligible. Duplicate and
+    unknown IDs are ignored. (default: None)
     """

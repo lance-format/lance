@@ -7465,11 +7465,11 @@ class DatasetOptimizer:
             Controls how much data is read at once when performing binary copy.
             Defaults to 16MB.
         max_source_fragments: int, optional
-            Maximum number of source fragments to compact in a single run.
-            Compaction tasks are included until adding the next task would
-            exceed this limit, allowing compaction to proceed incrementally.
-            Fragments are processed oldest first. If not specified, uses the
-            manifest config value, or applies no limit.
+            Maximum number of fragments whose identities may change in a
+            single run. This includes compacted source fragments and following
+            fragments relabeled to preserve row order. The planner selects
+            candidates from a suffix within this limit. If not specified, uses
+            the manifest config value, or applies no limit.
         max_source_rows: int, optional
             Maximum number of source rows to compact in a single run. Rows are
             counted as live rows (physical rows minus soft-deleted rows).
@@ -7486,7 +7486,9 @@ class DatasetOptimizer:
             Fragment IDs to exclude from compaction planning. Excluded
             fragments remain unchanged and act as boundaries, so fragments
             on opposite sides are not combined into the same compaction task.
-            Duplicate and unknown IDs are ignored.
+            To preserve row order, only candidates after the last present
+            excluded fragment are eligible. Duplicate and unknown IDs are
+            ignored.
 
         Returns
         -------
