@@ -5,12 +5,13 @@ use async_trait::async_trait;
 use datafusion::common::Result as DFResult;
 use datafusion::{
     common::DFSchema,
-    execution::SessionState,
+    execution::{SessionState, context::SessionContext},
     physical_plan::ExecutionPlan,
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
 };
 use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
 use lance_core::{ROW_ADDR, ROW_ID};
+use lance_datafusion::exec::LanceExecutionOptions;
 use std::{
     cmp::Ordering,
     sync::{Arc, atomic::AtomicU64},
@@ -50,14 +51,29 @@ pub enum WriteSink {
 ///   See [`super::assign_action::merge_insert_action`]
 ///
 /// Output is empty.
-#[derive(Debug)]
 pub struct MergeInsertWriteNode {
     input: LogicalPlan,
     pub(crate) dataset: Arc<Dataset>,
     pub(crate) params: MergeInsertParams,
     pub(crate) source_skipped_duplicates: Arc<AtomicU64>,
     pub(crate) write_sink: WriteSink,
+    pub(crate) spill_session_context: SessionContext,
+    pub(crate) spill_execution_options: LanceExecutionOptions,
     schema: Arc<DFSchema>,
+}
+
+impl std::fmt::Debug for MergeInsertWriteNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MergeInsertWriteNode")
+            .field("input", &self.input)
+            .field("dataset", &self.dataset)
+            .field("params", &self.params)
+            .field("source_skipped_duplicates", &self.source_skipped_duplicates)
+            .field("write_sink", &self.write_sink)
+            .field("spill_execution_options", &self.spill_execution_options)
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PartialEq for MergeInsertWriteNode {
@@ -99,6 +115,8 @@ impl MergeInsertWriteNode {
         params: MergeInsertParams,
         source_skipped_duplicates: Arc<AtomicU64>,
         write_sink: WriteSink,
+        spill_session_context: SessionContext,
+        spill_execution_options: LanceExecutionOptions,
     ) -> Self {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let schema = Arc::new(DFSchema::try_from(empty_schema).unwrap());
@@ -108,6 +126,8 @@ impl MergeInsertWriteNode {
             params,
             source_skipped_duplicates,
             write_sink,
+            spill_session_context,
+            spill_execution_options,
             schema,
         }
     }
@@ -183,6 +203,8 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             self.params.clone(),
             self.source_skipped_duplicates.clone(),
             self.write_sink,
+            self.spill_session_context.clone(),
+            self.spill_execution_options.clone(),
         ))
     }
 
@@ -296,6 +318,8 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.dataset.clone(),
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
+                        write_node.spill_session_context.clone(),
+                        write_node.spill_execution_options.clone(),
                     )?)
                 } else {
                     Arc::new(FullSchemaMergeInsertExec::try_new(
