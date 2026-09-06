@@ -4,8 +4,9 @@
 //! IVF - Inverted File index.
 
 use super::{
-    LogicalIvfView, derive_hnsw_params,
+    LogicalIvfView, derive_hnsw_params, has_unowned_fragment_rows,
     pq::{PQIndex, build_pq_model},
+    remap_for_owned_fragments,
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
 use super::{
@@ -454,6 +455,7 @@ enum VectorModelMismatch {
     StorageFormat,
     IvfCentroids,
     QuantizerMetadata,
+    HnswBuildParameters,
 }
 
 fn vector_index_dimension(index: &dyn VectorIndex) -> usize {
@@ -526,6 +528,8 @@ fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModel
     let first = indices.first()?;
     let first_centroids = first.ivf_model().centroids_array();
     let first_quantizer = first.quantizer();
+    let first_hnsw_params = matches!(first.sub_index_type().0, SubIndexType::Hnsw)
+        .then(|| derive_hnsw_params(first.as_ref()));
 
     for index in indices.iter().skip(1) {
         if first.as_any().type_id() != index.as_any().type_id() {
@@ -544,9 +548,75 @@ fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModel
         if !shared_quantizer_model(&first_quantizer, &index.quantizer()) {
             return Some(VectorModelMismatch::QuantizerMetadata);
         }
+
+        if let Some(first_hnsw_params) = first_hnsw_params.as_ref()
+            && !hnsw_build_params_eq(first_hnsw_params, &derive_hnsw_params(index.as_ref()))
+        {
+            return Some(VectorModelMismatch::HnswBuildParameters);
+        }
     }
 
     None
+}
+
+fn vector_segments_share_merge_model(
+    left: (&TableIndexMetadata, &Arc<dyn VectorIndex>),
+    right: (&TableIndexMetadata, &Arc<dyn VectorIndex>),
+) -> bool {
+    if left.0.index_version != right.0.index_version {
+        return false;
+    }
+
+    let indices = [left.1.clone(), right.1.clone()];
+    validate_vector_query_compatibility(&indices, "merging vector index segments").is_ok()
+        && vector_model_mismatch(&indices).is_none()
+}
+
+fn partition_vector_segment_merge_groups(
+    logical_index: &LogicalIvfView<'_>,
+    can_merge_after_remap: impl Fn(&dyn VectorIndex) -> bool,
+) -> Vec<Vec<Uuid>> {
+    let segments = logical_index.segments().collect::<Vec<_>>();
+    let mut groups = Vec::<Vec<usize>>::new();
+
+    for segment_idx in 0..segments.len() {
+        if !can_merge_after_remap(segments[segment_idx].1.as_ref()) {
+            groups.push(vec![segment_idx]);
+            continue;
+        }
+        if let Some(group) = groups.iter_mut().find(|group| {
+            vector_segments_share_merge_model(segments[group[0]], segments[segment_idx])
+        }) {
+            group.push(segment_idx);
+        } else {
+            groups.push(vec![segment_idx]);
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|segment_idx| segments[segment_idx].0.uuid)
+                .collect()
+        })
+        .collect()
+}
+
+/// Partition a logical vector index into groups that remain acceptable to the
+/// distributed merger after compaction remaps their row addresses.
+pub(crate) fn compaction_vector_segment_merge_groups(
+    logical_index: &LogicalIvfView<'_>,
+) -> Vec<Vec<Uuid>> {
+    partition_vector_segment_merge_groups(logical_index, |index| {
+        // Remapping writes PQ codes transposed and RQ codes packed for query
+        // execution, while the distributed merger accepts row-major shards.
+        !matches!(
+            index.sub_index_type().1,
+            QuantizationType::Product | QuantizationType::Rabit
+        )
+    })
 }
 
 pub(crate) fn vector_segment_compatibility(
@@ -555,11 +625,14 @@ pub(crate) fn vector_segment_compatibility(
 ) -> Result<VectorSegmentCompatibility> {
     let indices = logical_index.indices().cloned().collect::<Vec<_>>();
     validate_vector_query_compatibility(&indices, operation)?;
-    Ok(if vector_model_mismatch(&indices).is_none() {
-        VectorSegmentCompatibility::SharedModel
-    } else {
-        VectorSegmentCompatibility::QueryCompatibleModelsDiffer
-    })
+
+    Ok(
+        if partition_vector_segment_merge_groups(logical_index, |_| true).len() == 1 {
+            VectorSegmentCompatibility::SharedModel
+        } else {
+            VectorSegmentCompatibility::QueryCompatibleModelsDiffer
+        },
+    )
 }
 
 fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &str) -> Result<()> {
@@ -573,6 +646,9 @@ fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &st
         ))),
         Some(VectorModelMismatch::QuantizerMetadata) => Err(Error::index(format!(
             "{operation}: vector index segments do not share quantizer metadata"
+        ))),
+        Some(VectorModelMismatch::HnswBuildParameters) => Err(Error::index(format!(
+            "{operation}: vector index segments do not share HNSW build parameters"
         ))),
         None => Ok(()),
     }
@@ -1967,12 +2043,26 @@ impl RemapPageTask {
         mut self,
         reader: Arc<dyn Reader>,
         index: &IVFIndex,
-        mapping: &RowAddrRemap,
+        mapping: Arc<RowAddrRemap>,
+        owned_fragments: Option<Arc<RoaringBitmap>>,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
             .load(reader, self.offset, self.length as usize)
             .await?;
+        let filtered_mapping;
+        let mapping = if let Some(owned_fragments) = owned_fragments
+            && has_unowned_fragment_rows(page.row_ids().copied(), owned_fragments.as_ref())
+        {
+            filtered_mapping = remap_for_owned_fragments(
+                mapping,
+                page.row_ids().copied(),
+                owned_fragments.as_ref(),
+            );
+            &filtered_mapping
+        } else {
+            mapping.as_ref()
+        };
         page.remap(mapping).await?;
         self.page = Some(page);
         Ok(self)
@@ -2019,6 +2109,7 @@ pub(crate) async fn remap_index_file_v3(
     index: Arc<dyn VectorIndex>,
     mapping: &RowAddrRemap,
     column: String,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<Vec<IndexFile>> {
     let dataset = dataset.clone();
     let index_dir = dataset.indices_dir().join(new_uuid.to_string());
@@ -2029,14 +2120,14 @@ pub(crate) async fn remap_index_file_v3(
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
                     dataset, column, index_dir, index,
                 )?
-                .remap(mapping)
+                .remap(mapping, owned_fragments)
                 .await
             }
             DataType::UInt8 => {
                 IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
                     dataset, column, index_dir, index,
                 )?
-                .remap(mapping)
+                .remap(mapping, owned_fragments)
                 .await
             }
             _ => Err(Error::index(format!(
@@ -2048,47 +2139,47 @@ pub(crate) async fn remap_index_file_v3(
             IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
             )?
-            .remap(mapping)
+            .remap(mapping, owned_fragments)
             .await
         }
         (SubIndexType::Flat, QuantizationType::Scalar) => {
             IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
             )?
-            .remap(mapping)
+            .remap(mapping, owned_fragments)
             .await
         }
         (SubIndexType::Flat, QuantizationType::FlatBin) => {
             IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
             )?
-            .remap(mapping)
+            .remap(mapping, owned_fragments)
             .await
         }
         (SubIndexType::Flat, QuantizationType::Rabit) => {
             IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
             )?
-            .remap(mapping)
+            .remap(mapping, owned_fragments)
             .await
         }
         (SubIndexType::Hnsw, QuantizationType::Flat) => {
             IvfIndexBuilder::<HNSW, FlatQuantizer>::new_remapper(dataset, column, index_dir, index)?
-                .remap(mapping)
+                .remap(mapping, owned_fragments)
                 .await
         }
         (SubIndexType::Hnsw, QuantizationType::FlatBin) => {
             IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
             )?
-            .remap(mapping)
+            .remap(mapping, owned_fragments)
             .await
         }
         (SubIndexType::Hnsw, QuantizationType::Product) => {
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
             )?
-            .remap(mapping)
+            .remap(mapping, owned_fragments)
             .await
         }
 
@@ -2096,14 +2187,14 @@ pub(crate) async fn remap_index_file_v3(
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
             )?
-            .remap(mapping)
+            .remap(mapping, owned_fragments)
             .await
         }
         (SubIndexType::Hnsw, QuantizationType::Rabit) => {
             IvfIndexBuilder::<HNSW, RabitQuantizer>::new_remapper(
                 dataset, column, index_dir, index,
             )?
-            .remap(mapping)
+            .remap(mapping, owned_fragments)
             .await
         }
     }
@@ -2120,6 +2211,7 @@ pub(crate) async fn remap_index_file(
     name: String,
     column: String,
     transforms: Vec<pb::Transform>,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<IndexFile> {
     let object_store = dataset.object_store.as_ref();
     let old_path = dataset
@@ -2143,9 +2235,18 @@ pub(crate) async fn remap_index_file(
     let mut writer = object_store.create(&new_path).await?;
 
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
+    let mapping = Arc::new(mapping.clone());
+    let owned_fragments = owned_fragments.cloned().map(Arc::new);
 
     let mut task_stream = stream::iter(tasks)
-        .map(|task| task.load_and_remap(reader.clone(), index, mapping))
+        .map(|task| {
+            task.load_and_remap(
+                reader.clone(),
+                index,
+                mapping.clone(),
+                owned_fragments.clone(),
+            )
+        })
         .buffered(object_store.io_parallelism());
 
     let mut ivf = IvfModel {
@@ -2444,11 +2545,27 @@ pub(crate) async fn merge_segments(
             })?,
         );
     }
-    merge_segments_with_row_filters(
+    merge_segments_inner(
         dataset.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
-        row_filters,
+        Some(row_filters),
+        lance_index::progress::noop_progress(),
+    )
+    .await
+}
+
+/// Merge staging segments whose remap already removed rows not owned by each
+/// source segment.
+pub(crate) async fn merge_remapped_segments(
+    dataset: &Dataset,
+    segments: Vec<TableIndexMetadata>,
+) -> Result<TableIndexMetadata> {
+    merge_segments_inner(
+        dataset.object_store.as_ref(),
+        &dataset.indices_dir(),
+        segments,
+        None,
         lance_index::progress::noop_progress(),
     )
     .await
@@ -2478,15 +2595,21 @@ pub(crate) async fn merge_segments_with_progress(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    merge_segments_with_row_filters(object_store, indices_dir, segments, row_filters, progress)
-        .await
+    merge_segments_inner(
+        object_store,
+        indices_dir,
+        segments,
+        Some(row_filters),
+        progress,
+    )
+    .await
 }
 
-async fn merge_segments_with_row_filters(
+async fn merge_segments_inner(
     object_store: &ObjectStore,
     indices_dir: &Path,
     segments: Vec<TableIndexMetadata>,
-    row_filters: Vec<lance_index::scalar::OldIndexDataFilter>,
+    row_filters: Option<Vec<lance_index::scalar::OldIndexDataFilter>>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<TableIndexMetadata> {
     if segments.is_empty() {
@@ -2526,7 +2649,7 @@ async fn merge_segments_with_row_filters(
         indices_dir,
         &final_dir,
         &segments,
-        &row_filters,
+        row_filters.as_deref(),
         None,
         progress,
     )
@@ -2554,7 +2677,7 @@ async fn merge_segments_to_dir(
     indices_dir: &Path,
     final_dir: &Path,
     segments: &[TableIndexMetadata],
-    row_filters: &[lance_index::scalar::OldIndexDataFilter],
+    row_filters: Option<&[lance_index::scalar::OldIndexDataFilter]>,
     _requested_index_type: Option<IndexType>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
@@ -2583,14 +2706,24 @@ async fn merge_segments_to_dir(
                 .join(INDEX_FILE_NAME)
         })
         .collect::<Vec<_>>();
-    let auxiliary_file = lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files_with_row_filters(
-        object_store,
-        &aux_paths,
-        final_dir,
-        row_filters,
-        progress.clone(),
-    )
-    .await?;
+    let auxiliary_file = if let Some(row_filters) = row_filters {
+        lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files_with_row_filters(
+            object_store,
+            &aux_paths,
+            final_dir,
+            row_filters,
+            progress.clone(),
+        )
+        .await?
+    } else {
+        lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
+            object_store,
+            &aux_paths,
+            final_dir,
+            progress.clone(),
+        )
+        .await?
+    };
     let index_file = write_root_vector_index_from_auxiliary(
         object_store,
         final_dir,
@@ -5697,6 +5830,7 @@ mod tests {
             INDEX_NAME.to_string(),
             WellKnownIvfPqData::COLUMN.to_string(),
             vec![],
+            None,
         )
         .await
         .unwrap();

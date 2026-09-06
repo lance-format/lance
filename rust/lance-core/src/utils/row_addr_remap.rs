@@ -52,6 +52,7 @@ use crate::{Error, Result};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
+use std::sync::Arc;
 
 /// A queryable row-address remapping with the exact semantics of
 /// `HashMap<u64, Option<u64>>::get(&addr).copied()`:
@@ -85,6 +86,16 @@ impl RowAddrRemap {
     /// Build a remap from a fully materialized old-to-new address map.
     pub fn direct(map: HashMap<u64, Option<u64>>) -> Self {
         Self::Direct(map)
+    }
+
+    /// Build a compact view that deletes addresses in `removed_fragments`
+    /// before lazily applying `mapping` to every other address.
+    #[doc(hidden)]
+    pub fn with_removed_fragments(mapping: Arc<Self>, removed_fragments: RoaringBitmap) -> Self {
+        Self::Compact(CompactRowAddrRemap::with_removed_fragments(
+            mapping,
+            removed_fragments,
+        ))
     }
 
     /// Build an ordered remap chain, flattening nested chains and omitting
@@ -596,6 +607,8 @@ impl DeepSizeOf for CompactRemapStep {
 enum RemapStep {
     Compact(CompactRemapStep),
     Direct(HashMap<u64, Option<u64>>),
+    RemoveFragments(RoaringBitmap),
+    Shared(Arc<RowAddrRemap>),
 }
 
 impl RemapStep {
@@ -603,6 +616,10 @@ impl RemapStep {
         match self {
             Self::Compact(compact) => compact.get(addr),
             Self::Direct(direct) => direct.get(&addr).copied(),
+            Self::RemoveFragments(fragments) => fragments
+                .contains(RowAddress::from(addr).fragment_id())
+                .then_some(None),
+            Self::Shared(mapping) => mapping.get(addr),
         }
     }
 
@@ -610,6 +627,8 @@ impl RemapStep {
         match self {
             Self::Compact(compact) => compact.is_empty(),
             Self::Direct(direct) => direct.is_empty(),
+            Self::RemoveFragments(fragments) => fragments.is_empty(),
+            Self::Shared(mapping) => mapping.is_empty(),
         }
     }
 
@@ -619,6 +638,8 @@ impl RemapStep {
             Self::Direct(direct) => {
                 RoaringBitmap::from_iter(direct.keys().map(|addr| (addr >> 32) as u32))
             }
+            Self::RemoveFragments(fragments) => fragments.clone(),
+            Self::Shared(mapping) => mapping.affected_fragments(),
         }
     }
 
@@ -629,6 +650,8 @@ impl RemapStep {
                 RoaringBitmap::from_iter(direct.keys().map(|addr| (addr >> 32) as u32)),
             ),
             Self::Direct(_) => None,
+            Self::RemoveFragments(fragments) => Some(fragments.clone()),
+            Self::Shared(mapping) => mapping.fully_deleted_fragments(),
         }
     }
 }
@@ -638,6 +661,10 @@ impl DeepSizeOf for RemapStep {
         match self {
             Self::Compact(compact) => compact.deep_size_of_children(context),
             Self::Direct(direct) => direct.deep_size_of_children(context),
+            // Roaring does not expose its allocation capacity. Its serialized
+            // size is a stable proxy for the retained containers.
+            Self::RemoveFragments(fragments) => fragments.serialized_size(),
+            Self::Shared(mapping) => mapping.deep_size_of_children(context),
         }
     }
 }
@@ -664,6 +691,18 @@ impl CompactRowAddrRemap {
                 groups,
             )?)],
         })
+    }
+
+    fn with_removed_fragments(
+        mapping: Arc<RowAddrRemap>,
+        removed_fragments: RoaringBitmap,
+    ) -> Self {
+        Self {
+            steps: vec![
+                RemapStep::RemoveFragments(removed_fragments),
+                RemapStep::Shared(mapping),
+            ],
+        }
     }
 
     fn chained(remaps: Vec<RowAddrRemap>) -> Self {
@@ -1002,6 +1041,33 @@ mod tests {
         .unwrap();
         assert_eq!(remap.get(addr(0, 0)), Some(Some(addr(12, 0))));
         assert_eq!(remap.get(addr(0, 1)), Some(Some(addr(11, 0))));
+    }
+
+    #[test]
+    fn test_with_removed_fragments_keeps_mapping_lazy() {
+        let mapping = Arc::new(
+            RowAddrRemap::compact([GroupInput {
+                rewritten_old_row_addrs: RoaringTreemap::from_iter([addr(1, 0), addr(1, 1)]),
+                old_frag_ids: vec![1],
+                new_frags: vec![(4, 2)],
+            }])
+            .unwrap(),
+        );
+        let filtered =
+            RowAddrRemap::with_removed_fragments(mapping, RoaringBitmap::from_iter([2u32]));
+
+        assert!(matches!(filtered, RowAddrRemap::Compact(_)));
+        assert_eq!(filtered.get(addr(1, 0)), Some(Some(addr(4, 0))));
+        assert_eq!(filtered.get(addr(2, 0)), Some(None));
+        assert_eq!(filtered.get(addr(3, 0)), None);
+        assert_eq!(
+            filtered.affected_fragments(),
+            RoaringBitmap::from_iter([1u32, 2u32])
+        );
+
+        let mut batch = vec![Some(addr(1, 1)), Some(addr(2, 0)), Some(addr(3, 0))];
+        filtered.remap_in_place(&mut batch);
+        assert_eq!(batch, vec![Some(addr(4, 1)), None, Some(addr(3, 0))]);
     }
 
     #[test]

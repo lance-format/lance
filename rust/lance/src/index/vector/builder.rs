@@ -93,7 +93,9 @@ use crate::index::vector::utils::infer_vector_dim;
 
 use super::v2::IVFIndex;
 use super::{
+    has_unowned_fragment_rows,
     ivf::load_precomputed_partitions_if_available,
+    remap_for_owned_fragments,
     utils::{self, get_vector_type},
 };
 
@@ -492,7 +494,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
     }
 
-    pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<Vec<IndexFile>> {
+    pub async fn remap(
+        &mut self,
+        mapping: &RowAddrRemap,
+        owned_fragments: Option<&RoaringBitmap>,
+    ) -> Result<Vec<IndexFile>> {
         if self.existing_indices.is_empty() {
             return Err(Error::invalid_input(
                 "No existing indices available for remapping",
@@ -505,9 +511,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].index.clone();
         let mapping = Arc::new(mapping.clone());
+        let owned_fragments = owned_fragments.cloned().map(Arc::new);
         let build_iter = (0..ivf.num_partitions()).map(move |part_id| {
             let existing_index = existing_index.clone();
             let mapping = mapping.clone();
+            let owned_fragments = owned_fragments.clone();
             async move {
                 let ivf_index = existing_index
                     .as_any()
@@ -517,8 +525,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .load_partition(part_id, false, &NoOpMetricsCollector)
                     .await?;
 
-                let storage = part.storage.remap(&mapping)?;
-                let index = part.index.remap(&mapping, &storage)?;
+                let filtered_mapping;
+                let mapping = if let Some(owned_fragments) = owned_fragments
+                    && has_unowned_fragment_rows(
+                        part.storage.row_ids().copied(),
+                        owned_fragments.as_ref(),
+                    ) {
+                    filtered_mapping = remap_for_owned_fragments(
+                        mapping.clone(),
+                        part.storage.row_ids().copied(),
+                        owned_fragments.as_ref(),
+                    );
+                    &filtered_mapping
+                } else {
+                    mapping.as_ref()
+                };
+                let storage = part.storage.remap(mapping)?;
+                let index = part.index.remap(mapping, &storage)?;
                 Result::Ok(Budgeted::untracked(PartitionBuildResult {
                     partition_id: part_id,
                     built: Some((storage, index, 0.0)),
