@@ -2054,6 +2054,70 @@ impl StructuralBatchDecodeStream {
         });
         stream.boxed()
     }
+
+    /// Returns exact decoded byte counts for each of the 8 [`CANDIDATE_BATCH_SIZES`],
+    /// clamped to `rows_remaining`.
+    ///
+    /// Waits for enough pages to be scheduled so that the largest candidate's
+    /// pages are available, then delegates to the root decoder's exact implementation.
+    pub async fn plan_decoded_bytes(&mut self, rows_remaining: u64) -> Result<[u64; 8]> {
+        let candidate_max = CANDIDATE_BATCH_SIZES[CANDIDATE_BATCH_SIZES.len() - 1] as u64;
+        let lookahead = candidate_max.min(rows_remaining);
+        if lookahead > 0 {
+            let want_scheduled = self.rows_drained + lookahead;
+            self.wait_for_scheduled(want_scheduled).await?;
+        }
+        self.root_decoder.plan_decoded_bytes(rows_remaining)
+    }
+
+    /// Drain exactly `num_rows` rows from the persistent decoder, returning a
+    /// [`ReadBatchTask`].
+    ///
+    /// Used by the byte-budget scan path where the caller controls batch sizes
+    /// externally (via [`plan_decoded_bytes`]).
+    pub async fn drain_task(&mut self, num_rows: u32) -> Result<Option<ReadBatchTask>> {
+        if self.rows_remaining == 0 {
+            return Ok(None);
+        }
+
+        let mut to_take = (num_rows as u64).min(self.rows_remaining);
+        self.rows_remaining -= to_take;
+
+        let desired_scheduled = self.rows_drained + to_take;
+        let scheduled_need = desired_scheduled.saturating_sub(self.rows_scheduled);
+        if scheduled_need > 0 {
+            let actually = self.wait_for_scheduled(desired_scheduled).await?;
+            if actually < desired_scheduled {
+                to_take -= desired_scheduled - actually;
+            }
+        }
+
+        if to_take == 0 {
+            return Ok(None);
+        }
+
+        let next_task = self.root_decoder.drain_batch_task(to_take)?;
+        let num_rows = next_task.num_rows;
+        let emitted_batch_size_warning = self.emitted_batch_size_warning.clone();
+        let spawn = self.spawn_batch_decode_tasks;
+        self.rows_drained += to_take;
+
+        let task = async move {
+            let (batch, _data_size) = if spawn {
+                tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
+                    .await
+                    .map_err(|err| Error::wrapped(err.into()))??
+            } else {
+                next_task.into_batch(emitted_batch_size_warning)?
+            };
+            Ok(batch)
+        };
+
+        Ok(Some(ReadBatchTask {
+            task: task.boxed(),
+            num_rows: num_rows as u32,
+        }))
+    }
 }
 
 #[derive(Debug)]
@@ -3030,6 +3094,73 @@ pub async fn decode_batch(
         None,
     )?;
     decode_stream.next().await.unwrap().task.await
+}
+
+/// Creates a persistent structural decode stream for byte-budget-controlled scanning.
+///
+/// Unlike [`schedule_and_decode`] which boxes the stream and exposes a fixed batch size,
+/// this returns the raw [`StructuralBatchDecodeStream`] so the caller can query
+/// [`StructuralBatchDecodeStream::plan_decoded_bytes`] and drain rows via
+/// [`StructuralBatchDecodeStream::drain_task`] with externally chosen batch sizes.
+///
+/// Only supports v2.1+ structural files. For v2.0 files, use schema-based estimates
+/// with fresh decode tasks instead.
+pub async fn open_structural_budget_scan(
+    column_infos: Vec<Arc<ColumnInfo>>,
+    num_rows: u64,
+    column_indices: Vec<u32>,
+    target_schema: Arc<Schema>,
+    config: SchedulerDecoderConfig,
+) -> Result<StructuralBatchDecodeStream> {
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let arrow_schema = ArrowSchema::from(target_schema.as_ref());
+    let structural_decoder = StructuralStructDecoder::new(
+        arrow_schema.fields,
+        config.decoder_config.validate_on_decode,
+        /*is_root=*/ true,
+    )?;
+
+    let stream = StructuralBatchDecodeStream::new(
+        rx,
+        u32::MAX, // rows_per_batch unused in drain_task path
+        num_rows,
+        structural_decoder,
+        /*spawn_batch_decode_tasks=*/ true,
+        /*batch_size_bytes=*/ None,
+    );
+
+    let mut decode_scheduler = DecodeBatchScheduler::try_new(
+        target_schema.as_ref(),
+        &column_indices,
+        &column_infos,
+        &vec![],
+        num_rows,
+        config.decoder_plugins,
+        config.io.clone(),
+        config.cache,
+        &FilterExpression::no_filter(),
+        &config.decoder_config,
+    )
+    .await?;
+
+    let ranges = vec![0..num_rows];
+    let filter = FilterExpression::no_filter();
+    let is_inline = config
+        .decoder_config
+        .inline_scheduling
+        .unwrap_or_else(|| num_rows <= inline_scheduling_threshold());
+
+    if is_inline {
+        decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io);
+    } else {
+        let io = config.io;
+        tokio::task::spawn(async move {
+            decode_scheduler.schedule_ranges(&ranges, &filter, tx, io);
+        });
+    }
+
+    Ok(stream)
 }
 
 #[cfg(test)]
