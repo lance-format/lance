@@ -955,12 +955,21 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL expression.
     ///
+    /// Simple column references are resolved directly against the schema,
+    /// including backtick-quoted names (e.g. `` `id` `` resolves to field `id`)
+    /// and case-insensitive matching. Compound expressions fall through to
+    /// the full SQL parser.
+    ///
     /// Note: the returned expression must be passed through `optimize_filter()`
     /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
         // First check if it's a simple column reference (no operators, functions, etc.)
         // resolve_column_name tries exact match first, then falls back to case-insensitive
-        let resolved_name = self.resolve_column_name(expr);
+        let bare = expr
+            .strip_prefix('`')
+            .and_then(|s| s.strip_suffix('`'))
+            .unwrap_or(expr);
+        let resolved_name = self.resolve_column_name(bare);
         if self.schema.field_with_name(&resolved_name).is_ok() {
             return Ok(Expr::Column(Column::from_name(resolved_name)));
         }
@@ -1257,6 +1266,32 @@ mod tests {
                 false, false, false, false, true, true, false, false, false, false
             ])
         );
+    }
+
+    #[rstest]
+    #[case::bare("id", "id")]
+    #[case::backtick_quoted("`id`", "id")]
+    #[case::case_insensitive("ID", "id")]
+    #[case::backtick_case_insensitive("`ID`", "id")]
+    #[case::reserved_word("`order`", "order")]
+    fn test_parse_expr_column_resolution(#[case] input: &str, #[case] expected_name: &str) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("order", DataType::Utf8, true),
+        ]));
+        let planner = Planner::new(schema);
+
+        let expr = planner.parse_expr(input).unwrap();
+        assert_eq!(expr, Expr::Column(Column::from_name(expected_name)));
+    }
+
+    #[test]
+    fn test_parse_expr_sql_fallback() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let planner = Planner::new(schema);
+
+        let expr = planner.parse_expr("id + 1").unwrap();
+        assert_eq!(expr, col("id") + lit(1_i32));
     }
 
     #[test]
