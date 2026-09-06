@@ -270,20 +270,23 @@ pub struct CompactionOptions {
     pub binary_copy_read_batch_bytes: Option<usize>,
     /// Maximum number of source fragments to compact in a single run. When set,
     /// tasks are included in the plan until adding the next task would exceed
-    /// this limit. This allows for incremental compaction (e.g., compact 20
-    /// fragments at a time).
+    /// this limit. If the next task is too large, the planner may use its
+    /// largest useful Fragment prefix that fits. This allows for incremental
+    /// compaction (e.g., compact 20 fragments at a time).
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
     /// Maximum number of source rows to compact in a single run. Rows are
     /// counted as live rows (physical rows minus soft-deleted rows). When
     /// set, tasks are included in the plan until adding the next task would
-    /// exceed this limit.
+    /// exceed this limit. If the next task is too large, the planner may use
+    /// its largest useful Fragment prefix that fits.
     /// Defaults to `None` (no limit).
     pub max_source_rows: Option<usize>,
     /// Maximum number of source bytes to compact in a single run, measured as
     /// the total size of the source fragments' data and overlay files. When
     /// set, tasks are included in the plan until adding the next task would
-    /// exceed this limit.
+    /// exceed this limit. If the next task is too large, the planner may use
+    /// its largest useful Fragment prefix that fits.
     /// Blob v2 payloads live in separate blob files and are not counted, so
     /// this is not a cap on total compaction I/O for datasets with blob
     /// columns.
@@ -907,22 +910,19 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             candidate_bins.push(bin);
         }
 
-        let all_tasks: Vec<(TaskData, usize)> = candidate_bins
+        let candidate_tasks: Vec<CandidateBin> = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
-            .map(|bin| {
-                let live_rows = bin.row_counts.iter().sum();
-                (
-                    TaskData {
-                        fragments: bin.fragments,
-                    },
-                    live_rows,
-                )
-            })
             .collect();
 
-        let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
+        let tasks: Vec<TaskData> =
+            limit_tasks_to_source_budget(&self.options, dataset.schema(), candidate_tasks)?
+                .into_iter()
+                .map(|bin| TaskData {
+                    fragments: bin.fragments,
+                })
+                .collect();
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
@@ -1024,26 +1024,25 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
     })
 }
 
-/// Truncates a planned task list to the configured per-run source budgets
+/// Truncates candidate tasks to the configured per-run source budgets
 /// (`max_source_fragments`, `max_source_rows`, `max_source_bytes`).
 ///
-/// All configured budgets apply together: tasks are kept, in order, until
-/// adding the next task would exceed any one of them. The budgets are hard
-/// upper bounds, so if the first task already exceeds one of them the
-/// returned plan is empty and a warning is logged, since compaction would
-/// otherwise stall silently.
-///
-/// Each task is paired with the number of live rows in its source fragments.
+/// All configured budgets apply together. Candidate tasks are kept in order.
+/// If the next candidate would exceed a budget, its largest prefix that both
+/// fits all remaining budgets and performs useful compaction is kept. Planning
+/// then stops because the following Fragment does not fit. A prefix is useful
+/// when it contains multiple neighboring Fragments or a single Fragment that
+/// independently needs rewriting.
 fn limit_tasks_to_source_budget(
     options: &CompactionOptions,
     schema: &lance_core::datatypes::Schema,
-    all_tasks: Vec<(TaskData, usize)>,
-) -> Result<Vec<TaskData>> {
+    candidate_tasks: Vec<CandidateBin>,
+) -> Result<Vec<CandidateBin>> {
     if options.max_source_fragments.is_none()
         && options.max_source_rows.is_none()
         && options.max_source_bytes.is_none()
     {
-        return Ok(all_tasks.into_iter().map(|(task, _)| task).collect());
+        return Ok(candidate_tasks);
     }
 
     // Only needed for the bytes budget: files whose fields are all absent
@@ -1055,30 +1054,58 @@ fn limit_tasks_to_source_budget(
         HashSet::new()
     };
 
-    let num_candidate_tasks = all_tasks.len();
+    let num_candidate_tasks = candidate_tasks.len();
     let mut total_fragments = 0_usize;
     let mut total_rows = 0_usize;
     let mut total_bytes = 0_u64;
-    let mut tasks = Vec::with_capacity(all_tasks.len());
-    for (task, live_rows) in all_tasks {
-        total_fragments += task.fragments.len();
-        total_rows = total_rows.saturating_add(live_rows);
-        if options.max_source_bytes.is_some() {
-            total_bytes = total_bytes.saturating_add(task_source_bytes(&task, &schema_field_ids)?);
+    let mut tasks = Vec::with_capacity(candidate_tasks.len());
+    for task in candidate_tasks {
+        let fragment_bytes = if options.max_source_bytes.is_some() {
+            task.fragments
+                .iter()
+                .map(|fragment| fragment_source_bytes(fragment, &schema_field_ids))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![0; task.fragments.len()]
+        };
+
+        let mut prefix_fragments = total_fragments;
+        let mut prefix_rows = total_rows;
+        let mut prefix_bytes = total_bytes;
+        let mut prefix_len = 0;
+        for (live_rows, fragment_bytes) in task.row_counts.iter().zip(fragment_bytes) {
+            let next_fragments = prefix_fragments.saturating_add(1);
+            let next_rows = prefix_rows.saturating_add(*live_rows);
+            let next_bytes = prefix_bytes.saturating_add(fragment_bytes);
+            let over_budget = options
+                .max_source_fragments
+                .is_some_and(|max| next_fragments > max)
+                || options.max_source_rows.is_some_and(|max| next_rows > max)
+                || options.max_source_bytes.is_some_and(|max| next_bytes > max);
+            if over_budget {
+                break;
+            }
+            prefix_fragments = next_fragments;
+            prefix_rows = next_rows;
+            prefix_bytes = next_bytes;
+            prefix_len += 1;
         }
 
-        let over_budget = options
-            .max_source_fragments
-            .is_some_and(|max| total_fragments > max)
-            || options.max_source_rows.is_some_and(|max| total_rows > max)
-            || options
-                .max_source_bytes
-                .is_some_and(|max| total_bytes > max);
-        if over_budget {
-            break;
+        if prefix_len == task.fragments.len() {
+            total_fragments = prefix_fragments;
+            total_rows = prefix_rows;
+            total_bytes = prefix_bytes;
+            tasks.push(task);
+            continue;
         }
 
-        tasks.push(task);
+        if prefix_len > 0 {
+            let prefix = task.into_prefix(prefix_len);
+            if !prefix.is_noop() {
+                tasks.push(prefix);
+            }
+        }
+        break;
     }
 
     if tasks.is_empty() && num_candidate_tasks > 0 {
@@ -1096,7 +1123,7 @@ fn limit_tasks_to_source_budget(
     Ok(tasks)
 }
 
-/// Returns the total size in bytes of a task's source data and overlay files.
+/// Returns the total size in bytes of a Fragment's source data and overlay files.
 ///
 /// Files whose fields are all absent from `schema_field_ids` only back
 /// dropped columns; compaction does not read them, so they are neither
@@ -1104,27 +1131,25 @@ fn limit_tasks_to_source_budget(
 /// Only sizes recorded in the manifest are used: a missing size is an error
 /// rather than a metadata request against object storage, which would turn
 /// planning into one round trip per file. Deletion files are not counted.
-fn task_source_bytes(task: &TaskData, schema_field_ids: &HashSet<i32>) -> Result<u64> {
+fn fragment_source_bytes(fragment: &Fragment, schema_field_ids: &HashSet<i32>) -> Result<u64> {
     let mut total_bytes = 0_u64;
-    for fragment in &task.fragments {
-        let overlay_files = fragment.overlays.iter().map(|overlay| &overlay.data_file);
-        for data_file in fragment.files.iter().chain(overlay_files) {
-            if !data_file
-                .fields
-                .iter()
-                .any(|field_id| schema_field_ids.contains(field_id))
-            {
-                continue;
-            }
-            let size = data_file.file_size_bytes.get().ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "max_source_bytes is set but file '{}' of fragment {} has no size recorded \
-                     in the manifest; unset max_source_bytes to compact this dataset",
-                    data_file.path, fragment.id
-                ))
-            })?;
-            total_bytes = total_bytes.saturating_add(size.get());
+    let overlay_files = fragment.overlays.iter().map(|overlay| &overlay.data_file);
+    for data_file in fragment.files.iter().chain(overlay_files) {
+        if !data_file
+            .fields
+            .iter()
+            .any(|field_id| schema_field_ids.contains(field_id))
+        {
+            continue;
         }
+        let size = data_file.file_size_bytes.get().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "max_source_bytes is set but file '{}' of fragment {} has no size recorded \
+                 in the manifest; unset max_source_bytes to compact this dataset",
+                data_file.path, fragment.id
+            ))
+        })?;
+        total_bytes = total_bytes.saturating_add(size.get());
     }
     Ok(total_bytes)
 }
@@ -2050,6 +2075,20 @@ impl CandidateBin {
         } else {
             false
         }
+    }
+
+    /// Keep the first `len` Fragments while preserving their planning metadata.
+    fn into_prefix(mut self, len: usize) -> Self {
+        debug_assert!(
+            len <= self.fragments.len(),
+            "candidate prefix length {len} exceeds Fragment count {}",
+            self.fragments.len()
+        );
+        self.fragments.truncate(len);
+        self.candidacy.truncate(len);
+        self.row_counts.truncate(len);
+        self.pos_range.end = self.pos_range.start + len;
+        self
     }
 
     /// Split into one or more bins with at least `min_num_rows` in them.
@@ -8097,6 +8136,53 @@ mod tests {
             plan_all.num_tasks()
         );
 
+        // The first row-sized task contains three Fragments. A tighter budget
+        // should use its largest useful prefix instead of returning an empty
+        // plan.
+        let opts_tight = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_fragments: Some(2),
+            ..Default::default()
+        };
+        let plan_tight = plan_compaction(&dataset, &opts_tight).await.unwrap();
+        assert_eq!(plan_tight.num_tasks(), 1);
+        let planned_fragment_ids = plan_tight.tasks()[0]
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(planned_fragment_ids, vec![0, 1]);
+
+        // Fragment 0 independently needs rewriting because of its deletions,
+        // so it remains useful even when only one Fragment fits.
+        let opts_single_rewrite = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_fragments: Some(1),
+            ..Default::default()
+        };
+        let plan_single_rewrite = plan_compaction(&dataset, &opts_single_rewrite)
+            .await
+            .unwrap();
+        assert_eq!(plan_single_rewrite.num_tasks(), 1);
+        assert_eq!(plan_single_rewrite.tasks()[0].fragments[0].id, 0);
+
+        // One ordinary small Fragment cannot be compacted usefully by itself,
+        // so a one-Fragment budget remains an empty plan.
+        let small_fragments = lance_datagen::gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        let opts_too_small = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_fragments: Some(1),
+            ..Default::default()
+        };
+        let plan_too_small = plan_compaction(&small_fragments, &opts_too_small)
+            .await
+            .unwrap();
+        assert_eq!(plan_too_small.num_tasks(), 0);
+
         // Execute bounded compaction incrementally
         let mut dataset = dataset;
         compact_files(&mut dataset, opts_bounded, None)
@@ -8245,6 +8331,22 @@ mod tests {
             .map(|f| f.physical_rows.unwrap())
             .sum();
         assert_eq!(physical_rows, 300);
+
+        // The first row-sized task has 250 live rows. A 150-row budget can
+        // still compact its first two neighboring Fragments (50 + 100 rows).
+        let opts_tight = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_rows: Some(150),
+            ..Default::default()
+        };
+        let plan_tight = plan_compaction(&dataset, &opts_tight).await.unwrap();
+        assert_eq!(plan_tight.num_tasks(), 1);
+        let planned_fragment_ids = plan_tight.tasks()[0]
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(planned_fragment_ids, vec![0, 1]);
     }
 
     #[tokio::test]
@@ -8252,6 +8354,11 @@ mod tests {
         let test_dir = TempStrDir::default();
         let dataset = dataset_with_ten_small_fragments(&test_dir).await;
 
+        let first_two_base_bytes: u64 = dataset.get_fragments()[..2]
+            .iter()
+            .flat_map(|f| f.metadata.files.iter())
+            .map(|df| df.file_size_bytes.get().unwrap().get())
+            .sum();
         let first_task_base_bytes: u64 = dataset.get_fragments()[..3]
             .iter()
             .flat_map(|f| f.metadata.files.iter())
@@ -8265,21 +8372,25 @@ mod tests {
             .get();
         assert!(first_task_base_bytes > 0 && overlay_bytes > 0);
 
-        // The first task covers fragments 0..=2 (target 250 rows). A budget of
-        // exactly their base bytes is exceeded once fragment 0's overlay file
-        // is counted, so the plan is empty: the budget is a hard upper bound,
-        // overlay bytes are part of a task's source, and deletion files are
-        // never counted.
+        // The first row-sized task covers fragments 0..=2. A byte budget sized
+        // for fragments 0..=1 should compact that useful prefix while still
+        // counting fragment 0's overlay file.
+        let prefix_budget = first_two_base_bytes + overlay_bytes;
         let opts = CompactionOptions {
             target_rows_per_fragment: 250,
-            max_source_bytes: Some(first_task_base_bytes),
+            max_source_bytes: Some(prefix_budget),
             ..Default::default()
         };
         let plan = plan_compaction(&dataset, &opts).await.unwrap();
-        assert_eq!(plan.num_tasks(), 0);
+        assert_eq!(plan.num_tasks(), 1);
+        let planned_fragment_ids = plan.tasks()[0]
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        assert_eq!(planned_fragment_ids, vec![0, 1]);
 
-        // Widening the budget by the overlay's bytes admits exactly the first
-        // task and nothing more.
+        // Widening the budget admits the complete first task and nothing more.
         let budget = first_task_base_bytes + overlay_bytes;
         let opts = CompactionOptions {
             target_rows_per_fragment: 250,
