@@ -118,6 +118,9 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         dist_q_c: Some(query.dist_q_c),
         query_parallelism: Some(query.query_parallelism),
         approx_mode: approx_mode_to_proto(query.approx_mode) as i32,
+        // No planner narrows the covering projection yet, so this is always absent:
+        // "materialize every covering column declared". See `CoveringProjection`.
+        covering_projection: None,
     })
 }
 
