@@ -6638,6 +6638,64 @@ mod tests {
         );
     }
 
+    /// A codebook whose sub-vector width disagrees with the column used to be
+    /// accepted: the PQ transform derives the width from the column, so an
+    /// oversized codebook had its sub-vector boundaries read at the wrong
+    /// offsets and produced a searchable but wrong index, with no error.
+    ///
+    /// The two index file versions reach the codebook through different
+    /// writers, so both are covered.
+    #[rstest]
+    #[case::v3(IndexFileVersion::V3)]
+    #[case::legacy(IndexFileVersion::Legacy)]
+    #[tokio::test]
+    async fn test_create_ivf_pq_rejects_mismatched_codebook(#[case] version: IndexFileVersion) {
+        const DIM: usize = 32;
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+        let arr = generate_random_array_with_seed::<Float32Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        // Twice the required 256 * DIM. Divisible by the column dimension, so
+        // nothing downstream complains on its own.
+        let codebook = Arc::new(generate_random_array_with_seed::<Float32Type>(
+            256 * DIM * 2,
+            [22; 32],
+        ));
+        let mut params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            fast_ivf_params(2),
+            PQBuildParams::with_codebook(4, 8, codebook),
+        );
+        params.version = version;
+        let error = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect_err("a codebook that does not match the column must be rejected");
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&(256 * DIM * 2).to_string())
+                && message.contains(&(256 * DIM).to_string()),
+            "the error must give the supplied and the required size: {message}"
+        );
+    }
+
     #[tokio::test]
     async fn test_create_ivf_flat_f16() {
         let test_dir = TempStrDir::default();

@@ -444,6 +444,45 @@ impl ProductQuantizer {
     }
 }
 
+/// Reject a caller-supplied codebook whose size disagrees with the column.
+///
+/// The codebook buffer is sliced by column-derived arithmetic downstream
+/// (`get_sub_vector_centroids` computes the sub-vector width as
+/// `dimension / num_sub_vectors`), so a wrong size is not a local error: an
+/// oversized codebook has its sub-vector boundaries read at the wrong offsets
+/// and trains a garbage index without complaining, and an undersized one slices
+/// out of bounds and panics.
+pub fn validate_supplied_codebook(
+    codebook_len: usize,
+    dimension: usize,
+    num_sub_vectors: usize,
+    num_bits: usize,
+) -> Result<()> {
+    if num_sub_vectors == 0 || dimension == 0 || !dimension.is_multiple_of(num_sub_vectors) {
+        return Err(Error::invalid_input(format!(
+            "PQ codebook requires a nonzero vector dimension divisible by num_sub_vectors, \
+             got dimension {dimension} and num_sub_vectors {num_sub_vectors}"
+        )));
+    }
+    let num_centroids = u32::try_from(num_bits)
+        .ok()
+        .filter(|num_bits| *num_bits > 0)
+        .and_then(|num_bits| 1usize.checked_shl(num_bits));
+    let expected = num_centroids.and_then(|num_centroids| num_centroids.checked_mul(dimension));
+    let (Some(num_centroids), Some(expected)) = (num_centroids, expected) else {
+        return Err(Error::invalid_input(format!(
+            "PQ codebook size is not representable: num_bits {num_bits}, dimension {dimension}"
+        )));
+    };
+    if codebook_len != expected {
+        return Err(Error::invalid_input(format!(
+            "PQ codebook has {codebook_len} values, but the vector column requires {expected} \
+             ({num_centroids} centroids x dimension {dimension} for num_bits {num_bits})"
+        )));
+    }
+    Ok(())
+}
+
 impl Quantization for ProductQuantizer {
     type BuildParams = PQBuildParams;
     type Metadata = ProductQuantizationMetadata;
@@ -461,10 +500,17 @@ impl Quantization for ProductQuantizer {
         )))?;
 
         if let Some(codebook) = params.codebook.as_ref() {
+            let dimension = fsl.value_length() as usize;
+            validate_supplied_codebook(
+                codebook.len(),
+                dimension,
+                params.num_sub_vectors,
+                params.num_bits,
+            )?;
             return Ok(Self::new(
                 params.num_sub_vectors,
                 params.num_bits as u32,
-                fsl.value_length() as usize,
+                dimension,
                 FixedSizeListArray::try_new_from_values(codebook.clone(), fsl.value_length())?,
                 distance_type,
             ));
@@ -817,6 +863,53 @@ mod tests {
                 .values()
                 .as_primitive::<UInt8Type>()
                 .values()
+        );
+    }
+
+    /// A caller-supplied codebook is sliced by column-derived arithmetic, so a
+    /// size that disagrees with the column has to be rejected here: oversized
+    /// would read the sub-vector boundaries at the wrong offsets and train a
+    /// garbage index, undersized would slice out of bounds and panic.
+    #[test]
+    fn test_validate_supplied_codebook() {
+        const DIM: usize = 128;
+        const NUM_SUB_VECTORS: usize = 8;
+        let expected = 256 * DIM;
+
+        validate_supplied_codebook(expected, DIM, NUM_SUB_VECTORS, 8).unwrap();
+        validate_supplied_codebook(16 * DIM, DIM, NUM_SUB_VECTORS, 4).unwrap();
+
+        let error = validate_supplied_codebook(expected * 2, DIM, NUM_SUB_VECTORS, 8).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&(expected * 2).to_string())
+                && message.contains(&expected.to_string()),
+            "the error must give both the supplied and the required size: {message}"
+        );
+
+        let error = validate_supplied_codebook(expected / 2, DIM, NUM_SUB_VECTORS, 8).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+
+        let error = validate_supplied_codebook(expected, DIM, 5, 8).unwrap_err();
+        assert!(
+            error.to_string().contains("divisible by num_sub_vectors"),
+            "a dimension that does not divide by num_sub_vectors must say so: {error}"
+        );
+
+        let error = validate_supplied_codebook(DIM, DIM, NUM_SUB_VECTORS, 0).unwrap_err();
+        assert!(
+            error.to_string().contains("not representable"),
+            "num_bits 0 must be rejected rather than accepting one centroid: {error}"
+        );
+
+        let error = validate_supplied_codebook(expected, DIM, NUM_SUB_VECTORS, 1024).unwrap_err();
+        assert!(
+            error.to_string().contains("not representable"),
+            "an absurd num_bits must be reported rather than wrapping: {error}"
         );
     }
 }

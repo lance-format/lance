@@ -556,6 +556,23 @@ def test_vector_transform(tmpdir, small_rand_dataset, small_rand_ivf, small_rand
     assert reader.metadata().num_rows == SMALL_NUM_ROWS
 
 
+def test_vector_transform_mismatched_codebook(
+    tmpdir, small_rand_dataset, small_rand_ivf
+):
+    # The dimension comes from the column and the codebook from the caller, and
+    # the codebook is sliced with column-derived offsets.
+    dtype = small_rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
+    codebook = np.random.default_rng(42).random(DIMENSION * 256 * 2).astype(dtype)
+    codebook = pa.FixedSizeListArray.from_arrays(codebook, DIMENSION)
+    pq = PqModel(NUM_SUBVECTORS, codebook)
+
+    builder = IndicesBuilder(small_rand_dataset, "vectors")
+    with pytest.raises(ValueError, match="PQ codebook has"):
+        builder.transform_vectors(
+            small_rand_ivf, pq, str(tmpdir / "transformed"), fragments=None
+        )
+
+
 @pytest.mark.cuda
 def test_vector_transform_with_precomputed_partitions(
     tmpdir, small_rand_dataset, small_rand_ivf, small_rand_pq

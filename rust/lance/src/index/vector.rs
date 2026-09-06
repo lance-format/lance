@@ -656,6 +656,12 @@ pub(crate) async fn build_distributed_vector_index(
             .codebook
             .clone()
             .expect("checked above that PQ codebook is present");
+        lance_index::vector::pq::validate_supplied_codebook(
+            pre_codebook.len(),
+            dim,
+            pq_params.num_sub_vectors,
+            pq_params.num_bits,
+        )?;
         let codebook_fsl =
             arrow_array::FixedSizeListArray::try_new_from_values(pre_codebook, dim as i32)?;
 
