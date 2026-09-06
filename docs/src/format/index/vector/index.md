@@ -161,6 +161,19 @@ the Arrow schema of the Lance file varies depending on the quantization method u
 !!! note
     All partitions are stored in the same file, and partitions must be written in order.
 
+Every quantization format below lists only its internal columns. When a V3 IVF
+writer materializes carried values, it appends one trailing column per carried
+field after them, named and typed exactly as in the dataset schema. This physical
+payload may be a subset of the manifest's `covering_fields` declaration (see
+[Index Metadata](../index.md)). A reader returns only columns whose physical
+schema and source field ids it verifies across every selected segment; all other
+projected columns come from a base-table take.
+
+A reader discovers carried columns by exclusion, not by position: any column in the
+auxiliary file's schema that is not one of the quantizer's internal columns is a
+carried column. Writers append them in trailing order, but a reader must not depend
+on that ordering to identify them.
+
 ##### FLAT
 
 No quantization applied - stores original vectors in their full precision:
@@ -228,6 +241,17 @@ It's only used for tracking each partition's offset and length in the auxiliary 
 Contains RabitQ-specific metadata in JSON format (only present for RQ quantization).
 This includes the rotation matrix position, number of bits, and packing information.
 See the RQ metadata specification in the "storage_metadata" section below.
+
+##### "covering_field_ids"
+
+The *source dataset* field ids of the storage file's physical carried columns,
+comma separated in physical schema order (only present when the storage carries
+values). Arrow fields carry no Lance field id, so names and types alone cannot
+prove which logical column a payload came from. Readers use these ids to bind
+physical values to the segment's `covering_fields` declaration, and treat missing,
+malformed, ambiguous, or mismatched metadata as no servable carried capability.
+Distributed merges use the same identity to reject shards whose columns match by
+name and type but come from different fields.
 
 ##### "storage_metadata"
 

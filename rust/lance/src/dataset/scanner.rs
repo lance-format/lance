@@ -100,6 +100,7 @@ use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::covering::effective_covering;
 use crate::index::scalar::fetch_index_details;
 use crate::index::scalar::inverted::{
     fts_index_fragment_bitmap, load_segment_details, load_segments, normalize_inverted_details,
@@ -645,6 +646,33 @@ pub struct FilterPlan {
     expr_filter_plan: ExprFilterPlan,
 }
 
+/// Whether an FTS query scores from the columns of the plan it is handed, rather than
+/// building its own FTS plan and joining the result on `_rowid`.
+///
+/// Only a `Match` does: it is the shape `FlatMatchQueryExec` / `FlatMatchFilterExec`
+/// support, and those read the document column straight out of their input.
+///
+/// This is the single authority for that rule. Two very different callers depend on it and
+/// must not drift apart:
+///
+/// * [`FilterPlan::refine_columns`], which decides what the refine pass has to *take* from
+///   the base table, and
+/// * [`Scanner::fts_scored_columns`], which decides what a covered vector index has to
+///   *materialize* so that take is not needed.
+///
+/// They are two halves of one decision. If a new FTS shape learns to score from its input
+/// and only the first is updated, the take appears and the covered index stops declaring
+/// the column it serves -- silently, because the results are identical either way.
+fn fts_scores_from_input(query: &FtsQuery) -> bool {
+    match query {
+        FtsQuery::Match(_) => true,
+        FtsQuery::Phrase(_)
+        | FtsQuery::Boost(_)
+        | FtsQuery::MultiMatch(_)
+        | FtsQuery::Boolean(_) => false,
+    }
+}
+
 impl FilterPlan {
     pub fn new(query_filter: Option<QueryFilter>, expr_filter_plan: ExprFilterPlan) -> Self {
         Self {
@@ -700,9 +728,11 @@ impl FilterPlan {
                         fts_query.columns()
                     };
 
-                    // Add refine column for match query since it supports `FlatMatchQueryExec`.
-                    // Other fts query use join so we don't need to add refine column.
-                    if let FtsQuery::Match(_) = &fts_query.query {
+                    // A shape that scores from its input needs that column taken for it;
+                    // the others join on `_rowid` and need nothing. Same rule, same
+                    // authority, as the covering declaration -- see
+                    // `fts_scores_from_input`.
+                    if fts_scores_from_input(&fts_query.query) {
                         columns.extend(cols.iter().cloned().collect::<Vec<_>>());
                     }
                 }
@@ -2021,6 +2051,7 @@ impl Scanner {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            covering_projection: None,
         });
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
@@ -3779,9 +3810,17 @@ impl Scanner {
         if self.prefilter {
             let source: Arc<dyn ExecutionPlan> = match &filter_plan.vector_filter() {
                 Some(vector_query) => {
-                    // Perform vector search first then rerank according to BM25 scores
+                    // Perform vector search first then rerank according to BM25 scores.
+                    // The rerank reads the FTS document column from this plan, so the
+                    // vector search must be told to materialize it when the index covers
+                    // it -- the scan's own projection need not mention it at all.
+                    let vector_query = self.with_covering_projection(
+                        vector_query,
+                        filter_plan,
+                        &Self::fts_scored_columns(query),
+                    );
                     let vector_plan = self
-                        .vector_search(&filter_plan.expr_filter_plan, vector_query)
+                        .vector_search(&filter_plan.expr_filter_plan, &vector_query)
                         .await?;
                     self.fts_rerank(vector_plan, query).await?
                 }
@@ -3810,6 +3849,15 @@ impl Scanner {
         let Some(query) = self.nearest.as_ref() else {
             return Err(Error::invalid_input("No nearest query".to_string()));
         };
+        // A postfiltered FTS *query filter* is scored by the refine pass on top of this
+        // search (`FilterPlan::refine_columns` takes its document column), so name it here
+        // too. Free in the prefilter branch below: that branch plans the FTS index as the
+        // source and scores with a flat KNN, so it builds no ANN node to declare anything.
+        let fts_scored = filter_plan
+            .fts_filter()
+            .map(|fts| Self::fts_scored_columns(&fts))
+            .unwrap_or_default();
+        let query = self.with_covering_projection(query, filter_plan, &fts_scored);
 
         if self.prefilter {
             log::trace!("source is a vector search (prefilter)");
@@ -3826,10 +3874,10 @@ impl Scanner {
                         .union_column(&query.column, OnMissing::Error)?;
                     let plan = self.take(fts_plan, projection)?;
 
-                    self.flat_knn(plan, query)?
+                    self.flat_knn(plan, &query)?
                 }
                 None => {
-                    self.vector_search(&filter_plan.expr_filter_plan, query)
+                    self.vector_search(&filter_plan.expr_filter_plan, &query)
                         .await?
                 }
             };
@@ -3841,7 +3889,7 @@ impl Scanner {
             // If we are postfiltering then we can't use scalar indices for the filter
             // and will need to run the postfilter in memory
             filter_plan.make_refine_only();
-            self.vector_search(&ExprFilterPlan::default(), query).await
+            self.vector_search(&ExprFilterPlan::default(), &query).await
         }
     }
 
@@ -5258,7 +5306,195 @@ impl Scanner {
         Ok(flat_match_plan)
     }
 
+    /// The dataset columns this scan still has to read once the vector search has
+    /// produced its `[_distance, _rowid]` rows.
+    ///
+    /// This is the input to [`Query::covering_projection`]. A covering column only pays
+    /// for itself if it saves a base-table read, so the set an index should materialize
+    /// is this set intersected with what the index declares. The intersection (and the
+    /// emission order, which is the index's, not this one's) is done by
+    /// [`effective_covering`]; this method only answers "what does the rest of the plan
+    /// read".
+    ///
+    /// Every column named here is one a later [`Scanner::take`] would otherwise fetch:
+    /// the output projection (`create_plan`'s final take), the sort keys and the
+    /// aggregate inputs, plus whatever the caller passes in `also_read`. Returning a
+    /// *superset* is harmless -- a name the index does not declare is dropped by the
+    /// intersection -- so this errs wide on purpose.
+    ///
+    /// Names are top-level only, matching the covering declaration: `covering_columns`
+    /// rejects dotted paths, so a projection of `nested.x` contributes `nested` and a
+    /// filter on `nested.x` contributes nothing. Both merely under-narrow.
+    ///
+    /// `also_read` carries the columns a node *between* the search and the final
+    /// projection consumes, which this method cannot see from the scan options alone:
+    ///
+    /// * on a postfiltered scan, every column the filter mentions -- not just the refine
+    ///   ones, because an index-satisfied conjunct can still be rechecked, and the recheck
+    ///   reads from whatever the search node emitted. A *prefiltered* scan contributes
+    ///   none of them; see [`Self::with_covering_projection`] for why;
+    /// * the document column an FTS scorer stacked on the vector search reads from it
+    ///   (see [`Self::fts_scored_columns`]); it takes the column from the base table when
+    ///   the search did not emit it.
+    ///
+    /// # An empty result is meaningful
+    ///
+    /// A query selecting only `_distance` / `_rowid` reads no dataset column at all, and
+    /// must yield an empty vec, which becomes `Some(&[])` -- "this query needs no
+    /// covering column". That is the state the whole projection pushdown exists for;
+    /// see [`Query::covering_projection`] for why it must not collapse into `None`.
+    ///
+    /// [`Query::covering_projection`]: lance_index::vector::Query::covering_projection
+    /// [`effective_covering`]: crate::index::covering::effective_covering
+    fn columns_read_after_vector_search(&self, also_read: &[String]) -> Vec<String> {
+        let mut columns: Vec<String> = Vec::new();
+        let push = |columns: &mut Vec<String>, name: &str| {
+            if !columns.iter().any(|existing| existing == name) {
+                columns.push(name.to_string());
+            }
+        };
+
+        let projection = &self.projection_plan.physical_projection;
+        for field in &self.dataset.schema().fields {
+            if projection.contains_field_id(field.id) {
+                push(&mut columns, &field.name);
+            }
+        }
+
+        if let Some(ordering) = &self.ordering {
+            for column in ordering {
+                push(&mut columns, &column.column_name);
+            }
+        }
+
+        if let Some(aggregate) = &self.aggregate {
+            for column in aggregate.required_columns() {
+                push(&mut columns, &column);
+            }
+        }
+
+        for column in also_read {
+            push(&mut columns, column);
+        }
+
+        columns
+    }
+
+    /// The columns an FTS scorer reads out of the plan it is handed, rather than fetching
+    /// for itself.
+    ///
+    /// Two nodes do this, and both sit *between* a vector search and the final
+    /// projection, so neither is visible to [`Self::columns_read_after_vector_search`]:
+    /// [`Scanner::fts_rerank`] (`FlatMatchQueryExec`, when FTS is the search and a vector
+    /// query is the filter) and the refine pass over an FTS query filter
+    /// (`FlatMatchFilter`, via `FilterPlan::refine_columns`).
+    ///
+    /// Which shapes score from their input is decided by [`fts_scores_from_input`], which
+    /// `FilterPlan::refine_columns` consults for the matching take. Narrowing must not be
+    /// looser than that rule: declaring a covering column no one reads is precisely the
+    /// cost this pushdown exists to remove.
+    ///
+    /// Names are passed through as the query states them. A dotted FTS field path names
+    /// no top-level column and so contributes nothing, which under-narrows exactly like a
+    /// filter on `nested.x` -- the scorer then takes the column from the base table, as it
+    /// does today.
+    /// Both callers pass queries `create_plan` has already resolved through
+    /// [`Self::resolve_full_text_search_query`], so the default unnamed `Match` arrives
+    /// with its column filled from the FTS-indexed columns -- no fill is needed (or
+    /// wanted) here. A caller handing this an UNRESOLVED query would silently narrow
+    /// the filled column away and un-engage covering for the most common query shape,
+    /// with results staying byte-identical; the unnamed-Match cases in
+    /// `test_covered_ann_keeps_the_column_an_fts_scorer_reads` pin against that.
+    fn fts_scored_columns(query: &FullTextSearchQuery) -> Vec<String> {
+        if !fts_scores_from_input(&query.query) {
+            return Vec::new();
+        }
+        let mut columns: Vec<String> = query.columns().into_iter().collect();
+        // `columns()` is a set; sort so the resolved projection is deterministic across
+        // runs. The emission order is the index's, but a stable request order keeps plans
+        // reproducible.
+        columns.sort_unstable();
+        columns
+    }
+
+    /// `query` with [`Query::covering_projection`] resolved against this scan: the one
+    /// place a covered index is told what to materialize.
+    ///
+    /// Called from the plan sources rather than from `vector_search`, because they still
+    /// hold the complete [`FilterPlan`]. By the time `vector_search` runs the plan has
+    /// been split into a prefilter and a refine half and it sees only one of them, so
+    /// resolving there would forget the filter columns of a postfiltered scan -- which
+    /// is the default. Deliberately not *also* resolved there as a fallback: two sites
+    /// computing the same policy from different inputs means the poorer one silently
+    /// covers for a mistake in the richer one.
+    ///
+    /// Always `Some`. The empty case is the point (see
+    /// [`Self::columns_read_after_vector_search`]); a `vector_search` reached without
+    /// passing through here keeps `None` and materializes everything, which is the safe
+    /// direction.
+    ///
+    /// `also_read` is for consumers the scan options do not describe -- today the FTS
+    /// scorers stacked on a vector search (see [`Self::fts_scored_columns`]). Callers with
+    /// no such consumer pass `&[]`.
+    ///
+    /// # The expression filter counts only when it is rechecked above the search
+    ///
+    /// A postfiltered scan re-evaluates the whole filter on the search's output: both plan
+    /// sources call `FilterPlan::make_refine_only`, so `create_plan` takes
+    /// `FilterPlan::refine_columns` and runs `refine_filter` above the search. Those
+    /// columns are read from whatever the search emitted, so a covered index should serve
+    /// them.
+    ///
+    /// A *prefiltered* scan is the opposite: the filter is consumed entirely below the
+    /// search (as a `ScalarIndexQuery` or a filtered read feeding the prefilter), and both
+    /// sources then call `FilterPlan::disable_refine`, which empties the expression filter
+    /// so `create_plan`'s `if filter_plan.has_refine()` take never runs. Nothing above the
+    /// search reads those columns, so naming them here would make the index materialize a
+    /// payload that the final projection discards. Storage honors this narrowed,
+    /// physically verified projection, so naming those columns would also cause wasted
+    /// index reads.
+    ///
+    /// The unindexed-fragment and stale-row paths in `knn_combined` do apply the filter,
+    /// but they read their columns from the base table, not from the search, so they do not
+    /// change this.
+    ///
+    /// [`Query::covering_projection`]: lance_index::vector::Query::covering_projection
+    fn with_covering_projection(
+        &self,
+        query: &Query,
+        filter_plan: &FilterPlan,
+        also_read: &[String],
+    ) -> Query {
+        let mut query = query.clone();
+        let mut columns = if self.prefilter {
+            Vec::new()
+        } else {
+            filter_plan.expr_filter_plan.all_columns()
+        };
+        columns.extend_from_slice(also_read);
+        // `refine` re-ranks against the indexed column, reading it out of the search output
+        // like the FTS scorers above. The narrowing below is computed from the projection,
+        // ordering and aggregates -- none of which name the vector column for the common
+        // `SELECT payload ORDER BY vector` shape -- so without this it would be narrowed
+        // away and refine would silently fall back to a base-table take.
+        if query.refine_factor.is_some() {
+            columns.push(query.column.clone());
+        }
+        // `Some`, unconditionally: an empty list means "materialize no covering column",
+        // and folding it into `None` restores full materialization with every result
+        // still correct. See `Query::covering_projection`.
+        query.covering_projection =
+            Some(Arc::from(self.columns_read_after_vector_search(&columns)));
+        query
+    }
+
     // ANN/KNN search execution node with optional prefilter
+    //
+    // `q.covering_projection` is expected to be resolved already (see
+    // `with_covering_projection`): the ANN node and every flat/fallback path in
+    // `knn_combined` derive their covering columns from it, and they are unioned against
+    // a single schema, so a flat path emitting fewer covering columns than the ANN node
+    // declares fails the projection with a missing column.
     #[async_recursion]
     async fn vector_search(
         &self,
@@ -5452,6 +5688,11 @@ impl Scanner {
             };
 
             let mut knn_node = if q.refine_factor.is_some() {
+                // No guard here on whether the index already carries the vectors: `take`
+                // subtracts its input's schema and returns the input untouched when nothing
+                // new is needed, so an index that emitted them makes this a no-op. A second
+                // check would be a redundant mechanism, and a regression in `take`'s
+                // elision would then go unnoticed.
                 let vector_projection = self
                     .dataset
                     .empty_projection()
@@ -5640,6 +5881,12 @@ impl Scanner {
         let q = q.clone();
         debug_assert!(q.metric_type.is_some());
 
+        // The ANN schema has already been narrowed against every selected segment's
+        // physical storage. Keep it as the authority for which declared covering columns
+        // the flat paths must mirror; the vector take below can widen `knn_node` with
+        // unrelated base-table columns.
+        let ann_schema = knn_node.schema();
+
         // Ensure the vector column is present for distance computation.
         if knn_node.schema().column_with_name(&q.column).is_none() {
             let vector_projection = self
@@ -5649,10 +5896,31 @@ impl Scanner {
             knn_node = self.take(knn_node, vector_projection)?;
         }
 
+        // Every flat path below must produce the covering columns the ANN node actually
+        // serves before it is unioned with `knn_node`. The manifest/query pair supplies the
+        // declaration order, while `ann_schema` supplies the storage-authoritative subset.
+        let covering_columns: Vec<String> = effective_covering(
+            indexed_segments
+                .first()
+                .map(|s| s.covering_fields.as_slice())
+                .unwrap_or(&[]),
+            q.covering_projection.as_deref(),
+            self.dataset.schema(),
+        )?
+        .into_iter()
+        .filter(|field| ann_schema.column_with_name(field.name()).is_some())
+        .map(|field| field.name().clone())
+        .collect();
+
         let mut columns = vec![q.column.clone()];
         if let Some(expr) = filter_plan.full_expr.as_ref() {
             let filter_columns = Planner::column_names_in_expr(expr);
             columns.extend(filter_columns);
+        }
+        for name in &covering_columns {
+            if !columns.contains(name) {
+                columns.push(name.clone());
+            }
         }
 
         // Collect flat-path plans; union order matches original (flat before ANN) so test snapshots
@@ -5707,6 +5975,9 @@ impl Scanner {
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 take_proj = take_proj.union_columns(filter_columns, OnMissing::Error)?;
+            }
+            if !covering_columns.is_empty() {
+                take_proj = take_proj.union_columns(covering_columns.clone(), OnMissing::Error)?;
             }
             let mut stale_node = self.stale_rows_take(stale_rows, take_proj).await?;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
@@ -6644,7 +6915,8 @@ impl Scanner {
             prefilter_source,
             overlay_block,
             self.external_row_mask.clone(),
-        )?;
+        )
+        .await?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
@@ -6706,7 +6978,8 @@ impl Scanner {
                 prefilter_source.clone(),
                 overlay_block.clone(),
                 self.external_row_mask.clone(),
-            )?;
+            )
+            .await?;
             let sort_expr = PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
                 options: SortOptions {
@@ -15108,6 +15381,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     version: crate::index::vector::IndexFileVersion::Legacy,
                     skip_transpose: false,
                     runtime_hints: Default::default(),
+                    covering_columns: Default::default(),
+                    store_vectors_for_refine: false,
                 },
                 false,
             )
@@ -16679,5 +16954,427 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 .as_primitive::<Int32Type>();
             assert_eq!(i_array.values(), &[expected_i]);
         }
+    }
+
+    /// Number of rows written before the index build, and again appended after it.
+    ///
+    /// Bounded from below on two sides, so this is close to the smallest fixture these
+    /// measurements can be made on:
+    ///
+    ///   - PQ refuses to train an 8-bit codebook on fewer than 256 rows.
+    ///   - below ~500 rows the covering column's whole partition fits in one data page, so
+    ///     reading one survivor's covering reads every row's. At 300 rows the streaming
+    ///     branch of [`test_covered_projected_query_serves_covering_from_the_index`]
+    ///     measures **4.51x** its plain arm with the survivors-only gather *working* and
+    ///     **4.52x** with it disabled -- 0.1% apart, and both far past its bound. The signal
+    ///     is not weakened at that size, it is gone.
+    const COVERED_FIXTURE_ROWS: usize = 500;
+
+    /// PQ codebook training iterations for every covering fixture below.
+    ///
+    /// No assertion in these tests depends on codebook quality -- none measures recall, and
+    /// both arms of every comparison train with the same parameters -- so this is set to
+    /// the smallest value that trains.
+    const COVERED_PQ_ITERS: usize = 2;
+
+    /// The rows every covering fixture below is built from.
+    ///
+    /// Shared rather than repeated because the byte counts these fixtures produce are only
+    /// comparable to each other while the rows are identically shaped: `payload` is
+    /// ~1 KB/row, so one copy of it (~0.5 MB) dominates everything else these queries read
+    /// (~0.15 MB) and no measurement is swamped by fixed costs.
+    ///
+    /// The width is load-bearing in *both* directions. Narrower rows stop dominating;
+    /// wider ones break the streaming branch, whose covering read is per probed partition
+    /// rather than per survivor -- at 4 KB/row it measures 2.1x its plain arm with the
+    /// gather working, over its own bound. Trade rows for width in neither direction.
+    fn covered_fixture_rows() -> impl arrow_array::RecordBatchReader + Send + 'static {
+        gen_batch()
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(Dimension::from(32)),
+            )
+            .col("payload", array::rand_utf8(ByteCount::from(1024), false))
+            .col("extra", array::step::<Int32Type>())
+            .into_reader_rows(
+                RowCount::from(COVERED_FIXTURE_ROWS as u64),
+                BatchCount::from(1),
+            )
+    }
+
+    /// A dataset whose `payload` column is wide (~1 KB/row), half of it indexed and half
+    /// of it not, for the read-byte measurements below.
+    ///
+    /// Every property here is load-bearing for
+    /// [`test_covered_unprojected_query_pays_for_no_covering_copy`]:
+    ///
+    ///   - The rows are appended *after* the index build, so a vector query unions an ANN
+    ///     branch (which reads the index) with a flat scan of the unindexed fragment
+    ///     (which reads the base table). A covering column is therefore reachable on
+    ///     *two* paths, and scanner-side narrowing removes exactly the flat-scan one.
+    ///   - The two halves are the same size and come from the same generator, so the
+    ///     unindexed half's `payload` cost is a faithful unit for the indexed half's too.
+    ///   - Four IVF partitions rather than one, so the query reaches the real probe path.
+    async fn covered_scan_fixture(uri: &str, cover_payload: bool) -> Dataset {
+        let mut dataset = Dataset::write(covered_fixture_rows(), uri, None)
+            .await
+            .unwrap();
+
+        let mut params = VectorIndexParams::ivf_pq(4, 8, 4, MetricType::L2, COVERED_PQ_ITERS);
+        if cover_payload {
+            params.covering_columns(vec!["payload".to_string()]);
+        }
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        dataset.append(covered_fixture_rows(), None).await.unwrap();
+        dataset
+    }
+
+    /// Bytes read while running an ANN query that projects no dataset column at all.
+    ///
+    /// The counter is reset first, so the fixture build is excluded and only the query is
+    /// measured.
+    async fn unprojected_ann_query_bytes(dataset: &Dataset) -> u64 {
+        let query = Float32Array::from(vec![0.3f32; 32]);
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &query, 10).unwrap();
+        scan.project::<&str>(&[]).unwrap();
+        let _ = scan.try_into_batch().await.unwrap();
+        dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes
+    }
+
+    /// Bytes read by scanning `payload` over the fragment appended after the index build:
+    /// exactly the read that scanner-side covering narrowing removes, measured on the same
+    /// dataset and the same column so it tracks any encoding change the bound must survive.
+    async fn unindexed_payload_bytes(dataset: &Dataset) -> u64 {
+        let fragments = dataset.get_fragments();
+        assert_eq!(
+            fragments.len(),
+            2,
+            "fixture must be one indexed fragment plus one appended unindexed fragment"
+        );
+        let unindexed = fragments.last().unwrap();
+        assert_eq!(
+            unindexed.count_rows(None).await.unwrap(),
+            COVERED_FIXTURE_ROWS,
+            "the appended fragment must hold the whole unindexed half"
+        );
+        let unindexed = unindexed.metadata().clone();
+
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
+        let mut scan = dataset.scan();
+        scan.with_fragments(vec![unindexed]);
+        scan.project(&["payload"]).unwrap();
+        let _ = scan.try_into_batch().await.unwrap();
+        dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes
+    }
+
+    /// The covering columns a dataset's sole index declares, by field id.
+    async fn declared_covering_field_ids(dataset: &Dataset) -> Vec<i32> {
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "fixture builds exactly one index");
+        indices[0].covering_fields.clone()
+    }
+
+    /// A covered index must make an unrelated query pay for the covering column *not at
+    /// all*.
+    ///
+    /// Without the projection narrowing, a query that reads no covering column still
+    /// materializes `payload` on both paths it can reach: the index storage serves it for
+    /// the indexed half, and the flat scan over the unindexed fragment reads it from the
+    /// base table. The narrowing removes the flat-scan copy; the survivors-only gather
+    /// removes the index one, so a covered query now reads neither.
+    ///
+    /// # The bound is half a copy, because that is what the reachable regression costs
+    ///
+    /// This bound was one and a half copies, calibrated when losing the narrowing cost two
+    /// copies. The survivors-only gather then removed the index-side copy independently, so
+    /// losing the narrowing costs **one** copy -- under the old bound, which therefore
+    /// passed with its own subject disabled. Measured on this fixture, each row taken with
+    /// `covering_projection` forced to `None` / the gather forced onto its whole-range
+    /// fallback:
+    ///
+    /// | | read bytes | copies of `payload` above plain |
+    /// |---|---|---|
+    /// | plain index | 140,930 | -- |
+    /// | covered, narrowed + gathered (today) | 145,034 | 0.008 |
+    /// | covered, narrowing disabled | 674,978 | 1.03 |
+    /// | covered, narrowing and gather both disabled | 1,163,967 | 2.01 |
+    ///
+    /// Each row's copy count is against its own run's `plain` and `one_copy`; the plain arm
+    /// itself varies by up to ~10% run to run, which is why the assertion is a ratio.
+    ///
+    /// Half a copy sits an order of magnitude above today's cost and half an order below
+    /// the cheapest regression, so it discriminates without pinning the exact number.
+    /// A recorded measurement is a claim with an expiry date: any later change that
+    /// *reduces* what a regression here costs has to re-derive this bound, not just the
+    /// baseline row.
+    ///
+    /// Expressing it in measured copies rather than as a byte constant keeps its margins if
+    /// unrelated encoding work moves the absolute totals. The subtraction of `plain` is
+    /// what makes this a covering measurement rather than a query-cost measurement: it
+    /// removes the vectors, PQ codes and metadata that both indexes read identically.
+    #[tokio::test]
+    async fn test_covered_unprojected_query_pays_for_no_covering_copy() {
+        let plain = covered_scan_fixture("memory://cov_io_one_copy_plain", false).await;
+        let covered = covered_scan_fixture("memory://cov_io_one_copy_covered", true).await;
+
+        // Guard the fixture itself. An `covering_columns` that silently did nothing would
+        // make `covered` cost the same as `plain`, and an upper bound on their difference
+        // would then pass for the wrong reason.
+        let payload_id = covered.schema().field("payload").unwrap().id;
+        assert_eq!(
+            declared_covering_field_ids(&covered).await,
+            vec![payload_id],
+            "the covered fixture's index must actually declare `payload` as covering"
+        );
+        assert!(
+            declared_covering_field_ids(&plain).await.is_empty(),
+            "the plain fixture's index must declare no covering column"
+        );
+
+        let plain_bytes = unprojected_ann_query_bytes(&plain).await;
+        let covered_bytes = unprojected_ann_query_bytes(&covered).await;
+        let one_copy = unindexed_payload_bytes(&covered).await;
+
+        let covering_overhead = covered_bytes.saturating_sub(plain_bytes);
+        let bound = one_copy / 2;
+        assert!(
+            covering_overhead < bound,
+            "a query projecting no covering column must not pay for `payload` at all: \
+             covered read {covered_bytes} bytes vs plain {plain_bytes}, an overhead of \
+             {covering_overhead} against a bound of {bound} (half the {one_copy}-byte \
+             covering copy). Half a copy or more means the scanner stopped narrowing what \
+             the covered index materializes."
+        );
+
+        // The same two measurements as a plain ratio. Redundant with the bound above
+        // against today's code -- both fail on a lost narrowing -- but it is the one that
+        // stays meaningful if `unindexed_payload_bytes` ever stops being a faithful unit
+        // for the indexed half, and it costs no extra fixture.
+        assert!(
+            covered_bytes < plain_bytes * 2,
+            "a covered index must not materially inflate a query that projects no covering \
+             column: covered read {covered_bytes} bytes vs plain {plain_bytes}"
+        );
+    }
+
+    /// The same fixture with every row indexed, so a covering column has exactly one
+    /// source -- the index -- and a measurement over it is the index's own read rather
+    /// than a mix of index and base table.
+    async fn covered_index_only_fixture(
+        uri: &str,
+        mut params: VectorIndexParams,
+        cover_payload: bool,
+    ) -> Dataset {
+        let mut dataset = Dataset::write(covered_fixture_rows(), uri, None)
+            .await
+            .unwrap();
+        if cover_payload {
+            params.covering_columns(vec!["payload".to_string()]);
+        }
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        dataset
+    }
+
+    /// Bytes read while running an ANN query that projects the covering column, with the
+    /// rows it returned.
+    ///
+    /// All four partitions are probed, so the covering read spans several partitions
+    /// rather than the single one the default `nprobes` would reach. `nprobes` and
+    /// `query_parallelism` are set after `nearest` because they apply to the query that
+    /// call installs.
+    ///
+    /// `query_parallelism(1)` routes the search through
+    /// [`VectorIndex::search_partitions`], whose branch is then chosen by the sub-index:
+    /// the flat sub-index (IVF_PQ) takes the global top-k heap, HNSW has no such heap and
+    /// takes the streaming send loop. That is how one query shape measures both covering
+    /// emit paths.
+    async fn projected_ann_query(dataset: &Dataset) -> (u64, RecordBatch) {
+        let query = Float32Array::from(vec![0.3f32; 32]);
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &query, 10).unwrap();
+        scan.nprobes(4);
+        scan.query_parallelism(1);
+        scan.project(&["payload"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let bytes = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes;
+        (bytes, batch)
+    }
+
+    /// The plan for the query [`projected_ann_query`] runs, so the two arms' plans are
+    /// derived the same way as their byte counts.
+    async fn projected_ann_plan(dataset: &Dataset) -> String {
+        let query = Float32Array::from(vec![0.3f32; 32]);
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &query, 10).unwrap();
+        scan.nprobes(4);
+        scan.query_parallelism(1);
+        scan.project(&["payload"]).unwrap();
+        scan.explain_plan(true).await.unwrap()
+    }
+
+    /// The query a covered index exists for: it projects the covering column, and the
+    /// index serves it without touching the base table.
+    ///
+    /// A plain index answers this with a base-table take of the `k` winners, which renders
+    /// as `LanceRead`; a covered index answers it out of index storage and takes nothing.
+    /// Both plans are asserted, because a covered plan that quietly fell back to the take
+    /// would return byte-identical rows -- the covering column is semantically transparent,
+    /// so results alone cannot tell the two apart.
+    ///
+    /// # The two emit paths get different bounds, because they bound the read differently
+    ///
+    /// The global top-k heap reads once per partition that owns a *survivor* (at most
+    /// `min(nprobe, k)` reads); the streaming loop every `IVF_HNSW_*` index takes reads once
+    /// per *probed* partition, so its covering cost grows with `nprobe` and, at a fixture
+    /// this size, with the data page a partition's covering lands in. One shared bound would
+    /// have to be the looser of the two, which would stop discriminating for the heap. Each
+    /// case therefore carries its own multiple of its own plain arm, each measured against
+    /// the gather forced onto its whole-range fallback -- the regression the survivors-only
+    /// gather replaced, and what a pending fragment-reuse remap still falls back to:
+    ///
+    /// | branch | plain | covered | ratio | bound | gather disabled |
+    /// |---|---|---|---|---|---|
+    /// | global heap (`pq`) | 64,197 | 67,725 | 1.06x | 1.5x | 4.74x |
+    /// | streaming (`hnsw_pq`) | 95,512 | 147,009 | 1.54x | 3x | 6.42x |
+    ///
+    /// Both bounds are order-of-magnitude claims, set so unrelated encoding work moving the
+    /// absolute totals cannot make them flaky. Neither is a floor on the fixture: shrinking
+    /// it further collapses the streaming row's ratio into its own regression -- see
+    /// [`COVERED_FIXTURE_ROWS`].
+    ///
+    /// Higher up the sweep the two separate sharply -- on a 32-partition, 32,768-row index
+    /// with the same ~1 KB payload, warm, `nprobes = 32`: global heap 15,202 B / 5 requests
+    /// (flat in `nprobe`), streaming 454,558 B / 106 requests, 2,069 vs 737 us against its
+    /// own plain arm. That is recorded, not pinned here: this test is the shape check that
+    /// each branch serves covering from the index at all, on a fixture small enough to
+    /// stay a unit test.
+    ///
+    /// HNSW is built with a small graph for the same reason the PQ codebook trains for two
+    /// iterations: nothing here measures recall, and both arms use identical parameters.
+    #[rstest]
+    #[case::global_heap_branch(
+        "pq",
+        VectorIndexParams::ivf_pq(4, 8, 4, MetricType::L2, COVERED_PQ_ITERS),
+        3
+    )]
+    #[case::streaming_branch(
+        "hnsw_pq",
+        VectorIndexParams::with_ivf_hnsw_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams {
+                max_level: 3,
+                m: 8,
+                ef_construction: 30,
+                ..HnswBuildParams::default()
+            },
+            PQBuildParams::new(4, 8),
+        ),
+        6
+    )]
+    #[tokio::test]
+    async fn test_covered_projected_query_serves_covering_from_the_index(
+        #[case] family: &str,
+        #[case] params: VectorIndexParams,
+        // Halves: the global heap's bound is 1.5x, the streaming loop's 3x. An integer
+        // multiple cannot express the former, and 2x would not discriminate for the latter.
+        #[case] bound_halves: u64,
+    ) {
+        let plain = covered_index_only_fixture(
+            &format!("memory://cov_projected_plain_{family}"),
+            params.clone(),
+            false,
+        )
+        .await;
+        let covered = covered_index_only_fixture(
+            &format!("memory://cov_projected_covered_{family}"),
+            params,
+            true,
+        )
+        .await;
+
+        // The two cases are the two covering emit paths, not two spellings of one:
+        // `search_partitions` takes the global top-k heap only when the sub-index has
+        // one, and only IVF_PQ's flat sub-index does.
+        use lance_index::vector::{flat::index::FlatIndex, hnsw::HNSW, v3::subindex::IvfSubIndex};
+        assert!(
+            FlatIndex::supports_global_topk_heap(),
+            "the `pq` case must exercise the global-heap branch"
+        );
+        assert!(
+            !HNSW::supports_global_topk_heap(),
+            "the `hnsw_pq` case must exercise the streaming branch"
+        );
+
+        // Guard the fixture itself: an `covering_columns` that silently did nothing would
+        // make the covered arm cost what the plain one costs, and the bound below would
+        // then pass for the wrong reason.
+        let payload_id = covered.schema().field("payload").unwrap().id;
+        assert_eq!(
+            declared_covering_field_ids(&covered).await,
+            vec![payload_id],
+            "the covered fixture's index must actually declare `payload` as covering"
+        );
+
+        // Each dataset serves exactly one measured query, so both are measured against a
+        // cold partition cache. A second query on the same dataset would find the
+        // partitions already resident and read far less.
+        let (plain_bytes, plain_batch) = projected_ann_query(&plain).await;
+        let (covered_bytes, covered_batch) = projected_ann_query(&covered).await;
+        assert_eq!(plain_batch.num_rows(), 10);
+        assert_eq!(covered_batch.num_rows(), 10);
+        assert_eq!(
+            covered_batch
+                .column_by_name("payload")
+                .expect("the covered result must carry the projected covering column")
+                .null_count(),
+            0,
+            "the covering values must come back from the index, not as a null fill"
+        );
+        let bound = plain_bytes * bound_halves / 2;
+        assert!(
+            covered_bytes < bound,
+            "a covered index must serve the column it covers for about what a plain index \
+             pays to take it: the {family} branch read {covered_bytes} bytes covered vs \
+             {plain_bytes} plain, against a bound of {bound} \
+             ({bound_halves} halves of plain). A covering read proportional to the \
+             partition's size rather than to its survivors overshoots this by several times."
+        );
+
+        let plain_plan = projected_ann_plan(&plain).await;
+        assert!(
+            plain_plan.contains("LanceRead"),
+            "the plain arm must take `payload` from the base table, which is the work the \
+             covered arm is expected to avoid; without it the assertion below is vacuous. \
+             Plan:\n{plain_plan}"
+        );
+        let covered_plan = projected_ann_plan(&covered).await;
+        assert!(
+            !covered_plan.contains("LanceRead"),
+            "a covered index must serve `payload` from the index, with no base-table take. \
+             Plan:\n{covered_plan}"
+        );
     }
 }

@@ -92,6 +92,8 @@ class IndexDescription:
     num_rows_indexed: int
     fields: list[int]
     field_names: list[str]
+    covering_fields: list[int]
+    covering_field_names: list[str]
     segments: list[IndexSegmentDescription]
     details: dict
     total_size_bytes: Optional[int]

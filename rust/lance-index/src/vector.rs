@@ -166,6 +166,52 @@ pub struct Query {
     /// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
     /// Other index types ignore this setting.
     pub approx_mode: ApproxMode,
+
+    /// The covering ("included") columns this query needs the index to materialize,
+    /// by name.
+    ///
+    /// Unlike the other fields here this is not a user-facing search parameter. It is
+    /// derived per plan from what the query actually reads, so that an index covering a
+    /// wide payload does not pay to materialize that payload on searches which never
+    /// look at it.
+    ///
+    /// # The three states are distinct, and must stay distinct
+    ///
+    /// * `None` — no query-level narrowing or physical-capability resolution was computed.
+    ///   A raw index search may consider every physical covering column, but an execution
+    ///   planner must not treat this state as proof that declared values are servable. It
+    ///   resolves storage first and converts the query to an explicit `Some` projection.
+    /// * `Some(&[])` — the index *does* declare covering columns, but this query needs
+    ///   **none** of them. Consumers must do no covering work at all: not "project zero
+    ///   columns out of a batch that was loaded anyway", but skip the covering read
+    ///   entirely.
+    /// * `Some(cols)` — this query needs exactly `cols`, and the execution planner has
+    ///   verified that every selected segment can physically serve them.
+    ///
+    /// `Some(&[])` is the state this field exists for, and the one that silently
+    /// degrades if it is folded into `None`: a covering column is semantically
+    /// transparent, so conflating the two restores full materialization while every
+    /// result stays byte-identical (the values simply arrive from the base table
+    /// instead). No result-correctness test can catch that; only a cost or plan-shape
+    /// assertion can. Treat `Option::unwrap_or_default()` on this field, or any
+    /// `is_empty()` test that does not first distinguish `None`, as a bug.
+    ///
+    /// # Physical capability is a ceiling
+    ///
+    /// A declared column left out of `cols` is simply fetched from the base table —
+    /// correct, just slower. A column listed here that any selected segment cannot emit
+    /// leaves the covered projection short a column. Planners may therefore remove an
+    /// unproven field, but must never add one based on the manifest declaration alone.
+    ///
+    /// # Notes
+    ///
+    /// Names rather than field ids, because consumers match against a storage batch whose
+    /// columns carry names. The planner separately verifies source field ids, Arrow shape,
+    /// and compatible physical order before producing this name projection.
+    ///
+    /// `Arc` rather than `Vec` because [`Query`] is cloned once per probed partition on
+    /// the search hot path.
+    pub covering_projection: Option<Arc<[String]>>,
 }
 
 impl From<pb::VectorMetricType> for DistanceType {
@@ -235,6 +281,17 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// Get the total number of partitions in the index.
     fn total_partitions(&self) -> usize;
+
+    /// Covering columns physically present and safe to serve from this index, paired with
+    /// their source dataset field ids and returned in storage order.
+    ///
+    /// [`IndexMetadata::covering_fields`](lance_table::format::IndexMetadata::covering_fields)
+    /// is only the logical declaration. Query planners intersect that declaration with this
+    /// physical capability for every segment before omitting a base-table read. Formats that
+    /// do not expose a verifiable covering payload use the default empty capability.
+    fn physical_covering_fields(&self) -> Result<Vec<(i32, Field)>> {
+        Ok(Vec::new())
+    }
 
     /// Search a single partition for nearest neighbors.
     ///

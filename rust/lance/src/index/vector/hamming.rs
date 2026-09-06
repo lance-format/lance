@@ -26,7 +26,7 @@ use lance_index::vector::VectorIndex;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex};
 use lance_index::vector::flat::storage::FLAT_COLUMN;
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::storage::VectorStore;
+use lance_index::vector::storage::{PartitionColumns, VectorStore};
 use lance_linalg::distance::{
     BinaryHashValues, ClusteringResult, cluster_pairwise_result,
     extract_binary_hashes_from_fixed_list, pairwise_hamming_distance_binary_parallel,
@@ -242,9 +242,10 @@ async fn hamming_clustering_for_ivf_partition_impl(
     let mut hash_chunks = Vec::new();
     let mut num_hashes = 0;
     for segment in &segments {
+        // Only the row ids and the binary hashes are read below, both internal columns.
         let storage = segment
             .ivf_flat_bin()
-            .load_partition_storage(partition_id, None)
+            .load_partition_storage(partition_id, PartitionColumns::Internal, None)
             .await?;
         all_row_ids.extend(storage.row_ids().copied());
         for batch in storage.to_batches()? {

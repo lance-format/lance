@@ -793,37 +793,120 @@ pub(super) async fn alter_columns(
     new_schema.validate()?;
     new_schema.verify_primary_key()?;
 
-    // If any column being cast has an attached index, fail fast. Cast operations
-    // rewrite the underlying column data and silently invalidate any index on the
-    // affected column(s). The current behavior is to drop such indices without
-    // warning, which has caused production incidents where vector search silently
-    // regressed to brute-force scan. We require users to explicitly drop the
-    // index before altering the column type, so the action is never silent. That
-    // includes an index this build has no reader for: the cast reassigns the
-    // field id, so carrying it forward is impossible and staying quiet about it
-    // is the silent drop this guard exists to abolish.
-    if !cast_fields.is_empty() {
+    // Fail fast on alterations that would invalidate an index or desync its
+    // covering data:
+    //   * CAST of an indexed *key* column -- cast rewrites the column data and
+    //     silently invalidates the index. This has caused production incidents
+    //     where vector search regressed to a brute-force scan. (Indices are
+    //     keyed by field id, so a plain rename or nullability change of a key
+    //     column is safe and stays allowed.)
+    //   * ANY alter (rename, cast, or nullability) of a covering ("included")
+    //     column, including one the index is also keyed on. `fields` lists the
+    //     covering suffix right alongside the key (see
+    //     `IndexMetadata::covering_fields`), so the auto-prune
+    //     (`retain_relevant_indices`) DOES see a covering column's id.
+    //
+    //     For a CAST this guard is load-bearing: a cast reassigns the column a
+    //     fresh field id, so the old covering id disappears from the schema and
+    //     auto-prune -- which requires every id in `fields` to survive -- would
+    //     delete the WHOLE index, not just leave its covering stale.
+    //
+    //     For a plain rename or nullability flip the id survives, so auto-prune
+    //     never fires and the index is left declaring covering that its storage
+    //     no longer matches. That is NOT silent corruption: the read path
+    //     intersects the declaration with each segment's proven physical
+    //     capability (`common_physical_covering`, which compares name, type,
+    //     nullability and metadata), so a mismatch withdraws covering and the
+    //     query falls back to a base-table take -- correct results, minus the
+    //     elision. The guard is conservative here rather than load-bearing, and
+    //     is kept so a lost elision surfaces as an explicit error instead of a
+    //     silent slowdown. Relaxing it to degrade instead of reject is a tracked
+    //     follow-up.
+    //
+    // Both cases include an index this build has no reader for -- hence
+    // `load_all_indices`. A cast reassigns the field id, so carrying such an index
+    // forward is impossible, and staying quiet about it is the silent drop these
+    // guards exist to abolish.
+    // Reject rather than let the index quietly change behaviour; the cast case
+    // above is the one that would otherwise destroy the index outright.
+    let cast_ids: Vec<i32> = alterations
+        .iter()
+        .filter(|a| a.data_type.is_some())
+        .filter_map(|a| dataset.schema().field(&a.path).map(|f| f.id))
+        .collect();
+    let altered: Vec<(&str, i32)> = alterations
+        .iter()
+        .filter(|a| a.rename.is_some() || a.data_type.is_some() || a.nullable.is_some())
+        .filter_map(|a| {
+            dataset
+                .schema()
+                .field(&a.path)
+                .map(|f| (a.path.as_str(), f.id))
+        })
+        .collect();
+    if !altered.is_empty() {
         let indices = load_all_indices(dataset).await?;
-        let affected: Vec<&lance_table::format::IndexMetadata> = indices
-            .iter()
-            .filter(|idx| {
-                cast_fields
-                    .iter()
-                    .any(|(old, _)| idx.fields.contains(&old.id))
+        // A covered column is stored as a whole subtree, so altering a *descendant* of a
+        // covered field (e.g. a subfield of a covered struct) invalidates the covering
+        // too; expand each altered field to its ancestors so the covered ancestor's id is
+        // caught. The expansion depends only on the schema, so do it once per altered
+        // field here rather than per (index x altered field) below.
+        let altered: Vec<(&str, i32, Vec<i32>)> = altered
+            .into_iter()
+            .map(|(name, id)| {
+                let ancestors =
+                    field_ids_with_ancestors(dataset.schema(), std::slice::from_ref(&id));
+                (name, id, ancestors)
             })
             .collect();
-        if !affected.is_empty() {
-            let affected_cols: Vec<String> = cast_fields
+        // An index is broken if a covering column of it is altered in any way, or if one
+        // of its indexed key columns is being cast. The cast check stays on the field's
+        // own id (only a cast of the indexed key column rewrites index data).
+        //
+        // A column the index is also KEYED on gets NO exemption here, even though a rename
+        // or nullability flip preserves its field id. Carried refine vectors
+        // (`store_vectors_for_refine`) declare the indexed column in `covering_fields`, and
+        // index storage holds that carried copy under the column's name *as it was at build
+        // time* -- nothing renames it. Letting the rename through leaves an index that still
+        // answers queries while both maintenance paths are permanently broken:
+        // `optimize_indices` fails with "field <new name> does not exist in the RecordBatch"
+        // and `compact_files` with "cannot remap index: its storage carries covering column
+        // '<old name>'". Recovering needs a drop and rebuild, so refuse up front and say so.
+        //
+        // Dropping the column is a different case and stays allowed -- see the `drop_columns`
+        // guard below: a drop removes the whole index via `retain_relevant_indices`, so no
+        // storage is stranded. `prune_stale_segment_coverage` (`index.rs`) refuses this the
+        // same way for uncommitted distributed segments; all three sites must agree.
+        let breaks_covering = |idx: &lance_table::format::IndexMetadata, ancestors: &[i32]| {
+            ancestors
                 .iter()
-                .filter(|(old, _)| affected.iter().any(|i| i.fields.contains(&old.id)))
-                .map(|(old, _)| old.name.clone())
+                .any(|ancestor| idx.covering_fields.contains(ancestor))
+        };
+        let is_broken = |idx: &lance_table::format::IndexMetadata| {
+            altered
+                .iter()
+                .any(|(_, _, ancestors)| breaks_covering(idx, ancestors))
+                || cast_ids.iter().any(|id| idx.fields.contains(id))
+        };
+        let affected: Vec<&lance_table::format::IndexMetadata> =
+            indices.iter().filter(|idx| is_broken(idx)).collect();
+        if !affected.is_empty() {
+            let affected_cols: Vec<String> = altered
+                .iter()
+                .filter(|(_, id, ancestors)| {
+                    affected.iter().any(|i| {
+                        breaks_covering(i, ancestors)
+                            || (cast_ids.contains(id) && i.fields.contains(id))
+                    })
+                })
+                .map(|(name, _, _)| name.to_string())
                 .collect();
             let affected_idx_names: Vec<String> = affected.iter().map(|i| i.name.clone()).collect();
             return Err(Error::invalid_input(format!(
-                "Cannot cast column(s) [{}] to a new type: they have {} index(es) \
-                 attached: [{}]. Cast rewrites column data and invalidates any index \
-                 on the affected column(s). Drop the index(es) with drop_index() \
-                 before altering, then recreate them after the cast completes.",
+                "Cannot alter column(s) [{}]: they are used by {} index(es) [{}] -- as a \
+                 covering (included) column (any change), or as an indexed key column being \
+                 cast (which rewrites the data and invalidates the index). Drop the index(es) \
+                 with drop_index() before altering, then recreate them.",
                 affected_cols.join(", "),
                 affected.len(),
                 affected_idx_names.join(", "),
@@ -1017,6 +1100,23 @@ pub(super) async fn alter_columns(
     Ok(())
 }
 
+/// Expand `field_ids` to also include every ancestor field id (root -> field).
+/// A covering column is stored as a whole subtree, so touching a *descendant* of a
+/// covered field (e.g. a subfield of a covered struct) still invalidates the covering
+/// even though `covering_fields` records only the ancestor's id. Adding each targeted
+/// field's ancestors makes the ancestor's id appear in the set so the exact-membership
+/// checks catch it.
+fn field_ids_with_ancestors(schema: &Schema, field_ids: &[i32]) -> Vec<i32> {
+    let mut expanded = Vec::with_capacity(field_ids.len());
+    for &id in field_ids {
+        match schema.field_ancestry_by_id(id) {
+            Some(ancestry) => expanded.extend(ancestry.iter().map(|field| field.id)),
+            None => expanded.push(id),
+        }
+    }
+    expanded
+}
+
 /// Remove columns from the dataset.
 ///
 /// This is a metadata-only operation and does not remove the data from the
@@ -1043,6 +1143,63 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         return Err(Error::invalid_input(
             "Cannot drop all columns from a dataset",
         ));
+    }
+
+    // Fail fast if any column being dropped is a covering ("included") column of
+    // an index, while the index's key survives. Dropping the key too is fine --
+    // `retain_relevant_indices` auto-prunes the whole index once any id in `fields`
+    // leaves the schema, and `fields` lists the covering suffix right alongside the
+    // key (see `IndexMetadata::covering_fields`), so a key+covering drop cleanly
+    // removes the whole thing. But that is exactly why dropping *only* the covering
+    // column, without this guard, would not merely leave the index's storage
+    // referencing a missing column -- the same auto-prune check would see the
+    // covering id vanish from `fields` and silently delete the ENTIRE index (the key,
+    // its ANN structure, everything), not just desync its covering. Require the user
+    // to drop the index first so the action is never silent.
+    let drop_field_ids: Vec<i32> = columns
+        .iter()
+        .filter_map(|c| dataset.schema().field(c).map(|f| f.id))
+        .collect();
+    let indices = load_all_indices(dataset).await?;
+    // Treat a descendant of a covered (e.g. struct) column as covered too: the covering
+    // declaration names the struct while the drop names a leaf inside it.
+    let drop_field_ids = field_ids_with_ancestors(dataset.schema(), &drop_field_ids);
+    // An index whose *key* is also being dropped is auto-pruned by
+    // `retain_relevant_indices`, so its covering metadata cannot dangle -- the whole index
+    // goes away. Rejecting here would block the perfectly safe "drop the vector column and
+    // its covered payload together" case. The commit-boundary guard
+    // (`reject_covered_field_subtree_change`) skips these indices for the same reason, and
+    // this preflight must agree with it or it forbids what the commit would accept.
+    //
+    // Agreement requires testing what that guard tests: whether a KEYED field survives the
+    // post-drop schema. Neither half of that can be read off `drop_field_ids`. It is
+    // expanded *upwards* to ancestors, so dropping `s.a` lists the struct `s` that in fact
+    // survives; and the keyed prefix is not all of `fields`, which also carries the
+    // covering suffix. Testing `fields` against the expanded set got both wrong in
+    // opposite directions -- it rejected dropping a key alongside a strict subset of its
+    // covering columns (the commit accepts that: the key is gone, the index goes with it),
+    // and it skipped an index keyed on a struct when a leaf under that struct was dropped,
+    // deferring a case this preflight is meant to catch to a far less legible error.
+    let surviving: HashSet<i32> = new_schema.fields_pre_order().map(|f| f.id).collect();
+    let affected: Vec<&lance_table::format::IndexMetadata> = indices
+        .iter()
+        .filter(|idx| idx.keyed_fields().iter().all(|id| surviving.contains(id)))
+        .filter(|idx| {
+            drop_field_ids
+                .iter()
+                .any(|id| idx.covering_fields.contains(id))
+        })
+        .collect();
+    if !affected.is_empty() {
+        let affected_idx_names: Vec<String> = affected.iter().map(|i| i.name.clone()).collect();
+        return Err(Error::invalid_input(format!(
+            "Cannot drop column(s) [{}]: they are a covering (included) column of {} \
+             index(es) [{}]. Drop the index(es) with drop_index() before dropping the \
+             column(s), then recreate them.",
+            columns.join(", "),
+            affected.len(),
+            affected_idx_names.join(", "),
+        )));
     }
 
     let transaction = Transaction::new(
@@ -3584,6 +3741,485 @@ mod test {
                 Arc::new(ArrowField::new("item", DataType::Float16, true)),
                 64,
             ),
+        );
+
+        Ok(())
+    }
+
+    /// The covered-column schema guards must treat a *descendant* of a covered field as
+    /// covered too: a covered column is stored as a whole subtree, so `covering_fields`
+    /// records only the ancestor's id. `field_ids_with_ancestors` expands a targeted
+    /// subfield to include that ancestor so the exact-membership guard catches it.
+    #[test]
+    fn test_field_ids_with_ancestors_expands_struct_subtree() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "s",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("a", DataType::Int32, true),
+                    ArrowField::new("b", DataType::Int32, true),
+                ])),
+                true,
+            ),
+            ArrowField::new("x", DataType::Int32, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let s_id = schema.field("s").unwrap().id;
+        let a_id = schema.field("s.a").unwrap().id;
+
+        let expanded = field_ids_with_ancestors(&schema, &[a_id]);
+        assert!(
+            expanded.contains(&s_id),
+            "expanding a subfield must include its covered struct ancestor's id"
+        );
+        assert!(
+            expanded.contains(&a_id),
+            "the field's own id must be included"
+        );
+    }
+
+    /// Dropping a covered column TOGETHER WITH its index's key column is safe and must be
+    /// allowed: `retain_relevant_indices` drops the whole index once its key leaves the
+    /// schema, so no covering metadata can dangle. The commit-boundary guard
+    /// (`reject_covered_field_subtree_change`) already skips such indices; this preflight
+    /// must agree with it, or it forbids an operation the commit would accept.
+    ///
+    /// The `key_and_covering_subset` case is what makes the two agree in general. The
+    /// preflight used to skip an index only when *every* id in `fields` was being dropped,
+    /// while the commit guard skips as soon as a *keyed* id is. With two covering columns
+    /// and only one of them dropped alongside the key, those disagree: the commit accepts
+    /// (the key is gone, so the whole index goes) and the preflight rejected.
+    #[rstest]
+    #[case::key_and_all_covering(&["vec", "id", "extra"], vec!["keep"])]
+    #[case::key_and_covering_subset(&["vec", "id"], vec!["extra", "keep"])]
+    #[tokio::test]
+    async fn test_drop_covered_column_with_its_index_key_is_allowed(
+        #[case] to_drop: &[&str],
+        #[case] expected_remaining: Vec<&str>,
+    ) -> Result<()> {
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_index::IndexType;
+        use lance_linalg::distance::MetricType;
+        use lance_testing::datagen::generate_random_array;
+
+        use crate::index::vector::VectorIndexParams;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    64,
+                ),
+                false,
+            ),
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("extra", DataType::Int32, false),
+            ArrowField::new("keep", DataType::Int32, false),
+        ]));
+        let nrows: i32 = 256;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(
+                    <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                        generate_random_array(64 * nrows as usize),
+                        64,
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(Int32Array::from_iter_values(0..nrows)),
+                Arc::new(Int32Array::from_iter_values(0..nrows)),
+                Arc::new(Int32Array::from_iter_values(0..nrows)),
+            ],
+        )?;
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &test_dir,
+            None,
+        )
+        .await?;
+
+        let mut params = VectorIndexParams::ivf_pq(4, 8, 8, MetricType::L2, 50);
+        params.covering_columns(vec!["id".to_string(), "extra".to_string()]);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await?;
+
+        // Drop the index key together with its covering column(s) in one call.
+        dataset.drop_columns(to_drop).await?;
+
+        assert!(
+            dataset.load_indices().await?.is_empty(),
+            "the index must be pruned once its key column is gone"
+        );
+        let remaining: Vec<&str> = dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(remaining, expected_remaining);
+        Ok(())
+    }
+
+    /// Dropping a column that an index *covers* (an "included"/covering column,
+    /// not the key column) must fail fast. The covering id lives in `fields`, so
+    /// letting the drop through would make `retain_relevant_indices` delete the
+    /// ENTIRE index -- key, ANN structure and all -- not merely desync its
+    /// covering. The user must drop the index first.
+    #[tokio::test]
+    async fn test_drop_columns_fails_on_covered_column() -> Result<()> {
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_index::IndexType;
+        use lance_linalg::distance::MetricType;
+        use lance_testing::datagen::generate_random_array;
+
+        use crate::index::vector::VectorIndexParams;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    64,
+                ),
+                false,
+            ),
+            ArrowField::new("id", DataType::Int32, false),
+        ]));
+        let nrows: i32 = 256;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(
+                    <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                        generate_random_array(64 * nrows as usize),
+                        64,
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(Int32Array::from_iter_values(0..nrows)),
+            ],
+        )?;
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &test_dir,
+            None,
+        )
+        .await?;
+
+        // IVF_PQ index on `vec` that COVERS `id`.
+        let mut params = VectorIndexParams::ivf_pq(4, 8, 8, MetricType::L2, 50);
+        params.covering_columns(vec!["id".to_string()]);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await?;
+        let index_name = dataset.load_indices().await?[0].name.clone();
+
+        // Dropping the covered column must fail, naming the column, the index,
+        // and the remediation.
+        let err = dataset
+            .drop_columns(&["id"])
+            .await
+            .expect_err("dropping a covered column should fail");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected Error::InvalidInput, got: {err:?}"
+        );
+        let msg = err.to_string();
+        // `[id]` (the rendered column list), not a bare `id`: the auto-generated index name
+        // is `vec_idx`, which contains `id` as a substring, so a bare `contains("id")` would
+        // pass even if the message never named the column.
+        assert!(
+            msg.contains("[id]") && msg.contains(&index_name) && msg.contains("drop_index"),
+            "error should mention the column, index, and remediation, got: {msg}"
+        );
+
+        // Unchanged: column still present, index still there.
+        assert!(dataset.schema().field("id").is_some());
+        assert_eq!(dataset.load_indices().await?.len(), 1);
+
+        // After dropping the index, the same drop succeeds.
+        dataset.drop_index(&index_name).await?;
+        dataset.drop_columns(&["id"]).await?;
+        assert!(dataset.schema().field("id").is_none());
+
+        Ok(())
+    }
+
+    /// Dropping a column that is only an INDEXED key column (not a covering
+    /// column) must remain allowed: lance auto-drops the dependent index. Only
+    /// a covering ("included") column dropped *while its index's key survives*
+    /// is protected by the drop guard: dropping the key removes the whole
+    /// index either way (via `retain_relevant_indices`), so there is nothing to
+    /// protect, whereas dropping just the covering column would otherwise
+    /// silently take the whole index down with it (see `drop_columns`).
+    /// Regression guard for the Python `test_drop_columns` behavior.
+    #[tokio::test]
+    async fn test_drop_indexed_noncovered_column_drops_index() -> Result<()> {
+        use crate::index::vector::VectorIndexParams;
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_index::IndexType;
+        use lance_linalg::distance::MetricType;
+        use lance_testing::datagen::generate_random_array;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    64,
+                ),
+                false,
+            ),
+            ArrowField::new("id", DataType::Int32, false),
+        ]));
+        let nrows: i32 = 256;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(
+                    <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                        generate_random_array(64 * nrows as usize),
+                        64,
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(Int32Array::from_iter_values(0..nrows)),
+            ],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &test_dir,
+            None,
+        )
+        .await?;
+
+        // Plain IVF_PQ index on `vec` -- NO covering columns.
+        let params = VectorIndexParams::ivf_pq(4, 8, 8, MetricType::L2, 50);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await?;
+        assert_eq!(dataset.load_indices().await?.len(), 1);
+
+        // Dropping the indexed key column is allowed and auto-drops the index.
+        dataset.drop_columns(&["vec"]).await?;
+        assert!(dataset.schema().field("vec").is_none());
+        assert_eq!(
+            dataset.load_indices().await?.len(),
+            0,
+            "dropping the indexed column should have dropped its index"
+        );
+
+        Ok(())
+    }
+
+    /// Fix 1: renaming or changing the nullability of a covered ("included")
+    /// column must fail fast (alongside cast) -- it would leave the index storage
+    /// referencing a stale name/schema and break covered queries.
+    #[tokio::test]
+    async fn test_alter_columns_rename_nullable_fail_on_covered_column() -> Result<()> {
+        use crate::index::vector::VectorIndexParams;
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_index::IndexType;
+        use lance_linalg::distance::MetricType;
+        use lance_testing::datagen::generate_random_array;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    64,
+                ),
+                false,
+            ),
+            ArrowField::new("id", DataType::Int32, false),
+        ]));
+        let nrows: i32 = 256;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(
+                    <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                        generate_random_array(64 * nrows as usize),
+                        64,
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(Int32Array::from_iter_values(0..nrows)),
+            ],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &test_dir,
+            None,
+        )
+        .await?;
+
+        let mut params = VectorIndexParams::ivf_pq(4, 8, 8, MetricType::L2, 50);
+        params.covering_columns(vec!["id".to_string()]);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await?;
+
+        // Rename of the covered column must fail with the remediation hint.
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).rename("uid".into())])
+            .await
+            .expect_err("rename of covered column should fail");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected Error::InvalidInput, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("drop_index"),
+            "rename error should suggest drop_index, got: {err}"
+        );
+        assert!(
+            dataset.schema().field("id").is_some(),
+            "rename should not have applied"
+        );
+
+        // Nullability change of the covered column must also fail.
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(true)])
+            .await
+            .expect_err("nullability change of covered column should fail");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected Error::InvalidInput, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("drop_index"),
+            "nullable error should suggest drop_index, got: {err}"
+        );
+
+        Ok(())
+    }
+
+    /// Carried refine vectors put the *indexed* column's own id into `covering_fields`
+    /// (`CreateIndexBuilder` appends it), so an alter of that column is an alter of a
+    /// covering column and must be refused -- exactly like any other covering column.
+    ///
+    /// A rename looks harmless (the field id survives, so the declaration still resolves)
+    /// but is NOT: index storage holds the carried copy under the column's *old* name, and
+    /// nothing renames it. Allowing the rename leaves an index that answers queries while
+    /// both maintenance paths are permanently broken -- `optimize_indices` dies with
+    /// "field <new> does not exist in the RecordBatch" and `compact_files` with "cannot
+    /// remap index: its storage carries covering column '<old>'". Refusing up front costs
+    /// the user one `drop_index()`; allowing it costs them the index.
+    ///
+    /// Dropping the same column IS allowed, and the asymmetry is the point: a drop takes
+    /// the index with it (`retain_relevant_indices` prunes any index whose keyed field left
+    /// the schema), so no storage is stranded. A rename keeps the index alive.
+    #[tokio::test]
+    async fn test_alter_of_indexed_column_refused_with_carried_refine() -> Result<()> {
+        use crate::index::vector::VectorIndexParams;
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_index::IndexType;
+        use lance_linalg::distance::MetricType;
+        use lance_testing::datagen::generate_random_array;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    64,
+                ),
+                false,
+            ),
+            ArrowField::new("id", DataType::Int32, false),
+        ]));
+        let nrows: i32 = 256;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(
+                    <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                        generate_random_array(64 * nrows as usize),
+                        64,
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(Int32Array::from_iter_values(0..nrows)),
+            ],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &test_dir,
+            None,
+        )
+        .await?;
+
+        let mut params = VectorIndexParams::ivf_pq(4, 8, 8, MetricType::L2, 50);
+        params.store_vectors_for_refine(true);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await?;
+        let indexed_field_id = dataset.schema().field("vec").unwrap().id;
+        assert!(
+            dataset.load_indices().await?[0]
+                .covering_fields
+                .contains(&indexed_field_id),
+            "precondition: carried refine vectors must declare the indexed column"
+        );
+
+        // Rename: refused, with the remedy named.
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("vec".into()).rename("embedding".into())])
+            .await
+            .expect_err("rename of a refine-carrying indexed column must be refused");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected Error::InvalidInput, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("drop_index"),
+            "the refusal must name the remedy, got: {err}"
+        );
+        assert!(
+            dataset.schema().field("vec").is_some(),
+            "the rename must not have applied"
+        );
+
+        // Nullability flip: refused for the same reason.
+        assert!(
+            dataset
+                .alter_columns(&[ColumnAlteration::new("vec".into()).set_nullable(true)])
+                .await
+                .is_err(),
+            "nullability change of a refine-carrying indexed column must be refused"
+        );
+
+        // Cast: refused, as it always was.
+        assert!(
+            dataset
+                .alter_columns(&[ColumnAlteration::new("vec".into()).cast_to(
+                    DataType::FixedSizeList(
+                        Arc::new(ArrowField::new("item", DataType::Float16, true)),
+                        64,
+                    ),
+                )])
+                .await
+                .is_err(),
+            "cast of the indexed column must be refused"
+        );
+
+        // Dropping it is allowed: the index goes with the column, so nothing is stranded.
+        dataset.drop_columns(&["vec"]).await?;
+        assert!(
+            dataset.load_indices().await?.is_empty(),
+            "dropping the indexed column must prune the index rather than strand it"
         );
 
         Ok(())

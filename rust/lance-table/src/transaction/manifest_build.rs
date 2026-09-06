@@ -697,6 +697,7 @@ impl Transaction {
                     &mut final_indices,
                     updated_fragments,
                     fields_modified,
+                    &schema,
                 );
 
                 let mut new_fragments =
@@ -841,7 +842,7 @@ impl Transaction {
                 // base data. Any index older than one of those overlays was built on
                 // the pre-overlay values, so drop the rewritten fragment from its
                 // coverage to keep it from serving stale values.
-                Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups);
+                Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups, &schema);
 
                 if let Some(frag_reuse_index) = frag_reuse_index {
                     final_indices.retain(|idx| idx.name != frag_reuse_index.name);
@@ -870,6 +871,45 @@ impl Transaction {
                     new_index.validate_covering_fields()?;
                 }
                 final_indices.extend(new_indices.clone());
+                // All delta segments of one logical index (same name) must declare
+                // the same covering columns: the covered read path derives its
+                // output schema from one delta but executes all of them, so
+                // committing a mixed set would fail every query on the index.
+                // Scoped to names this operation adds, so a commit untouched by
+                // covering cannot be blocked by pre-existing state.
+                for new_index in new_indices {
+                    // A declared covering field must resolve to a TOP-LEVEL field of
+                    // the schema being committed: the read path resolves the id to its
+                    // bare name, so a nested id (e.g. a struct child) would silently
+                    // bind to a same-named top-level column, and a nonexistent id
+                    // fails every later query at planning time ("index metadata and
+                    // schema are inconsistent"). Reject at the commit boundary.
+                    for id in &new_index.covering_fields {
+                        if !schema.fields.iter().any(|field| field.id == *id) {
+                            return Err(Error::invalid_input(format!(
+                                "CreateIndex: index '{}' (segment {}) declares covering \
+                                 field id {}, which is not a top-level field of the \
+                                 schema (covering columns must be top-level)",
+                                new_index.name, new_index.uuid, id
+                            )));
+                        }
+                    }
+                    if let Some(conflict) = final_indices.iter().find(|idx| {
+                        idx.name == new_index.name
+                            && idx.covering_fields != new_index.covering_fields
+                    }) {
+                        return Err(Error::invalid_input(format!(
+                            "CreateIndex: delta segment {} of index '{}' declares covering \
+                             fields {:?}, but delta segment {} declares {:?}; all segments of \
+                             one index must declare the same covering columns",
+                            new_index.uuid,
+                            new_index.name,
+                            new_index.covering_fields,
+                            conflict.uuid,
+                            conflict.covering_fields
+                        )));
+                    }
+                }
             }
             Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -906,6 +946,18 @@ impl Transaction {
                 }
                 final_fragments.extend(merged_fragments);
 
+                // `add_columns` commits as a Merge; growing a *covered* field's subtree
+                // (e.g. an AllNulls child under a covered struct, which writes no data file
+                // and so is invisible to the file-path-keyed prune below) would leave the
+                // index emitting the old payload schema while covered queries declare the
+                // new one. Reject at the commit boundary, mirroring the Project guard.
+                Self::reject_covered_field_subtree_change(
+                    &final_indices,
+                    current_manifest.map(|m| &m.schema),
+                    &schema,
+                    "add_columns (Merge)",
+                )?;
+
                 // A Merge can rewrite a column's data file in place; the field stays
                 // in the schema, so the index is retained -- prune its now-stale
                 // entries for the rewritten fragments.
@@ -913,6 +965,7 @@ impl Transaction {
                     &mut final_indices,
                     existing_fragments,
                     fragments,
+                    &schema,
                 );
 
                 // Some fields that have indices may have been removed, so we should
@@ -935,6 +988,16 @@ impl Transaction {
                             .any(|field_id| remaining_field_ids.contains(field_id))
                     });
                 }
+
+                // A Project that drops or renames a *covered* field would leave dangling
+                // index metadata whose storage still emits the column -- reject it before
+                // dropping/retaining any indices.
+                Self::reject_covered_field_subtree_change(
+                    &final_indices,
+                    current_manifest.map(|m| &m.schema),
+                    &schema,
+                    "Project",
+                )?;
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
@@ -1162,6 +1225,7 @@ impl Transaction {
                     &mut final_indices,
                     &modified_fragments,
                     &replaced_fields,
+                    &schema,
                 );
             }
             Operation::DataOverlay { groups } => {
@@ -1573,6 +1637,95 @@ mod tests {
         )
     }
 
+    /// A stable-row-id `RewriteRows` update that modifies ONLY a covering
+    /// (included) column must not re-extend a covered index's fragment
+    /// coverage onto the moved fragment: the index still holds the pre-update
+    /// materialized value, so reusing it would serve a stale covered result.
+    /// The modified field is in `covering_fields`, not `fields`.
+    ///
+    /// Both spellings of "the covering column changed" must be caught. `covering_fields`
+    /// only ever holds TOP-LEVEL ids (index creation resolves whole columns and rejects
+    /// dotted names), but the caller may report either the covered struct's own id or the
+    /// leaf ids it actually rewrote -- `Operation::Update` is public, so
+    /// `fields_for_preserving_frag_bitmap` is caller-supplied and unvalidated. Comparing raw
+    /// ids catches only the first spelling and silently serves stale subfield values for the
+    /// second.
+    #[test]
+    fn test_pure_rewrite_preserves_covering_index_coverage() {
+        use arrow_schema::Fields as ArrowFields;
+
+        // meta{a} => ids 0 (struct) and 1 (leaf); vector => id 2.
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new(
+                "meta",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "a",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+            ArrowField::new("vector", DataType::Int32, true),
+        ]);
+        let schema = LanceSchema::try_from(&arrow).unwrap();
+        let meta_id = schema.field("meta").unwrap().id;
+        let leaf_id = schema.field("meta.a").unwrap().id;
+        let vector_id = schema.field("vector").unwrap().id;
+
+        // Returns (covered index re-extended?, plain index re-extended?).
+        let run = |modified: &[u32]| {
+            let mut covering = sample_index_metadata("covering");
+            // `covering_fields` is always the trailing entries of `fields`.
+            covering.fields = vec![vector_id, meta_id]; // top-level, as creation guarantees
+            covering.covering_fields = vec![meta_id];
+            covering.fragment_bitmap = Some([0].into_iter().collect());
+
+            let mut plain = sample_index_metadata("plain");
+            plain.fields = vec![vector_id];
+            plain.covering_fields = vec![];
+            plain.fragment_bitmap = Some([0].into_iter().collect());
+
+            let mut indices = vec![covering, plain];
+            let overlaid: HashMap<u32, &Fragment> = HashMap::new();
+            Transaction::register_pure_rewrite_rows_update_frags_in_indices(
+                &mut indices,
+                &[1], // new fragment holding the moved rows
+                &[0], // original fragment (covered by both indices)
+                modified,
+                &overlaid,
+                &schema,
+            )
+            .unwrap();
+            (
+                indices[0].fragment_bitmap.as_ref().unwrap().contains(1),
+                indices[1].fragment_bitmap.as_ref().unwrap().contains(1),
+            )
+        };
+
+        for (label, modified) in [
+            (
+                "covered struct reported by its own id",
+                vec![meta_id as u32],
+            ),
+            (
+                "covered struct reported by its leaf id",
+                vec![leaf_id as u32],
+            ),
+        ] {
+            let (covered_extended, plain_extended) = run(&modified);
+            assert!(
+                !covered_extended,
+                "covered index must not re-extend coverage onto a fragment whose covering \
+                 column was rewritten ({label})"
+            );
+            assert!(
+                plain_extended,
+                "index that neither indexes nor covers the modified field still reuses its \
+                 entries ({label})"
+            );
+        }
+    }
+
     #[test]
     fn test_create_index_build_manifest_keeps_unremoved_same_name_indices() {
         let manifest = sample_manifest();
@@ -1647,6 +1800,251 @@ mod tests {
                 .iter()
                 .any(|idx| idx.uuid == second_index.uuid)
         );
+    }
+
+    /// A raw CreateIndex commit whose new index declares a covering field id missing
+    /// from the schema must be rejected at the commit boundary -- otherwise every later
+    /// query on the index fails at planning time with an inconsistent-metadata error.
+    ///
+    /// `covering_fields` must also be a suffix of `fields` (`fields = [0, 9999]` here),
+    /// or `validate_covering_fields`'s cardinality check rejects the index earlier, for
+    /// an unrelated reason, before this test's intended "unresolvable in schema" check
+    /// ever runs.
+    #[test]
+    fn test_create_index_build_manifest_rejects_unresolvable_covered_field() {
+        let manifest = sample_manifest();
+        let mut covered = sample_index_metadata("vector_idx");
+        covered.fields = vec![0, 9999];
+        covered.covering_fields = vec![9999];
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let err = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("9999") && err.to_string().contains("top-level"),
+            "an unresolvable covered field id must be rejected at commit: {err}"
+        );
+    }
+
+    /// A covering declaration must reference a TOP-LEVEL field: `covering_fields`
+    /// resolution on the read path goes id -> name -> arrow field by bare name, so a
+    /// nested field id (e.g. a struct child) would silently bind to a same-named
+    /// top-level column instead of erroring. The create path rejects dotted names;
+    /// raw commits must reject nested ids for the same reason.
+    #[test]
+    fn test_create_index_build_manifest_rejects_nested_covered_field() {
+        use arrow_schema::Fields as ArrowFields;
+
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "s",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "id",
+                    DataType::Int64,
+                    true,
+                )])),
+                true,
+            ),
+        ]);
+        let schema = LanceSchema::try_from(&arrow).unwrap();
+        let nested_id = schema.field("s.id").unwrap().id;
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let mut covered = sample_index_metadata("vector_idx");
+        covered.fields = vec![0, nested_id];
+        covered.covering_fields = vec![nested_id];
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let err = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("top-level"),
+            "a nested covered field id must be rejected at commit: {err}"
+        );
+    }
+
+    /// A raw `Operation::Project` that drops ONLY a covering (included) field, keeping the
+    /// index's key field intact, must be rejected at the commit boundary. `fields` lists the
+    /// covering suffix alongside the key (see `IndexMetadata::covering_fields`), so
+    /// `retain_relevant_indices` -- which requires every entry of `fields` to survive --
+    /// would otherwise auto-prune the WHOLE index the moment the commit went through, with
+    /// no error: a working vector index silently disappearing rather than merely desyncing
+    /// its covering payload.
+    #[test]
+    fn test_project_build_manifest_rejects_dropped_covering_field() {
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("vec", DataType::Int32, false),
+            ArrowField::new("meta", DataType::Utf8, true),
+        ]);
+        let schema = LanceSchema::try_from(&arrow).unwrap();
+        let vec_id = schema.field("vec").unwrap().id;
+        let meta_id = schema.field("meta").unwrap().id;
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let mut covered = sample_index_metadata("vector_idx");
+        covered.fields = vec![vec_id, meta_id];
+        covered.covering_fields = vec![meta_id];
+
+        let projected_schema = manifest.schema.project(&["vec"]).unwrap();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Project {
+                schema: projected_schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
+        let err = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![covered],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("drop or alter covered"),
+            "dropping a covering field while its index's key survives must be rejected \
+             instead of silently letting the whole index be auto-pruned: {err}"
+        );
+    }
+
+    /// All delta segments of one logical index must declare the same covering columns:
+    /// the covered read path derives its output schema from one delta but executes all
+    /// of them, so a mixed set fails every query on the index at execution time.
+    #[test]
+    fn test_create_index_build_manifest_rejects_mixed_covering_deltas() {
+        // A second top-level field is needed so the covered index can declare it as a
+        // trailing, schema-resolvable `covering_fields` entry (`sample_manifest`'s
+        // single-field schema has no field left over once field 0 is keyed on).
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("vector", DataType::Int32, false),
+        ]);
+        let schema = LanceSchema::try_from(&arrow).unwrap();
+        let covered_field_id = schema.field("vector").unwrap().id;
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut covered = sample_index_metadata("vector_idx");
+        covered.fields = vec![0, covered_field_id];
+        covered.covering_fields = vec![covered_field_id];
+        let plain = sample_index_metadata("vector_idx");
+
+        // Adding a non-covered delta to an existing covered index is rejected.
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![plain.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let err = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![covered.clone()],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("covering"),
+            "mixed covering across deltas must be rejected: {err}"
+        );
+
+        // A mixed covering set within one commit's own new segments is rejected too.
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered.clone(), plain.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let err = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("covering"),
+            "mixed covering within one commit must be rejected: {err}"
+        );
+
+        // Removing the disagreeing delta in the same commit leaves a homogeneous
+        // final state, which is fine.
+        let mut covered2 = sample_index_metadata("vector_idx");
+        covered2.fields = vec![0, covered_field_id];
+        covered2.covering_fields = vec![covered_field_id];
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered2],
+                removed_indices: vec![plain.clone()],
+            },
+            None,
+        );
+        let (_, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![covered.clone(), plain],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
+        assert_eq!(final_indices.len(), 2);
+        assert!(
+            final_indices
+                .iter()
+                .all(|idx| idx.covering_fields == vec![covered_field_id]),
+            "the homogeneous replacement set should commit"
+        );
+
+        // An index with a different name is unaffected.
+        let other = sample_index_metadata("other_idx");
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![other],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![covered],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
     }
 
     #[test]

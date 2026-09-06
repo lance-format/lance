@@ -7008,6 +7008,8 @@ mod tests {
                     version: crate::index::vector::IndexFileVersion::V3,
                     skip_transpose: false,
                     runtime_hints: Default::default(),
+                    covering_columns: Default::default(),
+                    store_vectors_for_refine: false,
                 },
                 false,
             )
@@ -7143,6 +7145,8 @@ mod tests {
                     version: crate::index::vector::IndexFileVersion::V3,
                     skip_transpose: false,
                     runtime_hints: Default::default(),
+                    covering_columns: Default::default(),
+                    store_vectors_for_refine: false,
                 },
                 false,
             )

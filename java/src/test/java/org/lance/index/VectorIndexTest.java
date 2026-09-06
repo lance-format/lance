@@ -22,16 +22,31 @@ import org.lance.index.vector.RQBuildParams;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.index.vector.VectorTrainer;
+import org.lance.ipc.Query;
+import org.lance.ipc.ScanOptions;
 
+import org.apache.arrow.dataset.scanner.Scanner;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -400,6 +415,408 @@ public class VectorIndexTest {
             "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
       }
     }
+  }
+
+  /**
+   * {@code coveringColumns} must be a defensive, unmodifiable copy: mutating the list the caller
+   * passed to the builder (or the list the getter returns) must not change the params, so the JNI
+   * read at build time sees exactly what was requested.
+   */
+  @Test
+  public void testCoveringColumnsIsDefensivelyCopied() {
+    IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
+    List<String> cols = new ArrayList<>();
+    cols.add("i");
+    VectorIndexParams params = new VectorIndexParams.Builder(ivf).setCoveringColumns(cols).build();
+
+    // Mutating the caller's list after build must not affect the params.
+    cols.add("s");
+    cols.clear();
+    assertEquals(
+        Collections.singletonList("i"),
+        params.getCoveringColumns(),
+        "include columns must be a defensive copy, unaffected by caller mutation");
+
+    // The returned list must be unmodifiable.
+    assertThrows(UnsupportedOperationException.class, () -> params.getCoveringColumns().add("x"));
+  }
+
+  /**
+   * {@code Index.coveringFields} must be a defensive, unmodifiable copy, matching {@code
+   * VectorIndexParams.coveringColumns}: mutating the caller's list (or the list the getter returns)
+   * must not change the value object -- equals/hashCode would silently drift, and a later JNI
+   * commit would read mutated covering metadata while the index files still carry the payload.
+   */
+  @Test
+  public void testIndexCoveringFieldsIsDefensivelyCopied() {
+    List<Integer> ids = new ArrayList<>();
+    ids.add(3);
+    Index index =
+        Index.builder()
+            .uuid(UUID.randomUUID())
+            .fields(Collections.singletonList(0))
+            .name("covered_idx")
+            .datasetVersion(1L)
+            .indexVersion(0)
+            .coveringFields(ids)
+            .build();
+
+    // Mutating the caller's list after build must not affect the index.
+    ids.add(7);
+    ids.clear();
+    assertEquals(
+        Collections.singletonList(3),
+        index.coveringFields(),
+        "covering fields must be a defensive copy, unaffected by caller mutation");
+
+    // The returned list must be unmodifiable.
+    assertThrows(UnsupportedOperationException.class, () -> index.coveringFields().add(9));
+  }
+
+  /**
+   * The Java builder must be able to request carried refine vectors, and the JNI must forward the
+   * flag: the core records them by appending the *indexed* column's own field id to the index's
+   * covering fields, so a build that dropped the flag still succeeds but commits an index whose
+   * covering declaration is empty and whose {@code refine} queries fall back to the base table.
+   *
+   * <p>This guards the {@code store_vectors_for_refine} read in {@code
+   * java/lance-jni/src/utils.rs}: restoring it to a hardcoded {@code false} leaves the index
+   * buildable and the field-id assertions below fail.
+   */
+  @Test
+  public void testCreateIndexWithStoreVectorsForRefine(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("refine_vectors"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(4).build();
+        // IVF_PQ, not IVF_FLAT: a flat quantizer already stores the full-precision vectors, so
+        // the core refuses to carry a second copy of them.
+        PQBuildParams pq = new PQBuildParams.Builder().setNumSubVectors(2).build();
+
+        VectorIndexParams vectorIndexParams =
+            new VectorIndexParams.Builder(ivf)
+                .setDistanceType(DistanceType.L2)
+                .setPqParams(pq)
+                .setStoreVectorsForRefine(true)
+                .build();
+        assertTrue(
+            vectorIndexParams.isStoreVectorsForRefine(),
+            "the builder must round-trip the requested flag");
+        IndexParams indexParams =
+            IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
+
+        dataset.createIndex(
+            IndexOptions.builder(
+                    Collections.singletonList(TestVectorDataset.vectorColumnName),
+                    IndexType.IVF_PQ,
+                    indexParams)
+                .withIndexName(TestVectorDataset.indexName)
+                .build());
+
+        Index carried =
+            dataset.getIndexes().stream()
+                .filter(idx -> TestVectorDataset.indexName.equals(idx.name()))
+                .findFirst()
+                .orElse(null);
+        assertNotNull(carried, "Expected the index to be present");
+
+        int vectorFieldId = fieldId(dataset, TestVectorDataset.vectorColumnName);
+        assertEquals(
+            Collections.singletonList(vectorFieldId),
+            carried.coveringFields(),
+            "carried refine vectors are declared as the indexed column's own field id");
+        // Covering fields are the trailing entries of fields; here the carried field is the
+        // keyed field itself, so it appears in both positions.
+        assertEquals(
+            Arrays.asList(vectorFieldId, vectorFieldId),
+            carried.fields(),
+            "the carried field must be appended after the keyed vector field");
+      }
+    }
+  }
+
+  /**
+   * A covered ("included") column set on {@link VectorIndexParams} must be threaded through the JNI
+   * create path into the built index's metadata, so the committed index reports the covered field
+   * id. Without the wiring the index would build but silently carry no covering columns.
+   *
+   * <p>This guards the {@code covering_columns} read in {@code java/lance-jni/src/utils.rs}:
+   * restoring it to an empty default leaves the index buildable but drops the covering declaration,
+   * and the field-id assertions below fail.
+   */
+  @Test
+  public void testCreateIvfFlatIndexWithCoveringColumns(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("ivf_flat_covering"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        // Several partitions, so the search below really probes an IVF partition instead of
+        // degenerating into a scan of the one partition that holds everything.
+        IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(4).build();
+
+        // Cover the non-vector "i" column so a projection of it is answered from the index.
+        VectorIndexParams vectorIndexParams =
+            new VectorIndexParams.Builder(ivf)
+                .setDistanceType(DistanceType.L2)
+                .setCoveringColumns(Collections.singletonList("i"))
+                .build();
+        IndexParams indexParams =
+            IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
+
+        dataset.createIndex(
+            IndexOptions.builder(
+                    Collections.singletonList(TestVectorDataset.vectorColumnName),
+                    IndexType.IVF_FLAT,
+                    indexParams)
+                .withIndexName(TestVectorDataset.indexName)
+                .build());
+
+        Index covered =
+            dataset.getIndexes().stream()
+                .filter(idx -> TestVectorDataset.indexName.equals(idx.name()))
+                .findFirst()
+                .orElse(null);
+        assertNotNull(covered, "Expected covered IVF_FLAT index to be present");
+
+        int coveredFieldId = fieldId(dataset, "i");
+        int vectorFieldId = fieldId(dataset, TestVectorDataset.vectorColumnName);
+        assertEquals(
+            Collections.singletonList(coveredFieldId),
+            covered.coveringFields(),
+            "committed index must report the requested covering column's field id");
+        // covering fields are always the trailing entries of fields, so the keyed vector field
+        // comes first and the covering field is appended after it.
+        assertEquals(
+            Arrays.asList(vectorFieldId, coveredFieldId),
+            covered.fields(),
+            "covering field must be appended after the keyed vector field");
+
+        float[] key = new float[32];
+        for (int j = 0; j < key.length; j++) {
+          key[j] = (float) (32 + j);
+        }
+        int k = 5;
+
+        // The assertion that actually exercises the covering payload: project the covered
+        // column together with an *uncovered* one and cross-check them row by row. Every row
+        // of the fixture satisfies s == "s-" + i, and only "i" is carried by the index, so "s"
+        // necessarily comes from a base-table take. A covering payload read positionally
+        // rather than by name, or attached to the wrong row, makes the two disagree.
+        Map<Integer, String> coveredRows = searchCoveredWithBaseColumn(dataset, key, k);
+        assertEquals(k, coveredRows.size(), "covered search should return k distinct rows");
+        coveredRows.forEach(
+            (i, s) ->
+                assertEquals(
+                    "s-" + i,
+                    s,
+                    "covered 'i' must belong to the same row as the base-table 's'; a"
+                        + " misaligned covering payload disagrees here"));
+
+        // Recall against an exact scan. Worth keeping as a floor on search quality, but note
+        // what it cannot show: it does NOT establish that the *index* served the query.
+        // Covering is semantically transparent -- if the index were ignored and Lance fell
+        // back to brute-force KNN, the fallback is exact and would score 1.0 here. Java has
+        // no explain-plan binding, so there is no node chain to assert against as
+        // test_create_index_covering_columns_serve_the_query_from_the_index does on the
+        // Python side. That distinction is pinned instead by
+        // testCoveredIndexServesTheSearchNotAFullScan below, which uses fast search over a
+        // partially indexed dataset so the two outcomes genuinely differ.
+        Set<Integer> exact = searchCoveredColumn(dataset, key, k, false);
+        Set<Integer> ann = searchCoveredColumn(dataset, key, k, true);
+        assertEquals(k, exact.size(), "exact KNN ground truth should return k distinct rows");
+        Set<Integer> hits = new HashSet<>(ann);
+        hits.retainAll(exact);
+        double recall = (double) hits.size() / k;
+        assertTrue(
+            recall >= 0.5,
+            "recall of the covered index against exact KNN must be at least 0.5 but was "
+                + recall
+                + " (ann="
+                + ann
+                + ", exact="
+                + exact
+                + ")");
+      }
+    }
+  }
+
+  /**
+   * A covered search must actually be served by the index, not by a full scan that silently
+   * produces the same answer.
+   *
+   * <p>Recall against an exact scan cannot show this: covering is semantically transparent, so if
+   * the index became unusable and Lance fell back to brute-force KNN, the fallback is exact and
+   * scores 1.0. Java has no explain-plan binding, so the Python trick of pinning the plan's node
+   * chain is unavailable.
+   *
+   * <p>What is available is fast search, which restricts a query to indexed fragments. Index only 2
+   * of the dataset's 5 fragments, and the two outcomes stop agreeing: {@code TestVectorDataset}
+   * writes the *same* 80 vectors into every fragment, so the query key matches one row at distance
+   * 0 in each of the 5 fragments ("i" = 1, 81, 161, 241, 321) with the next-nearest row ~181 away.
+   * Served by the index under fast search, only the two indexed fragments can contribute, so every
+   * returned "i" is below 160. Served by a full scan, the distance-0 rows from the three unindexed
+   * fragments win and "i" values above 160 appear.
+   */
+  @Test
+  public void testCoveredIndexServesTheSearchNotAFullScan(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("ivf_flat_covering_fast_search"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        List<Fragment> fragments = dataset.getFragments();
+        assertTrue(fragments.size() >= 3, "fixture must have unindexed fragments left over");
+
+        IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(4).build();
+        VectorIndexParams vectorIndexParams =
+            new VectorIndexParams.Builder(ivf)
+                .setDistanceType(DistanceType.L2)
+                .setCoveringColumns(Collections.singletonList("i"))
+                .build();
+        IndexParams indexParams =
+            IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
+
+        List<Index> segments = new ArrayList<>();
+        for (int f = 0; f < 2; f++) {
+          segments.add(
+              dataset.createIndex(
+                  IndexOptions.builder(
+                          Collections.singletonList(TestVectorDataset.vectorColumnName),
+                          IndexType.IVF_FLAT,
+                          indexParams)
+                      .withIndexName(TestVectorDataset.indexName)
+                      .withFragmentIds(Collections.singletonList(fragments.get(f).getId()))
+                      .build()));
+        }
+        dataset.commitExistingIndexSegments(
+            TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, segments);
+
+        int coveredFieldId = fieldId(dataset, "i");
+        for (Index segment : segments) {
+          assertEquals(
+              Collections.singletonList(coveredFieldId),
+              segment.coveringFields(),
+              "every distributed segment must carry the covering declaration");
+        }
+
+        float[] key = new float[32];
+        for (int j = 0; j < key.length; j++) {
+          key[j] = (float) (32 + j);
+        }
+
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .columns(Collections.singletonList("i"))
+                .fastSearch(true)
+                .nearest(
+                    new Query.Builder()
+                        .setColumn(TestVectorDataset.vectorColumnName)
+                        .setKey(key)
+                        .setK(5)
+                        .setUseIndex(true)
+                        .build())
+                .build();
+
+        Set<Integer> values = new HashSet<>();
+        try (Scanner scanner = dataset.newScan(options);
+            ArrowReader reader = scanner.scanBatches()) {
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          while (reader.loadNextBatch()) {
+            IntVector iVector = (IntVector) root.getVector("i");
+            for (int row = 0; row < root.getRowCount(); row++) {
+              values.add(iVector.get(row));
+            }
+          }
+        }
+
+        assertFalse(values.isEmpty(), "fast search over the covered index returned no rows");
+        // Positive: the exact-match rows of both indexed fragments must be present.
+        assertTrue(
+            values.contains(1) && values.contains(81),
+            "fast search must return the distance-0 row of each indexed fragment, got " + values);
+        // Discriminating: any row from an unindexed fragment means a full scan served this.
+        for (int value : values) {
+          assertTrue(
+              value < 160,
+              "fast search must be confined to the 2 indexed fragments, but returned i="
+                  + value
+                  + " (a full scan, not the covered index, served this query); got "
+                  + values);
+        }
+      }
+    }
+  }
+
+  /** Resolve a top-level column's Lance field id, which is what index metadata records. */
+  private static int fieldId(Dataset dataset, String name) {
+    return dataset.getLanceSchema().fields().stream()
+        .filter(field -> name.equals(field.getName()))
+        .findFirst()
+        .orElseThrow(() -> new AssertionError("No field named " + name + " in the dataset schema"))
+        .getId();
+  }
+
+  /**
+   * Run a nearest-neighbor search projecting the covered "i" column together with the uncovered "s"
+   * column, returning i -&gt; s for the matched rows. Only "i" is carried by the index, so "s"
+   * comes from a base-table take and the pair cross-checks the covering payload's row alignment.
+   */
+  private static Map<Integer, String> searchCoveredWithBaseColumn(
+      Dataset dataset, float[] key, int k) throws Exception {
+    ScanOptions options =
+        new ScanOptions.Builder()
+            .columns(Arrays.asList("i", "s"))
+            .nearest(
+                new Query.Builder()
+                    .setColumn(TestVectorDataset.vectorColumnName)
+                    .setKey(key)
+                    .setK(k)
+                    .setUseIndex(true)
+                    .build())
+            .build();
+
+    Map<Integer, String> rows = new HashMap<>();
+    try (Scanner scanner = dataset.newScan(options);
+        ArrowReader reader = scanner.scanBatches()) {
+      VectorSchemaRoot root = reader.getVectorSchemaRoot();
+      while (reader.loadNextBatch()) {
+        IntVector iVector = (IntVector) root.getVector("i");
+        VarCharVector sVector = (VarCharVector) root.getVector("s");
+        for (int row = 0; row < root.getRowCount(); row++) {
+          rows.put(iVector.get(row), new String(sVector.get(row), StandardCharsets.UTF_8));
+        }
+      }
+    }
+    return rows;
+  }
+
+  /**
+   * Run a nearest-neighbor search projecting only the covered "i" column and return the matched
+   * values, so a covered result can be compared against exact KNN ground truth.
+   */
+  private static Set<Integer> searchCoveredColumn(
+      Dataset dataset, float[] key, int k, boolean useIndex) throws Exception {
+    ScanOptions options =
+        new ScanOptions.Builder()
+            .columns(Collections.singletonList("i"))
+            .nearest(
+                new Query.Builder()
+                    .setColumn(TestVectorDataset.vectorColumnName)
+                    .setKey(key)
+                    .setK(k)
+                    .setUseIndex(useIndex)
+                    .build())
+            .build();
+
+    Set<Integer> values = new HashSet<>();
+    try (Scanner scanner = dataset.newScan(options);
+        ArrowReader reader = scanner.scanBatches()) {
+      VectorSchemaRoot root = reader.getVectorSchemaRoot();
+      while (reader.loadNextBatch()) {
+        IntVector iVector = (IntVector) root.getVector("i");
+        for (int row = 0; row < root.getRowCount(); row++) {
+          values.add(iVector.get(row));
+        }
+      }
+    }
+    return values;
   }
 
   /**

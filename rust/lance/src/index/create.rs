@@ -597,11 +597,52 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         };
 
+        // Resolve any covering ("included") columns to field ids for the generic
+        // IndexMetadata. The build path validates these names first, so a failure here is
+        // defence-in-depth -- but this is the site that decides what lands in the manifest,
+        // so it refuses rather than dropping: silently skipping a name would commit an
+        // index whose `fields` under-declare the payload its storage actually carries,
+        // leaving that column out of every invalidation rule keyed on `fields`.
+        let covering_fields = match self.params.as_any().downcast_ref::<VectorIndexParams>() {
+            Some(vp) => {
+                let mut ids = vp
+                    .covering_columns
+                    .iter()
+                    .map(|name| {
+                        self.dataset
+                            .schema()
+                            .field(name)
+                            .map(|f| f.id)
+                            .ok_or_else(|| {
+                                Error::index(format!(
+                                    "covering column '{name}' is not present in the dataset schema"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<i32>>>()?;
+                // Carried refine vectors are the indexed column, stored a second time in
+                // full precision. Declaring them makes the search emit them and `refine`
+                // re-rank from the index; leaving the declaration off would store the copy
+                // and never read it. Appended last on purpose: the covering ids come first
+                // and the carried vectors close the list (see the `fields` contract below).
+                if vp.store_vectors_for_refine {
+                    ids.push(field.id);
+                }
+                ids
+            }
+            None => Vec::new(),
+        };
+        // `covering_fields` must be the trailing entries of `fields` (see
+        // `IndexMetadata::validate_covering_fields`), so the keyed field comes first
+        // and the covering fields are appended, not tracked separately.
+        let mut fields = vec![field.id];
+        fields.extend_from_slice(&covering_fields);
+
         Ok(IndexMetadata {
             uuid: output_index_uuid,
             name: index_name,
-            fields: vec![field.id],
-            covering_fields: vec![],
+            fields,
+            covering_fields,
             dataset_version: self.dataset.manifest.version,
             fragment_bitmap: if train {
                 match &self.fragments {

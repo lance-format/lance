@@ -16,6 +16,7 @@ package org.lance.index;
 import com.google.common.base.MoreObjects;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -57,8 +58,19 @@ public class Index {
       List<IndexFile> files,
       IndexType indexType) {
     this.uuid = uuid;
-    this.fields = fields;
-    this.coveringFields = coveringFields;
+    // Both lists are defensively copied and unmodifiable so a caller cannot mutate them
+    // after construction: equals/hashCode would silently drift from the index files that
+    // actually carry the payload, and `coveringFields` is documented as the trailing slice
+    // of `fields`, so mutating either alone breaks that relationship. Null-coalesced so an
+    // explicit null from the builder reads as "none" rather than blowing up at first use.
+    this.fields =
+        fields == null
+            ? Collections.emptyList()
+            : Collections.unmodifiableList(new ArrayList<>(fields));
+    this.coveringFields =
+        coveringFields == null
+            ? Collections.emptyList()
+            : Collections.unmodifiableList(new ArrayList<>(coveringFields));
     this.name = name;
     this.datasetVersion = datasetVersion;
     this.fragments = fragments;
@@ -106,7 +118,7 @@ public class Index {
    * <p>These ids also appear in {@link #fields()} — that is deliberate, so that every consumer
    * reading {@code fields()} as the index's dependency set also covers them with no change.
    *
-   * @return the covering field IDs
+   * @return the covering field IDs, as an unmodifiable list
    */
   public List<Integer> coveringFields() {
     return coveringFields;

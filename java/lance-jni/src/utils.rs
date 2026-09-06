@@ -24,7 +24,7 @@ use lance_linalg::distance::DistanceType;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 
-use crate::traits::FromJObjectWithEnv;
+use crate::traits::{FromJObjectWithEnv, import_vec_from_method};
 use lance_index::vector::{ApproxMode, Query};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -261,6 +261,11 @@ pub fn build_compaction_options(
 }
 
 // Convert from Java Optional<Query> to Rust Option<Query>
+//
+// This builds a `Query` directly rather than through `Scanner::nearest`, and is used
+// only by `JniTestHelper.parseQuery` to check the Java-side field marshalling. Java's
+// real search path is `blocking_scanner.rs`, which configures a `Scanner`, so it picks
+// up every plan-derived setting -- including the covering projection below.
 pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> {
     let query = env.get_optional(&query_obj, |env, java_obj| {
         let column = env.get_string_from_method(&java_obj, "getColumn")?;
@@ -305,6 +310,11 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
+            // Not a user-settable search parameter: the covering projection is derived
+            // per plan from what the scan reads, so it stays `None` (materialize
+            // whatever the index declares) at the binding boundary. Java's real search
+            // path resolves it in `Scanner`; see the note on this function.
+            covering_projection: None,
         })
     })?;
 
@@ -509,12 +519,36 @@ pub fn get_vector_index_params(
                 stages.push(StageParams::RQ(rq_params));
             }
 
+            // Covering ("included") columns: names of extra dataset columns stored inline in
+            // the index. Empty when absent. The core validates them when the index is built.
+            let covering_columns: Vec<String> = import_vec_from_method(
+                env,
+                &vector_index_params_obj,
+                "getCoveringColumns",
+                |env, elem| Ok(env.get_string(&JString::from(elem))?.into()),
+            )?;
+
+            // Carry full-precision vectors in the index so `refine` re-ranks from index
+            // storage instead of taking them from the base table. Deliberately not part of
+            // the covering columns above: the core records it by naming the indexed column
+            // itself, which the covering setter rejects. The core validates it at build.
+            let store_vectors_for_refine = env
+                .call_method(
+                    &vector_index_params_obj,
+                    "isStoreVectorsForRefine",
+                    "()Z",
+                    &[],
+                )?
+                .z()?;
+
             Ok(VectorIndexParams {
                 metric_type: distance_type,
                 stages,
                 version: IndexFileVersion::V3,
                 skip_transpose: false,
                 runtime_hints: Default::default(),
+                covering_columns,
+                store_vectors_for_refine,
             })
         },
     )?;

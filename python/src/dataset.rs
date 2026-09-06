@@ -4968,6 +4968,8 @@ fn prepare_vector_index_params(
     let mut rq_params = RQBuildParams::default();
     let mut index_file_version = IndexFileVersion::V3;
     let mut skip_transpose = false;
+    let mut covering_columns: Vec<String> = Vec::new();
+    let mut store_vectors_for_refine = false;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -5129,6 +5131,24 @@ fn prepare_vector_index_params(
         if let Some(value) = kwargs.get_item("skip_transpose")? {
             skip_transpose = value.extract()?;
         }
+
+        // Covering ("included") columns: names of extra dataset columns stored inline in the
+        // index. Empty when absent. The core validates them when the index is built.
+        if let Some(cols) = kwargs.get_item("covering_columns")?
+            && !cols.is_none()
+        {
+            covering_columns = cols.extract()?;
+        }
+
+        // Carry full-precision vectors in the index so `refine` re-ranks from index
+        // storage rather than taking them from the base table. Deliberately separate
+        // from `covering_columns`: the core records it by naming the indexed column
+        // itself, which the covering setter rejects. Validated by the core at build.
+        if let Some(value) = kwargs.get_item("store_vectors_for_refine")?
+            && !value.is_none()
+        {
+            store_vectors_for_refine = value.extract()?;
+        }
     }
 
     let mut params = match index_type {
@@ -5174,6 +5194,8 @@ fn prepare_vector_index_params(
     }?;
     params.version(index_file_version);
     params.skip_transpose(skip_transpose);
+    params.covering_columns(covering_columns);
+    params.store_vectors_for_refine(store_vectors_for_refine);
     if let Some(kwargs) = kwargs
         && let Some(acc) = kwargs.get_item("accelerator")?
     {
@@ -5674,6 +5696,10 @@ impl PySearchFilter {
             query_parallelism,
             dist_q_c: 0.0,
             approx_mode,
+            // Not a user-settable search parameter: the covering projection is derived
+            // from what the plan reads, so it stays `None` (materialize whatever the
+            // index declares) at the binding boundary.
+            covering_projection: None,
         };
 
         Ok(Self {

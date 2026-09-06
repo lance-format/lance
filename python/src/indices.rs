@@ -674,15 +674,23 @@ pub struct PyIndexDescription {
     pub type_url: String,
     /// The short type of the index (may not be unique)
     pub index_type: String,
-    /// The ids of the fields that the index is built on
+    /// The ids of the fields the index is keyed on -- the columns it can answer queries about.
+    /// Covering ("included") columns are excluded; those are reported per-segment as
+    /// `covering_fields`.
     pub fields: Vec<u32>,
-    /// The full paths of the fields that the index is built on
+    /// The full paths of the fields the index is keyed on, matching `fields`
     /// (dotted, with backtick-quoted segments for non-identifier names)
     pub field_names: Vec<String>,
     /// The number of rows indexed by the index
     pub num_rows_indexed: u64,
     /// The details of the index
     pub details: PyJson,
+    /// The ids of the covering ("included") fields the index co-locates alongside
+    /// its key fields, so covered queries can skip the base-table take. Empty for
+    /// indexes without covering columns. All segments of one index share the set.
+    pub covering_fields: Vec<i32>,
+    /// The resolved names of `covering_fields` in the current schema.
+    pub covering_field_names: Vec<String>,
     /// The segments of the index
     pub segments: Vec<PyIndexSegmentDescription>,
     /// The total size in bytes of all files across all segments
@@ -703,10 +711,26 @@ impl PyIndexDescription {
             })
             .collect();
 
-        let segments = index
+        let segments: Vec<PyIndexSegmentDescription> = index
             .metadata()
             .iter()
             .map(PyIndexSegmentDescription::from_metadata)
+            .collect();
+
+        // All segments of one logical index declare the same covering columns
+        // (enforced at every commit boundary), so the first segment is authoritative.
+        let covering_fields = segments
+            .first()
+            .map(|segment| segment.covering_fields.clone())
+            .unwrap_or_default();
+        let covering_field_names = covering_fields
+            .iter()
+            .map(|field| {
+                dataset
+                    .schema()
+                    .field_path_minimal(*field)
+                    .unwrap_or_else(|_| "<unknown>".to_string())
+            })
             .collect();
 
         let details = index.details().unwrap_or_else(|_| "{}".to_string());
@@ -716,6 +740,8 @@ impl PyIndexDescription {
             fields: index.field_ids().to_vec(),
             field_names,
             index_type: index.index_type().to_string(),
+            covering_fields,
+            covering_field_names,
             segments,
             type_url: index.type_url().to_string(),
             num_rows_indexed: index.rows_indexed(),
@@ -728,13 +754,19 @@ impl PyIndexDescription {
 #[pymethods]
 impl PyIndexDescription {
     pub fn __repr__(&self) -> String {
+        // `covering_fields` is printed alongside `fields` so a covered and an uncovered
+        // index do not render identically -- the segment repr already prints it, and
+        // without it here `print(ds.describe_indices()[0])` cannot answer "what does
+        // this index cover?" without descending into the segments.
         let mut repr = format!(
-            "IndexDescription(name='{}', type_url='{}', num_rows_indexed={}, fields={:?}, field_names={:?}, num_segments={}",
+            "IndexDescription(name='{}', type_url='{}', num_rows_indexed={}, fields={:?}, field_names={:?}, covering_fields={:?}, covering_field_names={:?}, num_segments={}",
             self.name,
             self.type_url,
             self.num_rows_indexed,
             self.fields,
             self.field_names,
+            self.covering_fields,
+            self.covering_field_names,
             self.segments.len()
         );
         if let Some(byte_size) = self.total_size_bytes {
@@ -761,4 +793,174 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;
     m.add_submodule(&indices)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StructArray};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+    /// Enough of an `IndexDescription` to drive the read-side conversion with metadata
+    /// no commit boundary would accept. That is the point: every write path rejects a
+    /// covering field id that is not a top-level field of the schema being committed
+    /// (`Operation::CreateIndex` in `transaction.rs`), and every schema-shrinking path
+    /// rejects dropping a covered column out from under a live index
+    /// (`reject_covered_field_subtree_change`). So `covering_field_names`'s `"<unknown>"`
+    /// fallback is only ever reached by a manifest this writer did not produce -- a
+    /// future format revision or a foreign writer -- and this stub is the only way to
+    /// hand it one.
+    struct StubIndexDescription {
+        field_ids: Vec<u32>,
+        segments: Vec<IndexMetadata>,
+    }
+
+    impl IndexDescription for StubIndexDescription {
+        fn name(&self) -> &str {
+            "stub_idx"
+        }
+        fn metadata(&self) -> &[IndexMetadata] {
+            &self.segments
+        }
+        fn type_url(&self) -> &str {
+            ""
+        }
+        fn index_type(&self) -> &str {
+            "Vector"
+        }
+        fn rows_indexed(&self) -> u64 {
+            0
+        }
+        fn field_ids(&self) -> &[u32] {
+            &self.field_ids
+        }
+        fn details(&self) -> lance_core::Result<String> {
+            Ok("{}".to_string())
+        }
+        fn total_size_bytes(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    fn covered_segment(fields: Vec<i32>, covering_fields: Vec<i32>) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields,
+            covering_fields,
+            name: "stub_idx".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
+
+    /// A dataset whose field ids deliberately do not match top-level positions:
+    /// `id` is field 0, the struct `nested` is field 1 (its children take 2 and 3),
+    /// and `price` is field 4 while sitting at top-level position 2. Resolving a
+    /// covered id positionally instead of by id therefore cannot accidentally
+    /// produce the right answer.
+    async fn dataset_with_offset_field_ids() -> LanceDataset {
+        let nested_fields = vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "nested",
+                DataType::Struct(nested_fields.clone().into()),
+                false,
+            ),
+            ArrowField::new("price", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StructArray::new(
+                    nested_fields.into(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![4, 5, 6])) as ArrayRef,
+                        Arc::new(Int32Array::from(vec![7, 8, 9])) as ArrayRef,
+                    ],
+                    None,
+                )),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = LanceDataset::write(reader, "memory://test", None)
+            .await
+            .unwrap();
+        // Pin the ids the tests below hardcode, so a change in id assignment fails
+        // here rather than silently making the covered id resolve to another column.
+        assert_eq!(dataset.schema().field("price").unwrap().id, PRICE_FIELD_ID);
+        dataset
+    }
+
+    /// `price`'s field id -- see [`dataset_with_offset_field_ids`].
+    const PRICE_FIELD_ID: i32 = 4;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn covering_field_names_resolve_against_the_schema() {
+        let dataset = runtime().block_on(dataset_with_offset_field_ids());
+        let index = StubIndexDescription {
+            field_ids: vec![0],
+            segments: vec![covered_segment(
+                vec![0, PRICE_FIELD_ID],
+                vec![PRICE_FIELD_ID],
+            )],
+        };
+
+        let description = PyIndexDescription::new(&index, &dataset);
+
+        assert_eq!(description.covering_fields, vec![PRICE_FIELD_ID]);
+        assert_eq!(description.covering_field_names, vec!["price".to_string()]);
+    }
+
+    #[test]
+    fn covering_field_names_fall_back_when_the_id_is_unresolvable() {
+        let dataset = runtime().block_on(dataset_with_offset_field_ids());
+        // No field carries id 99, so `field_path_minimal` returns an error.
+        let index = StubIndexDescription {
+            field_ids: vec![0],
+            segments: vec![covered_segment(vec![0, 99], vec![99])],
+        };
+
+        // Introspection must still succeed -- the fallback exists so a stale or
+        // unrecognized covering declaration cannot make `describe_indices()` error out.
+        let description = PyIndexDescription::new(&index, &dataset);
+
+        assert_eq!(description.covering_fields, vec![99]);
+        assert_eq!(
+            description.covering_field_names,
+            vec!["<unknown>".to_string()]
+        );
+    }
+
+    #[test]
+    fn covering_fields_are_empty_without_segments() {
+        let dataset = runtime().block_on(dataset_with_offset_field_ids());
+        let index = StubIndexDescription {
+            field_ids: vec![0],
+            segments: vec![],
+        };
+
+        let description = PyIndexDescription::new(&index, &dataset);
+
+        assert!(description.covering_fields.is_empty());
+        assert!(description.covering_field_names.is_empty());
+    }
 }

@@ -290,7 +290,15 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
                 let mut indices = Vec::with_capacity(b.num_rows());
                 let mut new_row_ids = Vec::with_capacity(b.num_rows());
 
-                let row_ids = b.column(0).as_primitive::<UInt64Type>().values();
+                // Look up by name, not position: a covering storage batch is
+                // `[_rowid, code, <covering...>]` for some quantizers but the
+                // covering columns can precede `_rowid` if the writer schema was
+                // inferred from a batch rather than declared, so position 0 is
+                // not reliably the row id column.
+                let row_id_col = b
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| Error::index(format!("column {ROW_ID} not found in batch")))?;
+                let row_ids = row_id_col.as_primitive::<UInt64Type>().values();
                 for (i, row_id) in row_ids.iter().enumerate() {
                     match mapping.get(*row_id) {
                         Some(Some(new_id)) => {
