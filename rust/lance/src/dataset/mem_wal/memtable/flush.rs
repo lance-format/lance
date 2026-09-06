@@ -1218,6 +1218,7 @@ impl std::fmt::Debug for TriggerMemTableFlush {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use arrow_array::{Int32Array, RecordBatch, StringArray};

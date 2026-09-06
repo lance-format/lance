@@ -430,10 +430,6 @@ fn writer_config_to_defaults(config: &ShardWriterConfig) -> HashMap<String, Stri
             config.max_memtable_batches.to_string(),
         ),
         (
-            "manifest_scan_batch_size".to_string(),
-            config.manifest_scan_batch_size.to_string(),
-        ),
-        (
             "max_unflushed_memtable_bytes".to_string(),
             config.max_unflushed_memtable_bytes.to_string(),
         ),

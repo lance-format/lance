@@ -5570,7 +5570,8 @@ class LanceDataset(pa.dataset.Dataset):
         max_unflushed_memtable_bytes : int, optional
             Maximum unflushed bytes before backpressure (default: 1 GB).
         manifest_scan_batch_size : int, optional
-            Batch size for manifest scans (default: 2).
+            Deprecated and ignored. Manifest scan concurrency is managed
+            internally.
         backpressure_log_interval_ms : int, optional
             Interval for backpressure log messages in milliseconds
             (default: 30 000).
