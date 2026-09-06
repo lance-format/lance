@@ -206,11 +206,11 @@ void dropColumns() {
 
 ## JVM Engine Connectors
 
-JVM engine connectors can be built using the Lance Java SDK. Here are some connectors maintained in lancedb Github organization:
+JVM engine connectors can be built using the Lance Java SDK. Here are some connectors maintained by the lance-format GitHub organization:
 
-* [Spark Lance connector](https://github.com/lancedb/lance-spark)
-* [Flink Lance connector](https://github.com/lancedb/lance-flink)
-* [Trino Lance connector](https://github.com/lancedb/lance-trino)
+* [Spark Lance connector](https://github.com/lance-format/lance-spark)
+* [Flink Lance connector](https://github.com/lance-format/lance-flink)
+* [Trino Lance connector](https://github.com/lance-format/lance-trino)
 
 ## Contributing
 
