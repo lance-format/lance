@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+// The streaming IVF training tests await the whole training stack, whose future
+// type nests past the default 128 in the lib test build. benches/streaming_ivf_training.rs
+// raises the limit for the same stack.
+#![cfg_attr(test, recursion_limit = "256")]
+
 //! Lance Columnar Data Format
 //!
 //! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,
