@@ -21,6 +21,8 @@ use serde::Serialize;
 
 pub use lance_table::system_index::frag_reuse::*;
 
+pub mod row_map;
+
 use crate::scalar::RowIdRemapper;
 use crate::{Index, IndexType};
 
