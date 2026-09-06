@@ -241,6 +241,46 @@ def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
     )
 
 
+@pytest.mark.parametrize("metric", ["l2", "cosine"])
+@pytest.mark.parametrize("query_count", [3, 1], ids=["three_queries", "single_query"])
+def test_batch_indexed_query_matches_repeated_single_queries(
+    dataset, metric, query_count
+):
+    indexed = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        metric=metric,
+    )
+    # Give the query vectors deliberately different magnitudes: a cosine batch
+    # that normalized the whole concatenated key by one global norm would scale
+    # them unequally and diverge from per-query single search.
+    scales = np.linspace(0.1, 10.0, query_count).reshape(-1, 1)
+    queries = (np.random.randn(query_count, 128) * scales).astype(np.float32)
+    k = 5
+
+    # nprobes covers every partition so the shared-scan batch path and the
+    # repeated single-query path search the same partitions deterministically.
+    nearest_kwargs = {"use_index": True, "nprobes": 4}
+    batch = indexed.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": queries, "k": k, **nearest_kwargs},
+    )
+
+    assert batch.column_names == ["query_index", "id", "_distance"]
+    assert batch["query_index"].to_pylist() == sum(
+        [[i] * k for i in range(query_count)], []
+    )
+
+    _assert_batch_matches_single_queries(
+        indexed,
+        queries,
+        k=k,
+        nearest_kwargs=nearest_kwargs,
+    )
+
+
 def _assert_batch_matches_single_queries(ds, queries, k, nearest_kwargs):
     batch = ds.to_table(
         columns=["id"],

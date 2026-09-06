@@ -1928,6 +1928,186 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         )))
     }
 
+    fn supports_batch_partition_search(&self) -> bool {
+        S::supports_global_topk_heap()
+    }
+
+    async fn search_partitions_batch(
+        self: Arc<Self>,
+        query: Query,
+        partitions_per_query: Vec<Arc<UInt32Array>>,
+        q_c_dists_per_query: Vec<Arc<Float32Array>>,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Vec<RecordBatch>> {
+        if !S::supports_global_topk_heap() {
+            return Err(Error::not_supported(
+                "batch partition search requires a global top-k heap sub-index",
+            ));
+        }
+        let query_count = partitions_per_query.len();
+        if q_c_dists_per_query.len() != query_count {
+            return Err(Error::invalid_input(format!(
+                "batch partition search: {query_count} query partition lists but {} distance lists",
+                q_c_dists_per_query.len()
+            )));
+        }
+        if query_count == 0 {
+            return Ok(Vec::new());
+        }
+        if !query.key.len().is_multiple_of(query_count) {
+            return Err(Error::invalid_input(format!(
+                "batch partition search: query key length {} is not divisible by query count {query_count}",
+                query.key.len()
+            )));
+        }
+        let dim = query.key.len() / query_count;
+
+        // Per-query immutable search state: the query vector slice and the
+        // optional Rabit raw-query context both depend only on the query vector,
+        // so compute them once up front rather than per probed partition.
+        let mut base_queries = Vec::with_capacity(query_count);
+        let mut raw_query_contexts = Vec::with_capacity(query_count);
+        for query_index in 0..query_count {
+            if partitions_per_query[query_index].len() != q_c_dists_per_query[query_index].len() {
+                return Err(Error::invalid_input(format!(
+                    "batch partition search: query {query_index} has {} partitions but {} distances",
+                    partitions_per_query[query_index].len(),
+                    q_c_dists_per_query[query_index].len()
+                )));
+            }
+            let mut single_query = query.clone();
+            single_query.key = query.key.slice(query_index * dim, dim);
+            raw_query_contexts.push(self.prepare_rq_raw_query_context(&single_query.key)?);
+            base_queries.push(single_query);
+        }
+        // Shared across every chunk's scoring dispatch below, so wrap once in an
+        // `Arc` instead of cloning the whole `Vec` per chunk.
+        let base_queries = Arc::new(base_queries);
+        let raw_query_contexts = Arc::new(raw_query_contexts);
+
+        // Invert the per-query partition lists so each distinct partition is
+        // loaded once and scored against every query that probes it.
+        let mut assignments: HashMap<u32, Vec<(usize, f32)>> = HashMap::new();
+        for (query_index, (parts, dists)) in partitions_per_query
+            .iter()
+            .zip(q_c_dists_per_query.iter())
+            .enumerate()
+        {
+            for (part_id, dist_q_c) in parts.values().iter().zip(dists.values().iter()) {
+                assignments
+                    .entry(*part_id)
+                    .or_default()
+                    .push((query_index, *dist_q_c));
+            }
+        }
+
+        pre_filter.wait_for_ready().await?;
+
+        // Score partitions in a deterministic order. `assignments` is a HashMap,
+        // so its iteration order (and hence the order partitions accumulate into
+        // each per-query heap) is otherwise arbitrary. When several rows tie at
+        // the k-th distance, which one the capped heap keeps depends on insertion
+        // order, so a stable partition order is what makes the selected top-k
+        // deterministic across runs. (Any of the tied rows is an equally valid
+        // k-th neighbor, so this does not affect recall.)
+        let mut assignment_list: Vec<(u32, Vec<(usize, f32)>)> = assignments.into_iter().collect();
+        assignment_list.sort_by_key(|(part_id, _)| *part_id);
+
+        // Load each distinct partition's storage exactly once (the shared I/O
+        // that batch search exists to save), but *stream* the loaded partitions
+        // through scoring in chunks rather than materializing them all. A wide
+        // batch probes up to `min(query_count * nprobes, num_partitions)` distinct
+        // partitions, so collecting every loaded partition before scoring would
+        // make peak memory scale with the batch width — up to the whole index.
+        // Streaming bounds resident partition storage to the load window plus one
+        // chunk. `buffered` preserves the sorted load order above, so scoring order
+        // (and thus the k-th-distance tie-break) stays deterministic.
+        let load_parallelism = get_num_compute_intensive_cpus().max(1);
+        let load_index = self.clone();
+        let load_metrics = metrics.clone();
+        let mut loaded_chunks = stream::iter(assignment_list)
+            .map(move |(part_id, probing_queries)| {
+                let index = load_index.clone();
+                let metrics = load_metrics.clone();
+                async move {
+                    let part_entry = index
+                        .load_partition(part_id as usize, true, metrics.as_ref())
+                        .await?;
+                    Result::Ok((part_id as usize, part_entry, probing_queries))
+                }
+            })
+            .buffered(load_parallelism)
+            .chunks(*STREAMING_SEARCH_BATCH_SIZE);
+
+        let use_query_residual = self.use_query_residual;
+        let use_residual_scratch = self.use_residual_scratch;
+        let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
+        let mut heaps: Vec<BinaryHeap<OrderedNode<u64>>> = (0..query_count)
+            .map(|_| BinaryHeap::with_capacity(heap_capacity))
+            .collect();
+
+        // Score each chunk on the CPU pool while the next chunk loads. `spawn_cpu`
+        // dispatches the scoring immediately and only touches CPU-bound state, so
+        // `join!`-ing it with the next `loaded_chunks` pull keeps partition I/O in
+        // flight during scoring: the async task, never a CPU-pool thread, does the
+        // waiting (#7642), and the load stream is not paused (the pairing `spawn_cpu`'s
+        // docs recommend with `buffered`). Scoring stays sequential across chunks —
+        // each mutates the same per-query heaps — so a step costs about
+        // max(load, score) rather than their sum, and a scored chunk's storage is
+        // dropped before the next is scored, keeping peak memory bounded.
+        let mut pending = loaded_chunks.next().await;
+        while let Some(chunk) = pending {
+            let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
+            let index = self.clone();
+            let pre_filter = pre_filter.clone();
+            let base_queries = base_queries.clone();
+            let raw_query_contexts = raw_query_contexts.clone();
+            let scratch_pool = self.scratch_pool.clone();
+            let search_metrics = metrics.clone();
+            let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
+                scratch_pool.with_scratch(|scratch| -> Result<()> {
+                    for (part_id, part_entry, probing_queries) in &chunk {
+                        let partition_centroid = index.ivf.centroid(*part_id);
+                        for (query_index, dist_q_c) in probing_queries {
+                            let mut single_query = base_queries[*query_index].clone();
+                            single_query.dist_q_c = *dist_q_c;
+                            let prepared = PreparedPartitionSearch::<S, Q> {
+                                query: single_query,
+                                pre_filter: pre_filter.clone(),
+                                partition_id: *part_id,
+                                partition_centroid: partition_centroid.clone(),
+                                rq_search_cache: index.rq_search_cache.clone(),
+                                raw_query_context: raw_query_contexts[*query_index].clone(),
+                                part_entry: part_entry.clone(),
+                                _marker: PhantomData,
+                            };
+                            Self::accumulate_prepared_partition_search(
+                                use_query_residual,
+                                use_residual_scratch,
+                                prepared,
+                                &mut heaps[*query_index],
+                                scratch,
+                                search_metrics.as_ref(),
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })?;
+                Ok(heaps)
+            });
+            // Load the next chunk while this one is scored on the CPU pool.
+            let (scored, next) = futures::join!(score, loaded_chunks.next());
+            heaps = scored?;
+            pending = next;
+        }
+
+        heaps
+            .into_iter()
+            .map(Self::global_heap_to_batch)
+            .collect::<Result<Vec<_>>>()
+    }
+
     fn is_loadable(&self) -> bool {
         false
     }
