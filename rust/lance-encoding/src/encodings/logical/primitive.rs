@@ -844,6 +844,58 @@ struct MiniBlockDecoder {
 /// See [`MiniBlockScheduler`] for more details on the scheduling and decoding
 /// process for miniblock encoded data.
 impl StructuralPageDecoder for MiniBlockDecoder {
+    fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        // Walk instructions and loaded chunks to compute the total decoded byte count
+        // for the next `num_rows` rows without actually decompressing.
+        //
+        // The decompressor's `decoded_bytes_from_chunk` does the per-chunk byte count
+        // by reading the offset table directly from the chunk buffer.  If the
+        // decompressor cannot report exact sizes we fall back to the default
+        // `NotSupported` error path, which the caller catches and replaces with a
+        // schema-based estimate.
+        let mut remaining = num_rows;
+        let mut total_bytes = 0u64;
+        let mut offset_in_chunk = self.offset_in_current_chunk;
+
+        for instruction in self.instructions.iter() {
+            if remaining == 0 {
+                break;
+            }
+            // Find the loaded chunk for this instruction.
+            let chunk = self
+                .loaded_chunks
+                .iter()
+                .find(|c| c.chunk_idx == instruction.chunk_idx);
+            let Some(chunk) = chunk else {
+                return Err(Error::not_supported(
+                    "decoded_bytes: chunk not loaded for miniblock decoder".to_string(),
+                ));
+            };
+
+            let available = instruction.rows_to_take.saturating_sub(offset_in_chunk);
+            let take = available.min(remaining);
+            if take == 0 {
+                offset_in_chunk = 0;
+                continue;
+            }
+
+            let chunk_buffers = std::slice::from_ref(&chunk.data);
+            let chunk_bytes = self
+                .value_decompressor
+                .decoded_bytes_from_chunk(chunk_buffers, offset_in_chunk, take);
+            let Some(chunk_bytes) = chunk_bytes else {
+                return Err(Error::not_supported(
+                    "decoded_bytes is not implemented for this page decoder".to_string(),
+                ));
+            };
+            total_bytes += chunk_bytes;
+            remaining -= take;
+            offset_in_chunk = 0;
+        }
+
+        Ok(total_bytes)
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let mut items_desired = num_rows;
         let mut need_preamble = false;
@@ -1831,6 +1883,10 @@ impl ComplexAllNullPageDecoder {
 }
 
 impl StructuralPageDecoder for ComplexAllNullPageDecoder {
+    fn decoded_bytes(&self, _num_rows: u64) -> Result<u64> {
+        Ok(0)
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let drained_ranges = self.drain_ranges(num_rows);
         let mut level_slices: Vec<LevelSlice> = Vec::with_capacity(drained_ranges.len());
@@ -2010,6 +2066,10 @@ pub struct SimpleAllNullPageDecoder {
 }
 
 impl StructuralPageDecoder for SimpleAllNullPageDecoder {
+    fn decoded_bytes(&self, _num_rows: u64) -> Result<u64> {
+        Ok(0)
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         Ok(Box::new(SimpleAllNullDecodePageTask {
             num_values: num_rows,
@@ -3794,6 +3854,37 @@ impl VariableFullZipDecoder {
 }
 
 impl StructuralPageDecoder for VariableFullZipDecoder {
+    fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        if num_rows == 0 {
+            return Ok(0);
+        }
+        let start = self.current_idx;
+        let end = start + num_rows as usize;
+        debug_assert!(
+            end < self.data_starts.len(),
+            "decoded_bytes({num_rows}) exceeds available rows; data_starts.len()={}",
+            self.data_starts.len()
+        );
+        // The offsets buffer holds one entry per visible item plus a final sentinel.
+        // offset_starts[i] is the byte position of the i-th row's first offset entry.
+        let offset_end = self.offset_starts[end] + (self.bits_per_offset as usize / 8);
+        let offset_bytes = (offset_end - self.offset_starts[start]) as u64;
+
+        let data_start = self.data_starts[start];
+        let data_end = self.data_starts[end];
+        let data_slice = &self.data.as_ref()[data_start..data_end];
+        let offsets_slice = &self.offsets.as_ref()[self.offset_starts[start]..offset_end];
+
+        // Ask the decompressor for the pessimistic decoded size; fall back to the
+        // compressed size when the decompressor can't report one.
+        let value_bytes = self
+            .decompressor
+            .decompressed_size(data_slice, offsets_slice, self.bits_per_offset)
+            .unwrap_or((data_end - data_start) as u64);
+
+        Ok(value_bytes + offset_bytes)
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let start = self.current_idx;
         let end = start + num_rows as usize;
@@ -10871,6 +10962,232 @@ mod tests {
             max_rep: 0,
             max_visible_def: 0,
         })
+    }
+
+    // ---------------------------------------------------------------------------
+    // plan_decoded_bytes tests (commits 2 & 3)
+    // ---------------------------------------------------------------------------
+
+    /// Build a VariableFullZipDecoder for `rows` items, each containing `value_bytes`
+    /// bytes of payload (uniform size). Uses 32-bit offsets and 32-bit length prefixes,
+    /// and no control words (no rep/def).
+    ///
+    /// In-file layout per item: [4-byte length LE] + [value_bytes of 0xAB]
+    fn build_variable_full_zip(rows: usize, values: &[Vec<u8>]) -> super::VariableFullZipDecoder {
+        use std::collections::VecDeque;
+        assert_eq!(rows, values.len());
+        let mut buf = Vec::new();
+        for v in values {
+            let len = v.len() as u32;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(v);
+        }
+        let mut data = VecDeque::new();
+        data.push_back(crate::buffer::LanceBuffer::from(buf));
+        super::VariableFullZipDecoder::new(
+            truncated_tail_details(),
+            data,
+            rows as u64,
+            /*in_bits_per_length=*/ 32,
+            /*out_bits_per_offset=*/ 32,
+        )
+        .expect("build_variable_full_zip failed")
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_fixed_width_single_page() {
+        use crate::decoder::{CANDIDATE_BATCH_SIZES, StructuralFieldDecoder};
+        let field = Arc::new(ArrowField::new("v", DataType::Int32, false));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let out = decoder.plan_decoded_bytes(100).unwrap();
+        assert_eq!(out[0], 4, "candidate[0]=1 row × 4 bytes");
+        assert_eq!(out[1], 16, "candidate[1]=4 rows × 4 bytes");
+        assert_eq!(out[2], 64, "candidate[2]=16 rows × 4 bytes");
+        assert_eq!(out[3], 256, "candidate[3]=64 rows × 4 bytes");
+        // Candidates 4..8 are all clamped to 100 rows → 400 bytes
+        let expected_clamped = 400_u64;
+        for &bytes in out[4..].iter() {
+            assert_eq!(bytes, expected_clamped, "clamped candidate should be 100*4");
+        }
+        // Verify all candidate sizes are accounted for
+        assert_eq!(CANDIDATE_BATCH_SIZES.len(), 8);
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_fixed_width_rows_remaining_clamping() {
+        use crate::decoder::StructuralFieldDecoder;
+        let field = Arc::new(ArrowField::new("v", DataType::Int32, false));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let out = decoder.plan_decoded_bytes(10).unwrap();
+        // All candidates > 10 are clamped to 10*4 = 40
+        let clamped = 40_u64;
+        for (i, (&c, &bytes)) in crate::decoder::CANDIDATE_BATCH_SIZES
+            .iter()
+            .zip(out.iter())
+            .enumerate()
+        {
+            let expected = (c as u64).min(10) * 4;
+            assert_eq!(bytes, expected, "candidate[{i}] mismatch");
+        }
+        // Confirm the clamp is active for at least candidate[4] (256 > 10)
+        assert_eq!(out[4], clamped);
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_fixed_width_64bit() {
+        use crate::decoder::StructuralFieldDecoder;
+        let field = Arc::new(ArrowField::new("v", DataType::Int64, false));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let out = decoder.plan_decoded_bytes(100).unwrap();
+        // First candidate: 1 row × 8 bytes = 8
+        assert_eq!(out[0], 8);
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_boolean() {
+        use crate::decoder::StructuralFieldDecoder;
+        let field = Arc::new(ArrowField::new("v", DataType::Boolean, false));
+        let decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let out = decoder.plan_decoded_bytes(100).unwrap();
+        // candidate[0]=1 row → 1 bit → div_ceil(1,8) = 1 byte
+        assert_eq!(out[0], 1, "1 bit rounds up to 1 byte");
+        // candidate[1]=4 rows → 4 bits → div_ceil(4,8) = 1 byte
+        assert_eq!(out[1], 1, "4 bits rounds up to 1 byte");
+        // candidate[2]=16 rows → 16 bits → div_ceil(16,8) = 2 bytes
+        assert_eq!(out[2], 2, "16 bits = 2 bytes");
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_does_not_consume_pages() {
+        use crate::decoder::{LoadedPageShard, StructuralFieldDecoder, StructuralPageDecoder};
+        use std::collections::VecDeque;
+
+        let field = Arc::new(ArrowField::new("v", DataType::Int32, false));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        // Inject a mock page with 100 rows (SimpleAllNullPageDecoder is pub and available)
+        let mock_page: Box<dyn StructuralPageDecoder> =
+            Box::new(super::SimpleAllNullPageDecoder { num_rows: 100 });
+        decoder
+            .accept_page(LoadedPageShard {
+                decoder: mock_page,
+                path: VecDeque::new(),
+            })
+            .unwrap();
+
+        // Planning must not advance the page cursor
+        let _ = decoder.plan_decoded_bytes(100).unwrap();
+
+        // After planning, drain must still produce 64 rows from the page
+        let task = decoder.drain(64).unwrap();
+        let decoded = task.decode().unwrap();
+        assert_eq!(
+            decoded.array.len(),
+            64,
+            "drain after plan_decoded_bytes must return correct row count"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Commit 3: variable-width decoded_bytes tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_variable_full_zip_decoded_bytes_uniform() {
+        use crate::decoder::StructuralPageDecoder;
+        // 5 rows, each with 10 bytes of payload.
+        // In-memory layout after unzip (32-bit offsets):
+        //   data_bytes = 5 * 10 = 50
+        //   offset_bytes = 5 * 4 (one offset per visible row) + 4 (sentinel) = 24
+        // But decoded_bytes(n) reports bytes for the *next* n rows from current_idx=0.
+        // For n=1: data = 10, offsets = 4 (row 0 offset) + 4 (sentinel) = 8 → total 18.
+        let values: Vec<Vec<u8>> = (0..5).map(|_| vec![0xABu8; 10]).collect();
+        let decoder = build_variable_full_zip(5, &values);
+
+        // n=1: one offset entry (4 bytes) + sentinel (4 bytes) + 10 data bytes = 18
+        let b1 = decoder.decoded_bytes(1).unwrap();
+        assert_eq!(b1, 10 + 4 + 4, "1 row: data=10, offsets=4+sentinel4");
+
+        // n=3: 3 offset entries (12 bytes) + sentinel (4 bytes) + 30 data bytes = 46
+        let b3 = decoder.decoded_bytes(3).unwrap();
+        assert_eq!(b3, 30 + 3 * 4 + 4, "3 rows: data=30, offsets=3*4+4");
+    }
+
+    #[test]
+    fn test_variable_full_zip_decoded_bytes_varying_sizes() {
+        use crate::decoder::StructuralPageDecoder;
+        // Alternate: row 0 = 5 bytes, row 1 = 500 bytes.
+        // Verify exact per-row counts, not averages.
+        let values: Vec<Vec<u8>> = vec![vec![0u8; 5], vec![0u8; 500]];
+        let decoder = build_variable_full_zip(2, &values);
+
+        // n=1: only row 0 → data=5, offsets=4+4=8 → total 13
+        let b1 = decoder.decoded_bytes(1).unwrap();
+        assert_eq!(b1, 5 + 4 + 4, "row 0 only: data=5 + 2 offsets");
+
+        // n=2: both rows → data=505, offsets=2*4+4=12 → total 517
+        let b2 = decoder.decoded_bytes(2).unwrap();
+        assert_eq!(b2, 505 + 2 * 4 + 4, "rows 0+1: data=505 + 3 offsets");
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_variable_width_rows_remaining_clamping() {
+        use crate::decoder::{LoadedPageShard, StructuralFieldDecoder};
+        use std::collections::VecDeque;
+
+        let field = Arc::new(ArrowField::new("s", DataType::Utf8, false));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        // 5 rows of uniform 10-byte strings.
+        let values: Vec<Vec<u8>> = (0..5).map(|_| vec![0xABu8; 10]).collect();
+        let page: Box<dyn crate::decoder::StructuralPageDecoder> =
+            Box::new(build_variable_full_zip(5, &values));
+        decoder
+            .accept_page(LoadedPageShard {
+                decoder: page,
+                path: VecDeque::new(),
+            })
+            .unwrap();
+
+        // rows_remaining = 3: candidates 4..8 (256+) are all clamped to 3 rows.
+        let out = decoder.plan_decoded_bytes(3).unwrap();
+        let bytes_for_3 = out[2]; // candidate[2]=16, clamped to 3
+        // candidates >= 16 are all clamped to 3
+        for &bytes in out[2..].iter() {
+            assert_eq!(bytes, bytes_for_3, "candidate should equal bytes_for_3");
+        }
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_does_not_consume_pages_variable() {
+        use crate::decoder::{LoadedPageShard, StructuralFieldDecoder};
+        use std::collections::VecDeque;
+
+        let field = Arc::new(ArrowField::new("s", DataType::Utf8, false));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        // 100 rows of 10-byte strings.
+        let values: Vec<Vec<u8>> = (0..100).map(|_| vec![0x41u8; 10]).collect();
+        let page: Box<dyn crate::decoder::StructuralPageDecoder> =
+            Box::new(build_variable_full_zip(100, &values));
+        decoder
+            .accept_page(LoadedPageShard {
+                decoder: page,
+                path: VecDeque::new(),
+            })
+            .unwrap();
+
+        // Planning must not consume rows from the page.
+        let _ = decoder.plan_decoded_bytes(100).unwrap();
+
+        // Drain the first 10 rows and decode — must succeed and return correct count.
+        let task = decoder.drain(10).unwrap();
+        let decoded = task.decode().unwrap();
+        assert_eq!(decoded.array.len(), 10, "10 rows must still be drainable");
     }
 
     fn decode_variable_full_zip(
