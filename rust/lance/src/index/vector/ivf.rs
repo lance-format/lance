@@ -3151,9 +3151,13 @@ where
             let _ = progress_tx.send(total);
         })
     };
-    let kmeans_params = KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
-        .with_balance_factor(1.0)
-        .with_on_progress(on_progress);
+    let mut kmeans_params =
+        KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
+            .with_balance_factor(1.0)
+            .with_on_progress(on_progress);
+    if let Some(seed) = params.kmeans_seed {
+        kmeans_params = kmeans_params.with_seed(seed);
+    }
     let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
         data,
         kmeans_params,
@@ -3527,6 +3531,7 @@ struct KMeansStepOptions {
     sample_rate: usize,
     max_iters: usize,
     on_progress: KMeansProgressCallback,
+    kmeans_seed: Option<u64>,
 }
 
 fn train_ivf_kmeans_step<T: ArrowPrimitiveType>(
@@ -3543,6 +3548,9 @@ where
         KMeansParams::new(centroids, options.max_iters as u32, 1, options.metric_type)
             .with_balance_factor(1.0)
             .with_on_progress(options.on_progress.clone());
+    if let Some(seed) = options.kmeans_seed {
+        kmeans_params = kmeans_params.with_seed(seed);
+    }
     if has_centroids {
         // Incremental refinement already has the full centroid set.  The
         // hierarchical trainer bootstraps a smaller tree and is only suitable
@@ -3561,37 +3569,24 @@ where
 fn train_ivf_kmeans_step_arrow_array_no_loss(
     centroids: Option<Arc<FixedSizeListArray>>,
     data: &FixedSizeListArray,
-    metric_type: MetricType,
-    num_partitions: usize,
-    sample_rate: usize,
-    max_iters: usize,
-    on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
+    options: KMeansStepOptions,
 ) -> Result<KMeans> {
-    let dimension = data.value_length() as usize;
     let values = data.values();
-    let step_options = KMeansStepOptions {
-        dimension,
-        metric_type,
-        num_partitions,
-        sample_rate,
-        max_iters,
-        on_progress,
-    };
-    let kmeans = match (values.data_type(), metric_type) {
+    let kmeans = match (values.data_type(), options.metric_type) {
         (DataType::Float16, _) => train_ivf_kmeans_step::<Float16Type>(
             centroids,
             values.as_primitive::<Float16Type>(),
-            &step_options,
+            &options,
         )?,
         (DataType::Float32, _) => train_ivf_kmeans_step::<Float32Type>(
             centroids,
             values.as_primitive::<Float32Type>(),
-            &step_options,
+            &options,
         )?,
         (DataType::Float64, _) => train_ivf_kmeans_step::<Float64Type>(
             centroids,
             values.as_primitive::<Float64Type>(),
-            &step_options,
+            &options,
         )?,
         (DataType::Int8, DistanceType::L2)
         | (DataType::Int8, DistanceType::Dot)
@@ -3600,18 +3595,18 @@ fn train_ivf_kmeans_step_arrow_array_no_loss(
             train_ivf_kmeans_step::<Float32Type>(
                 centroids,
                 data.values().as_primitive::<Float32Type>(),
-                &step_options,
+                &options,
             )?
         }
         (DataType::UInt8, DistanceType::Hamming) => train_ivf_kmeans_step::<UInt8Type>(
             centroids,
             values.as_primitive::<UInt8Type>(),
-            &step_options,
+            &options,
         )?,
         _ => Err(Error::index(format!(
             "KMeans: can not train data type {} with distance type: {}",
             values.data_type(),
-            metric_type
+            options.metric_type
         )))?,
     };
     Ok(kmeans)
@@ -4169,18 +4164,20 @@ fn append_local_coreset(
     local_k: usize,
     max_iters: usize,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
+    kmeans_seed: Option<u64>,
 ) -> Result<()> {
     let dimension = data.value_length() as usize;
     let sample_rate = data.len().div_ceil(local_k).max(1);
-    let kmeans = train_ivf_kmeans_step_arrow_array_no_loss(
-        None,
-        data,
+    let options = KMeansStepOptions {
+        dimension,
         metric_type,
-        local_k,
+        num_partitions: local_k,
         sample_rate,
         max_iters,
         on_progress,
-    )?;
+        kmeans_seed,
+    };
+    let kmeans = train_ivf_kmeans_step_arrow_array_no_loss(None, data, options)?;
     let centroids = FixedSizeListArray::try_new_from_values(kmeans.centroids, dimension as i32)?;
     let kmeans =
         KMeans::with_centroids(centroids.values().clone(), dimension, metric_type, f64::MAX);
@@ -4588,6 +4585,7 @@ async fn train_streaming_coreset_ivf_model(
                 local_k,
                 params.max_iters,
                 on_progress.clone(),
+                params.kmeans_seed,
             )?;
             coreset.append(chunk_coreset);
             coreset.reduce_to_budget(dimension, coreset_budget);
@@ -4774,14 +4772,19 @@ async fn train_streaming_ivf_model(
                 );
             }
 
+            let options = KMeansStepOptions {
+                dimension: training_data.value_length() as usize,
+                metric_type: mt,
+                num_partitions,
+                sample_rate: step_sample_rate,
+                max_iters: params.max_iters,
+                on_progress: on_progress.clone(),
+                kmeans_seed: params.kmeans_seed,
+            };
             let kmeans = train_ivf_kmeans_step_arrow_array_no_loss(
                 centroids.clone(),
                 &training_data,
-                mt,
-                num_partitions,
-                step_sample_rate,
-                params.max_iters,
-                on_progress.clone(),
+                options,
             )?;
             let trained_centroids = Arc::new(FixedSizeListArray::try_new_from_values(
                 kmeans.centroids,

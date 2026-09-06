@@ -39,6 +39,12 @@ pub struct IvfBuildParams {
 
     pub sample_rate: usize,
 
+    /// Optional seed for k-means centroid initialization.
+    ///
+    /// `None` initializes from OS entropy, while `Some(seed)` makes centroid
+    /// selection reproducible for the same training data and parameters.
+    pub kmeans_seed: Option<u64>,
+
     /// Optional per-step sample rate for streaming IVF kmeans training.
     ///
     /// When set, IVF training loads at most `num_partitions * streaming_sample_rate`
@@ -94,6 +100,7 @@ impl Default for IvfBuildParams {
             centroids: None,
             retrain: false,
             sample_rate: 256, // See faiss
+            kmeans_seed: None,
             streaming_sample_rate: None,
             streaming_coreset_rate: None,
             streaming_refine_passes: 0,

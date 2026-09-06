@@ -468,6 +468,7 @@ pub fn get_vector_index_params(
                         kmeans_redos,
                         codebook,
                         sample_rate,
+                        kmeans_seed: None,
                     })
                 },
             )?;

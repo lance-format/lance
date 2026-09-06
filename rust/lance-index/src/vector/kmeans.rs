@@ -92,6 +92,12 @@ pub struct KMeansParams {
 
     /// Optional sync callback for iteration progress: (current_iteration, max_iterations).
     pub on_progress: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
+
+    /// Optional seed for random centroid initialization.
+    ///
+    /// `None` initializes from OS entropy, while `Some(seed)` makes centroid
+    /// selection reproducible for the same training data and parameters.
+    pub seed: Option<u64>,
 }
 
 impl std::fmt::Debug for KMeansParams {
@@ -105,6 +111,7 @@ impl std::fmt::Debug for KMeansParams {
             .field("balance_factor", &self.balance_factor)
             .field("hierarchical_k", &self.hierarchical_k)
             .field("on_progress", &self.on_progress.as_ref().map(|_| "..."))
+            .field("seed", &self.seed)
             .finish()
     }
 }
@@ -120,6 +127,7 @@ impl Default for KMeansParams {
             balance_factor: 0.0,
             hierarchical_k: 16,
             on_progress: None,
+            seed: None,
         }
     }
 }
@@ -156,6 +164,12 @@ impl KMeansParams {
 
     pub fn with_on_progress(mut self, cb: Arc<dyn Fn(u32, u32) + Send + Sync>) -> Self {
         self.on_progress = Some(cb);
+        self
+    }
+
+    /// Set the seed used for random centroid initialization.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
         self
     }
 
@@ -927,8 +941,10 @@ impl KMeans {
         let mut cluster_sizes = vec![0; k];
         let mut adjusted_balance_factor = f32::MAX;
 
-        // TODO: use seed for Rng.
-        let mut rng = SmallRng::from_os_rng();
+        let mut rng = match params.seed {
+            Some(seed) => SmallRng::seed_from_u64(seed),
+            None => SmallRng::from_os_rng(),
+        };
         for redo in 1..=params.redos {
             let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
@@ -1848,6 +1864,32 @@ mod tests {
             first.centroids.as_primitive::<Float32Type>().values(),
             second.centroids.as_primitive::<Float32Type>().values(),
         );
+    }
+
+    #[test]
+    fn test_seeded_initialization_is_reproducible() {
+        const DIM: usize = 4;
+        const K: usize = 8;
+        const NUM_ROWS: usize = 64;
+
+        let values = Float32Array::from_iter_values(
+            (0..NUM_ROWS * DIM).map(|value| ((value * 37) % 101) as f32),
+        );
+        let data = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let train = || {
+            // Keep this to one iteration to isolate the seeded initialization
+            // from floating-point ordering in later parallel reductions.
+            let params = KMeansParams::new(None, 1, 1, DistanceType::L2).with_seed(42);
+            KMeans::new_with_params(&data, K, &params).unwrap()
+        };
+
+        let first = train();
+        let second = train();
+        assert_eq!(
+            first.centroids.as_primitive::<Float32Type>().values(),
+            second.centroids.as_primitive::<Float32Type>().values()
+        );
+        assert_eq!(first.loss, second.loss);
     }
 
     #[tokio::test]

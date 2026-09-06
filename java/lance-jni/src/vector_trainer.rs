@@ -78,6 +78,7 @@ fn build_pq_params_from_java(
         kmeans_redos,
         codebook: None,
         sample_rate,
+        kmeans_seed: None,
     })
 }
 
