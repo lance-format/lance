@@ -3659,7 +3659,8 @@ mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatchIterator, StringArray,
+        ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, RecordBatchIterator,
+        StringArray,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ID;
@@ -5506,6 +5507,77 @@ mod tests {
         );
     }
 
+    /// The dataset declares `payload` non-nullable, so the blank restored for the
+    /// deleted row cannot be a null no matter how the update stream marks the field.
+    /// `test_write_schema_controls_blank_nullability` in `updater.rs` pins the value
+    /// itself; what matters here is that the rewritten data file still accounts for
+    /// every physical row, which is what `validate` checks.
+    #[tokio::test]
+    async fn test_update_columns_respects_dataset_nullability() {
+        let dataset_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("payload", DataType::Binary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            dataset_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(BinaryArray::from(vec![&b"a"[..], &b"b"[..], &b"c"[..]])),
+            ],
+        )
+        .unwrap();
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], dataset_schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id = 2").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Update streams commonly carry nullable Arrow fields even when the dataset
+        // field is non-nullable.
+        let right_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("payload", DataType::Binary, true),
+        ]));
+        let right = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 3])),
+                Arc::new(BinaryArray::from(vec![&b"A"[..], &b"C"[..]])),
+            ],
+        )
+        .unwrap();
+
+        let mut fragment = dataset.get_fragments().pop().unwrap();
+        let (updated, _) = fragment
+            .update_columns(
+                RecordBatchIterator::new([Ok(right)], right_schema),
+                "id",
+                "id",
+            )
+            .await
+            .unwrap();
+
+        // `payload` moved to a new file, leaving a tombstone behind in the old one.
+        let layout = updated
+            .files
+            .iter()
+            .map(|file| file.fields.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(layout, vec![vec![0, -2], vec![1]]);
+        FileFragment::new(dataset, updated)
+            .validate()
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_fragment_update() {
         let test_dir = TempStrDir::default();
@@ -6560,6 +6632,116 @@ mod tests {
             message.contains(&format!("fragment {fragment_id}")),
             "message should name the fragment: {message}"
         );
+    }
+
+    /// Stopping early is diagnosed as unread input, not as unmaterialized deletions:
+    /// the caller's remedy is to keep polling, not to run compaction. `finish` probes the
+    /// stream before consulting the restorer for exactly that reason -- otherwise which
+    /// message a caller saw would depend only on where the deletions happened to fall.
+    #[tokio::test]
+    async fn test_updater_finish_rejects_stopping_early() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        dataset.delete("i >= 5 AND i < 40").await?;
+
+        let fragment_id = dataset.manifest.fragments[0].id;
+        let fragment = dataset.get_fragment(fragment_id as usize).unwrap();
+        let mut updater = fragment.updater(Some(&["i"]), None, Some(5), None).await?;
+
+        let num_rows = updater.next().await?.unwrap().num_rows();
+        assert_eq!(num_rows, 5);
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "double_i",
+            DataType::Int32,
+            true,
+        )]));
+        updater
+            .update(RecordBatch::try_new(
+                new_schema,
+                vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+            )?)
+            .await?;
+
+        let err = updater.finish().await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("cannot finish"), "{message}");
+        assert!(message.contains("unread input batches"), "{message}");
+        assert!(
+            !message.contains("run compaction"),
+            "stopping early is not a compaction problem: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_updater_rejects_unpaired_and_unread_batches() -> Result<()> {
+        let test_dir = TempStrDir::default();
+        let dataset = create_dataset(&test_dir, LanceFileVersion::Stable).await;
+        let fragment = dataset.get_fragment(0).unwrap();
+        let mut updater = fragment.updater(Some(&["i"]), None, Some(5), None).await?;
+
+        let num_rows = updater.next().await?.unwrap().num_rows();
+        assert_eq!(num_rows, 5);
+
+        let error = updater.next().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("previous input batch"),
+            "{error}"
+        );
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "double_i",
+            DataType::Int32,
+            false,
+        )]));
+        let output = RecordBatch::try_new(
+            output_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows as i32))],
+        )?;
+        updater.update(output.clone()).await?;
+
+        let error = updater.update(output).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("no input data"), "{error}");
+
+        let error = updater.finish().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("unread input batches"),
+            "{error}"
+        );
+
+        // Probing must not consume a batch. In particular, repeatedly calling
+        // `finish` cannot walk the stream to its end and commit a short file.
+        let repeated = updater.finish().await.unwrap_err();
+        assert!(
+            repeated.to_string().contains("unread input batches"),
+            "{repeated}"
+        );
+
+        let mut rows_written = num_rows;
+        while let Some(input) = updater.next().await? {
+            if rows_written == num_rows {
+                let values = arrow_array::cast::as_primitive_array::<arrow_array::types::Int32Type>(
+                    input.column_by_name("i").unwrap().as_ref(),
+                );
+                assert_eq!(values.value(0), 5);
+            }
+            let rows = input.num_rows();
+            updater
+                .update(RecordBatch::try_new(
+                    output_schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(0..rows as i32))],
+                )?)
+                .await?;
+            rows_written += rows;
+        }
+        assert_eq!(rows_written, 40);
+        let updated = updater.finish().await?;
+        assert_eq!(updated.files.len(), 2);
+        Ok(())
     }
 
     #[rstest]
