@@ -468,7 +468,7 @@ impl HNSW {
             bitset,
             &mut visited_generator,
             storage,
-            Some(2),
+            self.inner.params.prefetch_distance,
         );
 
         match self.inner.visited_generator_queue.push(visited_generator) {
@@ -510,7 +510,7 @@ impl HNSW {
             &mut visited_generator,
             &mut expanded_generator,
             storage,
-            Some(2),
+            self.inner.params.prefetch_distance,
         );
 
         // if the queue is full, we just don't push it back, so ignore the error here
@@ -3021,5 +3021,192 @@ mod tests {
             loaded.deep_size_of(),
             builder.deep_size_of(),
         );
+    }
+
+    /// Wraps [FlatFloatStorage] so tests can observe whether the search path
+    /// issued prefetches, which is otherwise invisible in the results.
+    #[derive(Clone)]
+    struct PrefetchCountingStorage {
+        inner: FlatFloatStorage,
+        prefetch_calls: Arc<AtomicUsize>,
+    }
+
+    struct PrefetchCountingCalc<'a> {
+        inner: <FlatFloatStorage as VectorStore>::DistanceCalculator<'a>,
+        prefetch_calls: &'a AtomicUsize,
+    }
+
+    impl DistCalculator for PrefetchCountingCalc<'_> {
+        fn distance(&self, id: u32) -> f32 {
+            self.inner.distance(id)
+        }
+
+        fn distance_all(&self, k_hint: usize) -> Vec<f32> {
+            self.inner.distance_all(k_hint)
+        }
+
+        fn prefetch(&self, id: u32) {
+            self.prefetch_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.prefetch(id);
+        }
+    }
+
+    impl VectorStore for PrefetchCountingStorage {
+        type DistanceCalculator<'a> = PrefetchCountingCalc<'a>;
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> &arrow_schema::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch> + Send> {
+            self.inner.to_batches()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn distance_type(&self) -> DistanceType {
+            self.inner.distance_type()
+        }
+
+        fn row_id(&self, id: u32) -> u64 {
+            self.inner.row_id(id)
+        }
+
+        fn row_ids(&self) -> impl Iterator<Item = &u64> {
+            self.inner.row_ids()
+        }
+
+        fn append_batch(&self, _batch: RecordBatch, _vector_column: &str) -> Result<Self> {
+            unreachable!("not used by search tests")
+        }
+
+        fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
+            PrefetchCountingCalc {
+                inner: self.inner.dist_calculator(query, dist_q_c),
+                prefetch_calls: &self.prefetch_calls,
+            }
+        }
+
+        fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+            PrefetchCountingCalc {
+                inner: self.inner.dist_calculator_from_id(id),
+                prefetch_calls: &self.prefetch_calls,
+            }
+        }
+    }
+
+    /// `search_basic` used to hardcode its bottom-level prefetch distance to
+    /// `Some(2)`, so `prefetch_distance: None` silently kept prefetching
+    /// (issue #8275). The counting storage observes what the results cannot.
+    #[rstest]
+    #[case::disabled(None, false)]
+    #[case::enabled(Some(2), true)]
+    fn test_search_basic_honors_prefetch_distance(
+        #[case] prefetch_distance: Option<usize>,
+        #[case] expect_prefetch: bool,
+    ) {
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let storage = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &storage,
+            HnswBuildParams {
+                prefetch_distance,
+                ..HnswBuildParams::default()
+            },
+        )
+        .unwrap();
+
+        let counting = PrefetchCountingStorage {
+            inner: storage,
+            prefetch_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let results = hnsw
+            .search_basic(
+                fsl.value(0),
+                10,
+                &HnswQueryParams {
+                    ef: 50,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn: false,
+                },
+                None,
+                &counting,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 10);
+        assert_eq!(
+            counting.prefetch_calls.load(Ordering::Relaxed) > 0,
+            expect_prefetch
+        );
+    }
+
+    /// Prefetch is a pure cache hint: any distance (and any `do_prefetch`
+    /// internals, such as its cache-line cap) must leave results identical.
+    #[test]
+    fn test_prefetch_distance_does_not_change_results() {
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        const K: usize = 10;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let storage = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(&storage, HnswBuildParams::default()).unwrap();
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+
+        let mut visited_generator = VisitedGenerator::new(storage.len());
+        let baseline: Vec<(u32, f32)> = hnsw
+            .search_inner(
+                fsl.value(1),
+                K,
+                &params,
+                None,
+                &mut visited_generator,
+                &storage,
+                None,
+            )
+            .unwrap()
+            .iter()
+            .map(|node| (node.id, node.dist.0))
+            .collect();
+
+        for prefetch_distance in [Some(1), Some(2), Some(64)] {
+            let with_prefetch: Vec<(u32, f32)> = hnsw
+                .search_inner(
+                    fsl.value(1),
+                    K,
+                    &params,
+                    None,
+                    &mut visited_generator,
+                    &storage,
+                    prefetch_distance,
+                )
+                .unwrap()
+                .iter()
+                .map(|node| (node.id, node.dist.0))
+                .collect();
+            assert_eq!(
+                baseline, with_prefetch,
+                "results changed with prefetch_distance={prefetch_distance:?}"
+            );
+        }
     }
 }
