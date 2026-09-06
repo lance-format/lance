@@ -553,8 +553,8 @@ impl FieldEncoder for StructFieldEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        self.num_rows_seen += array.len() as u64;
         let struct_array = array.as_struct();
+        self.num_rows_seen += array.len() as u64;
         let child_tasks = self
             .children
             .iter_mut()

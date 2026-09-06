@@ -60,7 +60,11 @@ def test_nullability(tmp_path, data_storage_version):
         schema=outer_nullable,
         data_storage_version=data_storage_version,
     )
-    can_write({"point": [None]}, dataset, outer_nullable)
+    if data_storage_version == "2.0":
+        with pytest.raises(OSError, match="does not encode struct validity"):
+            can_write({"point": [None]}, dataset, outer_nullable)
+    else:
+        can_write({"point": [None]}, dataset, outer_nullable)
     cannot_write({"point": [{"x": None}]}, dataset, outer_nullable)
 
     inner_nullable = pa.schema(

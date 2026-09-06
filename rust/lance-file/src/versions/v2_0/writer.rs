@@ -6,11 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_data::ArrayData;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
-use lance_core::datatypes::{Field, Schema as LanceSchema};
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::PageEncoding;
@@ -309,34 +308,17 @@ impl Writer {
         Ok(())
     }
 
-    /// Reject a null in a non-nullable field whether or not a null ancestor
-    /// masks it: the 2.0 logical encoders cannot store such a slot. The 2.1+
-    /// structural writer counts only visible nulls
-    /// (`writer::structural::FileWriter::verify_field_nullability`).
-    fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
-        if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!(
-                "The field `{}` contained null values even though the field is marked non-null in the schema",
-                field.name
-            )));
-        }
-
-        for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
-            Self::verify_field_nullability(child_arr, child_field)?;
-        }
-
-        Ok(())
-    }
-
-    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
-        for (col, field) in batch
-            .columns()
-            .iter()
-            .zip(self.schema.as_ref().unwrap().fields.iter())
-        {
-            Self::verify_field_nullability(&col.to_data(), field)?;
-        }
-        Ok(())
+    fn prepare_field_arrays(
+        &mut self,
+        field_arrays: Vec<(usize, ArrayRef)>,
+    ) -> Result<Vec<(usize, ArrayRef)>> {
+        field_arrays
+            .into_iter()
+            .map(|(field_idx, array)| {
+                let array = self.column_writers[field_idx].prepare_array(array)?;
+                Ok((field_idx, array))
+            })
+            .collect()
     }
 
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
@@ -391,14 +373,8 @@ impl Writer {
         Ok(self.schema.as_ref().unwrap())
     }
 
-    #[instrument(skip_all, level = "debug")]
-    fn encode_batch(
-        &mut self,
-        batch: &RecordBatch,
-        external_buffers: &mut OutOfLineBuffers,
-    ) -> Result<Vec<Vec<EncodeTask>>> {
-        let field_arrays = self
-            .schema
+    fn field_arrays(&self, batch: &RecordBatch) -> Result<Vec<(usize, ArrayRef)>> {
+        self.schema
             .as_ref()
             .unwrap()
             .fields
@@ -417,8 +393,7 @@ impl Writer {
                         ))?;
                 Ok((field_idx, array.clone()))
             })
-            .collect::<Result<Vec<_>>>()?;
-        self.encode_columns(&field_arrays, external_buffers)
+            .collect()
     }
 
     // Encode a set of `(field index, array)` pairs, each advancing only its own
@@ -478,7 +453,8 @@ impl Writer {
             batch.get_array_memory_size()
         );
         self.ensure_initialized(batch)?;
-        self.verify_nullability_constraints(batch)?;
+        let field_arrays = self.field_arrays(batch)?;
+        let field_arrays = self.prepare_field_arrays(field_arrays)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
@@ -492,7 +468,7 @@ impl Writer {
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
         let mut external_buffers =
             OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
-        let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
+        let encoding_tasks = self.encode_columns(&field_arrays, &mut external_buffers)?;
         // Next, write external buffers
         for external_buffer in external_buffers.take_buffers() {
             Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
@@ -554,22 +530,22 @@ impl Writer {
                 "write_column requires the writer to be created with an explicit schema".into(),
             )
         })?;
-        let field = schema.fields.get(column_index).ok_or_else(|| {
-            Error::invalid_input_source(
+        if column_index >= schema.fields.len() {
+            return Err(Error::invalid_input_source(
                 format!(
                     "write_column: field index {} is out of bounds (schema has {} fields)",
                     column_index,
                     schema.fields.len()
                 )
                 .into(),
-            )
-        })?;
+            ));
+        }
         if array.len() as u64 > u32::MAX as u64 {
             return Err(Error::invalid_input_source(
                 "cannot write Lance files with more than 2^32 rows".into(),
             ));
         }
-        Self::verify_field_nullability(&array.to_data(), field)?;
+        let array = self.column_writers[column_index].prepare_array(array)?;
 
         // A never-advanced field simply remains a zero-length column, which the
         // encoders handle at `finish` time.
