@@ -73,6 +73,7 @@ use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
+use crate::dataset::overlay::writer::{OverlayWriter, WriteOverlayError};
 use crate::dataset::overlay::{
     OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
 };
@@ -718,10 +719,29 @@ fn duplicate_nested_path(data_type: &DataType, path: &str) -> Option<String> {
     }
 }
 
+/// Remove a staged file that will not be committed. Best effort: it is
+/// unreachable either way, and must not mask the error that caused it.
+pub(crate) async fn discard_staged_file(dataset: &Dataset, path: &Path) {
+    // Blob v2 spills sidecars into data/<file-stem>/ beside the file, and
+    // those are the large ones; leaving them is what makes a routine
+    // rejection expensive.
+    if let Some(stem) = path
+        .filename()
+        .and_then(|name| name.strip_suffix(".lance"))
+        .map(|stem| dataset.data_dir().join(stem))
+        && let Err(delete_error) = dataset.object_store.remove_dir_all(stem.clone()).await
+    {
+        log::warn!("failed to delete staged blob sidecars '{stem}': {delete_error}");
+    }
+    if let Err(delete_error) = dataset.object_store.delete(path).await {
+        log::warn!("failed to delete staged column file '{path}': {delete_error}");
+    }
+}
+
 /// `field` with nullability dropped at every level: the projector rebuilds
 /// arrays against its target and panics rather than reports on a constraint,
 /// so it gets a shape that cannot fail and the writer objects instead.
-fn relax_nullability(field: &ArrowField) -> ArrowField {
+pub(crate) fn relax_nullability(field: &ArrowField) -> ArrowField {
     let relax = |field: &Arc<ArrowField>| Arc::new(relax_nullability(field));
     let data_type = match field.data_type() {
         DataType::Struct(children) => DataType::Struct(children.iter().map(relax).collect()),
@@ -2274,25 +2294,6 @@ impl FileFragment {
         ))
     }
 
-    /// Remove a staged file that will not be returned. Best effort: it is
-    /// unreachable either way, and must not mask the error that caused it.
-    async fn discard_staged_file(&self, path: &Path) {
-        // Blob v2 spills sidecars into data/<file-stem>/ beside the file, and
-        // those are the large ones; leaving them is what makes a routine
-        // rejection expensive.
-        if let Some(stem) = path
-            .filename()
-            .and_then(|name| name.strip_suffix(".lance"))
-            .map(|stem| self.dataset.data_dir().join(stem))
-            && let Err(delete_error) = self.dataset.object_store.remove_dir_all(stem.clone()).await
-        {
-            log::warn!("failed to delete staged blob sidecars '{stem}': {delete_error}");
-        }
-        if let Err(delete_error) = self.dataset.object_store.delete(path).await {
-            log::warn!("failed to delete staged column file '{path}': {delete_error}");
-        }
-    }
-
     /// Write new data for columns of this fragment as a standalone data file,
     /// without committing it, and return the
     /// [`DataReplacementGroup`](super::transaction::DataReplacementGroup)
@@ -2326,72 +2327,7 @@ impl FileFragment {
     ) -> Result<super::transaction::DataReplacementGroup> {
         let expected_rows = self.physical_rows().await? as u64;
 
-        // Readers take everything but the field id from the manifest, so a
-        // staged field reusing an id is decoded as the manifest's version rather
-        // than rejected. Compare full identity, not just the storage type.
-        let compare_options = SchemaCompareOptions {
-            compare_field_ids: true,
-            ..Default::default()
-        };
-        // Top-level requests match top-level manifest fields only: resolving an
-        // id from anywhere lets a caller reuse a field at a path the dataset
-        // never gave it, staging a file covering the borrowed field. Layout then
-        // comes from the manifest, since the metadata the identity check ignores
-        // -- packed structs, blob encoding -- decides physical field coverage.
-        let dataset_schema = self.dataset.schema();
-        let mut writer_fields = Vec::with_capacity(schema.fields.len());
-        let mut requested = HashSet::with_capacity(schema.fields.len());
-        for field in &schema.fields {
-            // The per-field identity check cannot see the request naming an
-            // id twice, and the set-based batch comparison downstream would
-            // match one batch column against both copies.
-            if !requested.insert(field.id) {
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} names field id {} ('{}') more than once",
-                    self.id(),
-                    field.id,
-                    field.name
-                )));
-            }
-            if lance_core::is_system_column(&field.name) {
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} names reserved column '{}'",
-                    self.id(),
-                    field.name
-                )));
-            }
-            let Some(existing) = dataset_schema
-                .fields
-                .iter()
-                .find(|existing| existing.id == field.id)
-            else {
-                // The commit path publishes data files, never schema, so a
-                // field the manifest does not define would commit as a file no
-                // live field answers for -- and a concurrent schema change
-                // could never be checked against it.
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} names field id {} ('{}') that the dataset schema \
-                     does not define; declare the column with add_columns before staging its data",
-                    self.id(),
-                    field.id,
-                    field.name
-                )));
-            };
-            // `explain_difference` recurses, covering the whole subtree.
-            if let Some(difference) = field.explain_difference(existing, &compare_options) {
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} does not match dataset field id {}: {}",
-                    self.id(),
-                    field.id,
-                    difference
-                )));
-            }
-            writer_fields.push(existing.clone());
-        }
-        let writer_schema = Schema {
-            fields: writer_fields,
-            metadata: schema.metadata.clone(),
-        };
+        let writer_schema = self.resolve_writer_schema(schema)?;
         let batch_schema = ArrowSchema::from(&writer_schema);
         let projection_schema = ArrowSchema::new(
             batch_schema
@@ -2494,10 +2430,147 @@ impl FileFragment {
                 // The writer may still hold the file open (a buffered upload,
                 // an unflushed local handle); release it before deleting.
                 drop(writer);
-                self.discard_staged_file(&staged_path).await;
+                discard_staged_file(self.dataset.as_ref(), &staged_path).await;
                 Err(err)
             }
         }
+    }
+
+    /// Resolve the fields a staged file will carry against the manifest.
+    ///
+    /// Shared by [`Self::write_columns`] and [`Self::write_overlay`]: both stage
+    /// a data file that the commit path publishes without publishing schema, so
+    /// both need the same guarantee that every field is one the dataset already
+    /// defines, exactly as it defines it. Returns the manifest's own fields, so
+    /// physical layout comes from the manifest rather than from the request.
+    pub(crate) fn resolve_writer_schema(&self, schema: &Schema) -> Result<Schema> {
+        // Readers take everything but the field id from the manifest, so a
+        // staged field reusing an id is decoded as the manifest's version rather
+        // than rejected. Compare full identity, not just the storage type.
+        let compare_options = SchemaCompareOptions {
+            compare_field_ids: true,
+            ..Default::default()
+        };
+        // Top-level requests match top-level manifest fields only: resolving an
+        // id from anywhere lets a caller reuse a field at a path the dataset
+        // never gave it, staging a file covering the borrowed field. Layout then
+        // comes from the manifest, since the metadata the identity check ignores
+        // -- packed structs, blob encoding -- decides physical field coverage.
+        let dataset_schema = self.dataset.schema();
+        let mut writer_fields = Vec::with_capacity(schema.fields.len());
+        let mut requested = HashSet::with_capacity(schema.fields.len());
+        for field in &schema.fields {
+            // The per-field identity check cannot see the request naming an
+            // id twice, and the set-based batch comparison downstream would
+            // match one batch column against both copies.
+            if !requested.insert(field.id) {
+                return Err(Error::invalid_input(format!(
+                    "column data for fragment {} names field id {} ('{}') more than once",
+                    self.id(),
+                    field.id,
+                    field.name
+                )));
+            }
+            if lance_core::is_system_column(&field.name) {
+                return Err(Error::invalid_input(format!(
+                    "column data for fragment {} names reserved column '{}'",
+                    self.id(),
+                    field.name
+                )));
+            }
+            let Some(existing) = dataset_schema
+                .fields
+                .iter()
+                .find(|existing| existing.id == field.id)
+            else {
+                // The commit path publishes data files, never schema, so a
+                // field the manifest does not define would commit as a file no
+                // live field answers for -- and a concurrent schema change
+                // could never be checked against it.
+                return Err(Error::invalid_input(format!(
+                    "column data for fragment {} names field id {} ('{}') that the dataset schema \
+                     does not define; declare the column with add_columns before staging its data",
+                    self.id(),
+                    field.id,
+                    field.name
+                )));
+            };
+            // `explain_difference` recurses, covering the whole subtree.
+            if let Some(difference) = field.explain_difference(existing, &compare_options) {
+                return Err(Error::invalid_input(format!(
+                    "column data for fragment {} does not match dataset field id {}: {}",
+                    self.id(),
+                    field.id,
+                    difference
+                )));
+            }
+            writer_fields.push(existing.clone());
+        }
+        Ok(Schema {
+            fields: writer_fields,
+            metadata: schema.metadata.clone(),
+        })
+    }
+
+    /// Stage a data overlay supplying new values for a subset of this fragment's
+    /// cells, without rewriting its base data files.
+    ///
+    /// `schema` declares the fields the overlay may supply, by the dataset's own
+    /// field ids, exactly as [`Self::write_columns`] does. Values are then fed to
+    /// the returned writer keyed by `_rowaddr`; see [`OverlayWriter`] for the
+    /// ordering and coverage rules it enforces, and for how to finish or discard
+    /// what it stages.
+    ///
+    /// An overlay is the cheap way to fill a small fraction of a column: write
+    /// cost is proportional to the cells supplied, rows keep their addresses, and
+    /// no existing values are re-read to carry them forward. It costs a merge on
+    /// every later read of the cells it covers, so a dense fill of a whole column
+    /// is better served by [`Self::write_columns`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_array::RecordBatch;
+    /// # use futures::TryStreamExt;
+    /// # use lance::Dataset;
+    /// # use lance::dataset::transaction::Operation;
+    /// # use lance::dataset::WriteDestination;
+    /// # use lance_core::Result;
+    /// # async fn backfill(
+    /// #     dataset: Arc<Dataset>,
+    /// #     mut values: impl futures::TryStream<Ok = RecordBatch, Error = lance_core::Error> + Unpin,
+    /// #     field_id: i32,
+    /// # ) -> Result<()> {
+    /// let read_version = dataset.version().version;
+    /// let fragment = dataset.get_fragment(0).expect("fragment 0 exists");
+    /// let schema = dataset.schema().project_by_ids(&[field_id], true);
+    ///
+    /// let mut overlay = fragment.write_overlay(&schema).await?;
+    /// // Each batch carries `_rowaddr` plus the fields being filled, for the
+    /// // rows it has values for. Addresses must strictly ascend per field.
+    /// while let Some(batch) = values.try_next().await? {
+    ///     overlay.write_batch(&batch).await?;
+    /// }
+    ///
+    /// if let Some(group) = overlay.finish().await? {
+    ///     Dataset::commit(
+    ///         WriteDestination::Dataset(dataset),
+    ///         Operation::DataOverlay { groups: vec![group] },
+    ///         Some(read_version),
+    ///         None,
+    ///         None,
+    ///         Arc::new(Default::default()),
+    ///         false,
+    ///     )
+    ///     .await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_overlay(
+        &self,
+        schema: &Schema,
+    ) -> std::result::Result<OverlayWriter, WriteOverlayError> {
+        OverlayWriter::open(self.dataset.clone(), self, schema).await
     }
 
     /// Delete rows from the fragment.

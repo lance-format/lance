@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
 use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -1618,6 +1618,27 @@ pub trait GenericWriter: Send {
     /// Finish writing the file (flush the remaining data and write footer)
     async fn finish(&mut self) -> Result<(u32, DataFile)>;
 
+    /// Append `array` to a single top-level column, leaving the others where
+    /// they are.
+    ///
+    /// `column_index` is the column's position in the writer's schema. Columns
+    /// advance independently, so a file written this way can end with a
+    /// different number of rows in each column, and the row count
+    /// [`finish`](Self::finish) reports is then the longest column rather than a
+    /// count every column shares. That raggedness is the point: it is what lets
+    /// an overlay carry a different subset of cells per field. Callers that want
+    /// every column to stay aligned should use [`Self::write`] instead.
+    ///
+    /// Only supported on V2 files without blob preprocessing. This is a
+    /// defaulted method rather than a required one so that the writers which
+    /// cannot offer it -- and any implementor outside this crate -- keep
+    /// compiling and reject it at runtime instead.
+    async fn write_column(&mut self, _column_index: usize, _array: ArrayRef) -> Result<()> {
+        Err(Error::not_supported(
+            "writing a single column: this writer only accepts whole batches",
+        ))
+    }
+
     /// Add a global buffer to the current file. Returns the 1-based buffer index.
     /// Must be called before `finish`. No-op on legacy (V1) files (returns `Ok(1)`).
     async fn add_global_buffer(&mut self, _buffer: Bytes) -> Result<u32> {
@@ -1686,6 +1707,17 @@ impl GenericWriter for V2WriterAdapter {
             }
         }
         Ok(())
+    }
+    async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
+        if self.preprocessor.is_some() {
+            // The preprocessor rewrites a batch as a whole, splitting blob
+            // values out to a sidecar and replacing them with descriptions; it
+            // has no meaning applied to one column in isolation.
+            return Err(Error::not_supported(
+                "writing a single column: this file stores blob data in a sidecar",
+            ));
+        }
+        self.writer.write_column(column_index, array).await
     }
     fn data_file_path(&self) -> (&str, Option<u32>) {
         self.data_file

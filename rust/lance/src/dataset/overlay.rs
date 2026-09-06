@@ -34,6 +34,8 @@
 //! deleted row is simply dropped along with the row. This matches the spec with no
 //! special casing.
 
+pub mod writer;
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
