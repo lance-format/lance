@@ -3848,6 +3848,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
+        covering_columns: Optional[List[str]] = None,
         require_commit: bool = True,
         **kwargs,
     ) -> Index:
@@ -4176,6 +4177,9 @@ class LanceDataset(pa.dataset.Dataset):
         if rabitq_model is not None:
             kwargs["rabitq_model"] = rabitq_model
 
+        if covering_columns is not None:
+            kwargs["covering_columns"] = covering_columns
+
         # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing
         if fragment_ids is not None:
@@ -4236,6 +4240,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_coreset_rate: Optional[int] = None,
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
+        covering_columns: Optional[List[str]] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
     ) -> LanceDataset:
@@ -4305,6 +4310,13 @@ class LanceDataset(pa.dataset.Dataset):
             If True, the index will be trained on the data (e.g., compute IVF
             centroids, PQ codebooks). If False, an empty index structure will be
             created without training, which can be populated later.
+        covering_columns : List[str], optional
+            The columns to cover ("include") in the index. Their values are stored
+            inline in the index so a query projecting only covered columns is
+            answered from the index without a take from the base table. Each must
+            name a top-level, non-key column of the dataset; the columns are
+            validated by the core when the index is built. Vector indexes only.
+            None by default (no covering).
         fragment_ids : List[int], optional
             If provided, the index will be created only on the specified fragments.
             This enables distributed/fragment-level indexing. When provided, the
@@ -4471,6 +4483,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_coreset_rate=streaming_coreset_rate,
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
+            covering_columns=covering_columns,
             require_commit=True,
             **kwargs,
         )
@@ -4509,6 +4522,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
+        covering_columns: Optional[List[str]] = None,
         **kwargs,
     ) -> Index:
         """
@@ -4571,6 +4585,16 @@ class LanceDataset(pa.dataset.Dataset):
                     "create_index_uncommitted requires fragment_ids "
                     "for distributed index build"
                 )
+            # Covering columns are a vector-index feature. This branch builds a
+            # scalar segment and never reaches the vector params, so honouring
+            # covering_columns here is impossible -- reject it rather than return a
+            # segment with covering_fields == [] that the caller believes is covered.
+            if covering_columns:
+                raise ValueError(
+                    "covering_columns is only supported for vector indexes, but "
+                    f"index_type={index_type!r} builds a scalar index segment; "
+                    f"got covering_columns={covering_columns!r}"
+                )
 
             kwargs = dict(kwargs)
             column, rust_index_type, _ = self._prepare_scalar_index_request(
@@ -4617,6 +4641,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
             rabitq_model=rabitq_model,
+            covering_columns=covering_columns,
             require_commit=False,
             **kwargs,
         )

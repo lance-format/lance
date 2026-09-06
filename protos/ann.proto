@@ -25,6 +25,23 @@ enum VectorApproxMode {
   Accurate = 2;
 }
 
+// The covering ("included") index columns a query needs materialized, by name.
+//
+// Exists as a message rather than a bare `repeated string` because proto3 has no
+// presence tracking for repeated fields, and the empty list is a distinct, meaningful
+// state here:
+//
+// * absent: no narrowing computed; materialize every covering column declared.
+// * present and empty: materialize nothing, though the index does declare covering.
+// * present and non-empty: materialize exactly these.
+//
+// Collapsing "present, empty" into "absent" costs no correctness (a covering column is
+// semantically transparent -- its values otherwise arrive from a base-table read) but
+// silently restores full materialization on every distributed plan.
+message CoveringProjection {
+  repeated string columns = 1;
+}
+
 // Serialized vector query parameters.
 message VectorQueryProto {
   // Query vector as Arrow IPC bytes (supports Float16, Float32, Float64, UInt8, etc.)
@@ -46,6 +63,12 @@ message VectorQueryProto {
    * indexes, such as IVF_RQ. Other index types ignore this setting.
    */
   VectorApproxMode approx_mode = 14;
+  // Which covering columns the index must materialize for this query. Absent means
+  // "not computed" -- see CoveringProjection. Carried across the wire so a remote
+  // executor declares the same search output schema the planner did; without it the
+  // executor's node is wider than the plan it came from, and the surrounding nodes
+  // were built against the planner's narrower schema.
+  CoveringProjection covering_projection = 15;
 }
 
 /* Serializable form of ANNIvfSubIndexExec — the IVF sub-index search node.

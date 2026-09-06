@@ -282,6 +282,7 @@ async fn test_vector_filter_fts_search() {
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        covering_projection: None,
     };
 
     // Case 1: search with prefilter=true, query_filter=vector([300,300,300,300])

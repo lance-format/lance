@@ -17,6 +17,9 @@ import org.lance.index.DistanceType;
 
 import com.google.common.base.MoreObjects;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 
 /** Parameters for creating a vector index. */
@@ -27,6 +30,7 @@ public class VectorIndexParams {
   private final Optional<HnswBuildParams> hnswParams;
   private final Optional<SQBuildParams> sqParams;
   private final Optional<RQBuildParams> rqParams;
+  private final List<String> coveringColumns;
 
   private VectorIndexParams(Builder builder) {
     this.distanceType = builder.distanceType;
@@ -35,6 +39,10 @@ public class VectorIndexParams {
     this.hnswParams = builder.hnswParams;
     this.sqParams = builder.sqParams;
     this.rqParams = builder.rqParams;
+    this.coveringColumns =
+        builder.coveringColumns == null
+            ? Collections.emptyList()
+            : Collections.unmodifiableList(new ArrayList<>(builder.coveringColumns));
     validate();
   }
 
@@ -179,6 +187,7 @@ public class VectorIndexParams {
     private Optional<HnswBuildParams> hnswParams = Optional.empty();
     private Optional<SQBuildParams> sqParams = Optional.empty();
     private Optional<RQBuildParams> rqParams = Optional.empty();
+    private List<String> coveringColumns = Collections.emptyList();
 
     /**
      * Create a new builder to create a vector index.
@@ -235,6 +244,20 @@ public class VectorIndexParams {
       return this;
     }
 
+    /**
+     * Set the columns to cover ("include") in the index. Their values are stored inline in the
+     * index so a query projecting only covered columns is answered from the index without a take
+     * from the base table. Each must name a top-level, non-key column of the dataset; the columns
+     * are validated by the core when the index is built. Empty by default (no covering).
+     *
+     * @param coveringColumns the covering column names
+     * @return Builder
+     */
+    public Builder setCoveringColumns(List<String> coveringColumns) {
+      this.coveringColumns = coveringColumns;
+      return this;
+    }
+
     public VectorIndexParams build() {
       return new VectorIndexParams(this);
     }
@@ -268,6 +291,16 @@ public class VectorIndexParams {
     return rqParams;
   }
 
+  /**
+   * Get the covering ("included") columns whose values are stored inline in the index. Empty when
+   * the index has no covering columns.
+   *
+   * @return the covering column names, as an unmodifiable list
+   */
+  public List<String> getCoveringColumns() {
+    return coveringColumns;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -277,6 +310,7 @@ public class VectorIndexParams {
         .add("hnswParams", hnswParams.orElse(null))
         .add("sqParams", sqParams.orElse(null))
         .add("rqParams", rqParams.orElse(null))
+        .add("coveringColumns", coveringColumns)
         .toString();
   }
 }

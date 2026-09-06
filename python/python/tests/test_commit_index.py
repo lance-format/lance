@@ -279,8 +279,23 @@ def test_index_covering_fields_roundtrip(dataset_with_index, test_table, tmp_pat
 
     # Exercises indices.rs: the IndexMetadata -> PyIndexSegmentDescription
     # conversion used by describe_indices().
-    segment = dataset_without_index.describe_indices()[0].segments[0]
-    assert segment.covering_fields == [price_id]
+    desc = dataset_without_index.describe_indices()[0]
+    assert desc.segments[0].covering_fields == [price_id]
+
+    # The index-level view lifts the same declaration out of the segments and
+    # resolves it against the current schema.
+    assert desc.covering_fields == [price_id]
+    assert desc.covering_field_names == ["price"]
+    # The covering suffix is reported apart from the key: `fields` stays the
+    # keyed prefix so it never claims the index can answer queries on "price".
+    assert desc.fields == [meta_id]
+    assert desc.field_names == ["meta"]
+
+    # The repr has to carry the covering too, or `print(ds.describe_indices()[0])`
+    # renders a covered and an uncovered index identically.
+    rendered = repr(desc)
+    assert f"covering_fields=[{price_id}]" in rendered
+    assert 'covering_field_names=["price"]' in rendered
 
 
 def test_commit_index_rejects_invalid_covering_fields(dataset_with_index, tmp_path):
@@ -316,3 +331,55 @@ def test_commit_index_rejects_invalid_covering_fields(dataset_with_index, tmp_pa
             create_index_op,
             read_version=dataset_with_index.version,
         )
+
+
+def test_commit_index_tolerates_missing_covering_fields(
+    dataset_with_index, test_table, tmp_path
+):
+    """An Index pickled by a pre-covering lance has no `covering_fields` attribute.
+
+    The dataclass default is `field(default_factory=list)`, so pickle's
+    `__dict__`-only restore leaves nothing to fall back to -- the attribute is
+    simply absent. The PyO3 conversion must treat that as "uncovered" (empty),
+    like it already does for `index_details`, not abort the commit with an
+    AttributeError mid rolling upgrade.
+    """
+    from lance.dataset import Index
+
+    index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
+
+    dataset_without_index = lance.write_dataset(
+        test_table, tmp_path / "dataset_without_index"
+    )
+    src_index_dir = Path(dataset_with_index.uri) / "_indices" / index_id
+    dest_index_dir = Path(dataset_without_index.uri) / "_indices" / index_id
+    shutil.copytree(src_index_dir, dest_index_dir)
+
+    field_id = _get_field_id_by_name(dataset_without_index.lance_schema, "meta")
+    index = Index(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[field_id],
+        dataset_version=dataset_without_index.version,
+        fragment_ids=set(
+            [f.fragment_id for f in dataset_without_index.get_fragments()]
+        ),
+        index_version=0,
+    )
+    # Simulate the old-writer object: the attribute does not exist at all,
+    # which is different from `covering_fields=[]`.
+    delattr(index, "covering_fields")
+    assert not hasattr(index, "covering_fields")
+
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+    committed = lance.LanceDataset.commit(
+        dataset_without_index.uri,
+        create_index_op,
+        read_version=dataset_without_index.version,
+    )
+
+    described = committed.describe_indices()[0]
+    assert described.segments[0].covering_fields == []

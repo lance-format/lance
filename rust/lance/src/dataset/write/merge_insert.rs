@@ -50,6 +50,7 @@ use super::{
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
+use crate::dataset::{ProjectionRequest, TakeBuilder};
 use crate::index::DatasetIndexExt;
 use crate::{
     Dataset,
@@ -1520,6 +1521,337 @@ impl MergeInsertJob {
         self.create_full_table_joined_stream(source).await
     }
 
+    /// Names of `source_schema` columns this merge would update that are covered
+    /// ("included") by some index. Patching such a column in place makes the index's
+    /// materialized copy of it stale, which forces the commit to drop the whole updated
+    /// fragment from every index covering it; the partial-schema path therefore rewrites
+    /// those updates as row-moves, where it can, so that invalidation is confined to the
+    /// rows actually updated. See the branch in `execute_uncommitted_impl` for what that
+    /// does and does not buy, and `covered_move_blocker` for the cases that fall back to
+    /// the in-place patch. Join keys are matched, not updated, so they are excluded.
+    async fn covered_columns_updated(&self, source_schema: &Schema) -> Result<Vec<String>> {
+        // Only the update-matched modes actually patch matched rows into fragments;
+        // DoNothing / Fail leave matched rows untouched (Delete is handled separately
+        // and never reaches this path). Without this gate, a partial source carrying a
+        // covered payload under the default DoNothing + InsertAll would be wrongly
+        // flagged and rejected even though no covered column is ever patched in place.
+        if !matches!(
+            self.params.when_matched,
+            WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
+        ) {
+            return Ok(Vec::new());
+        }
+        let indices = self.dataset.load_indices().await?;
+        let covered: HashSet<i32> = indices
+            .iter()
+            .flat_map(|idx| idx.covering_fields.iter().copied())
+            .collect();
+        if covered.is_empty() {
+            return Ok(Vec::new());
+        }
+        let target = self.dataset.schema();
+        let keys: HashSet<&str> = self.params.on.iter().map(|s| s.as_str()).collect();
+        let mut updated = Vec::new();
+        for field in source_schema.fields() {
+            let name = field.name();
+            if keys.contains(name.as_str()) {
+                continue;
+            }
+            if let Some(tf) = target.field(name)
+                && covered.contains(&tf.id)
+            {
+                updated.push(name.clone());
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Why `rewrite_covered_update_as_move` cannot handle this merge, if it cannot.
+    ///
+    /// Every case below is a limitation of the *move*, never of the operation: the in-place
+    /// patch handles all of them, and it is correct for covered columns (see the caller --
+    /// the suffix-subset shape already drops the fragment from the index, so no stale copy
+    /// is reachable). The move is an optimisation, and an optimisation must not be able to
+    /// fail an operation that would otherwise succeed, so the caller logs this reason and
+    /// patches in place, forfeiting only confinement. Returns the reason so the log can name
+    /// it; the phrasing is a "because ..." clause.
+    fn covered_move_blocker(&self, source_schema: &Schema) -> Option<String> {
+        // The move would corrupt row identity. Moving a row to a new fragment must carry its
+        // stable row id along, and the full-schema `RewriteRows` path does exactly that -- it
+        // rechunks the merger's captured `row_id_sequence` onto the new fragments and stamps
+        // `row_id_meta` (see the `updating_row_ids` block in `execute_uncommitted_impl`).
+        // `rewrite_covered_update_as_move` has no such step, so the commit would reach
+        // `Transaction::assign_row_ids` and mint *fresh* ids for every moved row, silently
+        // breaking the one guarantee stable row ids exist to provide. The in-place patch moves
+        // no rows at all, so it preserves those ids by construction -- strictly safer here than
+        // the move, not less safe.
+        if self.dataset.manifest.uses_stable_row_ids() {
+            return Some(
+                "the move cannot carry stable row ids onto the new fragments (it has no \
+                 `row_id_sequence` rechunk step), while the in-place patch preserves them by \
+                 moving no rows"
+                    .into(),
+            );
+        }
+        // The move would delete rows the user never touched. With `insert_not_matched`,
+        // `Merger::execute_batch` pushes a *second* batch holding the unmatched (`left_only`)
+        // rows, projected with the row-address column appended. Those rows come from the left
+        // side of an outer join, so their `_rowaddr` is NULL. The move extracts addresses with
+        // `batch[ROW_ADDR].as_primitive::<UInt64Type>().values()`, which reads the raw value
+        // buffer and *ignores the null mask* -- so every inserted row would contribute a bogus
+        // address (in practice 0), used both to take the wrong row and, via `moved_addrs`, to
+        // tombstone it. Never entering the move prevents that as completely as refusing the
+        // merge did, and `update_fragments` already routes the NULL-`_rowaddr` group to
+        // `handle_new_fragments`.
+        if self.params.insert_not_matched {
+            return Some(
+                "the move reads row addresses through the null mask and would tombstone \
+                 unrelated rows for the unmatched (inserted) group, which arrives with a NULL \
+                 `_rowaddr`"
+                    .into(),
+            );
+        }
+        // The move re-reads full rows via a take, which materializes legacy (v1) blob columns
+        // as description structs, not binary -- writing those back would corrupt the blob. The
+        // full-schema path reads them as binary via the scan provider (`SomeBlobsBinary`); the
+        // take path has no equivalent. The in-place patch never reads the blob column at all.
+        //
+        // Scanning the *whole dataset schema* is deliberate, not sloppy. Do not narrow this to
+        // the covered or updated columns: the take reads every column, so an unrelated v1 blob
+        // elsewhere in the schema is corrupted just the same. In fact a covered column can
+        // never itself be a blob -- index creation rejects blob covering columns outright
+        // (`crate::index::vector`, the `covering_columns` validation) -- so this guard is
+        // entirely about the *collateral* columns the full-row take drags in. Narrowing it
+        // would therefore disable it completely and reintroduce the corruption.
+        if self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .any(|f| f.is_blob() && !f.is_blob_v2())
+        {
+            return Some(
+                "the move's full-row take reads legacy (v1) blob columns as description \
+                 structs rather than binary, which would corrupt them on write back"
+                    .into(),
+            );
+        }
+        // The move overlays each source column onto a full-row take by REPLACING the whole
+        // column, which needs the source column's Arrow type to equal the target's exactly:
+        // `replace_column_by_name` keeps the target schema and revalidates through
+        // `RecordBatch::try_new`. The partial-schema contract does not promise that. A source
+        // is admitted as a *subschema*, and `compare_fields` recurses with the same options,
+        // so a column may legally differ in its struct children, in nested nullability, or in
+        // nested field metadata -- all three are part of `DataType` and none is compared by
+        // the check that admitted the source. Note a field's OWN nullability is not part of
+        // its `DataType`, so the ordinary "nullable source, non-null target" partial update
+        // does not land here.
+        let target_arrow = Schema::from(self.dataset.schema());
+        let type_mismatched = source_schema
+            .fields()
+            .iter()
+            .filter(|f| {
+                target_arrow
+                    .field_with_name(f.name())
+                    .is_ok_and(|tf| tf.data_type() != f.data_type())
+            })
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>();
+        if !type_mismatched.is_empty() {
+            return Some(format!(
+                "the move replaces whole columns and source column(s) {type_mismatched:?} do \
+                 not have exactly the target's type (struct children, nested nullability or \
+                 nested metadata may differ)"
+            ));
+        }
+        None
+    }
+
+    /// Rewrite a partial-schema covered-column update as a row-move: read the full
+    /// existing rows for the touched addresses, overlay the updated columns, write
+    /// them as new fragments, and tombstone the originals. Only the moved rows leave
+    /// the index's reach; the rest of the fragment keeps its coverage, which is the
+    /// point of the move (a recall/cost property, not a correctness one -- see the
+    /// caller for why).
+    ///
+    /// `source` is the merger's partial output stream (`_rowaddr` + updated cols); it is consumed
+    /// in bounded batches so peak memory is one batch of full rows rather than the whole update.
+    /// Mirrors `dataset.update()`'s streamed `RewriteRows` move (`update.rs::execute_impl`).
+    /// Returns the resulting `RewriteRows` operation together with the moved rows' addresses, so
+    /// the caller can publish them as `affected_rows` and let a concurrent delete/update rebase
+    /// instead of hard-conflicting.
+    ///
+    /// Non-stable-row-id datasets only. The caller **falls back to the in-place path** for
+    /// stable-row-id datasets, insert-carrying combinations, legacy v1 blob columns, and
+    /// partial struct-subschema sources — it does not reject them. That fallback branch is
+    /// live and load-bearing, not dead code: the in-place path is correct for covered columns
+    /// (it drops the updated fragment from the index via `prune_updated_fields_from_indices`),
+    /// so this move is an optimisation that confines the bitmap damage, and an optimisation
+    /// must not be able to fail the operation. Restoring a hard rejection here would
+    /// re-break merge shapes that work today.
+    async fn rewrite_covered_update_as_move(
+        &self,
+        source: SendableRecordBatchStream,
+        target_bases_info: Option<Vec<TargetBaseInfo>>,
+    ) -> Result<(Operation, RoaringTreemap)> {
+        let full_schema = self.dataset.schema().clone();
+        // EVERY field id, leaves included (`fields_pre_order`), never just the
+        // top-level ids: the consumer
+        // (`register_pure_rewrite_rows_update_frags_in_indices`) treats this list
+        // as "fields whose values were updated" and compares it against each
+        // index's leaf-expanded dependency set -- its contract for a caller that
+        // cannot prove any field survived unchanged is to pass *every* field id.
+        // An index keyed on a nested field stores a leaf id that a top-level-only
+        // set does not contain, so it would escape the exclusion and have its
+        // bitmap wrongly extended onto the moved fragment. Both sibling row-move
+        // producers (`update.rs`, the insert exec) already expand to leaves for
+        // this exact reason.
+        let preserving: Vec<u32> = full_schema
+            .fields_pre_order()
+            .map(|f| f.id as u32)
+            .collect();
+        let empty_op = |fields_bitmap: Vec<u32>| Operation::Update {
+            removed_fragment_ids: Vec::new(),
+            updated_fragments: Vec::new(),
+            new_fragments: Vec::new(),
+            fields_modified: Vec::new(),
+            compacted_sstables: self.params.compacted_sstables.clone(),
+            fields_for_preserving_frag_bitmap: fields_bitmap,
+            update_mode: Some(RewriteRows),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+
+        // Per merger batch: take the full existing rows for its addresses and overlay the updated
+        // columns, streaming the result so peak memory is one batch of full rows rather than the
+        // whole update. On the partial-schema path the merger appends `_rowaddr` to its output
+        // (`Merger::output_schema`), so every batch names the originals to tombstone; the take's
+        // result is built from the dataset schema and never carries that column onward.
+        let dataset = self.dataset.clone();
+        let plan = Arc::new(
+            ProjectionRequest::from_schema(full_schema.clone())
+                .into_projection_plan(dataset.clone())?,
+        );
+        let out_arrow = Arc::new(Schema::from(&full_schema));
+
+        // Record which originals to tombstone as the overlay runs. `make_rowid_capture_stream` is
+        // deliberately not reused here: its `AddressStyle` capture bulk-loads a `RoaringTreemap`
+        // with `append`, which rejects any value <= the running maximum, so it is only safe on a
+        // stream whose addresses are strictly ascending. That holds today, but only as an accident
+        // of routing: this function is reachable only via the indexed-scan join (every other
+        // partial source goes to v2 -- see the caller), and that scan reads in fragment order, so
+        // addresses arrive ascending however the user ordered the source. Swapping this `extend`
+        // for `append` accordingly passes the covered suite, reversed source included. `extend` is
+        // kept anyway: it costs nothing, and it means a future routing or planner change cannot
+        // turn an ordering assumption into an abort that fires *after* fragments are written.
+        let moved_addrs = Arc::new(Mutex::new(RoaringTreemap::new()));
+        let moved_addrs_for_stream = moved_addrs.clone();
+        let out_arrow_for_stream = out_arrow.clone();
+        // `.then` processes one batch at a time (fully bounded); a small `.buffered(k)` could later
+        // pipeline the take of the next batch with the write of the current one.
+        let overlaid = source.then(move |batch| {
+            let dataset = dataset.clone();
+            let plan = plan.clone();
+            let moved_addrs = moved_addrs_for_stream.clone();
+            async move {
+                let batch = batch?;
+                let addresses: Vec<u64> = batch[ROW_ADDR]
+                    .as_primitive::<arrow::datatypes::UInt64Type>()
+                    .values()
+                    .to_vec();
+                let full_rows =
+                    TakeBuilder::try_new_from_addresses(dataset, addresses.clone(), plan)?
+                        .execute()
+                        .await?;
+                let mut overlaid = full_rows;
+                for field in batch.schema().fields() {
+                    let name = field.name();
+                    if name == ROW_ADDR || name == ROW_ID {
+                        continue;
+                    }
+                    let new_col = batch
+                        .column_by_name(name)
+                        .expect("updated column present in merger output")
+                        .clone();
+                    overlaid = overlaid.replace_column_by_name(name, new_col)?;
+                }
+                // Only after the take succeeded: a batch that never reaches the writer must not
+                // tombstone its originals.
+                moved_addrs
+                    .lock()
+                    .expect("covered move address set poisoned")
+                    .extend(addresses);
+                Ok::<_, DataFusionError>(overlaid)
+            }
+        });
+        let write_stream = Box::pin(RecordBatchStreamAdapter::new(
+            out_arrow_for_stream,
+            overlaid,
+        ));
+
+        // Write the moved rows as new fragments.
+        // Retain the target-base info: `write_fragments_internal` consumes it, but a later cleanup
+        // must still resolve fragments routed to external bases (otherwise `cleanup_data_fragments`
+        // skips every file with a `base_id`, orphaning it).
+        let bases_for_cleanup = target_bases_info.clone();
+        let (new_fragments, _) = write_fragments_internal(
+            self.dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_format(),
+            Some(&self.dataset),
+            self.dataset.object_store.clone(),
+            &self.dataset.base,
+            full_schema.clone(),
+            write_stream,
+            WriteParams::default(),
+            target_bases_info,
+        )
+        .await?;
+
+        // The overlay recorded every address it handed to the writer; the write above has now
+        // drained the stream, so the set is complete.
+        let removed_row_addrs = std::mem::take(
+            &mut *moved_addrs
+                .lock()
+                .expect("covered move address set poisoned"),
+        );
+        if removed_row_addrs.is_empty() {
+            // Nothing matched -> nothing written; return a no-op update.
+            return Ok((empty_op(preserving), RoaringTreemap::new()));
+        }
+
+        // Tombstone the originals.
+        let deletions = Self::apply_deletions(&self.dataset, &removed_row_addrs).await;
+        let (updated_fragments, removed_fragment_ids) = match deletions {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup_data_fragments(
+                    &self.dataset.object_store,
+                    &self.dataset.base,
+                    bases_for_cleanup.as_deref(),
+                    &new_fragments,
+                )
+                .await;
+                return Err(e);
+            }
+        };
+
+        Ok((
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                fields_modified: Vec::new(),
+                compacted_sstables: self.params.compacted_sstables.clone(),
+                fields_for_preserving_frag_bitmap: preserving,
+                update_mode: Some(RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            removed_row_addrs,
+        ))
+    }
+
     /// Patches the columns carried by `source` into the fragments that hold the
     /// rows it names, and writes the rows with no target address as new
     /// fragments.
@@ -2736,7 +3068,7 @@ impl MergeInsertJob {
         let joined = self.create_joined_stream(source).await?;
         let merger = Merger::try_new(
             self.params.clone(),
-            source_schema,
+            source_schema.clone(),
             !is_full_schema,
             self.dataset.manifest.uses_stable_row_ids(),
         )?;
@@ -2818,38 +3150,108 @@ impl MergeInsertJob {
                 return Err(Error::not_supported_source("Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data".into()));
             }
 
-            // We will have a different commit path here too, as we are modifying
-            // fragments rather than writing new ones
-            let PatchedFragments {
-                updated_fragments,
-                new_fragments,
-                fields_modified,
-                matched_offsets,
-            } = Self::update_fragments(
-                self.dataset.clone(),
-                Box::pin(stream),
-                self.dataset.manifest.version + 1,
-                target_bases_info,
-            )
-            .await?;
-
-            let operation = Operation::Update {
-                removed_fragment_ids: Vec::new(),
-                updated_fragments,
-                new_fragments,
-                fields_modified,
-                compacted_sstables: self.params.compacted_sstables.clone(),
-                fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
-                update_mode: Some(RewriteColumns),
-                inserted_rows_filter: None, // not implemented for v1
-                // The version stamped above is a guess; carry the patched offsets
-                // so `build_manifest` can re-stamp them at the real commit
-                // version after a rebase.
-                updated_fragment_offsets: Some(matched_offsets),
+            // A covered column's values are materialized in index storage, so patching one in
+            // place leaves that copy behind. Correctness is NOT what the row-move buys, and the
+            // comment here used to claim otherwise: `covering_fields` is stored as a suffix of
+            // `IndexMetadata::fields`, so `Transaction::index_dependent_leaf_ids` already counts
+            // a covered column as index-dependent and `prune_updated_fields_from_indices` drops
+            // the whole updated fragment from every index covering it. Disabling the move
+            // entirely leaves every covered correctness test in this module passing, both
+            // optimize variants included -- the stale copy is already unreachable, and no
+            // append-optimize failure mode could be reproduced.
+            //
+            // What the move buys is CONFINEMENT. That prune is all-or-nothing per fragment: one
+            // partial update evicts the ENTIRE fragment from the vector index, including rows the
+            // merge never matched, and the vectors are the expensive part to rebuild. The move
+            // tombstones only the matched rows and re-appends them, so the fragment keeps its
+            // coverage for everything else. Measured on the fixture in
+            // `test_covered_update_is_fresh_and_confines_index_invalidation`: with the move the
+            // index bitmap stays `{0, 1}` over fragments `[0, 1, 2]`; patched in place it
+            // collapses to `{0}`. A recall/cost property rather than a correctness one, then --
+            // and that test is the only thing pinning it.
+            //
+            // It also makes the two merge_insert paths AGREE, which is the stronger argument. A
+            // partial source only reaches this branch when every join key has a scalar index
+            // (`can_use_create_plan` routes the rest to v2), and v2's `create_plan` fills every
+            // missing dataset column from the target side and writes FULL rows -- already a
+            // row-move, already confining. Without this branch the same merge would invalidate a
+            // whole fragment or only the matched rows depending on whether an unrelated scalar
+            // index happened to exist on the join key.
+            //
+            // Known cost, deliberately not addressed here: there is no match-ratio heuristic, so
+            // when the matched rows are (nearly) a whole fragment the move rewrites every column
+            // including the vectors for zero confinement gain, where the in-place patch writes one
+            // column file for the same coverage outcome. Adding one is not cheap -- the strategy
+            // must be chosen before the stream is consumed, and the per-fragment match
+            // distribution is not known until the merger has run, so it would take either a
+            // pre-pass scan or buffering the whole merge, and the latter breaks the bounded-memory
+            // property this path is built around.
+            let covered = self.covered_columns_updated(source_schema.as_ref()).await?;
+            // The move cannot handle every merge (see `covered_move_blocker`). Because it is an
+            // optimisation over an already-correct in-place patch, a case it cannot handle
+            // degrades to that patch instead of failing the merge -- otherwise adding
+            // `covering_columns` to a vector index would silently delete merge_insert shapes that
+            // worked before, and only on the half of the routing that reaches this code at all.
+            let move_blocked = if covered.is_empty() {
+                None
+            } else {
+                self.covered_move_blocker(source_schema.as_ref())
             };
-            // We have rewritten the fragments, not just the deletion files, so
-            // we can't use affected rows here.
-            (operation, None)
+            if !covered.is_empty() && move_blocked.is_none() {
+                let (operation, removed_row_addrs) = self
+                    .rewrite_covered_update_as_move(
+                        Box::pin(stream) as SendableRecordBatchStream,
+                        target_bases_info,
+                    )
+                    .await?;
+                // Same shape as the full-schema `RewriteRows` paths below -- deletions on the
+                // originals plus new fragments -- so publish the moved addresses. Without them
+                // `check_update_txn` turns any concurrent delete/update touching these fragments
+                // into a hard conflict, costing covered datasets concurrency that non-covered
+                // ones keep.
+                (operation, Some(RowAddrTreeMap::from(removed_row_addrs)))
+            } else {
+                if let Some(reason) = &move_blocked {
+                    info!(
+                        "merge_insert is updating covered column(s) {covered:?} in place rather \
+                         than moving the matched rows, because {reason}. The updated fragment(s) \
+                         lose their coverage in every index covering those columns until the next \
+                         optimize; the merge itself is unaffected."
+                    );
+                }
+                // We will have a different commit path here too, as we are modifying
+                // fragments rather than writing new ones
+                let PatchedFragments {
+                    updated_fragments,
+                    new_fragments,
+                    fields_modified,
+                    matched_offsets,
+                } = Self::update_fragments(
+                    self.dataset.clone(),
+                    Box::pin(stream),
+                    self.dataset.manifest.version + 1,
+                    target_bases_info,
+                )
+                .await?;
+
+                let operation = Operation::Update {
+                    removed_fragment_ids: Vec::new(),
+                    updated_fragments,
+                    new_fragments,
+                    fields_modified,
+                    compacted_sstables: self.params.compacted_sstables.clone(),
+                    fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
+                    update_mode: Some(RewriteColumns),
+                    inserted_rows_filter: None, // not implemented for v1
+                    // The version stamped above is a guess; carry the patched offsets
+                    // so `build_manifest` can re-stamp them at the real commit
+                    // version after a rebase.
+                    updated_fragment_offsets: Some(matched_offsets),
+                };
+                // We have rewritten the fragments, not just the deletion files, so
+                // we can't use affected rows here.
+                (operation, None)
+            }
         } else {
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
@@ -13248,7 +13650,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
 
     mod external_error {
         use super::*;
-        use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
+        use arrow_schema::{ArrowError, Field as ArrowField, Schema};
         use std::fmt;
 
         #[derive(Debug)]
@@ -13267,7 +13669,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
 
         #[tokio::test]
         async fn test_merge_insert_execute_reader_preserves_error_message() {
-            let schema = Arc::new(ArrowSchema::new(vec![
+            let schema = Arc::new(Schema::new(vec![
                 ArrowField::new("key", DataType::Int32, false),
                 ArrowField::new("value", DataType::Int32, false),
             ]));
@@ -13699,16 +14101,14 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(combined.num_rows(), 300);
     }
 
-    // Regression test: after a partial-schema merge_insert drops a fragment from the vector
-    // index bitmap, a vector search should not return duplicate rows. The stale vector index
-    // data still references the dropped fragment, and the scanner also flat-scans unindexed
-    // fragments, causing the same rows to appear from both paths.
-    #[tokio::test]
-    async fn test_partial_merge_insert_stale_vector_index_duplicates() {
+    /// Build a dataset with a plain (non-covered) IVF_FLAT vector index whose fragment 1
+    /// has been pruned from the index bitmap by a partial-schema merge_insert that patched
+    /// the indexed vector column in place -- the pruned fragment's stale rows still live in
+    /// the old index segment's storage. Returns `(dataset, total_rows, rows_per_frag, dim)`.
+    async fn build_pruned_plain_vector_dataset(uri: &str) -> (Arc<Dataset>, usize, usize, i32) {
         let dim = 4i32;
         let rows_per_frag = 10usize;
         let num_frags = 3usize;
-        let total_rows = rows_per_frag * num_frags;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -13745,9 +14145,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         // Write 3 fragments
         let batch0 = make_batch(0, 0.0);
         let reader = Box::new(RecordBatchIterator::new([Ok(batch0)], schema.clone()));
-        let mut ds = Dataset::write(reader, "memory://vector_stale_test", None)
-            .await
-            .unwrap();
+        let mut ds = Dataset::write(reader, uri, None).await.unwrap();
         for frag_idx in 1..num_frags {
             let batch = make_batch(frag_idx, 0.0);
             let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
@@ -13797,7 +14195,18 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .await
             .unwrap();
 
-        // KNN search with k = total_rows to retrieve all rows
+        (ds, rows_per_frag * num_frags, rows_per_frag, dim)
+    }
+
+    /// A KNN query over every row must return each id exactly once -- no stale duplicate
+    /// served from old index storage alongside the fresh copy.
+    async fn assert_knn_no_duplicate_ids(
+        ds: &Dataset,
+        total_rows: usize,
+        rows_per_frag: usize,
+        dim: i32,
+    ) {
+        let frag1_start = rows_per_frag;
         let query: Float32Array = (0..dim)
             .map(|i| (frag1_start * dim as usize + i as usize) as f32 + 0.5)
             .collect();
@@ -13809,7 +14218,6 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .await
             .unwrap();
 
-        // Check no duplicate ids
         let ids = results
             .column_by_name("id")
             .unwrap()
@@ -13824,6 +14232,1748 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             "Found duplicate ids in KNN results: {} unique out of {} total",
             unique_ids.len(),
             ids.len()
+        );
+    }
+
+    // Regression test: after a partial-schema merge_insert drops a fragment from the vector
+    // index bitmap, a vector search should not return duplicate rows. The stale vector index
+    // data still references the dropped fragment, and the scanner also flat-scans unindexed
+    // fragments, causing the same rows to appear from both paths.
+    #[tokio::test]
+    async fn test_partial_merge_insert_stale_vector_index_duplicates() {
+        let (ds, total_rows, rows_per_frag, dim) =
+            build_pruned_plain_vector_dataset("memory://vector_stale_test").await;
+        assert_knn_no_duplicate_ids(&ds, total_rows, rows_per_frag, dim).await;
+    }
+
+    /// Same pruned-fragment state, but merged back into the index:
+    /// `optimize_indices(merge)` re-scans the pruned fragment as unindexed data AND
+    /// carries the fragment's stale rows from the old segment's storage -- the merge
+    /// must drop the stale copies for plain (non-covered) indexes just as it does for
+    /// covered ones, or ANN queries return duplicate row ids from the merged index.
+    #[tokio::test]
+    async fn test_optimize_merge_after_partial_update_no_duplicates_non_covered() {
+        use lance_index::optimize::OptimizeOptions;
+        let (ds, total_rows, rows_per_frag, dim) =
+            build_pruned_plain_vector_dataset("memory://vector_stale_opt_merge").await;
+        let mut ds = Arc::try_unwrap(ds).unwrap_or_else(|arc| (*arc).clone());
+        ds.optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+        assert_knn_no_duplicate_ids(&ds, total_rows, rows_per_frag, dim).await;
+    }
+
+    /// A partial merge_insert that rewrites only a covered column is a row-MOVE: the
+    /// touched rows are tombstoned at their old addresses and reinserted into a new
+    /// fragment, so the index's stale copy is hidden by the deletion mask rather than
+    /// patched in place. Fragment 1 is updated in full, so it disappears entirely, and a
+    /// covered query must observe the fresh values for every row.
+    #[tokio::test]
+    async fn test_partial_merge_insert_moves_covered_column_rows() {
+        let (ds, total_rows, rows_per_frag, dim) =
+            build_moved_covering_dataset("memory://covering_move_test").await;
+        assert!(
+            !ds.get_fragments().iter().any(|f| f.id() == 1),
+            "fragment 1's rows should have been moved out (tombstoned + reinserted), \
+             but fragment 1 is still present"
+        );
+
+        assert_covered_query_no_duplicates_fresh(&ds, total_rows, rows_per_frag, dim).await;
+    }
+
+    /// Pins the two things a partial merge_insert on a covered column must deliver: covered reads
+    /// are FRESH with no intervening optimize, and the index invalidation is confined to the rows
+    /// actually updated.
+    ///
+    /// The second half is what the row-move uniquely buys, and it is the half that discriminates.
+    /// Freshness alone does not: `covering_fields` is stored as a suffix of `IndexMetadata::fields`,
+    /// so `prune_updated_fields_from_indices` already counts a covered column as index-dependent
+    /// and drops the whole updated fragment from the index whenever a `RewriteColumns` update
+    /// touches one. That backstop hides the stale copy on its own -- verified by disabling the
+    /// row-move entirely, which leaves every covered correctness assertion in this module passing.
+    /// What it costs is coverage: an in-place update of one payload column evicts the ENTIRE
+    /// fragment from the vector index, including rows the merge never touched, and the vectors are
+    /// the expensive part to rebuild. The row-move instead tombstones only the matched rows and
+    /// re-appends them, so the fragment keeps its coverage for everything else. Measured here:
+    /// with the move the bitmap stays `{0, 1}` over fragments `[0, 1, 2]`; patched in place it
+    /// collapses to `{0}`.
+    ///
+    /// Freshness is still checked, against an INDEPENDENT `take_rows` from the base table rather
+    /// than against a formula this test also wrote -- asserting that a column came back, or that
+    /// the query returned something, passes just as happily against a stale copy. `take_rows`
+    /// re-orders its output to match the requested row ids (see the remapping branch in
+    /// `dataset::take`), so the two reads line up row for row.
+    ///
+    /// Shape follows the recipe in `dataset::tests::dataset_index`: four well-separated clusters,
+    /// since a covered-ANN test with one partition never reaches the probe path at all and passes
+    /// against a broken covered read.
+    #[tokio::test]
+    async fn test_covered_update_is_fresh_and_confines_index_invalidation() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::UInt64Type;
+        use lance_core::ROW_ID;
+        use std::collections::HashSet;
+
+        const DIMS: i32 = 16;
+        const NUM_CLUSTERS: usize = 4;
+        const ROWS_PER_CLUSTER: usize = 64;
+        const TOTAL: usize = NUM_CLUSTERS * ROWS_PER_CLUSTER;
+        // Only the last cluster is rewritten, so one query spans both moved rows and untouched
+        // rows still served from the original index storage.
+        const UPDATED_FROM: i32 = ((NUM_CLUSTERS - 1) * ROWS_PER_CLUSTER) as i32;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("payload", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIMS,
+                ),
+                false,
+            ),
+        ]));
+
+        // Cluster centers 1000 apart on dim 0 with deterministic jitter: uniform-random vectors
+        // leave the early-pruning heuristic searching every partition.
+        let make_batch = |clusters: std::ops::Range<usize>| {
+            let mut ids = Vec::new();
+            let mut payloads = Vec::new();
+            let mut values = Vec::new();
+            for cluster in clusters {
+                let center = (cluster * 1000) as f32;
+                for row in 0..ROWS_PER_CLUSTER {
+                    let n = cluster * ROWS_PER_CLUSTER + row;
+                    ids.push(n as i32);
+                    payloads.push(n as i32 * 10);
+                    for dim in 0..DIMS as usize {
+                        let base = if dim == 0 { center } else { 0.0 };
+                        values.push(base + ((n * 7919 + dim) % 97) as f32 * 0.0001);
+                    }
+                }
+            }
+            let vectors =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIMS).unwrap();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(Int32Array::from(payloads)),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap()
+        };
+
+        // Two fragments, so the move has to reach across more than one.
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(make_batch(0..2))],
+            schema.clone(),
+        ));
+        let mut ds = Dataset::write(reader, "memory://covered_fresh_no_optimize", None)
+            .await
+            .unwrap();
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(make_batch(2..NUM_CLUSTERS))],
+            schema.clone(),
+        ));
+        ds.append(reader, None).await.unwrap();
+
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut params = VectorIndexParams::ivf_pq(NUM_CLUSTERS, 8, 4, MetricType::L2, 2);
+        params.covering_columns(vec!["payload".to_string()]);
+        ds.create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let ds = Arc::new(ds);
+
+        // Precondition the assertion depends on: the index really does carry `payload`, so a
+        // projection of just `payload` is answered from index storage.
+        let payload_field_id = ds.schema().field("payload").unwrap().id;
+        let indices = ds.load_indices().await.unwrap();
+        let vec_idx = indices.iter().find(|i| i.name == "vector_idx").unwrap();
+        assert_eq!(vec_idx.covering_fields, vec![payload_field_id]);
+
+        // Partial-schema merge_insert rewriting ONLY the covered column, for the last cluster.
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("payload", DataType::Int32, false),
+        ]));
+        let updated_ids: Vec<i32> = (UPDATED_FROM..TOTAL as i32).collect();
+        let updated_payloads: Vec<i32> = updated_ids.iter().map(|id| id * 10 + 7).collect();
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(updated_ids)),
+                Arc::new(Int32Array::from(updated_payloads)),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update_batch)], sub_schema));
+        let frags_before: HashSet<usize> = ds.get_fragments().iter().map(|f| f.id()).collect();
+        let (ds, _) = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
+        // Deliberately no `optimize_indices` here: the point is that the stale copy is hidden
+        // without one.
+
+        // The move half: the matched rows left fragment 1 for a brand-new fragment, and
+        // fragment 1 -- which also holds 64 rows the merge never matched -- keeps its place in
+        // the vector index. An in-place patch evicts it instead.
+        let frags_after: HashSet<usize> = ds.get_fragments().iter().map(|f| f.id()).collect();
+        assert!(
+            frags_after.difference(&frags_before).count() == 1,
+            "the matched rows should have been re-appended to one new fragment; \
+             fragments went from {frags_before:?} to {frags_after:?}"
+        );
+        let updated_frag = *frags_before.iter().max().unwrap();
+        let indices = ds.load_indices().await.unwrap();
+        let vec_idx = indices.iter().find(|i| i.name == "vector_idx").unwrap();
+        let bitmap = vec_idx.fragment_bitmap.as_ref().unwrap();
+        assert!(
+            bitmap.contains(updated_frag as u32),
+            "a covered update must not evict the whole fragment from the vector index: \
+             fragment {updated_frag} still holds {ROWS_PER_CLUSTER} untouched rows, but the \
+             index now covers only {bitmap:?}"
+        );
+
+        let mut q_values = vec![0.0f32; DIMS as usize];
+        q_values[0] = ((NUM_CLUSTERS - 1) * 1000) as f32;
+        let query = Float32Array::from(q_values);
+
+        // Project ONLY the covered column. Adding an uncovered column here would send the whole
+        // projection to the base table and the covered storage would never be read, so the test
+        // would pass against a stale copy.
+        let mut scan = ds.scan();
+        scan.nearest("vector", &query, TOTAL).unwrap();
+        scan.with_row_id();
+        scan.project(&["payload"]).unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("ANNIvfPartition"),
+            "the covered values must come from the vector index, not a flat rescan:\n{plan}"
+        );
+        let results = scan.try_into_batch().await.unwrap();
+
+        assert_eq!(
+            results.num_rows(),
+            TOTAL,
+            "covered query returned {} rows, expected {TOTAL}",
+            results.num_rows()
+        );
+        let row_ids = results[ROW_ID].as_primitive::<UInt64Type>();
+        let unique: HashSet<u64> = row_ids.values().iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            TOTAL,
+            "a stale copy survived at its old address: duplicate row ids in covered results"
+        );
+
+        // The independent read: same rows, fetched from the base table by row id.
+        let queried_row_ids: Vec<u64> = row_ids.values().to_vec();
+        let base = ds
+            .take_rows(
+                &queried_row_ids,
+                ProjectionRequest::from_schema(ds.schema().project(&["payload"]).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(base.num_rows(), TOTAL);
+
+        let covered_payload = results["payload"].as_primitive::<Int32Type>();
+        let base_payload = base["payload"].as_primitive::<Int32Type>();
+        let mut updated_seen = 0usize;
+        for i in 0..TOTAL {
+            assert_eq!(
+                covered_payload.value(i),
+                base_payload.value(i),
+                "covered read disagrees with the base table for row id {}: index says {}, \
+                 table says {}",
+                row_ids.value(i),
+                covered_payload.value(i),
+                base_payload.value(i)
+            );
+            if base_payload.value(i) % 10 == 7 {
+                updated_seen += 1;
+            }
+        }
+        // Guards the assertion above from passing vacuously if the merge silently no-ops.
+        assert_eq!(
+            updated_seen, ROWS_PER_CLUSTER,
+            "expected {ROWS_PER_CLUSTER} rewritten rows in the covered results, saw {updated_seen}"
+        );
+
+        // The comparison above would still agree if the move had taken the WRONG addresses --
+        // the base table would carry the same corruption, so both reads would match. Row
+        // integrity is what catches that: the move rebuilds each row from a full-row take at an
+        // address, so a wrongly addressed take pairs one row's `id` with another's payload and
+        // duplicates or drops ids.
+        let full = ds
+            .scan()
+            .project(&["id", "payload"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(full.num_rows(), TOTAL, "the move changed the row count");
+        let full_ids = full["id"].as_primitive::<Int32Type>();
+        let full_payload = full["payload"].as_primitive::<Int32Type>();
+        let mut seen_ids = HashSet::new();
+        for i in 0..TOTAL {
+            let id = full_ids.value(i);
+            assert!(seen_ids.insert(id), "id {id} duplicated by the move");
+            let expected = if id >= UPDATED_FROM {
+                id * 10 + 7
+            } else {
+                id * 10
+            };
+            assert_eq!(
+                full_payload.value(i),
+                expected,
+                "row {id} came back paired with another row's payload"
+            );
+        }
+        assert_eq!(seen_ids.len(), TOTAL, "the move dropped rows");
+    }
+
+    /// Bounded-streaming regression for the covered row-move: a covered-column update spanning
+    /// MORE than one scan batch (> `BATCH_SIZE_FALLBACK` = 8192 rows) must move every row exactly
+    /// once with its fresh value. `rewrite_covered_update_as_move` streams the take/overlay/write
+    /// per batch and accumulates the tombstoned addresses across batches, so this exercises the
+    /// multi-batch accumulation path the small covered tests never reach.
+    #[tokio::test]
+    async fn test_covered_update_move_streams_multiple_batches() {
+        use arrow_array::cast::AsArray;
+        use std::collections::HashSet;
+
+        let dim = 2i32;
+        let rows_per_frag = 5000usize; // 2 frags => 10_000 rows > BATCH_SIZE_FALLBACK (8192)
+        let num_frags = 2usize;
+        let total_rows = rows_per_frag * num_frags;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                false,
+            ),
+        ]));
+        let make_batch = |frag_idx: usize| {
+            let start = frag_idx * rows_per_frag;
+            let ids: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("id-{j:05}"))
+                .collect();
+            let cats: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("cat-{j:05}"))
+                .collect();
+            let values: Vec<f32> = (0..rows_per_frag * dim as usize)
+                .map(|i| (start * dim as usize + i) as f32)
+                .collect();
+            let vectors =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(cats)),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap()
+        };
+
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(make_batch(0))],
+            schema.clone(),
+        ));
+        let mut ds = Dataset::write(reader, "memory://covered_move_multibatch", None)
+            .await
+            .unwrap();
+        for frag_idx in 1..num_frags {
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(make_batch(frag_idx))],
+                schema.clone(),
+            ));
+            ds.append(reader, None).await.unwrap();
+        }
+
+        // BTree on the join key + a vector index covering `category`.
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        params.covering_columns(vec!["category".to_string()]);
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let ds = Arc::new(ds);
+
+        // Partial merge_insert rewriting `category` for EVERY row -> a >1-batch covered move.
+        let ids: Vec<String> = (0..total_rows).map(|j| format!("id-{j:05}")).collect();
+        let new_cats: Vec<String> = (0..total_rows).map(|j| format!("updated-{j:05}")).collect();
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(new_cats)),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update_batch)], sub_schema));
+        let (ds, _) = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
+
+        // Every row must survive exactly once with its fresh category -- nothing lost or
+        // duplicated across the batch boundary the streaming move crosses.
+        let batch = ds
+            .scan()
+            .project(&["id", "category"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            total_rows,
+            "row count changed after a multi-batch covered move"
+        );
+        let ids_col = batch["id"].as_string::<i32>();
+        let cats_col = batch["category"].as_string::<i32>();
+        let mut seen = HashSet::new();
+        for i in 0..batch.num_rows() {
+            let id = ids_col.value(i);
+            assert!(
+                seen.insert(id.to_string()),
+                "duplicate id {id} after covered move"
+            );
+            let n: usize = id[3..].parse().unwrap();
+            assert_eq!(
+                cats_col.value(i),
+                format!("updated-{n:05}"),
+                "stale or missing covered value for {id}"
+            );
+        }
+        assert_eq!(seen.len(), total_rows);
+    }
+
+    /// Runs a partial-schema merge_insert whose source carries a STRUCT with only one of the
+    /// target's two children, alongside `category`. `cover` decides whether the vector index
+    /// includes `category`, i.e. whether the covered row-move branch is taken at all.
+    async fn partial_struct_source_merge(uri: &str, cover: bool) -> Result<Arc<Dataset>> {
+        const ROWS: usize = 256;
+        const DIM: i32 = 2;
+        let struct_fields: arrow_schema::Fields = vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]
+        .into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("s", DataType::Struct(struct_fields.clone()), false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+                false,
+            ),
+        ]));
+        let ids: Vec<String> = (0..ROWS).map(|j| format!("id-{j:03}")).collect();
+        let cats: Vec<String> = (0..ROWS).map(|j| format!("cat-{j:03}")).collect();
+        let a = Int32Array::from((0..ROWS as i32).collect::<Vec<_>>());
+        let b = Int32Array::from((0..ROWS as i32).map(|v| v + 1000).collect::<Vec<_>>());
+        let s = StructArray::new(struct_fields, vec![Arc::new(a), Arc::new(b)], None);
+        let values: Vec<f32> = (0..ROWS * DIM as usize).map(|i| i as f32).collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids.clone())),
+                Arc::new(StringArray::from(cats)),
+                Arc::new(s),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
+        let mut ds = Dataset::write(reader, uri, None).await.unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        if cover {
+            params.covering_columns(vec!["category".to_string()]);
+        }
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let ds = Arc::new(ds);
+
+        // Partial source: the join key, the (maybe-covered) `category`, and a STRUCT with
+        // only one of its two children.
+        let partial_struct_fields: arrow_schema::Fields =
+            vec![Field::new("a", DataType::Int32, false)].into();
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new("s", DataType::Struct(partial_struct_fields.clone()), false),
+        ]));
+        let new_cats: Vec<String> = (0..ROWS).map(|j| format!("upd-{j:03}")).collect();
+        let new_a = Int32Array::from((0..ROWS as i32).map(|v| v + 500).collect::<Vec<_>>());
+        let new_s = StructArray::new(partial_struct_fields, vec![Arc::new(new_a)], None);
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(new_cats)),
+                Arc::new(new_s),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update_batch)], sub_schema));
+        MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .map(|(ds, _)| ds)
+    }
+
+    /// `id -> (s.a, s.b, category)` for the whole dataset, so the covered and uncovered runs of
+    /// `partial_struct_source_merge` can be compared row for row.
+    async fn partial_struct_merge_contents(ds: &Dataset) -> HashMap<String, (i32, i32, String)> {
+        let batch = ds
+            .scan()
+            .project(&["id", "category", "s"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch["id"].as_string::<i32>();
+        let cats = batch["category"].as_string::<i32>();
+        let s = batch["s"].as_struct();
+        let a = s.column_by_name("a").unwrap().as_primitive::<Int32Type>();
+        let b = s.column_by_name("b").unwrap().as_primitive::<Int32Type>();
+        (0..batch.num_rows())
+            .map(|i| {
+                (
+                    ids.value(i).to_string(),
+                    (a.value(i), b.value(i), cats.value(i).to_string()),
+                )
+            })
+            .collect()
+    }
+
+    /// The covered row-move overlays each source column onto a full-row take by REPLACING the
+    /// whole column, so it needs the source column's Arrow type to equal the target's exactly. A
+    /// partial-schema source is only required to be a *subschema*, and `compare_fields` recurses
+    /// with the same options, so a struct may legally arrive carrying only some of its children.
+    /// Left unguarded this fails with an opaque Arrow "column types must match schema types" from
+    /// `replace_column_by_name`; guarded, it falls back to the in-place patch.
+    ///
+    /// The control is the whole point: the same merge on a dataset whose index does NOT cover
+    /// `category` takes the in-place branch, and both runs must produce **identical data**. That
+    /// pins the fallback as behaviour-preserving rather than merely non-failing -- adding
+    /// `covering_columns` to a vector index must not change what a merge does, only how much index
+    /// coverage survives it.
+    #[tokio::test]
+    async fn test_merge_insert_covered_update_falls_back_with_partial_struct_source() {
+        let plain = partial_struct_source_merge("memory://partial_struct_plain", false)
+            .await
+            .expect(
+                "control: a partial struct source is handled by the in-place branch, so if this \
+                 fails the comparison below is no longer evidence of anything",
+            );
+        let covered = partial_struct_source_merge("memory://partial_struct_covered", true)
+            .await
+            .expect("a partial struct source must fall back to in-place, not fail");
+
+        let plain_rows = partial_struct_merge_contents(&plain).await;
+        let covered_rows = partial_struct_merge_contents(&covered).await;
+        assert_eq!(plain_rows.len(), 256);
+        assert_eq!(
+            plain_rows, covered_rows,
+            "covering a column must not change what the merge writes"
+        );
+        // Spot-check against the expected values too, so an identical-but-wrong pair of runs
+        // cannot pass: `s.a` was updated, `s.b` was never in the source and must survive.
+        assert_eq!(covered_rows["id-007"], (507, 1007, "upd-007".to_string()));
+
+        // Confinement is what covering forfeits here, and only that.
+        let indices = covered.load_indices().await.unwrap();
+        let vec_idx = indices.iter().find(|i| i.name == "vec_idx").unwrap();
+        let bitmap = vec_idx.fragment_bitmap.as_ref().unwrap();
+        assert!(
+            bitmap.is_empty(),
+            "the in-place fallback should have evicted the only fragment from the vector index; \
+             still covered means the fallback was not taken: {bitmap:?}"
+        );
+    }
+
+    /// The covered row-move must not depend on the order its source arrives in: it accumulates
+    /// tombstoned addresses with `extend` rather than the bulk `RoaringTreemap::append`, which
+    /// rejects any value <= the running maximum and would abort *after* fragments were written,
+    /// orphaning them.
+    ///
+    /// Note what this can and cannot reach. The BTree is required, not incidental: without a
+    /// scalar index on every join key, `can_use_create_plan` routes the merge to v2 and this
+    /// function never runs (the earlier version of this test omitted the index specifically to
+    /// get the hash join, and so tested nothing here). With it, the merge takes the indexed-scan
+    /// join -- the only route to the move -- which reads in fragment order, so descending
+    /// addresses cannot be produced through the public API at all. What is pinned is that a
+    /// reversed *source* is handled correctly; `extend` remains a deliberate defence against a
+    /// future routing change rather than something reachable today.
+    #[tokio::test]
+    async fn test_covered_update_move_accepts_unsorted_source_order() {
+        use arrow_array::cast::AsArray;
+        use std::collections::HashSet;
+
+        let dim = 2i32;
+        let total_rows = 128usize;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                false,
+            ),
+        ]));
+        let ids: Vec<String> = (0..total_rows).map(|j| format!("id-{j:04}")).collect();
+        let cats: Vec<String> = (0..total_rows).map(|j| format!("cat-{j:04}")).collect();
+        let values: Vec<f32> = (0..total_rows * dim as usize).map(|i| i as f32).collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids.clone())),
+                Arc::new(StringArray::from(cats)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
+        let mut ds = Dataset::write(reader, "memory://covered_move_unsorted", None)
+            .await
+            .unwrap();
+        // The BTree is what makes this test reach `rewrite_covered_update_as_move` at all --
+        // see the doc comment.
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        params.covering_columns(vec!["category".to_string()]);
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let ds = Arc::new(ds);
+
+        // Feed the source fully reversed.
+        let mut update_ids: Vec<String> = ids.clone();
+        update_ids.reverse();
+        let new_cats: Vec<String> = update_ids
+            .iter()
+            .map(|id| format!("updated-{}", &id[3..]))
+            .collect();
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(update_ids)),
+                Arc::new(StringArray::from(new_cats)),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update_batch)], sub_schema));
+        let frags_before: HashSet<usize> = ds.get_fragments().iter().map(|f| f.id()).collect();
+        let (ds, _) = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
+
+        // Proof this test reached the move rather than the in-place patch: the move re-appends the
+        // matched rows to a new fragment, where the in-place patch leaves the fragment ids alone.
+        // Without this the value checks below pass on either path.
+        //
+        // This does NOT by itself exclude the v2 path, which also writes full rows and would also
+        // append. v2 is excluded structurally instead: the scalar index created above means
+        // `can_use_create_plan`'s `!would_use_scalar_index` is false. That coupling is load-bearing
+        // -- it is exactly what this test lacked when it silently never ran the move at all.
+        let frags_after: HashSet<usize> = ds.get_fragments().iter().map(|f| f.id()).collect();
+        assert!(
+            !frags_after
+                .difference(&frags_before)
+                .collect::<Vec<_>>()
+                .is_empty(),
+            "expected the covered row-move to append a new fragment; fragments went from \
+             {frags_before:?} to {frags_after:?}, so this test never ran the move"
+        );
+
+        let batch = ds
+            .scan()
+            .project(&["id", "category"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            total_rows,
+            "row count changed after an out-of-order covered move"
+        );
+        let ids_col = batch["id"].as_string::<i32>();
+        let cats_col = batch["category"].as_string::<i32>();
+        let mut seen = HashSet::new();
+        for i in 0..batch.num_rows() {
+            let id = ids_col.value(i);
+            assert!(
+                seen.insert(id.to_string()),
+                "duplicate id {id} after covered move"
+            );
+            assert_eq!(
+                cats_col.value(i),
+                format!("updated-{}", &id[3..]),
+                "stale or missing covered value for {id}"
+            );
+        }
+        assert_eq!(seen.len(), total_rows);
+    }
+
+    /// The covered row-move must publish the moved rows as `affected_rows`, exactly as the
+    /// full-schema `RewriteRows` paths do. Without them `check_update_txn` short-circuits on
+    /// `affected_rows.is_none()` and turns any concurrent delete/update touching the same
+    /// fragments into a retryable conflict, so covered datasets would silently lose the
+    /// merge_insert/delete concurrency that non-covered ones keep.
+    #[tokio::test]
+    async fn test_covered_update_move_publishes_affected_rows() {
+        let dim = 2i32;
+        let total_rows = 64usize;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                false,
+            ),
+        ]));
+        let ids: Vec<String> = (0..total_rows).map(|j| format!("id-{j:04}")).collect();
+        let cats: Vec<String> = (0..total_rows).map(|j| format!("cat-{j:04}")).collect();
+        let values: Vec<f32> = (0..total_rows * dim as usize).map(|i| i as f32).collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(cats)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
+        let mut ds = Dataset::write(reader, "memory://covered_move_affected_rows", None)
+            .await
+            .unwrap();
+        // Required to reach `rewrite_covered_update_as_move`: without a scalar index on every
+        // join key, `can_use_create_plan` routes the merge to v2, which publishes affected rows
+        // of its own and would satisfy this test's assertion without the move running at all.
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        params.covering_columns(vec!["category".to_string()]);
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let ds = Arc::new(ds);
+
+        // Single fragment written in id order, so row N sits at address N.
+        let targets = [2usize, 5, 7];
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    targets
+                        .iter()
+                        .map(|n| format!("id-{n:04}"))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    targets
+                        .iter()
+                        .map(|n| format!("updated-{n:04}"))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update_batch)], sub_schema));
+        let UncommittedMergeInsert { affected_rows, .. } =
+            MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(reader)
+                .await
+                .unwrap();
+
+        let expected =
+            RowAddrTreeMap::from(RoaringTreemap::from_iter(targets.iter().map(|n| *n as u64)));
+        assert_eq!(
+            affected_rows,
+            Some(expected),
+            "covered row-move must publish the moved addresses so a concurrent delete can rebase"
+        );
+    }
+
+    /// Builds a 3-fragment dataset with an IVF_PQ index covering `category`, then does a
+    /// partial merge_insert that rewrites only `category` for fragment 1. That update is a
+    /// row-MOVE: fragment 1's rows are tombstoned and rewritten into a new fragment, while
+    /// the old segment's storage still physically holds their pre-update covering values.
+    /// Returns `(post-move dataset, total_rows, rows_per_frag, dim)`.
+    /// The covered move must report EVERY field id -- leaves included -- in
+    /// `fields_for_preserving_frag_bitmap`. The consumer compares that list against
+    /// each index's leaf-expanded dependency set, so a top-level-only list would let
+    /// an index keyed on a nested field (its dependency set holds the LEAF id)
+    /// escape the exclude-everything contract and get its bitmap wrongly extended
+    /// onto the moved fragment. Unobservable through query results today (the move
+    /// runs only on address-style datasets, where the consumer skips every index),
+    /// so this pins the committed transaction payload itself.
+    #[tokio::test]
+    async fn test_covered_move_reports_leaf_field_ids_for_preserving() {
+        use crate::io::commit::read_transaction_file;
+
+        let dim = 4i32;
+        let rows_per_frag = 256usize; // >= 256 rows so PQ has enough to train
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "meta",
+                DataType::Struct(vec![Field::new("code", DataType::Int32, false)].into()),
+                false,
+            ),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                false,
+            ),
+        ]));
+        let make_batch = |frag_idx: usize| {
+            let start = frag_idx * rows_per_frag;
+            let ids: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("id-{j:04}"))
+                .collect();
+            let cats: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("cat-{j:04}"))
+                .collect();
+            let codes =
+                Int32Array::from_iter_values((start..start + rows_per_frag).map(|j| j as i32));
+            let meta = StructArray::from(vec![(
+                Arc::new(Field::new("code", DataType::Int32, false)),
+                Arc::new(codes) as arrow_array::ArrayRef,
+            )]);
+            let values: Vec<f32> = (0..rows_per_frag * dim as usize)
+                .map(|i| (start * dim as usize + i) as f32)
+                .collect();
+            let vectors =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(cats)),
+                    Arc::new(meta),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap()
+        };
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(make_batch(0))],
+            schema.clone(),
+        ));
+        let mut ds = Dataset::write(reader, "memory://covered_move_preserving", None)
+            .await
+            .unwrap();
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(make_batch(1))],
+            schema.clone(),
+        ));
+        ds.append(reader, None).await.unwrap();
+        // Scalar index on the join key so the merge joins via the indexed scan and
+        // reaches `rewrite_covered_update_as_move` (the full-scan join commits its
+        // move through the insert exec instead, which is not the producer under
+        // test here).
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut params = VectorIndexParams::ivf_pq(1, 8, 2, MetricType::L2, 2);
+        params.covering_columns(vec!["category".to_string()]);
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let ds = Arc::new(ds);
+
+        // Partial covered-column update over fragment 1 -> takes the row-move path.
+        let frag1_start = rows_per_frag;
+        let ids: Vec<String> = (frag1_start..frag1_start + rows_per_frag)
+            .map(|j| format!("id-{j:04}"))
+            .collect();
+        let new_cats: Vec<String> = (frag1_start..frag1_start + rows_per_frag)
+            .map(|j| format!("updated-{j:04}"))
+            .collect();
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(new_cats)),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update_batch)], sub_schema));
+        let (ds, _) = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
+
+        let tx_path = ds
+            .manifest()
+            .transaction_file
+            .clone()
+            .expect("the covered move writes a transaction file");
+        let tx = read_transaction_file(ds.object_store.as_ref(), &ds.base, &tx_path)
+            .await
+            .unwrap();
+        let Operation::Update {
+            fields_for_preserving_frag_bitmap,
+            update_mode,
+            ..
+        } = &tx.operation
+        else {
+            panic!("expected Operation::Update, got: {:?}", tx.operation);
+        };
+        assert_eq!(*update_mode, Some(RewriteRows), "the move path committed");
+        let reported: HashSet<u32> = fields_for_preserving_frag_bitmap.iter().copied().collect();
+        let expected: HashSet<u32> = ds
+            .schema()
+            .fields_pre_order()
+            .map(|f| f.id as u32)
+            .collect();
+        let leaf_id = ds.schema().field("meta").unwrap().children[0].id as u32;
+        assert!(
+            reported.contains(&leaf_id),
+            "the preserving list must include nested LEAF ids (missing {leaf_id}): {reported:?}"
+        );
+        assert_eq!(
+            reported, expected,
+            "the covered move must report every field id, leaves included"
+        );
+    }
+
+    async fn build_moved_covering_dataset(uri: &str) -> (Arc<Dataset>, usize, usize, i32) {
+        let dim = 4i32;
+        let rows_per_frag = 256usize;
+        let num_frags = 3usize;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                false,
+            ),
+        ]));
+
+        let make_batch = |frag_idx: usize| {
+            let start = frag_idx * rows_per_frag;
+            let ids: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("id-{j:04}"))
+                .collect();
+            let cats: Vec<String> = (start..start + rows_per_frag)
+                .map(|j| format!("cat-{j:04}"))
+                .collect();
+            let values: Vec<f32> = (0..rows_per_frag * dim as usize)
+                .map(|i| (start * dim as usize + i) as f32)
+                .collect();
+            let vectors =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(cats)),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap()
+        };
+
+        let reader = Box::new(RecordBatchIterator::new(
+            [Ok(make_batch(0))],
+            schema.clone(),
+        ));
+        let mut ds = Dataset::write(reader, uri, None).await.unwrap();
+        for frag_idx in 1..num_frags {
+            let reader = Box::new(RecordBatchIterator::new(
+                [Ok(make_batch(frag_idx))],
+                schema.clone(),
+            ));
+            ds.append(reader, None).await.unwrap();
+        }
+
+        // Scalar index on the join key so the merge joins via the indexed scan. The write
+        // strategy is unaffected: a covered-column update is always a row-move.
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut params = VectorIndexParams::ivf_pq(1, 8, 2, MetricType::L2, 2);
+        params.covering_columns(vec!["category".to_string()]);
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let ds = Arc::new(ds);
+
+        // Partial merge_insert rewriting ONLY `category` for fragment 1 -> prunes
+        // fragment 1 from the vector index's coverage bitmap.
+        let frag1_start = rows_per_frag;
+        let ids: Vec<String> = (frag1_start..frag1_start + rows_per_frag)
+            .map(|j| format!("id-{j:04}"))
+            .collect();
+        let new_cats: Vec<String> = (frag1_start..frag1_start + rows_per_frag)
+            .map(|j| format!("updated-{j:04}"))
+            .collect();
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(new_cats)),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update_batch)], sub_schema));
+        let (ds, _) = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .unwrap();
+
+        // Precondition every caller relies on: the covering column really is recorded on
+        // the index metadata, since the move/prune logic keys on it.
+        let category_field_id = ds.schema().field("category").unwrap().id;
+        let indices = ds.load_indices().await.unwrap();
+        let vec_idx = indices.iter().find(|i| i.name == "vec_idx").unwrap();
+        assert_eq!(vec_idx.covering_fields, vec![category_field_id]);
+
+        (ds, num_frags * rows_per_frag, rows_per_frag, dim)
+    }
+
+    /// A covered query over every row must return each row exactly once (no stale duplicate
+    /// from the old storage) with the fresh `category` value.
+    async fn assert_covered_query_no_duplicates_fresh(
+        ds: &Dataset,
+        total_rows: usize,
+        rows_per_frag: usize,
+        dim: i32,
+    ) {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::UInt64Type;
+        use lance_core::ROW_ID;
+        use std::collections::HashSet;
+
+        let frag1_start = rows_per_frag;
+        let query: Float32Array = (0..dim)
+            .map(|i| (frag1_start * dim as usize + i as usize) as f32)
+            .collect();
+        let results = ds
+            .scan()
+            .nearest("vec", &query, total_rows)
+            .unwrap()
+            .with_row_id()
+            .project(&["id", "category"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let rowids = results[ROW_ID].as_primitive::<UInt64Type>();
+        let unique: HashSet<u64> = rowids.values().iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            rowids.len(),
+            "optimize double-counted the pruned fragment: duplicate row ids in covered results"
+        );
+        assert_eq!(
+            results.num_rows(),
+            total_rows,
+            "covered query returned {} rows, expected {total_rows} (dropped/duplicated rows)",
+            results.num_rows()
+        );
+
+        let ids_col = results["id"].as_string::<i32>();
+        let cats = results["category"].as_string::<i32>();
+        for i in 0..ids_col.len() {
+            let id = ids_col.value(i);
+            let n: usize = id[3..].parse().unwrap();
+            let expected = if (frag1_start..frag1_start + rows_per_frag).contains(&n) {
+                format!("updated-{n:04}")
+            } else {
+                format!("cat-{n:04}")
+            };
+            assert_eq!(cats.value(i), expected, "stale covering value for row {id}");
+        }
+    }
+
+    /// After a covered-column update moves rows out of a fragment, an optimize must not
+    /// resurrect the stale copies still sitting in the old segment's storage. `merge`
+    /// re-scans the moved rows as unindexed data *and* folds in the old segment, so it must
+    /// not double-count them; the default (append) optimize leaves the old segment in place,
+    /// so the deletion mask must keep hiding them.
+    #[rstest::rstest]
+    #[case::merge(lance_index::optimize::OptimizeOptions::merge(1))]
+    #[case::append_default(lance_index::optimize::OptimizeOptions::default())]
+    #[tokio::test]
+    async fn test_optimize_after_covering_move_no_duplicate_rows(
+        #[case] options: lance_index::optimize::OptimizeOptions,
+    ) {
+        let (ds, total_rows, rows_per_frag, dim) =
+            build_moved_covering_dataset("memory://covered_opt").await;
+        let mut ds = Arc::try_unwrap(ds).unwrap_or_else(|arc| (*arc).clone());
+        ds.optimize_indices(&options).await.unwrap();
+        assert_covered_query_no_duplicates_fresh(&ds, total_rows, rows_per_frag, dim).await;
+    }
+
+    /// The covered move cannot carry stable row ids onto its new fragments -- it never rechunks
+    /// the captured `row_id_sequence` the way the full-schema path does, so `assign_row_ids`
+    /// would mint fresh ids for every moved row and break the one guarantee stable row ids exist
+    /// to provide. The move is an optimisation over an already-correct in-place patch, so this
+    /// must degrade to that patch rather than fail the merge.
+    ///
+    /// The assertions are the property the old rejection protected, stated positively: the merge
+    /// SUCCEEDS, every row keeps the row id it had (the in-place patch moves no rows, so ids are
+    /// preserved by construction -- strictly safer here than the move), and confinement was the
+    /// only thing given up, i.e. the updated fragment left the vector index's bitmap. Run against
+    /// a real directory rather than `memory://` so the ids are checked after a genuine reopen.
+    #[tokio::test]
+    async fn test_merge_insert_covered_update_falls_back_on_stable_row_ids() {
+        use arrow_array::types::UInt64Type;
+        use lance_core::ROW_ID;
+
+        /// `id -> _rowid` for the whole dataset, so "ids were preserved" is provable per row
+        /// rather than as a count.
+        async fn row_ids_by_key(ds: &Dataset) -> HashMap<String, u64> {
+            let batch = ds
+                .scan()
+                .with_row_id()
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let ids = batch["id"].as_string::<i32>();
+            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            (0..batch.num_rows())
+                .map(|i| (ids.value(i).to_string(), row_ids.value(i)))
+                .collect()
+        }
+
+        let test_uri = TempStrDir::default();
+        let dim = 4i32;
+        let n = 256usize; // enough rows to train PQ
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                false,
+            ),
+        ]));
+        let ids: Vec<String> = (0..n).map(|j| format!("id-{j:04}")).collect();
+        let cats: Vec<String> = (0..n).map(|j| format!("cat-{j:04}")).collect();
+        let values: Vec<f32> = (0..n * dim as usize).map(|i| i as f32).collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids.clone())),
+                Arc::new(StringArray::from(cats)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
+        let mut ds = Dataset::write(
+            reader,
+            &test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut params = VectorIndexParams::ivf_pq(1, 8, 2, MetricType::L2, 2);
+        params.covering_columns(vec!["category".to_string()]);
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // Partial merge_insert updating only the covered `category`.
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let update = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(
+                    (0..n).map(|j| format!("new-{j:04}")).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update)], sub_schema));
+        let row_ids_before = row_ids_by_key(&ds).await;
+        let updated_frag = ds.get_fragments().iter().map(|f| f.id()).max().unwrap();
+        let (ds, _) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .expect("a covered update on a stable-row-id dataset must fall back, not fail");
+
+        // Reopen so the ids are read back from committed bytes, not from the in-memory handle.
+        let reopened = Dataset::open(test_uri.as_ref()).await.unwrap();
+        let after = reopened
+            .scan()
+            .project(&["id", "category"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(after.num_rows(), n, "the fallback must not lose rows");
+        let cats = after["category"].as_string::<i32>();
+        assert!(
+            (0..cats.len()).all(|i| cats.value(i).starts_with("new-")),
+            "the fallback must still apply the update"
+        );
+
+        // The property the old rejection existed to protect: no row changed identity. The
+        // in-place patch moves no rows, so every id survives, paired with the same key.
+        let row_ids_after = row_ids_by_key(&reopened).await;
+        assert_eq!(
+            row_ids_before, row_ids_after,
+            "falling back to the in-place patch must preserve every stable row id"
+        );
+
+        // And the only thing forfeited is confinement: the updated fragment left the bitmap.
+        let indices = ds.load_indices().await.unwrap();
+        let vec_idx = indices.iter().find(|i| i.name == "vec_idx").unwrap();
+        let bitmap = vec_idx.fragment_bitmap.as_ref().unwrap();
+        assert!(
+            !bitmap.contains(updated_frag as u32),
+            "the in-place fallback should have evicted fragment {updated_frag} from the vector \
+             index; if it is still covered the merge did not take the fallback and this test is \
+             not exercising it: {bitmap:?}"
+        );
+    }
+
+    /// A partial-schema merge that does NOT update matched rows (DoNothing + InsertAll)
+    /// must not be treated as a covered-column update, even when the source carries a
+    /// covered column -- matched rows are untouched and unmatched rows enter unindexed
+    /// fragments, so nothing is patched into the index.
+    #[tokio::test]
+    async fn test_merge_insert_covered_donothing_insert_not_rejected() {
+        let dim = 4i32;
+        let n = 20usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                // nullable so InsertAll with a partial source is permitted
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
+        ]));
+        let ids: Vec<String> = (0..n).map(|j| format!("id-{j:04}")).collect();
+        let cats: Vec<String> = (0..n).map(|j| format!("cat-{j:04}")).collect();
+        let values: Vec<f32> = (0..n * dim as usize).map(|i| i as f32).collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(cats)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
+        let mut ds = Dataset::write(reader, "memory://covered_donothing", None)
+            .await
+            .unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        params.covering_columns(vec!["category".to_string()]);
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // DoNothing on matched + InsertAll unmatched, partial source (id + category)
+        // including new rows to insert.
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let new_ids: Vec<String> = (n..n + 5).map(|j| format!("id-{j:04}")).collect();
+        let new_cats: Vec<String> = (n..n + 5).map(|j| format!("cat-{j:04}")).collect();
+        let update = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(new_ids)),
+                Arc::new(StringArray::from(new_cats)),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update)], sub_schema));
+        let result = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::DoNothing)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await;
+        assert!(
+            result.is_ok(),
+            "DoNothing + InsertAll with a covered column in a partial source must not be \
+             rejected as a covered update; got {:?}",
+            result.err()
+        );
+    }
+
+    /// An upsert touching a covered column -- `UpdateAll` matched plus `InsertAll` unmatched --
+    /// must fall back to the in-place patch. The move reads row addresses through the null mask,
+    /// and the unmatched group arrives with a NULL `_rowaddr`, so entering the move would
+    /// tombstone unrelated rows at address 0. Never entering it prevents that as completely as
+    /// refusing the merge did, and `update_fragments` already routes the NULL group to
+    /// `handle_new_fragments`.
+    ///
+    /// The data-loss assertion is the point: the row count must be exactly the original plus the
+    /// inserted row, and every pre-existing row must still be there. That is what a bogus
+    /// address-0 tombstone would break.
+    #[tokio::test]
+    async fn test_merge_insert_covered_update_with_insert_falls_back() {
+        let dim = 4i32;
+        let n = 20usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                // nullable so InsertAll with a partial source is permitted
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
+        ]));
+        let ids: Vec<String> = (0..n).map(|j| format!("id-{j:04}")).collect();
+        let cats: Vec<String> = (0..n).map(|j| format!("cat-{j:04}")).collect();
+        let values: Vec<f32> = (0..n * dim as usize).map(|i| i as f32).collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(cats)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
+        let mut ds = Dataset::write(reader, "memory://covered_update_insert", None)
+            .await
+            .unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        params.covering_columns(vec!["category".to_string()]);
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // Partial source mixing an update to an existing row with a brand-new row.
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let update = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "id-0001".to_string(),
+                    format!("id-{:04}", n),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    "updated-0001".to_string(),
+                    "brand-new".to_string(),
+                ])),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update)], sub_schema));
+        let updated_frag = ds.get_fragments().iter().map(|f| f.id()).max().unwrap();
+        let (ds, stats) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .expect("a covered update carrying inserts must fall back, not fail");
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 1);
+
+        // No row was tombstoned at a bogus address: exactly the original rows plus the insert,
+        // with every original key still present.
+        let after = ds
+            .scan()
+            .project(&["id", "category"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            after.num_rows(),
+            n + 1,
+            "the fallback must insert the new row and tombstone nothing else"
+        );
+        let ids_col = after["id"].as_string::<i32>();
+        let cats_col = after["category"].as_string::<i32>();
+        let found: HashMap<&str, &str> = (0..after.num_rows())
+            .map(|i| (ids_col.value(i), cats_col.value(i)))
+            .collect();
+        for j in 0..n {
+            assert!(
+                found.contains_key(format!("id-{j:04}").as_str()),
+                "the fallback dropped pre-existing row id-{j:04}"
+            );
+        }
+        assert_eq!(
+            found["id-0001"], "updated-0001",
+            "the update was not applied"
+        );
+        assert_eq!(
+            found[format!("id-{n:04}").as_str()],
+            "brand-new",
+            "the insert was not applied"
+        );
+
+        // Confinement is what was forfeited.
+        let indices = ds.load_indices().await.unwrap();
+        let vec_idx = indices.iter().find(|i| i.name == "vec_idx").unwrap();
+        let bitmap = vec_idx.fragment_bitmap.as_ref().unwrap();
+        assert!(
+            !bitmap.contains(updated_frag as u32),
+            "the in-place fallback should have evicted fragment {updated_frag} from the vector \
+             index; still covered means the fallback was not taken: {bitmap:?}"
+        );
+    }
+
+    /// The covered-column row-move re-reads full rows via a take, which cannot round-trip
+    /// legacy (v1) blob columns as binary, so a dataset carrying one must fall back to the
+    /// in-place patch -- which never reads the blob column at all. The assertion that matters
+    /// is therefore that the blob survives the merge intact, not that the merge was refused.
+    #[tokio::test]
+    async fn test_merge_insert_covered_update_falls_back_with_v1_blob() {
+        use arrow_array::LargeBinaryArray;
+        use lance_arrow::BLOB_META_KEY;
+
+        let dim = 4i32;
+        let n = 20usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+                true,
+            ),
+            Field::new("blobs", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )])),
+        ]));
+        let ids: Vec<String> = (0..n).map(|j| format!("id-{j:04}")).collect();
+        let cats: Vec<String> = (0..n).map(|j| format!("cat-{j:04}")).collect();
+        let blobs: Vec<Option<&[u8]>> = (0..n).map(|_| Some(b"payload".as_slice())).collect();
+        let values: Vec<f32> = (0..n * dim as usize).map(|i| i as f32).collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(cats)),
+                Arc::new(vectors),
+                Arc::new(LargeBinaryArray::from(blobs)),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
+        let mut ds = Dataset::write(
+            reader,
+            "memory://covered_v1_blob",
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        params.covering_columns(vec!["category".to_string()]);
+        ds.create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // Partial source updating the covered `category` on matched rows only.
+        let sub_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let upd_ids: Vec<String> = (0..3).map(|j| format!("id-{j:04}")).collect();
+        let upd_cats: Vec<String> = (0..3).map(|j| format!("new-{j:04}")).collect();
+        let update = RecordBatch::try_new(
+            sub_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(upd_ids)),
+                Arc::new(StringArray::from(upd_cats)),
+            ],
+        )
+        .unwrap();
+        let reader = Box::new(RecordBatchIterator::new([Ok(update)], sub_schema));
+        let updated_frag = ds.get_fragments().iter().map(|f| f.id()).max().unwrap();
+        // A v1 blob column scans as a position/size description struct, not binary -- writing
+        // those descriptors back as data is exactly the corruption the move would cause. Capture
+        // them so "the blob was left alone" is provable rather than assumed.
+        let blobs_before = ds
+            .scan()
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let (ds, _) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(reader)
+            .await
+            .expect("a covered update on a v1-blob dataset must fall back, not fail");
+
+        // The update landed, and the blob the move would have corrupted is untouched. Read the
+        // blobs through the binary path the v1 column is meant to be read by.
+        let after = ds
+            .scan()
+            .project(&["id", "category"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(after.num_rows(), n);
+        let ids_col = after["id"].as_string::<i32>();
+        let cats_col = after["category"].as_string::<i32>();
+        for i in 0..after.num_rows() {
+            let key: usize = ids_col.value(i)[3..].parse().unwrap();
+            let expected = if key < 3 {
+                format!("new-{key:04}")
+            } else {
+                format!("cat-{key:04}")
+            };
+            assert_eq!(cats_col.value(i), expected, "wrong category after fallback");
+        }
+        let blobs_after = ds
+            .scan()
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            blobs_before, blobs_after,
+            "the in-place fallback must leave the v1 blob column untouched; the move would have \
+             rewritten these descriptors into a new fragment as ordinary struct data"
+        );
+        // And the bytes are still readable through the blob API they were written with.
+        let blob_handles = ds
+            .take_blobs_by_indices(&(0..n as u64).collect::<Vec<_>>(), "blobs")
+            .await
+            .unwrap();
+        assert_eq!(blob_handles.len(), n);
+        assert!(
+            blob_handles.iter().all(|b| b
+                .as_ref()
+                .is_some_and(|b| b.size() == b"payload".len() as u64)),
+            "every v1 blob must still read back at its original size"
+        );
+
+        // Confinement is what was forfeited.
+        let indices = ds.load_indices().await.unwrap();
+        let vec_idx = indices.iter().find(|i| i.name == "vec_idx").unwrap();
+        let bitmap = vec_idx.fragment_bitmap.as_ref().unwrap();
+        assert!(
+            !bitmap.contains(updated_frag as u32),
+            "the in-place fallback should have evicted fragment {updated_frag} from the vector \
+             index; still covered means the fallback was not taken: {bitmap:?}"
         );
     }
 
@@ -14921,11 +17071,11 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     #[tokio::test]
     async fn test_merge_insert_with_blob_v1_source_provides_blob() {
         use arrow_array::LargeBinaryArray;
-        use arrow_schema::Schema as ArrowSchema;
+        use arrow_schema::Schema;
         use lance_arrow::BLOB_META_KEY;
 
         let test_dir = TempStrDir::default();
-        let schema = Arc::new(ArrowSchema::new(vec![
+        let schema = Arc::new(Schema::new(vec![
             Field::new("blobs", DataType::LargeBinary, true).with_metadata(HashMap::from([(
                 BLOB_META_KEY.to_string(),
                 "true".to_string(),
@@ -15000,10 +17150,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     #[tokio::test]
     async fn test_merge_insert_with_blob_v2_source_provides_blob() {
         use crate::{BlobArrayBuilder, blob_field};
-        use arrow_schema::Schema as ArrowSchema;
+        use arrow_schema::Schema;
 
         let test_dir = TempStrDir::default();
-        let schema = Arc::new(ArrowSchema::new(vec![
+        let schema = Arc::new(Schema::new(vec![
             blob_field("blobs", true),
             Field::new("id", DataType::Int64, true),
             Field::new("other", DataType::Int64, true),

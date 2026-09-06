@@ -328,6 +328,262 @@ def test_ann(indexed_dataset):
     run(indexed_dataset)
 
 
+def _field_id(dataset, name):
+    for field in dataset.lance_schema.fields():
+        if field.name() == name:
+            return field.id()
+    raise KeyError(name)
+
+
+def test_create_index_with_covering_columns(tmp_path):
+    """A covered ("included") column passed to create_index is threaded through the
+    PyO3 boundary into the built index's metadata, so the committed index reports the
+    covered field id. Without the wiring the index builds but carries no covering
+    columns."""
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    price_id = _field_id(dataset, "price")
+
+    query = np.random.randn(128).astype(np.float32)
+    exact = dataset.to_table(
+        nearest={"column": "vector", "q": query, "k": 10}, columns=["id"]
+    )["id"].to_pylist()
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        covering_columns=["price"],
+    )
+
+    # The CreateIndex transaction carries the built index's metadata, including the
+    # covered field ids.
+    created_index = dataset.get_transactions(1)[0].operation.new_indices[0]
+    assert created_index.covering_fields == [price_id]
+
+    # The covering declaration also survives into the committed manifest, so it is
+    # visible without replaying the transaction log.
+    desc = dataset.describe_indices()[0]
+    assert [segment.covering_fields for segment in desc.segments] == [[price_id]]
+
+    # The index-level view resolves the same declaration to schema names, so callers
+    # can see what an index covers without knowing field ids.
+    assert desc.covering_fields == [price_id]
+    assert desc.covering_field_names == ["price"]
+    # Covering columns are reported separately from the key the index answers on.
+    assert desc.field_names == ["vector"]
+
+    hits = dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 10,
+            "nprobes": 4,
+            "refine_factor": 10,
+        },
+        columns=["id", "price"],
+    )
+    recall = len(set(exact) & set(hits["id"].to_pylist())) / len(exact)
+    assert recall >= 0.5, f"recall={recall}, exact={exact}, got={hits['id']}"
+
+    # Declaring a covering column must not disturb the values a query projects.
+    prices = dict(zip(tbl["id"].to_pylist(), tbl["price"].to_pylist()))
+    assert hits["price"].to_pylist() == [prices[i] for i in hits["id"].to_pylist()]
+
+
+def _covered_query_table(nvec=1000, ndim=128, k=10, id_offset=1_000_000, seed=0):
+    """A vector table with an unambiguous k-neighborhood and ids disjoint from row ids.
+
+    Two fixture properties are load-bearing, and neither is cosmetic:
+
+    `create_table` numbers ids from 0, so on a single-fragment write `id == _rowid` for
+    every row -- and under that fixture any defect that serves the row id where a
+    covered value belongs (or the reverse) satisfies a row-alignment assertion by
+    accident. A `UInt64` covering column substituted for `_rowid` downcasts cleanly, so
+    the confusion is silent. `id_offset` separates the two columns.
+
+    The first `k` rows form one tight, well-separated cluster around the query while
+    every other row is orders of magnitude further away. In uniformly random 128-d data
+    the true top-k sit at nearly identical distances, so which ones a quantizer returns
+    is a coin flip and a recall gate on it flakes around its threshold. Here the top-k
+    is unambiguous, so the recall assertion tests the search rather than the fixture.
+    """
+    rng = np.random.default_rng(seed)
+    mat = rng.standard_normal((nvec, ndim)).astype(np.float32) * 10.0
+    mat[:k] = mat[0] + rng.standard_normal((k, ndim)).astype(np.float32) * 0.01
+    tbl = pa.table(
+        {
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(mat.reshape(-1), type=pa.float32()), ndim
+            ),
+            "id": pa.array([id_offset + i for i in range(nvec)], type=pa.uint64()),
+            "price": pa.array(rng.random(nvec) * 100),
+        }
+    )
+    return tbl, mat
+
+
+def test_create_index_covering_columns_serve_the_query_from_the_index(tmp_path):
+    """The payoff of the whole create-side wiring: an index built *through the Python
+    binding* with covering columns must answer a query for those columns out of index
+    storage, with values that match an independent read of the base table.
+
+    Creation succeeding proves nothing -- nor does a correct query result on its own,
+    since a plain base-table take returns the same values. The plan assertions are what
+    separate the two, and they are deliberately both positive and negative: pinning the
+    exact node chain means a take inserted between the search and the output fails the
+    test whatever that node is called, while a bare `"LanceRead" not in plan` would go
+    vacuously true the moment the node is renamed -- and then the test would pass with
+    covering entirely dead, since values, row alignment and recall are all satisfied by
+    an ordinary base-table take.
+    """
+    id_offset = 1_000_000
+    tbl, mat = _covered_query_table(id_offset=id_offset)
+    dataset = lance.write_dataset(tbl, tmp_path)
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        covering_columns=["id", "price"],
+    )
+    desc = dataset.describe_indices()[0]
+    assert desc.covering_field_names == ["id", "price"]
+    # Covering columns never join the keyed prefix, or a consumer would believe the
+    # index can be searched on them.
+    assert desc.field_names == ["vector"]
+
+    query = mat[0]
+    scanner = dataset.scanner(
+        nearest={"column": "vector", "q": query, "k": 10, "nprobes": 4},
+        columns=["id", "price"],
+        with_row_id=True,
+    )
+    plan = scanner.explain_plan(True)
+    # Positive: the covered plan is exactly search -> sort -> project, with nothing in
+    # between fetching from the base table. Asserting the whole chain (rather than only
+    # the absence of a node name) is what makes a rename fail loudly instead of
+    # silently satisfying the test.
+    plan_nodes = [
+        line.split(":", 1)[0].strip() for line in plan.splitlines() if line.strip()
+    ]
+    assert plan_nodes == [
+        "ProjectionExec",
+        "SortExec",
+        "ANNSubIndex",
+        "ANNIvfPartition",
+    ], f"unexpected node in the covered plan; plan was:\n{plan}"
+    # Negative, kept for the clearer failure message when the take is what came back.
+    assert "LanceRead" not in plan, (
+        f"a covered projection must not fall back to a take; plan was:\n{plan}"
+    )
+
+    hits = scanner.to_table()
+    assert hits.num_rows == 10
+
+    # Independent read: reopen the dataset and read the base table directly, rather
+    # than trusting the in-memory `tbl` the index was built from.
+    base = lance.dataset(tmp_path).to_table(columns=["id", "price"])
+    price_by_id = dict(zip(base["id"].to_pylist(), base["price"].to_pylist()))
+
+    ids = hits["id"].to_pylist()
+    row_ids = hits["_rowid"].to_pylist()
+    prices = hits["price"].to_pylist()
+    # Single-fragment, step-id dataset => a correctly covered id is the row id plus the
+    # offset. A covered value sourced from `_rowid`, or paired with the wrong row,
+    # cannot satisfy this.
+    assert ids == [row_id + id_offset for row_id in row_ids]
+    assert prices == [price_by_id[i] for i in ids]
+
+    # Serving the columns from the index is worthless if the search returns the wrong
+    # neighbors, so also gate on recall against brute-force ground truth. The fixture's
+    # planted neighborhood makes that truth unambiguous, so this gate measures the
+    # search and not the concentration of random high-dimensional distances.
+    truth = set(
+        (id_offset + int(i))
+        for i in np.argsort(np.linalg.norm(mat - query, axis=1))[:10]
+    )
+    recall = len(truth & set(ids)) / len(truth)
+    assert recall >= 0.5, f"covered recall {recall} < 0.5 (got {ids}, truth {truth})"
+
+
+def test_create_index_uncommitted_with_covering_columns(tmp_path):
+    """create_index_uncommitted is a second entry point into the same PyO3 create
+    path. It has to forward covering_columns as well, or a distributed build silently
+    produces a segment with no covering columns."""
+    tbl = create_table(nvec=256)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    price_id = _field_id(dataset, "price")
+
+    segment = dataset.create_index_uncommitted(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        covering_columns=["price"],
+        fragment_ids=[fragment.fragment_id for fragment in dataset.get_fragments()],
+    )
+    assert segment.covering_fields == [price_id]
+
+    dataset = dataset.commit_existing_index_segments("vector_idx", "vector", [segment])
+    assert dataset.describe_indices()[0].segments[0].covering_fields == [price_id]
+
+
+@pytest.mark.parametrize(
+    "index_type",
+    [pytest.param("BTREE", id="btree"), pytest.param("BITMAP", id="bitmap")],
+)
+def test_create_index_uncommitted_rejects_covering_columns_for_scalar(
+    tmp_path, index_type
+):
+    """The segment-native scalar branch of create_index_uncommitted early-returns
+    before the vector params are ever built, so it cannot honour covering_columns. It
+    has to say so: silently returning a segment with covering_fields == [] leaves a
+    distributed pipeline believing it built covered scalar segments, and the covering
+    turns up missing only at query time."""
+    dataset = lance.write_dataset(create_table(nvec=256), tmp_path)
+    fragment_ids = [fragment.fragment_id for fragment in dataset.get_fragments()]
+
+    with pytest.raises(ValueError, match="only supported for vector indexes"):
+        dataset.create_index_uncommitted(
+            "price",
+            index_type=index_type,
+            fragment_ids=fragment_ids,
+            covering_columns=["meta"],
+        )
+
+    # The guard must not disturb the ordinary uncovered scalar path.
+    segment = dataset.create_index_uncommitted(
+        "price", index_type=index_type, fragment_ids=fragment_ids
+    )
+    assert segment.covering_fields == []
+
+
+@pytest.mark.parametrize(
+    "covering_columns",
+    [
+        pytest.param(["nope"], id="unknown_column"),
+        pytest.param(["vector"], id="indexed_column"),
+        pytest.param(["price", "price"], id="duplicate_column"),
+    ],
+)
+def test_create_index_covering_columns_rejected_by_core(tmp_path, covering_columns):
+    """Covering columns are validated in the Rust core, never in the binding. The
+    binding only has to let those errors reach the caller."""
+    dataset = lance.write_dataset(create_table(nvec=256), tmp_path)
+
+    with pytest.raises(ValueError, match="covering_columns"):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=16,
+            covering_columns=covering_columns,
+        )
+
+
 def test_create_index_progress_callback_vector(tmp_path):
     ds = _make_sample_dataset_base(tmp_path, "vector_progress", 1500, 128)
     recorder = ProgressRecorder()
