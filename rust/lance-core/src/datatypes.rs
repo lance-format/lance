@@ -529,14 +529,17 @@ impl TryFrom<&LogicalType> for DataType {
                     }
                 }
                 "timestamp" => {
-                    if splits.len() != 3 {
+                    if splits.len() < 3 {
                         Err(Error::schema(format!("Unsupported timestamp type: {}", lt)))
                     } else {
                         let timeunit = parse_timeunit(splits[1])?;
-                        let tz: Option<Arc<str>> = if splits[2] == "-" {
+                        // A fixed-offset timezone such as "+08:00" contains a colon, so the
+                        // trailing segments must be rejoined instead of read as a single one.
+                        let tz_str = splits[2..].join(":");
+                        let tz: Option<Arc<str>> = if tz_str == "-" {
                             None
                         } else {
-                            Some(splits[2].into())
+                            Some(tz_str.into())
                         };
                         Ok(Timestamp(timeunit, tz))
                     }
@@ -614,6 +617,8 @@ impl TryFrom<u8> for BlobKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::Schema as ArrowSchema;
+    use rstest::rstest;
 
     #[test]
     fn test_classify_blob_v2_layouts() {
@@ -684,5 +689,115 @@ mod tests {
             ArrowField::new("blob_uri", DataType::Utf8, false),
         ]);
         assert_eq!(BlobV2Layout::classify(&malformed_descriptor), None);
+    }
+
+    /// The `timestamp:<unit>:<timezone>` encoding embeds the timezone verbatim, so a
+    /// fixed-offset zone such as `+08:00` contributes a colon of its own. Round-tripping
+    /// every timezone shape guards the parser against splitting on that colon.
+    #[rstest]
+    #[case::second_no_timezone(TimeUnit::Second, None)]
+    #[case::millisecond_no_timezone(TimeUnit::Millisecond, None)]
+    #[case::microsecond_no_timezone(TimeUnit::Microsecond, None)]
+    #[case::nanosecond_no_timezone(TimeUnit::Nanosecond, None)]
+    #[case::named_utc(TimeUnit::Microsecond, Some("UTC"))]
+    #[case::named_region(TimeUnit::Nanosecond, Some("America/Los_Angeles"))]
+    #[case::offset_without_colon(TimeUnit::Microsecond, Some("+0800"))]
+    #[case::offset_positive(TimeUnit::Microsecond, Some("+08:00"))]
+    #[case::offset_negative(TimeUnit::Millisecond, Some("-05:00"))]
+    #[case::offset_half_hour(TimeUnit::Nanosecond, Some("+05:30"))]
+    #[case::offset_zero(TimeUnit::Second, Some("+00:00"))]
+    fn test_timestamp_logical_type_round_trip(
+        #[case] timeunit: TimeUnit,
+        #[case] timezone: Option<&str>,
+    ) {
+        let data_type = DataType::Timestamp(timeunit, timezone.map(Arc::from));
+        let logical_type = LogicalType::try_from(&data_type).unwrap();
+        assert_eq!(
+            DataType::try_from(&logical_type).unwrap(),
+            data_type,
+            "logical type: {logical_type}"
+        );
+    }
+
+    /// Pins the on-disk spelling as well as the round trip: the timezone is written
+    /// verbatim, which is why the parser cannot assume a fixed segment count.
+    #[rstest]
+    #[case::no_timezone(TimeUnit::Second, None, "timestamp:s:-")]
+    #[case::named_utc(TimeUnit::Millisecond, Some("UTC"), "timestamp:ms:UTC")]
+    #[case::offset_positive(TimeUnit::Microsecond, Some("+08:00"), "timestamp:us:+08:00")]
+    #[case::offset_negative(TimeUnit::Nanosecond, Some("-05:00"), "timestamp:ns:-05:00")]
+    fn test_timestamp_logical_type_encoding(
+        #[case] timeunit: TimeUnit,
+        #[case] timezone: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let data_type = DataType::Timestamp(timeunit, timezone.map(Arc::from));
+        assert_eq!(
+            LogicalType::try_from(&data_type).unwrap().to_string(),
+            expected
+        );
+    }
+
+    /// Opening an existing dataset parses the stored string directly, so cover that
+    /// direction on its own rather than only as half of a round trip.
+    #[rstest]
+    #[case::offset_positive("timestamp:us:+08:00", TimeUnit::Microsecond, Some("+08:00"))]
+    #[case::offset_negative("timestamp:ms:-05:00", TimeUnit::Millisecond, Some("-05:00"))]
+    #[case::offset_half_hour("timestamp:ns:+05:30", TimeUnit::Nanosecond, Some("+05:30"))]
+    #[case::named_utc("timestamp:s:UTC", TimeUnit::Second, Some("UTC"))]
+    #[case::no_timezone("timestamp:us:-", TimeUnit::Microsecond, None)]
+    fn test_parse_timestamp_logical_type(
+        #[case] encoded: &str,
+        #[case] timeunit: TimeUnit,
+        #[case] timezone: Option<&str>,
+    ) {
+        assert_eq!(
+            DataType::try_from(&LogicalType::from(encoded)).unwrap(),
+            DataType::Timestamp(timeunit, timezone.map(Arc::from))
+        );
+    }
+
+    /// `Field::data_type` unwraps the parse, so a timezone it cannot read surfaces as a
+    /// panic instead of an error. Walk the Arrow -> Lance -> Arrow trip end to end.
+    #[test]
+    fn test_field_round_trip_with_fixed_offset_timezone() {
+        let data_type = DataType::Timestamp(TimeUnit::Microsecond, Some("+08:00".into()));
+        let arrow_field = ArrowField::new("ts", data_type.clone(), true);
+        let field = Field::try_from(&arrow_field).unwrap();
+        assert_eq!(field.data_type(), data_type);
+        assert_eq!(ArrowField::from(&field), arrow_field);
+    }
+
+    /// The conversion a write performs, mixing both timezone spellings in one schema.
+    #[test]
+    fn test_schema_round_trip_with_fixed_offset_timezone() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "ts_offset",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+08:00".into())),
+                true,
+            ),
+            ArrowField::new(
+                "ts_named",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        assert_eq!(ArrowSchema::from(&schema), arrow_schema);
+    }
+
+    /// A timezone cannot be recovered from fewer than three segments, and an unknown
+    /// time unit is still an error, so neither becomes collateral damage of the rejoin.
+    #[rstest]
+    #[case::unit_and_timezone_missing("timestamp")]
+    #[case::timezone_missing("timestamp:us")]
+    #[case::unknown_timeunit("timestamp:decade:UTC")]
+    #[case::unknown_timeunit_with_offset("timestamp:decade:+08:00")]
+    fn test_malformed_timestamp_logical_type_is_rejected(#[case] encoded: &str) {
+        assert!(
+            DataType::try_from(&LogicalType::from(encoded)).is_err(),
+            "expected {encoded} to be rejected"
+        );
     }
 }
