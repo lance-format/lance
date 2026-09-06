@@ -108,6 +108,12 @@ pub fn overlaid_fragments(fragments: &[Fragment]) -> HashMap<u32, &Fragment> {
 /// stale because an overlay committed after the segment was built touches a field the segment
 /// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].
 ///
+/// Walking `segment.fields` alone covers both the key fields and any covering
+/// (`covering_fields`) columns materialized in the index storage: `fields` always lists
+/// `covering_fields` as its trailing entries (see [`IndexMetadata::covering_fields`]). An
+/// overlay touching either makes the segment's stored copy stale, so both must gate overlay
+/// exclusion.
+///
 /// `overlaid_frags` holds only the fragments that actually carry overlays (rare), so the loop is
 /// `O(overlaid_frags)` rather than `O(fragments the segment covers)`.
 pub fn collect_overlay_stale_frags(
@@ -410,6 +416,50 @@ mod tests {
         assert!(
             stale.is_empty(),
             "fragment absent from bitmap contributes no rows"
+        );
+    }
+
+    #[test]
+    fn test_collect_rows_flags_overlay_on_covered_column() {
+        let schema = flat_test_schema();
+        // Segment indexes field 3 (key) and COVERS field 2 (included). An overlay touching
+        // ONLY the covered field must still flag its rows stale -- otherwise a covered query
+        // serves the stale index-stored copy of that column instead of the fresh overlay value.
+        let fragment = fragment_with_overlay(3, dense_overlay(vec![2], [1, 2], 9));
+        let overlaid: HashMap<u32, &Fragment> = HashMap::from([(3u32, &fragment)]);
+        // `covering_fields` is always the trailing entries of `fields`.
+        let seg = IndexMetadata {
+            covering_fields: vec![2],
+            ..segment(vec![3, 2], 1, Some(bitmap([3])))
+        };
+
+        let mut stale = HashMap::new();
+        collect_overlay_stale_rows_for_segment(&seg, &overlaid, &mut stale, &schema).unwrap();
+        assert_eq!(
+            stale.get(&3),
+            Some(&bitmap([1, 2])),
+            "overlay on a covered (included) column must flag its rows stale"
+        );
+    }
+
+    #[test]
+    fn test_collect_frags_flags_overlay_on_covered_column() {
+        let schema = flat_test_schema();
+        // Same at fragment granularity: an overlay on a covered column marks the fragment stale.
+        let fragment = fragment_with_overlay(3, dense_overlay(vec![2], [1, 2], 9));
+        let overlaid: HashMap<u32, &Fragment> = HashMap::from([(3u32, &fragment)]);
+        // `covering_fields` is always the trailing entries of `fields`.
+        let seg = IndexMetadata {
+            covering_fields: vec![2],
+            ..segment(vec![3, 2], 1, Some(bitmap([3])))
+        };
+
+        let mut stale = RoaringBitmap::new();
+        collect_overlay_stale_frags(&seg, &overlaid, &mut stale, &schema).unwrap();
+        assert_eq!(
+            stale,
+            bitmap([3]),
+            "overlay on a covered (included) column must flag the fragment stale"
         );
     }
 }

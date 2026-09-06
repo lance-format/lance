@@ -14,7 +14,7 @@ use std::{
 use arrow::datatypes::{self, UInt8Type};
 use arrow_array::{ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_array::{
-    FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
+    FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array, UInt64Array,
     cast::AsArray,
     types::{Float32Type, UInt64Type},
 };
@@ -43,7 +43,7 @@ use crate::vector::graph::{OrderedFloat, OrderedNode};
 use crate::{
     INDEX_METADATA_SCHEMA_KEY, IndexMetadata, pb,
     vector::{
-        PQ_CODE_COLUMN,
+        PART_ID_COLUMN, PQ_CODE_COLUMN,
         pq::transform::PQTransformer,
         quantizer::{QuantizerMetadata, QuantizerStorage},
         storage::{DistCalculator, VectorStore},
@@ -52,6 +52,14 @@ use crate::{
 };
 
 pub const PQ_METADATA_KEY: &str = "lance:pq";
+
+/// PQ storage's internal (non-covering) column names: the row id, the PQ code column,
+/// and the legacy `__ivf_part_id` column (written by pre-#3606 single-partition
+/// builds; PQ storage drops it at construction, so post-load it is never present and
+/// excluding it is a no-op -- but pre-load classification, e.g. from a raw shard
+/// schema in the distributed merger, needs it). Every other column is a user-declared
+/// covering ("included") column. The single authority for this set.
+pub const PQ_INTERNAL_COLUMNS: &[&str] = &[ROW_ID, PQ_CODE_COLUMN, PART_ID_COLUMN];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductQuantizationMetadata {
@@ -230,16 +238,23 @@ impl ProductQuantizationStorage {
         transposed: bool,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
-        if batch.num_columns() != 2 {
-            log::warn!(
-                "PQ storage should have 2 columns, but got {} columns: {}",
-                batch.num_columns(),
-                batch.schema(),
-            );
-            batch = batch.project(&[
-                batch.schema().index_of(ROW_ID)?,
-                batch.schema().index_of(PQ_CODE_COLUMN)?,
-            ])?;
+        // Require `_rowid` and the PQ code column, but preserve any additional
+        // ("included"/covering) columns row-aligned.
+        // Normalize the order to `[_rowid, __pq_code, <extras...>]` so the schema
+        // is stable across builds. `__ivf_part_id` is never a covering column:
+        // legacy `num_partitions=1` builds (pre-#3606) wrote it into the index
+        // file, so keep dropping it on load as before.
+        let row_id_idx = batch.schema().index_of(ROW_ID)?;
+        let pq_idx = batch.schema().index_of(PQ_CODE_COLUMN)?;
+        if row_id_idx != 0 || pq_idx != 1 || batch.num_columns() > 2 {
+            let schema = batch.schema();
+            let mut order = Vec::with_capacity(batch.num_columns());
+            order.push(row_id_idx);
+            order.push(pq_idx);
+            order.extend((0..batch.num_columns()).filter(|&i| {
+                i != row_id_idx && i != pq_idx && schema.field(i).name() != PART_ID_COLUMN
+            }));
+            batch = batch.project(&order)?;
         }
 
         let Some(row_ids) = batch.column_by_name(ROW_ID) else {
@@ -285,6 +300,7 @@ impl ProductQuantizationStorage {
             let transposed_codes = pq_code.values();
             let mut new_row_ids = Vec::with_capacity(row_ids.len());
             let mut new_codes = Vec::with_capacity(row_ids.len() * num_sub_vectors);
+            let mut kept_indices: Vec<u32> = Vec::with_capacity(row_ids.len());
 
             let row_ids_values = row_ids.values();
             for (i, row_id) in row_ids_values.iter().enumerate() {
@@ -296,6 +312,7 @@ impl ProductQuantizationStorage {
                         num_sub_vectors,
                         i as u32,
                     ));
+                    kept_indices.push(i as u32);
                 }
             }
 
@@ -311,7 +328,14 @@ impl ProductQuantizationStorage {
                     new_transposed_codes,
                     num_bytes_in_code as i32,
                 )?);
-                RecordBatch::try_new(batch.schema(), vec![new_row_ids, codes_fsl])?
+                // Preserve any included/covering columns row-aligned to the kept rows.
+                rebuild_storage_batch(
+                    batch.schema(),
+                    &batch,
+                    new_row_ids,
+                    codes_fsl,
+                    &UInt32Array::from(kept_indices),
+                )?
             };
             pq_code = batch[PQ_CODE_COLUMN]
                 .as_fixed_size_list()
@@ -529,6 +553,40 @@ where
     transposed_codes.into()
 }
 
+/// Rebuild a PQ-storage batch after a row selection (fragment-reuse remap in
+/// [`ProductQuantizationStorage::new`] or [`ProductQuantizationStorage::remap`]),
+/// preserving any extra ("included"/covering) columns beyond `_rowid` and the PQ
+/// code. The already-remapped `row_ids` and transposed `pq_codes` are supplied
+/// directly; every other column is gathered from `original` at the surviving
+/// positions `kept` so it stays row-aligned. `schema` carries the column order
+/// `[_rowid, __pq_code, <extras...>]`.
+fn rebuild_storage_batch(
+    schema: SchemaRef,
+    original: &RecordBatch,
+    row_ids: ArrayRef,
+    pq_codes: ArrayRef,
+    kept: &UInt32Array,
+) -> Result<RecordBatch> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let name = field.name().as_str();
+            if name == ROW_ID {
+                Ok(row_ids.clone())
+            } else if name == PQ_CODE_COLUMN {
+                Ok(pq_codes.clone())
+            } else {
+                let col = original.column_by_name(name).ok_or_else(|| {
+                    Error::index(format!("column '{name}' missing from PQ storage batch"))
+                })?;
+                Ok(arrow::compute::take(col.as_ref(), kept, None)?)
+            }
+        })
+        .collect::<Result<Vec<ArrayRef>>>()?;
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
 #[async_trait]
 impl QuantizerStorage for ProductQuantizationStorage {
     type Metadata = ProductQuantizationMetadata;
@@ -610,6 +668,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
         let transposed_codes = self.pq_code.values();
         let mut new_row_ids = Vec::with_capacity(self.len());
         let mut new_codes = Vec::with_capacity(self.len() * self.metadata.num_sub_vectors);
+        let mut kept_indices: Vec<u32> = Vec::with_capacity(self.len());
 
         let row_ids = self.row_ids.values();
         for (i, row_id) in row_ids.iter().enumerate() {
@@ -622,6 +681,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
                         self.metadata.num_sub_vectors,
                         i as u32,
                     ));
+                    kept_indices.push(i as u32);
                 }
                 Some(None) => {}
                 None => {
@@ -632,6 +692,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
                         self.metadata.num_sub_vectors,
                         i as u32,
                     ));
+                    kept_indices.push(i as u32);
                 }
             }
         }
@@ -647,7 +708,14 @@ impl QuantizerStorage for ProductQuantizationStorage {
                 new_transposed_codes,
                 num_bytes_in_code as i32,
             )?);
-            RecordBatch::try_new(self.schema(), vec![new_row_ids.clone(), codes_fsl])?
+            // Preserve any included/covering columns row-aligned to the kept rows.
+            rebuild_storage_batch(
+                self.schema(),
+                &self.batch,
+                new_row_ids.clone(),
+                codes_fsl,
+                &UInt32Array::from(kept_indices),
+            )?
         };
         let transposed_codes = batch[PQ_CODE_COLUMN]
             .as_fixed_size_list()
@@ -709,6 +777,9 @@ impl QuantizerStorage for ProductQuantizationStorage {
 
 impl VectorStore for ProductQuantizationStorage {
     type DistanceCalculator<'a> = PQDistCalculator;
+
+    /// PQ storage is `[_rowid, __pq_code, <included cols...>]`.
+    const INTERNAL_COLUMNS: &'static [&'static str] = PQ_INTERNAL_COLUMNS;
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok(std::iter::once(self.batch.clone()))
@@ -1291,6 +1362,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_build_preserves_extra_column() {
+        // A covering ("included") column beyond _rowid + __pq_code must be kept
+        // in the storage batch, row-aligned to the rows, not dropped.
+        let storage = create_pq_storage_with_extra_column().await;
+        let batch = storage.batch();
+        assert_eq!(batch.num_columns(), 3);
+        assert!(batch.column_by_name(ROW_ID).is_some());
+        assert!(batch.column_by_name(PQ_CODE_COLUMN).is_some());
+        let extra = batch
+            .column_by_name("extra")
+            .expect("extra column should be preserved")
+            .as_primitive::<datatypes::UInt32Type>();
+        // In the fixture extra[i] == row_ids[i] == i, so it must stay aligned.
+        for (i, row_id) in storage.row_ids().enumerate() {
+            assert_eq!(extra.value(i) as u64, *row_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_rejects_mismatched_batch_columns() {
+        // Batches merged into one storage must carry the same column set. A
+        // batch with a column the FIRST batch lacks must be rejected: aligning
+        // to the first batch's schema would silently drop it, losing covering
+        // data while the index metadata still advertises it.
+        let codebook = Float32Array::from_iter_values((0..256 * DIM).map(|_| rand::random()));
+        let codebook = FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap();
+        let pq = ProductQuantizer::new(NUM_SUB_VECTORS, 8, DIM, codebook, DistanceType::Dot);
+
+        let vec_field = Field::new(
+            "vec",
+            DataType::FixedSizeList(
+                Field::new_list_field(DataType::Float32, true).into(),
+                DIM as i32,
+            ),
+            true,
+        );
+        let make_fsl = || {
+            let vectors = Float32Array::from_iter_values((0..TOTAL * DIM).map(|_| rand::random()));
+            FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap()
+        };
+        let row_ids = || UInt64Array::from_iter_values((0..TOTAL).map(|v| v as u64));
+
+        let plain_schema = ArrowSchema::new(vec![vec_field.clone(), ROW_ID_FIELD.clone()]);
+        let plain = RecordBatch::try_new(
+            plain_schema.into(),
+            vec![Arc::new(make_fsl()), Arc::new(row_ids())],
+        )
+        .unwrap();
+
+        let covered_schema = ArrowSchema::new(vec![
+            vec_field,
+            ROW_ID_FIELD.clone(),
+            Field::new("extra", DataType::UInt32, true),
+        ]);
+        let covered = RecordBatch::try_new(
+            covered_schema.into(),
+            vec![
+                Arc::new(make_fsl()),
+                Arc::new(row_ids()),
+                Arc::new(UInt32Array::from_iter_values((0..TOTAL).map(|v| v as u32))),
+            ],
+        )
+        .unwrap();
+
+        let err = StorageBuilder::new("vec".to_owned(), pq.distance_type, pq, None)
+            .unwrap()
+            .build(vec![plain, covered])
+            .expect_err("a batch with extra columns must be rejected, not silently projected");
+        assert!(err.to_string().contains("extra"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_new_drops_legacy_part_id_column() {
+        // Pre-#3606 `num_partitions=1` builds wrote `__ivf_part_id` into the
+        // index file. It must still be dropped on load (the legacy read shim),
+        // NOT preserved and misclassified as a covering column -- that would
+        // make search emit an extra column the exec's declared schema (from
+        // `IndexMetadata.covering_fields`, empty for those indexes) lacks.
+        use crate::vector::PART_ID_COLUMN;
+        let codebook = Float32Array::from_iter_values((0..256 * DIM).map(|_| rand::random()));
+        let codebook = FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap();
+
+        let schema = ArrowSchema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new(
+                PQ_CODE_COLUMN,
+                DataType::FixedSizeList(
+                    Field::new_list_field(DataType::UInt8, true).into(),
+                    NUM_SUB_VECTORS as i32,
+                ),
+                true,
+            ),
+            Field::new(PART_ID_COLUMN, DataType::UInt32, true),
+        ]);
+        let row_ids = UInt64Array::from_iter_values((0..TOTAL).map(|v| v as u64));
+        let codes = UInt8Array::from_iter_values((0..TOTAL * NUM_SUB_VECTORS).map(|v| v as u8));
+        let codes = FixedSizeListArray::try_new_from_values(codes, NUM_SUB_VECTORS as i32).unwrap();
+        let part_ids = UInt32Array::from_iter_values((0..TOTAL).map(|_| 0));
+        let batch = RecordBatch::try_new(
+            schema.into(),
+            vec![Arc::new(row_ids), Arc::new(codes), Arc::new(part_ids)],
+        )
+        .unwrap();
+
+        let storage = ProductQuantizationStorage::new(
+            codebook,
+            batch,
+            8,
+            NUM_SUB_VECTORS,
+            DIM,
+            DistanceType::L2,
+            true, // codes already transposed
+            None,
+        )
+        .unwrap();
+        assert!(
+            storage.batch().column_by_name(PART_ID_COLUMN).is_none(),
+            "legacy __ivf_part_id must be dropped on load, not kept"
+        );
+        assert!(
+            storage.covering_field_indices().is_empty(),
+            "legacy __ivf_part_id must not be classified as a covering column"
+        );
+    }
+
+    #[tokio::test]
     async fn test_distance_all() {
         let storage = create_pq_storage().await;
         let query = Arc::new(Float32Array::from_iter_values((0..DIM).map(|v| v as f32)));
@@ -1392,8 +1589,19 @@ mod tests {
             // Rewritten row i lands at offset i of frag 1.
             assert_eq!(*row_id, (1u64 << 32) | i as u64);
         }
-        assert_eq!(new_storage.batch.num_columns(), 2);
+        // The covering ("extra") column must survive remap, row-aligned to the
+        // surviving rows — otherwise PK/covering data is lost on compaction.
+        assert_eq!(new_storage.batch.num_columns(), 3);
         assert!(new_storage.batch.column_by_name(ROW_ID).is_some());
         assert!(new_storage.batch.column_by_name(PQ_CODE_COLUMN).is_some());
+        let extra = new_storage
+            .batch
+            .column_by_name("extra")
+            .expect("extra column should survive remap")
+            .as_primitive::<datatypes::UInt32Type>();
+        // Surviving rows are original indices 0..TOTAL/2, whose extra values are 0..TOTAL/2.
+        for i in 0..TOTAL / 2 {
+            assert_eq!(extra.value(i), i as u32);
+        }
     }
 }

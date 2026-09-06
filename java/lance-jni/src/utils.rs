@@ -261,6 +261,11 @@ pub fn build_compaction_options(
 }
 
 // Convert from Java Optional<Query> to Rust Option<Query>
+//
+// This builds a `Query` directly rather than through `Scanner::nearest`, and is used
+// only by `JniTestHelper.parseQuery` to check the Java-side field marshalling. Java's
+// real search path is `blocking_scanner.rs`, which configures a `Scanner`, so it picks
+// up every plan-derived setting -- including the covering projection below.
 pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> {
     let query = env.get_optional(&query_obj, |env, java_obj| {
         let column = env.get_string_from_method(&java_obj, "getColumn")?;
@@ -305,6 +310,11 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
+            // Not a user-settable search parameter: the covering projection is derived
+            // per plan from what the scan reads, so it stays `None` (materialize
+            // whatever the index declares) at the binding boundary. Java's real search
+            // path resolves it in `Scanner`; see the note on this function.
+            covering_projection: None,
         })
     })?;
 
@@ -515,6 +525,7 @@ pub fn get_vector_index_params(
                 version: IndexFileVersion::V3,
                 skip_transpose: false,
                 runtime_hints: Default::default(),
+                covering_columns: Default::default(),
             })
         },
     )?;

@@ -100,10 +100,11 @@ Index segments are created and updated through a transactional process:
    - `name`: The index name (must match existing segments if adding to an existing index)
    - `fields`: The columns the index depends on: the keyed column(s) it is searched on, followed
      by any merely-carried columns named in `covering_fields`. `fields[0]` is always a keyed column.
-   - `covering_fields`: The trailing subset of `fields` whose values the index carries but is not
-     keyed on, letting a query that only projects those columns be answered without a fragment take.
-     Empty for an index that carries no extra columns. Declaring a column here does not by itself
-     make it servable -- see [Serving carried columns](#serving-carried-columns).
+   - `covering_fields`: The trailing subset of `fields` whose values the index carries, letting a
+     query that only projects those columns be answered without a fragment take. Usually these are
+     columns the index is not keyed on, but a keyed column may also be carried. Empty for an index
+     that carries no extra columns. Declaring a column here does not by itself make it servable --
+     see [Serving carried columns](#serving-carried-columns).
    - `fragment_bitmap`: The set of fragment IDs covered by this segment
    - `index_details`: Index-specific configuration and parameters
    - `version`: The format version of this index type
@@ -141,18 +142,36 @@ fragments that would have been covered by that segment.
 carries. It does not establish that the segment's storage holds their values.
 
 **The segment's storage schema is authoritative.** Before answering a query from a
-carried column, an engine must confirm that column is present in the storage it opened,
-and fall back to a take against the base table when it is not. A segment whose
-declaration names a column its storage does not hold is a legal state, not corruption:
-a maintenance operation that cannot carry the payload through a rebuild is permitted to
-withdraw it and leave the declaration standing.
+carried column, an engine must confirm that column is present and bound to the declared
+logical field in the storage it opened, and fall back to a take against the base table
+when it cannot. A segment whose declaration names a column its storage does not hold is
+a legal state, not corruption: a maintenance operation that cannot carry the payload
+through a rebuild is permitted to withdraw it and leave the declaration standing.
 
-!!! note "Current state"
+!!! note "Capability varies by segment"
 
-    No index builder writes carried values yet, so today every declaration is ahead of
-    its storage. Engines that read `covering_fields` must therefore treat it purely as a
-    declaration and serve every column from the base table until they have verified the
-    storage themselves. This is transitional; the rule above is not.
+    Whether a segment's storage holds a declared column depends on the index type, on the
+    writer that produced the segment, and on what later maintenance did to it, so one
+    logical index may hold values for some of its segments and not others. An engine
+    therefore verifies each selected segment rather than inferring capability from the
+    index type, the writer version, or the declaration alone, and serves from the base
+    table every column it cannot verify.
+
+!!! note "A keyed column may also be carried"
+
+    `covering_fields` usually names columns the index is *not* keyed on, but an index is
+    permitted to carry a column it is also keyed on -- for instance a vector index that
+    keeps full-precision vectors so a refine pass can re-rank without a base-table take.
+    The id then appears twice in `fields`, once as `fields[0]` and again as the trailing
+    carried entry, and once in `covering_fields`. This is the only case in which an id
+    repeats in `fields`.
+
+    A reader must therefore take the carried set from `covering_fields` directly, and
+    never derive it by subtracting the keyed prefix from `fields`: that set difference
+    silently drops a column that is both. The trailing-subset rule is stated over
+    `covering_fields` and is unaffected: `fields[0]` remains the column the index is
+    searched on, and an engine serves the repeated id from storage like any other
+    carried column.
 
 ## Loading an index
 
@@ -175,9 +194,9 @@ The `IndexMetadata` message contains important information about the index segme
 - `fields`: the columns the index depends on: the keyed column(s) the index is searched on, followed
   by any columns it merely carries, as named in `covering_fields`. `fields[0]` is always a keyed column.
 - `covering_fields`: the trailing subset of `fields` whose values the index carries alongside its own
-  data but is not keyed on. Empty for an index that carries no extra columns. This declaration is
-  not authoritative for what the segment can serve -- see
-  [Serving carried columns](#serving-carried-columns).
+  data -- usually columns it is not keyed on, though a keyed column may also be carried. Empty for an
+  index that carries no extra columns. This declaration is not authoritative for what the segment can
+  serve -- see [Serving carried columns](#serving-carried-columns).
 - `fragment_bitmap`: the set of fragment IDs covered by this index segment.
 - `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.

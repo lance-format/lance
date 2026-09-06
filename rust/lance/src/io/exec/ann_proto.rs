@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::Dataset;
 use crate::pb;
 
-use super::knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec};
+use super::knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, resolve_physical_covering_query};
 use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
 use super::utils::PreFilterSource;
 
@@ -118,6 +118,15 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         dist_q_c: Some(query.dist_q_c),
         query_parallelism: Some(query.query_parallelism),
         approx_mode: approx_mode_to_proto(query.approx_mode) as i32,
+        // Three states, and the message wrapper is what keeps the middle one alive across
+        // the wire (see `CoveringProjection` in `ann.proto`). `map` -- never
+        // `unwrap_or_default()` -- because an empty list means "materialize nothing",
+        // while absence means "materialize everything the index declares".
+        covering_projection: query.covering_projection.as_ref().map(|columns| {
+            pb::CoveringProjection {
+                columns: columns.to_vec(),
+            }
+        }),
     })
 }
 
@@ -148,6 +157,13 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         query_parallelism: proto.query_parallelism.unwrap_or(DEFAULT_QUERY_PARALLELISM),
         dist_q_c: proto.dist_q_c.unwrap_or(0.0),
         approx_mode: approx_mode_from_proto(proto.approx_mode),
+        // A message field, so absence survives the round trip and stays distinct from an
+        // empty list. A producer predating field 15 sends nothing and the reconstructed
+        // query narrows nothing -- the conservative direction (see
+        // `Query::covering_projection`: under-narrowing costs time, never correctness).
+        covering_projection: proto
+            .covering_projection
+            .map(|projection| Arc::from(projection.columns)),
     })
 }
 
@@ -288,21 +304,31 @@ pub async fn ann_ivf_sub_index_exec_from_proto(
         }
     };
 
-    ANNIvfSubIndexExec::try_new(input, dataset, indices, query, prefilter_source)
+    let query = resolve_physical_covering_query(dataset.clone(), &indices, &query).await?;
+    ANNIvfSubIndexExec::try_new_with_resolved_covering(
+        input,
+        dataset,
+        indices,
+        query,
+        prefilter_source,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::types::{Float32Type, UInt32Type};
+    use arrow_array::types::{Float32Type, Int32Type, UInt32Type};
     use arrow_array::{ArrayRef, Float32Array, Float64Array};
     use half::f16;
     use lance_datagen::{array, gen_batch};
 
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
+    use datafusion_physical_plan::ExecutionPlan;
     use datafusion_physical_plan::test::TestMemoryExec;
+    use lance_core::ROW_ID;
     use lance_index::IndexType;
+    use lance_index::vector::DIST_COL;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
 
@@ -354,6 +380,7 @@ mod tests {
             query_parallelism: -1,
             dist_q_c: 0.42,
             approx_mode: ApproxMode::Accurate,
+            covering_projection: None,
         };
 
         let proto = query_to_proto(&query).unwrap();
@@ -394,6 +421,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
+            covering_projection: None,
         };
 
         let proto = query_to_proto(&query).unwrap();
@@ -406,6 +434,148 @@ mod tests {
         proto.approx_mode = i32::MAX;
         let back = query_from_proto(proto).unwrap();
         assert_eq!(back.approx_mode, ApproxMode::Normal);
+    }
+
+    /// `covering_projection` has three states and only two of them are expressible by a
+    /// bare proto3 `repeated string`, so the wire format wraps the list in a message.
+    /// Folding `Some(&[])` into `None` here would silently restore full materialization
+    /// on every distributed plan while every result stayed correct.
+    #[test]
+    fn test_query_roundtrip_covering_projection_three_states() {
+        let query = |projection: Option<Vec<String>>| {
+            let key: ArrayRef = Arc::new(Float32Array::from(vec![1.0]));
+            Query {
+                column: "v".to_string(),
+                key,
+                k: 5,
+                lower_bound: None,
+                upper_bound: None,
+                minimum_nprobes: 1,
+                maximum_nprobes: None,
+                ef: None,
+                refine_factor: None,
+                metric_type: None,
+                use_index: true,
+                query_parallelism: DEFAULT_QUERY_PARALLELISM,
+                dist_q_c: 0.0,
+                approx_mode: ApproxMode::Normal,
+                covering_projection: projection.map(Arc::from),
+            }
+        };
+        let roundtrip = |projection: Option<Vec<String>>| {
+            let proto = query_to_proto(&query(projection)).unwrap();
+            query_from_proto(proto).unwrap().covering_projection
+        };
+
+        assert!(
+            roundtrip(None).is_none(),
+            "'not computed' must stay 'not computed'"
+        );
+        let narrowed = roundtrip(Some(vec![])).expect(
+            "'this query needs no covering column' must survive; decoding it as `None` \
+             turns every remote plan back into a fully materializing one",
+        );
+        assert!(narrowed.is_empty());
+        assert_eq!(
+            roundtrip(Some(vec!["payload".to_string(), "price".to_string()]))
+                .expect("a computed projection must survive")
+                .to_vec(),
+            vec!["payload".to_string(), "price".to_string()],
+        );
+    }
+
+    /// The schema a remote executor declares must be the schema the planner declared.
+    /// The surrounding nodes -- `knn_combined`'s union and its projections -- were built
+    /// against the planner's, so a reconstruction that widens is not merely slower.
+    #[tokio::test]
+    async fn test_sub_index_proto_preserves_the_declared_covering_schema() {
+        let (dataset, _dir) = make_covered_indexed_dataset().await;
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            indices[0].covering_fields.len(),
+            2,
+            "the fixture must actually be a covered index"
+        );
+
+        let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            TestMemoryExec::try_new_exec(
+                &[],
+                super::super::knn::KNN_PARTITION_SCHEMA.clone(),
+                None,
+            )
+            .unwrap();
+
+        for (projection, expected) in [
+            (
+                None,
+                vec![
+                    DIST_COL.to_string(),
+                    ROW_ID.to_string(),
+                    "price".to_string(),
+                    "id".to_string(),
+                ],
+            ),
+            (Some(vec![]), vec![DIST_COL.to_string(), ROW_ID.to_string()]),
+            (
+                Some(vec!["id".to_string()]),
+                vec![DIST_COL.to_string(), ROW_ID.to_string(), "id".to_string()],
+            ),
+        ] {
+            let key: ArrayRef = Arc::new(Float32Array::from(vec![0.1f32; 128]));
+            let query = Query {
+                column: "vector".to_string(),
+                key,
+                k: 10,
+                lower_bound: None,
+                upper_bound: None,
+                minimum_nprobes: 2,
+                maximum_nprobes: None,
+                ef: None,
+                refine_factor: None,
+                metric_type: Some(DistanceType::L2),
+                use_index: true,
+                query_parallelism: DEFAULT_QUERY_PARALLELISM,
+                dist_q_c: 0.0,
+                approx_mode: ApproxMode::Normal,
+                covering_projection: projection.clone().map(Arc::from),
+            };
+            let query = resolve_physical_covering_query(dataset.clone(), &indices, &query)
+                .await
+                .unwrap();
+            let exec = ANNIvfSubIndexExec::try_new_with_resolved_covering(
+                input.clone(),
+                dataset.clone(),
+                indices.clone(),
+                query,
+                PreFilterSource::None,
+            )
+            .unwrap();
+            let names = |schema: arrow_schema::SchemaRef| {
+                schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect::<Vec<_>>()
+            };
+            // Pin the local schema too: if this fixture stopped narrowing, the equality
+            // below would hold trivially for the wrong reason.
+            assert_eq!(names(exec.schema()), expected, "local plan, {projection:?}");
+
+            let proto = ann_ivf_sub_index_exec_to_proto(&exec).await.unwrap();
+            let back = ann_ivf_sub_index_exec_from_proto(
+                proto,
+                Some(dataset.clone()),
+                input.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                names(back.schema()),
+                expected,
+                "reconstructed plan, {projection:?}"
+            );
+        }
     }
 
     async fn make_vector_dataset() -> (Arc<Dataset>, tempfile::TempDir) {
@@ -426,6 +596,41 @@ mod tests {
         )
         .await
         .unwrap();
+        (Arc::new(ds), dir)
+    }
+
+    /// An IVF_PQ index covering `price` and `id`, declared in the reverse of schema
+    /// order so the assertions above can tell declaration order from schema order.
+    async fn make_covered_indexed_dataset() -> (Arc<Dataset>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("price", array::step::<Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(128)),
+            )
+            .into_batch_rows(lance_datagen::RowCount::from(256))
+            .unwrap();
+        let path = dir.path().join("test_ann_covered.lance");
+        let mut ds = Dataset::write(
+            arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            path.to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut index_params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(2),
+            PQBuildParams::default(),
+        );
+        index_params.covering_columns(vec!["price".to_string(), "id".to_string()]);
+        ds.create_index(&["vector"], IndexType::Vector, None, &index_params, false)
+            .await
+            .unwrap();
+        let ds = Dataset::open(path.to_str().unwrap()).await.unwrap();
         (Arc::new(ds), dir)
     }
 
@@ -472,6 +677,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
+            covering_projection: None,
         };
 
         let exec = ANNIvfPartitionExec::try_new(
@@ -520,6 +726,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
+            covering_projection: None,
         };
 
         // Use a TestMemoryExec as a mock input child (provides the KNN_PARTITION_SCHEMA)
@@ -584,6 +791,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
+            covering_projection: None,
         };
         let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
             TestMemoryExec::try_new_exec(

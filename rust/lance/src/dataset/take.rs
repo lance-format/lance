@@ -530,6 +530,19 @@ impl TakeBuilder {
         self
     }
 
+    /// Add the row id to the output *without* requesting it as a projected column.
+    ///
+    /// Naming `_rowid` in a [`ProjectionRequest`] also sets `must_add_row_offset`
+    /// (see `ProjectionPlan::from_schema`), which arms the "must not target deleted
+    /// rows" check in [`do_take_rows`] and turns a take that legitimately returns
+    /// fewer rows than requested into an error. It also computes a row-offset column
+    /// per batch. A caller that wants the ids only to realign its own output against
+    /// the rows that actually came back needs neither, so it uses this instead.
+    pub(crate) fn include_row_id(mut self) -> Self {
+        Arc::make_mut(&mut self.projection).include_row_id();
+        self
+    }
+
     pub(super) fn with_missing_row_policy(mut self, policy: MissingRowPolicy) -> Self {
         self.missing_row_policy = policy;
         self

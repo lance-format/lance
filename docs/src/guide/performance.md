@@ -529,3 +529,17 @@ Set `LANCE_DISABLE_AMX=1` to take the AMX paths out of service without rebuildin
 A/B measurement, or to get the previous behaviour back. Because it also moves partition
 assignment back to the approximate path, an index built with it set is not equivalent to one
 built without it; compare recall, not just build time.
+
+#### Covering Columns
+
+A vector index can carry the values of extra columns beside its vectors, so a query whose
+projection they satisfy is answered from the index without a take against the base table.
+That trade only pays off where the search settles into a single global top-k heap, because
+the covering read is then bounded by the query's survivors. Every HNSW index, and any query
+with `query_parallelism` above one, emits results per partition instead, so covering reads
+scale with the number of partitions probed rather than with `k`, and are issued serially.
+
+On those shapes covering is *slower* than the base-table take it exists to avoid — roughly
+2.8x a plain index's latency warm at nprobe 32, and 1.18x cold. Prefer IVF_PQ or IVF_FLAT
+when declaring covering columns; index creation logs a warning when covering is combined
+with HNSW.

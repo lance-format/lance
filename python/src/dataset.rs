@@ -5674,6 +5674,10 @@ impl PySearchFilter {
             query_parallelism,
             dist_q_c: 0.0,
             approx_mode,
+            // Not a user-settable search parameter: the covering projection is derived
+            // from what the plan reads, so it stays `None` (materialize whatever the
+            // index declares) at the binding boundary.
+            covering_projection: None,
         };
 
         Ok(Self {

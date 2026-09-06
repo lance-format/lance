@@ -674,9 +674,11 @@ pub struct PyIndexDescription {
     pub type_url: String,
     /// The short type of the index (may not be unique)
     pub index_type: String,
-    /// The ids of the fields that the index is built on
+    /// The ids of the fields the index is keyed on -- the columns it can answer queries about.
+    /// Covering ("included") columns are excluded; those are reported per-segment as
+    /// `covering_fields`.
     pub fields: Vec<u32>,
-    /// The full paths of the fields that the index is built on
+    /// The full paths of the fields the index is keyed on, matching `fields`
     /// (dotted, with backtick-quoted segments for non-identifier names)
     pub field_names: Vec<String>,
     /// The number of rows indexed by the index
