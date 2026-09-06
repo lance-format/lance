@@ -27,16 +27,19 @@ use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
+use std::io::Cursor;
 use std::sync::LazyLock;
 
 use arrow_array::{
     ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
 };
+use arrow_ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
+use datafusion_expr::{Expr, Operator, ScalarUDF};
 use lance_select::{RowAddrTreeMap, RowSetOps};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops::Bound, sync::Arc};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::scalar::RowIdRemapper;
@@ -54,7 +57,106 @@ const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
 const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 const SEED_NULL_BITMAP_META_KEY: &str = "seed_null_bitmap";
-const ZONEMAP_INDEX_VERSION: u32 = 0;
+const DATA_TYPE_META_KEY: &str = "data_type";
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum ZoneMapIndexVersion {
+    Ordered = 0,
+    NullOnly = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZoneMapMode {
+    Ordered,
+    NullOnly,
+}
+
+impl ZoneMapMode {
+    fn for_data_type(data_type: &DataType) -> Self {
+        if data_type.is_nested() {
+            Self::NullOnly
+        } else {
+            Self::Ordered
+        }
+    }
+
+    fn from_supports_min_max(supports_min_max: bool) -> Self {
+        if supports_min_max {
+            Self::Ordered
+        } else {
+            Self::NullOnly
+        }
+    }
+
+    fn supports_min_max(self) -> bool {
+        matches!(self, Self::Ordered)
+    }
+
+    fn index_version(self) -> u32 {
+        match self {
+            Self::Ordered => ZoneMapIndexVersion::Ordered as u32,
+            Self::NullOnly => ZoneMapIndexVersion::NullOnly as u32,
+        }
+    }
+}
+
+fn serialize_data_type(data_type: &DataType) -> Result<bytes::Bytes> {
+    let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+        "value",
+        data_type.clone(),
+        true,
+    )]));
+    let mut buffer = Cursor::new(Vec::new());
+    let mut writer = FileWriter::try_new(&mut buffer, &schema)?;
+    writer.finish()?;
+    Ok(bytes::Bytes::from(buffer.into_inner()))
+}
+
+fn deserialize_data_type(bytes: &bytes::Bytes) -> Result<DataType> {
+    let reader = FileReader::try_new(Cursor::new(bytes.as_ref()), None).map_err(|error| {
+        Error::corrupt_file_named(
+            ZONEMAP_FILENAME,
+            format!("failed to read persisted zone map data type: {error}"),
+        )
+    })?;
+    reader
+        .schema()
+        .fields()
+        .first()
+        .map(|field| field.data_type().clone())
+        .ok_or_else(|| {
+            Error::corrupt_file_named(
+                ZONEMAP_FILENAME,
+                "persisted zone map data type schema has no fields",
+            )
+        })
+}
+
+fn zonemap_extrema_arrays(
+    zones: &[ZoneMapStatistics],
+    data_type: &DataType,
+    mode: ZoneMapMode,
+) -> Result<(ArrayRef, ArrayRef, DataType)> {
+    if mode == ZoneMapMode::NullOnly {
+        return Ok((
+            new_null_array(&DataType::Null, zones.len()),
+            new_null_array(&DataType::Null, zones.len()),
+            DataType::Null,
+        ));
+    }
+    let mins = if zones.is_empty() {
+        new_empty_array(data_type)
+    } else {
+        ScalarValue::iter_to_array(zones.iter().map(|stat| stat.min.clone()))?
+    };
+    let maxs = if zones.is_empty() {
+        new_empty_array(data_type)
+    } else {
+        ScalarValue::iter_to_array(zones.iter().map(|stat| stat.max.clone()))?
+    };
+    Ok((mins, maxs, data_type.clone()))
+}
 
 /// Basic stats about zonemap index
 #[derive(Debug, PartialEq, Clone)]
@@ -109,6 +211,7 @@ impl AsRef<ZoneBound> for ZoneMapStatistics {
 pub struct ZoneMapIndex {
     zones: Vec<ZoneMapStatistics>,
     data_type: DataType,
+    mode: ZoneMapMode,
     // The maximum rows per zone provided by user
     rows_per_zone: u64,
     use_seeds: bool,
@@ -125,6 +228,7 @@ impl std::fmt::Debug for ZoneMapIndex {
         f.debug_struct("ZoneMapIndex")
             .field("zones", &self.zones)
             .field("data_type", &self.data_type)
+            .field("mode", &self.mode)
             .field("rows_per_zone", &self.rows_per_zone)
             .field("use_seeds", &self.use_seeds)
             .field("store", &self.store)
@@ -195,8 +299,7 @@ impl ZoneMapIndex {
         let mut min: Option<&ScalarValue> = None;
         let mut max: Option<&ScalarValue> = None;
         for seg in segments.into_iter() {
-            // Nested types have no meaningful ordering
-            if seg.data_type.is_nested() {
+            if seg.mode == ZoneMapMode::NullOnly {
                 return None;
             }
             for zone in seg.zones.iter() {
@@ -240,8 +343,8 @@ impl ZoneMapIndex {
     ) -> Result<bool> {
         use std::ops::Bound;
 
-        // For nested types we only track null_count; prune only when certain.
-        if self.data_type.is_nested() {
+        // Null-only indexes only track null_count; prune only when certain.
+        if self.mode == ZoneMapMode::NullOnly {
             let all_null = zone.null_count as usize == zone.bound.length;
             return match query {
                 SargableQuery::IsNull() => Ok(zone.null_count > 0),
@@ -510,6 +613,7 @@ impl ZoneMapIndex {
     }
 
     /// Load the scalar index from storage
+    #[cfg(test)]
     async fn load(
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<dyn RowIdRemapper>>,
@@ -519,6 +623,16 @@ impl ZoneMapIndex {
     where
         Self: Sized,
     {
+        Self::load_with_mode(store, fri, index_cache, use_seeds, None).await
+    }
+
+    async fn load_with_mode(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+        use_seeds: bool,
+        mode: Option<ZoneMapMode>,
+    ) -> Result<Arc<Self>> {
         let index_file = store.open_index_file(ZONEMAP_FILENAME).await?;
         let zone_maps = index_file
             .read_range(0..index_file.num_rows(), None)
@@ -541,7 +655,30 @@ impl ZoneMapIndex {
             None
         };
 
-        Ok(Arc::new(Self::try_from_serialized(
+        let persisted_data_type =
+            if let Some(idx_str) = file_schema.metadata.get(DATA_TYPE_META_KEY) {
+                let idx = idx_str.parse::<u32>().map_err(|error| {
+                    Error::corrupt_file_named(
+                        ZONEMAP_FILENAME,
+                        format!("invalid data type buffer index: {error}"),
+                    )
+                })?;
+                Some(deserialize_data_type(
+                    &index_file.read_global_buffer(idx).await?,
+                )?)
+            } else {
+                None
+            };
+        let mode = mode.unwrap_or_else(|| {
+            if persisted_data_type.is_some() {
+                ZoneMapMode::NullOnly
+            } else {
+                ZoneMapMode::Ordered
+            }
+        });
+        let data_type = persisted_data_type.unwrap_or_else(|| zone_maps["min"].data_type().clone());
+
+        Ok(Arc::new(Self::try_from_serialized_with_mode(
             zone_maps,
             store,
             fri,
@@ -549,9 +686,12 @@ impl ZoneMapIndex {
             rows_per_zone,
             null_rows,
             use_seeds,
+            data_type,
+            mode,
         )?))
     }
 
+    #[cfg(test)]
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
@@ -560,6 +700,33 @@ impl ZoneMapIndex {
         rows_per_zone: u64,
         null_rows: Option<RowAddrTreeMap>,
         use_seeds: bool,
+    ) -> Result<Self> {
+        let data_type = data["min"].data_type().clone();
+        let mode = ZoneMapMode::for_data_type(&data_type);
+        Self::try_from_serialized_with_mode(
+            data,
+            store,
+            fri,
+            index_cache,
+            rows_per_zone,
+            null_rows,
+            use_seeds,
+            data_type,
+            mode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_from_serialized_with_mode(
+        data: RecordBatch,
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+        rows_per_zone: u64,
+        null_rows: Option<RowAddrTreeMap>,
+        use_seeds: bool,
+        data_type: DataType,
+        mode: ZoneMapMode,
     ) -> Result<Self> {
         // The RecordBatch should have columns: min, max, null_count
         let min_col = data
@@ -611,12 +778,11 @@ impl ZoneMapIndex {
                 Error::invalid_input("ZoneMapIndex: 'zone_start' column is not UInt64")
             })?;
 
-        let data_type = min_col.data_type().clone();
-
         if data.num_rows() == 0 {
             return Ok(Self {
                 zones: Vec::new(),
                 data_type,
+                mode,
                 rows_per_zone,
                 use_seeds,
                 store,
@@ -650,6 +816,7 @@ impl ZoneMapIndex {
         Ok(Self {
             zones,
             data_type,
+            mode,
             rows_per_zone,
             use_seeds,
             store,
@@ -775,7 +942,8 @@ impl ScalarIndex for ZoneMapIndex {
         });
 
         // Serialize the combined zones back into the index file
-        let mut builder = ZoneMapIndexBuilder::try_new(options, self.data_type.clone())?;
+        let mut builder =
+            ZoneMapIndexBuilder::try_new_with_mode(options, self.data_type.clone(), self.mode)?;
         builder.options.rows_per_zone = self.rows_per_zone;
         builder.maps = updated_zones;
         builder.null_rows = merged_null_rows;
@@ -787,8 +955,9 @@ impl ScalarIndex for ZoneMapIndex {
                 self.rows_per_zone,
                 self.use_seeds,
                 has_null_bitmap,
+                self.mode,
             ),
-            index_version: ZONEMAP_INDEX_VERSION,
+            index_version: self.mode.index_version(),
             files,
         })
     }
@@ -810,8 +979,7 @@ impl ScalarIndex for ZoneMapIndex {
     /// Single-segment `[min, max]` folded from this index's zones; see
     /// [`value_range_over`](Self::value_range_over) for the full contract.
     fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
-        // We don't record min/max for nested types
-        if self.data_type.is_nested() {
+        if self.mode == ZoneMapMode::NullOnly {
             return None;
         }
         Self::value_range_over([self])
@@ -859,9 +1027,10 @@ impl ZoneMapIndex {
         }
         new_zones.sort_by_key(|z| (z.bound.fragment_id, z.bound.start));
 
-        let mut builder = ZoneMapIndexBuilder::try_new(
+        let mut builder = ZoneMapIndexBuilder::try_new_with_mode(
             ZoneMapIndexBuilderParams::new(self.rows_per_zone),
             self.data_type.clone(),
+            self.mode,
         )?;
         builder.maps = new_zones;
         builder.null_rows = merged_null_rows;
@@ -873,8 +1042,9 @@ impl ZoneMapIndex {
                 self.rows_per_zone,
                 self.use_seeds,
                 has_null_bitmap,
+                self.mode,
             ),
-            index_version: ZONEMAP_INDEX_VERSION,
+            index_version: self.mode.index_version(),
             files,
         }))
     }
@@ -990,6 +1160,7 @@ pub async fn merge_zonemap_indices(
     let rows_per_zone = first.rows_per_zone;
     let use_seeds = first.use_seeds;
     let data_type = first.data_type.clone();
+    let mode = first.mode;
 
     let mut zones = Vec::new();
     let mut merged_null_rows = RowAddrTreeMap::new();
@@ -1007,6 +1178,11 @@ pub async fn merge_zonemap_indices(
                 data_type, source.data_type
             )));
         }
+        if source.mode != mode {
+            return Err(Error::invalid_input(
+                "cannot merge ordered and null-only ZoneMap segments",
+            ));
+        }
         let remapped_null_rows = source.null_rows.as_ref().map(|null_rows| {
             source.fri.as_deref().map_or_else(
                 || null_rows.clone(),
@@ -1021,7 +1197,7 @@ pub async fn merge_zonemap_indices(
                         zone,
                         remapper,
                         remapped_null_rows.as_ref(),
-                        source.data_type.is_nested(),
+                        source.mode == ZoneMapMode::NullOnly,
                     )
                 },
             )?;
@@ -1040,8 +1216,11 @@ pub async fn merge_zonemap_indices(
     }
     zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
 
-    let mut builder =
-        ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(rows_per_zone), data_type)?;
+    let mut builder = ZoneMapIndexBuilder::try_new_with_mode(
+        ZoneMapIndexBuilderParams::new(rows_per_zone),
+        data_type,
+        mode,
+    )?;
     builder.maps = zones;
     if !any_missing_bitmap {
         builder.null_rows = Some(merged_null_rows);
@@ -1050,8 +1229,8 @@ pub async fn merge_zonemap_indices(
     let files = builder.write_index(dest_store).await?;
 
     Ok(CreatedIndex {
-        index_details: make_zone_map_index_details(rows_per_zone, use_seeds, has_null_bitmap),
-        index_version: ZONEMAP_INDEX_VERSION,
+        index_details: make_zone_map_index_details(rows_per_zone, use_seeds, has_null_bitmap, mode),
+        index_version: mode.index_version(),
         files,
     })
 }
@@ -1106,6 +1285,7 @@ pub struct ZoneMapIndexBuilder {
     options: ZoneMapIndexBuilderParams,
 
     items_type: DataType,
+    mode: ZoneMapMode,
     maps: Vec<ZoneMapStatistics>,
     // None means "legacy index — null positions unknown"; Some means a complete bitmap.
     // write_index omits the null-bitmap global buffer when this is None, preserving the
@@ -1115,9 +1295,19 @@ pub struct ZoneMapIndexBuilder {
 
 impl ZoneMapIndexBuilder {
     pub fn try_new(options: ZoneMapIndexBuilderParams, items_type: DataType) -> Result<Self> {
+        let mode = ZoneMapMode::for_data_type(&items_type);
+        Self::try_new_with_mode(options, items_type, mode)
+    }
+
+    fn try_new_with_mode(
+        options: ZoneMapIndexBuilderParams,
+        items_type: DataType,
+        mode: ZoneMapMode,
+    ) -> Result<Self> {
         Ok(Self {
             options,
             items_type,
+            mode,
             maps: Vec::new(),
             null_rows: None,
         })
@@ -1127,7 +1317,7 @@ impl ZoneMapIndexBuilder {
     /// the value column followed by `_rowaddr`, matching the dataset scan order enforced
     /// by the scalar index registry.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
-        let processor = ZoneMapProcessor::new(self.items_type.clone())?;
+        let processor = ZoneMapProcessor::new_with_mode(self.items_type.clone(), self.mode)?;
         let trainer = ZoneTrainer::new(processor, self.options.rows_per_zone)?;
         let (maps, null_rows) = trainer.train(batches_source).await?;
         self.maps = maps;
@@ -1137,16 +1327,8 @@ impl ZoneMapIndexBuilder {
 
     fn zonemap_stats_as_batch(&self) -> Result<RecordBatch> {
         // Flush self.maps as a RecordBatch
-        let mins = if self.maps.is_empty() {
-            new_empty_array(&self.items_type)
-        } else {
-            ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.min.clone()))?
-        };
-        let maxs = if self.maps.is_empty() {
-            new_empty_array(&self.items_type)
-        } else {
-            ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.max.clone()))?
-        };
+        let (mins, maxs, extrema_type) =
+            zonemap_extrema_arrays(&self.maps, &self.items_type, self.mode)?;
         let null_counts =
             UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.null_count));
 
@@ -1163,8 +1345,8 @@ impl ZoneMapIndexBuilder {
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             // min and max can be null if the entire batch is null values
-            Field::new("min", self.items_type.clone(), true),
-            Field::new("max", self.items_type.clone(), true),
+            Field::new("min", extrema_type.clone(), true),
+            Field::new("max", extrema_type, true),
             Field::new("null_count", DataType::UInt32, false),
             Field::new("nan_count", DataType::UInt32, false),
             Field::new("fragment_id", DataType::UInt64, false),
@@ -1198,21 +1380,25 @@ impl ZoneMapIndexBuilder {
             .await?;
         index_file.write_record_batch(record_batch).await?;
 
-        let zonemap_file = if let Some(null_rows) = self.null_rows {
+        let mut metadata = HashMap::new();
+        if self.mode == ZoneMapMode::NullOnly {
+            let data_type_idx = index_file
+                .add_global_buffer(serialize_data_type(&self.items_type)?)
+                .await?;
+            metadata.insert(DATA_TYPE_META_KEY.to_string(), data_type_idx.to_string());
+        }
+        if let Some(null_rows) = self.null_rows {
             let mut null_bitmap_bytes = Vec::with_capacity(null_rows.serialized_size());
             null_rows.serialize_into(&mut null_bitmap_bytes)?;
             let null_bitmap_idx = index_file
                 .add_global_buffer(bytes::Bytes::from(null_bitmap_bytes))
                 .await?;
-            index_file
-                .finish_with_metadata(HashMap::from([(
-                    NULL_BITMAP_META_KEY.to_string(),
-                    null_bitmap_idx.to_string(),
-                )]))
-                .await?
-        } else {
-            index_file.finish_with_metadata(HashMap::new()).await?
-        };
+            metadata.insert(
+                NULL_BITMAP_META_KEY.to_string(),
+                null_bitmap_idx.to_string(),
+            );
+        }
+        let zonemap_file = index_file.finish_with_metadata(metadata).await?;
 
         Ok(vec![zonemap_file])
     }
@@ -1227,14 +1413,21 @@ impl ZoneMapIndexBuilder {
 #[derive(Debug)]
 struct ZoneMapProcessor {
     data_type: DataType,
+    mode: ZoneMapMode,
     statistics: StatisticsAccumulator,
 }
 
 impl ZoneMapProcessor {
     fn new(data_type: DataType) -> Result<Self> {
+        let mode = ZoneMapMode::for_data_type(&data_type);
+        Self::new_with_mode(data_type, mode)
+    }
+
+    fn new_with_mode(data_type: DataType, mode: ZoneMapMode) -> Result<Self> {
         let statistics = StatisticsAccumulator::new(&data_type);
         Ok(Self {
             data_type,
+            mode,
             statistics,
         })
     }
@@ -1296,8 +1489,7 @@ impl ZoneProcessor for ZoneMapProcessor {
         let statistics = self.statistics.statistics();
         let null_count = Self::stat_count_to_u32("null_count", statistics.null_count)?;
 
-        // For nested types, only null_count is meaningful; store null min/max.
-        if self.data_type.is_nested() {
+        if self.mode == ZoneMapMode::NullOnly {
             return Ok(ZoneMapStatistics {
                 min: ScalarValue::try_new_null(&self.data_type)?,
                 max: ScalarValue::try_new_null(&self.data_type)?,
@@ -1334,11 +1526,13 @@ fn make_zone_map_index_details(
     rows_per_zone: u64,
     use_seeds: bool,
     has_null_bitmap: bool,
+    mode: ZoneMapMode,
 ) -> prost_types::Any {
     prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails {
         rows_per_zone: Some(rows_per_zone),
         use_seeds: Some(use_seeds),
         has_null_bitmap: Some(has_null_bitmap),
+        supports_min_max: Some(mode.supports_min_max()),
     })
     .unwrap()
 }
@@ -1370,6 +1564,68 @@ fn default_use_seeds(data_type: &DataType) -> bool {
 
 #[derive(Debug, Default)]
 pub struct ZoneMapIndexPlugin;
+
+#[derive(Debug)]
+struct NullOnlyZoneMapQueryParser {
+    inner: SargableQueryParser,
+}
+
+impl ScalarQueryParser for NullOnlyZoneMapQueryParser {
+    fn visit_between(
+        &self,
+        _column: &str,
+        _low: &Bound<ScalarValue>,
+        _high: &Bound<ScalarValue>,
+    ) -> Option<crate::scalar::expression::IndexedExpression> {
+        None
+    }
+
+    fn visit_in_list(
+        &self,
+        _column: &str,
+        _in_list: &[ScalarValue],
+    ) -> Option<crate::scalar::expression::IndexedExpression> {
+        None
+    }
+
+    fn visit_is_bool(
+        &self,
+        _column: &str,
+        _value: bool,
+    ) -> Option<crate::scalar::expression::IndexedExpression> {
+        None
+    }
+
+    fn visit_is_null(&self, column: &str) -> Option<crate::scalar::expression::IndexedExpression> {
+        self.inner.visit_is_null(column)
+    }
+
+    fn visit_comparison(
+        &self,
+        _column: &str,
+        _value: &ScalarValue,
+        _op: &Operator,
+    ) -> Option<crate::scalar::expression::IndexedExpression> {
+        None
+    }
+
+    fn visit_scalar_function(
+        &self,
+        _column: &str,
+        _data_type: &DataType,
+        _func: &ScalarUDF,
+        _args: &[Expr],
+    ) -> Option<crate::scalar::expression::IndexedExpression> {
+        None
+    }
+
+    fn is_valid_reference(&self, func: &Expr, data_type: &DataType) -> Option<DataType> {
+        match func {
+            Expr::Column(_) => Some(data_type.clone()),
+            _ => None,
+        }
+    }
+}
 
 impl ZoneMapIndexPlugin {
     async fn train_zonemap_index(
@@ -1443,12 +1699,18 @@ impl BasicTrainer for ZoneMapIndexPlugin {
             })?;
         let rows_per_zone = request.params.rows_per_zone;
         let use_seeds = request.params.use_seeds.unwrap_or(false);
+        let mode = ZoneMapMode::for_data_type(data.schema().field(0).data_type());
         let files = Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
         // Training a new index will always populate the null bitmap
         let has_null_bitmap = true;
         Ok(CreatedIndex {
-            index_details: make_zone_map_index_details(rows_per_zone, use_seeds, has_null_bitmap),
-            index_version: ZONEMAP_INDEX_VERSION,
+            index_details: make_zone_map_index_details(
+                rows_per_zone,
+                use_seeds,
+                has_null_bitmap,
+                mode,
+            ),
+            index_version: mode.index_version(),
             files,
         })
     }
@@ -1469,7 +1731,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        ZONEMAP_INDEX_VERSION
+        ZoneMapIndexVersion::NullOnly as u32
     }
 
     fn new_query_parser(
@@ -1477,10 +1739,10 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         index_name: String,
         index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        let has_null_bitmap = index_details
-            .to_msg::<pbold::ZoneMapIndexDetails>()
-            .ok()
-            .and_then(|d| d.has_null_bitmap)
+        let details = index_details.to_msg::<pbold::ZoneMapIndexDetails>().ok();
+        let has_null_bitmap = details
+            .as_ref()
+            .and_then(|details| details.has_null_bitmap)
             .unwrap_or(false);
         let parser = SargableQueryParser::new(index_name, self.name().to_string(), true);
         let parser = if has_null_bitmap {
@@ -1488,7 +1750,14 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         } else {
             parser
         };
-        Some(Box::new(parser))
+        if details
+            .and_then(|details| details.supports_min_max)
+            .unwrap_or(true)
+        {
+            Some(Box::new(parser))
+        } else {
+            Some(Box::new(NullOnlyZoneMapQueryParser { inner: parser }))
+        }
     }
 
     async fn load_index(
@@ -1498,14 +1767,25 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let use_seeds = index_details
-            .to_msg::<pbold::ZoneMapIndexDetails>()
-            .ok()
-            .and_then(|d| d.use_seeds)
+        let details = index_details.to_msg::<pbold::ZoneMapIndexDetails>().ok();
+        let use_seeds = details
+            .as_ref()
+            .and_then(|details| details.use_seeds)
             .unwrap_or(false);
+        let mode = ZoneMapMode::from_supports_min_max(
+            details
+                .and_then(|details| details.supports_min_max)
+                .unwrap_or(true),
+        );
         Ok(
-            ZoneMapIndex::load(index_store, frag_reuse_index, cache, use_seeds).await?
-                as Arc<dyn ScalarIndex>,
+            ZoneMapIndex::load_with_mode(
+                index_store,
+                frag_reuse_index,
+                cache,
+                use_seeds,
+                Some(mode),
+            )
+            .await? as Arc<dyn ScalarIndex>,
         )
     }
 
@@ -1901,7 +2181,7 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::scalar::registry::VALUE_COLUMN_NAME;
+    use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::{IndexStore, zonemap::ROWS_PER_ZONE_DEFAULT};
     use std::sync::Arc;
 
@@ -1929,8 +2209,8 @@ mod tests {
         RowIdRemapper, SargableQuery, ScalarIndex, SearchResult,
         lance_format::LanceIndexStore,
         zonemap::{
-            ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex, ZoneMapIndexBuilderParams,
-            merge_zonemap_indices, remap_zone,
+            ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex, ZoneMapIndexBuilder,
+            ZoneMapIndexBuilderParams, ZoneMapMode, merge_zonemap_indices, remap_zone,
         },
     };
 
@@ -2007,6 +2287,106 @@ mod tests {
         ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
             .await
             .expect("Failed to load ZoneMapIndex")
+    }
+
+    #[tokio::test]
+    async fn test_null_only_v1_round_trip() {
+        let data_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let null_row = 1_u64;
+        let mut builder =
+            ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(2), data_type.clone())
+                .unwrap();
+        builder.maps.push(ZoneMapStatistics {
+            min: ScalarValue::try_new_null(&data_type).unwrap(),
+            max: ScalarValue::try_new_null(&data_type).unwrap(),
+            null_count: 1,
+            nan_count: 0,
+            bound: ZoneBound {
+                fragment_id: 0,
+                start: 0,
+                length: 2,
+            },
+        });
+        builder.null_rows = Some(RowAddrTreeMap::from_iter([null_row]));
+
+        let batch = builder.zonemap_stats_as_batch().unwrap();
+        assert_eq!(batch["min"].data_type(), &DataType::Null);
+        assert_eq!(batch["max"].data_type(), &DataType::Null);
+        builder.write_index(store.as_ref()).await.unwrap();
+
+        let index = ZoneMapIndex::load_with_mode(
+            store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            Some(ZoneMapMode::NullOnly),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ZoneMapIndexPlugin.version(), 1);
+        assert_eq!(ZoneMapMode::Ordered.index_version(), 0);
+        assert_eq!(ZoneMapMode::NullOnly.index_version(), 1);
+        assert_eq!(
+            super::make_zone_map_index_details(2, false, true, ZoneMapMode::NullOnly)
+                .to_msg::<crate::pbold::ZoneMapIndexDetails>()
+                .unwrap()
+                .supports_min_max,
+            Some(false)
+        );
+        assert_eq!(index.data_type, data_type);
+        assert_eq!(index.mode, ZoneMapMode::NullOnly);
+        assert_eq!(index.value_range(), None);
+        assert_eq!(
+            index
+                .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            SearchResult::exact(null_row..=null_row)
+        );
+    }
+
+    #[test]
+    fn test_null_only_query_parser_accepts_only_null_predicates() {
+        let details = super::make_zone_map_index_details(2, false, true, ZoneMapMode::NullOnly);
+        let parser = ZoneMapIndexPlugin
+            .new_query_parser("lists_idx".to_string(), &details)
+            .unwrap();
+
+        assert!(parser.visit_is_null(VALUE_COLUMN_NAME).is_some());
+        assert!(
+            parser
+                .visit_comparison(
+                    VALUE_COLUMN_NAME,
+                    &ScalarValue::Int32(Some(1)),
+                    &datafusion_expr::Operator::Eq,
+                )
+                .is_none()
+        );
+
+        let legacy_details = prost_types::Any::from_msg(&crate::pbold::ZoneMapIndexDetails {
+            rows_per_zone: Some(2),
+            use_seeds: Some(false),
+            has_null_bitmap: Some(true),
+            supports_min_max: None,
+        })
+        .unwrap();
+        assert!(
+            ZoneMapIndexPlugin
+                .new_query_parser("legacy_idx".to_string(), &legacy_details)
+                .unwrap()
+                .visit_comparison(
+                    VALUE_COLUMN_NAME,
+                    &ScalarValue::Int32(Some(1)),
+                    &datafusion_expr::Operator::Eq,
+                )
+                .is_some()
+        );
     }
 
     #[derive(Debug)]
@@ -3634,6 +4014,7 @@ mod tests {
         let index = ZoneMapIndex {
             zones,
             data_type: DataType::Utf8,
+            mode: ZoneMapMode::Ordered,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
             use_seeds: false,
             store: test_store,
@@ -3708,6 +4089,7 @@ mod tests {
         let index = ZoneMapIndex {
             zones,
             data_type: DataType::Utf8,
+            mode: ZoneMapMode::Ordered,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
             use_seeds: false,
             store: test_store,
@@ -3777,6 +4159,7 @@ mod tests {
         let index = ZoneMapIndex {
             zones,
             data_type: DataType::LargeUtf8,
+            mode: ZoneMapMode::Ordered,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
             use_seeds: false,
             store: test_store,

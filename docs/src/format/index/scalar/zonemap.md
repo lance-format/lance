@@ -2,14 +2,12 @@
 
 Zone maps are a columnar database technique for predicate pushdown and scan pruning.
 They break data into fixed-size chunks called "zones" and maintain summary statistics
-(min, max, null count) for each zone, enabling efficient filtering by eliminating
-zones that cannot contain matching values.
+(minimum, maximum, and null count) for each zone. Ordered zone maps use minimum
+and maximum values to eliminate zones that cannot match. Null-only zone maps
+store only top-level null information for nested values without scalar ordering.
 
-Zone maps are "inexact" filters - they can definitively exclude zones but may include
-false positives that require rechecking.
-
-In addition, since finding NULLs is a common query pattern, the index also maintains a
-bitmap of null rows which allows it to return exact results for IS NULL queries.
+Current writers also maintain a bitmap of null rows for exact `IS NULL` and
+`IS NOT NULL` queries.
 
 ## Index Details
 
@@ -19,43 +17,49 @@ bitmap of null rows which allows it to return exact results for IS NULL queries.
 
 ## Storage Layout
 
-The zone map index stores zone statistics in a single file:
+`zonemap.lance` is the index entry point. Each record describes one zone.
+Ordered indices use the indexed logical type for extrema. Null-only indices
+use Arrow `Null` extrema columns and store the indexed logical type separately.
 
-1. `zonemap.lance` - Zone statistics for query pruning
+```python
+extrema_type = value_type if supports_min_max else pa.null()
 
-### Zone Statistics File Schema
+pa.schema([
+    pa.field("min", extrema_type, nullable=True),
+    pa.field("max", extrema_type, nullable=True),
+    pa.field("null_count", pa.uint32(), nullable=False),
+    pa.field("nan_count", pa.uint32(), nullable=False),
+    pa.field("fragment_id", pa.uint64(), nullable=False),
+    pa.field("zone_start", pa.uint64(), nullable=False),
+    pa.field("zone_length", pa.uint64(), nullable=False),
+])
+```
 
-| Column        | Type       | Nullable | Description                             |
-|---------------|------------|----------|-----------------------------------------|
-| `min`         | {DataType} | true     | Minimum value in the zone               |
-| `max`         | {DataType} | true     | Maximum value in the zone               |
-| `null_count`  | UInt32     | false    | Number of null values in the zone       |
-| `nan_count`   | UInt32     | false    | Number of NaN values (for float types)  |
-| `fragment_id` | UInt64     | false    | Fragment containing this zone           |
-| `zone_start`  | UInt64     | false    | Starting row offset within the fragment |
-| `zone_length` | UInt32     | false    | Number of rows in this zone             |
+The schema metadata contains:
 
-### Schema Metadata
+- `rows_per_zone`: decimal string containing the configured maximum zone size.
+- `null_bitmap`: global-buffer index of the serialized `RowAddrTreeMap`.
+- `data_type`: global-buffer index of the logical type for null-only indices.
 
-| Key                 | Type   | Description                               |
-|---------------------|--------|-------------------------------------------|
-| `rows_per_zone`     | String | Number of rows per zone (default: "8192") |
-| `null_bitmap`       | UInt32 | Index of null bitmap global buffer        |
+The `data_type` global buffer is an Arrow IPC schema:
 
-### Global Buffers
+```python
+pa.schema([
+    pa.field("value", value_type, nullable=True),
+])
+```
 
-| Metadata Key        | Description                                                |
-|---------------------|------------------------------------------------------------|
-| `null_bitmap`       | A serialized RowAddrTreeMap specifying which rows are null |
+## Query Semantics
 
-## Accelerated Queries
+Ordered zone maps provide inexact pruning for `Equals`, `Range`, and `IsIn`.
+Null-only zone maps do not advertise these predicates because they have no
+value bounds. Both modes use the null bitmap for exact null predicates.
 
-The zone map index provides inexact results for the following query types (nullability queries
-return exact results):
+`ZoneMapIndexDetails.supports_min_max` records the mode. An absent value means
+ordered mode for compatibility with existing version-0 indices.
 
-| Query Type | Description               | Operation                                   | Result Type |
-|------------|---------------------------|---------------------------------------------|-------------|
-| **Equals** | `column = value`          | Includes zones where min ≤ value ≤ max      | AtMost      |
-| **Range**  | `column BETWEEN a AND b`  | Includes zones where ranges overlap         | AtMost      |
-| **IsIn**   | `column IN (v1, v2, ...)` | Includes zones that could contain any value | AtMost      |
-| **IsNull** | `column IS NULL`          | Includes zones where null_count > 0         | Exact       |
+## Index Versions
+
+- Version 0 stores ordered zone maps.
+- Version 1 stores null-only zone maps. Version-0 readers reject this version
+  and fall back to scanning instead of interpreting absent value bounds.

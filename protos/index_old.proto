@@ -50,6 +50,10 @@ message ZoneMapIndexDetails {
    * full scan.
    */
   optional bool has_null_bitmap = 3;
+  // Whether the index stores ordered min/max bounds. Absent means true for
+  // version-0 indexes written before this field was added. False identifies
+  // the version-1 null-only layout.
+  optional bool supports_min_max = 4;
 }
 message InvertedIndexDetails {
   enum DocumentGranularity {
