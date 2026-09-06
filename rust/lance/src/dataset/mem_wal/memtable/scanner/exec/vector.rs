@@ -23,6 +23,7 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::VectorQuery;
+use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Distance column name in output.
@@ -246,9 +247,15 @@ impl VectorIndexExec {
                 columns.push(Arc::new(Float32Array::from(distances)));
 
                 // Apply projection if needed (excluding distance column which is always included)
+                let source_schema = stored.data.schema();
                 let mut final_columns = if let Some(ref proj_indices) = self.projection {
-                    let mut projected: Vec<_> =
-                        proj_indices.iter().map(|&i| columns[i].clone()).collect();
+                    let mut projected: Vec<_> = take_projected_columns(
+                        &columns,
+                        source_schema.fields(),
+                        proj_indices,
+                        self.output_schema.as_ref(),
+                        row_positions.len(),
+                    )?;
                     // Always include distance as last column
                     projected.push(columns.last().unwrap().clone());
                     projected

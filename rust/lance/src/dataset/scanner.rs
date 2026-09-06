@@ -1546,6 +1546,28 @@ impl Scanner {
         Ok(self)
     }
 
+    /// Projection by a (possibly partial) schema.
+    ///
+    /// Unlike [`Self::project`], which routes through expressions, this can
+    /// select *part* of a nested field — `meta` narrowed to just its `a` child.
+    /// Expressions cannot express that, so a nested projection must come
+    /// through here.
+    pub fn project_with_schema(
+        &mut self,
+        projection: &lance_core::datatypes::Schema,
+    ) -> Result<&mut Self> {
+        self.explicit_projection = true;
+        self.projection_plan = ProjectionPlan::from_schema(self.dataset.clone(), projection)?;
+        if self.legacy_with_row_id {
+            self.projection_plan.include_row_id();
+        }
+        if self.legacy_with_row_addr {
+            self.projection_plan.include_row_addr();
+        }
+        self.apply_blob_handling();
+        Ok(self)
+    }
+
     /// Should the filter run before the vector index is applied
     ///
     /// If true then the filter will be applied before the vector index.  This

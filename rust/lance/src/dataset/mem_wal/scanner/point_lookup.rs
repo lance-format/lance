@@ -122,9 +122,9 @@ impl LsmPointLookupPlanner {
         collector: LsmDataSourceCollector,
         pk_columns: Vec<String>,
         base_schema: SchemaRef,
-    ) -> Self {
-        let none_target = canonical_output_schema(None, &base_schema, &pk_columns, false);
-        Self {
+    ) -> Result<Self> {
+        let none_target = canonical_output_schema(None, &base_schema, &pk_columns, false)?;
+        Ok(Self {
             collector,
             pk_columns,
             base_schema,
@@ -136,7 +136,7 @@ impl LsmPointLookupPlanner {
             none_target,
             task_ctx: SessionContext::new().task_ctx(),
             visibility: MemTableVisibility::Published,
-        }
+        })
     }
 
     /// Read the in-memory memtables at `visibility`. See
@@ -217,8 +217,12 @@ impl LsmPointLookupPlanner {
             // fall through to an older arm — resurrecting the deleted row. Then
             // the carried `_tombstone` column is projected away.
             Some(coalesced) => {
-                let canonical =
-                    canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+                let canonical = canonical_output_schema(
+                    projection,
+                    &self.base_schema,
+                    &self.pk_columns,
+                    false,
+                )?;
                 filter_tombstones_after_coalesce(coalesced, &canonical)
             }
             None => self.empty_plan(projection),
@@ -331,7 +335,7 @@ impl LsmPointLookupPlanner {
         projection: Option<&[String]>,
     ) -> Result<RecordBatch> {
         let canonical =
-            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)?;
         let target = carry_schema(&canonical, &self.pk_columns);
         let mut out: Vec<RecordBatch> = Vec::with_capacity(keys.len());
         for key in keys {
@@ -394,7 +398,7 @@ impl LsmPointLookupPlanner {
                         &self.base_schema,
                         &self.pk_columns,
                         false,
-                    );
+                    )?;
                     &projected
                 }
             };
@@ -473,7 +477,7 @@ impl LsmPointLookupPlanner {
         let target = match projection {
             None => self.none_target.clone(),
             Some(_) => {
-                canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)
+                canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)?
             }
         };
         if keys.is_empty() {
@@ -609,7 +613,7 @@ impl LsmPointLookupPlanner {
                     &self.base_schema,
                     &self.pk_columns,
                     false,
-                )),
+                )?),
             }
         } else {
             self.lookup_many(keys, projection).await?
@@ -651,13 +655,16 @@ impl LsmPointLookupPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let cols = build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
         let target =
-            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)?;
         let want_row_id = wants_row_id(projection);
         let want_row_addr = wants_row_address(projection);
         let scan: Arc<dyn ExecutionPlan> = match source {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 // Only the base produces row IDs callers can use against the
                 // dataset (e.g. `take_rows`); non-base arms NULL via canonical.
                 if want_row_id {
@@ -687,7 +694,10 @@ impl LsmPointLookupPlanner {
                 // a deleted key (gen written before deletes existed lack it →
                 // `project_to_carry` synthesizes `false`).
                 let cols = cols_with_tombstone(&cols, dataset.schema().field(TOMBSTONE).is_some());
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 scanner.filter_expr(filter.clone());
                 Box::pin(scanner.create_plan()).await?
             }
@@ -753,7 +763,7 @@ impl LsmPointLookupPlanner {
         use datafusion::physical_plan::empty::EmptyExec;
 
         let schema =
-            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false)?;
         Ok(Arc::new(EmptyExec::new(schema)))
     }
 }
@@ -1112,7 +1122,8 @@ mod tests {
         // Create collector without memtables
         let collector = LsmDataSourceCollector::new(base_dataset, vec![]);
 
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone());
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone()).unwrap();
 
         let pk_values = vec![ScalarValue::Int32(Some(2))];
         let plan = planner.plan_lookup(&pk_values, None).await.unwrap();
@@ -1152,7 +1163,8 @@ mod tests {
         // Create collector
         let collector = LsmDataSourceCollector::new(base_dataset, vec![shard_snapshot]);
 
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone());
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone()).unwrap();
 
         let pk_values = vec![ScalarValue::Int32(Some(2))];
         let plan = planner.plan_lookup(&pk_values, None).await.unwrap();
@@ -1187,6 +1199,7 @@ mod tests {
         bf.insert_hash(pk_hash);
 
         let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone())
+            .unwrap()
             .with_bloom_filter(1, Arc::new(bf));
 
         let pk_values = vec![ScalarValue::Int32(Some(2))];
@@ -1206,7 +1219,8 @@ mod tests {
 
         let collector = LsmDataSourceCollector::new(base_dataset, vec![]);
 
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let pk_values = vec![ScalarValue::Int32(Some(42))];
         let expr = planner.build_pk_filter_expr(&pk_values).unwrap();
@@ -1242,7 +1256,8 @@ mod tests {
             .with_sstable(1, "gen_1".to_string());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         // id=3 lives in the SSTable
         let pk_values = vec![ScalarValue::Int32(Some(3))];
@@ -1288,7 +1303,8 @@ mod tests {
         let base_dataset = Arc::new(create_dataset(&base_uri, vec![base_batch]).await);
 
         let collector = LsmDataSourceCollector::new(base_dataset, vec![]);
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         // User requests `_rowaddr` between `id` and `name`, plus `_rowoffset` at end.
         let projection = vec![
@@ -1355,7 +1371,8 @@ mod tests {
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let projection = vec![
             "id".to_string(),
@@ -1394,7 +1411,8 @@ mod tests {
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let projection = vec!["missing".to_string()];
         let pk_values = vec![ScalarValue::Int32(Some(2))];
@@ -1464,7 +1482,8 @@ mod tests {
                 },
             );
 
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let plan = planner
             .plan_lookup(&[ScalarValue::Int32(Some(1))], None)
@@ -1535,7 +1554,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         // `lookup` takes the fast probe path (single-column PK, no system cols).
         let hit = planner
@@ -1622,7 +1642,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
         let key = [ScalarValue::Int32(Some(1))];
 
         assert!(
@@ -1678,7 +1699,8 @@ mod tests {
             .with_sstable(1, "gen_1".to_string());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let plan = planner
             .plan_lookup(&[ScalarValue::Int32(Some(1))], None)
@@ -1764,7 +1786,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone());
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone()).unwrap();
 
         let row = planner
             .lookup(&[ScalarValue::Int32(Some(20))], None)
@@ -1807,7 +1830,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let row = planner
             .lookup(&[ScalarValue::Int32(Some(5))], None)
@@ -1838,7 +1862,8 @@ mod tests {
                 frozen: vec![],
             },
         );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone());
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone()).unwrap();
 
         // In active only → fast-path hit.
         let row = planner
@@ -1886,7 +1911,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let row = planner
             .lookup(&[ScalarValue::Int32(Some(20))], Some(&["name".to_string()]))
@@ -1928,7 +1954,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let row = planner
             .lookup(&[ScalarValue::Int64(Some(20))], None)
@@ -1956,7 +1983,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let err = planner.lookup(&[], None).await;
         assert!(err.is_err(), "empty pk_values must error, not panic");
@@ -1988,7 +2016,7 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema)
+        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap()
     }
 
     #[tokio::test]
@@ -2126,7 +2154,8 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema).unwrap();
 
         let row = planner
             .lookup(&[ScalarValue::Int32(Some(20))], None)
@@ -2204,7 +2233,7 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema)
+        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema).unwrap()
     }
 
     /// Read the `_tombstone` marker from row 0 of a keep-tombstone result.
@@ -2370,7 +2399,8 @@ mod tests {
                 frozen: vec![],
             },
         );
-        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema).unwrap();
 
         let proj = vec!["id".to_string(), "_rowid".to_string()];
         assert!(

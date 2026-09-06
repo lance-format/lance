@@ -552,7 +552,10 @@ impl LsmFtsSearchPlanner {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 if let Some(ref filter) = self.filter {
                     // `prefilter(true)` is required: without it the scanner
                     // post-filters the unfiltered BM25 top-k, dropping matching
@@ -580,7 +583,10 @@ impl LsmFtsSearchPlanner {
                 .await?;
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // Resolve against the *source* schema so a nested path narrows the
+                // struct rather than flattening it; expressions cannot express a
+                // partial nested projection, only a schema can.
+                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
                 if let Some(ref filter) = self.filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the BM25 top-k.
