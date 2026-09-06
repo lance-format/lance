@@ -43,6 +43,8 @@ use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
 use crate::{Dataset, Scanner, rt};
 
+type UpdateColumnsResult = (PyLance<Fragment>, Vec<u32>, Option<Vec<u8>>);
+
 #[pyclass(name = "_Fragment", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct FileFragment {
@@ -402,15 +404,30 @@ impl FileFragment {
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
-    ) -> PyResult<(PyLance<Fragment>, Vec<u32>)> {
+        with_offsets: bool,
+    ) -> PyResult<UpdateColumnsResult> {
         let mut fragment = self.fragment.clone();
-        let (updated_fragment, fields_modified) = rt()
+        let result = rt()
             .spawn(None, async move {
-                fragment.update_columns(reader.0, &left_on, &right_on).await
+                fragment
+                    .update_columns_with_offsets(reader.0, &left_on, &right_on)
+                    .await
             })?
             .infer_error()?;
 
-        Ok((PyLance(updated_fragment), fields_modified))
+        let matched_offsets = with_offsets.then(|| {
+            let mut buf = Vec::with_capacity(result.matched_offsets.serialized_size());
+            result
+                .matched_offsets
+                .serialize_into(&mut buf)
+                .expect("RoaringBitmap serialization cannot fail");
+            buf
+        });
+        Ok((
+            PyLance(result.fragment),
+            result.fields_modified,
+            matched_offsets,
+        ))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
