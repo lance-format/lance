@@ -78,10 +78,11 @@ use lance_namespace::models::{
     ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest,
-    RestoreTableResponse, TableExistsRequest, TableVersion, TagContents as ModelTagContents,
-    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
-    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
+    QueryTableRequest, QueryTableRequestColumns, QueryTableRequestVector, RenameTableRequest,
+    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
+    TableVersion, TagContents as ModelTagContents, UpdateTableRequest, UpdateTableResponse,
+    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
+    UpdateTableTagResponse,
 };
 
 use lance_core::utils::parse::str_to_bool;
@@ -3790,6 +3791,29 @@ impl LanceNamespace for DirectoryNamespace {
             location: Some(table_uri),
             ..Default::default()
         })
+    }
+
+    async fn rename_table(&self, request: RenameTableRequest) -> Result<RenameTableResponse> {
+        self.record_op("rename_table");
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
+            return LanceNamespace::rename_table(manifest_ns.as_ref(), request).await;
+        }
+
+        // Without a manifest there is nothing that can reserve a name across processes.
+        // A table's name is its directory, so renaming is check, copy, delete -- and no
+        // step of that is a claim another caller can lose. Two callers renaming the same
+        // source to different names, or different sources to the same name, both pass
+        // their checks and both publish, leaving one table under two names or two tables
+        // merged under one. There is no cheap fix at this layer: object storage has no
+        // atomic directory rename and no place to record ownership. Renaming therefore
+        // requires the manifest, which does provide a durable cross-instance claim.
+        Err(NamespaceError::Unsupported {
+            message: "rename_table requires manifest mode: a directory-only namespace \
+                      cannot reserve the source and destination names against concurrent \
+                      callers"
+                .to_string(),
+        }
+        .into())
     }
 
     async fn alter_table_add_columns(
@@ -9454,6 +9478,320 @@ mod tests {
         // The operation might succeed or fail depending on implementation
         // But it should not panic
         let _ = result;
+    }
+
+    async fn rows_at_location(namespace: &DirectoryNamespace, id: Vec<String>) -> usize {
+        let mut describe = DescribeTableRequest::new();
+        describe.id = Some(id);
+        let location = namespace
+            .describe_table(describe)
+            .await
+            .unwrap()
+            .location
+            .unwrap();
+        Dataset::open(&location)
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_without_manifest_is_unsupported() {
+        use lance_namespace::models::RenameTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["source".to_string()]);
+        namespace
+            .create_table(
+                create_request,
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        // A directory-only namespace has no way to claim the two names, so the rename is
+        // refused rather than racing other callers into a corrupted namespace.
+        let mut rename_request = RenameTableRequest::new("renamed".to_string());
+        rename_request.id = Some(vec!["source".to_string()]);
+        let err = namespace.rename_table(rename_request).await.unwrap_err();
+        let lance_core::Error::Namespace { source, .. } = &err else {
+            panic!("expected a Namespace error, got: {err}");
+        };
+        assert!(
+            matches!(
+                source.downcast_ref::<NamespaceError>(),
+                Some(NamespaceError::Unsupported { .. })
+            ),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("requires manifest mode"),
+            "unexpected error: {err}"
+        );
+
+        // The table is untouched.
+        assert_eq!(
+            rows_at_location(&namespace, vec!["source".to_string()]).await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_rejects_empty_new_name() {
+        use lance_namespace::models::RenameTableRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["source".to_string()]);
+        namespace
+            .create_table(
+                create_request,
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        let mut rename_request = RenameTableRequest::new("   ".to_string());
+        rename_request.id = Some(vec!["source".to_string()]);
+        let err = namespace.rename_table(rename_request).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid input"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_with_manifest_moves_data() {
+        use lance_namespace::models::{RenameTableRequest, TableExistsRequest};
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["original".to_string()]);
+        namespace
+            .create_table(
+                create_request,
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        let mut rename_request = RenameTableRequest::new("renamed".to_string());
+        rename_request.id = Some(vec!["original".to_string()]);
+        namespace.rename_table(rename_request).await.unwrap();
+
+        let mut old_exists = TableExistsRequest::new();
+        old_exists.id = Some(vec!["original".to_string()]);
+        assert!(namespace.table_exists(old_exists).await.is_err());
+
+        let mut new_exists = TableExistsRequest::new();
+        new_exists.id = Some(vec!["renamed".to_string()]);
+        namespace.table_exists(new_exists).await.unwrap();
+
+        assert_eq!(
+            rows_at_location(&namespace, vec!["renamed".to_string()]).await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_with_manifest_rejects_existing_destination() {
+        use lance_namespace::models::RenameTableRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        for name in ["source", "destination"] {
+            let mut create_request = CreateTableRequest::new();
+            create_request.id = Some(vec![name.to_string()]);
+            namespace
+                .create_table(
+                    create_request,
+                    Bytes::from(create_non_empty_test_ipc_data()),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut rename_request = RenameTableRequest::new("destination".to_string());
+        rename_request.id = Some(vec!["source".to_string()]);
+        let err = namespace.rename_table(rename_request).await.unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_with_manifest_rolls_back_failed_copy() {
+        use lance_namespace::models::RenameTableRequest;
+
+        let (namespace, temp_dir) = create_test_namespace().await;
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["source".to_string()]);
+        namespace
+            .create_table(
+                create_request,
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        // A plain file where the destination directory would go: the prefix still lists as
+        // empty, but nothing can be written underneath it, so the copy fails after the
+        // rename has been committed.
+        let blocker = std::path::Path::new(temp_dir.to_str().unwrap()).join("renamed.lance");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let mut rename_request = RenameTableRequest::new("renamed".to_string());
+        rename_request.id = Some(vec!["source".to_string()]);
+        namespace.rename_table(rename_request).await.unwrap_err();
+
+        // The commit was rolled back, so the source still owns its catalog entry and can
+        // be renamed again. Without the rollback this fails with "table not found".
+        let mut retry_request = RenameTableRequest::new("elsewhere".to_string());
+        retry_request.id = Some(vec!["source".to_string()]);
+        namespace.rename_table(retry_request).await.unwrap();
+        assert_eq!(
+            rows_at_location(&namespace, vec!["elsewhere".to_string()]).await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_with_manifest_rejects_occupied_directory() {
+        use lance_namespace::models::RenameTableRequest;
+
+        let (namespace, temp_dir) = create_test_namespace().await;
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["source".to_string()]);
+        namespace
+            .create_table(
+                create_request,
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        // Something unrelated to the manifest already sits on the name-derived directory.
+        let occupied_dir = std::path::Path::new(temp_dir.to_str().unwrap()).join("renamed.lance");
+        std::fs::create_dir_all(&occupied_dir).unwrap();
+        std::fs::write(occupied_dir.join("leftover.txt"), b"debris").unwrap();
+
+        // Root tables are resolved by directory name here, so the rename cannot pick a
+        // different directory and must not copy on top of the debris.
+        let mut rename_request = RenameTableRequest::new("renamed".to_string());
+        rename_request.id = Some(vec!["source".to_string()]);
+        let err = namespace.rename_table(rename_request).await.unwrap_err();
+        assert!(
+            err.to_string().contains("is not empty"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(
+            rows_at_location(&namespace, vec!["source".to_string()]).await,
+            2
+        );
+        assert_eq!(
+            std::fs::read_dir(&occupied_dir).unwrap().count(),
+            1,
+            "rename copied into the occupied directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_with_manifest_is_one_commit() {
+        use lance_namespace::models::{ListTablesRequest, RenameTableRequest};
+
+        let (namespace, temp_dir) = create_test_namespace().await;
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["original".to_string()]);
+        namespace
+            .create_table(
+                create_request,
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        let manifest_uri = format!("{}/__manifest", temp_dir.to_str().unwrap());
+        let version_before = Dataset::open(&manifest_uri)
+            .await
+            .unwrap()
+            .version()
+            .version;
+
+        let mut rename_request = RenameTableRequest::new("renamed".to_string());
+        rename_request.id = Some(vec!["original".to_string()]);
+        namespace.rename_table(rename_request).await.unwrap();
+
+        // Retiring the old name and publishing the new one is a single manifest commit,
+        // so no intermediate state ever exposes both names.
+        let version_after = Dataset::open(&manifest_uri)
+            .await
+            .unwrap()
+            .version()
+            .version;
+        assert_eq!(version_after, version_before + 1);
+
+        let mut list_request = ListTablesRequest::new();
+        list_request.id = Some(vec![]);
+        let tables = namespace.list_tables(list_request).await.unwrap().tables;
+        assert_eq!(tables, vec!["renamed".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_cross_namespace_with_manifest() {
+        use lance_namespace::models::{RenameTableRequest, TableExistsRequest};
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        let mut create_namespace_request = CreateNamespaceRequest::new();
+        create_namespace_request.id = Some(vec!["child".to_string()]);
+        namespace
+            .create_namespace(create_namespace_request)
+            .await
+            .unwrap();
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["source".to_string()]);
+        namespace
+            .create_table(
+                create_request,
+                Bytes::from(create_non_empty_test_ipc_data()),
+            )
+            .await
+            .unwrap();
+
+        let mut rename_request = RenameTableRequest::new("moved".to_string());
+        rename_request.id = Some(vec!["source".to_string()]);
+        rename_request.new_namespace_id = Some(vec!["child".to_string()]);
+        namespace.rename_table(rename_request).await.unwrap();
+
+        let mut old_exists = TableExistsRequest::new();
+        old_exists.id = Some(vec!["source".to_string()]);
+        assert!(namespace.table_exists(old_exists).await.is_err());
+
+        let mut new_exists = TableExistsRequest::new();
+        new_exists.id = Some(vec!["child".to_string(), "moved".to_string()]);
+        namespace.table_exists(new_exists).await.unwrap();
+
+        assert_eq!(
+            rows_at_location(&namespace, vec!["child".to_string(), "moved".to_string()]).await,
+            2
+        );
     }
 
     #[tokio::test]
