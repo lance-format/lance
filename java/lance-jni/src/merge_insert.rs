@@ -12,7 +12,8 @@ use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
 use lance::dataset::scanner::ExprFilter;
 use lance::dataset::{
-    MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertWriteMode, MergeStats, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource,
 };
 use lance_core::datatypes::Schema;
 use lance_index::mem_wal::CompactedSsTable;
@@ -52,6 +53,7 @@ fn inner_merge_insert<'local>(
     let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
     let skip_auto_cleanup = extract_skip_auto_cleanup(env, &jparam)?;
     let use_index = extract_use_index(env, &jparam)?;
+    let write_mode = extract_write_mode(env, &jparam)?;
     let compacted_sstables = extract_compacted_sstables(env, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
@@ -71,6 +73,7 @@ fn inner_merge_insert<'local>(
             .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
             .skip_auto_cleanup(skip_auto_cleanup)
             .use_index(use_index)
+            .write_mode(write_mode)
             .mark_sstables_as_compacted(compacted_sstables)
             .try_build()?;
 
@@ -239,6 +242,26 @@ fn extract_skip_auto_cleanup<'local>(env: &mut JNIEnv<'local>, jparam: &JObject)
 fn extract_use_index<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Result<bool> {
     let use_index = env.call_method(jparam, "useIndex", "()Z", &[])?.z()?;
     Ok(use_index)
+}
+
+fn extract_write_mode<'local>(
+    env: &mut JNIEnv<'local>,
+    jparam: &JObject,
+) -> Result<MergeInsertWriteMode> {
+    let write_mode: JString = env
+        .call_method(jparam, "writeModeValue", "()Ljava/lang/String;", &[])?
+        .l()?
+        .into();
+    let write_mode = write_mode.extract(env)?;
+
+    match write_mode.as_str() {
+        "Auto" => Ok(MergeInsertWriteMode::Auto),
+        "RewriteRows" => Ok(MergeInsertWriteMode::RewriteRows),
+        "RewriteColumns" => Ok(MergeInsertWriteMode::RewriteColumns),
+        _ => Err(Error::input_error(format!(
+            "Illegal write_mode: {write_mode}",
+        ))),
+    }
 }
 
 fn extract_compacted_sstables<'local>(
