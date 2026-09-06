@@ -32,9 +32,11 @@ import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -763,6 +765,107 @@ public class ScannerTest {
         }
       }
     }
+  }
+
+  @Test
+  void testDatasetScannerAllNullStructColumnMultipleBatches(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("all_null_struct_scanner").toString();
+    int totalRows = 6;
+    int batchRows = 2;
+
+    try (BufferAllocator allocator = new RootAllocator()) {
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  new Field(
+                      "metadata",
+                      FieldType.nullable(new ArrowType.Struct()),
+                      Arrays.asList(
+                          Field.nullable("field0", new ArrowType.Int(32, true)),
+                          Field.nullable("field1", new ArrowType.Int(32, true)),
+                          Field.nullable("field2", new ArrowType.Int(32, true)),
+                          Field.nullable("field3", new ArrowType.Int(32, true)),
+                          Field.nullable("field4", new ArrowType.Int(32, true)),
+                          Field.nullable("field5", new ArrowType.Int(32, true))))));
+
+      try (VectorSchemaRoot inputRoot = VectorSchemaRoot.create(schema, allocator);
+          ArrowReader inputReader = singleBatchReader(allocator, schema, inputRoot);
+          ArrowArrayStream inputStream = ArrowArrayStream.allocateNew(allocator)) {
+        inputRoot.allocateNew();
+        IntVector idVector = (IntVector) inputRoot.getVector("id");
+        StructVector structVector = (StructVector) inputRoot.getVector("metadata");
+        for (int i = 0; i < totalRows; i++) {
+          idVector.setSafe(i, i);
+          structVector.setNull(i);
+        }
+        inputRoot.setRowCount(totalRows);
+
+        Data.exportArrayStream(allocator, inputReader, inputStream);
+
+        try (Dataset dataset =
+                Dataset.create(
+                    allocator, inputStream, datasetPath, new WriteParams.Builder().build());
+            LanceScanner scanner =
+                dataset.newScan(new ScanOptions.Builder().batchSize(batchRows).build());
+            ArrowReader reader = scanner.scanBatches()) {
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          int batches = 0;
+          int rows = 0;
+
+          while (reader.loadNextBatch()) {
+            int rowCount = root.getRowCount();
+            StructVector metadata = (StructVector) root.getVector("metadata");
+            assertEquals(6, metadata.getField().getChildren().size());
+            assertEquals(6, metadata.getChildrenFromFields().size());
+            assertEquals(rowCount, metadata.getValueCount());
+            for (int i = 0; i < rowCount; i++) {
+              assertTrue(metadata.isNull(i));
+            }
+            batches++;
+            rows += rowCount;
+          }
+
+          assertEquals(3, batches);
+          assertEquals(totalRows, rows);
+        }
+      }
+    }
+  }
+
+  private static ArrowReader singleBatchReader(
+      BufferAllocator allocator, Schema schema, VectorSchemaRoot root) {
+    return new ArrowReader(allocator) {
+      private boolean batchLoaded = false;
+
+      @Override
+      public boolean loadNextBatch() {
+        if (batchLoaded) {
+          return false;
+        }
+        batchLoaded = true;
+        return true;
+      }
+
+      @Override
+      public VectorSchemaRoot getVectorSchemaRoot() {
+        return root;
+      }
+
+      @Override
+      public long bytesRead() {
+        return root.getFieldVectors().stream().mapToLong(FieldVector::getBufferSize).sum();
+      }
+
+      @Override
+      protected void closeReadSource() {}
+
+      @Override
+      protected Schema readSchema() {
+        return schema;
+      }
+    };
   }
 
   @Test
