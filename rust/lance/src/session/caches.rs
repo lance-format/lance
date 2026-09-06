@@ -17,7 +17,7 @@ use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     utils::deletion::DeletionVector,
 };
-use lance_select::RowAddrMask;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::{
     format::{DeletionFile, DeletionFileType, Manifest, RowIdMeta},
     rowids::{RowIdIndex, RowIdSequence},
@@ -193,6 +193,73 @@ impl CacheKey for RowAddrMaskKey {
             builder.write_u64(restrict_hash);
         } else {
             builder.write_none();
+        }
+    }
+}
+
+/// One fragment's live stable-row-id set (an allow-list "piece") for
+/// stable-row-id datasets.
+///
+/// [`RowAddrMaskKey`] is keyed by manifest version, so every commit
+/// invalidates the whole-dataset mask and every distinct `restrict_to` set
+/// pays its own full rebuild (lance-format/lance#8849). This key identifies
+/// the piece by the fragment's *content* instead: the row id generation
+/// (same identity [`RowIdSequenceKey`] uses, #7645) plus the deletion file
+/// identity. Commits that leave a fragment's row ids and deletions untouched
+/// keep hitting the same piece, so a whole-dataset allow list is assembled by
+/// OR-ing cached pieces and only fragments whose content changed reload.
+#[derive(Debug)]
+pub struct RowIdAllowListPieceKey {
+    pub fragment_id: u64,
+    pub row_id_meta: RowIdMeta,
+    pub deletion_file: Option<DeletionFile>,
+}
+
+impl CacheKey for RowIdAllowListPieceKey {
+    type ValueType = RowAddrTreeMap;
+    // Only the legacy display form. Identity comes from `write_key` below.
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("row_id_allow_list_piece/{}", self.fragment_id))
+    }
+    fn type_name() -> &'static str {
+        "RowAddrTreeMap"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-allow-list-piece-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.fragment_id);
+        match &self.row_id_meta {
+            RowIdMeta::Inline(data) => {
+                builder.write_variant(0);
+                builder.write_fixed_bytes(data.digest());
+            }
+            RowIdMeta::External(file) => {
+                builder.write_variant(1);
+                builder.write_str(&file.path);
+                builder.write_u64(file.offset);
+                builder.write_u64(file.size);
+            }
+        }
+        match &self.deletion_file {
+            None => builder.write_variant(0),
+            Some(deletion_file) => {
+                builder.write_variant(1);
+                builder.write_u64(deletion_file.read_version);
+                builder.write_u64(deletion_file.id);
+                builder.write_variant(match deletion_file.file_type {
+                    DeletionFileType::Array => 0,
+                    DeletionFileType::Bitmap => 1,
+                });
+                if let Some(base_id) = deletion_file.base_id {
+                    builder.write_some();
+                    builder.write_u32(base_id);
+                } else {
+                    builder.write_none();
+                }
+            }
         }
     }
 }
