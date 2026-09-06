@@ -540,7 +540,7 @@ impl Fragment {
             files,
             overlays,
             deletion_file: _,
-            row_id_meta: _,
+            row_id_meta,
             physical_rows: _,
             last_updated_at_version_meta: _,
             created_at_version_meta: _,
@@ -548,6 +548,7 @@ impl Fragment {
         files
             .iter()
             .chain(overlays.iter().map(|overlay| &overlay.data_file))
+            .chain(row_id_meta.iter().filter_map(RowIdMeta::column_file))
     }
 
     /// Mutable counterpart of [`Self::referenced_lance_files`], for rewriting
@@ -561,7 +562,7 @@ impl Fragment {
             files,
             overlays,
             deletion_file: _,
-            row_id_meta: _,
+            row_id_meta,
             physical_rows: _,
             last_updated_at_version_meta: _,
             created_at_version_meta: _,
@@ -569,6 +570,11 @@ impl Fragment {
         files
             .iter_mut()
             .chain(overlays.iter_mut().map(|overlay| &mut overlay.data_file))
+            .chain(
+                row_id_meta
+                    .iter_mut()
+                    .filter_map(RowIdMeta::column_file_mut),
+            )
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
@@ -741,6 +747,9 @@ impl From<&Fragment> for pb::DataFragment {
                     offset: file.offset,
                     size: file.size,
                 })
+            }
+            RowIdMeta::Column(data_file) => {
+                pb::data_fragment::RowIdSequence::ColumnRowIds(pb::DataFile::from(data_file))
             }
         });
         let last_updated_at_version_sequence =

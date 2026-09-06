@@ -320,6 +320,10 @@ name = "manifest_commit"
 harness = false
 
 [[bench]]
+name = "rowid_spill"
+harness = false
+
+[[bench]]
 name = "concurrent_append"
 harness = false
 

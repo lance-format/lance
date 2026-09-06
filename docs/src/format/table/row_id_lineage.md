@@ -181,11 +181,32 @@ The implementation selects the most compact encoding based on the value range, c
 
 </details>
 
-#### Inline vs External Storage
+#### Inline vs Spilled Storage
 
-Row ID sequences are stored either inline in the fragment metadata or in external files.
-Sequences smaller than ~200KB are stored inline to avoid additional I/O, while larger sequences are written to external files referenced by path and offset.
-This threshold balances manifest size against the overhead of separate file reads.
+Row ID sequences are stored either inline in the fragment metadata or outside it.
+Sequences smaller than ~200KB are stored inline to avoid additional I/O.
+This threshold balances manifest size against the overhead of separate file reads:
+an inline sequence is rewritten into every manifest version, so on a table whose
+sequences do not run-encode well the manifest grows with the total row count.
+
+A larger sequence is written to a **hidden column of a Lance data file**, carrying
+the reserved field id `-3`. The column holds one `uint64` per physical row, in
+offset order, and is located by the same `fields`/`column_indices` pair as a user
+column, so it may share a file with user data or occupy a file of its own. Reading
+it uses the ordinary data file reader and its encodings.
+
+A writer that emits `column_row_ids` MUST set the spilled row ids feature flag
+(bit 9, value 512) in both the reader and writer flag words. A reader without that
+bit sees an unset `row_id_sequence` oneof and would take the fragment to have no
+row IDs at all, on a table whose manifest says every fragment has them.
+
+The `external_row_ids` arm predates this and is a raw byte range holding the same
+encoded form as the inline arm. It is retained for compatibility; new writers use
+`column_row_ids`.
+
+!!! note
+    Spilled row ID sequences are not yet a released feature. A released build
+    treats bit 9 as an unknown feature flag and refuses the dataset.
 
 <details>
 <summary>DataFragment row_id_sequence field</summary>
@@ -195,6 +216,7 @@ message DataFragment {
   oneof row_id_sequence {
     bytes inline_row_ids = 5;
     ExternalFile external_row_ids = 6;
+    DataFile column_row_ids = 12;
   }
 }
 ```

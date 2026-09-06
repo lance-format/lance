@@ -405,6 +405,16 @@ message DataFragment {
     bytes inline_row_ids = 5;
     // Otherwise, stored as part of a file.
     ExternalFile external_row_ids = 6;
+    // The row ids are stored as a hidden column of a Lance data file, at the
+    // reserved field id -3 (`ROW_ID_FIELD_ID`). The `fields`/`column_indices`
+    // pair locates the column the same way it does for a user column, so the
+    // column may share a file with user data or sit in a file of its own.
+    //
+    // A writer MUST set the spilled row ids feature flag (512) when any
+    // fragment uses this arm. A reader that does not understand the flag would
+    // see an unset `row_id_sequence` oneof and treat the fragment as having no
+    // row ids at all.
+    DataFile column_row_ids = 12;
   } // row_id_sequence
 
   oneof last_updated_at_version_sequence {

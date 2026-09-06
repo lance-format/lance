@@ -23,7 +23,7 @@ pub use manifest::{
     SelfDescribingFileReader, WriterVersion, is_detached_version,
     populate_manifest_schema_dictionaries,
 };
-pub use row_ids::{ExternalFile, InlineRowIds, RowIdMeta};
+pub use row_ids::{ExternalFile, InlineRowIds, ROW_ID_FIELD_ID, RowIdMeta};
 pub use transaction::{Transaction, operation_may_change_schema};
 
 use lance_core::{Error, Result};

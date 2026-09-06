@@ -637,8 +637,9 @@ pub fn refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
                 let sequence = read_row_ids(data).unwrap();
                 sequence.len()
             }
-            // Follow existing behavior: external sequence not yet supported here
-            crate::format::RowIdMeta::External(_file) => 0,
+            // Follow existing behavior: a sequence that is not inline needs IO
+            // to read, which this synchronous path cannot do.
+            crate::format::RowIdMeta::External(_) | crate::format::RowIdMeta::Column(_) => 0,
         }
     } else {
         0
@@ -674,9 +675,13 @@ pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
                 let sequence = read_row_ids(data).unwrap();
                 sequence.len()
             }
-            crate::format::RowIdMeta::External(_file) => {
-                // Preserve original behavior for external sequences
-                todo!("External file loading not yet implemented")
+            // Reading these needs IO, which this synchronous path cannot do.
+            // Reachable only for a fragment that also has no `physical_rows`.
+            crate::format::RowIdMeta::External(_) | crate::format::RowIdMeta::Column(_) => {
+                return Err(Error::not_supported(
+                    "refreshing row update versions for a fragment whose row id \
+                     sequence is stored outside the manifest",
+                ));
             }
         }
     } else {

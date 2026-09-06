@@ -288,6 +288,12 @@ impl CacheKey for RowIdSequenceKey<'_> {
                 builder.write_u64(file.offset);
                 builder.write_u64(file.size);
             }
+            // The path is a fresh random name per spilled sequence, so it
+            // identifies the contents the way the inline digest does.
+            RowIdMeta::Column(data_file) => {
+                builder.write_variant(2);
+                builder.write_str(&data_file.path);
+            }
         }
     }
 }
