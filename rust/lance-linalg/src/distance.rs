@@ -26,7 +26,11 @@ pub mod l2;
 pub mod l2_u8;
 pub mod norm_l2;
 
+// `#[track_caller]` on both helpers is load-bearing: without it a length-contract
+// panic reports this file rather than the distance function the caller reached.
+// See #8863.
 #[inline]
+#[track_caller]
 fn assert_equal_lengths(left_len: usize, right_len: usize) {
     assert_eq!(
         left_len, right_len,
@@ -35,6 +39,7 @@ fn assert_equal_lengths(left_len: usize, right_len: usize) {
 }
 
 #[inline]
+#[track_caller]
 fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
     assert!(
         dimension > 0,
