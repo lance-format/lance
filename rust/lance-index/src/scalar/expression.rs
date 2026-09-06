@@ -1939,8 +1939,12 @@ impl ScalarIndexExpr {
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableIndexExprResult> {
-        self.evaluate_with_options(index_loader, metrics, true)
-            .await
+        self.evaluate_with_options(
+            index_loader,
+            metrics,
+            SearchOptions::default().with_track_nulls(true),
+        )
+        .await
     }
 
     #[async_recursion]
@@ -1948,26 +1952,37 @@ impl ScalarIndexExpr {
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
-        track_nulls: bool,
+        options: SearchOptions,
     ) -> Result<NullableIndexExprResult> {
         match self {
             Self::Not(inner) => {
                 // NOT needs the child's NULL rows to preserve SQL three-valued
                 // logic. Once enabled, keep tracking through the whole subtree.
+                // The limit is dropped for the same reason it cannot cross any
+                // combining operator: a partial match set cannot be complemented.
                 let result = inner
-                    .evaluate_with_options(index_loader, metrics, true)
+                    .evaluate_with_options(
+                        index_loader,
+                        metrics,
+                        options.with_track_nulls(true).with_limit(None),
+                    )
                     .await?;
                 Ok(!result)
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
-                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
+                // A limit must not cross AND/OR: each side would stop early at a
+                // different subset, and the intersection or union of two partial
+                // sets is not a prefix of the full result.
+                let options = options.with_limit(None);
+                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, options);
+                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, options);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
-                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
+                let options = options.with_limit(None);
+                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, options);
+                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, options);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result | rhs_result)
             }
@@ -1976,11 +1991,7 @@ impl ScalarIndexExpr {
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
                 let search_result = index
-                    .search_with_options(
-                        search.query.as_ref(),
-                        SearchOptions::default().with_track_nulls(track_nulls),
-                        metrics,
-                    )
+                    .search_with_options(search.query.as_ref(), options, metrics)
                     .await?;
                 let result = search_result_to_nullable(search_result);
                 if index.results_are_row_addresses() {
@@ -1995,6 +2006,33 @@ impl ScalarIndexExpr {
         }
     }
 
+    /// Like [`Self::evaluate`] but pushes a best-effort `limit` into the index search so
+    /// it can stop once it has found at least `limit` matches.
+    ///
+    /// The limit reaches only a top-level positive lookup. It is dropped at any `Not`,
+    /// `And`, or `Or` node, because a partial match set cannot be complemented,
+    /// intersected, or unioned soundly. A limited search reports
+    /// [`SearchResult::AtLeast`], so callers must still enforce the exact limit
+    /// downstream.
+    #[instrument(level = "debug", skip_all)]
+    pub async fn evaluate_limited(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+        limit: Option<usize>,
+    ) -> Result<IndexExprResult> {
+        Ok(self
+            .evaluate_with_options(
+                index_loader,
+                metrics,
+                SearchOptions::default()
+                    .with_track_nulls(false)
+                    .with_limit(limit),
+            )
+            .await?
+            .drop_nulls())
+    }
+
     #[instrument(level = "debug", skip_all)]
     pub async fn evaluate(
         &self,
@@ -2002,7 +2040,11 @@ impl ScalarIndexExpr {
         metrics: &dyn MetricsCollector,
     ) -> Result<IndexExprResult> {
         Ok(self
-            .evaluate_with_options(index_loader, metrics, false)
+            .evaluate_with_options(
+                index_loader,
+                metrics,
+                SearchOptions::default().with_track_nulls(false),
+            )
             .await?
             .drop_nulls())
     }

@@ -508,11 +508,29 @@ pub struct SearchOptions {
     /// Callers may disable this only when NULL rows cannot affect the final
     /// result, such as a top-level filter whose NULL results will be discarded.
     track_nulls: bool,
+    /// Best-effort cap on how many matching rows the search needs to find.
+    ///
+    /// An index may stop once it has `n` matches and may still return more, so
+    /// this narrows work without narrowing the contract. It applies only to
+    /// positive lookups that preserve matches, such as equality, range, and `IsIn`.
+    /// Negating and combining operators ignore it, because a partial match set
+    /// cannot be complemented or intersected soundly.
+    ///
+    /// A search that acts on the limit reports [`SearchResult::AtLeast`], never
+    /// [`SearchResult::Exact`], so a short-circuited scan can never be mistaken
+    /// for the complete match set. An index may also decline the hint and search
+    /// in full, in which case it still reports [`SearchResult::Exact`]. Notably
+    /// [`track_nulls`](Self::track_nulls) forces this, because a partial scan
+    /// cannot report a complete null set.
+    limit: Option<usize>,
 }
 
 impl Default for SearchOptions {
     fn default() -> Self {
-        Self { track_nulls: true }
+        Self {
+            track_nulls: true,
+            limit: None,
+        }
     }
 }
 
@@ -527,6 +545,17 @@ impl SearchOptions {
     /// Whether searches preserve rows where the query evaluates to NULL.
     pub fn track_nulls(&self) -> bool {
         self.track_nulls
+    }
+
+    /// Set a best-effort cap on the number of matching rows the search must find.
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// The best-effort cap on matching rows, if any.
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
     }
 }
 

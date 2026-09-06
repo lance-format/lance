@@ -2245,13 +2245,43 @@ impl ScalarIndex for BTreeIndex {
             .collect::<Vec<_>>();
         debug!("Searching {} btree pages", page_tasks.len());
 
-        // Collect both matching row IDs and null row IDs from all pages
-        let results: Vec<NullableRowAddrSet> = stream::iter(page_tasks)
-            // I/O and compute mixed here but important case is index in cache so
-            // use compute intensive thread count
-            .buffered(get_num_compute_intensive_cpus())
-            .try_collect()
-            .await?;
+        // Null tracking and an early stop are incompatible. The null pages above are appended
+        // after the matching pages, and an unread matching page can hold nulls of its own, so a
+        // short-circuited scan cannot report a complete null set. Decline the hint rather than
+        // the search: the limit is only an optimization and must never turn an otherwise valid
+        // search into a failure or a wrong answer.
+        let limit = if options.track_nulls() {
+            None
+        } else {
+            options.limit()
+        };
+
+        // Collect both matching row IDs and null row IDs from all pages.
+        //
+        // With a limit, read one page at a time and stop as soon as enough TRUE matches
+        // have been seen. Fanning out would defeat the point by doing the work anyway.
+        // Without one, fan out across CPUs as usual.
+        let parallelism = if limit.is_some() {
+            1
+        } else {
+            get_num_compute_intensive_cpus()
+        };
+        let mut page_stream = stream::iter(page_tasks).buffered(parallelism);
+        let mut results: Vec<NullableRowAddrSet> = Vec::new();
+        let mut matches_found: u64 = 0;
+        while let Some(page_result) = page_stream.try_next().await? {
+            if let Some(limit) = limit {
+                // A limit implies nulls are not tracked, so every selected row is a TRUE match
+                // and `selected_rows()` counts them without the set arithmetic `len()` does.
+                matches_found += page_result.selected_rows().len().unwrap_or(0);
+                results.push(page_result);
+                if matches_found >= limit as u64 {
+                    break;
+                }
+            } else {
+                results.push(page_result);
+            }
+        }
 
         let selection = if options.track_nulls() {
             NullableRowAddrSet::union_all(&results)
@@ -2266,7 +2296,17 @@ impl ScalarIndex for BTreeIndex {
             )
         };
 
-        Ok(SearchResult::Exact(selection))
+        // A limited search may stop before reading every matching page, so the returned set
+        // is a lower bound rather than the complete match set. Reporting `Exact` would let a
+        // downstream consumer treat a partial set as complete, so report `AtLeast` whenever a
+        // limit was in play, even if this particular scan happened to read every page,
+        // since the caller cannot tell the difference and must not rely on it. A declined
+        // limit read every page as usual, so it stays `Exact`.
+        Ok(if limit.is_some() {
+            SearchResult::AtLeast(selection)
+        } else {
+            SearchResult::Exact(selection)
+        })
     }
 
     fn can_remap(&self) -> bool {
@@ -5607,6 +5647,168 @@ mod tests {
             }
             _ => panic!("BTree search should return Exact"),
         }
+    }
+
+    /// A limited search returns at least `limit` matches but stops reading pages early, so
+    /// for a multi-page range it reads fewer pages than an unlimited search and must report
+    /// `AtLeast` rather than `Exact`.
+    #[tokio::test]
+    async fn test_search_limited_short_circuits() {
+        use arrow_array::{Int32Array, UInt64Array};
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Five btree pages of `DEFAULT_BTREE_BATCH_SIZE` rows, no nulls, so every row matches.
+        let num_rows = 5 * DEFAULT_BTREE_BATCH_SIZE;
+        let values: Int32Array = (0..num_rows).map(|i| Some(i as i32)).collect();
+        let row_ids = UInt64Array::from_iter_values(0..num_rows);
+        let data = arrow_array::RecordBatch::try_from_iter(vec![
+            ("value", Arc::new(values) as arrow_array::ArrayRef),
+            ("_rowid", Arc::new(row_ids) as arrow_array::ArrayRef),
+        ])
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            data.schema(),
+            stream::iter(vec![Ok(data)]),
+        ));
+        train_btree_index(
+            stream,
+            test_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let metrics = NoOpMetricsCollector;
+        let everything =
+            SargableQuery::Range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
+
+        // Baseline: an unlimited search returns every row and is exact.
+        let full = index.search(&everything, &metrics).await.unwrap();
+        assert!(
+            matches!(full, SearchResult::Exact(_)),
+            "an unlimited search must stay Exact, got {full:?}"
+        );
+        let full_len = full.row_addrs().len().unwrap();
+        assert_eq!(full_len, num_rows);
+
+        // A limit reaching into the second page: satisfied, but stops before all five.
+        let limit = (DEFAULT_BTREE_BATCH_SIZE + 100) as usize;
+        let limited = index
+            .search_with_options(
+                &everything,
+                SearchOptions::default()
+                    .with_track_nulls(false)
+                    .with_limit(Some(limit)),
+                &metrics,
+            )
+            .await
+            .unwrap();
+        // A short-circuited search is not the complete match set, so it must be reported as
+        // `AtLeast` (a lower bound), never `Exact`.
+        assert!(
+            matches!(limited, SearchResult::AtLeast(_)),
+            "limited search must return AtLeast, got {limited:?}"
+        );
+        let limited_len = limited.row_addrs().len().unwrap();
+        assert!(
+            limited_len >= limit as u64,
+            "expected at least {limit} matches, got {limited_len}"
+        );
+        assert!(
+            limited_len < full_len,
+            "expected the search to short-circuit, but it returned all {full_len} rows"
+        );
+    }
+
+    /// Null tracking and an early stop cannot both be honored: null pages are searched after
+    /// the matching pages, and an unread matching page can hold nulls too, so a short-circuited
+    /// scan could not report a complete null set. The limit is declined instead of the search,
+    /// so the result stays `Exact` and its nulls match an unlimited search exactly.
+    #[tokio::test]
+    async fn test_limit_is_declined_when_nulls_are_tracked() {
+        use arrow_array::{Int32Array, UInt64Array};
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Five pages where every fifth row is NULL, so nulls are spread across every page and
+        // a search that stopped early would miss the ones on the pages it never read.
+        let num_rows = 5 * DEFAULT_BTREE_BATCH_SIZE;
+        let values: Int32Array = (0..num_rows)
+            .map(|i| if i % 5 == 0 { None } else { Some(i as i32) })
+            .collect();
+        let row_ids = UInt64Array::from_iter_values(0..num_rows);
+        let data = arrow_array::RecordBatch::try_from_iter_with_nullable(vec![
+            ("value", Arc::new(values) as arrow_array::ArrayRef, true),
+            ("_rowid", Arc::new(row_ids) as arrow_array::ArrayRef, false),
+        ])
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            data.schema(),
+            stream::iter(vec![Ok(data)]),
+        ));
+        train_btree_index(
+            stream,
+            test_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let metrics = NoOpMetricsCollector;
+        let everything =
+            SargableQuery::Range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
+
+        let track_nulls = |limit| {
+            index.search_with_options(
+                &everything,
+                SearchOptions::default()
+                    .with_track_nulls(true)
+                    .with_limit(limit),
+                &metrics,
+            )
+        };
+
+        let unlimited = track_nulls(None).await.unwrap();
+        // A limit small enough that acting on it would stop on the first page.
+        let limited = track_nulls(Some(10)).await.unwrap();
+
+        assert!(
+            matches!(limited, SearchResult::Exact(_)),
+            "a declined limit searched every page, so the result must stay Exact, got {limited:?}"
+        );
+        let unlimited = unlimited.row_addrs();
+        let limited = limited.row_addrs();
+        assert_eq!(
+            limited.null_rows(),
+            unlimited.null_rows(),
+            "tracked nulls must be complete even when a limit was requested"
+        );
+        assert!(
+            !limited.null_rows().is_empty(),
+            "the fixture must produce nulls, otherwise this asserts nothing"
+        );
+        assert_eq!(limited.len(), unlimited.len());
     }
 
     /// Regression test: disabling NULL tracking also omits NULL rows from a
