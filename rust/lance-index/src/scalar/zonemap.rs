@@ -760,8 +760,10 @@ impl ScalarIndex for ZoneMapIndex {
         let value_type = schema.field(0).data_type().clone();
 
         let options = ZoneMapIndexBuilderParams::new(self.rows_per_zone);
-        let processor = ZoneMapProcessor::new(value_type.clone())?;
-        let trainer = ZoneTrainer::new(processor, self.rows_per_zone)?;
+        let trainer = ZoneTrainer::new(
+            move || ZoneMapProcessor::new(value_type.clone()),
+            self.rows_per_zone,
+        )?;
         let (updated_zones, new_null_rows) = rebuild_zones(&self.zones, trainer, new_data).await?;
 
         // Merge existing and new null rows.  If the existing index had no null bitmap
@@ -1127,8 +1129,11 @@ impl ZoneMapIndexBuilder {
     /// the value column followed by `_rowaddr`, matching the dataset scan order enforced
     /// by the scalar index registry.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
-        let processor = ZoneMapProcessor::new(self.items_type.clone())?;
-        let trainer = ZoneTrainer::new(processor, self.options.rows_per_zone)?;
+        let items_type = self.items_type.clone();
+        let trainer = ZoneTrainer::new(
+            move || ZoneMapProcessor::new(items_type.clone()),
+            self.options.rows_per_zone,
+        )?;
         let (maps, null_rows) = trainer.train(batches_source).await?;
         self.maps = maps;
         self.null_rows = Some(null_rows);
