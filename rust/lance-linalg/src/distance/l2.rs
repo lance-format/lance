@@ -47,6 +47,12 @@ use crate::simd::x86::hsum256_ps;
 ///
 pub trait L2: Num {
     /// Calculate the L2 distance between two vectors.
+    ///
+    /// # Panics
+    ///
+    /// `x` and `y` must have the same length. An implementation is required to
+    /// reject a mismatch rather than read past the shorter slice; the five in
+    /// this crate do it by panicking.
     fn l2(x: &[Self], y: &[Self]) -> f32;
 
     /// L2 distance from `x` to each `dimension`-sized vector in `y`.
@@ -60,6 +66,11 @@ pub trait L2: Num {
     /// assignment loop drives this one element at a time, so a
     /// `Box<dyn Iterator>` would cost a virtual call per element and an
     /// allocation per batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `dimension` is non-zero, `x.len()` equals `dimension`, and
+    /// `y.len()` is a multiple of `dimension`.
     fn l2_batch<'a>(
         x: &'a [Self],
         y: &'a [Self],
@@ -70,6 +81,11 @@ pub trait L2: Num {
     }
 }
 
+/// Squared L2 distance between two vectors of any [`L2`] element type.
+///
+/// # Panics
+///
+/// Panics under the conditions [`L2::l2`] documents.
 #[inline]
 pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
     T::l2(from, to)
@@ -82,12 +98,20 @@ pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
 /// to [`l2`], whose x86_64 implementation selects the best runtime-supported
 /// kernel. This entry point gives hot-path callers such as the in-memory HNSW
 /// index an explicit f32 API.
+///
+/// # Panics
+///
+/// Panics if `x` and `y` have different lengths.
 #[inline]
 pub fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
     f32::l2(x, y)
 }
 
 /// Calculate L2 distance between two uint8 slices.
+///
+/// # Panics
+///
+/// Panics if `key` and `target` have different lengths.
 #[inline]
 pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
     assert_equal_lengths(key.len(), target.len());
@@ -102,6 +126,11 @@ pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
 /// It relies on LLVM for auto-vectorization and unrolling.
 ///
 /// This is pub for test/benchmark only. use [l2] instead.
+///
+/// # Panics
+///
+/// Panics if `from` and `to` have different lengths, and separately if `LANES`
+/// is zero, which `chunks_exact` rejects.
 #[inline]
 pub fn l2_scalar<
     T: AsPrimitive<Output>,
@@ -839,6 +868,14 @@ pub struct L2Prepared {
 
 impl L2Prepared {
     /// Transpose `targets` from AoS `[num_targets][dimension]` to SoA layout.
+    ///
+    /// `targets.len()` must be a multiple of `dimension`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dimension` is zero. With debug assertions on, also panics if
+    /// `targets.len()` is not a multiple of `dimension`; without them the
+    /// trailing partial vector is dropped.
     pub fn new(targets: &[f32], dimension: usize) -> Self {
         let num_targets = targets.len() / dimension;
         debug_assert_eq!(targets.len(), num_targets * dimension);
@@ -859,7 +896,13 @@ impl L2Prepared {
 
     /// Compute L2 distances from `query` to every target, writing into `out`.
     ///
-    /// `out` must have length `num_targets`. It will be zeroed before accumulation.
+    /// `query` must have length `dimension` and `out` must have length
+    /// `num_targets`. `out` will be zeroed before accumulation.
+    ///
+    /// # Panics
+    ///
+    /// With debug assertions on, panics unless both lengths match. A `query`
+    /// longer than `dimension` can also panic on a slice range without them.
     pub fn distances_into(&self, query: &[f32], out: &mut [f32]) {
         debug_assert_eq!(query.len(), self.dimension);
         debug_assert_eq!(out.len(), self.num_targets);
@@ -908,6 +951,10 @@ impl L2Prepared {
 }
 
 /// Compute L2 distance between two vectors.
+///
+/// # Panics
+///
+/// Panics if `from` and `to` have different lengths.
 #[inline]
 pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
     l2(from, to)
@@ -924,6 +971,10 @@ pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
 /// Returns
 ///
 /// An iterator of pair-wise distance between `from` vector to each vector in the batch.
+///
+/// # Panics
+///
+/// Panics under the conditions [`L2::l2_batch`] documents.
 pub fn l2_distance_batch<'a, T: L2>(
     from: &'a [T],
     to: &'a [T],
