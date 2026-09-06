@@ -344,7 +344,13 @@ pub trait IndexDescription: Send + Sync {
     /// deleted.
     fn rows_indexed(&self) -> u64;
 
-    /// Returns the ids of the fields that the index is built on.
+    /// Returns the ids of the fields that the index is built on -- the columns it can
+    /// answer queries for.
+    ///
+    /// This is the index's *keyed* prefix only. An index may additionally carry values
+    /// for columns it is not keyed on (see [`IndexMetadata::covering_fields`]); those are
+    /// deliberately absent here, because the index cannot be searched on them. They stay
+    /// reachable per segment via [`Self::metadata`].
     fn field_ids(&self) -> &[u32];
 
     /// Returns a JSON string representation of the index details

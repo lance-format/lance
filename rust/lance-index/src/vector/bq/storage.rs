@@ -44,6 +44,7 @@ use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
 use crate::pb;
 use crate::scalar::RowIdRemapper;
 use crate::vector::ApproxMode;
+use crate::vector::PART_ID_COLUMN;
 use crate::vector::bq::dist_table_quant::{
     DistTableDequant, quantize_dist_table_into, quantize_dist_table_u16_into,
 };
@@ -66,6 +67,7 @@ use crate::vector::pq::storage::transpose;
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::storage::{
     DistCalculator, DistanceCalculatorOptions, QueryResidual, RabitRawQueryContext, VectorStore,
+    covering_field_indices_excluding,
 };
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
@@ -2048,6 +2050,29 @@ impl VectorStore for RabitQuantizationStorage {
         self.batch.schema_ref()
     }
 
+    /// RQ storage carries the row id plus many internal columns (the binary codes, the
+    /// extended-bit codes, and the per-row factor columns, some present only for higher
+    /// `num_bits`); the covering ("included") columns are everything else.
+    fn covering_field_indices(&self) -> Vec<usize> {
+        // Every RaBitQ-internal column plus the legacy `__ivf_part_id` column
+        // (left in pre-#3606 single-partition builds; unlike PQ, RaBitQ storage
+        // does not drop it at construction, so it is excluded here). Anything
+        // else is a user-declared covering column.
+        const INTERNAL: &[&str] = &[
+            ROW_ID,
+            RABIT_CODE_COLUMN,
+            RABIT_EX_CODE_COLUMN,
+            RABIT_BLOCKED_EX_CODE_COLUMN,
+            ADD_FACTORS_COLUMN,
+            SCALE_FACTORS_COLUMN,
+            ERROR_FACTORS_COLUMN,
+            EX_ADD_FACTORS_COLUMN,
+            EX_SCALE_FACTORS_COLUMN,
+            PART_ID_COLUMN,
+        ];
+        covering_field_indices_excluding(self.schema().as_ref(), INTERNAL)
+    }
+
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch> + Send> {
         Ok(std::iter::once(self.batch.clone()))
     }
@@ -3033,6 +3058,39 @@ mod tests {
             ),
         ])
         .unwrap()
+    }
+
+    #[test]
+    fn test_covering_excludes_legacy_part_id_column() {
+        // Same legacy `__ivf_part_id` guard as the other quantizer storages:
+        // pre-#3606 `num_partitions=1` builds left it in the storage file, and
+        // it must never be classified as a covering column -- otherwise search
+        // emits a column the exec's declared schema (from
+        // `IndexMetadata.covering_fields`, empty for those indexes) lacks.
+        use crate::vector::PART_ID_COLUMN;
+        use arrow_array::UInt32Array;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let code_dim = 64;
+        let codes = make_test_codes(10, code_dim);
+        let metadata = make_test_metadata(codes.value_length() as usize * 8);
+        let base = make_test_batch(codes);
+
+        let mut fields: Vec<_> = base.schema().fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new(PART_ID_COLUMN, DataType::UInt32, true)));
+        let mut columns = base.columns().to_vec();
+        columns.push(Arc::new(UInt32Array::from_iter_values(
+            (0..base.num_rows()).map(|_| 0),
+        )) as ArrayRef);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
+        assert!(
+            storage.covering_field_indices().is_empty(),
+            "legacy __ivf_part_id must not be classified as a covering column"
+        );
     }
 
     fn make_test_ex_codes(num_vectors: usize, code_dim: usize, num_bits: u8) -> FixedSizeListArray {

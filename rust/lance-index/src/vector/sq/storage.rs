@@ -30,9 +30,12 @@ use crate::scalar::RowIdRemapper;
 use crate::{
     INDEX_METADATA_SCHEMA_KEY, IndexMetadata,
     vector::{
-        SQ_CODE_COLUMN,
+        PART_ID_COLUMN, SQ_CODE_COLUMN,
         quantizer::{QuantizerMetadata, QuantizerStorage},
-        storage::{DistCalculator, DistanceCalculatorOptions, QueryResidual, VectorStore},
+        storage::{
+            DistCalculator, DistanceCalculatorOptions, QueryResidual, VectorStore,
+            covering_field_indices_excluding, remap_row_ids_by_name,
+        },
         transform::Transformer,
     },
 };
@@ -193,7 +196,7 @@ impl ScalarQuantizationStorage {
         offsets.push(0);
         for mut batch in batches.into_iter() {
             if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                batch = frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
+                batch = remap_row_ids_by_name(batch, frag_reuse_index_ref.as_ref())?
             }
             offsets.push(offsets.last().unwrap() + batch.num_rows() as u32);
             let chunk = SQStorageChunk::new(batch)?;
@@ -368,6 +371,17 @@ impl VectorStore for ScalarQuantizationStorage {
 
     fn schema(&self) -> &SchemaRef {
         self.chunks[0].schema()
+    }
+
+    /// SQ storage is `[_rowid, __sq_code, <included cols...>]`, so the covering
+    /// columns are every field except the row id, the SQ code column, and the
+    /// legacy `__ivf_part_id` column (left in pre-#3606 single-partition builds;
+    /// unlike PQ, SQ does not drop it at construction, so it is excluded here).
+    fn covering_field_indices(&self) -> Vec<usize> {
+        covering_field_indices_excluding(
+            self.schema().as_ref(),
+            &[ROW_ID, SQ_CODE_COLUMN, PART_ID_COLUMN],
+        )
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -783,6 +797,50 @@ mod tests {
             ),
         ]));
         RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(code_arr)]).unwrap()
+    }
+
+    #[test]
+    fn test_covering_excludes_legacy_part_id_column() {
+        // Pre-#3606 `num_partitions=1` builds left `__ivf_part_id` in the SQ
+        // storage file. It must never be classified as a covering column --
+        // otherwise search emits a column the exec's declared schema (from
+        // `IndexMetadata.covering_fields`, empty for those indexes) lacks,
+        // desyncing the two and failing every query on that legacy index.
+        use crate::vector::PART_ID_COLUMN;
+        use arrow_array::UInt32Array;
+        const DIM: usize = 64;
+        const N: usize = 10;
+
+        let row_ids = UInt64Array::from_iter_values(0..N as u64);
+        let sq_code = UInt8Array::from_iter_values((0..N * DIM).map(|v| v as u8));
+        let code_arr = FixedSizeListArray::try_new_from_values(sq_code, DIM as i32).unwrap();
+        let part_ids = UInt32Array::from_iter_values((0..N).map(|_| 0));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(
+                SQ_CODE_COLUMN,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    DIM as i32,
+                ),
+                false,
+            ),
+            Field::new(PART_ID_COLUMN, DataType::UInt32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(row_ids), Arc::new(code_arr), Arc::new(part_ids)],
+        )
+        .unwrap();
+
+        let storage =
+            ScalarQuantizationStorage::try_new(8, DistanceType::L2, -0.7..0.7, [batch], None)
+                .unwrap();
+        assert!(
+            storage.covering_field_indices().is_empty(),
+            "legacy __ivf_part_id must not be classified as a covering column"
+        );
     }
 
     #[test]

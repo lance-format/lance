@@ -7,17 +7,17 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arrow::datatypes::UInt64Type;
-use arrow_array::UInt64Array;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrowPrimitiveType, RecordBatch, UInt32Array, cast::AsArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::RecordBatchExt;
 use num_traits::Float;
 
-use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
+use lance_core::{Error, Result};
 use lance_linalg::kernels::normalize_fsl;
 use tracing::instrument;
+
+use super::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 
 /// Transform of a Vector Matrix.
 ///
@@ -194,25 +194,48 @@ impl Transformer for Flatten {
         match arr.data_type() {
             DataType::FixedSizeList(_, _) => Ok(batch.clone()),
             DataType::List(_) => {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let vectors = arr.as_list::<i32>();
-
-                let row_ids = row_ids.values().iter().zip(vectors.iter()).flat_map(
-                    |(row_id, multivector)| {
-                        std::iter::repeat_n(
-                            *row_id,
-                            multivector.map(|multivec| multivec.len()).unwrap_or(0),
-                        )
-                    },
-                );
-                let row_ids = UInt64Array::from_iter_values(row_ids);
-                let vectors = vectors.values().as_fixed_size_list().clone();
-                let schema = Arc::new(Schema::new(vec![
-                    ROW_ID_FIELD.clone(),
-                    Field::new(self.column.as_str(), vectors.data_type().clone(), true),
-                ]));
-                let batch =
-                    RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(vectors)])?;
+                // Each source row expands into one output row per vector in its list.
+                // Replicate the row id AND every other column (e.g. covering / "included"
+                // columns) across the expansion via a gather; dropping them here would
+                // silently lose covering data on the multivector build/split path.
+                //
+                // The IVF partition-assignment columns are the exception and must be
+                // DROPPED, not replicated: they describe the source *row*, and after the
+                // expansion each sub-vector needs its own nearest centroid. Carrying them
+                // through makes `PartitionTransformer` see its output column already
+                // present and early-return, silently collapsing every sub-vector of a row
+                // into that row's single partition -- no error, just degraded recall.
+                let take_indices =
+                    UInt32Array::from_iter_values((0..vectors.len()).flat_map(|i| {
+                        let n = if vectors.is_valid(i) {
+                            vectors.value(i).len()
+                        } else {
+                            0
+                        };
+                        std::iter::repeat_n(i as u32, n)
+                    }));
+                let flat_vectors = vectors.values().as_fixed_size_list().clone();
+                let mut fields: Vec<Arc<Field>> = Vec::with_capacity(batch.num_columns());
+                let mut columns: Vec<arrow_array::ArrayRef> =
+                    Vec::with_capacity(batch.num_columns());
+                for (i, field) in batch.schema().fields().iter().enumerate() {
+                    if field.name() == &self.column {
+                        fields.push(Arc::new(Field::new(
+                            self.column.as_str(),
+                            flat_vectors.data_type().clone(),
+                            true,
+                        )));
+                        columns.push(Arc::new(flat_vectors.clone()));
+                    } else if field.name() == PART_ID_COLUMN || field.name() == CENTROID_DIST_COLUMN
+                    {
+                        continue;
+                    } else {
+                        fields.push(field.clone());
+                        columns.push(arrow::compute::take(batch.column(i), &take_indices, None)?);
+                    }
+                }
+                let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
                 Ok(batch)
             }
             _ => Err(Error::index(format!(
@@ -235,6 +258,114 @@ mod tests {
     use half::f16;
     use lance_arrow::*;
     use lance_linalg::distance::L2;
+
+    #[test]
+    fn test_flatten_preserves_extra_columns_for_multivector() {
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::UInt64Type;
+        use arrow_array::{ListArray, UInt64Array};
+        use lance_core::{ROW_ID, ROW_ID_FIELD};
+
+        // row 10 has 2 vectors, row 20 has 1 vector; a covering column "meta" must be
+        // replicated across each row's expanded vectors, not dropped.
+        let values = Float32Array::from(vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let offsets = OffsetBuffer::new(vec![0i32, 2, 3].into());
+        let item = Arc::new(Field::new("item", fsl.data_type().clone(), true));
+        let list = ListArray::new(item, offsets, Arc::new(fsl), None);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                ROW_ID_FIELD.clone(),
+                Field::new("vector", list.data_type().clone(), true),
+                Field::new("meta", DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![10u64, 20])),
+                Arc::new(list),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+
+        let out = Flatten::new("vector").transform(&batch).unwrap();
+
+        assert_eq!(out.num_rows(), 3, "2 + 1 vectors expand to 3 rows");
+        assert_eq!(
+            out[ROW_ID].as_primitive::<UInt64Type>().values(),
+            &[10, 10, 20]
+        );
+        let meta = out
+            .column_by_name("meta")
+            .expect("covering column must survive Flatten")
+            .as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(
+            meta.values(),
+            &[100, 100, 200],
+            "covering column replicated per expanded vector"
+        );
+        assert!(matches!(
+            out.column_by_name("vector").unwrap().data_type(),
+            DataType::FixedSizeList(_, 2)
+        ));
+    }
+
+    /// The IVF partition-assignment columns describe the source *row*. Replicating them
+    /// across the multivector expansion makes `PartitionTransformer` see its output column
+    /// already present and early-return, so every sub-vector inherits its row's single
+    /// partition instead of being assigned to its own nearest centroid -- silent recall
+    /// loss with no error. They must be dropped even though covering columns are kept.
+    #[test]
+    fn test_flatten_drops_partition_columns_for_multivector() {
+        use arrow::buffer::OffsetBuffer;
+        use arrow_array::{ListArray, UInt32Array as U32, UInt64Array};
+        use lance_core::ROW_ID_FIELD;
+
+        let values = Float32Array::from(vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let offsets = OffsetBuffer::new(vec![0i32, 2, 3].into());
+        let item = Arc::new(Field::new("item", fsl.data_type().clone(), true));
+        let list = ListArray::new(item, offsets, Arc::new(fsl), None);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                ROW_ID_FIELD.clone(),
+                Field::new("vector", list.data_type().clone(), true),
+                Field::new("meta", DataType::Int32, true),
+                Field::new(PART_ID_COLUMN, DataType::UInt32, true),
+                Field::new(CENTROID_DIST_COLUMN, DataType::Float32, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![10u64, 20])),
+                Arc::new(list),
+                Arc::new(Int32Array::from(vec![100, 200])),
+                Arc::new(U32::from(vec![7u32, 9])),
+                Arc::new(Float32Array::from(vec![0.5f32, 0.25])),
+            ],
+        )
+        .unwrap();
+
+        let out = Flatten::new("vector").transform(&batch).unwrap();
+
+        assert_eq!(out.num_rows(), 3);
+        assert!(
+            out.column_by_name(PART_ID_COLUMN).is_none(),
+            "a row's partition assignment must not survive the multivector expansion, or \
+             PartitionTransformer early-returns and every sub-vector shares one partition"
+        );
+        assert!(
+            out.column_by_name(CENTROID_DIST_COLUMN).is_none(),
+            "the row's centroid distance is likewise meaningless per sub-vector"
+        );
+        // ...while genuine covering columns are still replicated.
+        assert_eq!(
+            out.column_by_name("meta")
+                .expect("covering column must survive")
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[100, 100, 200]
+        );
+    }
 
     #[tokio::test]
     async fn test_normalize_transformer_f32() {

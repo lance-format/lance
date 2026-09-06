@@ -276,6 +276,10 @@ pub struct VectorIndexParams {
     /// Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters").
     /// Populated by the build path and merged into VectorIndexDetails at creation time.
     pub runtime_hints: HashMap<String, String>,
+
+    /// Columns to co-locate ("include") in the index storage alongside the row id
+    /// and the quantization code. Empty by default.
+    pub covering_columns: Vec<String>,
 }
 
 impl VectorIndexParams {
@@ -289,6 +293,12 @@ impl VectorIndexParams {
         self
     }
 
+    /// Set the columns to co-locate ("include") in the index storage.
+    pub fn covering_columns(&mut self, columns: Vec<String>) -> &mut Self {
+        self.covering_columns = columns;
+        self
+    }
+
     pub fn ivf_flat(num_partitions: usize, metric_type: MetricType) -> Self {
         let ivf_params = IvfBuildParams::new(num_partitions);
         let stages = vec![StageParams::Ivf(ivf_params)];
@@ -298,6 +308,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            covering_columns: Vec::new(),
         }
     }
 
@@ -309,6 +320,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            covering_columns: Vec::new(),
         }
     }
 
@@ -344,6 +356,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            covering_columns: Vec::new(),
         }
     }
 
@@ -371,6 +384,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            covering_columns: Vec::new(),
         }
     }
 
@@ -387,6 +401,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            covering_columns: Vec::new(),
         }
     }
 
@@ -402,6 +417,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            covering_columns: Vec::new(),
         }
     }
 
@@ -417,6 +433,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            covering_columns: Vec::new(),
         }
     }
 
@@ -432,6 +449,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            covering_columns: Vec::new(),
         }
     }
 
@@ -454,6 +472,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            covering_columns: Vec::new(),
         }
     }
 
@@ -476,6 +495,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            covering_columns: Vec::new(),
         }
     }
 
@@ -612,6 +632,18 @@ pub(crate) async fn build_distributed_vector_index(
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<(Uuid, Vec<IndexFile>)> {
+    // The distributed shard builders and the distributed merger have no covering-column
+    // plumbing: each shard would write storage without the payload while the committed
+    // metadata still advertises `covering_fields`, desyncing the two. Reject covering on
+    // this path up front rather than publishing an inconsistent index.
+    if !params.covering_columns.is_empty() {
+        return Err(Error::invalid_input(
+            "covering_columns (covering columns) are not supported for distributed vector index \
+             builds (precomputed IVF centroids with a fragment subset). Build the covered index \
+             without a fragment restriction / precomputed IVF."
+                .to_string(),
+        ));
+    }
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
         dataset,
         column,
@@ -1025,6 +1057,87 @@ async fn build_vector_index_impl(
     .await?;
     let stages = &params.stages;
 
+    // Covering ("included") columns require the V3 index file format: only the V3
+    // covering-aware storages preserve the extra columns row-aligned and report them via
+    // `covering_field_indices`. Every vector index type supports covering at V3, so reject
+    // only legacy/non-V3 builds up front -- otherwise the build silently ignores the option
+    // while `covering_fields` still lands in the index metadata, and the search exec then
+    // declares a covered schema the storage cannot emit.
+    if !params.covering_columns.is_empty() && !matches!(params.version, IndexFileVersion::V3) {
+        return Err(Error::invalid_input(format!(
+            "covering_columns (covering columns) requires index file version V3, but got {:?}",
+            params.version
+        )));
+    }
+
+    // A covering column is stored inline in the index, row-aligned with the code, and
+    // projected by name from the source batch. Reject columns that cannot satisfy that
+    // contract up front (otherwise the build fails deep in projection, or -- worse --
+    // stores unusable data): nested/dotted paths (the covering gather projects only
+    // top-level names) and blob columns (which store out-of-line descriptors, not inline
+    // data).
+    // Names that collide with a build pipeline's own internal columns. Covering one would
+    // advertise a column in `covering_fields` that the storage's `covering_field_indices`
+    // excludes (so a covered query declares a column storage never emits), or fail deep in
+    // the quantizer transform. This check runs before the `match index_type` below, so it
+    // must list the *union* of every pipeline's internal names -- the row id, distance,
+    // partition id, each quantizer's code column, RaBitQ's extended-code and per-row factor
+    // columns, and the IVF partition transform's transient `__centroid_dist`.
+    const RESERVED_STORAGE_COLUMNS: &[&str] = &[
+        lance_core::ROW_ID,
+        lance_index::vector::DIST_COL,
+        lance_index::vector::PART_ID_COLUMN,
+        lance_index::vector::CENTROID_DIST_COLUMN,
+        lance_index::vector::PQ_CODE_COLUMN,
+        lance_index::vector::SQ_CODE_COLUMN,
+        lance_index::vector::flat::storage::FLAT_COLUMN,
+        lance_index::vector::bq::storage::RABIT_CODE_COLUMN,
+        lance_index::vector::bq::storage::RABIT_EX_CODE_COLUMN,
+        lance_index::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN,
+        lance_index::vector::bq::transform::ADD_FACTORS_COLUMN,
+        lance_index::vector::bq::transform::SCALE_FACTORS_COLUMN,
+        lance_index::vector::bq::transform::ERROR_FACTORS_COLUMN,
+        lance_index::vector::bq::transform::EX_ADD_FACTORS_COLUMN,
+        lance_index::vector::bq::transform::EX_SCALE_FACTORS_COLUMN,
+    ];
+    let mut seen_include = std::collections::HashSet::with_capacity(params.covering_columns.len());
+    for name in &params.covering_columns {
+        if name.contains('.') {
+            return Err(Error::invalid_input(format!(
+                "covering_columns: nested/dotted covering column '{name}' is not supported; only \
+                 top-level columns can be covered"
+            )));
+        }
+        if name == column {
+            return Err(Error::invalid_input(format!(
+                "covering_columns: covering column '{name}' is the indexed vector column itself; it \
+                 is stored as the quantization code, not a covered payload"
+            )));
+        }
+        if RESERVED_STORAGE_COLUMNS.contains(&name.as_str()) {
+            return Err(Error::invalid_input(format!(
+                "covering_columns: covering column '{name}' collides with a reserved index storage \
+                 column name"
+            )));
+        }
+        if !seen_include.insert(name.as_str()) {
+            return Err(Error::invalid_input(format!(
+                "covering_columns: duplicate covering column '{name}'"
+            )));
+        }
+        let field = dataset.schema().field(name).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "covering_columns: covering column '{name}' does not exist in the dataset schema"
+            ))
+        })?;
+        if field.is_blob() {
+            return Err(Error::invalid_input(format!(
+                "covering_columns: covering column '{name}' is a blob column; blob columns cannot be \
+                 covered by a vector index"
+            )));
+        }
+    }
+
     match index_type {
         IndexType::IvfFlat => match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
@@ -1039,6 +1152,7 @@ async fn build_vector_index_impl(
                     (),
                     frag_reuse_index,
                 )?
+                .with_covering_columns(params.covering_columns.clone())
                 .with_optional_fragment_filter(fragment_ids)
                 .with_progress(progress.clone())
                 .build()
@@ -1057,6 +1171,7 @@ async fn build_vector_index_impl(
                     (),
                     frag_reuse_index,
                 )?
+                .with_covering_columns(params.covering_columns.clone())
                 .with_optional_fragment_filter(fragment_ids)
                 .with_progress(progress.clone())
                 .build()
@@ -1112,6 +1227,7 @@ async fn build_vector_index_impl(
                     )?;
 
                     let summary = builder
+                        .with_covering_columns(params.covering_columns.clone())
                         .with_transpose(!params.skip_transpose)
                         .with_optional_fragment_filter(fragment_ids)
                         .with_progress(progress.clone())
@@ -1140,6 +1256,7 @@ async fn build_vector_index_impl(
                 (),
                 frag_reuse_index,
             )?
+            .with_covering_columns(params.covering_columns.clone())
             .with_optional_fragment_filter(fragment_ids)
             .with_progress(progress.clone())
             .build()
@@ -1167,6 +1284,7 @@ async fn build_vector_index_impl(
             )?;
 
             let summary = builder
+                .with_covering_columns(params.covering_columns.clone())
                 .with_transpose(!params.skip_transpose)
                 .with_optional_fragment_filter(fragment_ids)
                 .with_progress(progress.clone())
@@ -1194,6 +1312,7 @@ async fn build_vector_index_impl(
                         hnsw_params.clone(),
                         frag_reuse_index,
                     )?
+                    .with_covering_columns(params.covering_columns.clone())
                     .with_optional_fragment_filter(fragment_ids)
                     .with_progress(progress.clone())
                     .build()
@@ -1212,6 +1331,7 @@ async fn build_vector_index_impl(
                         hnsw_params.clone(),
                         frag_reuse_index,
                     )?
+                    .with_covering_columns(params.covering_columns.clone())
                     .with_optional_fragment_filter(fragment_ids)
                     .with_progress(progress.clone())
                     .build()
@@ -1244,6 +1364,7 @@ async fn build_vector_index_impl(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_covering_columns(params.covering_columns.clone())
             .with_optional_fragment_filter(fragment_ids)
             .with_progress(progress.clone())
             .build()
@@ -1274,6 +1395,7 @@ async fn build_vector_index_impl(
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
+            .with_covering_columns(params.covering_columns.clone())
             .with_optional_fragment_filter(fragment_ids)
             .with_progress(progress.clone())
             .build()
@@ -1355,6 +1477,11 @@ pub(crate) async fn build_vector_index_incremental(
     // Determine the index type and build incrementally
     let (sub_index_type, quantization_type) = existing_index.sub_index_type();
 
+    // Every vector index type supports covering ("included") columns, so the
+    // incremental/copy path needs no per-type gate here -- each branch below threads
+    // `covering_columns` into its builder, and the source index was already built with a
+    // covering-aware storage.
+
     match (sub_index_type, quantization_type) {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
@@ -1370,6 +1497,7 @@ pub(crate) async fn build_vector_index_incremental(
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
+            .with_covering_columns(params.covering_columns.clone())
             .with_progress(progress.clone())
             .build()
             .await?;
@@ -1388,6 +1516,7 @@ pub(crate) async fn build_vector_index_incremental(
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
+            .with_covering_columns(params.covering_columns.clone())
             .with_progress(progress.clone())
             .build()
             .await?;
@@ -1409,6 +1538,7 @@ pub(crate) async fn build_vector_index_incremental(
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
+                .with_covering_columns(params.covering_columns.clone())
                 .with_progress(progress.clone())
                 .build()
                 .await?;
@@ -1428,6 +1558,7 @@ pub(crate) async fn build_vector_index_incremental(
             )?
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
+            .with_covering_columns(params.covering_columns.clone())
             .with_progress(progress.clone())
             .build()
             .await?;
@@ -1448,6 +1579,7 @@ pub(crate) async fn build_vector_index_incremental(
             let summary = builder
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
+                .with_covering_columns(params.covering_columns.clone())
                 .with_transpose(!params.skip_transpose)
                 .with_progress(progress.clone())
                 .build()
@@ -1477,6 +1609,7 @@ pub(crate) async fn build_vector_index_incremental(
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
+                    .with_covering_columns(params.covering_columns.clone())
                     .with_progress(progress.clone())
                     .build()
                     .await?;
@@ -1495,6 +1628,7 @@ pub(crate) async fn build_vector_index_incremental(
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
+                    .with_covering_columns(params.covering_columns.clone())
                     .with_progress(progress.clone())
                     .build()
                     .await?;
@@ -1513,6 +1647,7 @@ pub(crate) async fn build_vector_index_incremental(
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
+                    .with_covering_columns(params.covering_columns.clone())
                     .with_progress(progress.clone())
                     .build()
                     .await?;
@@ -1531,6 +1666,7 @@ pub(crate) async fn build_vector_index_incremental(
                     )?
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
+                    .with_covering_columns(params.covering_columns.clone())
                     .with_progress(progress.clone())
                     .build()
                     .await?;
@@ -1864,7 +2000,7 @@ pub async fn initialize_vector_index(
     let (sub_index_type, quantization_type) = source_vector_index.sub_index_type();
     let ivf_params = derive_ivf_params(ivf_model);
 
-    let params = match (sub_index_type, quantization_type) {
+    let mut params = match (sub_index_type, quantization_type) {
         (SubIndexType::Flat, QuantizationType::Flat)
         | (SubIndexType::Flat, QuantizationType::FlatBin) => {
             VectorIndexParams::with_ivf_flat_params(metric_type, ivf_params)
@@ -1919,6 +2055,27 @@ pub async fn initialize_vector_index(
         }
     };
 
+    // Carry the source index's covering ("included") columns so the rebuilt
+    // target storage keeps them. covering_fields are field ids in the source;
+    // resolve to names (the same columns must exist in the target dataset).
+    let covering_columns: Vec<String> = source_index
+        .covering_fields
+        .iter()
+        .map(|id| {
+            source_dataset
+                .schema()
+                .field_by_id(*id)
+                .map(|f| f.name.clone())
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "covering field id {id} (from index '{}') not found in source dataset schema",
+                        source_index.name
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    params.covering_columns(covering_columns);
+
     let new_uuid = Uuid::new_v4();
     let frag_reuse_index = target_dataset
         .open_frag_reuse_index(&NoOpMetricsCollector)
@@ -1944,11 +2101,35 @@ pub async fn initialize_vector_index(
 
     let fragment_bitmap = Some(target_dataset.fragment_bitmap.as_ref().clone());
 
+    // Field ids are per-dataset: re-resolve the covering column names against
+    // the TARGET schema (like `fields` below), never copy the source's ids.
+    let covering_fields = params
+        .covering_columns
+        .iter()
+        .map(|name| {
+            target_dataset
+                .schema()
+                .field(name)
+                .map(|f| f.id)
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "covering column '{}' not found in target dataset schema",
+                        name
+                    ))
+                })
+        })
+        .collect::<Result<Vec<i32>>>()?;
+    // `covering_fields` must be the trailing entries of `fields` (see
+    // `IndexMetadata::validate_covering_fields`), so the keyed field comes first
+    // and the covering fields are appended, not tracked separately.
+    let mut fields = vec![field.id];
+    fields.extend_from_slice(&covering_fields);
+
     let new_idx = IndexMetadata {
         uuid: new_uuid,
         name: source_index.name.clone(),
-        fields: vec![field.id],
-        covering_fields: vec![],
+        fields,
+        covering_fields,
         dataset_version: target_dataset.manifest.version,
         fragment_bitmap,
         index_details: source_index.index_details.clone(),
@@ -2189,7 +2370,8 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use arrow_array::Array;
     use arrow_array::RecordBatch;
-    use arrow_array::types::{Float32Type, Int32Type};
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array};
@@ -2525,6 +2707,301 @@ mod tests {
         assert_eq!(results.num_rows(), 10, "Should return 10 nearest neighbors");
     }
 
+    /// `covering_columns` requires the V3 index file format. A legacy/non-V3 build must be
+    /// rejected at create time: the build would silently ignore the option while
+    /// `create_index` still records `covering_fields` in the manifest, so the exec would
+    /// declare a covered schema the storage cannot emit and every query on the index would
+    /// fail. This restriction is about the file format, not the index type -- it applies
+    /// even though covering now works for every IVF vector index type (see
+    /// `test_covering_columns_supported_for_all_ivf_index_types` below).
+    #[tokio::test]
+    async fn test_covering_columns_rejected_for_legacy_index_file_version() {
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        let mut params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::new(8, 8),
+        )
+        .version(IndexFileVersion::Legacy)
+        .clone();
+        params.covering_columns(vec!["id".to_string()]);
+        let err = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .expect_err("covering_columns on a legacy/non-V3 IVF_PQ build must be rejected");
+        assert!(
+            err.to_string().contains("covering_columns"),
+            "error should mention covering_columns, got: {err}"
+        );
+        // Fail fast: no index metadata must have been committed.
+        assert!(
+            dataset.load_indices().await.unwrap().is_empty(),
+            "no index should have been created"
+        );
+    }
+
+    /// Covering ("included") columns now work on every IVF vector index type, not just
+    /// IVF_PQ: each storage format declares which of its own columns are internal (see
+    /// `VectorStore::covering_field_indices`), so the creation-time restriction that used to
+    /// reject non-PQ types here (`"covering_columns ... only supported for IVF_PQ"`) is gone.
+    ///
+    /// This is the per-type coverage of the *creation* path: `create_index` succeeds and the
+    /// committed `IndexMetadata.covering_fields` records exactly the requested column. The
+    /// read-path proof (search reads the covering column back from the index, no base-table
+    /// take) is covered per-type by `ivf::v2::tests::test_covered_projection_skips_take`.
+    #[rstest::rstest]
+    #[case::ivf_pq(VectorIndexParams::ivf_pq(4, 8, 4, MetricType::L2, 2))]
+    #[case::ivf_sq(VectorIndexParams::with_ivf_sq_params(
+        MetricType::L2,
+        IvfBuildParams::new(4),
+        SQBuildParams::default(),
+    ))]
+    #[case::ivf_hnsw_pq(VectorIndexParams::with_ivf_hnsw_pq_params(
+        MetricType::L2,
+        IvfBuildParams::new(4),
+        HnswBuildParams::default(),
+        PQBuildParams::new(8, 8),
+    ))]
+    #[case::ivf_hnsw_sq(VectorIndexParams::with_ivf_hnsw_sq_params(
+        MetricType::L2,
+        IvfBuildParams::new(4),
+        HnswBuildParams::default(),
+        SQBuildParams::default(),
+    ))]
+    #[case::ivf_rq(VectorIndexParams::with_ivf_rq_params(
+        MetricType::L2,
+        IvfBuildParams::new(4),
+        RQBuildParams::with_rotation_type(1, RQRotationType::Fast),
+    ))]
+    #[case::ivf_flat(VectorIndexParams::ivf_flat(4, MetricType::L2))]
+    #[case::ivf_hnsw_flat(VectorIndexParams::ivf_hnsw(
+        MetricType::L2,
+        IvfBuildParams::new(4),
+        HnswBuildParams::default(),
+    ))]
+    #[tokio::test]
+    async fn test_covering_columns_supported_for_all_ivf_index_types(
+        #[case] mut params: VectorIndexParams,
+    ) {
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        params.covering_columns(vec!["id".to_string()]);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            indices.len(),
+            1,
+            "exactly one index should have been created"
+        );
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+        assert_eq!(
+            indices[0].covering_fields,
+            vec![id_field_id],
+            "covering_fields must record exactly the requested covering column"
+        );
+
+        // The metadata above is derived purely from the request (`create.rs`) and
+        // never consults the built storage, so it stays correct even if
+        // `with_covering_columns` were neutralized into a no-op. Force a read that
+        // only the storage can satisfy: a covered projection must be answered
+        // without a base-table take, and the returned values must be the row's
+        // true covering value (not garbage/misaligned) -- proof the storage
+        // actually carries the column, not just the metadata.
+        let q = arrow_array::Float32Array::from(vec![0.0f32; 32]);
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &q, 10).unwrap();
+        scan.nprobes(4);
+        scan.with_row_id();
+        scan.project(&["id"]).unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(
+            !plan.contains("LanceRead"),
+            "covered projection ['id'] should be answered from the index storage, \
+             not a base-table take; plan:\n{plan}"
+        );
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .expect("covered 'id' column must be emitted by the storage")
+            .as_primitive::<Int32Type>();
+        let row_ids = batch
+            .column_by_name(lance_core::ROW_ID)
+            .expect("row id column")
+            .as_primitive::<UInt64Type>();
+        assert_eq!(ids.len(), 10, "should return k=10 rows");
+        // Single-fragment, step-id dataset => id == row offset == _rowid, so a
+        // correctly covered id equals the row id for every returned row.
+        for i in 0..ids.len() {
+            assert_eq!(
+                ids.value(i) as u64,
+                row_ids.value(i),
+                "covered id must be the row's true value, not a no-op/garbage storage column"
+            );
+        }
+    }
+
+    /// Copying/importing a covered index into another dataset (initialize) must
+    /// rebuild the target storage WITH the covering columns, not just copy the
+    /// `covering_fields` metadata -- otherwise the target advertises covering
+    /// columns its storage can't emit and covered queries fail.
+    ///
+    /// Covering works on every IVF vector index type (see
+    /// `test_covering_columns_supported_for_all_ivf_index_types`), and
+    /// `initialize_vector_index`/`build_vector_index_incremental` thread
+    /// `covering_columns` through every `(SubIndexType, QuantizationType)` branch with no
+    /// per-type gate, so this parametrizes over all of them the same way.
+    #[rstest::rstest]
+    #[case::pq(VectorIndexParams::ivf_pq(10, 8, 16, MetricType::L2, 50))]
+    #[case::sq(VectorIndexParams::with_ivf_sq_params(
+        MetricType::L2,
+        IvfBuildParams::new(10),
+        SQBuildParams::default(),
+    ))]
+    #[case::rq(VectorIndexParams::with_ivf_rq_params(
+        MetricType::L2,
+        IvfBuildParams::new(10),
+        RQBuildParams::with_rotation_type(1, RQRotationType::Fast),
+    ))]
+    #[case::flat(VectorIndexParams::ivf_flat(10, MetricType::L2))]
+    #[case::hnsw_flat(VectorIndexParams::ivf_hnsw(
+        MetricType::L2,
+        IvfBuildParams::new(10),
+        HnswBuildParams::default(),
+    ))]
+    #[case::hnsw_pq(VectorIndexParams::with_ivf_hnsw_pq_params(
+        MetricType::L2,
+        IvfBuildParams::new(10),
+        HnswBuildParams::default(),
+        PQBuildParams::new(8, 8),
+    ))]
+    #[case::hnsw_sq(VectorIndexParams::with_ivf_hnsw_sq_params(
+        MetricType::L2,
+        IvfBuildParams::new(10),
+        HnswBuildParams::default(),
+        SQBuildParams::default(),
+    ))]
+    #[tokio::test]
+    async fn test_initialize_vector_index_preserves_covering(
+        #[case] mut params: VectorIndexParams,
+    ) {
+        let test_dir = TempStrDir::default();
+        let source_uri = format!("{}/source", test_dir.as_str());
+        let target_uri = format!("{}/target", test_dir.as_str());
+
+        let source_reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
+            .await
+            .unwrap();
+
+        // Covered index on source (covers `id`).
+        params.covering_columns(vec!["id".to_string()]);
+        source_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vidx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let source_dataset = Dataset::open(&source_uri).await.unwrap();
+        let source_index = source_dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|i| i.name == "vidx")
+            .unwrap()
+            .clone();
+
+        // The target has an extra leading column, so its field ids are shifted
+        // relative to the source's: `covering_fields` must be re-resolved
+        // against the TARGET schema (by name), not copied from the source.
+        let target_reader = lance_datagen::gen_batch()
+            .col("pad", array::step::<Int32Type>())
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut target_dataset = Dataset::write(target_reader, &target_uri, None)
+            .await
+            .unwrap();
+
+        initialize_vector_index(
+            &mut target_dataset,
+            &source_dataset,
+            &source_index,
+            &["vector"],
+        )
+        .await
+        .unwrap();
+
+        // Metadata carried over, resolved to the target's field ids.
+        let target_index = target_dataset.load_indices().await.unwrap()[0].clone();
+        let id_field = target_dataset.schema().field("id").unwrap().id;
+        assert_ne!(
+            id_field, source_index.covering_fields[0],
+            "test setup must give 'id' different field ids in source and target"
+        );
+        assert_eq!(target_index.covering_fields, vec![id_field]);
+
+        // End-to-end: a covered projection on the copied index skips the take and
+        // returns `id` -- which only works if the rebuilt storage carries it.
+        let query = arrow_array::Float32Array::from(vec![0.5f32; 32]);
+        let mut scan = target_dataset.scan();
+        scan.nearest("vector", &query, 10).unwrap();
+        scan.with_row_id();
+        scan.project(&["id"]).unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(
+            !plan.contains("LanceRead"),
+            "covered projection should skip the take on the copied index; plan:\n{plan}"
+        );
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .expect("copied index should emit the covering column 'id'")
+            .as_primitive::<Int32Type>();
+        let row_ids = batch
+            .column_by_name(lance_core::ROW_ID)
+            .expect("row id column")
+            .as_primitive::<UInt64Type>();
+        // Single-fragment, step-id target dataset => id == row offset == _rowid, so
+        // a correctly-rebuilt covering column matches the row's true value (not a
+        // stale copy of the source's storage, and not garbage from a schema
+        // mismatch during the rebuild).
+        for i in 0..ids.len() {
+            assert_eq!(
+                ids.value(i) as u64,
+                row_ids.value(i),
+                "copied index's covered id must be the row's true value, row {i}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_initialize_vector_index_ivf_flat() {
         let test_dir = TempStrDir::default();
@@ -2773,6 +3250,47 @@ mod tests {
             result.is_ok(),
             "Expected Ok for invalid fragment ids, got {:?}",
             result
+        );
+    }
+
+    /// The distributed build + merge path has no covering-column plumbing, so it must
+    /// reject `covering_columns` up front rather than publish an index whose metadata
+    /// advertises columns the shard files do not contain.
+    #[tokio::test]
+    async fn test_build_distributed_rejects_covering_columns() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(32.into()))
+            .into_reader_rows(RowCount::from(128), BatchCount::from(1));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let mut params = VectorIndexParams::ivf_flat(4, MetricType::L2);
+        params.covering_columns(vec!["id".to_string()]);
+
+        let result = build_distributed_vector_index(
+            &dataset,
+            "vector",
+            "vector_dist",
+            Uuid::new_v4(),
+            &params,
+            None,
+            &[0],
+            noop_progress(),
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(Error::InvalidInput { .. })),
+            "distributed build must reject covering_columns, got {:?}",
+            result
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("covering_columns") && msg.contains("distributed"),
+            "error should mention covering_columns and the distributed path; got: {msg}"
         );
     }
 

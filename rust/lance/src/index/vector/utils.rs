@@ -23,6 +23,52 @@ use tokio::sync::Mutex;
 
 use crate::dataset::{Dataset, ProjectionRequest, TakeBuilder, row_offsets_to_row_addresses};
 use crate::{Error, Result};
+use lance_core::ROW_ID;
+
+/// Row-align the non-`_rowid` columns of `source` (a `[_rowid, <cols...>]` batch)
+/// to `target_rowids`, gathered by row id. Every target row id must be present in
+/// `source`; a miss returns an error, because silently gathering an unrelated
+/// row's values would corrupt the covered result. Returns the taken columns paired
+/// with their fields, in `source` column order, with `_rowid` excluded.
+///
+/// Shared by the covered-search read path (regrouping heap winners into
+/// `[_distance, _rowid, <included...>]`) and the reassignment build path
+/// (re-attaching covering columns to rows regrouped by the partition join).
+pub(super) fn gather_covering_columns_by_row_id(
+    source: &RecordBatch,
+    target_rowids: &arrow_array::UInt64Array,
+) -> Result<Vec<(arrow_schema::FieldRef, ArrayRef)>> {
+    let src_rowids = source
+        .column_by_name(ROW_ID)
+        .ok_or_else(|| Error::internal("covering source missing row id".to_string()))?
+        .as_primitive::<arrow_array::types::UInt64Type>();
+    let mut pos: std::collections::HashMap<u64, u32> =
+        std::collections::HashMap::with_capacity(src_rowids.len());
+    for (i, rid) in src_rowids.values().iter().enumerate() {
+        pos.insert(*rid, i as u32);
+    }
+    let take_idx: arrow_array::UInt32Array = target_rowids
+        .values()
+        .iter()
+        .map(|rid| {
+            pos.get(rid).copied().ok_or_else(|| {
+                Error::internal(format!(
+                    "row id {rid} missing from covering source during row-id gather"
+                ))
+            })
+        })
+        .collect::<Result<Vec<u32>>>()?
+        .into();
+    let mut out = Vec::with_capacity(source.num_columns().saturating_sub(1));
+    for (i, field) in source.schema().fields().iter().enumerate() {
+        if field.name() == ROW_ID {
+            continue;
+        }
+        let taken = arrow::compute::take(source.column(i), &take_idx, None)?;
+        out.push((field.clone(), taken));
+    }
+    Ok(out)
+}
 
 /// Helper function to extract a column from a RecordBatch, supporting nested field paths.
 ///

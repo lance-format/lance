@@ -10,7 +10,7 @@ use crate::{
     dataset::transaction::{DataOverlayGroup, Operation, Transaction, UpdateMode},
 };
 use futures::{StreamExt, TryStreamExt};
-use lance_core::{Error, Result, utils::deletion::DeletionVector};
+use lance_core::{Error, Result, datatypes::Schema, utils::deletion::DeletionVector};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -37,6 +37,57 @@ pub struct TransactionRebase<'a> {
     /// Compacted SSTables from conflicting UpdateMemWalState transactions.
     /// Used when rebasing CreateIndex of MemWalIndex.
     conflicting_mem_wal_compacted_sstables: Vec<CompactedSsTable>,
+    /// The dataset schema at the read version, used to expand a covering index's
+    /// covered (included) struct fields to their leaf subtrees when checking whether a
+    /// concurrent transaction touches covered data.
+    schema: Arc<Schema>,
+    /// Read-version snapshot of which data file backs each covered (included) leaf
+    /// field, per fragment: `fragment id -> field id -> path`. Empty unless this
+    /// transaction creates an index that declares covering columns.
+    ///
+    /// This is what lets `check_create_index_txn` tell a concurrent `Merge` that
+    /// rewrote covered data *in place* from one that merely added a column. The
+    /// post-merge fragments alone cannot answer that: a rewrite tombstones the
+    /// superseded field with a single sentinel that does not name it.
+    covered_field_paths: Arc<HashMap<u64, HashMap<i32, String>>>,
+}
+
+/// Snapshot the data file backing each covered leaf field of `new_indices`, as of
+/// `dataset`'s version. Covered struct fields are expanded to their whole subtree
+/// because a rewritten data file lists leaf ids while `covering_fields` records only
+/// the parent id. Fragments with no covered field are omitted.
+fn covered_field_paths_at(
+    dataset: &Dataset,
+    new_indices: &[IndexMetadata],
+    schema: &Schema,
+) -> HashMap<u64, HashMap<i32, String>> {
+    let mut covered: HashSet<i32> = HashSet::new();
+    for index in new_indices {
+        for &id in index.covering_fields.iter() {
+            match schema.field_by_id(id) {
+                Some(field) => crate::index::collect_subtree_field_ids(field, &mut covered),
+                None => {
+                    covered.insert(id);
+                }
+            }
+        }
+    }
+    if covered.is_empty() {
+        return HashMap::new();
+    }
+    dataset
+        .manifest
+        .fragments
+        .iter()
+        .filter_map(|fragment| {
+            let paths: HashMap<i32, String> = Transaction::fragment_field_paths(fragment)
+                .into_iter()
+                .filter(|(field_id, _)| covered.contains(field_id))
+                .map(|(field_id, path)| (field_id, path.to_string()))
+                .collect();
+            (!paths.is_empty()).then_some((fragment.id, paths))
+        })
+        .collect()
 }
 
 /// Whether `operation` may make a nullability-affecting schema change: a
@@ -99,6 +150,55 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
+        // Capture the schema AS OF THE TRANSACTION'S READ VERSION, matching what
+        // `initial_fragments_for_rebase` does for fragments. The dataset handed to us is not
+        // necessarily at that version: the URI commit path deliberately loads the *latest*
+        // version ("we are writing to the main history, and need to check out the latest
+        // version") for any non-detached read version. The covering checks below use this as
+        // the *pre-commit* side when asking whether a concurrent operation changed a covered
+        // field's subtree, so capturing the latest schema would compare a post-change schema
+        // against itself -- silently missing a covered-field rename or retype and committing
+        // index storage under a schema it was never built against.
+        //
+        // Only `check_create_index_txn` and `check_data_replacement_txn` consult this, so
+        // only they pay for the extra checkout; every other operation gets the in-hand schema
+        // and never reads it. If a new check starts using `self.schema`, add its operation
+        // here or it will silently see the wrong version.
+        //
+        // CreateIndex is narrowed further to indices that actually declare covering columns:
+        // comparing a covered subtree across versions is the only thing that can observe the
+        // difference, so an ordinary index build keeps the pre-covering behaviour (in-hand
+        // schema, no extra round trip) instead of paying for a manifest load on every commit
+        // retry. DataReplacement cannot be narrowed the same way -- the covering it has to
+        // respect belongs to a *concurrent* transaction's indices, which are not known until
+        // the check runs.
+        //
+        // `read_version == 0` is the "no prior version" sentinel (overwrite/create): there is
+        // nothing to check out, and attempting it fails with DatasetNotFound.
+        let needs_read_version_schema = match &transaction.operation {
+            Operation::CreateIndex { new_indices, .. } => new_indices
+                .iter()
+                .any(|idx| !idx.covering_fields.is_empty()),
+            Operation::DataReplacement { .. } => true,
+            _ => false,
+        };
+        let checked_out;
+        let at_read_version = if !needs_read_version_schema
+            || transaction.read_version == 0
+            || dataset.manifest.version == transaction.read_version
+        {
+            dataset
+        } else {
+            checked_out = dataset.checkout_version(transaction.read_version).await?;
+            &checked_out
+        };
+        let schema = Arc::new(at_read_version.schema().clone());
+        let covered_field_paths = Arc::new(match &transaction.operation {
+            Operation::CreateIndex { new_indices, .. } if needs_read_version_schema => {
+                covered_field_paths_at(at_read_version, new_indices, &schema)
+            }
+            _ => HashMap::new(),
+        });
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
@@ -117,6 +217,8 @@ impl<'a> TransactionRebase<'a> {
                 modified_fragment_ids: HashSet::new(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                schema: schema.clone(),
+                covered_field_paths: covered_field_paths.clone(),
             }),
             Operation::Delete {
                 updated_fragments,
@@ -145,6 +247,8 @@ impl<'a> TransactionRebase<'a> {
                         affected_rows: None,
                         conflicting_frag_reuse_indices: Vec::new(),
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
+                        schema: schema.clone(),
+                        covered_field_paths: covered_field_paths.clone(),
                     });
                 }
 
@@ -158,6 +262,8 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    schema: schema.clone(),
+                    covered_field_paths: covered_field_paths.clone(),
                 })
             }
             Operation::Rewrite { groups, .. } => {
@@ -176,6 +282,8 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    schema: schema.clone(),
+                    covered_field_paths: covered_field_paths.clone(),
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -191,6 +299,8 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    schema: schema.clone(),
+                    covered_field_paths: covered_field_paths.clone(),
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -206,6 +316,8 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    schema: schema.clone(),
+                    covered_field_paths: covered_field_paths.clone(),
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -220,6 +332,8 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
+                    schema: schema.clone(),
+                    covered_field_paths: covered_field_paths.clone(),
                 })
             }
         }
@@ -695,6 +809,10 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
+        // Captured before the mutable borrow below so the covered-field checks can expand
+        // covered struct fields to their leaf subtree (an Arc clone is cheap).
+        let schema = self.schema.clone();
+        let covered_field_paths = self.covered_field_paths.clone();
         if let Operation::CreateIndex {
             new_indices,
             removed_indices,
@@ -791,25 +909,89 @@ impl<'a> TransactionRebase<'a> {
                     fields_modified,
                     ..
                 } => {
+                    // Expand covered struct fields to their leaf subtree so a concurrent
+                    // update of a covered struct's child still invalidates the fragment's
+                    // coverage (the schema is captured at the read version above).
                     Transaction::prune_updated_fields_from_indices(
                         new_indices,
                         updated_fragments,
                         fields_modified,
+                        schema.as_ref(),
                     );
                     Ok(())
                 }
-                // Merge, reserve, and project don't change row ids. The MemWAL
-                // index is the exception: its install validates schema-dependent
-                // state, which a concurrent schema change invalidates.
-                Operation::Merge { .. } => {
-                    if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
+                // Reserve and project don't change row ids. Merge is usually fine too,
+                // but two independent conditions make it unsafe here, and neither
+                // subsumes the other:
+                //
+                //  (a) the MemWAL index's install validates schema-dependent state, which
+                //      a concurrent schema change invalidates.
+                //
+                //  (b) it can rewrite a covered column's data file *in place*, or change a
+                //      covered field's *subtree* (notably `add_columns` growing a covered
+                //      struct with an AllNulls child, which writes NO data file, so the
+                //      path comparison alone is blind to it). Either leaves the rebased
+                //      index serving values it was not built against.
+                //
+                // Merely adding an unrelated column trips none of these and keeps the
+                // optimistic path -- otherwise a routine `add_columns` would discard a
+                // covered index build that may have been running for hours.
+                Operation::Merge {
+                    fragments,
+                    schema: merged_schema,
+                    ..
+                } => {
+                    let installs_mem_wal_index =
+                        new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME);
+                    let rewrote_covered_data = fragments.iter().any(|fragment| {
+                        let Some(previous) = covered_field_paths.get(&fragment.id) else {
+                            return false;
+                        };
+                        let current = Transaction::fragment_field_paths(fragment);
+                        previous.iter().any(|(field_id, previous_path)| {
+                            current
+                                .get(field_id)
+                                .is_some_and(|current_path| *current_path != previous_path.as_str())
+                        })
+                    });
+                    let changed_covered_subtree = new_indices.iter().any(|idx| {
+                        idx.covering_fields.iter().any(|id| {
+                            Transaction::covered_field_subtree_changed(&schema, merged_schema, *id)
+                        })
+                    });
+                    if installs_mem_wal_index || rewrote_covered_data || changed_covered_subtree {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
                     }
                 }
                 Operation::ReserveFragments { .. } => Ok(()),
-                Operation::Project { .. } => Ok(()),
+                Operation::Project {
+                    schema: projected_schema,
+                    ..
+                } => {
+                    // A concurrent Project that changes a covered field's subtree in *any*
+                    // way -- drop, rename, retype, nullability, child change -- leaves the
+                    // rebased index emitting a schema the dataset no longer declares, so
+                    // force a retry and let the index rebuild against the projected schema.
+                    // A rename counts: `covered_field_subtree_changed` compares names, and
+                    // the index's covering payload carries the old one.
+                    // Non-covering indexes, and covered subtrees the Project left alone,
+                    // keep the optimistic path (row ids are unchanged either way).
+                    if new_indices.iter().any(|idx| {
+                        idx.covering_fields.iter().any(|id| {
+                            Transaction::covered_field_subtree_changed(
+                                &schema,
+                                projected_schema,
+                                *id,
+                            )
+                        })
+                    }) {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 // Should be compatible with rewrite if it didn't move the rows
                 // we indexed. If it did, we could retry.
                 // TODO: this will change with stable row ids.
@@ -887,16 +1069,19 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::UpdateConfig { .. } => Ok(()),
                 Operation::DataReplacement { replacements } => {
-                    // A data replacement only conflicts if it is updating a field the
-                    // index depends on -- whether keyed on or merely carried, since
-                    // `fields` lists both (see `IndexMetadata::covering_fields`).
-                    let newly_depended_fields = new_indices
-                        .iter()
-                        .flat_map(|idx| idx.fields.iter())
-                        .collect::<HashSet<_>>();
+                    // A data replacement conflicts if it updates a field the index
+                    // either *indexes* or *covers*: a covered field's values are
+                    // materialized in the index storage, so replacing them would
+                    // leave the rebased index serving stale values. Expand each field to
+                    // its leaf subtree, since `covering_fields` records a covered struct's
+                    // parent id while a replacement lists leaf ids.
+                    let mut relevant_fields: HashSet<i32> = HashSet::new();
+                    for idx in new_indices.iter() {
+                        relevant_fields.extend(Transaction::index_dependent_leaf_ids(idx, &schema));
+                    }
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_depended_fields.contains(&field) {
+                            if relevant_fields.contains(field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -1208,6 +1393,7 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
+        let schema = self.schema.clone();
         if let Operation::DataReplacement { replacements } = &self.transaction.operation {
             match &other_transaction.operation {
                 Operation::Append { .. }
@@ -1307,13 +1493,17 @@ impl<'a> TransactionRebase<'a> {
                     // the index's fragment bitmap, which would lead to fewer conflicts.  However
                     // this would introduce fragment bitmaps with holes which may not be well tested
                     // yet.  For now, we don't allow this case.
-                    let newly_depended_fields = new_indices
-                        .iter()
-                        .flat_map(|idx| idx.fields.iter())
-                        .collect::<HashSet<_>>();
+                    // Expand covered fields to their leaf subtree so replacing a covered
+                    // struct's subfield (a leaf id, while `covering_fields` records the
+                    // parent) is still recognized as touching the index -- matching the
+                    // reverse rebase direction in check_create_index_txn.
+                    let mut relevant_fields: HashSet<i32> = HashSet::new();
+                    for idx in new_indices.iter() {
+                        relevant_fields.extend(Transaction::index_dependent_leaf_ids(idx, &schema));
+                    }
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_depended_fields.contains(&field) {
+                            if relevant_fields.contains(field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -2368,6 +2558,14 @@ mod tests {
     };
     use lance_table::format::DataFile;
 
+    /// An empty schema for manually-constructed rebases in tests: covered-field subtree
+    /// expansion is a no-op against it (each id maps to itself), preserving the exact-id
+    /// behavior these tests assert. Tests that exercise covered structs build the rebase
+    /// via `try_new`, which captures the real dataset schema.
+    fn empty_lance_schema() -> Arc<lance_core::datatypes::Schema> {
+        Arc::new(lance_core::datatypes::Schema::default())
+    }
+
     async fn test_dataset(num_rows: usize, num_fragments: usize) -> Dataset {
         let write_params = WriteParams {
             max_rows_per_file: num_rows / num_fragments,
@@ -2727,6 +2925,279 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::DatasetNotFound { .. }));
+    }
+
+    /// A concurrent Project that drops a column an in-flight index *covers* must force
+    /// the index build to rebase (retryable conflict); a Project that preserves the
+    /// covered column stays on the optimistic path.
+    #[tokio::test]
+    async fn test_create_index_conflicts_with_project_dropping_covered_field() {
+        use roaring::RoaringBitmap;
+
+        let dataset = test_dataset(10, 2).await;
+        let a_id = dataset.schema().field("a").unwrap().id;
+        let b_id = dataset.schema().field("b").unwrap().id;
+
+        // A covering index over key "a" that also covers "b".
+        // `covering_fields` is always the trailing entries of `fields`.
+        let covering_index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "cov_idx".to_string(),
+            fields: vec![a_id, b_id],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+                value: vec![],
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            covering_fields: vec![b_id],
+        };
+        let self_txn = Transaction::new_from_version(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![covering_index],
+                removed_indices: vec![],
+            },
+        );
+
+        // Concurrent Project that drops "b" (the covered column) -> conflict.
+        let dropped_schema = dataset.schema().project(&["a"]).unwrap();
+        let drop_txn = Transaction::new_from_version(
+            2,
+            Operation::Project {
+                schema: dropped_schema,
+                preserves_nullability: true,
+            },
+        );
+        let mut rebase = TransactionRebase::try_new(&dataset, self_txn.clone(), None)
+            .await
+            .unwrap();
+        assert!(
+            rebase.check_txn(&drop_txn, 2).is_err(),
+            "dropping a covered column must conflict with an in-flight covering index build"
+        );
+
+        // A Project that preserves "b" -> no conflict.
+        let keep_txn = Transaction::new_from_version(
+            2,
+            Operation::Project {
+                schema: dataset.schema().clone(),
+                preserves_nullability: true,
+            },
+        );
+        let mut rebase = TransactionRebase::try_new(&dataset, self_txn.clone(), None)
+            .await
+            .unwrap();
+        assert!(
+            rebase.check_txn(&keep_txn, 2).is_ok(),
+            "a project that preserves the covered column must not conflict"
+        );
+
+        // A Project that renames the covered column (id stays, name changes) -> conflict:
+        // the built index still emits the old name.
+        let mut renamed_schema = dataset.schema().clone();
+        renamed_schema.field_by_id_mut(b_id).unwrap().name = "b_renamed".to_string();
+        let rename_txn = Transaction::new_from_version(
+            2,
+            Operation::Project {
+                schema: renamed_schema,
+                preserves_nullability: true,
+            },
+        );
+        let mut rebase = TransactionRebase::try_new(&dataset, self_txn, None)
+            .await
+            .unwrap();
+        assert!(
+            rebase.check_txn(&rename_txn, 2).is_err(),
+            "renaming a covered column must conflict with an in-flight covering index build"
+        );
+    }
+
+    /// A concurrent DataReplacement of a *child* of a covered struct must conflict with
+    /// an in-flight covering index build: `covering_fields` records the struct's parent
+    /// id, but the replacement lists the leaf id, so the check must expand the subtree.
+    #[tokio::test]
+    async fn test_create_index_conflicts_with_replacement_of_covered_struct_child() {
+        use arrow_schema::{
+            DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
+        };
+        use roaring::RoaringBitmap;
+
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("vec", DataType::Int32, false),
+            ArrowField::new(
+                "s",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("a", DataType::Int32, true),
+                    ArrowField::new("b", DataType::Int32, true),
+                ])),
+                true,
+            ),
+        ]);
+        let schema = lance_core::datatypes::Schema::try_from(&arrow).unwrap();
+        let vec_id = schema.field("vec").unwrap().id;
+        let s_id = schema.field("s").unwrap().id;
+        let a_id = schema.field("s.a").unwrap().id;
+
+        // Index keyed on `vec`, covering the whole struct `s`.
+        // `covering_fields` is always the trailing entries of `fields`.
+        let covering_index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "cov_idx".to_string(),
+            fields: vec![vec_id, s_id],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+                value: vec![],
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            covering_fields: vec![s_id],
+        };
+        let self_txn = Transaction::new_from_version(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![covering_index],
+                removed_indices: vec![],
+            },
+        );
+
+        // try_new needs a real dataset, so build the rebase directly with the struct schema.
+        let mut rebase = TransactionRebase {
+            transaction: self_txn,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: Arc::new(schema),
+        };
+
+        // A concurrent DataReplacement rewriting the covered struct's child `s.a`.
+        let replace_child = Transaction::new_from_version(
+            2,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new_legacy_from_fields("child.lance", vec![a_id], None),
+                )],
+            },
+        );
+        assert!(
+            rebase.check_txn(&replace_child, 2).is_err(),
+            "replacing a child of a covered struct must conflict (subtree expansion)"
+        );
+    }
+
+    /// A concurrent `add_columns` (which commits as `Operation::Merge`) that grows a
+    /// covered struct with an AllNulls child writes **no data file**, so the covered-file
+    /// path comparison cannot see it. The index would otherwise commit storage built for
+    /// the old struct type under the new schema, and every covered query on it would fail.
+    /// The Merge arm must therefore also compare the covered subtree, as the Project arm
+    /// does -- the two checks are complementary and neither subsumes the other.
+    #[tokio::test]
+    async fn test_create_index_conflicts_with_merge_growing_covered_struct() {
+        use arrow_schema::{
+            DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
+        };
+        use roaring::RoaringBitmap;
+
+        let struct_of = |children: Vec<ArrowField>| {
+            ArrowSchema::new(vec![
+                ArrowField::new("vec", DataType::Int32, false),
+                ArrowField::new("s", DataType::Struct(ArrowFields::from(children)), true),
+            ])
+        };
+        let before = lance_core::datatypes::Schema::try_from(&struct_of(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]))
+        .unwrap();
+        // The AllNulls child add keeps every existing id and gives the new leaf a fresh one.
+        let after = lance_core::datatypes::Schema::try_from(&struct_of(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let vec_id = before.field("vec").unwrap().id;
+        let s_id = before.field("s").unwrap().id;
+        assert_eq!(
+            s_id,
+            after.field("s").unwrap().id,
+            "the struct keeps its id"
+        );
+
+        // `covering_fields` is always the trailing entries of `fields`.
+        let covering_index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "cov_idx".to_string(),
+            fields: vec![vec_id, s_id],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
+                value: vec![],
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            covering_fields: vec![s_id],
+        };
+        let create = |index: IndexMetadata| {
+            Transaction::new_from_version(
+                1,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                },
+            )
+        };
+        let rebase_over = |index: IndexMetadata| TransactionRebase {
+            transaction: create(index),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+            // Empty: the conflict must come from the schema comparison alone, not from
+            // any data-file path change.
+            covered_field_paths: Default::default(),
+            schema: Arc::new(before.clone()),
+        };
+        let merge_with = |schema: lance_core::datatypes::Schema| {
+            Transaction::new_from_version(
+                1,
+                Operation::Merge {
+                    fragments: vec![],
+                    schema,
+                    preserves_nullability: true,
+                },
+            )
+        };
+
+        let mut rebase = rebase_over(covering_index.clone());
+        assert!(
+            rebase.check_txn(&merge_with(after), 2).is_err(),
+            "a Merge that grows a covered struct's subtree must conflict"
+        );
+
+        // Control: a Merge that leaves the covered subtree alone keeps the optimistic
+        // path, so an ordinary add_columns still does not discard a covered build.
+        let mut rebase = rebase_over(covering_index);
+        assert!(
+            rebase.check_txn(&merge_with(before), 2).is_ok(),
+            "a Merge that does not touch the covered subtree must not conflict"
+        );
     }
 
     async fn apply_deletion(
@@ -3522,6 +3993,8 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                covered_field_paths: Default::default(),
+                schema: empty_lance_schema(),
             };
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
@@ -3726,6 +4199,8 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                covered_field_paths: Default::default(),
+                schema: empty_lance_schema(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -3785,6 +4260,8 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                covered_field_paths: Default::default(),
+                schema: empty_lance_schema(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -3926,6 +4403,8 @@ mod tests {
                 affected_rows: affected_rows.as_ref(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                covered_field_paths: Default::default(),
+                schema: empty_lance_schema(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -3968,6 +4447,8 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                covered_field_paths: Default::default(),
+                schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
             assert_eq!(
@@ -3983,6 +4464,8 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                covered_field_paths: Default::default(),
+                schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
             assert!(
@@ -4059,6 +4542,8 @@ mod tests {
                         affected_rows: None,
                         conflicting_frag_reuse_indices: Vec::new(),
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
+                        covered_field_paths: Default::default(),
+                        schema: Arc::new(lance_core::datatypes::Schema::default()),
                     };
                     let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                     assert_eq!(
@@ -4193,6 +4678,8 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: empty_lance_schema(),
         };
         let update = Transaction::new(
             1,
@@ -4269,6 +4756,8 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                covered_field_paths: Default::default(),
+                schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let result = rebase.check_txn(&merge, 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -4290,6 +4779,8 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
         let result = rebase.check_txn(&install, 1);
         assert!(
@@ -4334,6 +4825,8 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: empty_lance_schema(),
         };
 
         let same_name = Transaction::new(
@@ -4389,6 +4882,8 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: empty_lance_schema(),
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -4599,6 +5094,8 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                covered_field_paths: Default::default(),
+                schema: empty_lance_schema(),
             };
             let result = rebase.check_txn(&rewrite, 2);
             if expect_conflict {
@@ -4946,6 +5443,124 @@ mod tests {
         assert!(rebase.check_txn(&txn2, 2).is_ok());
     }
 
+    /// A covering-index build must treat its *covered* fields as dependencies during
+    /// conflict resolution: a concurrent write to a covered field would leave the
+    /// rebased index serving stale materialized values.
+    #[tokio::test]
+    async fn test_create_covering_index_conflicts_with_writes_to_covered_field() {
+        let dataset = test_dataset(10, 2).await; // fields: 0 = "a", 1 = "b"
+
+        // `covering_fields` is always the trailing entries of `fields`.
+        let make_index = |name: &str, covering_fields: Vec<i32>| {
+            let mut fields = vec![0];
+            fields.extend(covering_fields.iter().copied());
+            IndexMetadata {
+                uuid: Uuid::new_v4(),
+                fields,
+                name: name.to_string(),
+                dataset_version: 1,
+                fragment_bitmap: Some([0, 1].into_iter().collect()),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+                covering_fields,
+            }
+        };
+        let create = |idx: IndexMetadata| {
+            Transaction::new_from_version(
+                1,
+                Operation::CreateIndex {
+                    new_indices: vec![idx],
+                    removed_indices: vec![],
+                },
+            )
+        };
+        let replace_field1 = || {
+            Transaction::new_from_version(
+                1,
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(
+                        0,
+                        DataFile::new_legacy_from_fields("replace.lance", vec![1], None),
+                    )],
+                },
+            )
+        };
+        // `fragment_field_paths` reads the last live file listing a field, which is how an
+        // in-place rewrite presents itself (the rewrite adds a file for the field and
+        // tombstones the old entry, and tombstones are skipped). So appending a file that
+        // carries `field` models a rewrite of it, and one carrying a brand-new id models
+        // `add_columns`.
+        let merge_appending_file_for = |field: i32, path: &str| {
+            let mut fragments = dataset.fragments().as_ref().clone();
+            for fragment in fragments.iter_mut() {
+                fragment
+                    .files
+                    .push(DataFile::new_legacy_from_fields(path, vec![field], None));
+            }
+            Transaction::new_from_version(
+                1,
+                Operation::Merge {
+                    fragments,
+                    schema: dataset.schema().clone(),
+                    preserves_nullability: true,
+                },
+            )
+        };
+        let merge_rewriting_covered = || merge_appending_file_for(1, "rewritten.lance");
+        let merge_adding_column = || merge_appending_file_for(2, "added.lance");
+
+        // Covering index (covers field 1): a replacement of field 1 conflicts...
+        let mut rebase =
+            TransactionRebase::try_new(&dataset, create(make_index("covering", vec![1])), None)
+                .await
+                .unwrap();
+        assert!(
+            rebase.check_txn(&replace_field1(), 2).is_err(),
+            "covering-index build must conflict with a data replacement of its covered field"
+        );
+        // ...and so does a merge that rewrites the covered column's data file in place.
+        let mut rebase =
+            TransactionRebase::try_new(&dataset, create(make_index("covering", vec![1])), None)
+                .await
+                .unwrap();
+        assert!(
+            rebase.check_txn(&merge_rewriting_covered(), 2).is_err(),
+            "covering-index build must conflict with a merge that rewrites its covered field"
+        );
+        // But a merge that only ADDS a column leaves the covered field's data untouched,
+        // so it must NOT discard the (potentially hours-long) covered index build.
+        let mut rebase =
+            TransactionRebase::try_new(&dataset, create(make_index("covering", vec![1])), None)
+                .await
+                .unwrap();
+        assert!(
+            rebase.check_txn(&merge_adding_column(), 2).is_ok(),
+            "covering-index build must not conflict with an add_columns that leaves covered data alone"
+        );
+
+        // Control: a plain index (no covered fields) keeps the optimistic path for
+        // both a merge and a replacement of the un-indexed field 1.
+        let mut rebase =
+            TransactionRebase::try_new(&dataset, create(make_index("plain", vec![])), None)
+                .await
+                .unwrap();
+        assert!(
+            rebase.check_txn(&merge_rewriting_covered(), 2).is_ok(),
+            "non-covering index build should keep the optimistic merge path"
+        );
+        let mut rebase =
+            TransactionRebase::try_new(&dataset, create(make_index("plain", vec![])), None)
+                .await
+                .unwrap();
+        assert!(
+            rebase.check_txn(&replace_field1(), 2).is_ok(),
+            "non-covering index build should not conflict with a replacement of an un-indexed field"
+        );
+    }
+
     /// Returns the IDs of fragments that have been modified by this operation.
     ///
     /// This does not include new fragments.
@@ -5280,6 +5895,8 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_compacted_sstables: Vec::new(),
+                covered_field_paths: Default::default(),
+                schema: empty_lance_schema(),
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -5343,6 +5960,8 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: empty_lance_schema(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5381,6 +6000,8 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: empty_lance_schema(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5420,6 +6041,8 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: empty_lance_schema(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5459,6 +6082,8 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: empty_lance_schema(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5509,6 +6134,8 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: empty_lance_schema(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -5534,6 +6161,8 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: empty_lance_schema(),
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -5580,6 +6209,8 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_compacted_sstables: Vec::new(),
+            covered_field_paths: Default::default(),
+            schema: empty_lance_schema(),
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState
