@@ -91,8 +91,10 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
     // Use MutableArrayData to efficiently copy just the slice
     let mut mutable = MutableArrayData::new(vec![data], false, data.len());
 
-    // Copy from offset to offset+len (the visible slice)
-    mutable.extend(0, data.offset(), data.offset() + data.len());
+    // `extend` indexes from the source array's first logical element; arrow
+    // adds `ArrayData::offset` itself. Passing the offset here would apply it
+    // twice and copy the wrong elements.
+    mutable.extend(0, 0, data.len());
 
     // Freeze into immutable ArrayData
     mutable.freeze()
@@ -119,7 +121,7 @@ pub fn deep_copy_batch_sliced(batch: &RecordBatch) -> crate::Result<RecordBatch>
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
+    use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     #[test]
@@ -234,5 +236,35 @@ mod tests {
         assert!(copied_int.is_valid(1)); // Some(3)
         assert!(!copied_int.is_valid(2)); // None
         assert_eq!(copied_int.value(1), 3);
+    }
+
+    /// Boolean is the array kind that keeps a non-zero `ArrayData::offset`
+    /// after a slice: a bit offset cannot be folded into the buffer pointer
+    /// the way the byte offset of a primitive array can. The copy has to start
+    /// at the slice's first element anyway.
+    #[test]
+    fn test_deep_copy_array_sliced_boolean_keeps_offset() {
+        let array = BooleanArray::from(vec![
+            Some(false),
+            None,
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(true),
+            None,
+            Some(true),
+            Some(true),
+        ]);
+        let sliced = array.slice(3, 4);
+        assert_eq!(sliced.to_data().offset(), 3);
+
+        let copied = super::deep_copy_array_sliced(&sliced);
+        let copied = copied.as_any().downcast_ref::<BooleanArray>().unwrap();
+
+        assert_eq!(
+            copied.iter().collect::<Vec<_>>(),
+            sliced.iter().collect::<Vec<_>>()
+        );
     }
 }
