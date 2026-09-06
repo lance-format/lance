@@ -42,12 +42,16 @@ use lance_core::{
 };
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
+use lance_encoding::decoder::estimate_bytes_per_row;
 use lance_file::reader::{
-    CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader,
+    CANDIDATE_BATCH_SIZES, CachedFileMetadata, FileMetadataIndex, FileReaderOptions,
+    ProjectedFileReader,
 };
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
-use lance_file::{LanceEncodingsIo, determine_file_version, versions as file_versions};
+use lance_file::{
+    BatchSizeEstimate, LanceEncodingsIo, determine_file_version, versions as file_versions,
+};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
@@ -152,6 +156,40 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     // Clone the reader, this is needed because Box<dyn Foo: Clone> doesn't
     // implement Clone
     fn clone_box(&self) -> Box<dyn GenericFileReader>;
+
+    /// Returns schema-based decoded byte counts for each of the 8 candidate
+    /// batch sizes, clamped to `rows_remaining`.
+    ///
+    /// Fixed-width fields are exact. Variable-width fields use a heuristic
+    /// constant matching the encoding layer's own estimate. This lets the
+    /// fragment reader sum across all file readers before picking a batch size
+    /// that fits the configured byte budget.
+    fn plan_next_decode(
+        &self,
+        rows_remaining: u64,
+    ) -> BoxFuture<'_, Result<lance_file::BatchSizeEstimate>>;
+
+    /// Creates a decode task for exactly `num_rows` rows starting at `row_offset`.
+    ///
+    /// The returned task, when awaited, produces a single `RecordBatch`.
+    fn next_decode_task(
+        &self,
+        row_offset: u64,
+        num_rows: u32,
+    ) -> BoxFuture<'_, Result<ReadBatchTask>>;
+
+    /// Opens a persistent scan handle for byte-budget-controlled streaming.
+    ///
+    /// Returns a boxed [`BudgetScanState`] that the fragment reader uses to call
+    /// [`BudgetScanState::plan_decoded_bytes`] and [`BudgetScanState::drain_task`]
+    /// across many batches without tearing down and rebuilding the decode pipeline.
+    ///
+    /// V2.1+ structural readers return an exact path; v2.0, v1, and null readers
+    /// fall back to schema-based estimates with fresh per-batch decoders.
+    // BudgetScanState is pub(crate); this method is only called from within this
+    // crate even though GenericFileReader is pub.
+    #[allow(private_interfaces)]
+    fn open_budget_scan(&self) -> BoxFuture<'_, Result<Box<dyn BudgetScanState>>>;
 }
 
 fn ranges_to_tasks(
@@ -303,6 +341,56 @@ impl GenericFileReader for V1Reader {
 
     fn clone_box(&self) -> Box<dyn GenericFileReader> {
         Box::new(self.clone())
+    }
+
+    fn plan_next_decode(&self, rows_remaining: u64) -> BoxFuture<'_, Result<BatchSizeEstimate>> {
+        // V1 files don't have structural decoders; use schema-based estimation.
+        let bpr = self
+            .projection
+            .fields
+            .iter()
+            .map(|f| estimate_bytes_per_row(&f.data_type()))
+            .sum::<f64>()
+            .max(1.0) as u64;
+        Box::pin(async move {
+            let mut exact_bytes = [0u64; 8];
+            for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+                let rows = (candidate as u64).min(rows_remaining);
+                exact_bytes[i] = rows * bpr;
+            }
+            Ok(BatchSizeEstimate { exact_bytes })
+        })
+    }
+
+    fn next_decode_task(
+        &self,
+        row_offset: u64,
+        num_rows: u32,
+    ) -> BoxFuture<'_, Result<ReadBatchTask>> {
+        let projection = self.projection.clone();
+        let range = row_offset as u32
+            ..row_offset
+                .saturating_add(num_rows as u64)
+                .min(self.reader.len() as u64) as u32;
+        Box::pin(async move {
+            let mut stream = self
+                .read_range_tasks(range.start as u64..range.end as u64, num_rows, projection)
+                .await?;
+            stream.next().await.ok_or_else(|| {
+                Error::internal(format!(
+                    "V1 next_decode_task produced no tasks for offset={row_offset} \
+                     num_rows={num_rows}"
+                ))
+            })
+        })
+    }
+
+    fn open_budget_scan(&self) -> BoxFuture<'_, Result<Box<dyn BudgetScanState>>> {
+        let scan = LegacyBudgetScan {
+            reader: self.clone_box(),
+            row_offset: 0,
+        };
+        Box::pin(async move { Ok(Box::new(scan) as Box<dyn BudgetScanState>) })
     }
 }
 
@@ -507,6 +595,47 @@ mod v2_adapter {
         fn clone_box(&self) -> Box<dyn GenericFileReader> {
             Box::new(self.clone())
         }
+
+        fn plan_next_decode(
+            &self,
+            rows_remaining: u64,
+        ) -> BoxFuture<'_, Result<BatchSizeEstimate>> {
+            let estimate = self.reader.plan_next_decode(rows_remaining);
+            Box::pin(async move { estimate })
+        }
+
+        fn next_decode_task(
+            &self,
+            row_offset: u64,
+            num_rows: u32,
+        ) -> BoxFuture<'_, Result<ReadBatchTask>> {
+            let reader = self.reader.clone();
+            Box::pin(async move {
+                reader
+                    .read_range_task(row_offset, num_rows)
+                    .await
+                    .map(|t| ReadBatchTask {
+                        task: t.task.map_err(Error::from).boxed(),
+                        num_rows: t.num_rows,
+                    })
+            })
+        }
+
+        fn open_budget_scan(&self) -> BoxFuture<'_, Result<Box<dyn BudgetScanState>>> {
+            if self.reader.version().is_structural() {
+                let reader = self.reader.clone();
+                Box::pin(async move {
+                    let stream = reader.open_budget_scan().await?;
+                    Ok(Box::new(V2BudgetScan { stream }) as Box<dyn BudgetScanState>)
+                })
+            } else {
+                let scan = LegacyBudgetScan {
+                    reader: self.clone_box(),
+                    row_offset: 0,
+                };
+                Box::pin(async move { Ok(Box::new(scan) as Box<dyn BudgetScanState>) })
+            }
+        }
     }
 }
 
@@ -604,6 +733,102 @@ impl GenericFileReader for NullReader {
 
     fn clone_box(&self) -> Box<dyn GenericFileReader> {
         Box::new(self.clone())
+    }
+
+    fn plan_next_decode(&self, rows_remaining: u64) -> BoxFuture<'_, Result<BatchSizeEstimate>> {
+        // All columns are null so there is no encoded data — estimate zero bytes per row.
+        // The null reader contributes 0 bytes to the budget: the data-bearing readers
+        // determine the actual batch size.
+        let mut exact_bytes = [0u64; 8];
+        for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+            let rows = (candidate as u64).min(rows_remaining);
+            // A null array still allocates validity-bitmap space: 1 bit per row.
+            exact_bytes[i] = rows.div_ceil(8) * self.schema.fields.len() as u64;
+        }
+        Box::pin(async move { Ok(BatchSizeEstimate { exact_bytes }) })
+    }
+
+    fn next_decode_task(
+        &self,
+        _row_offset: u64,
+        num_rows: u32,
+    ) -> BoxFuture<'_, Result<ReadBatchTask>> {
+        let projection: Arc<ArrowSchema> = Arc::new(self.schema.as_ref().into());
+        let num_rows = num_rows.min(self.num_rows) as usize;
+        Box::pin(async move {
+            let batch = Self::batch(projection, num_rows);
+            Ok(ReadBatchTask {
+                task: futures::future::ready(Ok(batch)).boxed(),
+                num_rows: num_rows as u32,
+            })
+        })
+    }
+
+    fn open_budget_scan(&self) -> BoxFuture<'_, Result<Box<dyn BudgetScanState>>> {
+        let scan = LegacyBudgetScan {
+            reader: self.clone_box(),
+            row_offset: 0,
+        };
+        Box::pin(async move { Ok(Box::new(scan) as Box<dyn BudgetScanState>) })
+    }
+}
+
+/// Persistent scan state used by [`FragmentReader::scan_with_byte_budget`].
+///
+/// Each file reader in a fragment owns one handle.  For each batch:
+/// 1. [`plan_decoded_bytes`](BudgetScanState::plan_decoded_bytes) is called with
+///    `rows_remaining` to get byte estimates for the 8 candidate batch sizes.
+/// 2. The fragment reader sums estimates across all handles and picks `chosen_rows`.
+/// 3. [`drain_task`](BudgetScanState::drain_task) is called with `chosen_rows` to
+///    drain exactly that many rows.
+pub(crate) trait BudgetScanState: Send {
+    fn plan_decoded_bytes(&mut self, rows_remaining: u64) -> BoxFuture<'_, Result<[u64; 8]>>;
+    fn drain_task(&mut self, num_rows: u32) -> BoxFuture<'_, Result<Option<ReadBatchTask>>>;
+}
+
+/// Budget scan for v2.1+ structural files: exact page-level byte counts.
+struct V2BudgetScan {
+    stream: lance_encoding::decoder::StructuralBatchDecodeStream,
+}
+
+impl BudgetScanState for V2BudgetScan {
+    fn plan_decoded_bytes(&mut self, rows_remaining: u64) -> BoxFuture<'_, Result<[u64; 8]>> {
+        Box::pin(self.stream.plan_decoded_bytes(rows_remaining))
+    }
+
+    fn drain_task(&mut self, num_rows: u32) -> BoxFuture<'_, Result<Option<ReadBatchTask>>> {
+        Box::pin(async move {
+            let enc_task = self.stream.drain_task(num_rows).await?;
+            Ok(enc_task.map(|t| ReadBatchTask {
+                task: t.task,
+                num_rows: t.num_rows,
+            }))
+        })
+    }
+}
+
+/// Budget scan for v1 / v2.0 files and the null reader: schema-based estimates,
+/// fresh decoder per batch.
+struct LegacyBudgetScan {
+    reader: Box<dyn GenericFileReader>,
+    row_offset: u64,
+}
+
+impl BudgetScanState for LegacyBudgetScan {
+    fn plan_decoded_bytes(&mut self, rows_remaining: u64) -> BoxFuture<'_, Result<[u64; 8]>> {
+        Box::pin(async move {
+            let est = self.reader.plan_next_decode(rows_remaining).await?;
+            Ok(est.exact_bytes)
+        })
+    }
+
+    fn drain_task(&mut self, num_rows: u32) -> BoxFuture<'_, Result<Option<ReadBatchTask>>> {
+        let row_offset = self.row_offset;
+        self.row_offset += num_rows as u64;
+        Box::pin(async move {
+            let task = self.reader.next_decode_task(row_offset, num_rows).await?;
+            Ok(Some(task))
+        })
     }
 }
 
@@ -3598,6 +3823,148 @@ impl FragmentReader {
         }
 
         Ok(batch)
+    }
+
+    /// Read rows using an exact byte budget.
+    ///
+    /// For each batch, the fragment reader opens a persistent scan handle for every
+    /// file reader, asks each handle how many bytes each of the 8 candidate batch
+    /// sizes would decode, sums the estimates across all handles, then picks the
+    /// largest candidate that fits within `budget_bytes`. The result is a `'static`
+    /// stream of `RecordBatch` values where every batch (except possibly the last)
+    /// decoded at most `budget_bytes` of data.
+    ///
+    /// For v2.1+ structural files the byte estimates come from the encoding layer
+    /// directly (exact), so variable-width types (strings, lists, …) are sized
+    /// precisely. For v2.0 and v1 files the estimates are schema-based heuristics.
+    ///
+    /// When `replace_oversized_with_null` is true and even a single row exceeds
+    /// the budget, the row is replaced by a null batch of 1 row rather than an
+    /// oversized batch. When it is false (the default), the oversized single
+    /// row is still returned as-is so the caller can observe the actual data.
+    pub async fn scan_with_byte_budget(
+        &self,
+        budget_bytes: u64,
+        replace_oversized_with_null: bool,
+    ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send + 'static> {
+        use futures::stream::unfold;
+
+        let total_physical_rows = self.num_physical_rows as u64;
+        let output_schema = Arc::new(self.output_schema.clone());
+
+        // Open one persistent scan handle per reader that has a non-empty projection.
+        let mut scan_handles: Vec<Box<dyn BudgetScanState>> =
+            Vec::with_capacity(self.readers.len());
+        for reader in self.readers.iter() {
+            if !reader.projection().fields.is_empty() {
+                scan_handles.push(reader.open_budget_scan().await?);
+            }
+        }
+
+        Ok(unfold(
+            (0u64, scan_handles),
+            move |(mut row_offset, mut scan_handles)| {
+                let output_schema = output_schema.clone();
+                async move {
+                    if row_offset >= total_physical_rows {
+                        return None;
+                    }
+                    let rows_remaining = total_physical_rows - row_offset;
+
+                    // Gather exact byte estimates from each handle.
+                    let mut totals = [0u64; 8];
+                    for handle in scan_handles.iter_mut() {
+                        match handle.plan_decoded_bytes(rows_remaining).await {
+                            Ok(est) => {
+                                for (total, &e) in totals.iter_mut().zip(est.iter()) {
+                                    *total = total.saturating_add(e);
+                                }
+                            }
+                            Err(e) => return Some((Err(e), (row_offset, scan_handles))),
+                        }
+                    }
+
+                    // Pick the largest candidate that fits the budget, clamped to rows_remaining.
+                    let chosen_rows = {
+                        let mut best = 0u32;
+                        for (i, &candidate) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
+                            let effective = (candidate as u64).min(rows_remaining) as u32;
+                            if totals[i] <= budget_bytes {
+                                best = effective;
+                            }
+                        }
+                        best
+                    };
+
+                    // If even 1 row exceeds the budget, either yield null or yield the row.
+                    if chosen_rows == 0 && replace_oversized_with_null {
+                        // Still drain 1 row from each handle to advance persistent state.
+                        for handle in scan_handles.iter_mut() {
+                            if let Err(e) = handle.drain_task(1).await {
+                                return Some((Err(e), (row_offset + 1, scan_handles)));
+                            }
+                        }
+                        let columns = output_schema
+                            .fields()
+                            .iter()
+                            .map(|f| new_null_array(f.data_type(), 1))
+                            .collect::<Vec<_>>();
+                        let batch = match RecordBatch::try_new(output_schema.clone(), columns)
+                            .map_err(Error::from)
+                        {
+                            Ok(b) => b,
+                            Err(e) => return Some((Err(e), (row_offset + 1, scan_handles))),
+                        };
+                        row_offset += 1;
+                        return Some((Ok(batch), (row_offset, scan_handles)));
+                    }
+                    // If chosen_rows is 0 (single row exceeds budget) and
+                    // replace_oversized_with_null is false, fall through and read 1 row.
+                    let read_rows = if chosen_rows == 0 { 1u32 } else { chosen_rows };
+
+                    // Drain one batch task from each active handle and collect batches.
+                    let mut per_reader_batches: Vec<RecordBatch> = Vec::new();
+                    let mut actual_rows = read_rows as usize;
+                    for handle in scan_handles.iter_mut() {
+                        match handle.drain_task(read_rows).await {
+                            Ok(Some(task)) => {
+                                actual_rows = task.num_rows as usize;
+                                match task.task.await {
+                                    Ok(batch) => per_reader_batches.push(batch),
+                                    Err(e) => {
+                                        return Some((Err(e), (row_offset, scan_handles)));
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => return Some((Err(e), (row_offset, scan_handles))),
+                        }
+                    }
+
+                    let batch = if per_reader_batches.len() == 1 {
+                        per_reader_batches.remove(0)
+                    } else if per_reader_batches.is_empty() {
+                        // Only system columns — produce an empty-schema batch.
+                        RecordBatch::from(StructArray::new_empty_fields(actual_rows, None))
+                    } else {
+                        match merge_batches(&per_reader_batches) {
+                            Ok(b) => b,
+                            Err(e) => return Some((Err(e), (row_offset, scan_handles))),
+                        }
+                    };
+
+                    // Reorder columns to match the output schema.
+                    let batch = match batch.project_by_schema(&output_schema).map_err(Error::from)
+                    {
+                        Ok(b) => b,
+                        Err(e) => return Some((Err(e), (row_offset, scan_handles))),
+                    };
+
+                    row_offset += actual_rows as u64;
+                    Some((Ok(batch), (row_offset, scan_handles)))
+                }
+            },
+        ))
     }
 }
 
