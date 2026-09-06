@@ -889,11 +889,11 @@ pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>)
         tokens.push(token.text.clone());
         positions.push(token.position as u32);
     }
-    if let Some(first_position) = positions.first().copied() {
-        // Phrase positions are relative to the first retained query token. This preserves gaps
-        // between retained tokens without requiring documents to contain filtered leading terms.
+    if let Some(min_position) = positions.iter().copied().min() {
+        // Token streams such as Jieba's search mode may emit overlapping terms out of position
+        // order. Rebase from the minimum so every position remains valid while preserving gaps.
         for position in &mut positions {
-            *position -= first_position;
+            *position -= min_position;
         }
     }
     Tokens::with_positions(tokens, positions, token_type)
@@ -1008,6 +1008,27 @@ pub fn fill_fts_query_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "tokenizer-jieba")]
+    #[test]
+    fn test_collect_query_tokens_normalizes_unordered_jieba_positions() {
+        let mut jieba = jieba_rs::Jieba::empty();
+        jieba.add_word("NGP渗透率", Some(1_000_000), None);
+        jieba.add_word("渗透", Some(10_000), None);
+        jieba.add_word("透率", Some(10_000), None);
+        let analyzer = lance_tokenizer::JiebaTokenizer::new(jieba).analyzer();
+        let mut tokenizer: Box<dyn LanceTokenizer> = Box::new(
+            crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer::new(analyzer),
+        );
+
+        let query = "NGP渗透率";
+        let tokens = collect_query_tokens(query, &mut tokenizer);
+        let positions = (0..tokens.len())
+            .map(|index| tokens.position(index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(positions, vec![3, 4, 0]);
+    }
 
     #[test]
     fn test_fuzzy_expansion_mode_and_unicode_auto_boundaries() {
