@@ -1524,6 +1524,7 @@ impl Dataset {
                 maximum_nprobes,
                 metric_type,
                 refine_factor,
+                quantized_refine_factor,
                 use_index,
                 ef,
                 query_parallelism,
@@ -1586,6 +1587,9 @@ impl Dataset {
                     }
                     if let Some(factor) = refine_factor {
                         s = s.refine(factor);
+                    }
+                    if let Some(factor) = quantized_refine_factor {
+                        s = s.quantized_refine(factor);
                     }
                     if let Some(m) = metric_type {
                         s = s.distance_metric(m);
@@ -5456,6 +5460,7 @@ type VectorQueryParams = (
     Option<usize>,
     Option<MetricType>,
     Option<u32>,
+    Option<u32>,
     bool,
     Option<usize>,
     i32,
@@ -5587,6 +5592,23 @@ fn vector_query_params_from_dict(
         None
     };
 
+    let quantized_refine_factor: Option<u32> =
+        if let Some(factor) = dict.get_item("quantized_refine_factor")? {
+            if factor.is_none() {
+                None
+            } else {
+                let factor: u32 = factor.extract()?;
+                if factor == 0 {
+                    return Err(PyValueError::new_err(
+                        "quantized_refine_factor must be greater than zero",
+                    ));
+                }
+                Some(factor)
+            }
+        } else {
+            None
+        };
+
     let use_index: bool = if let Some(idx) = dict.get_item("use_index")? {
         idx.extract()?
     } else {
@@ -5614,6 +5636,7 @@ fn vector_query_params_from_dict(
         maximum_nprobes,
         metric_type,
         refine_factor,
+        quantized_refine_factor,
         use_index,
         ef,
         query_parallelism,
@@ -5651,11 +5674,18 @@ impl PySearchFilter {
             maximum_nprobes,
             metric_type_opt,
             refine_factor,
+            quantized_refine_factor,
             use_index,
             ef,
             query_parallelism,
             approx_mode,
         ) = vector_query_params_from_dict(query, default_k)?;
+
+        if quantized_refine_factor.is_some() {
+            return Err(PyValueError::new_err(
+                "quantized_refine_factor is only supported on dataset scanners",
+            ));
+        }
 
         let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
 

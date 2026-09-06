@@ -19,7 +19,9 @@ use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{
+    ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array, UInt64Array,
+};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -28,7 +30,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
 use futures::{StreamExt, TryFutureExt};
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
     KeyBuilder, LanceCache, WeakLanceCache,
@@ -60,16 +62,16 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
-    QueryResidual, QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext,
-    VectorStore,
+    DistCalculator, DistanceCalculatorOptions, QueryResidual, QueryScratch, QueryScratchCapacity,
+    QueryScratchPool, RabitRawQueryContext, VectorStore,
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
-        DISTANCE_TYPE_KEY, PartitionSearchControl, PreparedPartitionSearchHandle, Query,
-        VECTOR_RESULT_SCHEMA, ivf::storage::IVF_METADATA_KEY, quantizer::Quantization,
-        storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
+        ApproxMode, DISTANCE_TYPE_KEY, PartitionSearchControl, PartitionSearchResult,
+        PreparedPartitionSearchHandle, Query, VECTOR_RESULT_SCHEMA, ivf::storage::IVF_METADATA_KEY,
+        quantizer::Quantization, storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
     },
 };
 use lance_index::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
@@ -1038,6 +1040,34 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(query)
     }
 
+    fn query_centroid_distance(&self, partition_id: usize, query: &Query) -> Result<f32> {
+        if partition_id >= self.ivf.num_partitions() {
+            return Err(Error::index(format!(
+                "partition {partition_id} is out of range for an IVF index with {} partitions",
+                self.ivf.num_partitions()
+            )));
+        }
+        let centroid = self.ivf.centroid(partition_id).ok_or_else(|| {
+            Error::index(format!("partition centroid {partition_id} does not exist"))
+        })?;
+        let centroid = FixedSizeListArray::try_new_from_values(
+            centroid.clone(),
+            i32::try_from(centroid.len()).map_err(|_| {
+                Error::index(format!(
+                    "partition centroid {partition_id} has unsupported dimension {}",
+                    centroid.len()
+                ))
+            })?,
+        )?;
+        let distance_type = if self.distance_type == DistanceType::Cosine {
+            DistanceType::L2
+        } else {
+            self.distance_type
+        };
+        let distances = distance_type.arrow_batch_func()(query.key.as_ref(), &centroid)?;
+        Ok(distances.value(0))
+    }
+
     fn query_scratch_capacity(
         ivf: &IvfModel,
         storage: &IvfQuantizationStorage<Q>,
@@ -1605,6 +1635,176 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         Ok(batch)
     }
 
+    async fn search_in_partition_with_candidates(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        candidate_limit: usize,
+    ) -> Result<PartitionSearchResult> {
+        if S::name() != "FLAT" || Q::quantization_type() != QuantizationType::Rabit {
+            return Err(Error::not_supported(format!(
+                "candidate-producing search is not supported for IVF_{}_{}",
+                S::name(),
+                Q::quantization_type()
+            )));
+        }
+        let partition_id_u32 = u32::try_from(partition_id).map_err(|_| {
+            Error::invalid_input(format!(
+                "partition id {partition_id} exceeds the candidate identity limit"
+            ))
+        })?;
+        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        pre_filter.wait_for_ready().await?;
+
+        let partition_centroid = self.ivf.centroid(partition_id);
+        let rq_search_cache = self.rq_search_cache.clone();
+        let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
+        let query = Self::preprocess_partition_query(
+            self.use_query_residual,
+            self.use_residual_scratch,
+            partition_id,
+            partition_centroid.as_ref(),
+            query,
+        )?;
+        let scratch_pool = self.scratch_pool.clone();
+        let use_query_residual = self.use_query_residual;
+        let use_residual_scratch = self.use_residual_scratch;
+        let (result, local_metrics) = spawn_cpu(move || {
+            let param = (&query).into();
+            let local_metrics = LocalMetricsCollector::default();
+            let part = part_entry
+                .as_any()
+                .downcast_ref::<PartitionEntry<S, Q>>()
+                .ok_or(Error::internal(
+                    "failed to downcast partition entry".to_string(),
+                ))?;
+            let rotated_partition_centroid =
+                rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
+            let residual = Self::query_context_for_scratch(
+                use_query_residual,
+                use_residual_scratch,
+                partition_id,
+                partition_centroid.as_ref(),
+                rotated_partition_centroid,
+                raw_query_context.as_deref(),
+            )?;
+            let result = scratch_pool.with_scratch(|scratch| {
+                part.index.search_with_candidates_with_scratch(
+                    query.key,
+                    candidate_limit,
+                    param,
+                    &part.storage,
+                    pre_filter,
+                    &local_metrics,
+                    partition_id_u32,
+                    residual,
+                    scratch,
+                )
+            })?;
+            Result::Ok((result, local_metrics))
+        })
+        .await?;
+
+        local_metrics.dump_into(metrics);
+        Ok(result)
+    }
+
+    async fn score_partition_candidates(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        offsets_in_partition: &[u32],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        if S::name() != "FLAT" || Q::quantization_type() != QuantizationType::Rabit {
+            return Err(Error::not_supported(format!(
+                "selected-candidate scoring is not supported for IVF_{}_{}",
+                S::name(),
+                Q::quantization_type()
+            )));
+        }
+
+        let mut query = query.clone();
+        if Q::quantization_type() == QuantizationType::Rabit {
+            query.dist_q_c = self.query_centroid_distance(partition_id, &query)?;
+        }
+        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        let partition_centroid = self.ivf.centroid(partition_id);
+        let rq_search_cache = self.rq_search_cache.clone();
+        let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
+        let query = Self::preprocess_partition_query_owned(
+            self.use_query_residual,
+            self.use_residual_scratch,
+            partition_id,
+            partition_centroid.as_ref(),
+            query,
+        )?;
+        let offsets_in_partition = offsets_in_partition.to_vec();
+        let scratch_pool = self.scratch_pool.clone();
+        let use_query_residual = self.use_query_residual;
+        let use_residual_scratch = self.use_residual_scratch;
+        let (batch, local_metrics) = spawn_cpu(move || {
+            let local_metrics = LocalMetricsCollector::default();
+            let part = part_entry
+                .as_any()
+                .downcast_ref::<PartitionEntry<S, Q>>()
+                .ok_or(Error::internal(
+                    "failed to downcast partition entry".to_string(),
+                ))?;
+            let partition_len = part.storage.len();
+            for &offset in &offsets_in_partition {
+                if offset as usize >= partition_len {
+                    return Err(Error::index(format!(
+                        "partition offset {offset} is out of range for partition {partition_id} with {partition_len} rows"
+                    )));
+                }
+            }
+
+            let rotated_partition_centroid =
+                rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
+            let residual = Self::query_context_for_scratch(
+                use_query_residual,
+                use_residual_scratch,
+                partition_id,
+                partition_centroid.as_ref(),
+                rotated_partition_centroid,
+                raw_query_context.as_deref(),
+            )?;
+            let batch = scratch_pool.with_scratch(|scratch| {
+                let dist_calc = part.storage.dist_calculator_with_scratch(
+                    query.key,
+                    query.dist_q_c,
+                    residual,
+                    &mut scratch.query_f32,
+                    DistanceCalculatorOptions {
+                        approx_mode: ApproxMode::Accurate,
+                    },
+                );
+                let mut row_ids = Vec::with_capacity(offsets_in_partition.len());
+                let mut distances = Vec::with_capacity(offsets_in_partition.len());
+                for &offset in &offsets_in_partition {
+                    row_ids.push(part.storage.row_id(offset));
+                    distances.push(dist_calc.distance(offset));
+                }
+                Result::Ok(RecordBatch::try_new(
+                    VECTOR_RESULT_SCHEMA.clone(),
+                    vec![
+                        Arc::new(Float32Array::from(distances)),
+                        Arc::new(UInt64Array::from(row_ids)),
+                    ],
+                )?)
+            })?;
+            local_metrics.record_comparisons(offsets_in_partition.len());
+            Result::Ok((batch, local_metrics))
+        })
+        .await?;
+
+        local_metrics.dump_into(metrics);
+        Ok(batch)
+    }
+
     async fn prepare_partition_search(
         &self,
         partition_id: usize,
@@ -2107,8 +2307,9 @@ mod tests {
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
         ListArray, PrimitiveArray, RecordBatch, RecordBatchIterator, UInt64Array,
     };
-    use arrow_buffer::OffsetBuffer;
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
+    use futures::TryStreamExt;
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::bq::{
@@ -2123,6 +2324,7 @@ mod tests {
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
+    use crate::index::prefilter::DatasetPreFilter;
     use crate::index::vector::ivf::v2::{
         IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
     };
@@ -2158,11 +2360,15 @@ mod tests {
     use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::{
+        ApproxMode, DEFAULT_QUERY_PARALLELISM, Query,
         pq::storage::ProductQuantizationMetadata,
         sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
         storage::STORAGE_METADATA_KEY,
     };
-    use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
+    use lance_index::{
+        INDEX_AUXILIARY_FILE_NAME,
+        metrics::{LocalMetricsCollector, NoOpMetricsCollector},
+    };
     use lance_io::{
         object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor},
         scheduler::{ScanScheduler, SchedulerConfig},
@@ -2356,6 +2562,35 @@ mod tests {
         .await
         .unwrap();
         (dataset, Arc::new(vectors.as_fixed_size_list().clone()))
+    }
+
+    async fn generate_f32_test_dataset_with_shape(
+        test_uri: &str,
+        num_rows: usize,
+        dimension: usize,
+        range: Range<f32>,
+    ) -> (Dataset, Arc<FixedSizeListArray>) {
+        let ids = Arc::new(UInt64Array::from_iter_values(0..num_rows as u64));
+        let values = generate_random_array_with_range::<Float32Type>(num_rows * dimension, range);
+        let vectors =
+            Arc::new(FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap());
+        let vectors = Arc::new(normalize_fsl(vectors.as_ref()).unwrap());
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("vector", vectors.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, vectors.clone()]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            test_uri,
+            Some(WriteParams {
+                mode: crate::dataset::WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        (dataset, vectors)
     }
 
     async fn generate_multivec_test_dataset<T: ArrowPrimitiveType>(
@@ -5063,6 +5298,292 @@ mod tests {
             VectorIndexParams::with_ivf_sq_params(DistanceType::Dot, ivf_params, sq_params);
 
         test_index_impl::<Float32Type>(params, nlist, 0.75, -1.0..1.0, None).await;
+    }
+
+    #[rstest]
+    #[case::rq4_l2(DistanceType::L2, 4, DIM)]
+    #[case::rq4_cosine(DistanceType::Cosine, 4, DIM)]
+    #[case::rq4_dot(DistanceType::Dot, 4, DIM)]
+    #[case::rq8_l2(DistanceType::L2, 8, DIM)]
+    #[case::rq8_cosine(DistanceType::Cosine, 8, DIM)]
+    #[case::rq8_dot(DistanceType::Dot, 8, DIM)]
+    #[case::rq4_dot_768(DistanceType::Dot, 4, 768)]
+    #[case::rq8_cosine_4096(DistanceType::Cosine, 8, 4096)]
+    #[tokio::test]
+    async fn test_score_partition_candidates_matches_accurate_native_search(
+        #[case] distance_type: DistanceType,
+        #[case] num_bits: u8,
+        #[case] dimension: usize,
+    ) {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let num_rows = if dimension == DIM { NUM_ROWS } else { 128 };
+        let (mut dataset, vectors) =
+            generate_f32_test_dataset_with_shape(test_uri, num_rows, dimension, 0.0..1.0).await;
+        let ivf_params = IvfBuildParams::new(4);
+        let params = VectorIndexParams::with_ivf_rq_params(
+            distance_type,
+            ivf_params,
+            RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let mut query = Query {
+            column: "vector".to_string(),
+            key: vectors.value(0),
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(distance_type),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: f32::NAN,
+            approx_mode: ApproxMode::Fast,
+        };
+        let (partition_ids, centroid_distances) = index.find_partitions(&query).unwrap();
+        let partition_position = (0..partition_ids.len())
+            .find(|&position| index.partition_size(partition_ids.value(position) as usize) > 0)
+            .expect("the test index should contain a non-empty partition");
+        let partition_id = partition_ids.value(partition_position) as usize;
+        let partition_len = index.partition_size(partition_id);
+        assert!(partition_len >= 3);
+
+        let partition_batches = index
+            .partition_reader(partition_id, false, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let partition_row_ids = partition_batches
+            .iter()
+            .flat_map(|batch| {
+                batch[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(partition_row_ids.len(), partition_len);
+
+        query.dist_q_c = centroid_distances.value(partition_position);
+        let prefilter = Arc::new(DatasetPreFilter::new(
+            Arc::new(dataset.clone()),
+            &indices,
+            None,
+        ));
+        let candidate_limit = partition_len.min(5);
+        let partition_search = index
+            .search_in_partition_with_candidates(
+                partition_id,
+                &query,
+                prefilter.clone(),
+                &NoOpMetricsCollector,
+                candidate_limit,
+            )
+            .await
+            .unwrap();
+        assert_eq!(partition_search.batch.num_rows(), candidate_limit);
+        assert_eq!(partition_search.candidates.len(), candidate_limit);
+        let candidate_row_ids = partition_search.batch[ROW_ID].as_primitive::<UInt64Type>();
+        for (position, candidate) in partition_search.candidates.iter().enumerate() {
+            assert_eq!(candidate.partition_id as usize, partition_id);
+            assert_eq!(
+                candidate_row_ids.value(position),
+                partition_row_ids[candidate.offset_in_partition as usize]
+            );
+        }
+
+        let offsets = vec![0, (partition_len / 2) as u32, (partition_len - 1) as u32];
+        let metrics = LocalMetricsCollector::default();
+        let scored = index
+            .score_partition_candidates(partition_id, &query, &offsets, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(scored.num_rows(), offsets.len());
+        assert_eq!(metrics.comparisons.load(Ordering::Relaxed), offsets.len());
+        let empty = index
+            .score_partition_candidates(partition_id, &query, &[], &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(empty.num_rows(), 0);
+
+        query.k = partition_len;
+        query.approx_mode = ApproxMode::Accurate;
+        let searched = index
+            .search_in_partition(partition_id, &query, prefilter, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let expected_distances = searched[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(
+                searched[DIST_COL]
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            )
+            .collect::<HashMap<_, _>>();
+        let scored_row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
+        let scored_distances = scored[DIST_COL].as_primitive::<Float32Type>();
+        for (position, &offset) in offsets.iter().enumerate() {
+            let row_id = partition_row_ids[offset as usize];
+            assert_eq!(scored_row_ids.value(position), row_id);
+            let expected_distance = expected_distances[&row_id];
+            let actual_distance = scored_distances.value(position);
+            assert!(
+                actual_distance.is_finite(),
+                "selected score for row {row_id} should be finite"
+            );
+            let tolerance = 1.0e-4 * (1.0 + expected_distance.abs());
+            assert!(
+                (actual_distance - expected_distance).abs() <= tolerance,
+                "selected score {actual_distance} differs from accurate native score {expected_distance} for row {row_id}"
+            );
+        }
+
+        let error = index
+            .score_partition_candidates(
+                partition_id,
+                &query,
+                &[partition_len as u32],
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(&format!(
+            "partition offset {partition_len} is out of range for partition {partition_id}"
+        )));
+    }
+
+    #[rstest]
+    #[case::rq4(4)]
+    #[case::rq8(8)]
+    #[tokio::test]
+    async fn test_selected_scoring_excludes_null_and_non_finite_stored_vectors(
+        #[case] num_bits: u8,
+    ) {
+        const EDGE_DIM: usize = 8;
+        let test_dir = TempStrDir::default();
+        let values = [
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0; EDGE_DIM],
+            [f32::NAN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let vectors = Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                EDGE_DIM as i32,
+                Arc::new(Float32Array::from(values)),
+                Some(NullBuffer::from(vec![true, false, true, true, true, true])),
+            )
+            .unwrap(),
+        );
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("vector", vectors.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(0..vectors.len() as u64)),
+                vectors,
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            test_dir.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                EDGE_DIM as i32,
+            )
+            .unwrap(),
+        );
+        let ivf_params = IvfBuildParams::try_with_centroids(1, centroids).unwrap();
+        let params = VectorIndexParams::with_ivf_rq_params(
+            DistanceType::L2,
+            ivf_params,
+            RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(index.partition_size(0), 4);
+        let query = Query {
+            column: "vector".to_string(),
+            key: Arc::new(Float32Array::from(vec![
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ])),
+            k: 4,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: Some(1),
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: DEFAULT_QUERY_PARALLELISM,
+            dist_q_c: 0.0,
+            approx_mode: ApproxMode::Accurate,
+        };
+        let scored = index
+            .score_partition_candidates(0, &query, &[0, 1, 2, 3], &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(scored.num_rows(), 4);
+        assert!(
+            scored[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|distance| distance.is_finite())
+        );
+        assert_eq!(
+            scored[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
     }
 
     // These queries probe every partition, so recall here measures RaBitQ quantization

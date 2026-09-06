@@ -168,6 +168,25 @@ pub struct Query {
     pub approx_mode: ApproxMode,
 }
 
+/// Stable partition-local identity for one candidate emitted by an IVF search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
+pub struct PartitionSearchCandidate {
+    /// IVF partition containing the candidate.
+    pub partition_id: u32,
+    /// Zero-based offset inside the partition's vector storage.
+    pub offset_in_partition: u32,
+}
+
+/// Result of a partition search that also exposes identities suitable for
+/// selected-candidate re-scoring.
+#[derive(Debug, Clone)]
+pub struct PartitionSearchResult {
+    /// Ordinary `(distance, row id)` result batch.
+    pub batch: RecordBatch,
+    /// Candidate identities in the same order as rows in `batch`.
+    pub candidates: Vec<PartitionSearchCandidate>,
+}
+
 impl From<pb::VectorMetricType> for DistanceType {
     fn from(proto: pb::VectorMetricType) -> Self {
         match proto {
@@ -247,6 +266,37 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
+
+    /// Search one partition and preserve the local offsets of emitted rows.
+    ///
+    /// Implementations may reject this operation. Quantized refinement uses it
+    /// only for flat IVF_RQ sub-indices.
+    async fn search_in_partition_with_candidates(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _pre_filter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+        _candidate_limit: usize,
+    ) -> Result<PartitionSearchResult> {
+        Err(Error::not_supported("search_in_partition_with_candidates"))
+    }
+
+    /// Score partition-local candidate offsets with the index's most accurate
+    /// native storage representation.
+    ///
+    /// The returned rows preserve the order of `offsets_in_partition`. This
+    /// operation does not apply a pre-filter or distance bounds; callers must
+    /// validate candidate identity and apply query result shaping around it.
+    async fn score_partition_candidates(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _offsets_in_partition: &[u32],
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        Err(Error::not_supported("score_partition_candidates"))
+    }
 
     /// Asynchronously prepare a single-partition search so the CPU-heavy portion
     /// can be executed separately.

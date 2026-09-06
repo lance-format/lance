@@ -274,6 +274,10 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let ef = env.get_optional_usize_from_method(&java_obj, "getEf")?;
 
         let refine_factor = env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?;
+        // Query filters cannot represent scanner execution stages, but read the
+        // property here so JNI contract tests cover the Java method signature.
+        let _quantized_refine_factor =
+            env.get_optional_u32_from_method(&java_obj, "getQuantizedRefineFactor")?;
 
         let distance_type = if let Some(distance_type_str) =
             env.get_optional_string_from_method(&java_obj, "getDistanceTypeString")?

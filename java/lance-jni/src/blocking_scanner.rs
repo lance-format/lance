@@ -394,6 +394,12 @@ pub(crate) fn build_scanner_with_options<'a>(
             scanner.refine(refine_factor);
         }
 
+        if let Some(factor) =
+            env.get_optional_u32_from_method(&java_obj, "getQuantizedRefineFactor")?
+        {
+            scanner.quantized_refine(factor);
+        }
+
         if let Some(distance_type_str) =
             env.get_optional_string_from_method(&java_obj, "getDistanceTypeString")?
         {
