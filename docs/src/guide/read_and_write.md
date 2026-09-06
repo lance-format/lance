@@ -577,7 +577,9 @@ And disabled again:
 ds.optimize.disable_auto_cleanup()
 ```
 
-Auto cleanup parameters can also be set directly via dataset config keys:
+Auto cleanup parameters can also be set directly via dataset config keys. See the
+[Table Config Specification](../format/table/table_config.md) for the full list of
+`lance.auto_cleanup.*` keys:
 
 ```python
 ds.update_config({

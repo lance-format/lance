@@ -37,6 +37,11 @@ a monotonically increasing version number, and an optional reference to the inde
 
 </details>
 
+The manifest also has a `config` map for table-level configuration. Keys prefixed with
+`lance.` are reserved for the Lance library; conforming readers and writers are expected
+to recognize and honor them. See the [Table Config Specification](table_config.md) for
+the full list of known `lance.` configuration keys and their meanings.
+
 ## Schema & Fields
 
 The schema of the table is written as a series of fields, plus a schema metadata map.
@@ -192,6 +197,12 @@ versioning, index integration, compaction, and a worked example — see the
 
 
 ## Related Specifications
+
+### Table Config
+
+Standard `lance.`-prefixed table configuration keys and their meanings.
+
+See [Table Config Specification](table_config.md)
 
 ### Storage Layout
 
