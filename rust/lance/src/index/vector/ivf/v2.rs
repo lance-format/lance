@@ -2796,11 +2796,13 @@ mod tests {
         num_partitions: usize,
         refine_factor: u32,
         ef: usize,
+        distance_type: DistanceType,
     ) -> RecordBatch {
         dataset
             .scan()
             .nearest("vector", query, k)
             .unwrap()
+            .distance_metric(distance_type)
             .minimum_nprobes(num_partitions)
             .ef(ef)
             .refine(refine_factor)
@@ -2877,30 +2879,57 @@ mod tests {
             assert_eq!(hnsw_params["ef_construction"], 16);
         }
 
+        // A single k=10 query of 4-bit PQ + Dot sits near the 0.5 bar: Windows
+        // CI has landed at 0.4 (4/10). Average over several queries so one
+        // platform-dependent ranking does not fail the contract.
+        const NUM_QUERIES: usize = 10;
+        // 4-bit PQ ranking is coarser; rescoring more candidates is cheap on
+        // this 256-row fixture and keeps mean recall clear of 0.5.
+        let refine_factor = if num_bits == 4 { 8 } else { 4 };
+        // HNSW requires ef >= k * refine. IVF_PQ ignores ef.
+        let ef = 64.max(K * refine_factor as usize);
+        let mut hits = 0usize;
         let query = vectors.value(0);
-        let ground_truth = ground_truth(&dataset, "vector", query.as_ref(), K, distance_type).await;
         let before_reopen = search_lightweight_pq_index(
             &dataset,
             query.as_ref(),
             K,
             LIGHTWEIGHT_PQ_PARTITIONS,
-            4,
-            64,
+            refine_factor,
+            ef,
+            distance_type,
         )
         .await;
-        assert_eq!(before_reopen.num_rows(), K);
-        let row_ids = before_reopen[ROW_ID].as_primitive::<UInt64Type>().values();
-        assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
-        let distances = before_reopen[DIST_COL]
-            .as_primitive::<Float32Type>()
-            .values();
-        assert!(distances.iter().all(|distance| distance.is_finite()));
-        assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
-        let recall = row_ids
-            .iter()
-            .filter(|row_id| ground_truth.contains(row_id))
-            .count() as f32
-            / K as f32;
+        for query_idx in 0..NUM_QUERIES {
+            let query = vectors.value(query_idx);
+            let ground_truth =
+                ground_truth(&dataset, "vector", query.as_ref(), K, distance_type).await;
+            let result = if query_idx == 0 {
+                before_reopen.clone()
+            } else {
+                search_lightweight_pq_index(
+                    &dataset,
+                    query.as_ref(),
+                    K,
+                    LIGHTWEIGHT_PQ_PARTITIONS,
+                    refine_factor,
+                    ef,
+                    distance_type,
+                )
+                .await
+            };
+            assert_eq!(result.num_rows(), K);
+            let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+            assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);
+            let distances = result[DIST_COL].as_primitive::<Float32Type>().values();
+            assert!(distances.iter().all(|distance| distance.is_finite()));
+            assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
+            hits += row_ids
+                .iter()
+                .filter(|row_id| ground_truth.contains(row_id))
+                .count();
+        }
+        let recall = hits as f32 / (NUM_QUERIES * K) as f32;
         assert_ge!(recall, 0.5, "recall: {recall}");
 
         drop(dataset);
@@ -2914,8 +2943,9 @@ mod tests {
                 query.as_ref(),
                 K,
                 LIGHTWEIGHT_PQ_PARTITIONS,
-                4,
-                64,
+                refine_factor,
+                ef,
+                distance_type,
             )
             .await,
             before_reopen
@@ -5316,7 +5346,16 @@ mod tests {
         let query = vectors.value(0);
         // Three vectors per query amplify the internal candidate k. This
         // bounded budget covers all 64 * 3 vector entries in the fixture.
-        let result = search_lightweight_pq_index(&dataset, query.as_ref(), K, 1, 2, 256).await;
+        let result = search_lightweight_pq_index(
+            &dataset,
+            query.as_ref(),
+            K,
+            1,
+            2,
+            256,
+            DistanceType::Cosine,
+        )
+        .await;
         assert_eq!(result.num_rows(), K);
         let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
         assert_eq!(row_ids.iter().copied().collect::<HashSet<_>>().len(), K);

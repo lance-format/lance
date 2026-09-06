@@ -22,8 +22,8 @@
 //! - **Write-before-read.** [`Spill::reader`] fails until the writer has been
 //!   shut down, so partially written bytes are never read back.
 //! - **RAII.** Dropping the [`Spill`] deletes the file and releases its bytes
-//!   back to the store's disk budget. The store's temp directory is the
-//!   backstop for anything leaked if a handle is forgotten.
+//!   back to the store's disk budget. The store's temp directory is created on
+//!   first use and is the backstop for anything leaked if a handle is forgotten.
 //!
 //! # Disk cap
 //!
@@ -41,6 +41,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use object_store::path::Path;
@@ -194,51 +195,87 @@ impl Writer for SpillWriter {
 /// By default there is no disk cap. Use [`LocalSpillStore::with_cap`] to
 /// configure one shared across every handle this store produces.
 ///
-/// The temp directory is deleted when the store is dropped, cleaning up any
+/// The scratch directory is created on the first [`SpillStore::new_spill`]
+/// call, not at construction, so opening a dataset does not require a writable
+/// temp directory. It is deleted when the store is dropped, cleaning up any
 /// files whose handles have already been dropped.
 pub struct LocalSpillStore {
     store: Arc<ObjectStore>,
-    /// Backstop cleanup: removes the whole scratch directory on drop.
-    temp_dir: Arc<tempfile::TempDir>,
+    /// Created on first spill. Backstop cleanup removes the directory on drop.
+    temp_dir: Mutex<Option<Arc<tempfile::TempDir>>>,
     file_counter: Arc<AtomicU64>,
     /// Byte budget shared across every handle, enforced while writing.
     quota: Option<DiskQuota>,
 }
 
+/// Create a unique scratch directory, retrying `PermissionDenied`.
+///
+/// Windows GitHub runners (and machines with antivirus) can reject a newly
+/// created `%TEMP%` subdirectory with `ERROR_ACCESS_DENIED`. Each attempt uses
+/// a fresh random name, so a short retry loop is the usual workaround.
+fn create_temp_dir() -> Result<tempfile::TempDir> {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 0;
+    loop {
+        match tempfile::tempdir() {
+            Ok(dir) => return Ok(dir),
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied && attempt + 1 < ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(10 * attempt as u64));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
 impl LocalSpillStore {
     /// Create a store with no disk cap.
+    ///
+    /// Construction does not touch the filesystem; the scratch directory is
+    /// created on the first [`SpillStore::new_spill`] call.
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            store: Arc::new(ObjectStore::local()),
-            temp_dir: Arc::new(tempfile::tempdir()?),
-            file_counter: Arc::new(AtomicU64::new(0)),
-            quota: None,
-        })
+        Ok(Self::default())
     }
 
     /// Create a store that returns [`lance_core::Error::DiskCapExceeded`] once
     /// total bytes written across all live handles would exceed `cap_bytes`.
     pub fn with_cap(cap_bytes: u64) -> Result<Self> {
         Ok(Self {
-            store: Arc::new(ObjectStore::local()),
-            temp_dir: Arc::new(tempfile::tempdir()?),
-            file_counter: Arc::new(AtomicU64::new(0)),
             quota: Some(DiskQuota::new(cap_bytes)),
+            ..Self::default()
         })
+    }
+
+    fn ensure_temp_dir(&self) -> Result<Arc<tempfile::TempDir>> {
+        // The lock is held only for init (and the rare PermissionDenied retry)
+        // and never across an `.await`.
+        let mut slot = self.temp_dir.lock().unwrap();
+        if let Some(dir) = slot.as_ref() {
+            return Ok(dir.clone());
+        }
+        let dir = Arc::new(create_temp_dir()?);
+        *slot = Some(dir.clone());
+        Ok(dir)
     }
 }
 
 impl Default for LocalSpillStore {
     fn default() -> Self {
-        Self::new().expect("failed to create temp directory for LocalSpillStore")
+        Self {
+            store: Arc::new(ObjectStore::local()),
+            temp_dir: Mutex::new(None),
+            file_counter: Arc::new(AtomicU64::new(0)),
+            quota: None,
+        }
     }
 }
 
 #[async_trait]
 impl SpillStore for LocalSpillStore {
     async fn new_spill(&self) -> Result<(Box<dyn Writer>, Box<dyn Spill>)> {
+        let temp_dir = self.ensure_temp_dir()?;
         let idx = self.file_counter.fetch_add(1, Ordering::Relaxed);
-        let fs_path = self.temp_dir.path().join(format!("spill_{idx:06}.bin"));
+        let fs_path = temp_dir.path().join(format!("spill_{idx:06}.bin"));
         let os_path = Path::from_absolute_path(&fs_path)?;
         let finished = Arc::new(AtomicBool::new(false));
 
@@ -253,7 +290,7 @@ impl SpillStore for LocalSpillStore {
             fs_path,
             quota: self.quota.clone(),
             finished,
-            _temp_dir: self.temp_dir.clone(),
+            _temp_dir: temp_dir,
         });
         Ok((writer, spill))
     }
@@ -385,6 +422,25 @@ mod tests {
         assert!(reader.get_all().await.unwrap().is_empty());
     }
 
+    #[test]
+    fn test_new_does_not_create_temp_dir() {
+        // Session construction must not touch the filesystem; Windows CI panics
+        // when thousands of tests each eagerly create a `%TEMP%` subdirectory.
+        let store = LocalSpillStore::new().unwrap();
+        assert!(
+            store.temp_dir.lock().unwrap().is_none(),
+            "temp directory should be created lazily on first spill"
+        );
+        assert!(
+            LocalSpillStore::default()
+                .temp_dir
+                .lock()
+                .unwrap()
+                .is_none(),
+            "Default should also defer temp directory creation"
+        );
+    }
+
     #[tokio::test]
     async fn test_raii_cleanup() {
         let store = LocalSpillStore::new().unwrap();
@@ -392,7 +448,14 @@ mod tests {
         finish_writer(writer, b"some bytes").await.unwrap();
 
         // The first spill gets a deterministic name under the store's temp dir.
-        let path = store.temp_dir.path().join("spill_000000.bin");
+        let path = store
+            .temp_dir
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("new_spill creates the temp dir")
+            .path()
+            .join("spill_000000.bin");
         assert!(path.exists());
         drop(spill);
         assert!(!path.exists(), "spill file should be deleted on drop");

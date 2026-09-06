@@ -537,6 +537,7 @@ pub struct TwoFileShuffler {
     output_dir: Path,
     num_partitions: usize,
     batch_size_bytes: usize,
+    max_preloaded_offsets_bytes: usize,
 
     progress: Arc<dyn crate::progress::IndexBuildProgress>,
 }
@@ -548,6 +549,7 @@ impl TwoFileShuffler {
             output_dir,
             num_partitions,
             batch_size_bytes: shuffle_batch_bytes(),
+            max_preloaded_offsets_bytes: MAX_PRELOADED_OFFSETS_BYTES,
             progress: crate::progress::noop_progress(),
         }
     }
@@ -560,6 +562,12 @@ impl TwoFileShuffler {
     #[cfg(test)]
     fn with_batch_size_bytes(mut self, batch_size_bytes: usize) -> Self {
         self.batch_size_bytes = batch_size_bytes;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_max_preloaded_offsets_bytes(mut self, max_preloaded_offsets_bytes: usize) -> Self {
+        self.max_preloaded_offsets_bytes = max_preloaded_offsets_bytes;
         self
     }
 }
@@ -578,7 +586,11 @@ type InterleaveResult = (Vec<(usize, usize)>, Vec<u64>);
 /// Also returns per-partition row counts (derived from the same sorted keys at no
 /// extra cost).
 ///
-/// Returns an error if any partition ID is out of range `[0, num_partitions)`.
+/// Returns an error if any partition ID is null or out of range `[0, num_partitions)`.
+///
+/// `PrimitiveArray::values()` stores a 0 in null slots. Treating those as
+/// partition 0 would silently move filtered/invalid rows into the first IVF
+/// partition.
 fn sort_to_interleave_indices(
     part_id_columns: &[&UInt32Array],
     num_partitions: usize,
@@ -587,8 +599,14 @@ fn sort_to_interleave_indices(
     let mut keys: Vec<(u32, u32, u32)> = Vec::with_capacity(total_rows);
     for (batch_idx, col) in part_id_columns.iter().enumerate() {
         let batch_idx = batch_idx as u32;
-        for (row_idx, &part_id) in col.values().iter().enumerate() {
-            keys.push((part_id, batch_idx, row_idx as u32));
+        for row_idx in 0..col.len() {
+            if col.is_null(row_idx) {
+                return Err(Error::invalid_input(format!(
+                    "null partition ID at batch {} row {}",
+                    batch_idx, row_idx
+                )));
+            }
+            keys.push((col.value(row_idx), batch_idx, row_idx as u32));
         }
     }
     keys.sort_unstable_by_key(|k| k.0);
@@ -650,6 +668,11 @@ impl Shuffler for TwoFileShuffler {
         let mut total_loss = 0.0f64;
         let mut accumulated: Vec<RecordBatch> = Vec::new();
         let mut acc_bytes: usize = 0;
+        // Keep flush-time prefix sums so the consumer does not have to re-decode
+        // the sidecar. Drop the in-memory copy once it would exceed
+        // `max_preloaded_offsets_bytes`; the sidecar remains the bounded
+        // on-demand fallback.
+        let mut written_offsets = BoundedWrittenOffsets::new(self.max_preloaded_offsets_bytes);
 
         let mut data = std::pin::pin!(data);
         while let Some(batch) = data.next().await {
@@ -670,6 +693,7 @@ impl Shuffler for TwoFileShuffler {
                     offsets_schema.clone(),
                     num_partitions,
                     global_row_count,
+                    &mut written_offsets,
                 )
                 .await?;
                 acc_bytes = 0;
@@ -693,6 +717,7 @@ impl Shuffler for TwoFileShuffler {
                 offsets_schema,
                 num_partitions,
                 global_row_count,
+                &mut written_offsets,
             )
             .await?;
             for (p, c) in counts.iter().enumerate() {
@@ -709,13 +734,15 @@ impl Shuffler for TwoFileShuffler {
         file_writer.finish().await?;
         offsets_writer.finish().await?;
 
-        TwoFileShuffleReader::try_new(
+        TwoFileShuffleReader::try_new_with_preload_limit(
             self.object_store.clone(),
             self.output_dir.clone(),
             num_partitions,
             num_batches,
             partition_counts,
             total_loss,
+            self.max_preloaded_offsets_bytes,
+            written_offsets.into_offsets(),
         )
         .await
     }
@@ -732,9 +759,8 @@ async fn flush_shuffle_batch(
     offsets_schema: Arc<Schema>,
     num_partitions: usize,
     global_row_count: u64,
+    written_offsets: &mut BoundedWrittenOffsets,
 ) -> Result<(u64, Vec<u64>)> {
-    let total_rows: u64 = accumulated.iter().map(|b| b.num_rows() as u64).sum();
-
     // Clone part-id columns into the CPU task (cheap: Arc ref bump, not data copy).
     let part_id_cols: Vec<UInt32Array> = accumulated
         .iter()
@@ -748,6 +774,20 @@ async fn flush_shuffle_batch(
     let (interleave_indices, batch_partition_counts) =
         spawn_cpu(move || sort_to_interleave_indices(&part_id_cols.iter().collect::<Vec<_>>(), np))
             .await?;
+
+    let total_rows = u64::try_from(interleave_indices.len()).map_err(|_| {
+        Error::invalid_input(format!(
+            "shuffle flush has {} rows, which cannot be represented as u64",
+            interleave_indices.len()
+        ))
+    })?;
+    let counted_rows: u64 = batch_partition_counts.iter().sum();
+    if counted_rows != total_rows {
+        return Err(Error::invalid_input(format!(
+            "partition counts sum to {} rows but the flush is interleaving {} rows",
+            counted_rows, total_rows
+        )));
+    }
 
     // Drop part-id column from source batches before interleaving.
     let source_batches: Vec<RecordBatch> = accumulated
@@ -770,6 +810,15 @@ async fn flush_shuffle_batch(
         running += count;
         adjusted_offsets.push(global_row_count + running);
     }
+    if adjusted_offsets.last().copied() != Some(global_row_count + total_rows) {
+        return Err(Error::invalid_input(format!(
+            "flush end offset {:?} does not equal global_row_count {} + total_rows {}",
+            adjusted_offsets.last(),
+            global_row_count,
+            total_rows
+        )));
+    }
+    written_offsets.retain(&adjusted_offsets)?;
     let offsets_batch = RecordBatch::try_new(
         offsets_schema,
         vec![Arc::new(UInt64Array::from(adjusted_offsets))],
@@ -795,6 +844,21 @@ enum ShuffleOffsets {
     OnDemand(FileReader),
 }
 
+/// How the shuffle reader should obtain partition offsets.
+///
+/// A writer-side capacity/allocation fallback must stay on-demand through
+/// reader construction. Recomputing preload eligibility from logical length
+/// would retry `Vec` allocation after the writer already dropped its copy.
+enum OffsetPreloadSource {
+    /// Writer-side prefix sums. Allocated capacity is already bounded.
+    Writer(Vec<u64>),
+    /// Writer dropped its copy after a capacity or reservation fallback.
+    ForcedOnDemand,
+    /// Reopening files without a writer copy. Decide from the byte cap, but
+    /// sidecar preload itself must still be fallible and capacity-checked.
+    Sidecar,
+}
+
 impl TwoFileShuffleReader {
     pub(super) async fn try_new(
         object_store: Arc<ObjectStore>,
@@ -812,10 +876,12 @@ impl TwoFileShuffleReader {
             partition_counts,
             total_loss,
             MAX_PRELOADED_OFFSETS_BYTES,
+            OffsetPreloadSource::Sidecar,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_new_with_preload_limit(
         object_store: Arc<ObjectStore>,
         output_dir: Path,
@@ -824,6 +890,7 @@ impl TwoFileShuffleReader {
         partition_counts: Vec<u64>,
         total_loss: f64,
         max_preloaded_offsets_bytes: usize,
+        offset_source: OffsetPreloadSource,
     ) -> Result<Box<dyn ShuffleReader>> {
         if num_batches == 0 {
             return Ok(Box::new(EmptyReader));
@@ -836,18 +903,6 @@ impl TwoFileShuffleReader {
         let file_reader = FileReader::try_open(
             scheduler
                 .open_file(&data_path, &CachedFileSize::unknown())
-                .await?,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &LanceCache::no_cache(),
-            FileReaderOptions::default(),
-        )
-        .await?;
-
-        let offsets_path = output_dir.clone().join("shuffle_offsets.lance");
-        let offsets_reader = FileReader::try_open(
-            scheduler
-                .open_file(&offsets_path, &CachedFileSize::unknown())
                 .await?,
             None,
             Arc::<DecoderPlugins>::default(),
@@ -876,89 +931,86 @@ impl TwoFileShuffleReader {
                 num_batches, num_partitions
             ))
         })?;
-        let expected_offsets_u64 = u64::try_from(expected_offsets).map_err(|_| {
-            Error::invalid_input(format!(
-                "expected offset count {} cannot be represented as u64",
-                expected_offsets
-            ))
-        })?;
-        if offsets_reader.num_rows() != expected_offsets_u64 {
-            return Err(Error::corrupt_file(
-                offsets_path.clone(),
-                format!(
-                    "offset count is {}, expected num_batches={} * num_partitions={} = {}",
-                    offsets_reader.num_rows(),
+        let offsets_path = output_dir.clone().join("shuffle_offsets.lance");
+        let offsets = match offset_source {
+            OffsetPreloadSource::Writer(written_offsets) => {
+                if written_offsets.len() != expected_offsets {
+                    return Err(Error::invalid_input(format!(
+                        "writer produced {} offsets, expected num_batches={} * num_partitions={} = {}",
+                        written_offsets.len(),
+                        num_batches,
+                        num_partitions,
+                        expected_offsets
+                    )));
+                }
+                let mut validator = ShuffleOffsetsValidator::new(
+                    expected_offsets,
+                    num_partitions,
+                    file_reader.num_rows(),
+                    &partition_counts,
+                    &offsets_path,
+                );
+                validator.push(&written_offsets)?;
+                validator.finish()?;
+                if should_preload_offsets(written_offsets.len(), max_preloaded_offsets_bytes)?
+                    && should_preload_offsets(
+                        written_offsets.capacity(),
+                        max_preloaded_offsets_bytes,
+                    )?
+                {
+                    // Prefer the prefix sums computed at flush time over a decode
+                    // of the ephemeral sidecar.
+                    ShuffleOffsets::Preloaded(written_offsets)
+                } else {
+                    // Writer-side copy exceeded the resident-memory bound. The
+                    // sidecar is still on disk; validate-and-stream it on demand.
+                    drop(written_offsets);
+                    load_shuffle_offsets_from_file(
+                        &scheduler,
+                        &offsets_path,
+                        expected_offsets,
+                        num_batches,
+                        num_partitions,
+                        file_reader.num_rows(),
+                        &partition_counts,
+                        false,
+                        max_preloaded_offsets_bytes,
+                    )
+                    .await?
+                }
+            }
+            OffsetPreloadSource::ForcedOnDemand => {
+                // The writer already fell back; do not recompute eligibility
+                // from logical length and retry a full preload.
+                load_shuffle_offsets_from_file(
+                    &scheduler,
+                    &offsets_path,
+                    expected_offsets,
                     num_batches,
                     num_partitions,
-                    expected_offsets
-                ),
-            ));
-        }
-
-        let offsets_schema = offsets_reader.schema();
-        let offset_field = offsets_schema.field("offset").ok_or_else(|| {
-            Error::corrupt_file(
-                offsets_path.clone(),
-                "required non-null UInt64 column 'offset' is missing",
-            )
-        })?;
-        if offset_field.data_type() != DataType::UInt64 || offset_field.nullable {
-            return Err(Error::corrupt_file(
-                offsets_path.clone(),
-                format!(
-                    "column 'offset' must be non-null UInt64, found {:?} (nullable={})",
-                    offset_field.data_type(),
-                    offset_field.nullable
-                ),
-            ));
-        }
-
-        let should_preload_offsets =
-            should_preload_offsets(expected_offsets, max_preloaded_offsets_bytes)?;
-        let mut offsets = should_preload_offsets.then(|| Vec::with_capacity(expected_offsets));
-        let mut validator = ShuffleOffsetsValidator::new(
-            expected_offsets,
-            num_partitions,
-            file_reader.num_rows(),
-            &partition_counts,
-            &offsets_path,
-        );
-        let mut offsets_stream = offsets_reader
-            .read_stream(
-                ReadBatchParams::RangeFull,
-                1024 * 1024,
-                16,
-                FilterExpression::no_filter(),
-            )
-            .await?;
-        while let Some(batch) = offsets_stream.try_next().await? {
-            let offset_column = batch
-                .column_by_name("offset")
-                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
-                .ok_or_else(|| {
-                    Error::corrupt_file(
-                        offsets_path.clone(),
-                        "required UInt64 column 'offset' is missing from decoded batch",
-                    )
-                })?;
-            if offset_column.null_count() != 0 {
-                return Err(Error::corrupt_file(
-                    offsets_path.clone(),
-                    format!(
-                        "column 'offset' contains {} null values",
-                        offset_column.null_count()
-                    ),
-                ));
+                    file_reader.num_rows(),
+                    &partition_counts,
+                    false,
+                    max_preloaded_offsets_bytes,
+                )
+                .await?
             }
-            validator.push(offset_column.values())?;
-            if let Some(offsets) = offsets.as_mut() {
-                offsets.extend_from_slice(offset_column.values());
+            OffsetPreloadSource::Sidecar => {
+                let should_preload_offsets =
+                    should_preload_offsets(expected_offsets, max_preloaded_offsets_bytes)?;
+                load_shuffle_offsets_from_file(
+                    &scheduler,
+                    &offsets_path,
+                    expected_offsets,
+                    num_batches,
+                    num_partitions,
+                    file_reader.num_rows(),
+                    &partition_counts,
+                    should_preload_offsets,
+                    max_preloaded_offsets_bytes,
+                )
+                .await?
             }
-        }
-        validator.finish()?;
-        let offsets = match offsets {
-            Some(offsets) => ShuffleOffsets::Preloaded(offsets),
-            None => ShuffleOffsets::OnDemand(offsets_reader),
         };
         let decoded_schema: Schema = file_reader.schema().as_ref().into();
         let estimated_row_bytes = estimate_decoded_row_bytes(&decoded_schema)?;
@@ -1133,6 +1185,225 @@ fn should_preload_offsets(expected_offsets: usize, max_bytes: usize) -> Result<b
     Ok(offsets_bytes <= max_bytes)
 }
 
+/// Allocate a Vec for `len` u64 offsets if both the logical size and the
+/// allocated capacity fit in `max_bytes`.
+///
+/// Returns `None` on reservation failure or allocator rounding past the
+/// ceiling so the caller can stay on-demand instead of panicking.
+fn try_allocate_preloaded_offsets(len: usize, max_bytes: usize) -> Result<Option<Vec<u64>>> {
+    if !should_preload_offsets(len, max_bytes)? {
+        return Ok(None);
+    }
+    let mut offsets = Vec::new();
+    if offsets.try_reserve_exact(len).is_err()
+        || !should_preload_offsets(offsets.capacity(), max_bytes)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(offsets))
+}
+
+/// Writer-side prefix sums kept only while their allocated `Vec` capacity
+/// fits in `max_bytes`.
+///
+/// Once a flush would exceed the bound the in-memory copy is dropped; the
+/// offsets sidecar remains the on-demand fallback. Growth uses
+/// [`Vec::try_reserve_exact`] rather than amortized doubling, and the copy
+/// is dropped if the allocator still rounds capacity above `max_bytes`.
+struct BoundedWrittenOffsets {
+    offsets: Option<Vec<u64>>,
+    max_bytes: usize,
+}
+
+impl BoundedWrittenOffsets {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            offsets: Some(Vec::new()),
+            max_bytes,
+        }
+    }
+
+    fn retain(&mut self, new_offsets: &[u64]) -> Result<()> {
+        let Some(offsets) = self.offsets.as_mut() else {
+            return Ok(());
+        };
+        let new_len = offsets
+            .len()
+            .checked_add(new_offsets.len())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "written offset count {} + {} overflows usize",
+                    offsets.len(),
+                    new_offsets.len()
+                ))
+            })?;
+        if !should_preload_offsets(new_len, self.max_bytes)? {
+            self.offsets = None;
+            return Ok(());
+        }
+        // `Vec::extend` doubles capacity, which can allocate past `max_bytes`
+        // even when `len * size_of::<u64>()` still fits. Reserve exactly and
+        // drop if the allocator still rounds above the ceiling.
+        if new_len > offsets.capacity()
+            && (offsets.try_reserve_exact(new_offsets.len()).is_err()
+                || !should_preload_offsets(offsets.capacity(), self.max_bytes)?)
+        {
+            self.offsets = None;
+            return Ok(());
+        }
+        offsets.extend_from_slice(new_offsets);
+        Ok(())
+    }
+
+    fn into_offsets(self) -> OffsetPreloadSource {
+        match self.offsets {
+            Some(offsets) => OffsetPreloadSource::Writer(offsets),
+            None => OffsetPreloadSource::ForcedOnDemand,
+        }
+    }
+}
+
+async fn open_shuffle_offsets_reader(
+    scheduler: &Arc<ScanScheduler>,
+    offsets_path: &Path,
+    expected_offsets: usize,
+    num_batches: usize,
+    num_partitions: usize,
+) -> Result<FileReader> {
+    let offsets_reader = FileReader::try_open(
+        scheduler
+            .open_file(offsets_path, &CachedFileSize::unknown())
+            .await?,
+        None,
+        Arc::<DecoderPlugins>::default(),
+        &LanceCache::no_cache(),
+        FileReaderOptions::default(),
+    )
+    .await?;
+    let expected_offsets_u64 = u64::try_from(expected_offsets).map_err(|_| {
+        Error::invalid_input(format!(
+            "expected offset count {} cannot be represented as u64",
+            expected_offsets
+        ))
+    })?;
+    if offsets_reader.num_rows() != expected_offsets_u64 {
+        return Err(Error::corrupt_file(
+            offsets_path.clone(),
+            format!(
+                "offset count is {}, expected num_batches={} * num_partitions={} = {}",
+                offsets_reader.num_rows(),
+                num_batches,
+                num_partitions,
+                expected_offsets
+            ),
+        ));
+    }
+    let offsets_schema = offsets_reader.schema();
+    let offset_field = offsets_schema.field("offset").ok_or_else(|| {
+        Error::corrupt_file(
+            offsets_path.clone(),
+            "required non-null UInt64 column 'offset' is missing",
+        )
+    })?;
+    if offset_field.data_type() != DataType::UInt64 || offset_field.nullable {
+        return Err(Error::corrupt_file(
+            offsets_path.clone(),
+            format!(
+                "column 'offset' must be non-null UInt64, found {:?} (nullable={})",
+                offset_field.data_type(),
+                offset_field.nullable
+            ),
+        ));
+    }
+    Ok(offsets_reader)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn load_shuffle_offsets_from_file(
+    scheduler: &Arc<ScanScheduler>,
+    offsets_path: &Path,
+    expected_offsets: usize,
+    num_batches: usize,
+    num_partitions: usize,
+    data_rows: u64,
+    partition_counts: &[u64],
+    preload: bool,
+    max_preloaded_offsets_bytes: usize,
+) -> Result<ShuffleOffsets> {
+    let offsets_reader = open_shuffle_offsets_reader(
+        scheduler,
+        offsets_path,
+        expected_offsets,
+        num_batches,
+        num_partitions,
+    )
+    .await?;
+    let mut offsets = if preload {
+        try_allocate_preloaded_offsets(expected_offsets, max_preloaded_offsets_bytes)?
+    } else {
+        None
+    };
+    let mut validator = ShuffleOffsetsValidator::new(
+        expected_offsets,
+        num_partitions,
+        data_rows,
+        partition_counts,
+        offsets_path,
+    );
+    let mut offsets_stream = offsets_reader
+        .read_stream(
+            ReadBatchParams::RangeFull,
+            1024 * 1024,
+            16,
+            FilterExpression::no_filter(),
+        )
+        .await?;
+    while let Some(batch) = offsets_stream.try_next().await? {
+        let offset_column = batch
+            .column_by_name("offset")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                Error::corrupt_file(
+                    offsets_path.clone(),
+                    "required UInt64 column 'offset' is missing from decoded batch",
+                )
+            })?;
+        if offset_column.null_count() != 0 {
+            return Err(Error::corrupt_file(
+                offsets_path.clone(),
+                format!(
+                    "column 'offset' contains {} null values",
+                    offset_column.null_count()
+                ),
+            ));
+        }
+        if offset_column.values().len() != offset_column.len() {
+            return Err(Error::corrupt_file(
+                offsets_path.clone(),
+                format!(
+                    "offset values buffer length {} does not match array length {}",
+                    offset_column.values().len(),
+                    offset_column.len()
+                ),
+            ));
+        }
+        let decoded = offset_column.values().as_ref();
+        validator.push(decoded)?;
+        if let Some(offsets) = offsets.as_mut() {
+            offsets.extend_from_slice(decoded);
+        }
+    }
+    validator.finish()?;
+    Ok(match offsets {
+        Some(offsets)
+            if should_preload_offsets(offsets.capacity(), max_preloaded_offsets_bytes)? =>
+        {
+            ShuffleOffsets::Preloaded(offsets)
+        }
+        _ => ShuffleOffsets::OnDemand(offsets_reader),
+    })
+}
+
 struct ShuffleOffsetsValidator<'a> {
     expected_offsets: usize,
     num_partitions: usize,
@@ -1233,8 +1504,12 @@ impl<'a> ShuffleOffsetsValidator<'a> {
             return Err(Error::corrupt_file(
                 self.offsets_path.clone(),
                 format!(
-                    "offset-derived count {} for partition {} does not match expected count {}",
-                    decoded, partition_id, expected
+                    "offset-derived count {} for partition {} does not match expected count {}; offset-derived counts={:?} expected counts={:?}",
+                    decoded,
+                    partition_id,
+                    expected,
+                    self.decoded_partition_counts,
+                    self.partition_counts
                 ),
             ));
         }
@@ -1998,6 +2273,7 @@ mod tests {
             vec![2, 1, 1, 3, 0],
             0.0,
             0,
+            OffsetPreloadSource::Sidecar,
         )
         .await
         .unwrap();
@@ -2089,12 +2365,13 @@ mod tests {
 
         let fallback_reader = TwoFileShuffleReader::try_new_with_preload_limit(
             Arc::new(ObjectStore::local()),
-            output_dir,
+            output_dir.clone(),
             3,
             2,
             vec![1, 2, 1],
             0.0,
             0,
+            OffsetPreloadSource::Sidecar,
         )
         .await
         .unwrap();
@@ -2105,6 +2382,118 @@ mod tests {
         assert_eq!(window.partition_range, 1..2);
         assert_eq!(window.partitions.len(), 1);
         assert_eq!(window.partitions[0].partition_id, 1);
+
+        // Writer-side offsets that exceed the byte cap must take the same
+        // sidecar on-demand path rather than staying Preloaded.
+        let over_limit_reader = TwoFileShuffleReader::try_new_with_preload_limit(
+            Arc::new(ObjectStore::local()),
+            output_dir,
+            3,
+            2,
+            vec![1, 2, 1],
+            0.0,
+            0,
+            OffsetPreloadSource::Writer(vec![1, 2, 2, 2, 3, 4]),
+        )
+        .await
+        .unwrap();
+        let window = over_limit_reader
+            .read_partition_window(1, DEFAULT_PARTITION_WINDOW_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(window.partition_range, 1..2);
+        let partition = collect_partition(over_limit_reader.as_ref(), 1)
+            .await
+            .unwrap();
+        let values: &Int32Array = partition["val"].as_primitive();
+        assert_eq!(values.values(), &[20, 30]);
+    }
+
+    #[tokio::test]
+    async fn test_shuffle_spills_offsets_when_preload_limit_is_zero() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let reader = TwoFileShuffler::new(output_dir, 3)
+            .with_batch_size_bytes(1)
+            .with_max_preloaded_offsets_bytes(0)
+            .shuffle(batches_to_stream(vec![
+                make_batch(&[0, 1], &[10, 20], None),
+                make_batch(&[1, 2], &[30, 40], None),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(reader.partition_size(0).unwrap(), 1);
+        assert_eq!(reader.partition_size(1).unwrap(), 2);
+        assert_eq!(reader.partition_size(2).unwrap(), 1);
+        let p1 = collect_partition(reader.as_ref(), 1).await.unwrap();
+        let values: &Int32Array = p1["val"].as_primitive();
+        assert_eq!(values.values(), &[20, 30]);
+        // On-demand offsets cannot coalesce a window.
+        let window = reader
+            .read_partition_window(0, DEFAULT_PARTITION_WINDOW_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(window.partition_range, 0..1);
+    }
+
+    #[tokio::test]
+    async fn test_forced_on_demand_does_not_repreload_when_logical_size_fits() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let reader = TwoFileShuffler::new(output_dir.clone(), 3)
+            .with_batch_size_bytes(1)
+            .shuffle(batches_to_stream(vec![
+                make_batch(&[0, 1], &[10, 20], None),
+                make_batch(&[1, 2], &[30, 40], None),
+            ]))
+            .await
+            .unwrap();
+        drop(reader);
+
+        // Logical table is 2 batches * 3 partitions * 8 bytes = 48 bytes, well
+        // under the default 256 MiB cap. ForcedOnDemand must still stay
+        // on-demand instead of retrying a full sidecar preload.
+        let forced = TwoFileShuffleReader::try_new_with_preload_limit(
+            Arc::new(ObjectStore::local()),
+            output_dir.clone(),
+            3,
+            2,
+            vec![1, 2, 1],
+            0.0,
+            MAX_PRELOADED_OFFSETS_BYTES,
+            OffsetPreloadSource::ForcedOnDemand,
+        )
+        .await
+        .unwrap();
+        let forced_plan = forced
+            .plan_partition_window(0, DEFAULT_PARTITION_WINDOW_BYTES)
+            .unwrap();
+        assert_eq!(
+            forced_plan.partition_range,
+            0..1,
+            "ForcedOnDemand must not re-preload from the sidecar"
+        );
+
+        let sidecar = TwoFileShuffleReader::try_new_with_preload_limit(
+            Arc::new(ObjectStore::local()),
+            output_dir,
+            3,
+            2,
+            vec![1, 2, 1],
+            0.0,
+            MAX_PRELOADED_OFFSETS_BYTES,
+            OffsetPreloadSource::Sidecar,
+        )
+        .await
+        .unwrap();
+        let sidecar_plan = sidecar
+            .plan_partition_window(0, DEFAULT_PARTITION_WINDOW_BYTES)
+            .unwrap();
+        assert!(
+            sidecar_plan.partition_range.end > 1,
+            "sidecar reopen with room under the cap should preload and coalesce"
+        );
     }
 
     #[test]
@@ -2285,6 +2674,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_try_allocate_preloaded_offsets_is_fallible_and_capacity_checked() {
+        let elem = std::mem::size_of::<u64>();
+        let allocated = try_allocate_preloaded_offsets(4, 4 * elem)
+            .unwrap()
+            .expect("logical size fits");
+        assert!(allocated.capacity() * elem <= 4 * elem);
+
+        assert!(
+            try_allocate_preloaded_offsets(5, 4 * elem)
+                .unwrap()
+                .is_none(),
+            "logical size above the cap must stay on-demand"
+        );
+    }
+
+    fn assert_allocated_bytes_within_limit(written: &BoundedWrittenOffsets, max_bytes: usize) {
+        let Some(offsets) = written.offsets.as_ref() else {
+            return;
+        };
+        let allocated = offsets
+            .capacity()
+            .checked_mul(std::mem::size_of::<u64>())
+            .expect("capacity * size_of::<u64> overflows");
+        assert!(
+            allocated <= max_bytes,
+            "allocated {allocated} bytes exceeds cap {max_bytes} (len={}, capacity={})",
+            offsets.len(),
+            offsets.capacity()
+        );
+    }
+
+    #[test]
+    fn test_bounded_written_offsets_drops_copy_at_byte_limit() {
+        let max_bytes = 2 * std::mem::size_of::<u64>();
+        let mut written = BoundedWrittenOffsets::new(max_bytes);
+        written.retain(&[1, 2]).unwrap();
+        assert_eq!(written.offsets.as_deref(), Some(&[1, 2][..]));
+        assert_allocated_bytes_within_limit(&written, max_bytes);
+
+        written.retain(&[3]).unwrap();
+        assert!(
+            written.offsets.is_none(),
+            "exceeding the preload cap must drop the in-memory copy"
+        );
+
+        written.retain(&[4]).unwrap();
+        assert!(
+            written.offsets.is_none(),
+            "a dropped copy must stay dropped"
+        );
+        assert!(matches!(
+            written.into_offsets(),
+            OffsetPreloadSource::ForcedOnDemand
+        ));
+    }
+
+    #[test]
+    fn test_bounded_written_offsets_allocated_capacity_stays_within_limit() {
+        // 3 u64s = 24 bytes. A first retain of 2 typically allocates capacity 2.
+        // A second retain of 1 still fits by length (24 bytes) but amortized
+        // doubling would grow capacity to 4 = 32 bytes, past the ceiling.
+        let max_bytes = 3 * std::mem::size_of::<u64>();
+        let mut written = BoundedWrittenOffsets::new(max_bytes);
+        written.retain(&[1, 2]).unwrap();
+        assert_eq!(written.offsets.as_deref(), Some(&[1, 2][..]));
+        assert_allocated_bytes_within_limit(&written, max_bytes);
+
+        written.retain(&[3]).unwrap();
+        if let Some(offsets) = written.offsets.as_ref() {
+            assert_eq!(offsets.as_slice(), &[1, 2, 3]);
+        }
+        assert_allocated_bytes_within_limit(&written, max_bytes);
+
+        // Filling the cap in a single retain must also keep allocated bytes
+        // at or below the ceiling.
+        let mut written = BoundedWrittenOffsets::new(max_bytes);
+        written.retain(&[1, 2, 3]).unwrap();
+        assert_eq!(written.offsets.as_deref(), Some(&[1, 2, 3][..]));
+        assert_allocated_bytes_within_limit(&written, max_bytes);
+    }
+
     #[tokio::test]
     async fn test_two_file_shuffler_multi_batch_single_flush() {
         // All three batches fit within the default batch_size_bytes, so they
@@ -2342,6 +2813,69 @@ mod tests {
         };
         assert!(
             err.to_string().contains("partition ID 5 is out of range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// CI failed `test_ann_with_deletion` with:
+    /// `offset-derived count 127 for partition 0 does not match expected count 126`
+    /// on a 512-row IVF shuffle into 4 partitions. This is that exact histogram.
+    #[tokio::test]
+    async fn test_two_file_shuffler_uneven_512_rows_four_partitions() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let num_partitions = 4;
+
+        let mut part_ids = Vec::with_capacity(512);
+        part_ids.extend(std::iter::repeat_n(0u32, 126));
+        part_ids.extend(std::iter::repeat_n(1u32, 130));
+        part_ids.extend(std::iter::repeat_n(2u32, 128));
+        part_ids.extend(std::iter::repeat_n(3u32, 128));
+        let values: Vec<i32> = (0..512).collect();
+        let batch = make_batch(&part_ids, &values, None);
+
+        let shuffler = TwoFileShuffler::new(output_dir, num_partitions);
+        let reader = shuffler
+            .shuffle(batches_to_stream(vec![batch]))
+            .await
+            .unwrap();
+
+        assert_eq!(reader.partition_size(0).unwrap(), 126);
+        assert_eq!(reader.partition_size(1).unwrap(), 130);
+        assert_eq!(reader.partition_size(2).unwrap(), 128);
+        assert_eq!(reader.partition_size(3).unwrap(), 128);
+
+        let p0 = collect_partition(reader.as_ref(), 0).await.unwrap();
+        assert_eq!(p0.num_rows(), 126);
+        let p1 = collect_partition(reader.as_ref(), 1).await.unwrap();
+        assert_eq!(p1.num_rows(), 130);
+    }
+
+    /// Nullable `__ivf_part_id` must not be treated as partition 0 via `values()`.
+    #[tokio::test]
+    async fn test_two_file_shuffler_rejects_null_partition_ids() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(PART_ID_COLUMN, DataType::UInt32, true),
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt32Array::from(vec![Some(0), None, Some(1)])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+
+        let shuffler = TwoFileShuffler::new(output_dir, 2);
+        let Err(err) = shuffler.shuffle(batches_to_stream(vec![batch])).await else {
+            panic!("expected an error for null partition IDs");
+        };
+        assert!(
+            err.to_string().contains("null partition ID"),
             "unexpected error: {err}"
         );
     }
