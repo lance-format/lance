@@ -401,23 +401,27 @@ message DataFragment {
    * first row is row 1, the second row is row 42, and the third row is row 3.
    */
   oneof row_id_sequence {
-    // If small (< 200KB), the row ids are stored inline.
+    // Current Lance writers store row ids inline regardless of encoded size.
     bytes inline_row_ids = 5;
-    // Otherwise, stored as part of a file.
+    // Supported by current Lance readers, but not emitted by current Lance writers.
     ExternalFile external_row_ids = 6;
   } // row_id_sequence
 
   oneof last_updated_at_version_sequence {
-    // If small (< 200KB), the row latest updated versions are stored inline.
+    // Current Lance writers store last-updated versions inline regardless of encoded size.
     bytes inline_last_updated_at_versions = 7;
-    // Otherwise, stored as part of a file.
+    /* Valid external alternative. Current Lance writers do not emit this field,
+     * and current Lance readers cannot load it.
+     */
     ExternalFile external_last_updated_at_versions = 8;
   } // last_updated_at_version_sequence
 
   oneof created_at_version_sequence {
-    // If small (< 200KB), the row created at versions are stored inline.
+    // Current Lance writers store created-at versions inline regardless of encoded size.
     bytes inline_created_at_versions = 9;
-    // Otherwise, stored as part of a file.
+    /* Valid external alternative. Current Lance writers do not emit this field,
+     * and current Lance readers cannot load it.
+     */
     ExternalFile external_created_at_versions = 10;
   } // created_at_version_sequence
 
