@@ -26,7 +26,7 @@ use crate::dataset::files::arrow::{TRACKED_FILES_SCHEMA, TrackedFileBatch};
 use crate::dataset::files::file_types::FileType;
 use crate::dataset::files::scan::{ManifestScan, scan_manifests};
 use crate::dataset::{DATA_DIR, INDICES_DIR, TRANSACTIONS_DIR};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use lance_table::io::deletion::relative_deletion_file_path;
 
 mod arrow;
@@ -35,11 +35,29 @@ pub(crate) mod scan;
 
 const BATCH_SIZE: usize = 4096;
 
-fn remove_prefix(path: &Path, prefix: &Path) -> Path {
-    match path.prefix_match(prefix) {
-        Some(parts) => Path::from_iter(parts),
-        None => path.clone(),
-    }
+/// Make `path` relative to `prefix`, because a dataset records root-relative paths.
+///
+/// Errors when `path` is not under `prefix`: the root-relative path the caller asked for
+/// is not recoverable there, and `tracked_files` and `all_files` both document their
+/// `path` column as relative to `base_uri`, so returning the absolute path would break
+/// that contract silently.
+///
+/// Only callers that pass a location the store handed back can reach that error: a path
+/// built by joining onto that base always stays under it, because `Path::join` appends a
+/// single percent-encoded segment.
+///
+/// Propagate it unless you are classifying one already-listed object: dropping an entry
+/// while building a keep-set leaves a live file out of the set, and cleanup then deletes a
+/// file the manifest still references.
+///
+/// `path == prefix` is not an error. `prefix_match` matches with nothing left over, so
+/// the result is the empty path.
+pub(crate) fn strip_prefix(path: &Path, prefix: &Path) -> Result<Path> {
+    path.prefix_match(prefix).map(Path::from_iter).ok_or_else(|| {
+        Error::internal(format!(
+            "path {path} is not under the dataset base {prefix}; a root-relative path was expected"
+        ))
+    })
 }
 
 /// A single row destined for the `tracked_files` output.
@@ -223,13 +241,11 @@ async fn get_index_files(
     }
 
     // Phase 3: collect paths for the requested UUIDs in order.
-    let mut paths = Vec::new();
+    let mut paths = Vec::with_capacity(uuids.iter().map(|uuid| cache[uuid].len()).sum());
     for uuid in &uuids {
-        paths.extend(
-            cache[uuid]
-                .iter()
-                .map(|meta| remove_prefix(&meta.location, base)),
-        );
+        for meta in cache[uuid].iter() {
+            paths.push(strip_prefix(&meta.location, base)?);
+        }
     }
     Ok(paths)
 }
@@ -285,6 +301,12 @@ impl Dataset {
     /// | `type`     | `Dictionary(Int8, Utf8)` (non-null)  | One of: `data file`, `manifest`, `deletion file`, `transaction file`, `index file` |
     ///
     /// Output order is non-deterministic.
+    ///
+    /// # Errors
+    ///
+    /// The stream fails if the object store reports a manifest or index location that is
+    /// not under the dataset's base, because `path` would then not be relative to
+    /// `base_uri`.
     pub async fn tracked_files(&self) -> SendableRecordBatchStream {
         self.tracked_files_with_options(TrackedFilesOptions::default())
             .await
@@ -426,6 +448,13 @@ impl Dataset {
     /// | `path`          | `Utf8` (non-null)                          | Relative to `base_uri` |
     /// | `size_bytes`    | `Int64` (non-null)                         | File size in bytes |
     /// | `last_modified` | `Timestamp(Microsecond, "UTC")` (non-null) | Last modification time |
+    ///
+    /// # Errors
+    ///
+    /// The stream fails if the object store reports a location that is not under the
+    /// dataset's base, because `path` would then not be relative to `base_uri`. Rather
+    /// than emit a row that breaks that contract, the batch containing it fails, which
+    /// ends the stream for any consumer that stops at the first error.
     pub async fn all_files(&self) -> SendableRecordBatchStream {
         let base = self.base.clone();
         let uri = self.uri().to_string();
@@ -463,7 +492,7 @@ fn build_all_files_batch(
     let mut ts_builder = TimestampMicrosecondBuilder::with_capacity(n).with_timezone("UTC");
 
     for meta in chunk {
-        let rel = remove_prefix(&meta.location, base);
+        let rel = strip_prefix(&meta.location, base)?;
         base_uri_builder.append_value(uri);
         path_builder.append_value(rel.as_ref());
         size_builder.append_value(meta.size as i64);
@@ -494,6 +523,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::some_batch;
+    use rstest::rstest;
     use std::collections::HashSet;
 
     async fn collect_rows(stream: SendableRecordBatchStream) -> Vec<RecordBatch> {
@@ -552,6 +582,66 @@ mod tests {
         )
         .unwrap();
         RecordBatchIterator::new(vec![Ok(batch)], schema)
+    }
+
+    /// The equal case is pinned because `all_files` reports the result as a file path: were
+    /// `prefix_match` to start rejecting it, a benign empty entry would fail a whole batch.
+    #[rstest]
+    #[case::a_nested_file("bucket/dataset/data/x.lance", "data/x.lance")]
+    #[case::the_base_itself("bucket/dataset", "")]
+    fn strip_prefix_makes_a_path_root_relative(#[case] path: &str, #[case] expected: &str) {
+        let base = Path::from("bucket/dataset");
+        assert_eq!(
+            strip_prefix(&Path::from(path), &base).unwrap(),
+            Path::from(expected)
+        );
+    }
+
+    /// A path outside the base must error, not fall back to the absolute path.
+    ///
+    /// The sibling case pins that the match is per path segment: a byte-wise
+    /// `str::strip_prefix` would have accepted `bucket/dataset2` and handed back
+    /// `2/data/x.lance`.
+    #[rstest]
+    #[case::a_different_dataset("bucket/other/data/x.lance")]
+    #[case::a_sibling_with_a_longer_name("bucket/dataset2/data/x.lance")]
+    fn strip_prefix_rejects_a_path_outside_the_base(#[case] outside: &str) {
+        let base = Path::from("bucket/dataset");
+        let outside = Path::from(outside);
+        let error = strip_prefix(&outside, &base).unwrap_err();
+        assert!(
+            matches!(error, Error::Internal { .. }),
+            "expected Internal, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(outside.as_ref())
+                && message.contains(&format!("is not under the dataset base {base}")),
+            "the error must name the offending path and the base, got {message}"
+        );
+    }
+
+    /// Covered here rather than through `all_files` itself because the batch builder takes
+    /// the listing as a plain slice, so no store wrapper is needed to reach it.
+    #[test]
+    fn build_all_files_batch_rejects_a_path_outside_the_base() {
+        let base = Path::from("bucket/dataset");
+        let meta = object_store::ObjectMeta {
+            location: Path::from("bucket/other/data/x.lance"),
+            last_modified: chrono::Utc::now(),
+            size: 1,
+            e_tag: None,
+            version: None,
+        };
+        let error = build_all_files_batch(&[meta], &base, "memory://bucket/dataset").unwrap_err();
+        assert!(
+            matches!(error, Error::Internal { .. }),
+            "expected Internal, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("bucket/other/data/x.lance"),
+            "the error must name the offending path, got {error}"
+        );
     }
 
     #[tokio::test]

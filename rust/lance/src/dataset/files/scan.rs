@@ -35,7 +35,7 @@ use lance_table::io::commit::ManifestLocation;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use object_store::path::Path;
 
-use super::remove_prefix;
+use super::strip_prefix;
 use crate::Dataset;
 
 /// Memory budget for in-flight manifests (estimated in-memory size).
@@ -263,7 +263,7 @@ fn spawn_reader(
                                 .await?;
                                 Ok(ScannedManifest {
                                     manifest: Arc::new(manifest),
-                                    manifest_path: remove_prefix(&location.path, &base)
+                                    manifest_path: strip_prefix(&location.path, &base)?
                                         .to_string(),
                                     indexes,
                                     _permit: permit,
