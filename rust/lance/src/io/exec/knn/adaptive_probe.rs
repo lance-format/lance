@@ -2,6 +2,25 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Experimental adaptive IVF probe policies used by the KNN execution path.
+//!
+//! `LANCE_EXPERIMENTAL_PROBE_POLICY` selects `legacy` (default), `spann`,
+//! `quake` (source-faithful control), or `quake-corrected` (retain finite negative
+//! cosine distances in the raw global top-k; clamp only the geometric radius).
+//! `LANCE_EXPERIMENTAL_PROBE_MIN_PARTITIONS` and `_MAX_PARTITIONS` are positive
+//! scan-count bounds for experimental policies. They do not alter Quake's
+//! fraction-selected candidate list or the probability denominator. The floor
+//! must fit the available candidates and cap; the cap can end before k results.
+//! Fixed nprobes and legacy ignore all experimental overrides.
+//!
+//! `LANCE_EXPERIMENTAL_QUAKE_ZERO_RADIUS_STOP=true` separately enables stopping
+//! when the clamped kth radius is exactly zero, after k results and the floor.
+//! No new positive-distance epsilon is introduced; the source APS profile keeps
+//! its original numerical thresholds. Zero is an exact mathematical lower bound
+//! for squared L2, but cosine rounding may yield smaller raw values elsewhere:
+//! the cosine shortcut is empirical, with no IEEE raw-ranking or tie-ID guarantee.
+//! `LANCE_EXPERIMENTAL_QUAKE_TRACE=true` emits per-partition calibration records
+//! through the `lance::quake_calibration` tracing target outside CPU callbacks.
+//! Enable an info-level subscriber for calibration; disable tracing in timings.
 
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,16 +40,109 @@ const EXPERIMENTAL_PROBE_POLICY_ENV: &str = "LANCE_EXPERIMENTAL_PROBE_POLICY";
 const EXPERIMENTAL_SPANN_RATIO_ENV: &str = "LANCE_EXPERIMENTAL_SPANN_RATIO";
 const EXPERIMENTAL_QUAKE_RECALL_TARGET_ENV: &str = "LANCE_EXPERIMENTAL_QUAKE_RECALL_TARGET";
 const EXPERIMENTAL_QUAKE_INITIAL_FRACTION_ENV: &str = "LANCE_EXPERIMENTAL_QUAKE_INITIAL_FRACTION";
+const EXPERIMENTAL_MIN_PARTITIONS_ENV: &str = "LANCE_EXPERIMENTAL_PROBE_MIN_PARTITIONS";
+const EXPERIMENTAL_MAX_PARTITIONS_ENV: &str = "LANCE_EXPERIMENTAL_PROBE_MAX_PARTITIONS";
+const EXPERIMENTAL_QUAKE_TRACE_ENV: &str = "LANCE_EXPERIMENTAL_QUAKE_TRACE";
+const EXPERIMENTAL_ZERO_RADIUS_STOP_ENV: &str = "LANCE_EXPERIMENTAL_QUAKE_ZERO_RADIUS_STOP";
+
+/// Limits actual scanned partitions, independently of Quake's candidate universe.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct ProbeLimits {
+    minimum: Option<usize>,
+    maximum: Option<usize>,
+}
+
+impl ProbeLimits {
+    pub(super) fn apply(self, query: &mut Query, candidate_count: usize) -> DataFusionResult<()> {
+        if self
+            .minimum
+            .is_some_and(|minimum| minimum > candidate_count)
+        {
+            return Err(DataFusionError::Execution(format!(
+                "experimental scan minimum {:?} exceeds available candidate count {candidate_count}",
+                self.minimum
+            )));
+        }
+        if let Some(minimum) = self.minimum {
+            query.minimum_nprobes = query.minimum_nprobes.max(minimum);
+        }
+        if let Some(maximum) = self.maximum {
+            query.maximum_nprobes = Some(query.maximum_nprobes.unwrap_or(maximum).min(maximum));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct QuakeOptions {
+    pub(super) limits: ProbeLimits,
+    corrected_cosine: bool,
+    zero_radius_stop: bool,
+    trace: bool,
+}
+
+fn parse_probe_limits(
+    minimum: Option<&str>,
+    maximum: Option<&str>,
+    query: &Query,
+) -> DataFusionResult<ProbeLimits> {
+    fn positive(name: &str, value: Option<&str>) -> DataFusionResult<Option<usize>> {
+        value
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "invalid {name} value {value:?}: expected a positive integer"
+                        ))
+                    })
+            })
+            .transpose()
+    }
+    let limits = ProbeLimits {
+        minimum: positive(EXPERIMENTAL_MIN_PARTITIONS_ENV, minimum)?,
+        maximum: positive(EXPERIMENTAL_MAX_PARTITIONS_ENV, maximum)?,
+    };
+    let minimum = limits
+        .minimum
+        .unwrap_or(query.minimum_nprobes)
+        .max(query.minimum_nprobes);
+    let maximum = limits
+        .maximum
+        .into_iter()
+        .chain(query.maximum_nprobes)
+        .min();
+    if maximum.is_some_and(|maximum| minimum > maximum) {
+        return Err(DataFusionError::Execution(format!(
+            "experimental scan minimum {minimum} exceeds scan maximum {maximum:?}"
+        )));
+    }
+    Ok(limits)
+}
+
+fn parse_bool(name: &str, value: Option<&str>) -> DataFusionResult<bool> {
+    match value.unwrap_or("false") {
+        "false" => Ok(false),
+        "true" => Ok(true),
+        value => Err(DataFusionError::Execution(format!(
+            "invalid {name} value {value:?}: expected true or false"
+        ))),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum ExperimentalProbePolicy {
     Legacy,
     Spann {
         ratio: f32,
+        limits: ProbeLimits,
     },
     Quake {
         recall_target: f32,
         initial_fraction: f32,
+        options: QuakeOptions,
     },
 }
 
@@ -75,9 +187,12 @@ fn parse_experimental_probe_policy(
                     "invalid {EXPERIMENTAL_SPANN_RATIO_ENV} value {ratio}: expected ratio >= 1"
                 )));
             }
-            Ok(ExperimentalProbePolicy::Spann { ratio })
+            Ok(ExperimentalProbePolicy::Spann {
+                ratio,
+                limits: ProbeLimits::default(),
+            })
         }
-        "quake" => {
+        "quake" | "quake-corrected" => {
             let recall_target = parse_f32(
                 EXPERIMENTAL_QUAKE_RECALL_TARGET_ENV,
                 quake_recall_target,
@@ -101,10 +216,14 @@ fn parse_experimental_probe_policy(
             Ok(ExperimentalProbePolicy::Quake {
                 recall_target,
                 initial_fraction,
+                options: QuakeOptions {
+                    corrected_cosine: policy == Some("quake-corrected"),
+                    ..Default::default()
+                },
             })
         }
         value => Err(DataFusionError::Execution(format!(
-            "invalid {EXPERIMENTAL_PROBE_POLICY_ENV} value {value:?}: expected legacy, spann, or quake"
+            "invalid {EXPERIMENTAL_PROBE_POLICY_ENV} value {value:?}: expected legacy, spann, quake, or quake-corrected"
         ))),
     }
 }
@@ -119,13 +238,33 @@ pub(super) fn experimental_probe_policy(
     let spann_ratio = env::var(EXPERIMENTAL_SPANN_RATIO_ENV).ok();
     let quake_recall_target = env::var(EXPERIMENTAL_QUAKE_RECALL_TARGET_ENV).ok();
     let quake_initial_fraction = env::var(EXPERIMENTAL_QUAKE_INITIAL_FRACTION_ENV).ok();
-    parse_experimental_probe_policy(
+    let mut policy = parse_experimental_probe_policy(
         policy.as_deref(),
         spann_ratio.as_deref(),
         quake_recall_target.as_deref(),
         quake_initial_fraction.as_deref(),
         query.k,
-    )
+    )?;
+    if policy != ExperimentalProbePolicy::Legacy {
+        let minimum = env::var(EXPERIMENTAL_MIN_PARTITIONS_ENV).ok();
+        let maximum = env::var(EXPERIMENTAL_MAX_PARTITIONS_ENV).ok();
+        let limits = parse_probe_limits(minimum.as_deref(), maximum.as_deref(), query)?;
+        match &mut policy {
+            ExperimentalProbePolicy::Spann { limits: target, .. } => *target = limits,
+            ExperimentalProbePolicy::Quake { options, .. } => {
+                options.limits = limits;
+                let zero_radius_stop = env::var(EXPERIMENTAL_ZERO_RADIUS_STOP_ENV).ok();
+                options.zero_radius_stop = parse_bool(
+                    EXPERIMENTAL_ZERO_RADIUS_STOP_ENV,
+                    zero_radius_stop.as_deref(),
+                )?;
+                let trace = env::var(EXPERIMENTAL_QUAKE_TRACE_ENV).ok();
+                options.trace = parse_bool(EXPERIMENTAL_QUAKE_TRACE_ENV, trace.as_deref())?;
+            }
+            ExperimentalProbePolicy::Legacy => {}
+        }
+    }
+    Ok(policy)
 }
 
 pub(super) fn quake_candidate_count(
@@ -398,18 +537,35 @@ fn quake_boundary_distances(
     Ok(distances)
 }
 
+#[derive(Debug)]
+struct QuakeTrace {
+    partition_id: u32,
+    partitions_searched: usize,
+    partition_vectors: usize,
+    scanned_vectors: usize,
+    raw_global_kth: Option<f32>,
+    policy_raw_kth: Option<f32>,
+    geometry_radius: Option<f32>,
+    reason: &'static str,
+}
+
 struct QuakeSearchState {
-    best_squared_l2_distances: Vec<f32>,
+    best_raw_distances: Vec<f32>,
     partitions_searched: usize,
     last_radius: Option<f32>,
     probabilities: Vec<f32>,
+    traces: Vec<QuakeTrace>,
+    trace_raw_distances: Vec<f32>,
 }
 
 pub(super) struct QuakePartitionSearchControl {
     k: usize,
     minimum_nprobes: usize,
+    maximum_nprobes: usize,
+    partition_ids: Vec<u32>,
     recall_target: f32,
     metric_type: DistanceType,
+    options: QuakeOptions,
     boundary_distances: Vec<f32>,
     partition_sizes: Vec<usize>,
     beta_table: Arc<[f64]>,
@@ -425,6 +581,7 @@ impl QuakePartitionSearchControl {
         partitions: &UInt32Array,
         minimum_nprobes: usize,
         recall_target: f32,
+        options: QuakeOptions,
     ) -> DataFusionResult<Self> {
         let centroids = index.ivf_model().centroids_array().ok_or_else(|| {
             DataFusionError::Execution("Quake probing requires IVF centroids".to_string())
@@ -457,20 +614,58 @@ impl QuakePartitionSearchControl {
         Ok(Self {
             k: query.k,
             minimum_nprobes,
+            maximum_nprobes: query
+                .maximum_nprobes
+                .unwrap_or(partitions.len())
+                .min(partitions.len()),
+            partition_ids: if options.trace {
+                partitions.values().to_vec()
+            } else {
+                Vec::new()
+            },
             recall_target,
             metric_type: index.metric_type(),
+            options,
             boundary_distances,
             partition_sizes,
             beta_table: quake_beta_table(dimension)?,
             state: Mutex::new(QuakeSearchState {
-                best_squared_l2_distances: Vec::with_capacity(query.k),
+                best_raw_distances: Vec::with_capacity(query.k),
                 partitions_searched: 0,
                 last_radius: None,
                 probabilities: Vec::new(),
+                traces: Vec::new(),
+                trace_raw_distances: Vec::new(),
             }),
             should_stop: AtomicBool::new(false),
             callback_failed: AtomicBool::new(false),
         })
+    }
+
+    /// Emit only outside spawn_cpu: logging may perform I/O or take locks.
+    pub(super) fn emit_trace(&self) {
+        if !self.options.trace {
+            return;
+        }
+        let Ok(mut state) = self.state.try_lock() else {
+            return;
+        };
+        let traces = std::mem::take(&mut state.traces);
+        drop(state);
+        for trace in traces {
+            tracing::info!(
+                target: "lance::quake_calibration",
+                partition_id = trace.partition_id,
+                partitions_searched = trace.partitions_searched,
+                partition_vectors = trace.partition_vectors,
+                scanned_vectors = trace.scanned_vectors,
+                raw_global_kth = ?trace.raw_global_kth,
+                policy_raw_kth = ?trace.policy_raw_kth,
+                geometry_radius = ?trace.geometry_radius,
+                stop_reason = trace.reason,
+                "experimental Quake calibration"
+            );
+        }
     }
 
     pub(super) fn callback_failed(&self) -> bool {
@@ -497,48 +692,110 @@ impl PartitionSearchControl for QuakePartitionSearchControl {
             return;
         };
         state.partitions_searched += 1;
-        state.best_squared_l2_distances.extend(
+        state.best_raw_distances.extend(
             distances
                 .iter()
                 .flatten()
                 .filter(|distance| distance.is_finite())
-                .map(|distance| squared_l2_distance(distance, self.metric_type))
-                .filter(|distance| distance.is_finite() && *distance >= 0.0),
+                .filter(|distance| {
+                    let squared = squared_l2_distance(*distance, self.metric_type);
+                    (self.options.corrected_cosine && self.metric_type == DistanceType::Cosine)
+                        || (squared.is_finite() && squared >= 0.0)
+                }),
         );
-        if state.best_squared_l2_distances.len() >= self.k {
-            state
-                .best_squared_l2_distances
-                .sort_unstable_by(f32::total_cmp);
-            state.best_squared_l2_distances.truncate(self.k);
+        if state.best_raw_distances.len() >= self.k {
+            state.best_raw_distances.sort_unstable_by(f32::total_cmp);
+            state.best_raw_distances.truncate(self.k);
         }
-        if state.partitions_searched < self.minimum_nprobes
-            || state.best_squared_l2_distances.len() < self.k
-        {
-            return;
-        }
-        let radius = state.best_squared_l2_distances[self.k - 1].sqrt();
-        if !radius.is_finite() || radius == 0.0 {
-            return;
-        }
-        let should_recompute = state
-            .last_radius
-            .is_none_or(|previous| (radius - previous).abs() / radius > QUAKE_RECOMPUTE_THRESHOLD);
-        if should_recompute {
-            state.probabilities = quake_recall_profile(
-                &self.boundary_distances,
-                radius,
-                &self.partition_sizes,
-                &self.beta_table,
+        let reason = (|| {
+            if state.partitions_searched < self.minimum_nprobes {
+                return "minimum_floor";
+            }
+            if state.best_raw_distances.len() < self.k {
+                return "insufficient_top_k";
+            }
+            // Keep the original distances in the top-k: a rounded negative cosine
+            // distance still ranks ahead of zero. Clamp only the geometric radius.
+            let squared_radius =
+                squared_l2_distance(state.best_raw_distances[self.k - 1], self.metric_type);
+            let radius = squared_radius.max(0.0).sqrt();
+            if !radius.is_finite() {
+                return "nonfinite_radius";
+            }
+            if radius == 0.0 {
+                // Exact squared L2 has lower bound zero, so k zero-distance results
+                // are distance-optimal (ties may choose different row IDs). Cosine
+                // kernels can round below zero; this optional shortcut is empirical
+                // for cosine and does not guarantee the globally smallest raw scores.
+                // Deliberately no epsilon: a positive radius still uses Quake APS.
+                if self.options.zero_radius_stop {
+                    self.should_stop.store(true, Ordering::Relaxed);
+                    return "zero_radius";
+                }
+                return "zero_radius_continue";
+            }
+            let should_recompute = state.last_radius.is_none_or(|previous| {
+                (radius - previous).abs() / radius > QUAKE_RECOMPUTE_THRESHOLD
+            });
+            if should_recompute {
+                state.probabilities = quake_recall_profile(
+                    &self.boundary_distances,
+                    radius,
+                    &self.partition_sizes,
+                    &self.beta_table,
+                );
+                state.last_radius = Some(radius);
+            }
+            let recall_estimate: f32 = state
+                .probabilities
+                .iter()
+                .take(state.partitions_searched)
+                .sum();
+            if recall_estimate >= self.recall_target {
+                self.should_stop.store(true, Ordering::Relaxed);
+                return "recall_target";
+            }
+            "continue"
+        })();
+        if self.options.trace {
+            // Calibration also records the unfiltered finite raw kth, so the
+            // source-faithful policy's negative-cosine omission is observable.
+            state.trace_raw_distances.extend(
+                distances
+                    .iter()
+                    .flatten()
+                    .filter(|distance| distance.is_finite()),
             );
-            state.last_radius = Some(radius);
-        }
-        let recall_estimate: f32 = state
-            .probabilities
-            .iter()
-            .take(state.partitions_searched)
-            .sum();
-        if recall_estimate >= self.recall_target {
-            self.should_stop.store(true, Ordering::Relaxed);
+            state.trace_raw_distances.sort_unstable_by(f32::total_cmp);
+            state.trace_raw_distances.truncate(self.k);
+            let searched = state.partitions_searched;
+            let raw_global_kth = (state.trace_raw_distances.len() >= self.k)
+                .then(|| state.trace_raw_distances[self.k - 1]);
+            let policy_raw_kth = (state.best_raw_distances.len() >= self.k)
+                .then(|| state.best_raw_distances[self.k - 1]);
+            let reason = if !self.should_stop() && searched >= self.maximum_nprobes {
+                if searched < self.boundary_distances.len() {
+                    "scan_cap"
+                } else {
+                    "candidate_exhausted"
+                }
+            } else {
+                reason
+            };
+            state.traces.push(QuakeTrace {
+                partition_id: self.partition_ids[searched - 1],
+                partitions_searched: searched,
+                partition_vectors: self.partition_sizes[searched - 1],
+                scanned_vectors: self.partition_sizes.iter().take(searched).sum(),
+                raw_global_kth,
+                policy_raw_kth,
+                geometry_radius: policy_raw_kth.map(|distance| {
+                    squared_l2_distance(distance, self.metric_type)
+                        .max(0.0)
+                        .sqrt()
+                }),
+                reason,
+            });
         }
     }
 }
@@ -645,16 +902,21 @@ mod tests {
         QuakePartitionSearchControl {
             k: 3,
             minimum_nprobes: 1,
+            maximum_nprobes: 2,
+            partition_ids: vec![0, 1],
             recall_target: 0.9,
             metric_type,
+            options: QuakeOptions::default(),
             boundary_distances: vec![0.0, 0.0],
             partition_sizes: vec![10, 10],
             beta_table: quake_beta_table(GOLDEN_DIMENSION).unwrap(),
             state: Mutex::new(QuakeSearchState {
-                best_squared_l2_distances: Vec::with_capacity(3),
+                best_raw_distances: Vec::with_capacity(3),
                 partitions_searched: 0,
                 last_radius: None,
                 probabilities: Vec::new(),
+                traces: Vec::new(),
+                trace_raw_distances: Vec::new(),
             }),
             should_stop: AtomicBool::new(false),
             callback_failed: AtomicBool::new(false),
@@ -677,11 +939,17 @@ mod tests {
         );
         assert_eq!(
             parse_experimental_probe_policy(Some("spann"), None, None, None, 1).unwrap(),
-            ExperimentalProbePolicy::Spann { ratio: 1.6 }
+            ExperimentalProbePolicy::Spann {
+                ratio: 1.6,
+                limits: ProbeLimits::default()
+            }
         );
         assert_eq!(
             parse_experimental_probe_policy(Some("spann"), None, None, None, 100).unwrap(),
-            ExperimentalProbePolicy::Spann { ratio: 8.0 }
+            ExperimentalProbePolicy::Spann {
+                ratio: 8.0,
+                limits: ProbeLimits::default()
+            }
         );
         assert_eq!(
             parse_experimental_probe_policy(Some("quake"), None, Some("0.95"), Some("1"), 10)
@@ -689,6 +957,7 @@ mod tests {
             ExperimentalProbePolicy::Quake {
                 recall_target: 0.95,
                 initial_fraction: 1.0,
+                options: QuakeOptions::default(),
             }
         );
         assert!(
@@ -804,5 +1073,185 @@ mod tests {
         control.record_batch(&distance_batch(vec![0.045, 0.005, 0.02]));
         let radius = control.state.lock().unwrap().last_radius.unwrap();
         assert!((radius - 0.3).abs() < 1.0e-6, "radius={radius}");
+    }
+    #[rstest::rstest]
+    #[case::l2_zero(DistanceType::L2, false, vec![0.0, 0.0, 0.0], true)]
+    #[case::cosine_zero(DistanceType::Cosine, true, vec![0.0, 0.0, 0.0], true)]
+    #[case::cosine_negative(DistanceType::Cosine, true, vec![-1e-7, -1e-8, -1e-9], true)]
+    #[case::cosine_mixed(DistanceType::Cosine, true, vec![-1e-7, 0.0, 0.0], true)]
+    #[case::cosine_positive(DistanceType::Cosine, true, vec![-1e-7, 0.0, 1e-10], false)]
+    #[case::l2_positive(DistanceType::L2, false, vec![0.0, 0.0, 1e-10], false)]
+    #[case::l2_negative_rejected(DistanceType::L2, true, vec![-1e-7, 0.0, 0.0], false)]
+    fn test_exact_zero_stop_and_raw_ranking(
+        #[case] metric: DistanceType,
+        #[case] corrected_cosine: bool,
+        #[case] distances: Vec<f32>,
+        #[case] expected_stop: bool,
+    ) {
+        let mut control = test_control(metric);
+        control.options.corrected_cosine = corrected_cosine;
+        control.options.zero_radius_stop = true;
+        control.record_batch(&distance_batch(distances.clone()));
+        assert_eq!(control.should_stop(), expected_stop);
+        if corrected_cosine && metric == DistanceType::Cosine {
+            assert_eq!(control.state.lock().unwrap().best_raw_distances, distances);
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::source(false, 1)]
+    #[case::corrected(true, 3)]
+    fn test_zero_stop_is_opt_in_and_negative_cosine_is_selectable(
+        #[case] corrected_cosine: bool,
+        #[case] expected_count: usize,
+    ) {
+        let mut control = test_control(DistanceType::Cosine);
+        control.options.corrected_cosine = corrected_cosine;
+        control.record_batch(&distance_batch(vec![
+            f32::NAN,
+            -1e-7,
+            -1e-8,
+            0.0,
+            f32::INFINITY,
+        ]));
+        let state = control.state.lock().unwrap();
+        assert_eq!(state.best_raw_distances.len(), expected_count);
+        assert!(!control.should_stop());
+    }
+
+    #[test]
+    fn test_zero_stop_respects_floor_and_waits_for_k() {
+        let mut control = test_control(DistanceType::L2);
+        control.minimum_nprobes = 4;
+        control.options.zero_radius_stop = true;
+        for _ in 0..3 {
+            control.record_batch(&distance_batch(vec![0.0]));
+            assert!(!control.should_stop());
+        }
+        control.record_batch(&distance_batch(vec![0.0]));
+        assert!(control.should_stop());
+        assert_eq!(
+            control.state.lock().unwrap().best_raw_distances,
+            vec![0.0; 3]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::floor_four_cap_twenty("4", "20")]
+    #[case::floor_eight_cap_thirty_two("8", "32")]
+    #[case::floor_eight_cap_sixty_four("8", "64")]
+    fn test_scan_limits_do_not_change_candidate_universe(
+        #[case] minimum: &str,
+        #[case] maximum: &str,
+    ) {
+        let mut query = base_query();
+        let candidate_count = quake_candidate_count(&query, 1024, 0.1);
+        assert_eq!(candidate_count, 102);
+        let limits = parse_probe_limits(Some(minimum), Some(maximum), &query).unwrap();
+        // Ranking receives the original query. Limits are applied only after
+        // its complete candidate list has been produced.
+        limits.apply(&mut query, candidate_count).unwrap();
+        assert_eq!(query.minimum_nprobes, minimum.parse::<usize>().unwrap());
+        assert_eq!(
+            query.maximum_nprobes,
+            Some(maximum.parse::<usize>().unwrap())
+        );
+        let mut control = test_control(DistanceType::L2);
+        control.boundary_distances = vec![0.0; candidate_count];
+        control.partition_sizes = vec![10; candidate_count];
+        control.record_batch(&distance_batch(vec![0.01, 0.04, 0.09]));
+        assert_eq!(
+            control.state.lock().unwrap().probabilities.len(),
+            candidate_count
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::zero(Some("0"), None)]
+    #[case::negative(None, Some("-1"))]
+    #[case::inverted(Some("8"), Some("4"))]
+    fn test_scan_limits_reject_invalid_values(
+        #[case] minimum: Option<&str>,
+        #[case] maximum: Option<&str>,
+    ) {
+        let error = parse_probe_limits(minimum, maximum, &base_query()).unwrap_err();
+        assert!(matches!(error, DataFusionError::Execution(_)));
+        assert!(
+            error.to_string().contains("experimental")
+                || error.to_string().contains("LANCE_EXPERIMENTAL")
+        );
+    }
+
+    #[test]
+    fn test_parse_corrected_and_zero_stop() {
+        let policy =
+            parse_experimental_probe_policy(Some("quake-corrected"), None, None, None, 10).unwrap();
+        assert!(matches!(
+            policy,
+            ExperimentalProbePolicy::Quake {
+                options: QuakeOptions {
+                    corrected_cosine: true,
+                    zero_radius_stop: false,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(parse_bool(EXPERIMENTAL_ZERO_RADIUS_STOP_ENV, Some("true")).unwrap());
+        assert!(!parse_bool(EXPERIMENTAL_ZERO_RADIUS_STOP_ENV, None).unwrap());
+        let error = parse_bool(EXPERIMENTAL_ZERO_RADIUS_STOP_ENV, Some("1")).unwrap_err();
+        assert!(matches!(error, DataFusionError::Execution(_)));
+        assert!(
+            error
+                .to_string()
+                .contains(EXPERIMENTAL_ZERO_RADIUS_STOP_ENV)
+        );
+    }
+    #[test]
+    fn test_trace_distinguishes_cap_zero_and_tiny_positive_radius() {
+        let mut control = test_control(DistanceType::Cosine);
+        control.options.trace = true;
+        control.options.corrected_cosine = true;
+        control.options.zero_radius_stop = true;
+        control.maximum_nprobes = 1;
+        control.record_batch(&distance_batch(vec![0.01, 0.02, 0.03]));
+        let state = control.state.lock().unwrap();
+        let trace = &state.traces[0];
+        assert_eq!(trace.reason, "scan_cap");
+        assert_eq!(trace.partition_id, 0);
+        assert_eq!(trace.scanned_vectors, 10);
+        assert_eq!(trace.raw_global_kth, Some(0.03));
+        assert_eq!(state.probabilities.len(), 2);
+        drop(state);
+
+        let mut control = test_control(DistanceType::Cosine);
+        control.options.trace = true;
+        control.options.zero_radius_stop = true;
+        control.record_batch(&distance_batch(vec![0.0, 0.0, f32::MIN_POSITIVE]));
+        let state = control.state.lock().unwrap();
+        // The source APS epsilon can still stop on its probability estimate;
+        // this must never be classified as the explicit exact-zero shortcut.
+        assert_ne!(state.traces[0].reason, "zero_radius");
+        assert!(state.traces[0].geometry_radius.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_floor_rejects_too_few_candidates() {
+        let mut query = base_query();
+        let limits = parse_probe_limits(Some("8"), None, &query).unwrap();
+        let error = limits.apply(&mut query, 4).unwrap_err();
+        assert!(matches!(error, DataFusionError::Execution(_)));
+        assert!(error.to_string().contains("candidate count 4"));
+    }
+    #[test]
+    fn test_trace_exposes_source_negative_cosine_omission() {
+        let mut control = test_control(DistanceType::Cosine);
+        control.options.trace = true;
+        control.record_batch(&distance_batch(vec![-1e-7, -1e-8, 0.0, 0.01, 0.02]));
+        let state = control.state.lock().unwrap();
+        let trace = &state.traces[0];
+        assert_eq!(trace.raw_global_kth, Some(0.0));
+        assert_eq!(trace.policy_raw_kth, Some(0.02));
+        assert_eq!(trace.geometry_radius, Some(0.2));
     }
 }

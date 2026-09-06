@@ -78,7 +78,7 @@ use super::utils::{
 mod adaptive_probe;
 
 use adaptive_probe::{
-    ExperimentalProbePolicy, QuakePartitionSearchControl, experimental_probe_policy,
+    ExperimentalProbePolicy, QuakeOptions, QuakePartitionSearchControl, experimental_probe_policy,
     quake_candidate_count, spann_nprobes, validate_experimental_probe_index,
     validate_experimental_probe_plan,
 };
@@ -2065,8 +2065,11 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         recall_target: f32,
+        options: QuakeOptions,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         stream::once(async move {
+            let mut query = query;
+            options.limits.apply(&mut query, partitions.len())?;
             let maximum_nprobes = query
                 .maximum_nprobes
                 .unwrap_or(partitions.len())
@@ -2078,6 +2081,7 @@ impl ANNIvfSubIndexExec {
                 &partitions,
                 minimum_nprobes,
                 recall_target,
+                options,
             )?);
             let index_metrics: Arc<dyn MetricsCollector> = Arc::new(metrics.index_metrics.clone());
             let stream = index
@@ -2097,11 +2101,12 @@ impl ANNIvfSubIndexExec {
                         "Failed to search partitions with Quake probing: {error}"
                     ))
                 })?;
+            let output_control = control.clone();
             Ok::<_, DataFusionError>(
                 stream
                     .map(move |batch| {
                         let batch = batch?;
-                        if control.callback_failed() {
+                        if output_control.callback_failed() {
                             return Err(DataFusionError::Execution(
                                 "Quake probing callback state was unexpectedly concurrent"
                                     .to_string(),
@@ -2111,6 +2116,15 @@ impl ANNIvfSubIndexExec {
                         metrics.baseline_metrics.record_output(batch.num_rows());
                         Ok(batch)
                     })
+                    // Wait for the producer to finish before reading callback state.
+                    // Emitting between batches could race the next CPU callback.
+                    .chain(
+                        stream::once(async move {
+                            control.emit_trace();
+                            None
+                        })
+                        .filter_map(futures::future::ready),
+                    )
                     .boxed(),
             )
         })
@@ -2340,11 +2354,12 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                                     early_pruning(q_c_dists.values(), query.k);
                                 adjust_probes(&mut query, pruned_nprobes);
                             }
-                            ExperimentalProbePolicy::Spann { ratio } => {
+                            ExperimentalProbePolicy::Spann { ratio, limits } => {
                                 // IVF centroid distances are squared L2 for both L2 and
                                 // normalized-cosine partition ranking. Apply SPANN's
                                 // d <= ratio * d0 comparison in that same squared-L2 unit.
                                 let pruned_nprobes = spann_nprobes(q_c_dists.values(), ratio);
+                                limits.apply(&mut query, part_ids.len())?;
                                 adjust_probes(&mut query, pruned_nprobes.max(1));
                             }
                             ExperimentalProbePolicy::Quake { .. } => {}
@@ -2372,7 +2387,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             None => None,
                         };
 
-                        if let ExperimentalProbePolicy::Quake { recall_target, .. } = probe_policy {
+                        if let ExperimentalProbePolicy::Quake { recall_target, options, .. } = probe_policy {
                             if seg_mask.is_some() {
                                 return Err(DataFusionError::Execution(
                                     "Quake probing does not support per-segment row masks"
@@ -2388,6 +2403,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                                     segment_pre_filter,
                                     metrics,
                                     recall_target,
+                                    options,
                                 )
                                 .boxed(),
                             );
