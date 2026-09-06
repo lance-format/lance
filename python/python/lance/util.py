@@ -18,13 +18,20 @@ from typing import (
 
 import pyarrow as pa
 
-from .dependencies import _check_for_numpy, _check_for_pandas
+from .dependencies import _PANDAS_AVAILABLE, _check_for_numpy, _check_for_pandas
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .lance import _Hnsw, _KMeans
 
 if TYPE_CHECKING:
-    ts_types = Union[datetime, pd.Timestamp, str]
+    from pandas.api.typing import NaTType
+
+    # ``pandas.Timestamp`` is a ``datetime`` subclass, so it needs no member of
+    # its own. ``NaTType`` does: the stubs bundled with pandas declare
+    # ``Timestamp.__new__`` as returning ``Self | NaTType``, so every caller
+    # writing ``asof=pd.Timestamp(...)`` hands us that union. We accept it here
+    # and reject the ``NaT`` half in ``sanitize_ts``.
+    ts_types = Union[datetime, NaTType, str]
 
 MetricType = Literal["l2", "euclidean", "dot", "cosine"]
 
@@ -40,20 +47,26 @@ def _normalize_metric_type(metric_type: str) -> MetricType:
 
 def sanitize_ts(ts: ts_types) -> datetime:
     """Returns a python datetime object from various timestamp input types."""
-    if _check_for_pandas(ts) and isinstance(ts, str):
-        ts = pd.to_datetime(ts).to_pydatetime()
-    elif isinstance(ts, str):
-        try:
-            ts = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            raise ValueError(
-                f"Failed to parse timestamp string {ts}. Try installing Pandas."
-            )
-    elif _check_for_pandas(ts) and isinstance(ts, pd.Timestamp):
-        ts = ts.to_pydatetime()
-    elif not isinstance(ts, datetime):
-        raise TypeError(f"Unrecognized version timestamp {ts} of type {type(ts)}")
-    return ts
+    if isinstance(ts, str):
+        if not _PANDAS_AVAILABLE:
+            try:
+                return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                raise ValueError(
+                    f"Failed to parse timestamp string {ts}. Try installing Pandas."
+                ) from None
+        ts = pd.to_datetime(ts)
+    if _check_for_pandas(ts):
+        # pandas spells a missing timestamp ``NaT``, which subclasses ``datetime``
+        # and compares false against every version timestamp, so it would
+        # otherwise be reported as being older than the first version.
+        if ts is pd.NaT:
+            raise ValueError("NaT is not a valid version timestamp")
+        if isinstance(ts, pd.Timestamp):
+            return ts.to_pydatetime()
+    if isinstance(ts, datetime):
+        return ts
+    raise TypeError(f"Unrecognized version timestamp {ts} of type {type(ts)}")
 
 
 def td_to_micros(td: timedelta) -> int:

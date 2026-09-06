@@ -7835,7 +7835,11 @@ def write_dataset(
     ----------
     data_obj: Reader-like
         The data to be written. Acceptable types are:
-        - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
+        - Pandas DataFrame, Polars DataFrame
+        - Pyarrow Table, RecordBatch, Dataset, Scanner, or RecordBatchReader
+        - An iterable of Pyarrow RecordBatch (requires ``schema``)
+        - A dict of columns, or a list of row dicts
+        - A list of Pydantic model instances
         - Huggingface dataset
     uri: str, Path, LanceDataset, or None
         Where to write the dataset to (directory). If a LanceDataset is passed,

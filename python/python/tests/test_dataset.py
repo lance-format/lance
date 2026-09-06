@@ -33,7 +33,7 @@ from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter, stable_version
 from lance.schema import LanceSchema
-from lance.util import validate_vector_index
+from lance.util import sanitize_ts, validate_vector_index
 
 BaseModel = pytest.importorskip("pydantic").BaseModel
 
@@ -70,6 +70,8 @@ input_data = [
     ),
     # Pydantic model instances are auto-converted
     (None, [_InputModel(a=1.0, b=20), _InputModel(a=2.0, b=30)]),
+    (None, {"a": [1.0, 2.0], "b": [20, 30]}),
+    (None, [{"a": 1.0, "b": 20}, {"a": 2.0, "b": 30}]),
 ]
 
 
@@ -556,6 +558,32 @@ def test_asof_checkout(tmp_path: Path):
     ds = lance.dataset(base_dir, asof=ts_3)
     assert ds.version == 3
     assert len(ds.to_table()) == 9
+
+
+def test_sanitize_ts_parses_strings_with_pandas():
+    # pandas accepts timestamp strings that the pandas-free fallback format
+    # rejects, so a date without a time of day has to work here.
+    assert sanitize_ts("2026-01-01") == datetime(2026, 1, 1)
+
+
+def test_sanitize_ts_rejects_nat():
+    # `NaT` is a `datetime` subclass, so it would otherwise pass through and
+    # compare false against every version timestamp.
+    with pytest.raises(ValueError, match="NaT is not a valid version timestamp"):
+        sanitize_ts(pd.NaT)
+
+
+def test_sanitize_ts_rejects_unknown_type():
+    with pytest.raises(TypeError, match="Unrecognized version timestamp"):
+        sanitize_ts(object())
+
+
+def test_sanitize_ts_without_pandas(monkeypatch):
+    monkeypatch.setattr("lance.util._PANDAS_AVAILABLE", False)
+
+    assert sanitize_ts("2026-01-01 00:00:00") == datetime(2026, 1, 1)
+    with pytest.raises(ValueError, match="Try installing Pandas"):
+        sanitize_ts("2026-01-01")
 
 
 def test_enable_stable_row_ids(tmp_path: Path):
