@@ -42,7 +42,6 @@
 //!   --cache-dir /tmp/fineweb-cache --output result.json
 //! ```
 
-#![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::{HashMap, HashSet};
