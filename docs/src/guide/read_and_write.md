@@ -274,6 +274,17 @@ print(dataset.to_table().to_pandas())
 # 3  Francene   44
 ```
 
+The `when_matched_delete` method also accepts an optional condition, letting you
+delete only the matched rows that satisfy a filter (rows that do not satisfy the
+filter are left untouched):
+
+```python
+# Only delete matched rows where the source table marks them as deleted
+_ = dataset.merge_insert("name") \
+       .when_matched_delete("source.deleted = true") \
+       .execute(new_table)
+```
+
 ## Reading Lance Dataset
 
 To open a Lance dataset, use the `lance.dataset` function:

@@ -3473,7 +3473,22 @@ def test_merge_insert_when_matched_fail(tmp_path: Path):
 
 
 def test_merge_insert_when_matched_delete(tmp_path: Path):
-    """Test when_matched_delete functionality for merge insert."""
+    """Test when_matched_delete functionality for merge insert.
+
+    Covers the unconditional form first: deleting matched rows with a full
+    source, with an id-only source, combined with when_not_matched_insert_all,
+    and with a source that matches nothing. Then covers the conditional form
+    against the same initial dataset of ids 1 to 6. A source.deleted flag
+    condition deletes ids 4 and 6 while id 5 matches but survives. A
+    target.val > 45 condition deletes ids 5 and 6. A condition that matches
+    nothing leaves the dataset unchanged. An invalid condition raises an
+    error, and because condition parsing is deferred to execution in the Rust
+    core the error currently surfaces from execute as OSError with Invalid
+    user input. ValueError is also accepted so the test keeps passing if the
+    core ever validates eagerly. Finally a source.val > 450 condition combined
+    with when_not_matched_insert_all deletes ids 5 and 6, keeps id 4 whose
+    source val is 400, and inserts ids 7 to 9.
+    """
     # Create initial dataset with ids 1-6
     data = pa.table({"id": [1, 2, 3, 4, 5, 6], "val": [10, 20, 30, 40, 50, 60]})
     ds = lance.write_dataset(data, tmp_path / "dataset")
@@ -3550,6 +3565,102 @@ def test_merge_insert_when_matched_delete(tmp_path: Path):
     # Data should be unchanged
     remaining = ds.to_table().sort_by("id")
     expected = pa.table({"id": [1, 2, 3, 4, 5, 6], "val": [10, 20, 30, 40, 50, 60]})
+    assert remaining == expected
+
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+
+    conditional_source = pa.table(
+        {
+            "id": [4, 5, 6, 7, 8, 9],
+            "val": [0, 0, 0, 0, 0, 0],
+            "deleted": [True, False, True, True, False, True],
+        }
+    )
+    result = (
+        ds.merge_insert("id")
+        .when_matched_delete("source.deleted = true")
+        .execute(conditional_source)
+    )
+
+    assert result["num_deleted_rows"] == 2
+    assert result["num_inserted_rows"] == 0
+    assert result["num_updated_rows"] == 0
+
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 5], "val": [10, 20, 30, 50]})
+    assert remaining == expected
+
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+
+    target_conditional_source = pa.table(
+        {"id": [4, 5, 6, 7, 8, 9], "val": [0, 0, 0, 0, 0, 0]}
+    )
+    result = (
+        ds.merge_insert("id")
+        .when_matched_delete("target.val > 45")
+        .execute(target_conditional_source)
+    )
+
+    assert result["num_deleted_rows"] == 2
+    assert result["num_inserted_rows"] == 0
+    assert result["num_updated_rows"] == 0
+
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 4], "val": [10, 20, 30, 40]})
+    assert remaining == expected
+
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+
+    result = (
+        ds.merge_insert("id")
+        .when_matched_delete("target.val > 1000")
+        .execute(target_conditional_source)
+    )
+
+    assert result["num_deleted_rows"] == 0
+    assert result["num_inserted_rows"] == 0
+    assert result["num_updated_rows"] == 0
+
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 4, 5, 6], "val": [10, 20, 30, 40, 50, 60]})
+    assert remaining == expected
+
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+
+    with pytest.raises((ValueError, OSError), match="Invalid user input"):
+        ds.merge_insert("id").when_matched_delete("not_a_real_column > 5").execute(
+            target_conditional_source
+        )
+
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table({"id": [1, 2, 3, 4, 5, 6], "val": [10, 20, 30, 40, 50, 60]})
+    assert remaining == expected
+
+    ds = lance.dataset(tmp_path / "dataset", version=version)
+    ds.restore()
+
+    upsert_source = pa.table(
+        {"id": [4, 5, 6, 7, 8, 9], "val": [400, 500, 600, 700, 800, 900]}
+    )
+    result = (
+        ds.merge_insert("id")
+        .when_matched_delete("source.val > 450")
+        .when_not_matched_insert_all()
+        .execute(upsert_source)
+    )
+
+    assert result["num_deleted_rows"] == 2
+    assert result["num_inserted_rows"] == 3
+    assert result["num_updated_rows"] == 0
+
+    remaining = ds.to_table().sort_by("id")
+    expected = pa.table(
+        {"id": [1, 2, 3, 4, 7, 8, 9], "val": [10, 20, 30, 40, 700, 800, 900]}
+    )
     assert remaining == expected
 
 

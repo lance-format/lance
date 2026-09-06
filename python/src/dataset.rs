@@ -381,8 +381,19 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
-    pub fn when_matched_delete(mut slf: PyRefMut<Self>) -> PyResult<PyRefMut<Self>> {
-        slf.builder.when_matched(WhenMatched::Delete);
+    #[pyo3(signature=(condition=None))]
+    pub fn when_matched_delete<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        condition: Option<&str>,
+    ) -> PyResult<PyRefMut<'a, Self>> {
+        let new_val = if let Some(expr) = condition {
+            let dataset = slf.dataset.borrow(slf.py());
+            WhenMatched::delete_if(&dataset.ds, expr)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?
+        } else {
+            WhenMatched::Delete
+        };
+        slf.builder.when_matched(new_val);
         Ok(slf)
     }
 

@@ -454,15 +454,55 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_matched_update_all(condition)
 
-    def when_matched_delete(self) -> "MergeInsertBuilder":
+    def when_matched_delete(
+        self, condition: Optional[str] = None
+    ) -> "MergeInsertBuilder":
         """
         Configure the operation to delete matched rows in the target table.
 
         After this method is called, when the merge insert operation executes,
         any rows that match both the source table and the target table will be
         deleted.
+
+        An optional condition may be specified. This should be an SQL filter
+        and, if present, then only matched rows that also satisfy this filter will
+        be deleted. Rows that do not satisfy the condition are left untouched.
+        The SQL filter should use the prefix `target.` to refer to columns in
+        the target table and the prefix `source.` to refer to columns in the
+        source table. For example, `source.deleted = true` or
+        `source.last_update > target.last_update`.
+
+        If a condition is specified and rows do not satisfy the condition then
+        these rows will not be deleted. Failure to satisfy the filter does not
+        cause a "matched" row to become a "not matched" row.
+
+        Examples
+        --------
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        >>> dataset = lance.write_dataset(table, "memory://when_matched_delete_example")
+        >>> new_table = pa.table(
+        ...     {"a": [2, 3], "b": ["y", "z"], "deleted": [True, False]}
+        ... )
+        >>> _ = (
+        ...     dataset.merge_insert("a")
+        ...     .when_matched_delete("source.deleted = true")
+        ...     .execute(new_table)
+        ... )
+        >>> dataset.to_table().sort_by("a").to_pandas()
+           a  b
+        0  1  x
+        1  3  z
+
+        See Also
+        --------
+        LanceDataset.merge_insert : Start building a merge insert operation
+        when_matched_update_all : Update matched rows instead of deleting them
+        when_not_matched_insert_all : Insert source rows that have no match
         """
-        return super(MergeInsertBuilder, self).when_matched_delete()
+        return super(MergeInsertBuilder, self).when_matched_delete(condition)
 
     def when_matched_fail(self) -> "MergeInsertBuilder":
         """

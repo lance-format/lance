@@ -111,6 +111,29 @@ impl MergeInsertWriteNode {
             schema,
         }
     }
+
+    /// Whether the merge only deletes matched rows, so no data has to be written.
+    ///
+    /// This holds when:
+    /// - `when_matched` is `Delete`, `DeleteIf`, or `DeleteIfExpr`
+    /// - `insert_not_matched` is `false` (no inserts)
+    /// - `delete_not_matched_by_source` is `Keep` (no additional deletes of unmatched
+    ///   target rows, which would need the full write path)
+    ///
+    /// Both column pruning in [`Self::necessary_children_exprs`] and physical planning in
+    /// [`MergeInsertPlanner`] read this, and they must agree: pruning for a delete-only
+    /// plan that then gets planned as a full-schema write leaves the writer without the
+    /// dataset columns it needs.
+    pub(super) fn is_delete_only(params: &MergeInsertParams) -> bool {
+        matches!(
+            params.when_matched,
+            WhenMatched::Delete | WhenMatched::DeleteIf(_) | WhenMatched::DeleteIfExpr(_)
+        ) && !params.insert_not_matched
+            && matches!(
+                params.delete_not_matched_by_source,
+                WhenNotMatchedBySource::Keep
+            )
+    }
 }
 
 impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
@@ -139,6 +162,8 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             crate::dataset::WhenMatched::UpdateIfExpr(_) => "UpdateIfExpr",
             crate::dataset::WhenMatched::Fail => "Fail",
             crate::dataset::WhenMatched::Delete => "Delete",
+            crate::dataset::WhenMatched::DeleteIf(_) => "DeleteIf",
+            crate::dataset::WhenMatched::DeleteIfExpr(_) => "DeleteIfExpr",
         };
         let when_not_matched = if self.params.insert_not_matched {
             "InsertAll"
@@ -197,10 +222,14 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 
         // Check if this is a delete-only operation (no writes needed)
         // In delete-only mode, we only need the key columns from source for matching
-        let no_upsert = matches!(
-            self.params.when_matched,
-            crate::dataset::WhenMatched::Delete
-        ) && !self.params.insert_not_matched;
+        // after the input projection has evaluated any conditional predicate into
+        // `__action`. Predicate-only columns do not need to cross the write boundary.
+        //
+        // This must agree with `MergeInsertPlanner::is_delete_only`: when unmatched
+        // target rows are also deleted the planner picks `FullSchemaMergeInsertExec`,
+        // which needs every dataset column, so pruning them here would leave the writer
+        // short of its input schema.
+        let no_upsert = Self::is_delete_only(&self.params);
 
         for (i, (qualifier, field)) in input_schema.iter().enumerate() {
             let should_include = match qualifier {
@@ -252,19 +281,8 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 pub struct MergeInsertPlanner {}
 
 impl MergeInsertPlanner {
-    /// Check if this is a delete-only operation that can use the optimized path.
-    ///
-    /// Delete-only operations are when:
-    /// - `when_matched` is `Delete`
-    /// - `insert_not_matched` is `false` (no inserts)
-    /// - `delete_not_matched_by_source` is `Keep` (no additional deletes of unmatched target rows)
     fn is_delete_only(params: &MergeInsertParams) -> bool {
-        matches!(params.when_matched, WhenMatched::Delete)
-            && !params.insert_not_matched
-            && matches!(
-                params.delete_not_matched_by_source,
-                WhenNotMatchedBySource::Keep
-            )
+        MergeInsertWriteNode::is_delete_only(params)
     }
 }
 

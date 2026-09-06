@@ -193,6 +193,31 @@ impl MergeState {
                 self.metrics.num_inserted_rows.add(1);
                 Ok(Some(row_idx)) // Keep this row for writing
             }
+            Action::MatchedNoOp => {
+                // The row matched a target row but the conditional clause did
+                // not apply. Nothing is written, but the target row is still
+                // claimed here so a second source row matching the same target
+                // is caught by `source_dedupe_behavior` even when the condition
+                // excludes one of them.
+                if !row_addr_array.is_null(row_idx) {
+                    let row_id = row_id_array.value(row_idx);
+                    if !self.processed_row_ids.insert(row_id) {
+                        match self.source_dedupe_behavior {
+                            SourceDedupeBehavior::Fail => {
+                                return Err(create_duplicate_row_error(
+                                    batch,
+                                    row_idx,
+                                    &self.on_columns,
+                                ));
+                            }
+                            SourceDedupeBehavior::FirstSeen => {
+                                self.metrics.num_skipped_duplicates.add(1);
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
             Action::Nothing => {
                 // Do nothing action - keep the row but don't count it
                 Ok(None)
@@ -791,6 +816,12 @@ impl DisplayAs for FullSchemaMergeInsertExec {
                     }
                     crate::dataset::WhenMatched::Fail => "Fail".to_string(),
                     crate::dataset::WhenMatched::Delete => "Delete".to_string(),
+                    crate::dataset::WhenMatched::DeleteIf(condition) => {
+                        format!("DeleteIf({})", condition)
+                    }
+                    crate::dataset::WhenMatched::DeleteIfExpr(expr) => {
+                        format!("DeleteIfExpr({})", expr.human_display())
+                    }
                 };
                 let when_not_matched = if self.params.insert_not_matched {
                     "InsertAll"
