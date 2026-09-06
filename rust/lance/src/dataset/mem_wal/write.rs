@@ -742,7 +742,16 @@ pub struct BackpressureStatsSnapshot {
 /// observe the drain and the wait would never end. A read is one `ArcSwap` load
 /// and a sum over the live memtables, so polling is cheap.
 #[derive(Clone)]
-pub struct ShardMemory(ShardMemorySource);
+pub struct ShardMemory {
+    source: ShardMemorySource,
+    /// Whether the put this reading was taken for can only land after a freeze.
+    /// Default `false`: a reading taken outside a put — an operator gauge, the
+    /// controller's own scan — asks about bytes, not about admission.
+    ///
+    /// Carried on the reading because the seal thresholds are per-table config
+    /// a process-wide controller cannot see, so only the writer can answer it.
+    seal_required: bool,
+}
 
 /// Where a [`ShardMemory`] reads from. A dispatch over the two write modes, not
 /// a second accounting: every arm is a field read, and the arithmetic that
@@ -764,17 +773,41 @@ enum ShardMemorySource {
 
 impl ShardMemory {
     fn memtables(tables: Arc<ArcSwap<ResidentMemTables>>) -> Self {
-        Self(ShardMemorySource::MemTables(tables))
+        Self {
+            source: ShardMemorySource::MemTables(tables),
+            seal_required: false,
+        }
     }
 
     fn queue(state: Arc<WalOnlyState>) -> Self {
-        Self(ShardMemorySource::Queue(state))
+        Self {
+            source: ShardMemorySource::Queue(state),
+            seal_required: false,
+        }
+    }
+
+    /// Mark this reading as one taken for a put that cannot land without a
+    /// freeze. Set by the put path; see [`Self::seal_required`].
+    fn with_seal_required(mut self, seal_required: bool) -> Self {
+        self.seal_required = seal_required;
+        self
+    }
+
+    /// Whether the put this reading was taken for can only land after a freeze.
+    ///
+    /// A controller that bounds the tier a flush lands in needs the two cases
+    /// separated: a put that still fits in the active memtable costs that tier
+    /// nothing and there is no reason to refuse it, while one that must first
+    /// seal adds a whole generation to it. Refusing only the latter is what
+    /// bounds the tier without throttling writes that would not have grown it.
+    pub fn seal_required(&self) -> bool {
+        self.seal_required
     }
 
     /// Resident bytes of the active memtable — row data plus its in-memory
     /// indexes. In WAL-only mode, the pending queue's bytes.
     pub fn active_bytes(&self) -> usize {
-        match &self.0 {
+        match &self.source {
             ShardMemorySource::MemTables(t) => t
                 .load()
                 .active
@@ -796,7 +829,7 @@ impl ShardMemory {
     /// on. Use this to reason about when a memtable seals, not about what it
     /// costs.
     pub fn row_bytes(&self) -> usize {
-        match &self.0 {
+        match &self.source {
             ShardMemorySource::MemTables(t) => t
                 .load()
                 .active
@@ -816,7 +849,7 @@ impl ShardMemory {
     /// explains a shard near its ceiling with few rows in it: an HNSW graph is
     /// pre-allocated in full on the first insert.
     pub fn index_bytes(&self) -> usize {
-        match &self.0 {
+        match &self.source {
             ShardMemorySource::MemTables(t) => t
                 .load()
                 .active
@@ -831,7 +864,7 @@ impl ShardMemory {
     /// Resident bytes of sealed memtables whose flush has not committed.
     /// Always `0` in WAL-only mode.
     pub fn frozen_bytes(&self) -> usize {
-        match &self.0 {
+        match &self.source {
             ShardMemorySource::MemTables(t) => t
                 .load()
                 .frozen
@@ -851,7 +884,7 @@ impl ShardMemory {
     /// waiter that blocks on this is waiting for the clock, not for a flush.
     /// `0` in WAL-only mode, and `0` under the default zero grace.
     pub fn grace_bytes(&self) -> usize {
-        match &self.0 {
+        match &self.source {
             ShardMemorySource::MemTables(t) => t
                 .load()
                 .grace
@@ -870,7 +903,7 @@ impl ShardMemory {
     /// double-count or lose a memtable the way two separate reads could — which
     /// is why this is not `active_bytes() + frozen_bytes()`.
     pub fn unflushed_bytes(&self) -> usize {
-        match &self.0 {
+        match &self.source {
             ShardMemorySource::MemTables(t) => {
                 let tables = t.load();
                 tables
@@ -898,7 +931,7 @@ impl ShardMemory {
     /// stall the writer waiting for a sweeper tick. The two differ only when a
     /// grace is configured; under the default zero grace they are equal.
     pub fn retained_bytes(&self) -> usize {
-        match &self.0 {
+        match &self.source {
             ShardMemorySource::MemTables(t) => {
                 let tables = t.load();
                 tables
@@ -924,7 +957,7 @@ impl ShardMemory {
     /// eventually works: a shard can be over its ceiling with nothing running
     /// that would bring it back down. See [`Drain`].
     pub fn drain(&self) -> Drain {
-        match &self.0 {
+        match &self.source {
             ShardMemorySource::MemTables(t) => {
                 let tables = t.load();
                 match tables.oldest_flush.clone() {
@@ -997,6 +1030,25 @@ pub trait BackpressureController: Send + Sync + Debug {
     /// reserve against — refusing does not un-allocate them. Bounding a single
     /// write's memory is the ingress's job, not this one's.
     async fn maybe_apply_backpressure(&self, shard: ShardMemory) -> Result<()>;
+
+    /// Whether a freeze may proceed right now.
+    ///
+    /// Read under the writer lock on the put path, so it must not block: an
+    /// implementation answers from state it already publishes. Returning
+    /// `false` pins the active memtable at its cap — nothing seals, so nothing
+    /// is added to the tier below, and the puts that would have needed a freeze
+    /// are refused instead. That is what turns congestion downstream of the
+    /// flush into backpressure at the ingress rather than unbounded growth.
+    ///
+    /// Deliberately not consulted by [`ShardWriter::force_seal_active`]. That is
+    /// how drain and drop get bytes out of memory and into storage, and they
+    /// have to be able to seal whatever the tier below looks like.
+    ///
+    /// The default admits every freeze, which is lance's own behaviour: only an
+    /// embedder bounding a tier lance cannot see has a reason to say no.
+    fn may_seal(&self) -> bool {
+        true
+    }
 
     /// Throttling counters for [`ShardWriter::backpressure_stats`]. An injected
     /// controller keeps its own metrics, so the default reports zeros rather
@@ -1475,6 +1527,33 @@ async fn replay_memtable_from_wal(
     })
 }
 
+/// Whether the seal a put needed actually happened.
+///
+/// A blocked freeze is not an error in itself — the memtable simply stays at
+/// its cap — but it does mean a put that could only land after it has nowhere
+/// to go. Pre-insert callers turn `Blocked` into a refusal; the post-insert
+/// caller, whose rows are already in, leaves the memtable full and lets the
+/// next put's pre-insert check do the refusing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealOutcome {
+    /// Nothing needed sealing, or the memtable was frozen.
+    Settled,
+    /// A freeze was required and the controller is holding it back.
+    Blocked,
+}
+
+/// The refusal a [`SealOutcome::Blocked`] turns into on a put that could only
+/// have landed after the freeze.
+///
+/// Retryable by construction: the controller admits freezes again as soon as
+/// the tier below drains, so the caller has something to come back to.
+fn seal_blocked_error() -> Error {
+    Error::backpressure(
+        "memtable is full and sealing is held back because the tier below it has no room;          retry once compaction drains it"
+            .to_string(),
+    )
+}
+
 /// Whether a memtable has reached the threshold at which it should be sealed and
 /// flushed.
 ///
@@ -1512,9 +1591,37 @@ fn memtable_reached_flush_threshold(
     incoming_batches: usize,
     incoming_rows: usize,
 ) -> bool {
-    let store = memtable.batch_store();
+    fill_reached_flush_threshold(
+        &memtable.batch_store(),
+        memtable_resident_bytes(memtable),
+        max_memtable_size,
+        max_memtable_rows,
+        max_resident_bytes,
+        incoming_batches,
+        incoming_rows,
+    )
+}
+
+/// [`memtable_reached_flush_threshold`] over what a memtable holds rather than
+/// over the memtable itself, so the same four arms can also be evaluated
+/// against the published snapshot — off the write lock, which is what lets
+/// admission decide before the lock the seal is taken under.
+///
+/// Split out rather than duplicated: the controller decides on this and the
+/// writer acts on it, so the two must be one predicate or a memtable can be
+/// refused for a seal the writer would not have made.
+#[allow(clippy::too_many_arguments)]
+fn fill_reached_flush_threshold(
+    store: &BatchStore,
+    resident_bytes: usize,
+    max_memtable_size: usize,
+    max_memtable_rows: usize,
+    max_resident_bytes: usize,
+    incoming_batches: usize,
+    incoming_rows: usize,
+) -> bool {
     store.row_bytes() >= max_memtable_size
-        || memtable_resident_bytes(memtable) >= max_resident_bytes
+        || resident_bytes >= max_resident_bytes
         || store.remaining_capacity() < incoming_batches
         || store.total_rows().saturating_add(incoming_rows) > max_memtable_rows
 }
@@ -1853,15 +1960,15 @@ impl SharedWriterState {
         state: &mut WriterState,
         incoming_batches: usize,
         incoming_rows: usize,
-    ) -> Result<()> {
+    ) -> Result<SealOutcome> {
         if state.flush_requested {
-            return Ok(());
+            return Ok(SealOutcome::Settled);
         }
 
         // An empty memtable has nothing to seal, and freezing one would spin: its
         // indexes alone can sit above the ceiling.
         if state.memtable.batch_count() == 0 {
-            return Ok(());
+            return Ok(SealOutcome::Settled);
         }
 
         let should_flush = memtable_reached_flush_threshold(
@@ -1873,12 +1980,62 @@ impl SharedWriterState {
             incoming_rows,
         );
 
-        if should_flush {
-            state.flush_requested = true;
-            self.freeze_memtable(state)?;
-            state.flush_requested = false;
+        if !should_flush {
+            return Ok(SealOutcome::Settled);
         }
-        Ok(())
+
+        // Held back rather than sealed: the tier a flush lands in has no room
+        // for another generation. The memtable stays at its cap, so a put that
+        // needed this freeze has to be refused — inserting past a capacity the
+        // in-memory indexes are pre-allocated to would fail the index apply.
+        if !self.may_seal() {
+            return Ok(SealOutcome::Blocked);
+        }
+
+        state.flush_requested = true;
+        self.freeze_memtable(state)?;
+        state.flush_requested = false;
+        Ok(SealOutcome::Settled)
+    }
+
+    /// Whether the installed controller is admitting freezes right now.
+    ///
+    /// Reads `config.backpressure` rather than the resolved controller the put
+    /// path threads: an unset one resolves to [`LocalBackpressureController`],
+    /// which takes the trait default and admits everything, so the two agree.
+    fn may_seal(&self) -> bool {
+        match &self.config.backpressure {
+            Some(controller) => controller.may_seal(),
+            None => true,
+        }
+    }
+
+    /// Whether a put of this shape can only land after a freeze — the same
+    /// predicate [`Self::maybe_trigger_memtable_flush`] acts on, answered off
+    /// the published snapshot so admission can decide before taking the write
+    /// lock that seal is made under.
+    ///
+    /// Racy against a concurrent seal in both directions. Conservative either
+    /// way: the writer re-checks under the lock, and a controller that parks
+    /// re-reads on its next poll.
+    fn seal_required(&self, incoming_batches: usize, incoming_rows: usize) -> bool {
+        let tables = self.memory.load();
+        let Some(active) = tables.active.as_ref() else {
+            return false;
+        };
+        // Matches the empty-memtable early-out above: nothing to seal.
+        if active.batch_store.is_empty() {
+            return false;
+        }
+        fill_reached_flush_threshold(
+            &active.batch_store,
+            active.resident_bytes(),
+            self.config.max_memtable_size,
+            self.config.max_memtable_rows,
+            self.config.max_unflushed_memtable_bytes,
+            incoming_batches,
+            incoming_rows,
+        )
     }
 
     /// Check if WAL flush is needed and trigger if so.
@@ -2831,12 +2988,23 @@ impl ShardWriter {
             >= self.config.max_unflushed_memtable_bytes
         {
             let mut state = state_lock.write().await;
-            writer_state.maybe_trigger_memtable_flush(&mut state, 1, 1)?;
+            if writer_state.maybe_trigger_memtable_flush(&mut state, 1, 1)? == SealOutcome::Blocked
+            {
+                return Err(seal_blocked_error());
+            }
         }
 
-        // Apply backpressure if needed (before acquiring main lock)
+        // Apply backpressure if needed (before acquiring main lock).
+        //
+        // The reading carries whether this put needs a freeze, so a controller
+        // bounding the tier flushes land in can refuse only the puts that would
+        // grow it. Evaluated here rather than under the lock below: it is the
+        // published snapshot, and the answer has to be known before the wait.
         backpressure
-            .maybe_apply_backpressure(ShardMemory::memtables(writer_state.memory.clone()))
+            .maybe_apply_backpressure(
+                ShardMemory::memtables(writer_state.memory.clone())
+                    .with_seal_required(writer_state.seal_required(batches.len(), incoming_rows)),
+            )
             .await?;
 
         let start = std::time::Instant::now();
@@ -2847,7 +3015,18 @@ impl ShardWriter {
 
             // 0. Seal first if this put would not fit: the row cap is a hard
             //    index capacity, so an overshoot cannot be undone afterwards.
-            writer_state.maybe_trigger_memtable_flush(&mut state, batches.len(), incoming_rows)?;
+            //    A freeze the controller is holding back therefore refuses the
+            //    put. Admission above normally catches this; the case left here
+            //    is the race where it decided on a reading taken before the
+            //    memtable filled.
+            if writer_state.maybe_trigger_memtable_flush(
+                &mut state,
+                batches.len(),
+                incoming_rows,
+            )? == SealOutcome::Blocked
+            {
+                return Err(seal_blocked_error());
+            }
 
             // 1. Insert all batches into memtable atomically
             let results = state.memtable.insert_batches_only(batches).await?;
@@ -2884,7 +3063,9 @@ impl ShardWriter {
             // 5. Check if WAL flush should be triggered
             writer_state.maybe_trigger_wal_flush(&mut state);
 
-            // 6. Check if memtable flush is needed (may freeze and rotate)
+            // 6. Check if memtable flush is needed (may freeze and rotate).
+            //    `Blocked` is not an error here: these rows already landed, and
+            //    the memtable is left full for the next put to be refused on.
             if let Err(e) = writer_state.maybe_trigger_memtable_flush(&mut state, 1, 1) {
                 warn!("Failed to trigger memtable flush: {}", e);
             }
@@ -6521,7 +6702,10 @@ mod tests {
     /// A `ShardMemory` backed by a closure instead of a live writer, re-read on
     /// every poll exactly as the real one is.
     fn fake_memory(read: impl Fn() -> usize + Send + Sync + 'static) -> ShardMemory {
-        ShardMemory(ShardMemorySource::Fake(Arc::new(read)))
+        ShardMemory {
+            source: ShardMemorySource::Fake(Arc::new(read)),
+            seal_required: false,
+        }
     }
 
     fn fixed_memory(unflushed: usize) -> ShardMemory {
@@ -9602,6 +9786,94 @@ mod tests {
             !err.is_backpressure(),
             "a config error must not masquerade as the retryable busy signal"
         );
+    }
+
+    /// A controller that admits every write but refuses every freeze — the shape
+    /// a pod-wide controller takes once the tier its flushes land in is full.
+    #[derive(Debug)]
+    struct SealBlocker {
+        blocked: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BackpressureController for SealBlocker {
+        async fn maybe_apply_backpressure(&self, _shard: ShardMemory) -> Result<()> {
+            Ok(())
+        }
+
+        fn may_seal(&self) -> bool {
+            !self.blocked.load(Ordering::Relaxed)
+        }
+    }
+
+    /// A held-back freeze pins the active memtable at its cap rather than
+    /// growing it, and refuses the put that could only have landed after the
+    /// seal. Both halves matter: growing instead would put the memtable past a
+    /// row cap its indexes are pre-allocated to, and admitting instead would
+    /// leave the tier below unbounded, which is the whole reason to say no.
+    #[tokio::test]
+    async fn test_a_blocked_seal_pins_the_memtable_and_refuses_the_put() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let blocker = Arc::new(SealBlocker {
+            blocked: std::sync::atomic::AtomicBool::new(true),
+        });
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: false,
+            // One put of this size carries row bytes past the window, so the
+            // put after it is one that can only land after a freeze.
+            max_memtable_size: 1024,
+            backpressure: Some(blocker.clone()),
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let generation = writer.memtable_stats().await.unwrap().generation;
+        writer
+            .put(vec![create_test_batch(&schema, 0, 200)])
+            .await
+            .expect("the first put fits and needs no seal");
+
+        let rows_before = writer.memtable_stats().await.unwrap().row_count;
+        let err = writer
+            .put(vec![create_test_batch(&schema, 200, 200)])
+            .await
+            .expect_err("a put that can only land after a blocked freeze must be refused");
+        assert!(
+            err.is_backpressure(),
+            "the refusal must be the retryable signal, not a hard failure: {err}"
+        );
+
+        let stats = writer.memtable_stats().await.unwrap();
+        assert_eq!(
+            stats.generation, generation,
+            "a blocked freeze must not rotate the memtable"
+        );
+        assert_eq!(
+            stats.row_count, rows_before,
+            "a refused put must not have landed any rows"
+        );
+
+        // Room again: the same put now seals and lands, so the block is a stall
+        // and not a wedge.
+        blocker
+            .blocked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        writer
+            .put(vec![create_test_batch(&schema, 200, 200)])
+            .await
+            .expect("the put admitted once the freeze is allowed");
+        // Past the generation the block pinned. Not `+ 1`: at this memtable size
+        // the put seals on the way in and rotates again on the way out.
+        assert!(
+            writer.memtable_stats().await.unwrap().generation > generation,
+            "the seal the block was holding back must happen once it lifts"
+        );
+
+        writer.close().await.unwrap();
     }
 
     /// The other side of the gate: a ceiling with room for the reservation *and*
