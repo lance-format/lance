@@ -593,6 +593,17 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Returns the criteria that will be used to update the index
     fn update_criteria(&self) -> UpdateCriteria;
 
+    /// Returns true when updating any part of this index must replace every
+    /// physical segment in the logical index.
+    ///
+    /// This is stronger than [`UpdateCriteria::requires_old_data`], which only
+    /// requires rescanning the segments selected for an update. Implementations
+    /// should request a full rebuild when newly derived index parameters are not
+    /// query-compatible with retained segments.
+    fn requires_full_rebuild(&self) -> bool {
+        false
+    }
+
     /// Derive the index parameters from the current index
     ///
     /// This returns a ScalarIndexParams that can be used to recreate an index

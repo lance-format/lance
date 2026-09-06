@@ -249,6 +249,13 @@ message HnswParameters {
 message JsonIndexDetails {
   string path = 1;
   google.protobuf.Any target_details = 2;
+  // The Arrow output type produced by the typed JSONPath evaluator for index
+  // keys. Absent only on legacy version-0 JSON indices, which query planning
+  // must not assume are compatible with a typed predicate.
+  optional string target_data_type = 3;
+  // Identifies the JSONPath conversion contract used for index keys. Absent
+  // only on legacy version-0 JSON indices; planners require an exact match.
+  optional string conversion = 4;
 }
 message BloomFilterIndexDetails {}
 

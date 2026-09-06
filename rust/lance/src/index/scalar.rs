@@ -35,6 +35,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use itertools::Itertools;
+use lance_core::cache::LanceCache;
 use lance_core::datatypes::Field;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
@@ -69,6 +70,17 @@ use tracing::instrument;
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
 const TRAINING_UPDATE_FREQ: usize = 1000000;
+
+fn scalar_index_container_cache(
+    index_cache: LanceCache,
+    plugin: &dyn ScalarIndexPlugin,
+    index_details: &prost_types::Any,
+) -> Result<LanceCache> {
+    Ok(match plugin.cache_namespace(index_details)? {
+        Some(namespace) => index_cache.with_key_prefix(&namespace),
+        None => index_cache,
+    })
+}
 
 pub(crate) struct TrainingRequest {
     pub fragment_ids: Option<Vec<u32>>,
@@ -577,6 +589,8 @@ pub async fn open_scalar_index(
     let index_cache = dataset
         .index_cache
         .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
+    let container_cache =
+        scalar_index_container_cache(index_cache.clone(), plugin, index_details.as_ref())?;
 
     let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> = frag_reuse_index
         .map(|f| Arc::new(CompactFragReuseIndexHandle(f)) as Arc<dyn RowIdRemapper>);
@@ -605,7 +619,7 @@ pub async fn open_scalar_index(
     });
 
     plugin
-        .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
+        .get_or_insert_in_cache(index_store, frag_reuse_index, &container_cache, load)
         .await
 }
 
@@ -618,6 +632,29 @@ pub(crate) async fn cached_scalar_index_container(
         .index_cache
         .for_index(uuid, frag_reuse_uuid.as_ref());
     index_cache.get_unsized_with_key(&ScalarIndexCacheKey).await
+}
+
+#[cfg(test)]
+pub(crate) async fn cached_scalar_index_container_for_metadata(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<Option<Arc<dyn ScalarIndex>>> {
+    let index_details = index.index_details.as_ref().ok_or_else(|| {
+        Error::internal(format!(
+            "Index {} has no details for its scalar container cache",
+            index.uuid
+        ))
+    })?;
+    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
+    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let index_cache = dataset
+        .index_cache
+        .for_index(&index.uuid, frag_reuse_uuid.as_ref());
+    let container_cache =
+        scalar_index_container_cache(index_cache, plugin, index_details.as_ref())?;
+    Ok(container_cache
+        .get_unsized_with_key(&ScalarIndexCacheKey)
+        .await)
 }
 
 pub(crate) async fn infer_scalar_index_details(

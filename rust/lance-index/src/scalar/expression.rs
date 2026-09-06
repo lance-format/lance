@@ -142,7 +142,7 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     /// is "x = 7" and we have a scalar index on "x" then we apply the index to the "x" column reference.
     ///
     /// However, some indexes are designed to run on projections of the indexed column.  For example,
-    /// if a query is "json_extract(json, '$.name') = 'books'" and we have a JSON index on the "json" column
+    /// if a query is "json_get_string(json, 'name') = 'books'" and we have a JSON index on the "json" column
     /// then we apply the index to the projection of the "json" column.
     ///
     /// This function is used to test if a potential column reference is a reference the index handles.
@@ -2090,7 +2090,7 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
 //
 // There's two ways to get a column.  First, the obvious way, is a
 // simple column reference (e.g. x = 7).  Second, a more complex way,
-// is some kind of projection into a column (e.g. json_extract(json, '$.name')).
+// is some kind of projection into a column (e.g. json_get_string(json, 'name')).
 // Third way is nested field access (e.g. get_field(metadata, "status.code"))
 fn maybe_indexed_column<'b>(
     expr: &Expr,
@@ -2759,6 +2759,30 @@ mod tests {
         check(index_info, expr, None, false)
     }
 
+    fn check_json(
+        index_info: &dyn IndexInformationProvider,
+        expr: &str,
+        expected: Option<IndexedExpression>,
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("color", DataType::Utf8, false),
+            Field::new("size", DataType::Float32, false),
+            Field::new("aisle", DataType::UInt32, false),
+            Field::new("on_sale", DataType::Boolean, false),
+            Field::new("price", DataType::Float32, false),
+            Field::new("json", DataType::LargeBinary, false),
+        ]));
+        let planner = lance_datafusion::planner::Planner::new(schema);
+        let expr = planner.parse_filter(expr).unwrap();
+        let actual = apply_scalar_indices(expr.clone(), index_info).unwrap();
+        if let Some(expected) = expected {
+            assert_eq!(actual, expected);
+        } else {
+            assert!(actual.scalar_query.is_none());
+            assert_eq!(actual.refine_expr.unwrap(), expr);
+        }
+    }
+
     fn check_simple(
         index_info: &dyn IndexInformationProvider,
         expr: &str,
@@ -2984,6 +3008,7 @@ mod tests {
                     DataType::LargeBinary,
                     Box::new(JsonQueryParser::new(
                         "$.name".to_string(),
+                        DataType::Utf8,
                         Box::new(SargableQueryParser::new(
                             "json_idx".to_string(),
                             "BTree".to_string(),
@@ -2994,17 +3019,24 @@ mod tests {
             ),
         ]);
 
-        check_simple(
+        check_json(
             &index_info,
-            "json_extract(json, '$.name') = 'foo'",
-            "json",
-            JsonQuery::new(
-                Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
-                    "foo".to_string(),
-                )))),
-                "$.name".to_string(),
-            ),
+            r#"json_extract(json, '$.name') = '"foo"'"#,
+            Some(IndexedExpression::index_query(
+                "json".to_string(),
+                "json_idx".to_string(),
+                "BTree".to_string(),
+                Arc::new(JsonQuery::new(
+                    Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                        "\"foo\"".to_string(),
+                    )))),
+                    "$.name".to_string(),
+                )),
+            )),
         );
+        // json_get_string returns decoded contents, so it must not use an
+        // index whose Utf8 keys preserve serialized JSON text.
+        check_json(&index_info, "json_get_string(json, 'name') = 'foo'", None);
 
         check_no_index(&index_info, "size BETWEEN 5 AND 10");
         // Cast case.  We will cast 5 (an int64) to Int16 and then coerce to UInt32
@@ -4153,15 +4185,16 @@ mod tests {
         assert_eq!(round_tripped_frags, fragments_covered);
     }
 
-    /// Regression test: when two JSON indices target different paths on the same
-    /// column, a query against one path must be routed to its own index instead
+    /// Regression test: when two JSON indices target different keys on the same
+    /// column, a query against one key must be routed to its own index instead
     /// of being intercepted by whichever parser was registered first.
     #[test]
-    fn test_multi_json_indices_route_by_path() {
+    fn test_multi_json_indices_route_by_key() {
         // Build a MultiQueryParser containing two JSON sub-parsers: one for
-        // path "$.a" and one for path "$.b".
+        // key "a" and one for key "b".
         let mut multi = MultiQueryParser::single(Box::new(JsonQueryParser::new(
             "$.a".to_string(),
+            DataType::Utf8,
             Box::new(SargableQueryParser::new(
                 "json_a_idx".to_string(),
                 "Json".to_string(),
@@ -4170,8 +4203,18 @@ mod tests {
         )));
         multi.add(Box::new(JsonQueryParser::new(
             "$.b".to_string(),
+            DataType::Utf8,
             Box::new(SargableQueryParser::new(
                 "json_b_idx".to_string(),
+                "Json".to_string(),
+                false,
+            )),
+        )));
+        multi.add(Box::new(JsonQueryParser::new(
+            "$.a".to_string(),
+            DataType::Int64,
+            Box::new(SargableQueryParser::new(
+                "json_a_int_idx".to_string(),
                 "Json".to_string(),
                 false,
             )),
@@ -4189,16 +4232,15 @@ mod tests {
             "Json".to_string(),
             Arc::new(JsonQuery::new(
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
-                    "foo".to_string(),
+                    "\"foo\"".to_string(),
                 )))),
                 "$.b".to_string(),
             )),
         );
-        check(
+        check_json(
             &index_info,
-            "json_extract(json, '$.b') = 'foo'",
+            r#"json_extract(json, '$.b') = '"foo"'"#,
             Some(expected_b),
-            false,
         );
 
         // Query against path "$.a" must hit the "$.a" index.
@@ -4208,20 +4250,45 @@ mod tests {
             "Json".to_string(),
             Arc::new(JsonQuery::new(
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
-                    "foo".to_string(),
+                    "\"foo\"".to_string(),
                 )))),
                 "$.a".to_string(),
             )),
         );
-        check(
+        check_json(
             &index_info,
-            "json_extract(json, '$.a') = 'foo'",
+            r#"json_extract(json, '$.a') = '"foo"'"#,
             Some(expected_a),
-            false,
         );
 
-        // Query against an unindexed path must not bind to either index.
-        check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
+        // The same path with native numeric semantics must route to its own
+        // typed index instead of the Utf8 index registered first.
+        let expected_a_int = || {
+            IndexedExpression::index_query(
+                "json".to_string(),
+                "json_a_int_idx".to_string(),
+                "Json".to_string(),
+                Arc::new(JsonQuery::new(
+                    Arc::new(SargableQuery::Equals(ScalarValue::Int64(Some(7)))),
+                    "$.a".to_string(),
+                )),
+            )
+        };
+        check_json(
+            &index_info,
+            "json_extract(json, '$.a') = 7",
+            Some(expected_a_int()),
+        );
+        // Direct-key getters remain eligible when both their type and their
+        // normalized path match the typed JSON index.
+        check_json(
+            &index_info,
+            "json_get_int(json, 'a') = 7",
+            Some(expected_a_int()),
+        );
+
+        // Query against an unindexed key must not bind to either index.
+        check_json(&index_info, r#"json_extract(json, '$.c') = '"foo"'"#, None);
     }
 
     #[test]

@@ -151,6 +151,21 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>>;
 
+    /// Returns a query parser using the physical type recovered from a loaded index.
+    ///
+    /// Most index formats persist enough information in `index_details` and can use
+    /// the default implementation. Compatibility wrappers whose historical metadata
+    /// omitted the training type can override this method and decline routing unless
+    /// the loaded type proves that the query and stored keys have identical semantics.
+    fn new_query_parser_with_training_data_type(
+        &self,
+        index_name: String,
+        index_details: &prost_types::Any,
+        _training_data_type: Option<&DataType>,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        self.new_query_parser(index_name, index_details)
+    }
+
     /// Load an index from storage
     ///
     /// The index details should match the details that were returned when the index was
@@ -162,6 +177,17 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// Returns an additional namespace for the cached whole-index container.
+    ///
+    /// Most index metadata is immutable for the lifetime of its UUID, so the
+    /// default per-UUID namespace is sufficient. Compatibility wrappers whose
+    /// interpretation can be upgraded without changing the UUID must include
+    /// that interpretation here so readers of old and new metadata cannot
+    /// exchange stale wrapper instances.
+    fn cache_namespace(&self, _index_details: &prost_types::Any) -> Result<Option<String>> {
+        Ok(None)
+    }
 
     /// Look up a previously-opened index in the cache.
     ///

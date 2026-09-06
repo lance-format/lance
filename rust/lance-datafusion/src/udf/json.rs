@@ -25,6 +25,58 @@ pub enum JsonbType {
     Object = 6,
 }
 
+/// Internal UDF name for JSONPath extraction with native `Int64` semantics.
+pub const JSON_EXTRACT_INT64_UDF_NAME: &str = "_lance_json_extract_int64";
+/// Internal UDF name for JSONPath extraction with native `Float64` semantics.
+pub const JSON_EXTRACT_FLOAT64_UDF_NAME: &str = "_lance_json_extract_float64";
+/// Internal UDF name for JSONPath extraction with native boolean semantics.
+pub const JSON_EXTRACT_BOOLEAN_UDF_NAME: &str = "_lance_json_extract_boolean";
+/// Internal UDF name for JSONPath extraction with serialized JSON text semantics.
+pub const JSON_EXTRACT_UTF8_UDF_NAME: &str = "_lance_json_extract_utf8";
+/// Internal UDF name for JSONPath extraction with JSONB array/object semantics.
+pub const JSON_EXTRACT_LARGE_BINARY_UDF_NAME: &str = "_lance_json_extract_large_binary";
+
+/// Normalize the JSONPath form shared by query planning and JSON indices.
+///
+/// JSON index parameters historically accepted a direct key such as `name` in
+/// addition to a rooted JSONPath such as `$.name`. Direct keys are normalized
+/// to the rooted form so both spellings select the same index.
+pub fn normalize_json_path(path: &str) -> Result<String> {
+    let path = path.trim();
+    let normalized = if path.starts_with('$') {
+        path.to_string()
+    } else {
+        format!("$.{path}")
+    };
+    common::parse_json_path(&normalized)?;
+    Ok(normalized)
+}
+
+/// Return the internal typed JSONPath UDF for a supported output type.
+///
+/// These UDFs are embedded directly in planned expressions. They are not part
+/// of the public SQL function namespace; uncontextualized `json_extract`
+/// projections continue to return serialized JSON text.
+pub fn json_extract_typed_udf(data_type: &DataType) -> Option<ScalarUDF> {
+    let name = match data_type {
+        DataType::Boolean => JSON_EXTRACT_BOOLEAN_UDF_NAME,
+        DataType::Int64 => JSON_EXTRACT_INT64_UDF_NAME,
+        DataType::Float64 => JSON_EXTRACT_FLOAT64_UDF_NAME,
+        DataType::Utf8 => JSON_EXTRACT_UTF8_UDF_NAME,
+        DataType::LargeBinary => JSON_EXTRACT_LARGE_BINARY_UDF_NAME,
+        _ => return None,
+    };
+    let output_type = data_type.clone();
+    let implementation_type = data_type.clone();
+    Some(create_udf(
+        name,
+        vec![DataType::LargeBinary, DataType::Utf8],
+        output_type,
+        Volatility::Immutable,
+        Arc::new(move |args| json_extract_typed_columnar_impl(args, &implementation_type)),
+    ))
+}
+
 impl JsonbType {
     /// Convert from u8 value
     pub fn from_u8(value: u8) -> Option<Self> {
@@ -300,6 +352,178 @@ fn json_extract_impl(args: &[ArrayRef]) -> Result<ArrayRef> {
     }
 
     Ok(Arc::new(builder.finish()))
+}
+
+fn json_extract_typed_columnar_impl(
+    args: &[ColumnarValue],
+    data_type: &DataType,
+) -> Result<ColumnarValue> {
+    let arrays = common::columnar_to_arrays(args);
+    let result = json_extract_typed_impl(&arrays, data_type)?;
+    Ok(ColumnarValue::Array(result))
+}
+
+/// Evaluate a JSONPath using the exact output semantics shared by scans and
+/// JSON index training.
+fn json_extract_typed_impl(args: &[ArrayRef], data_type: &DataType) -> Result<ArrayRef> {
+    common::validate_arg_count(args, 2, "typed json_extract")?;
+
+    let jsonb_array = common::extract_jsonb_array(args)?;
+    let path_array = common::extract_string_array(args, 1)?;
+
+    macro_rules! append_native_values {
+        ($builder:expr, $expected:pat, $target:ty, $type_name:literal) => {{
+            let mut builder = $builder;
+            for index in 0..jsonb_array.len() {
+                if jsonb_array.is_null(index) {
+                    builder.append_null();
+                    continue;
+                }
+                let Some(path) = common::get_string_value_at(path_array, index) else {
+                    builder.append_null();
+                    continue;
+                };
+                match extract_json_path_with_type(jsonb_array.value(index), path)? {
+                    None => builder.append_null(),
+                    Some((_, type_tag)) if type_tag == JsonbType::Null.as_u8() => {
+                        builder.append_null()
+                    }
+                    Some((value, type_tag)) => {
+                        let actual_type = JsonbType::from_u8(type_tag).ok_or_else(|| {
+                            common::execution_error(format!(
+                                "JSONPath '{path}' produced invalid type tag {type_tag} at row {index}"
+                            ))
+                        })?;
+                        if !matches!(actual_type, $expected) {
+                            return Err(common::execution_error(format!(
+                                "JSONPath '{path}' expected {}, but row {index} has JSON type {actual_type:?}",
+                                $type_name
+                            )));
+                        }
+                        let raw_jsonb = jsonb::RawJsonb::new(&value);
+                        let value = jsonb::from_raw_jsonb::<$target>(&raw_jsonb).map_err(|error| {
+                            common::execution_error(format!(
+                                "Failed to convert JSONPath '{path}' at row {index} to {}: {error}",
+                                $type_name
+                            ))
+                        })?;
+                        builder.append_value(value);
+                    }
+                }
+            }
+            Arc::new(builder.finish()) as ArrayRef
+        }};
+    }
+
+    let result = match data_type {
+        DataType::Boolean => append_native_values!(
+            BooleanBuilder::with_capacity(jsonb_array.len()),
+            JsonbType::Boolean,
+            bool,
+            "Boolean"
+        ),
+        DataType::Int64 => append_native_values!(
+            Int64Builder::with_capacity(jsonb_array.len()),
+            JsonbType::Int64,
+            i64,
+            "Int64"
+        ),
+        DataType::Float64 => append_native_values!(
+            Float64Builder::with_capacity(jsonb_array.len()),
+            JsonbType::Int64 | JsonbType::Float64,
+            f64,
+            "Float64"
+        ),
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::with_capacity(jsonb_array.len(), 1024);
+            for index in 0..jsonb_array.len() {
+                if jsonb_array.is_null(index) {
+                    builder.append_null();
+                    continue;
+                }
+                let Some(path) = common::get_string_value_at(path_array, index) else {
+                    builder.append_null();
+                    continue;
+                };
+                match extract_json_path(jsonb_array.value(index), path)? {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::LargeBinary => {
+            let mut builder = LargeBinaryBuilder::with_capacity(jsonb_array.len(), 1024);
+            for index in 0..jsonb_array.len() {
+                if jsonb_array.is_null(index) {
+                    builder.append_null();
+                    continue;
+                }
+                let Some(path) = common::get_string_value_at(path_array, index) else {
+                    builder.append_null();
+                    continue;
+                };
+                match extract_json_path_with_type(jsonb_array.value(index), path)? {
+                    None => builder.append_null(),
+                    Some((_, type_tag)) if type_tag == JsonbType::Null.as_u8() => {
+                        builder.append_null()
+                    }
+                    Some((value, type_tag)) => {
+                        let actual_type = JsonbType::from_u8(type_tag).ok_or_else(|| {
+                            common::execution_error(format!(
+                                "JSONPath '{path}' produced invalid type tag {type_tag} at row {index}"
+                            ))
+                        })?;
+                        if !matches!(actual_type, JsonbType::Array | JsonbType::Object) {
+                            return Err(common::execution_error(format!(
+                                "JSONPath '{path}' expected LargeBinary, but row {index} has JSON type {actual_type:?}"
+                            )));
+                        }
+                        builder.append_value(value);
+                    }
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        _ => {
+            return Err(common::execution_error(format!(
+                "Unsupported typed JSONPath output type: {data_type:?}"
+            )));
+        }
+    };
+
+    Ok(result)
+}
+
+/// Infer the native scalar type of the first non-null JSONPath value in an
+/// array. The input remains untouched so callers can subsequently evaluate it
+/// with [`json_extract_typed_udf`].
+pub fn infer_json_extract_type(
+    jsonb_array: &LargeBinaryArray,
+    path: &str,
+) -> Result<Option<DataType>> {
+    for value in jsonb_array.iter().flatten() {
+        let Some((_, type_tag)) = extract_json_path_with_type(value, path)? else {
+            continue;
+        };
+        let jsonb_type = JsonbType::from_u8(type_tag).ok_or_else(|| {
+            common::execution_error(format!(
+                "JSONPath '{path}' produced invalid type tag {type_tag}"
+            ))
+        })?;
+        let data_type = match jsonb_type {
+            JsonbType::Null => continue,
+            JsonbType::Boolean => DataType::Boolean,
+            JsonbType::Int64 => DataType::Int64,
+            JsonbType::Float64 => DataType::Float64,
+            // Utf8 extraction preserves serialized JSON text, matching the
+            // public json_extract projection semantics.
+            JsonbType::String => DataType::Utf8,
+            JsonbType::Array | JsonbType::Object => DataType::LargeBinary,
+        };
+        return Ok(Some(data_type));
+    }
+    Ok(None)
 }
 
 /// Implementation of json_extract_with_type function
@@ -952,6 +1176,7 @@ fn get_array_length(jsonb_bytes: &[u8], path: &str) -> Result<Option<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::AsArray;
     use arrow_array::builder::LargeBinaryBuilder;
     use arrow_array::{BooleanArray, Float64Array, Int64Array};
 
@@ -1008,6 +1233,37 @@ mod tests {
         assert_eq!(string_array.value(1), "30");
         assert_eq!(string_array.value(2), "[\"python\",\"ml\"]");
         assert!(string_array.is_null(3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_typed_json_extract_numeric_and_lexical_semantics() -> Result<()> {
+        let jsonb = [
+            r#"{"nested": {"n": 3}}"#,
+            r#"{"nested": {"n": null}}"#,
+            r#"{"nested": {}}"#,
+        ]
+        .map(create_test_jsonb);
+        let jsonb_array: ArrayRef = Arc::new(LargeBinaryArray::from_iter_values(
+            jsonb.iter().map(Vec::as_slice),
+        ));
+        let path_array: ArrayRef = Arc::new(StringArray::from(vec!["$.nested.n"]));
+
+        let numeric =
+            json_extract_typed_impl(&[jsonb_array.clone(), path_array.clone()], &DataType::Int64)?;
+        let numeric = numeric.as_primitive::<arrow_array::types::Int64Type>();
+        assert_eq!(
+            numeric.iter().collect::<Vec<_>>(),
+            vec![Some(3), None, None]
+        );
+
+        let lexical = json_extract_typed_impl(&[jsonb_array, path_array], &DataType::Utf8)?;
+        let lexical = lexical.as_string::<i32>();
+        assert_eq!(
+            lexical.iter().collect::<Vec<_>>(),
+            vec![Some("3"), Some("null"), None]
+        );
 
         Ok(())
     }

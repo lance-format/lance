@@ -456,7 +456,7 @@ async fn merge_scalar_indices<'a>(
         ));
     }
 
-    let selected_old_indices = select_segments_to_merge(dataset.as_ref(), old_indices, options);
+    let mut selected_old_indices = select_segments_to_merge(dataset.as_ref(), old_indices, options);
 
     // No new data + ≤1 old selected = rewriting one segment to itself.
     if unindexed.is_empty() && selected_old_indices.len() <= 1 {
@@ -472,6 +472,12 @@ async fn merge_scalar_indices<'a>(
     let reference_index = dataset
         .open_scalar_index(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
         .await?;
+    if reference_index.requires_full_rebuild() {
+        // Append mode normally selects no old segments. Expanding here prevents
+        // a migration rebuild from committing new semantics beside retained,
+        // query-incompatible segments.
+        selected_old_indices = old_indices.to_vec();
+    }
     let update_criteria = reference_index.update_criteria();
 
     // Effective = bitmap ∩ live fragments; deleted = bitmap \ live fragments.
@@ -2049,6 +2055,168 @@ mod tests {
             0,
             "a failed stale commit must not publish the staged vector segment"
         );
+    }
+
+    #[tokio::test]
+    async fn test_append_rebuilds_all_legacy_json_segments() {
+        use lance_arrow::{ARROW_EXT_NAME_KEY, json::ARROW_JSON_EXT_NAME};
+        use lance_core::ROW_ID;
+        use lance_index::pb::JsonIndexDetails;
+        use lance_index::scalar::registry::VALUE_COLUMN_NAME;
+
+        const INDEX_NAME: &str = "json_idx";
+
+        let test_dir = TempStrDir::default();
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("json", DataType::Utf8, false).with_metadata(metadata),
+        ]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![r#"{"val":"foo"}"#]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            test_dir.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Build the target B-tree exactly as a released version-0 JSON wrapper
+        // did: decoded string keys with no conversion metadata.
+        let training_schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let training_batch = RecordBatch::try_new(
+            training_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["foo"])),
+                Arc::new(UInt64Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let training_reader = Box::new(RecordBatchIterator::new(
+            [Ok(training_batch)],
+            training_schema,
+        ));
+        let legacy_uuid = Uuid::new_v4();
+        let target_created = crate::index::scalar::build_scalar_index(
+            &dataset,
+            "json",
+            legacy_uuid,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            true,
+            None,
+            Some(reader_to_stream(training_reader)),
+            Arc::new(NoopIndexBuildProgress),
+        )
+        .await
+        .unwrap();
+        let legacy_details = JsonIndexDetails {
+            path: "$.val".to_string(),
+            target_details: Some(target_created.index_details),
+            target_data_type: None,
+            conversion: None,
+        };
+        let legacy_segment = IndexMetadata {
+            uuid: legacy_uuid,
+            name: INDEX_NAME.to_string(),
+            fields: vec![dataset.schema().field("json").unwrap().id],
+            covering_fields: Vec::new(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0])),
+            index_details: Some(Arc::new(
+                prost_types::Any::from_msg(&legacy_details).unwrap(),
+            )),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: Some(index_files_to_table(target_created.files)),
+        };
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "json", vec![legacy_segment])
+            .await
+            .unwrap();
+
+        let appended = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![r#"{"val":"bar"}"#]))],
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(appended)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(
+            segments.len(),
+            1,
+            "legacy and typed segments must not coexist"
+        );
+        assert_eq!(
+            segments[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([0, 1])
+        );
+        let rebuilt_details =
+            JsonIndexDetails::decode(segments[0].index_details.as_ref().unwrap().value.as_slice())
+                .unwrap();
+        assert_eq!(rebuilt_details.target_data_type.as_deref(), Some("Utf8"));
+        assert_eq!(
+            rebuilt_details.conversion.as_deref(),
+            Some("jsonpath_typed_v1")
+        );
+
+        for (predicate, expected_json) in [
+            (
+                r#"json_extract(json, '$.val') = '"foo"'"#,
+                r#"{"val":"foo"}"#,
+            ),
+            (
+                r#"json_extract(json, '$.val') = '"bar"'"#,
+                r#"{"val":"bar"}"#,
+            ),
+        ] {
+            let mut indexed_scan = dataset.scan();
+            indexed_scan.filter(predicate).unwrap();
+            let plan = indexed_scan.explain_plan(false).await.unwrap();
+            assert!(
+                plan.contains(INDEX_NAME),
+                "typed predicate did not use the rebuilt JSON index:\n{plan}"
+            );
+            let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+            let mut baseline_scan = dataset.scan();
+            baseline_scan.use_scalar_index(false);
+            let baseline = baseline_scan
+                .filter(predicate)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            assert_eq!(indexed.num_rows(), 1, "predicate={predicate}");
+            assert_eq!(indexed, baseline, "predicate={predicate}");
+            assert_eq!(indexed["json"].as_string::<i32>().value(0), expected_json);
+        }
     }
 
     #[tokio::test]

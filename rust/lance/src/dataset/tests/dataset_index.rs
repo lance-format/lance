@@ -6288,6 +6288,17 @@ fn json_batch(values: Vec<&str>) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
 }
 
+fn sorted_json_values(batch: &RecordBatch) -> Vec<String> {
+    let mut values = batch["json"]
+        .as_string::<i32>()
+        .iter()
+        .flatten()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values
+}
+
 async fn json_btree_dataset(initial_values: Vec<&str>) -> Dataset {
     let initial = json_batch(initial_values);
     let initial_schema = initial.schema();
@@ -6308,6 +6319,213 @@ async fn json_btree_dataset(initial_values: Vec<&str>) -> Dataset {
         .await
         .unwrap();
     dataset
+}
+
+/// Regression test for https://github.com/lance-format/lance/issues/8806.
+#[tokio::test]
+async fn test_json_btree_routes_typed_json_extract() {
+    let initial = json_batch(vec![
+        r#"{"kind": "click", "n": 3}"#,
+        r#"{"kind": "view", "n": 7}"#,
+        r#"{"kind": "click", "n": 9}"#,
+    ]);
+    let initial_schema = initial.schema();
+    let reader = RecordBatchIterator::new([Ok(initial)], initial_schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    let appended = json_batch(vec![
+        r#"{"kind": "scroll", "n": 12}"#,
+        r#"{"kind": "click", "n": 100}"#,
+        r#"{"kind": null, "n": null}"#,
+        r#"{"other": "missing"}"#,
+    ]);
+    let appended_schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended)], appended_schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let int_params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "btree",
+        "target_data_type": "Int64",
+        // Direct keys and rooted JSONPaths normalize to the same identity.
+        "path": "n",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_n_int_idx".to_string()),
+            &int_params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    for (predicate, expected_rows) in [
+        ("json_extract(json, '$.n') = 9", 1),
+        ("json_extract(json, '$.n') > 5", 4),
+        ("CAST(json_extract(json, '$.n') AS BIGINT) >= 9", 3),
+    ] {
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter(predicate).unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("json_n_int_idx"),
+            "numeric predicate did not use the Int64 JSON index: {predicate}\n{plan}"
+        );
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        let baseline = baseline_scan
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(baseline.num_rows(), expected_rows, "predicate={predicate}");
+        assert_eq!(indexed.num_rows(), expected_rows, "predicate={predicate}");
+        assert_eq!(
+            sorted_json_values(&indexed),
+            sorted_json_values(&baseline),
+            "predicate={predicate}"
+        );
+    }
+
+    // A Utf8 predicate has lexicographic serialized-JSON semantics. It must
+    // scan while only the differently typed Int64 index exists.
+    for (predicate, expected_rows) in [
+        ("json_extract(json, '$.n') = '9'", 1),
+        ("json_extract(json, '$.n') > '5'", 3),
+    ] {
+        let mut scan = dataset.scan();
+        scan.filter(predicate).unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ScalarIndexQuery"),
+            "Utf8 predicate used a differently typed JSON index: {predicate}\n{plan}"
+        );
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), expected_rows, "predicate={predicate}");
+    }
+
+    let text_params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": "btree",
+        "target_data_type": "Utf8",
+        "path": "$.n",
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_n_text_idx".to_string()),
+            &text_params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    for (predicate, expected_rows) in [
+        ("json_extract(json, '$.n') = '9'", 1),
+        ("json_extract(json, '$.n') > '5'", 3),
+    ] {
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter(predicate).unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("json_n_text_idx"),
+            "Utf8 predicate did not use the Utf8 JSON index: {predicate}\n{plan}"
+        );
+        assert!(
+            !plan.contains("json_n_int_idx"),
+            "Utf8 predicate used the Int64 JSON index: {predicate}\n{plan}"
+        );
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        let baseline = baseline_scan
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(baseline.num_rows(), expected_rows, "predicate={predicate}");
+        assert_eq!(
+            sorted_json_values(&indexed),
+            sorted_json_values(&baseline),
+            "predicate={predicate}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_inferred_json_btree_preserves_json_null() {
+    let dataset = json_btree_dataset(vec![
+        r#"{"val": "x"}"#,
+        r#"{"val": null}"#,
+        r#"{"other": "missing"}"#,
+    ])
+    .await;
+    let predicate = "json_extract(json, '$.val') = 'null'";
+
+    let mut indexed_scan = dataset.scan();
+    indexed_scan.filter(predicate).unwrap();
+    let plan = indexed_scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("json_idx"),
+        "Utf8 JSON-null predicate did not use the inferred JSON index:\n{plan}"
+    );
+    let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+    let mut baseline_scan = dataset.scan();
+    baseline_scan.use_scalar_index(false);
+    let baseline = baseline_scan
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(baseline.num_rows(), 1);
+    assert_eq!(sorted_json_values(&indexed), sorted_json_values(&baseline));
+}
+
+#[tokio::test]
+async fn test_json_get_null_semantics_bypass_typed_json_index() {
+    let dataset = json_btree_dataset(vec![
+        r#"{"val": [1]}"#,
+        r#"{"val": null}"#,
+        r#"{"other": "missing"}"#,
+    ])
+    .await;
+    let predicate = "json_get(json, 'val') IS NULL";
+
+    let mut indexed_scan = dataset.scan();
+    indexed_scan.filter(predicate).unwrap();
+    let plan = indexed_scan.explain_plan(false).await.unwrap();
+    assert!(
+        !plan.contains("ScalarIndexQuery"),
+        "json_get has different JSON-null semantics and must bypass the typed index:\n{plan}"
+    );
+    let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+    let mut baseline_scan = dataset.scan();
+    baseline_scan.use_scalar_index(false);
+    let baseline = baseline_scan
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    assert_eq!(baseline.num_rows(), 1);
+    assert_eq!(sorted_json_values(&indexed), sorted_json_values(&baseline));
 }
 
 #[tokio::test]

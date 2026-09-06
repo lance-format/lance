@@ -6157,11 +6157,15 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         "NGram",
         "ZoneMap",
     ]
+    index_versions = [0, 0, 0, 1, 0, 0]
     details = [
         "{}",
         "{}",
         "{}",
-        '{"path":"x","target_details":{}}',
+        (
+            '{"path":"x","target_data_type":"Utf8",'
+            '"conversion":"jsonpath_typed_v1","target_details":{}}'
+        ),
         "{}",
         "{}",
     ]
@@ -6176,7 +6180,7 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         assert len(indices[i].segments) == 1
         assert indices[i].segments[0].fragment_ids == {0}
         assert indices[i].segments[0].dataset_version_at_last_update == i + 2
-        assert indices[i].segments[0].index_version == 0
+        assert indices[i].segments[0].index_version == index_versions[i]
         assert indices[i].segments[0].created_at is not None
         assert isinstance(indices[i].segments[0].created_at, datetime)
         assert indices[i].segments[0].size_bytes is not None
