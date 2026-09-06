@@ -639,7 +639,7 @@ impl InvertedIndex {
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
         let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_query_tokens(text, &mut tokenizer);
+        let tokens = try_collect_query_tokens(text, &mut tokenizer)?;
 
         let (doc_ids, _) = self
             .bm25_search(

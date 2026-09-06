@@ -892,6 +892,12 @@ impl BasicTrainer for JsonIndexPlugin {
             .unwrap_or(DataType::Utf8);
         let registry = self.registry()?;
         let target_plugin = registry.get_plugin_by_name(&params.target_index_type)?;
+        if target_plugin.name().eq_ignore_ascii_case("inverted") {
+            return Err(Error::not_supported(format!(
+                "JSON-path indexes do not support target index type '{}'; create an INVERTED index directly on the JSON column instead",
+                params.target_index_type
+            )));
+        }
         let target_trainer = target_plugin.basic_trainer().ok_or_else(|| {
             Error::invalid_input_source(
                 format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.target_index_type).into(),
@@ -1071,6 +1077,27 @@ mod tests {
     use std::ops::Bound;
     use std::sync::Arc;
 
+    #[test]
+    fn test_json_index_rejects_inverted_target() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let trainer = plugin.basic_trainer().unwrap();
+        let error = trainer
+            .new_training_request(
+                r#"{"target_index_type":"inverted","path":"$.title"}"#,
+                &Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            )
+            .err()
+            .expect("an inverted target should be rejected");
+
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("JSON-path indexes do not support target index type 'inverted'"),
+            "{error}"
+        );
+    }
     // Note: The old test_detect_json_value_type test has been removed as we now use
     // JSONB's inherent type information instead of string-based type detection
 

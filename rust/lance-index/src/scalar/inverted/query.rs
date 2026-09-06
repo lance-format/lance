@@ -882,13 +882,47 @@ impl<'a> IntoIterator for &'a Tokens {
 
 pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>) -> Tokens {
     let token_type = tokenizer.doc_type();
-    let mut stream = tokenizer.token_stream_for_search(text);
+    let stream = tokenizer.token_stream_for_search(text);
+    collect_tokens(stream, token_type)
+}
+
+/// Tokenize search text, returning tokenizer-specific query syntax errors.
+pub fn try_collect_query_tokens(
+    text: &str,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
+) -> Result<Tokens> {
+    let token_type = tokenizer.doc_type();
+    let stream = tokenizer.token_stream_for_search(text);
+    try_collect_tokens(stream, token_type)
+}
+
+fn collect_tokens(mut stream: lance_tokenizer::BoxTokenStream<'_>, token_type: DocType) -> Tokens {
     let mut tokens = Vec::new();
     let mut positions = Vec::new();
     while let Some(token) = stream.next() {
         tokens.push(token.text.clone());
         positions.push(token.position as u32);
     }
+    finish_tokens(tokens, positions, token_type)
+}
+
+fn try_collect_tokens(
+    mut stream: lance_tokenizer::BoxTokenStream<'_>,
+    token_type: DocType,
+) -> Result<Tokens> {
+    let mut tokens = Vec::new();
+    let mut positions = Vec::new();
+    while let Some(token) = stream
+        .try_next()
+        .map_err(lance_core::Error::invalid_input)?
+    {
+        tokens.push(token.text.clone());
+        positions.push(token.position as u32);
+    }
+    Ok(finish_tokens(tokens, positions, token_type))
+}
+
+fn finish_tokens(tokens: Vec<String>, mut positions: Vec<u32>, token_type: DocType) -> Tokens {
     if let Some(first_position) = positions.first().copied() {
         // Phrase positions are relative to the first retained query token. This preserves gaps
         // between retained tokens without requiring documents to contain filtered leading terms.

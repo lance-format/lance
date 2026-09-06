@@ -10,13 +10,13 @@ use arrow_array::{
     builder::{ListBuilder, StringBuilder},
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields};
+use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::scanner::{ColumnOrdering, QueryFilter};
 use lance::dataset::{ColumnAlteration, InsertBuilder, WriteMode, WriteParams};
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt, json::ARROW_JSON_EXT_NAME};
 use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
@@ -244,6 +244,67 @@ fn expected_bm25_score(
     let avg_doc_length = total_tokens as f32 / num_docs;
     let doc_norm = 1.2 * (1.0 - 0.75 + 0.75 * doc_tokens as f32 / avg_doc_length);
     idf * 2.2 / (1.0 + doc_norm)
+}
+
+#[tokio::test]
+async fn test_invalid_json_fts_query_returns_error() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("doc", DataType::Utf8, false).with_metadata(
+            [(
+                ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_JSON_EXT_NAME.to_string(),
+            )]
+            .into(),
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            Arc::new(StringArray::from(vec![
+                r#"{"title":"quick brown fox"}"#,
+                r#"{"title":"lazy dog"}"#,
+            ])),
+        ],
+    )
+    .unwrap();
+    let test_dir = tempfile::tempdir().unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        test_dir.path().to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            None,
+            &base_inverted_params(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for (query, expected_message) in [
+        ("brown", "Invalid triple format: brown"),
+        ("title,string,brown", "Invalid triple type: string"),
+    ] {
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new(query.to_string())
+                    .with_column("doc".to_string())
+                    .unwrap(),
+            )
+            .unwrap();
+        let error = scanner.try_into_batch().await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(expected_message), "{message}");
+        assert!(!message.contains("Task was aborted"), "{message}");
+    }
 }
 
 #[tokio::test]
