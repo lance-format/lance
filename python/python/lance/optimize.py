@@ -13,7 +13,7 @@ from .lance import RewriteResult as RewriteResult
 # from .lance import CompactionPlan as CompactionPlan
 
 
-class CompactionOptions(TypedDict):
+class CompactionOptions(TypedDict, total=False):
     """Options for compaction."""
 
     target_rows_per_fragment: Optional[int]
@@ -113,6 +113,17 @@ class CompactionOptions(TypedDict):
     this is not a cap on total compaction I/O for datasets with blob
     columns.
     (default: None, no limit)
+    """
+    source_budget_mode: Optional[Literal["hard", "soft"]]
+    """
+    Controls how all configured max-source budgets are applied to cumulative
+    totals across the tasks selected for one plan. ``"hard"`` rejects a task
+    when adding it would exceed any cumulative budget and is the default.
+    ``"soft"`` always admits the first task. If that task exceeds a budget,
+    the plan stops there; otherwise later tasks use the same cumulative checks
+    as ``"hard"``. If a byte budget is set but the first task has a source
+    file without a recorded size, ``"soft"`` admits that task and stops;
+    ``"hard"`` reports an error.
     """
     excluded_fragment_ids: Optional[list[int]]
     """

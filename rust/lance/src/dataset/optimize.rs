@@ -168,6 +168,39 @@ impl TryFrom<&str> for CompactionMode {
     }
 }
 
+/// Controls how compaction planning applies the configured source budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SourceBudgetMode {
+    /// Reject a task when adding it would make any cumulative source total
+    /// exceed its configured budget.
+    ///
+    /// If the first indivisible compaction task exceeds any budget, the plan
+    /// is empty. This preserves the historical behavior.
+    #[default]
+    Hard,
+    /// Always admit the first indivisible compaction task, even when it exceeds
+    /// a configured cumulative source budget.
+    ///
+    /// If the first task exceeds a budget, the plan stops there. Otherwise,
+    /// later tasks use the same cumulative checks as [`SourceBudgetMode::Hard`].
+    Soft,
+}
+
+impl TryFrom<&str> for SourceBudgetMode {
+    type Error = Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value.to_lowercase().as_str() {
+            "hard" => Ok(Self::Hard),
+            "soft" => Ok(Self::Soft),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid source budget mode \"{}\". Valid values: \"hard\", \"soft\"",
+                value
+            ))),
+        }
+    }
+}
+
 /// Controls how the old-to-new row-address mapping is built when remapping
 /// indices during compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -289,6 +322,21 @@ pub struct CompactionOptions {
     /// columns.
     /// Defaults to `None` (no limit).
     pub max_source_bytes: Option<u64>,
+    /// Controls whether `max_source_fragments`, `max_source_rows`, and
+    /// `max_source_bytes` are hard or soft limits.
+    ///
+    /// Budgets apply to cumulative totals across the tasks selected for one
+    /// plan. In [`SourceBudgetMode::Hard`] mode, a task is rejected when adding
+    /// it would exceed any budget. In [`SourceBudgetMode::Soft`] mode, the first
+    /// task is always admitted. If it exceeds a budget, the plan stops there;
+    /// otherwise later tasks use the same cumulative checks as hard mode.
+    /// If a task has a source file without a recorded size while a byte budget
+    /// is configured, soft mode stops at that task because it cannot be safely
+    /// compared with the budget. The task is admitted only when it is first,
+    /// preserving the soft-mode progress guarantee. Hard mode reports an error.
+    /// Defaults to [`SourceBudgetMode::Hard`].
+    #[serde(default)]
+    pub source_budget_mode: SourceBudgetMode,
     /// Fragment IDs to exclude from compaction planning.
     ///
     /// Excluded fragments act as boundaries between adjacent compaction candidates,
@@ -337,6 +385,7 @@ impl Default for CompactionOptions {
             max_source_fragments: None,
             max_source_rows: None,
             max_source_bytes: None,
+            source_budget_mode: SourceBudgetMode::Hard,
             excluded_fragment_ids: Vec::new(),
             max_overlays_per_fragment: Some(10),
             transaction_properties: None,
@@ -367,6 +416,7 @@ impl CompactionOptions {
     /// - `lance.compaction.max_source_fragments`
     /// - `lance.compaction.max_source_rows`
     /// - `lance.compaction.max_source_bytes`
+    /// - `lance.compaction.source_budget_mode`
     /// - `lance.compaction.max_overlays_per_fragment`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
@@ -493,6 +543,9 @@ impl CompactionOptions {
                             key, value
                         ))
                     })?);
+                }
+                "source_budget_mode" => {
+                    self.source_budget_mode = SourceBudgetMode::try_from(value.as_str())?;
                 }
                 "max_overlays_per_fragment" => {
                     // The default is `Some(10)`, so an explicit "none" is the only
@@ -1027,11 +1080,12 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
 /// Truncates a planned task list to the configured per-run source budgets
 /// (`max_source_fragments`, `max_source_rows`, `max_source_bytes`).
 ///
-/// All configured budgets apply together: tasks are kept, in order, until
-/// adding the next task would exceed any one of them. The budgets are hard
-/// upper bounds, so if the first task already exceeds one of them the
-/// returned plan is empty and a warning is logged, since compaction would
-/// otherwise stall silently.
+/// All configured budgets apply together to cumulative totals across selected
+/// tasks. Tasks are kept, in order, until adding the next task would exceed any
+/// one of them. In [`SourceBudgetMode::Hard`] mode the returned plan is empty if
+/// the first task exceeds a budget. [`SourceBudgetMode::Soft`] always admits the
+/// first task. If it exceeds a budget, the plan stops there; otherwise later
+/// tasks use the same cumulative checks as hard mode.
 ///
 /// Each task is paired with the number of live rows in its source fragments.
 fn limit_tasks_to_source_budget(
@@ -1064,7 +1118,18 @@ fn limit_tasks_to_source_budget(
         total_fragments += task.fragments.len();
         total_rows = total_rows.saturating_add(live_rows);
         if options.max_source_bytes.is_some() {
-            total_bytes = total_bytes.saturating_add(task_source_bytes(&task, &schema_field_ids)?);
+            let allow_missing_size = options.source_budget_mode == SourceBudgetMode::Soft;
+            let Some(task_bytes) = task_source_bytes(&task, &schema_field_ids, allow_missing_size)?
+            else {
+                // Soft mode stops at a task whose source size is unavailable.
+                // Admit it only when it is first so planning still makes
+                // progress; otherwise keep the already-safe selected prefix.
+                if tasks.is_empty() {
+                    tasks.push(task);
+                }
+                break;
+            };
+            total_bytes = total_bytes.saturating_add(task_bytes);
         }
 
         let over_budget = options
@@ -1074,7 +1139,12 @@ fn limit_tasks_to_source_budget(
             || options
                 .max_source_bytes
                 .is_some_and(|max| total_bytes > max);
+        let admit_oversized_first_task =
+            tasks.is_empty() && options.source_budget_mode == SourceBudgetMode::Soft;
         if over_budget {
+            if admit_oversized_first_task {
+                tasks.push(task);
+            }
             break;
         }
 
@@ -1101,10 +1171,15 @@ fn limit_tasks_to_source_budget(
 /// Files whose fields are all absent from `schema_field_ids` only back
 /// dropped columns; compaction does not read them, so they are neither
 /// counted nor required to have a recorded size.
-/// Only sizes recorded in the manifest are used: a missing size is an error
-/// rather than a metadata request against object storage, which would turn
-/// planning into one round trip per file. Deletion files are not counted.
-fn task_source_bytes(task: &TaskData, schema_field_ids: &HashSet<i32>) -> Result<u64> {
+/// Only sizes recorded in the manifest are used rather than issuing metadata
+/// requests against object storage, which would turn planning into one round
+/// trip per file. A missing size returns `None` only when `allow_missing_size`
+/// is true; otherwise it is an error. Deletion files are not counted.
+fn task_source_bytes(
+    task: &TaskData,
+    schema_field_ids: &HashSet<i32>,
+    allow_missing_size: bool,
+) -> Result<Option<u64>> {
     let mut total_bytes = 0_u64;
     for fragment in &task.fragments {
         let overlay_files = fragment.overlays.iter().map(|overlay| &overlay.data_file);
@@ -1116,17 +1191,20 @@ fn task_source_bytes(task: &TaskData, schema_field_ids: &HashSet<i32>) -> Result
             {
                 continue;
             }
-            let size = data_file.file_size_bytes.get().ok_or_else(|| {
-                Error::invalid_input(format!(
+            let Some(size) = data_file.file_size_bytes.get() else {
+                if allow_missing_size {
+                    return Ok(None);
+                }
+                return Err(Error::invalid_input(format!(
                     "max_source_bytes is set but file '{}' of fragment {} has no size recorded \
                      in the manifest; unset max_source_bytes to compact this dataset",
                     data_file.path, fragment.id
-                ))
-            })?;
+                )));
+            };
             total_bytes = total_bytes.saturating_add(size.get());
         }
     }
-    Ok(total_bytes)
+    Ok(Some(total_bytes))
 }
 
 /// A plan for what groups of fragments to compact.
@@ -7850,6 +7928,10 @@ mod tests {
                 "lance.compaction.max_source_bytes".to_string(),
                 "1073741824".to_string(),
             ),
+            (
+                "lance.compaction.source_budget_mode".to_string(),
+                "soft".to_string(),
+            ),
         ]);
 
         let opts = CompactionOptions::from_dataset_config(&config).unwrap();
@@ -7868,6 +7950,7 @@ mod tests {
         assert_eq!(opts.max_source_fragments, Some(20));
         assert_eq!(opts.max_source_rows, Some(1_000_000));
         assert_eq!(opts.max_source_bytes, Some(1_073_741_824));
+        assert_eq!(opts.source_budget_mode, SourceBudgetMode::Soft);
     }
 
     #[test]
@@ -7991,6 +8074,17 @@ mod tests {
         let result = CompactionOptions::from_dataset_config(&config);
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("invalid_mode"));
+    }
+
+    #[test]
+    fn test_from_dataset_config_invalid_source_budget_mode() {
+        let config = HashMap::from([(
+            "lance.compaction.source_budget_mode".to_string(),
+            "invalid".to_string(),
+        )]);
+
+        let err = CompactionOptions::from_dataset_config(&config).unwrap_err();
+        assert!(err.to_string().contains("Invalid source budget mode"));
     }
 
     #[test]
@@ -8245,6 +8339,179 @@ mod tests {
             .map(|f| f.physical_rows.unwrap())
             .sum();
         assert_eq!(physical_rows, 300);
+    }
+
+    #[tokio::test]
+    async fn test_soft_source_budget_admits_one_oversized_task() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+
+        // The first task contains three fragments and 250 live rows, and its
+        // source files are larger than one byte. In soft mode it is admitted
+        // so compaction can make progress, but the next task is not.
+        let opts = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_fragments: Some(1),
+            max_source_rows: Some(1),
+            max_source_bytes: Some(1),
+            source_budget_mode: SourceBudgetMode::Soft,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &opts).await.unwrap();
+
+        assert_eq!(plan.num_tasks(), 1);
+        assert_eq!(plan.tasks()[0].fragments.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_soft_source_budget_missing_first_task_size() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+        let unbounded = CompactionOptions {
+            target_rows_per_fragment: 250,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+        assert!(plan.tasks.len() > 1);
+
+        let mut all_tasks = plan
+            .tasks
+            .into_iter()
+            .map(|task| (task, 0))
+            .collect::<Vec<_>>();
+        all_tasks[0].0.fragments[0].files[0].file_size_bytes = CachedFileSize::unknown();
+
+        let hard = CompactionOptions {
+            max_source_bytes: Some(1),
+            ..Default::default()
+        };
+        let err =
+            limit_tasks_to_source_budget(&hard, dataset.schema(), all_tasks.clone()).unwrap_err();
+        assert!(err.to_string().contains("has no size recorded"));
+
+        let soft = CompactionOptions {
+            max_source_bytes: Some(1),
+            source_budget_mode: SourceBudgetMode::Soft,
+            ..Default::default()
+        };
+        let selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+        assert_eq!(selected.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_soft_source_budget_keeps_prefix_before_unknown_later_task() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+        let unbounded = CompactionOptions {
+            target_rows_per_fragment: 250,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+        assert!(plan.tasks.len() > 1);
+
+        let mut all_tasks = plan
+            .tasks
+            .into_iter()
+            .map(|task| (task, 0))
+            .collect::<Vec<_>>();
+        assert!(
+            all_tasks[0].0.fragments[0].files[0]
+                .file_size_bytes
+                .get()
+                .is_some()
+        );
+        all_tasks[1].0.fragments[0].files[0].file_size_bytes = CachedFileSize::unknown();
+
+        let hard = CompactionOptions {
+            max_source_bytes: Some(u64::MAX),
+            ..Default::default()
+        };
+        let err =
+            limit_tasks_to_source_budget(&hard, dataset.schema(), all_tasks.clone()).unwrap_err();
+        assert!(err.to_string().contains("has no size recorded"));
+
+        let soft = CompactionOptions {
+            max_source_bytes: Some(u64::MAX),
+            source_budget_mode: SourceBudgetMode::Soft,
+            ..Default::default()
+        };
+        let selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+        assert_eq!(selected.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_soft_source_budget_stops_after_oversized_first_task() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+        let unbounded = CompactionOptions {
+            target_rows_per_fragment: 250,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+        assert!(plan.tasks.len() > 1);
+
+        let mut all_tasks = plan
+            .tasks
+            .into_iter()
+            .map(|task| (task, 0))
+            .collect::<Vec<_>>();
+        // The first task has known source sizes and exceeds the row budget.
+        // The second task's unknown size must not be inspected after soft mode
+        // admits the first task, because the plan must stop at that point.
+        assert!(
+            all_tasks[0].0.fragments[0].files[0]
+                .file_size_bytes
+                .get()
+                .is_some()
+        );
+        all_tasks[0].1 = 2;
+        all_tasks[1].0.fragments[0].files[0].file_size_bytes = CachedFileSize::unknown();
+
+        let soft = CompactionOptions {
+            max_source_rows: Some(1),
+            max_source_bytes: Some(u64::MAX),
+            source_budget_mode: SourceBudgetMode::Soft,
+            ..Default::default()
+        };
+        let selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+        assert_eq!(selected.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_soft_source_budget_uses_cumulative_totals_after_first_task() {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+        let unbounded = CompactionOptions {
+            target_rows_per_fragment: 250,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+        assert!(plan.tasks.len() > 2);
+
+        // Each task's synthetic row count fits the budget independently. The
+        // first two fit cumulatively, but adding the third exceeds the total.
+        let all_tasks = plan
+            .tasks
+            .into_iter()
+            .take(3)
+            .map(|task| (task, 2))
+            .collect::<Vec<_>>();
+        let hard = CompactionOptions {
+            max_source_rows: Some(5),
+            ..Default::default()
+        };
+        let soft = CompactionOptions {
+            max_source_rows: Some(5),
+            source_budget_mode: SourceBudgetMode::Soft,
+            ..Default::default()
+        };
+
+        let hard_selected =
+            limit_tasks_to_source_budget(&hard, dataset.schema(), all_tasks.clone()).unwrap();
+        let soft_selected =
+            limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+        assert_eq!(hard_selected.len(), 2);
+        assert_eq!(soft_selected, hard_selected);
     }
 
     #[tokio::test]
