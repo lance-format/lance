@@ -14,6 +14,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use lance_core::utils::address::RowAddress;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
@@ -34,6 +35,7 @@ use lance_file::writer::FileWriterOptions;
 
 use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
+use crate::dataset::scanner::RowAddrTreeMap;
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
 use crate::index::vector::VectorIndexParams;
@@ -252,6 +254,50 @@ async fn test_overlay_stale_drop_and_new_match(#[values(false, true)] stable_row
     assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
     // An untouched indexed value is unaffected.
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+}
+
+/// The scalar-index stale-row replay is a second read branch. A physical row selection must
+/// constrain it too, otherwise an overlaid row outside the requested slice can be reintroduced.
+#[rstest]
+#[tokio::test]
+async fn test_physical_row_selection_constrains_overlay_stale_replay(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    build_age_index(&mut dataset).await;
+
+    let dataset = commit_overlay(
+        dataset,
+        "age_physical_selection",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    let selected_addr = u64::from(RowAddress::new_from_parts(0, 2));
+    let mut scanner = dataset.scan();
+    scanner
+        .with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter([selected_addr]))
+        .filter("age = 999")
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 0);
+
+    let selected_addr = u64::from(RowAddress::new_from_parts(0, 1));
+    let mut scanner = dataset.scan();
+    scanner
+        .with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter([selected_addr]))
+        .filter("age = 999")
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    assert_eq!(
+        ids_from_batches(&[scanner.try_into_batch().await.unwrap()]),
+        vec![1]
+    );
 }
 
 /// Row-level BTree precision: when one row in a covered fragment is stale, only that row is

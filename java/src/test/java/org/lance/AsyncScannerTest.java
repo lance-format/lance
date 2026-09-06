@@ -18,6 +18,7 @@ import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.AsyncScanner;
+import org.lance.ipc.FragmentSlice;
 import org.lance.ipc.MaterializationStyle;
 import org.lance.ipc.ScanOptions;
 
@@ -40,6 +41,7 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -238,6 +240,43 @@ public class AsyncScannerTest {
             assertEquals(5, countRows(reader));
             reader.close();
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testFragmentSliceAsync(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("async_scanner_fragment_slice").toString();
+    WriteParams writeParams =
+        new WriteParams.Builder()
+            .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_STABLE)
+            .build();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createDatasetWithWriteParams(writeParams).close();
+      List<FragmentMetadata> metadata = testDataset.createNewFragment(10, writeParams);
+      try (Dataset dataset =
+          Dataset.commit(
+              allocator, datasetPath, new FragmentOperation.Append(metadata), Optional.of(1L))) {
+        int fragmentId = dataset.getFragments().get(0).getId();
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .fragmentSlices(Collections.singletonList(new FragmentSlice(fragmentId, 3, 4)))
+                .columns(Collections.singletonList("id"))
+                .build();
+        try (AsyncScanner scanner = AsyncScanner.create(dataset, options, allocator);
+            ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
+          List<Integer> ids = new ArrayList<>();
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          while (reader.loadNextBatch()) {
+            IntVector vector = (IntVector) root.getVector("id");
+            for (int i = 0; i < root.getRowCount(); i++) {
+              ids.add(vector.get(i));
+            }
+          }
+          assertEquals(Arrays.asList(3, 4, 5, 6), ids);
         }
       }
     }

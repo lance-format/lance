@@ -177,6 +177,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
     _class: JObject<'local>,
     jdataset: JObject<'local>,
     fragment_ids_obj: JObject<'local>,
+    fragment_slices_obj: JObject<'local>,
     columns_obj: JObject<'local>,
     substrait_filter_obj: JObject<'local>,
     filter_obj: JObject<'local>,
@@ -208,6 +209,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
             &mut env,
             jdataset,
             fragment_ids_obj,
+            fragment_slices_obj,
             columns_obj,
             substrait_filter_obj,
             filter_obj,
@@ -241,6 +243,7 @@ fn inner_create_async_scanner<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject<'local>,
     fragment_ids_obj: JObject<'local>,
+    fragment_slices_obj: JObject<'local>,
     columns_obj: JObject<'local>,
     substrait_filter_obj: JObject<'local>,
     filter_obj: JObject<'local>,
@@ -273,6 +276,7 @@ fn inner_create_async_scanner<'local>(
 
     let options = ScannerOptions {
         fragment_ids_obj,
+        fragment_slices_obj,
         columns_obj,
         substrait_filter_obj,
         filter_obj,

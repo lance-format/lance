@@ -83,7 +83,7 @@ use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
-use lance_select::IndexExprResult;
+use lance_select::{IndexExprResult, RowAddrSelection};
 // Re-exported so callers of `Scanner::with_row_addr_prefilter` can name the mask
 // type without depending on `lance-select` directly.
 pub use lance_select::{RowAddrMask, RowAddrTreeMap};
@@ -1091,6 +1091,11 @@ pub struct Scanner {
     /// mask size.
     external_row_mask: Option<Arc<RowAddrMask>>,
 
+    /// Optional allow-list keyed by physical `(fragment_id, row_offset)` addresses.
+    /// Unlike `external_row_mask`, this remains in the physical domain until
+    /// filtered-read planning intersects it with fragment scope and deletions.
+    physical_row_addr_prefilter: Option<Arc<RowAddrTreeMap>>,
+
     /// Materialization style controls when columns are fetched
     materialization_style: MaterializationStyle,
 
@@ -1394,6 +1399,7 @@ impl Scanner {
             blob_handling: BlobHandling::default(),
             prefilter: false,
             external_row_mask: None,
+            physical_row_addr_prefilter: None,
             materialization_style: MaterializationStyle::Heuristic,
             filter: LanceFilter::default(),
             full_text_query: None,
@@ -1597,6 +1603,21 @@ impl Scanner {
     /// ```
     pub fn with_row_addr_prefilter(&mut self, mask: RowAddrMask) -> &mut Self {
         self.external_row_mask = Some(Arc::new(mask));
+        self
+    }
+
+    /// Restrict the scan to physical row addresses.
+    ///
+    /// This selection is always keyed by physical `(fragment_id, row_offset)`
+    /// addresses, including on datasets that use stable row ids. It is kept in
+    /// that domain until scan planning, where it is intersected with fragment
+    /// scope, deletion vectors, and any scalar-index result.
+    ///
+    /// This is independent from [`with_row_addr_prefilter`](Self::with_row_addr_prefilter),
+    /// whose mask is keyed in the dataset's `_rowid` domain. If both are set,
+    /// both restrictions apply.
+    pub fn with_physical_row_addr_prefilter(&mut self, rows: RowAddrTreeMap) -> &mut Self {
+        self.physical_row_addr_prefilter = Some(Arc::new(rows));
         self
     }
 
@@ -2921,6 +2942,54 @@ impl Scanner {
             ));
         }
 
+        if self.physical_row_addr_prefilter.is_some() {
+            if self.nearest.is_some() || self.full_text_query.is_some() {
+                return Err(Error::not_supported(
+                    "with_physical_row_addr_prefilter is not supported for vector or full-text search",
+                ));
+            }
+            if self
+                .dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_format()
+                == lance_file::version::ConcreteFileVersion::V1
+            {
+                return Err(Error::not_supported(
+                    "with_physical_row_addr_prefilter is not supported on legacy-storage datasets",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn validate_physical_row_addr_prefilter(&self) -> Result<()> {
+        let Some(rows) = self.physical_row_addr_prefilter.as_deref() else {
+            return Ok(());
+        };
+        for (fragment_id, selection) in rows.iter() {
+            let fragment = self
+                .dataset
+                .get_fragment(*fragment_id as usize)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "physical row selection references fragment_id={fragment_id}, which is not present in dataset version={}",
+                        self.dataset.version().version
+                    ))
+                })?;
+            if let RowAddrSelection::Partial(offsets) = selection
+                && let Some(max_offset) = offsets.max()
+            {
+                let physical_row_count = fragment.physical_rows().await? as u64;
+                if u64::from(max_offset) >= physical_row_count {
+                    return Err(Error::invalid_input(format!(
+                        "physical row selection for fragment_id={fragment_id} contains row_offset={max_offset}, but the fragment has physical_row_count={physical_row_count} in dataset version={}",
+                        self.dataset.version().version
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3095,6 +3164,7 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
+        self.validate_physical_row_addr_prefilter().await?;
 
         let full_text_query = match &self.full_text_query {
             Some(query) => Some(self.resolve_full_text_search_query(query).await?),
@@ -3464,6 +3534,10 @@ impl Scanner {
             .with_filter_plan(effective_filter)
             .with_projection(projection);
 
+        if let Some(rows) = &self.physical_row_addr_prefilter {
+            read_options = read_options.with_physical_row_addr_prefilter(rows.clone());
+        }
+
         if let Some(fragments) = fragments {
             read_options = read_options.with_fragments(fragments);
         }
@@ -3604,9 +3678,9 @@ impl Scanner {
             .data_storage_format
             .lance_file_format()
             == lance_file::version::ConcreteFileVersion::V1;
-        if is_legacy && self.use_external_mask() {
+        if is_legacy && (self.use_external_mask() || self.physical_row_addr_prefilter.is_some()) {
             return std::future::ready(Err(Error::not_supported(
-                "with_row_addr_prefilter is not supported for plain scans on \
+                "row prefilters are not supported for plain scans on \
                  legacy-storage datasets",
             )))
             .boxed();
@@ -3685,6 +3759,10 @@ impl Scanner {
             filtered_read_options =
                 filtered_read_options.with_fragments(Arc::new(fragment.clone()));
         }
+        if let Some(rows) = &self.physical_row_addr_prefilter {
+            filtered_read_options =
+                filtered_read_options.with_physical_row_addr_prefilter(rows.clone());
+        }
 
         Ok(Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
@@ -3744,7 +3822,10 @@ impl Scanner {
         // limit/offset must not be pushed down as a pre-mask range (that would limit
         // rows before masking). Leaving scan_range None keeps limit_pushed_down false
         // so the limit is applied by a node above the masked source instead.
-        let scan_range = if filter_plan.is_empty() && !self.use_external_mask() {
+        let scan_range = if filter_plan.is_empty()
+            && !self.use_external_mask()
+            && self.physical_row_addr_prefilter.is_none()
+        {
             log::trace!("pushing scan_range into filtered_read");
             self.get_scan_range(filter_plan).await?
         } else {
@@ -5984,6 +6065,9 @@ impl Scanner {
         if let Some(fragments) = self.fragments.as_ref() {
             read_options = read_options.with_fragments(Arc::new(fragments.clone()));
         }
+        if let Some(rows) = &self.physical_row_addr_prefilter {
+            read_options = read_options.with_physical_row_addr_prefilter(rows.clone());
+        }
         Ok(Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
             read_options,
@@ -7831,6 +7915,152 @@ mod test {
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec()
+    }
+
+    #[rstest]
+    #[case::without_stable_row_ids(false)]
+    #[case::with_stable_row_ids(true)]
+    #[tokio::test]
+    async fn physical_row_addr_prefilter_reads_ranges_with_deletions_and_refine(
+        #[case] stable_row_ids: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        test_ds.dataset.delete("i = 2 OR i = 203").await.unwrap();
+        test_ds.make_scalar_index().await.unwrap();
+        let ds = &test_ds.dataset;
+        let fragments = ds.get_fragments();
+        assert_eq!(fragments.len(), 2);
+
+        let mut physical_rows = RowAddrTreeMap::new();
+        for (fragment_id, start, end) in [
+            (fragments[0].id() as u32, 1, 4),
+            (fragments[1].id() as u32, 2, 5),
+        ] {
+            physical_rows.insert_range(
+                u64::from(RowAddress::new_from_parts(fragment_id, start))
+                    ..u64::from(RowAddress::new_from_parts(fragment_id, end)),
+            );
+        }
+
+        let mut scan = ds.scan();
+        scan.with_physical_row_addr_prefilter(physical_rows.clone());
+        scan.filter("i >= 3").unwrap();
+        scan.project(&["i"]).unwrap();
+        assert!(
+            scan.explain_plan(false)
+                .await
+                .unwrap()
+                .contains("ScalarIndexQuery")
+        );
+        let batch = scan.try_into_batch().await.unwrap();
+        let values = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+        assert_eq!(values, vec![3, 202, 204]);
+
+        let mut count_scan = ds.scan();
+        count_scan.with_physical_row_addr_prefilter(physical_rows);
+        count_scan.filter("i >= 3").unwrap();
+        assert_eq!(count_scan.count_rows().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn physical_row_addr_prefilter_rejects_invalid_addresses() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+
+        let mut missing_fragment = RowAddrTreeMap::new();
+        missing_fragment.insert_fragment(42);
+        let mut scan = ds.scan();
+        scan.with_physical_row_addr_prefilter(missing_fragment);
+        let error = scan.create_plan().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("references fragment_id=42, which is not present")
+        );
+
+        let fragment = &ds.get_fragments()[0];
+        let physical_row_count = fragment.physical_rows().await.unwrap();
+        let invalid_offset = u32::try_from(physical_row_count).unwrap();
+        let mut past_fragment_end = RowAddrTreeMap::new();
+        past_fragment_end.insert(u64::from(RowAddress::new_from_parts(
+            fragment.id() as u32,
+            invalid_offset,
+        )));
+        let mut scan = ds.scan();
+        scan.with_physical_row_addr_prefilter(past_fragment_end);
+        let error = scan.create_plan().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(&format!(
+            "contains row_offset={invalid_offset}, but the fragment has physical_row_count={physical_row_count}"
+        )));
+
+        let mut physical_rows = RowAddrTreeMap::new();
+        physical_rows.insert(u64::from(RowAddress::new_from_parts(
+            fragment.id() as u32,
+            0,
+        )));
+        let mut scan = ds.scan();
+        scan.with_physical_row_addr_prefilter(physical_rows);
+        scan.full_text_search(FullTextSearchQuery::new("query".into()))
+            .unwrap();
+        let error = scan.create_plan().await.unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("not supported for vector or full-text search")
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_and_logical_row_prefilters_are_intersected() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+        let fragment_id = ds.get_fragments()[0].id() as u32;
+
+        let mut physical_rows = RowAddrTreeMap::new();
+        physical_rows.insert_range(
+            u64::from(RowAddress::new_from_parts(fragment_id, 1))
+                ..u64::from(RowAddress::new_from_parts(fragment_id, 4)),
+        );
+        let logical_rows = RowAddrTreeMap::from_iter([
+            u64::from(RowAddress::new_from_parts(fragment_id, 0)),
+            u64::from(RowAddress::new_from_parts(fragment_id, 2)),
+        ]);
+
+        let mut scan = ds.scan();
+        scan.with_physical_row_addr_prefilter(physical_rows);
+        scan.with_row_addr_prefilter(RowAddrMask::from_allowed(logical_rows));
+        scan.project(&["i"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let values = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+        assert_eq!(values, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn physical_row_addr_prefilter_applies_to_take_shortcut() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let ds = &test_ds.dataset;
+        let fragment_id = ds.get_fragments()[0].id() as u32;
+        let excluded = u64::from(RowAddress::new_from_parts(fragment_id, 0));
+
+        let mut physical_rows = RowAddrTreeMap::new();
+        physical_rows.insert(u64::from(RowAddress::new_from_parts(fragment_id, 1)));
+
+        let mut scan = ds.scan();
+        scan.with_physical_row_addr_prefilter(physical_rows);
+        scan.filter(&format!("_rowaddr = {excluded}")).unwrap();
+        scan.project(&["i"]).unwrap();
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
     }
 
     #[rstest]

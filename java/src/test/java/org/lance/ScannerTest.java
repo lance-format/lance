@@ -18,11 +18,14 @@ import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.ColumnOrdering;
+import org.lance.ipc.FragmentSlice;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.MaterializationStyle;
 import org.lance.ipc.ScanOptions;
 import org.lance.ipc.ScanStats;
+import org.lance.update.UpdateParams;
 
+import com.google.common.collect.ImmutableMap;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.dataset.scanner.Scanner;
@@ -30,6 +33,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
@@ -119,6 +123,274 @@ public class ScannerTest {
         IllegalArgumentException.class,
         () -> new ScanOptions.Builder().batchSizeBytes(1024).strictBatchSize(true).build());
     assertTrue(MaterializationStyle.allEarlyExcept(Collections.emptyList()).getColumns().isEmpty());
+  }
+
+  @Test
+  void testFragmentSliceValueObjectAndValidation() {
+    FragmentSlice slice = new FragmentSlice(7, 11, 13);
+    assertEquals(7, slice.getFragmentId());
+    assertEquals(11, slice.getRowOffset());
+    assertEquals(13, slice.getRowCount());
+    assertEquals(slice, new FragmentSlice(7, 11, 13));
+    assertEquals(slice.hashCode(), new FragmentSlice(7, 11, 13).hashCode());
+    assertTrue(slice.toString().contains("fragmentId=7"));
+
+    assertThrows(IllegalArgumentException.class, () -> new FragmentSlice(-1, 0, 1));
+    assertThrows(IllegalArgumentException.class, () -> new FragmentSlice(0, -1, 1));
+    assertThrows(IllegalArgumentException.class, () -> new FragmentSlice(0, 0, -1));
+    assertThrows(IllegalArgumentException.class, () -> new FragmentSlice(0, Long.MAX_VALUE, 1));
+
+    ScanOptions options =
+        new ScanOptions.Builder().fragmentSlices(Collections.singletonList(slice)).build();
+    assertEquals(Collections.singletonList(slice), options.getFragmentSlices().orElseThrow());
+    assertEquals(
+        options.getFragmentSlices(), new ScanOptions.Builder(options).build().getFragmentSlices());
+    assertTrue(options.toString().contains("fragmentSlices"));
+  }
+
+  @Test
+  void testFragmentSlicesAcrossFragmentsWithFilterLimitAndOverlap(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("fragment_slices_multi_fragment").toString();
+    WriteParams writeParams =
+        new WriteParams.Builder()
+            .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_STABLE)
+            .build();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createDatasetWithWriteParams(writeParams).close();
+      List<FragmentMetadata> metadata = new ArrayList<>();
+      metadata.addAll(testDataset.createNewFragment(5, writeParams));
+      metadata.addAll(testDataset.createNewFragment(6, writeParams));
+      try (Dataset dataset =
+          Dataset.commit(
+              allocator, datasetPath, new FragmentOperation.Append(metadata), Optional.of(1L))) {
+        List<Fragment> fragments = dataset.getFragments();
+        int first = fragments.get(0).getId();
+        int second = fragments.get(1).getId();
+        List<FragmentSlice> slices =
+            Arrays.asList(
+                new FragmentSlice(first, 1, 3),
+                new FragmentSlice(first, 2, 2),
+                new FragmentSlice(second, 3, 2));
+
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .fragmentSlices(slices)
+                .columns(Collections.singletonList("id"))
+                .filter("id >= 2")
+                .limit(3)
+                .build();
+        try (LanceScanner scanner = dataset.newScan(options)) {
+          assertEquals(Arrays.asList(2, 3, 3), readIds(scanner));
+        }
+
+        ScanOptions intersected =
+            new ScanOptions.Builder(options)
+                .fragmentIds(Collections.singletonList(second))
+                .filter("id >= 0")
+                .build();
+        try (LanceScanner scanner = dataset.newScan(intersected)) {
+          assertEquals(Arrays.asList(3, 4), readIds(scanner));
+        }
+
+        try (LanceScanner scanner = fragments.get(0).newScan(options)) {
+          assertEquals(Arrays.asList(2, 3), readIds(scanner));
+        }
+      }
+    }
+  }
+
+  @Test
+  void testFragmentSliceStableRowIdsAndDeletion(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fragment_slice_stable_row_ids").toString();
+    WriteParams writeParams =
+        new WriteParams.Builder()
+            .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_STABLE)
+            .withEnableStableRowIds(true)
+            .build();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createDatasetWithWriteParams(writeParams).close();
+      List<FragmentMetadata> metadata = testDataset.createNewFragment(8, writeParams);
+      try (Dataset dataset =
+          Dataset.commit(
+              allocator, datasetPath, new FragmentOperation.Append(metadata), Optional.of(1L))) {
+        assertTrue(dataset.hasStableRowIds());
+        int fragmentId = dataset.getFragments().get(0).getId();
+        dataset.delete("id = 2");
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .fragmentSlices(Collections.singletonList(new FragmentSlice(fragmentId, 1, 5)))
+                .columns(Collections.singletonList("id"))
+                .build();
+        try (LanceScanner scanner = dataset.newScan(options)) {
+          assertEquals(Arrays.asList(1, 3, 4, 5), readIds(scanner));
+        }
+
+        // Count-style scans request no user columns and count rows from the returned batches.
+        ScanOptions countOptions =
+            new ScanOptions.Builder(options)
+                .columns(Collections.emptyList())
+                .withRowId(true)
+                .build();
+        try (LanceScanner scanner = dataset.newScan(countOptions);
+            ArrowReader reader = scanner.scanBatches()) {
+          long rowCount = 0;
+          while (reader.loadNextBatch()) {
+            rowCount += reader.getVectorSchemaRoot().getRowCount();
+          }
+          assertEquals(4, rowCount);
+        }
+
+        ScanOptions withDeletedOptions =
+            new ScanOptions.Builder(options).withRowId(true).includeDeletedRows(true).build();
+        try (LanceScanner scanner = dataset.newScan(withDeletedOptions);
+            ArrowReader reader = scanner.scanBatches()) {
+          assertTrue(reader.loadNextBatch());
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          IntVector ids = (IntVector) root.getVector("id");
+          UInt8Vector rowIds = (UInt8Vector) root.getVector("_rowid");
+          List<Integer> actualIds = new ArrayList<>();
+          for (int index = 0; index < root.getRowCount(); index++) {
+            actualIds.add(ids.get(index));
+            assertEquals(index == 1, rowIds.isNull(index));
+          }
+          assertEquals(Arrays.asList(1, 2, 3, 4, 5), actualIds);
+          assertFalse(reader.loadNextBatch());
+        }
+      }
+    }
+  }
+
+  @Test
+  void testFragmentSliceDoesNotFollowUpdatedStableRowId(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fragment_slice_stable_row_id_update").toString();
+    WriteParams writeParams =
+        new WriteParams.Builder()
+            .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_STABLE)
+            .withEnableStableRowIds(true)
+            .build();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createDatasetWithWriteParams(writeParams).close();
+      List<FragmentMetadata> metadata = testDataset.createNewFragment(8, writeParams);
+      try (Dataset dataset =
+          Dataset.commit(
+              allocator, datasetPath, new FragmentOperation.Append(metadata), Optional.of(1L))) {
+        int originalFragmentId = dataset.getFragments().get(0).getId();
+        try (Dataset updated =
+            dataset
+                .update(
+                    new UpdateParams(ImmutableMap.of("name", "'updated'"))
+                        .withWhere("id = 2 OR id = 3"))
+                .getDataset()) {
+          int replacementFragmentId =
+              updated.getFragments().stream()
+                  .map(Fragment::getId)
+                  .filter(fragmentId -> fragmentId != originalFragmentId)
+                  .findFirst()
+                  .orElseThrow();
+
+          ScanOptions options =
+              new ScanOptions.Builder()
+                  .fragmentSlices(
+                      Arrays.asList(
+                          new FragmentSlice(originalFragmentId, 2, 1),
+                          new FragmentSlice(replacementFragmentId, 1, 1)))
+                  .columns(Collections.singletonList("id"))
+                  .build();
+          try (LanceScanner scanner = updated.newScan(options)) {
+            assertEquals(Collections.singletonList(3), readIds(scanner));
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testFragmentSliceEmptyAndInvalidBounds(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fragment_slice_bounds").toString();
+    WriteParams writeParams =
+        new WriteParams.Builder()
+            .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_STABLE)
+            .build();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createDatasetWithWriteParams(writeParams).close();
+      List<FragmentMetadata> metadata = testDataset.createNewFragment(5, writeParams);
+      try (Dataset dataset =
+          Dataset.commit(
+              allocator, datasetPath, new FragmentOperation.Append(metadata), Optional.of(1L))) {
+        int fragmentId = dataset.getFragments().get(0).getId();
+        ScanOptions empty =
+            new ScanOptions.Builder()
+                .fragmentSlices(Collections.singletonList(new FragmentSlice(fragmentId, 5, 0)))
+                .columns(Collections.singletonList("id"))
+                .build();
+        try (LanceScanner scanner = dataset.newScan(empty)) {
+          assertEquals(Collections.emptyList(), readIds(scanner));
+        }
+
+        ScanOptions emptyList =
+            new ScanOptions.Builder()
+                .fragmentSlices(Collections.emptyList())
+                .columns(Collections.singletonList("id"))
+                .build();
+        try (LanceScanner scanner = dataset.newScan(emptyList)) {
+          assertEquals(Collections.emptyList(), readIds(scanner));
+        }
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.newScan(
+                    new ScanOptions.Builder()
+                        .fragmentSlices(
+                            Collections.singletonList(new FragmentSlice(fragmentId, 4, 2)))
+                        .build()));
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.newScan(
+                    new ScanOptions.Builder()
+                        .fragmentSlices(Collections.singletonList(new FragmentSlice(999, 0, 1)))
+                        .build()));
+      }
+    }
+  }
+
+  @Test
+  void testFragmentSliceRejectedForLegacyScan(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fragment_slice_legacy").toString();
+    WriteParams writeParams =
+        new WriteParams.Builder()
+            .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_LEGACY)
+            .build();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createDatasetWithWriteParams(writeParams).close();
+      List<FragmentMetadata> metadata = testDataset.createNewFragment(5, writeParams);
+      try (Dataset dataset =
+              Dataset.commit(
+                  allocator, datasetPath, new FragmentOperation.Append(metadata), Optional.of(1L));
+          LanceScanner scanner =
+              dataset.newScan(
+                  new ScanOptions.Builder()
+                      .fragmentSlices(
+                          Collections.singletonList(
+                              new FragmentSlice(dataset.getFragments().get(0).getId(), 0, 2)))
+                      .build())) {
+        UnsupportedOperationException error =
+            assertThrows(UnsupportedOperationException.class, scanner::scanBatches);
+        assertTrue(error.getMessage().contains("legacy-storage"));
+      }
+    }
   }
 
   static Stream<MaterializationStyle> materializationStyles() {
@@ -288,6 +560,20 @@ public class ScannerTest {
         IntVector vector = (IntVector) root.getVector("id");
         int rowsInBatch = vector.getValueCount();
         for (int i = 0; i < rowsInBatch; i++) {
+          ids.add(vector.get(i));
+        }
+      }
+    }
+    return ids;
+  }
+
+  private static List<Integer> readIds(Scanner scanner) throws IOException {
+    List<Integer> ids = new ArrayList<>();
+    try (ArrowReader reader = scanner.scanBatches()) {
+      VectorSchemaRoot root = reader.getVectorSchemaRoot();
+      while (reader.loadNextBatch()) {
+        IntVector vector = (IntVector) root.getVector("id");
+        for (int i = 0; i < root.getRowCount(); i++) {
           ids.add(vector.get(i));
         }
       }
