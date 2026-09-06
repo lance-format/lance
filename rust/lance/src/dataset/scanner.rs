@@ -1182,6 +1182,12 @@ pub struct Scanner {
     /// batching and waiting are required, and the performance will decrease.
     strict_batch_size: bool,
 
+    /// When `batch_size_bytes` is set and a single row exceeds the budget,
+    /// replace that row with a null batch instead of returning the oversized row.
+    ///
+    /// Defaults to `false` (return the oversized row as-is).
+    replace_oversized_with_null: bool,
+
     /// File reader options to use when reading data files.
     file_reader_options: Option<FileReaderOptions>,
 
@@ -1418,6 +1424,7 @@ impl Scanner {
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
+            replace_oversized_with_null: false,
             file_reader_options,
             aggregate: None,
             legacy_with_row_addr: false,
@@ -1733,6 +1740,17 @@ impl Scanner {
     /// precedence over the dataset-level default.
     pub fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
         self.batch_size_bytes = Some(batch_size_bytes);
+        self
+    }
+
+    /// When [`Self::batch_size_bytes`] is set and a single row exceeds the
+    /// byte budget, replace that row with a 1-row null batch instead of
+    /// returning the oversized row.
+    ///
+    /// The null batch preserves the output schema; every column contains a
+    /// single null value.  Defaults to `false` (return the oversized row).
+    pub fn replace_oversized_with_null(&mut self, replace: bool) -> &mut Self {
+        self.replace_oversized_with_null = replace;
         self
     }
 
@@ -3483,6 +3501,10 @@ impl Scanner {
 
         if let Some(file_reader_options) = self.resolved_file_reader_options() {
             read_options = read_options.with_file_reader_options(file_reader_options);
+        }
+
+        if self.replace_oversized_with_null {
+            read_options = read_options.with_replace_oversized_with_null(true);
         }
 
         if let Some(fragment_readahead) = self.fragment_readahead {
@@ -6240,6 +6262,7 @@ impl Scanner {
             with_make_deletions_null,
             ordered_output: ordered,
             file_reader_options: self.resolved_file_reader_options(),
+            replace_oversized_with_null: self.replace_oversized_with_null,
             parallelism_cap: None,
         };
         Arc::new(LanceScanExec::new(

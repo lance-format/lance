@@ -1703,6 +1703,10 @@ pub struct FilteredReadOptions {
     /// (overlay-merged) values on a targeted take path. Their fragments stay in the covered set,
     /// so non-stale rows keep the index. `None` on the common no-overlay fast path.
     pub overlay_block: Option<RowAddrMask>,
+    /// When `file_reader_options.batch_size_bytes` is set and a single row's decoded
+    /// size exceeds that budget, yield a 1-row batch of all-null values instead of
+    /// the oversized row. `false` (the default) passes the oversized row through as-is.
+    pub replace_oversized_with_null: bool,
 }
 
 impl FilteredReadOptions {
@@ -1735,6 +1739,7 @@ impl FilteredReadOptions {
             materialization_readahead_bytes: None,
             only_indexed_fragments: false,
             overlay_block: None,
+            replace_oversized_with_null: false,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
@@ -1827,6 +1832,13 @@ impl FilteredReadOptions {
     /// Specify the file reader options to use when reading data files.
     pub fn with_file_reader_options(mut self, file_reader_options: FileReaderOptions) -> Self {
         self.file_reader_options = Some(file_reader_options);
+        self
+    }
+
+    /// When `batch_size_bytes` is set and a single decoded row exceeds the budget,
+    /// yield a 1-row all-null batch instead of the oversized row.
+    pub fn with_replace_oversized_with_null(mut self, replace: bool) -> Self {
+        self.replace_oversized_with_null = replace;
         self
     }
 
@@ -2339,7 +2351,20 @@ impl FilteredReadExec {
                 ));
             }
         }
-        let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
+        let base_output_schema = public_blob_v2_binary_projection_schema(&options.projection);
+        // When replace_oversized_with_null is active, all fields must be nullable so
+        // that Arrow accepts the all-null batches produced for oversized single rows.
+        let output_schema = if options.replace_oversized_with_null {
+            Arc::new(ArrowSchema::new(
+                base_output_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone().with_nullable(true))
+                    .collect::<Vec<_>>(),
+            ))
+        } else {
+            base_output_schema
+        };
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -2562,6 +2587,7 @@ impl FilteredReadExec {
             .file_reader_options
             .as_ref()
             .and_then(|o| o.batch_size_bytes);
+        let replace_oversized_with_null = options.replace_oversized_with_null;
         let metrics = self.metrics.clone();
         let index_input = self.input.row_set_plan().cloned();
         let plan_cell = self.plan.clone();
@@ -2632,6 +2658,48 @@ impl FilteredReadExec {
                     ))
                 }
                 (None, None) => inner,
+            };
+            // When replace_oversized_with_null is active, replace any single-row batch
+            // whose memory size exceeds the byte budget with an all-null batch of the
+            // same schema. This preserves the output row count while signalling to
+            // callers that the row was too large to materialize within the budget.
+            //
+            // All fields are made nullable so Arrow validation accepts null values in
+            // columns that were declared non-nullable in the original schema.
+            let stream: SendableRecordBatchStream = if replace_oversized_with_null
+                && let Some(budget) = batch_size_bytes
+            {
+                let schema = stream.schema();
+                let nullable_schema = Arc::new(ArrowSchema::new(
+                    schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.as_ref().clone().with_nullable(true))
+                        .collect::<Vec<_>>(),
+                ));
+                Box::pin(RecordBatchStreamAdapter::new(
+                    nullable_schema.clone(),
+                    stream.map(move |res| match res {
+                        Err(e) => Err(e),
+                        Ok(batch) => {
+                            if batch.num_rows() == 1
+                                && batch.get_array_memory_size() > budget as usize
+                            {
+                                let null_cols = nullable_schema
+                                    .fields()
+                                    .iter()
+                                    .map(|f| arrow_array::new_null_array(f.data_type(), 1))
+                                    .collect::<Vec<_>>();
+                                RecordBatch::try_new(nullable_schema.clone(), null_cols)
+                                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                            } else {
+                                Ok(batch)
+                            }
+                        }
+                    }),
+                ))
+            } else {
+                stream
             };
             DataFusionResult::<SendableRecordBatchStream>::Ok(stream)
         })
