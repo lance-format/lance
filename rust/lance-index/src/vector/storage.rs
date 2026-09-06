@@ -155,6 +155,19 @@ pub trait DistCalculator {
 
 pub const STORAGE_METADATA_KEY: &str = "storage_metadata";
 
+/// Schema-metadata key recording the *source dataset* field ids of a storage file's
+/// covering ("included") columns, comma separated in declaration order.
+///
+/// Arrow fields carry no Lance field id, so a storage file's own schema cannot say
+/// which logical column a covering column came from -- and the ids in the file's Lance
+/// schema are file-local, assigned when the writer was built. Without this, a
+/// distributed merge comparing shards by name and type would accept two shards whose
+/// covering columns share a name and type but belong to different fields (a column
+/// dropped and re-added between shard builds) and concatenate them as one.
+///
+/// Absent when the storage has no covering columns.
+pub const COVERING_FIELD_IDS_KEY: &str = "covering_field_ids";
+
 #[derive(Debug)]
 pub struct QueryScratch {
     pub distances: Vec<f32>,
@@ -373,6 +386,41 @@ impl DeepSizeOf for QueryScratchPool {
 ///
 /// It abstracts away the logic to compute the distance between vectors.
 ///
+/// Indices of the covering ("included") columns in a vector-storage schema: every
+/// field whose name is not one of `internal`. Each storage lists its own non-covering
+/// column names (the row id, its quantization code columns, and any legacy bookkeeping
+/// column it carries) and shares this filter, so covering detection stays a per-storage
+/// data decision rather than duplicated iteration logic. See
+/// [`VectorStore::covering_field_indices`] for why the set cannot be inferred generically.
+pub(crate) fn covering_field_indices_excluding(
+    schema: &arrow_schema::Schema,
+    internal: &[&str],
+) -> Vec<usize> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !internal.contains(&f.name().as_str()))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Remap `batch`'s row ids through `frag_reuse_index`, locating the row id column
+/// by name rather than assuming it is at a fixed position. A covering storage batch
+/// is built from a scan projection of `[<covering...>, vector]` with `_rowid`
+/// appended by the scan, so `_rowid` lands wherever the covering columns end --
+/// never reliably at a fixed index once any are configured.
+pub(crate) fn remap_row_ids_by_name(
+    batch: RecordBatch,
+    frag_reuse_index: &dyn RowIdRemapper,
+) -> Result<RecordBatch> {
+    let row_id_idx = batch
+        .schema()
+        .index_of(ROW_ID)
+        .map_err(|_| Error::schema(format!("column {} not found", ROW_ID)))?;
+    frag_reuse_index.remap_row_ids_record_batch(batch, row_id_idx)
+}
+
 /// TODO: should we rename this to "VectorDistance"?;
 ///
 /// <section class="warning">
@@ -384,6 +432,17 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     type DistanceCalculator<'a>: DistCalculator
     where
         Self: 'a;
+
+    /// This storage's own column names: the row id, its quantization code
+    /// columns, and any legacy bookkeeping column it carries. Everything else in
+    /// the schema is a covering ("included") column.
+    ///
+    /// Required rather than defaulted on purpose: only the storage knows which of
+    /// its columns are code columns, and a wrong answer here silently mislabels
+    /// covering data (e.g. it would mistake RaBitQ's code columns for covering
+    /// ones). Making it a required associated const means a new storage cannot
+    /// forget to answer.
+    const INTERNAL_COLUMNS: &'static [&'static str];
 
     fn as_any(&self) -> &dyn Any;
 
@@ -409,6 +468,40 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     /// Append Raw [RecordBatch] into the Storage.
     /// The storage implement will perform quantization if necessary.
     fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;
+
+    /// Field indices of the "included"/covering columns: the extra columns
+    /// stored alongside the row id and quantization code so a covered query can
+    /// skip the take from the base table. Derived from [`Self::INTERNAL_COLUMNS`].
+    fn covering_field_indices(&self) -> Vec<usize> {
+        covering_field_indices_excluding(self.schema().as_ref(), Self::INTERNAL_COLUMNS)
+    }
+
+    /// `[_rowid, <included cols...>]` for the whole storage. Captured while a
+    /// partition is loaded during search so covering columns can be emitted with
+    /// the result without a separate take. Returns `None` if there are no
+    /// included columns (ordinary index — nothing to cover).
+    fn covering_batch(&self) -> Result<Option<RecordBatch>> {
+        let included = self.covering_field_indices();
+        if included.is_empty() {
+            return Ok(None);
+        }
+        let schema = self.schema().clone();
+        let row_id_idx = schema.index_of(ROW_ID)?;
+        let mut indices = Vec::with_capacity(included.len() + 1);
+        indices.push(row_id_idx);
+        indices.extend(included);
+        // Project each batch BEFORE concatenating. Concatenating the full partition first
+        // would copy every quantization-code column only to discard it on the next line --
+        // and those columns dominate the partition (HNSW partitions target 1 << 20 rows), so
+        // on a multi-probe query that copy is hundreds of MB of pure waste on the ANN hot
+        // path. Only `[_rowid, <included...>]` is ever read from the result.
+        let projected: Vec<RecordBatch> = self
+            .to_batches()?
+            .map(|batch| batch.project(&indices))
+            .collect::<std::result::Result<_, _>>()?;
+        let projected_schema = Arc::new(schema.project(&indices)?);
+        Ok(Some(concat_batches(&projected_schema, projected.iter())?))
+    }
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
@@ -480,7 +573,43 @@ impl<Q: Quantization> StorageBuilder<Q> {
     }
 
     pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
-        let mut batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
+        // Batches can come from different sources (existing partitions loaded
+        // from disk vs freshly shuffled/split/reassigned data) that carry the
+        // same columns in a different order -- notably when the index has
+        // included/covering columns. `concat_batches` matches columns by
+        // position, so align every batch to the first batch's column order (by
+        // name). No-op when all batches already share a schema.
+        let schema = batches[0].schema();
+        let aligned: Vec<RecordBatch> = batches
+            .iter()
+            .map(|b| {
+                if b.schema() == schema {
+                    return Ok(b.clone());
+                }
+                // `project_by_schema` reorders by name and errors on a missing
+                // column, but it cannot see extras -- and a batch with MORE
+                // columns must error rather than have them silently dropped
+                // (e.g. covering columns the index metadata still advertises).
+                // Equal count + every expected column present = same set.
+                if b.num_columns() != schema.fields().len() {
+                    let names = |s: &arrow_schema::Schema| {
+                        s.fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    return Err(Error::index(format!(
+                        "mismatched columns while merging vector storage batches: \
+                         expected [{}], got [{}]",
+                        names(&schema),
+                        names(&b.schema()),
+                    )));
+                }
+                Ok(b.project_by_schema(schema.as_ref())?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut batch = concat_batches(&schema, aligned.iter())?;
 
         if batch.column_by_name(self.quantizer.column()).is_none() {
             let vectors = batch
@@ -518,6 +647,13 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 
     ivf: IvfModel,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Lazily-computed covering schema (see [`Self::covering_schema`]). The schema is
+    /// fixed for the storage's lifetime and is consulted on every search, so it is
+    /// resolved once rather than per query. Constructing it builds an empty `Q::Storage`:
+    /// cheap for a current-format index (zero rows, and the codebook is cloned, not
+    /// decoded), but the legacy `codebook_tensor` path does decode, so this is not free
+    /// for every index.
+    covering_schema: std::sync::OnceLock<Option<SchemaRef>>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -589,6 +725,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             metadata,
             ivf,
             frag_reuse_index,
+            covering_schema: std::sync::OnceLock::new(),
         })
     }
 
@@ -620,6 +757,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             metadata,
             ivf,
             frag_reuse_index,
+            covering_schema: std::sync::OnceLock::new(),
         }
     }
 
@@ -654,6 +792,31 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     pub fn schema(&self) -> SchemaRef {
         Arc::new(self.reader.schema().as_ref().into())
+    }
+
+    /// The `[_rowid, <included cols...>]` schema for this index's covering
+    /// columns, or `None` if the index has no covering columns. Derived from an
+    /// empty storage instance (no I/O) so callers can emit the correct covered
+    /// output schema even when zero partitions are searched. Cached because it is queried
+    /// per search. The cache is best-effort under concurrency: racing cold callers may each
+    /// construct one and all but the first are discarded. That is deliberate -- the empty
+    /// construction is cheap on the current format, and `OnceLock::get_or_init` cannot
+    /// carry the `Result` this returns.
+    pub fn covering_schema(&self) -> Result<Option<SchemaRef>> {
+        if let Some(cached) = self.covering_schema.get() {
+            return Ok(cached.clone());
+        }
+        let arrow_schema = arrow_schema::Schema::from(self.reader.schema().as_ref());
+        let empty = RecordBatch::new_empty(Arc::new(arrow_schema));
+        // No remapper: the batch is empty, so there are no row ids to remap and the
+        // remapper cannot influence the schema this derives. Passing one would also be
+        // wrong now that the field holds a `dyn RowIdRemapper` -- the default
+        // `try_from_batch_with_remapper` rejects a remapper outright for every storage
+        // that does not override it, which would fail this call on an SQ/RQ/FLAT index
+        // whose dataset happens to carry a fragment-reuse index.
+        let storage = Q::Storage::try_from_batch(empty, self.metadata(), self.distance_type, None)?;
+        let computed = storage.covering_batch()?.map(|b| b.schema());
+        Ok(self.covering_schema.get_or_init(|| computed).clone())
     }
 
     /// Get the number of partitions in the storage.

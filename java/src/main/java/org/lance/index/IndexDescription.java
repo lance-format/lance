@@ -69,7 +69,14 @@ public final class IndexDescription {
     return name;
   }
 
-  /** Field ids that this index is built on. */
+  /**
+   * Field ids that this index is built on -- the columns it can answer queries for.
+   *
+   * <p>This is the index's <em>keyed</em> prefix only. An index may additionally carry values for
+   * columns it is not keyed on; those are deliberately absent here, because the index cannot be
+   * searched on them. They stay reachable per segment via {@link Index#coveringFields()} on the
+   * entries of {@link #getMetadata()}.
+   */
   public List<Integer> getFieldIds() {
     return fieldIds;
   }

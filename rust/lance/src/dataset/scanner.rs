@@ -5649,10 +5649,31 @@ impl Scanner {
             knn_node = self.take(knn_node, vector_projection)?;
         }
 
+        // The index search now emits the index's covering ("included") columns, so every flat
+        // path below must produce the same columns before it is unioned with `knn_node`;
+        // otherwise projecting the flat output to `knn_node.schema()` panics on the missing column.
+        let covering_columns: Vec<String> = indexed_segments
+            .first()
+            .map(|s| s.covering_fields.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|id| {
+                self.dataset
+                    .schema()
+                    .field_by_id(*id)
+                    .map(|field| field.name.clone())
+            })
+            .collect();
+
         let mut columns = vec![q.column.clone()];
         if let Some(expr) = filter_plan.full_expr.as_ref() {
             let filter_columns = Planner::column_names_in_expr(expr);
             columns.extend(filter_columns);
+        }
+        for name in &covering_columns {
+            if !columns.contains(name) {
+                columns.push(name.clone());
+            }
         }
 
         // Collect flat-path plans; union order matches original (flat before ANN) so test snapshots
@@ -5707,6 +5728,9 @@ impl Scanner {
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 take_proj = take_proj.union_columns(filter_columns, OnMissing::Error)?;
+            }
+            if !covering_columns.is_empty() {
+                take_proj = take_proj.union_columns(covering_columns.clone(), OnMissing::Error)?;
             }
             let mut stale_node = self.stale_rows_take(stale_rows, take_proj).await?;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
@@ -15108,6 +15132,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     version: crate::index::vector::IndexFileVersion::Legacy,
                     skip_transpose: false,
                     runtime_hints: Default::default(),
+                    covering_columns: Default::default(),
                 },
                 false,
             )

@@ -21,8 +21,8 @@ use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
 use crate::scalar::OldIndexDataFilter;
 use crate::vector::bq::storage::{
-    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQueryEstimator,
-    pack_codes, rabit_binary_code_field, rabit_ex_code_field,
+    RABIT_CODE_COLUMN, RABIT_INTERNAL_COLUMNS, RABIT_METADATA_KEY, RabitQuantizationMetadata,
+    RabitQueryEstimator, pack_codes, rabit_binary_code_field, rabit_ex_code_field,
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
@@ -30,14 +30,20 @@ use crate::vector::bq::transform::{
 };
 use crate::vector::bq::validate_rq_num_bits;
 use crate::vector::flat::index::FlatMetadata;
+use crate::vector::flat::storage::{FLAT_COLUMN, FLAT_INTERNAL_COLUMNS};
 use crate::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel as IvfStorageModel};
-use crate::vector::pq::storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, transpose};
+use crate::vector::pq::storage::{
+    PQ_INTERNAL_COLUMNS, PQ_METADATA_KEY, ProductQuantizationMetadata, transpose,
+};
 use crate::vector::quantizer::QuantizerMetadata;
-use crate::vector::sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata};
+use crate::vector::sq::storage::{
+    SQ_INTERNAL_COLUMNS, SQ_METADATA_KEY, ScalarQuantizationMetadata,
+};
 use crate::vector::storage::STORAGE_METADATA_KEY;
+use crate::vector::storage::{COVERING_FIELD_IDS_KEY, covering_field_indices_excluding};
 use crate::vector::{DISTANCE_TYPE_KEY, PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 use crate::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use bytes::Bytes;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions};
@@ -249,6 +255,34 @@ fn init_writer_for_storage(
     Ok(())
 }
 
+/// The covering ("included") columns carried in a shard's auxiliary storage schema: every
+/// field that is not the row id or one of the quantizer's internal code/factor columns (or the
+/// legacy `__ivf_part_id`). The merger rebuilds the unified output schema from quantizer
+/// metadata (it reshapes the code column via the transpose), so these fields must be
+/// re-appended or the covered payload is silently dropped from the merged index. All shards
+/// share the same covering set, so the first shard's schema is authoritative.
+fn covering_fields_from_shard_schema(
+    schema: &ArrowSchema,
+    index_type: SupportedIvfIndexType,
+) -> Vec<FieldRef> {
+    use SupportedIvfIndexType::*;
+    // Each storage's exported internal set already excludes PART_ID_COLUMN, which
+    // matters here: a legacy PQ shard's raw aux schema may still physically carry
+    // `__ivf_part_id` even though PQ storage drops it at load, so classifying from
+    // the raw schema (pre-load) must exclude it or it would be wrongly classified
+    // as a covering column.
+    let internal: &[&str] = match index_type {
+        IvfPq | IvfHnswPq => PQ_INTERNAL_COLUMNS,
+        IvfSq | IvfHnswSq => SQ_INTERNAL_COLUMNS,
+        IvfFlat | IvfHnswFlat => FLAT_INTERNAL_COLUMNS,
+        IvfRq => RABIT_INTERNAL_COLUMNS,
+    };
+    covering_field_indices_excluding(schema, internal)
+        .into_iter()
+        .map(|i| schema.fields()[i].clone())
+        .collect()
+}
+
 /// Create and initialize a unified writer for FLAT storage.
 pub async fn init_writer_for_flat(
     object_store: &lance_io::object_store::ObjectStore,
@@ -257,18 +291,21 @@ pub async fn init_writer_for_flat(
     item_type: &DataType,
     dt: DistanceType,
     format_version: ConcreteFileVersion,
+    covering_fields: &[FieldRef],
 ) -> Result<FileWriter> {
-    let arrow_schema = ArrowSchema::new(vec![
+    let mut fields = vec![
         (*ROW_ID_FIELD).clone(),
         Field::new(
-            crate::vector::flat::storage::FLAT_COLUMN,
+            FLAT_COLUMN,
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", item_type.clone(), true)),
                 d0 as i32,
             ),
             true,
         ),
-    ]);
+    ];
+    fields.extend(covering_fields.iter().map(|f| f.as_ref().clone()));
+    let arrow_schema = ArrowSchema::new(fields);
     let writer = object_store.create(aux_out).await?;
     let mut w = versions::create_writer(
         format_version,
@@ -291,13 +328,14 @@ pub async fn init_writer_for_pq(
     dt: DistanceType,
     pm: &ProductQuantizationMetadata,
     format_version: ConcreteFileVersion,
+    covering_fields: &[FieldRef],
 ) -> Result<FileWriter> {
     let num_bytes = if pm.nbits == 4 {
         pm.num_sub_vectors / 2
     } else {
         pm.num_sub_vectors
     };
-    let arrow_schema = ArrowSchema::new(vec![
+    let mut fields = vec![
         (*ROW_ID_FIELD).clone(),
         Field::new(
             PQ_CODE_COLUMN,
@@ -307,7 +345,9 @@ pub async fn init_writer_for_pq(
             ),
             true,
         ),
-    ]);
+    ];
+    fields.extend(covering_fields.iter().map(|f| f.as_ref().clone()));
+    let arrow_schema = ArrowSchema::new(fields);
     let writer = object_store.create(aux_out).await?;
     let mut w = versions::create_writer(
         format_version,
@@ -336,9 +376,10 @@ pub async fn init_writer_for_sq(
     dt: DistanceType,
     sq_meta: &ScalarQuantizationMetadata,
     format_version: ConcreteFileVersion,
+    covering_fields: &[FieldRef],
 ) -> Result<FileWriter> {
     let d0 = sq_meta.dim;
-    let arrow_schema = ArrowSchema::new(vec![
+    let mut fields = vec![
         (*ROW_ID_FIELD).clone(),
         Field::new(
             SQ_CODE_COLUMN,
@@ -348,7 +389,9 @@ pub async fn init_writer_for_sq(
             ),
             true,
         ),
-    ]);
+    ];
+    fields.extend(covering_fields.iter().map(|f| f.as_ref().clone()));
+    let arrow_schema = ArrowSchema::new(fields);
     let writer = object_store.create(aux_out).await?;
     let mut w = versions::create_writer(
         format_version,
@@ -368,6 +411,7 @@ pub async fn init_writer_for_rq(
     dt: DistanceType,
     rq_meta: &RabitQuantizationMetadata,
     format_version: ConcreteFileVersion,
+    covering_fields: &[FieldRef],
 ) -> Result<FileWriter> {
     let mut fields = vec![
         (*ROW_ID_FIELD).clone(),
@@ -383,6 +427,7 @@ pub async fn init_writer_for_rq(
         fields.push(EX_ADD_FACTORS_FIELD.clone());
         fields.push(EX_SCALE_FACTORS_FIELD.clone());
     }
+    fields.extend(covering_fields.iter().map(|f| f.as_ref().clone()));
     let arrow_schema = ArrowSchema::new(fields);
     let writer = object_store.create(aux_out).await?;
     let mut w = versions::create_writer(
@@ -898,6 +943,11 @@ async fn merge_partial_vector_auxiliary_files_inner(
     let mut nlist_opt: Option<usize> = None;
     let mut accumulated_lengths: Vec<u32> = Vec::new();
     let mut first_centroids: Option<FixedSizeListArray> = None;
+    // Covering ("included") columns of the first shard, used as the authoritative set every
+    // later shard must match (see the per-shard check below).
+    // (covering fields, source dataset field ids) of the first shard; every later
+    // shard must match both.
+    let mut first_covering_fields: Option<(Vec<FieldRef>, Option<String>)> = None;
 
     // Track per-shard readers, IVF lengths, and precomputed partition offsets.
     // This avoids reopening each shard file for every partition during merge.
@@ -1044,6 +1094,68 @@ async fn merge_partial_vector_auxiliary_files_inner(
         // Preserve the historical fallback while keeping the writer boundary exact.
         let fv = format_version.unwrap_or(ConcreteFileVersion::V2_0);
 
+        // Covering ("included") columns carried in this shard's storage. The unified writer
+        // schemas below are rebuilt from quantizer metadata, so these must be re-appended or
+        // the covered payload is dropped from the merged index. The output schema is built
+        // from the *first* shard's covering fields and `concat_batches` combines columns
+        // positionally, so a later shard whose covering columns differ in name, type, or order
+        // would be silently stored under the first shard's names -> wrong covered values.
+        // Reject any such mismatch rather than corrupt the merged index.
+        let shard_arrow: ArrowSchema = reader.schema().as_ref().into();
+        let covering_fields = covering_fields_from_shard_schema(&shard_arrow, idx_type);
+        // Name and type alone cannot establish that two shards cover the *same logical
+        // column*: Arrow fields carry no Lance field id, and the ids in a shard's own
+        // Lance schema are file-local. A column dropped and re-added between two shard
+        // builds yields the same name and type under a different field id, and
+        // `concat_batches` would stack the old values under the new field. The build
+        // stamps the source field ids for exactly this comparison.
+        let covering_source_ids = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(COVERING_FIELD_IDS_KEY)
+            .cloned();
+        if !covering_fields.is_empty() && covering_source_ids.is_none() {
+            return Err(Error::index(format!(
+                "Distributed merge: shard {idx} carries covering (included) columns but records \
+                 no source field ids, so it cannot be proven to cover the same fields as the \
+                 other shards. Rebuild the shard."
+            )));
+        }
+        match first_covering_fields.as_ref() {
+            None => {
+                first_covering_fields = Some((covering_fields.clone(), covering_source_ids.clone()))
+            }
+            Some((first, first_source_ids)) => {
+                let matches = first.len() == covering_fields.len()
+                    && first
+                        .iter()
+                        .zip(&covering_fields)
+                        .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
+                    && *first_source_ids == covering_source_ids;
+                if !matches {
+                    let describe = |fields: &[FieldRef], source_ids: &Option<String>| {
+                        let names = fields
+                            .iter()
+                            .map(|f| format!("{}: {}", f.name(), f.data_type()))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        match source_ids {
+                            Some(ids) => format!("{names} (source field ids {ids})"),
+                            None => names,
+                        }
+                    };
+                    return Err(Error::index(format!(
+                        "Distributed merge: covering (included) columns differ across shards; \
+                         shard 0 has [{}] but shard {idx} has [{}]. All shards must declare the \
+                         same covering columns (same source fields, names, types, and order).",
+                        describe(first, first_source_ids),
+                        describe(&covering_fields, &covering_source_ids),
+                    )));
+                }
+            }
+        }
+
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
                 // Handle Scalar Quantization (SQ) storage for IVF_SQ
@@ -1097,8 +1209,15 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     sq_meta = Some(sq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {
-                    let w =
-                        init_writer_for_sq(object_store, &aux_out, dt, &sq_meta_parsed, fv).await?;
+                    let w = init_writer_for_sq(
+                        object_store,
+                        &aux_out,
+                        dt,
+                        &sq_meta_parsed,
+                        fv,
+                        &covering_fields,
+                    )
+                    .await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1205,8 +1324,15 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     rq_meta = Some(rq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {
-                    let w =
-                        init_writer_for_rq(object_store, &aux_out, dt, &rq_meta_parsed, fv).await?;
+                    let w = init_writer_for_rq(
+                        object_store,
+                        &aux_out,
+                        dt,
+                        &rq_meta_parsed,
+                        fv,
+                        &covering_fields,
+                    )
+                    .await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1305,8 +1431,15 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 if v2w_opt.is_none() {
                     let mut pm_for_unified = pm.clone();
                     pm_for_unified.transposed = true;
-                    let w =
-                        init_writer_for_pq(object_store, &aux_out, dt, &pm_for_unified, fv).await?;
+                    let w = init_writer_for_pq(
+                        object_store,
+                        &aux_out,
+                        dt,
+                        &pm_for_unified,
+                        fv,
+                        &covering_fields,
+                    )
+                    .await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1334,8 +1467,16 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if v2w_opt.is_none() {
-                    let w = init_writer_for_flat(object_store, &aux_out, d0, &item_type, dt, fv)
-                        .await?;
+                    let w = init_writer_for_flat(
+                        object_store,
+                        &aux_out,
+                        d0,
+                        &item_type,
+                        dt,
+                        fv,
+                        &covering_fields,
+                    )
+                    .await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1367,8 +1508,16 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if v2w_opt.is_none() {
-                    let w = init_writer_for_flat(object_store, &aux_out, d0, &item_type, dt, fv)
-                        .await?;
+                    let w = init_writer_for_flat(
+                        object_store,
+                        &aux_out,
+                        d0,
+                        &item_type,
+                        dt,
+                        fv,
+                        &covering_fields,
+                    )
+                    .await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1463,8 +1612,15 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 if v2w_opt.is_none() {
                     let mut pm_for_unified = pm.clone();
                     pm_for_unified.transposed = true;
-                    let w =
-                        init_writer_for_pq(object_store, &aux_out, dt, &pm_for_unified, fv).await?;
+                    let w = init_writer_for_pq(
+                        object_store,
+                        &aux_out,
+                        dt,
+                        &pm_for_unified,
+                        fv,
+                        &covering_fields,
+                    )
+                    .await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1515,8 +1671,15 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     sq_meta = Some(sq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {
-                    let w =
-                        init_writer_for_sq(object_store, &aux_out, dt, &sq_meta_parsed, fv).await?;
+                    let w = init_writer_for_sq(
+                        object_store,
+                        &aux_out,
+                        dt,
+                        &sq_meta_parsed,
+                        fv,
+                        &covering_fields,
+                    )
+                    .await?;
                     v2w_opt = Some(w);
                 }
             }
@@ -1715,6 +1878,15 @@ async fn merge_partial_vector_auxiliary_files_inner(
         };
         for len in merged_lengths.iter() {
             ivf_model.add_partition(*len);
+        }
+        // Carry the covering provenance onto the merged output. Every shard has already
+        // been checked to agree on this stamp, so the first shard's value IS the merged
+        // file's value. Without it the merged segment carries covering columns but no
+        // source ids, and feeding it back in as a shard of a later hierarchical merge
+        // would be rejected by the very check that verified its inputs -- with an error
+        // telling the user to rebuild a shard the merger itself produced.
+        if let Some((_, Some(covering_source_ids))) = first_covering_fields.as_ref() {
+            w.add_schema_metadata(COVERING_FIELD_IDS_KEY, covering_source_ids.clone());
         }
         let dt2 = distance_type.ok_or_else(|| Error::index("Distance type missing".to_string()))?;
         write_unified_ivf_and_index_metadata(w, &ivf_model, dt2, idx_type_final).await?;

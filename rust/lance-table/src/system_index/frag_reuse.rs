@@ -397,11 +397,11 @@ impl CompactFragReuseIndex {
         RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| self.remap_row_id(addr)))
     }
 
-    /// Remap a record batch that contains a row_id column at index `row_id_idx`
-    /// Currently this assumes there are only 2 columns in the schema,
-    /// which is the case for all indexes.
-    /// For example, for btree, the schema is (value, row_id).
-    /// For vector index storage, the schema is (row_id, vector).
+    /// Remap a record batch that contains a row_id column at index `row_id_idx`.
+    /// Every other column (there may be one, as for scalar indexes -- `(value,
+    /// row_id)` -- or several, as for a covered vector index's storage --
+    /// `(row_id, code, <covering...>)`) is row-aligned to the surviving,
+    /// remapped row ids by the same take.
     pub fn remap_row_ids_record_batch(
         &self,
         batch: RecordBatch,
@@ -426,8 +426,9 @@ fn remap_row_ids_record_batch(
     row_id_idx: usize,
     remap: impl FnOnce(&mut [Option<u64>]),
 ) -> Result<RecordBatch> {
-    assert_eq!(batch.schema().fields().len(), 2);
-    let other_column_idx = 1 - row_id_idx;
+    // Every column but `_rowid` is carried through row-aligned, however many there are.
+    // A covered index's storage batch holds its covering ("included") columns next to the
+    // codes, so this cannot assume the two-column `[_rowid, <codes>]` shape.
     let row_ids = batch.column(row_id_idx).as_primitive::<UInt64Type>();
     let mut remapped_row_ids = row_ids
         .values()
@@ -436,26 +437,27 @@ fn remap_row_ids_record_batch(
         .map(Some)
         .collect::<Vec<_>>();
     remap(&mut remapped_row_ids);
-    let (val_indices, new_row_ids): (Vec<u64>, Vec<u64>) = remapped_row_ids
+    let (keep_indices, new_row_ids): (Vec<u64>, Vec<u64>) = remapped_row_ids
         .iter()
         .enumerate()
         .filter_map(|(idx, new_id)| new_id.map(|new_id| (idx as u64, new_id)))
         .unzip();
-    let new_val_indices = UInt64Array::from_iter_values(val_indices);
-    let new_vals = arrow::compute::take(batch.column(other_column_idx), &new_val_indices, None)?;
+    let keep_indices = UInt64Array::from_iter_values(keep_indices);
+    let new_row_ids: ArrayRef = Arc::new(UInt64Array::from_iter_values(new_row_ids));
 
-    let mut batch_data: Vec<(usize, ArrayRef)> = vec![
-        (
-            row_id_idx,
-            Arc::new(UInt64Array::from_iter_values(new_row_ids)) as ArrayRef,
-        ),
-        (other_column_idx, Arc::new(new_vals)),
-    ];
-    batch_data.sort_by_key(|(i, _)| *i);
-    Ok(RecordBatch::try_new(
-        batch.schema(),
-        batch_data.into_iter().map(|(_, item)| item).collect(),
-    )?)
+    let columns = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            if idx == row_id_idx {
+                Ok(new_row_ids.clone())
+            } else {
+                Ok(arrow::compute::take(column, &keep_indices, None)?)
+            }
+        })
+        .collect::<Result<Vec<ArrayRef>>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 fn remap_row_ids_array(

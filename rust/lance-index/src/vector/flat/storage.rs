@@ -6,8 +6,9 @@ use std::{borrow::Cow, sync::Arc};
 use super::index::FlatMetadata;
 use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
 use crate::scalar::RowIdRemapper;
+use crate::vector::PART_ID_COLUMN;
 use crate::vector::quantizer::QuantizerStorage;
-use crate::vector::storage::{DistCalculator, VectorStore};
+use crate::vector::storage::{DistCalculator, VectorStore, remap_row_ids_by_name};
 use crate::vector::utils::do_prefetch;
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
@@ -25,6 +26,14 @@ use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::{Cosine, DistanceType, Dot, L2, Normalize, norm_l2_fsl};
 
 pub const FLAT_COLUMN: &str = "flat";
+
+/// Flat storage's internal (non-covering) column names: the row id, the flat vector
+/// column, and the legacy `__ivf_part_id` column (left in pre-#3606 single-partition
+/// builds; unlike PQ, flat storage does not drop it at construction). Every other
+/// column in a flat storage schema is a user-declared covering ("included") column.
+/// The single authority for this set -- the distributed shard merger classifies from
+/// it too, so a new internal column added here is excluded everywhere at once.
+pub const FLAT_INTERNAL_COLUMNS: &[&str] = &[ROW_ID, FLAT_COLUMN, PART_ID_COLUMN];
 
 /// Per-vector L2 norms cached for Cosine distance, so `cosine_with_norms` can
 /// skip recomputing each stored vector's norm per comparison. `None` for other
@@ -85,7 +94,7 @@ impl QuantizerStorage for FlatFloatStorage {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let batch = if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
+            remap_row_ids_by_name(batch, frag_reuse_index_ref.as_ref())?
         } else {
             batch
         };
@@ -162,6 +171,9 @@ impl FlatFloatStorage {
 
 impl VectorStore for FlatFloatStorage {
     type DistanceCalculator<'a> = FlatFloatDistanceCalc<'a>;
+
+    /// Flat storage is `[_rowid, flat, <included cols...>]`.
+    const INTERNAL_COLUMNS: &'static [&'static str] = FLAT_INTERNAL_COLUMNS;
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok([self.batch.clone()].into_iter())
@@ -265,7 +277,7 @@ impl QuantizerStorage for FlatBinStorage {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let batch = if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
+            remap_row_ids_by_name(batch, frag_reuse_index_ref.as_ref())?
         } else {
             batch
         };
@@ -338,6 +350,9 @@ impl FlatBinStorage {
 
 impl VectorStore for FlatBinStorage {
     type DistanceCalculator<'a> = FlatDistanceCal<'a, UInt8Type>;
+
+    /// Flat storage is `[_rowid, flat, <included cols...>]`.
+    const INTERNAL_COLUMNS: &'static [&'static str] = FLAT_INTERNAL_COLUMNS;
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
         Ok([self.batch.clone()].into_iter())
@@ -683,6 +698,70 @@ mod tests {
         let values = Float64Array::from(vec![1.0, 2.0, 4.0, 6.0]);
         let vectors = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
         FlatFloatStorage::new(vectors, DistanceType::L2)
+    }
+
+    // Pre-#3606 `num_partitions=1` builds left `__ivf_part_id` in the flat
+    // storage file. It must never be classified as a covering column --
+    // otherwise search emits a column the exec's declared schema (from
+    // `IndexMetadata.covering_fields`, empty for those indexes) lacks,
+    // desyncing the two and failing every query on that legacy index.
+    #[test]
+    fn test_flat_covering_excludes_legacy_part_id_column() {
+        use crate::vector::PART_ID_COLUMN;
+        const DIM: i32 = 8;
+        const N: usize = 8;
+
+        let part_id_batch = |vectors: ArrayRef| {
+            RecordBatch::try_from_iter_with_nullable(vec![
+                (
+                    ROW_ID,
+                    Arc::new(UInt64Array::from_iter_values(0..N as u64)) as ArrayRef,
+                    true,
+                ),
+                (FLAT_COLUMN, vectors, true),
+                (
+                    PART_ID_COLUMN,
+                    Arc::new(arrow_array::UInt32Array::from_iter_values(
+                        (0..N).map(|_| 0),
+                    )) as ArrayRef,
+                    true,
+                ),
+            ])
+            .unwrap()
+        };
+        let meta = FlatMetadata { dim: DIM as usize };
+
+        let floats =
+            arrow_array::Float32Array::from_iter_values((0..N * DIM as usize).map(|v| v as f32));
+        let float_storage = FlatFloatStorage::try_from_batch(
+            part_id_batch(Arc::new(
+                FixedSizeListArray::try_new_from_values(floats, DIM).unwrap(),
+            )),
+            &meta,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        assert!(
+            float_storage.covering_field_indices().is_empty(),
+            "legacy __ivf_part_id must not be classified as covering (float storage)"
+        );
+
+        let codes =
+            arrow_array::UInt8Array::from_iter_values((0..N * DIM as usize).map(|v| v as u8));
+        let bin_storage = FlatBinStorage::try_from_batch(
+            part_id_batch(Arc::new(
+                FixedSizeListArray::try_new_from_values(codes, DIM).unwrap(),
+            )),
+            &meta,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        assert!(
+            bin_storage.covering_field_indices().is_empty(),
+            "legacy __ivf_part_id must not be classified as covering (binary storage)"
+        );
     }
 
     #[test]
