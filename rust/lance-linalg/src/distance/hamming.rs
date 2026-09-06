@@ -19,6 +19,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rayon::prelude::*;
 
+use crate::distance::assert_batch_layout;
 use crate::{Error, Result};
 
 /// Schema of a Hamming distance-pair batch.
@@ -83,13 +84,29 @@ pub fn hamming_scalar(x: &[u8], y: &[u8]) -> f32 {
         .sum::<u32>() as f32
 }
 
+/// Compute Hamming distances from one vector to a batch of vectors.
+///
+/// # Examples
+///
+/// ```
+/// use lance_linalg::distance::hamming::hamming_distance_batch;
+///
+/// let query = [0, u8::MAX];
+/// let targets = [0, u8::MAX, 1, u8::MAX - 1];
+/// let distances = hamming_distance_batch(&query, &targets, query.len()).collect::<Vec<_>>();
+/// assert_eq!(distances, [0.0, 2.0]);
+/// ```
+///
+/// # Panics
+///
+/// Panics if `dimension` is zero, `from.len()` differs from `dimension`, or
+/// `to` does not contain a whole number of vectors with that dimension.
 pub fn hamming_distance_batch<'a>(
     from: &'a [u8],
     to: &'a [u8],
     dimension: usize,
 ) -> Box<dyn Iterator<Item = f32> + 'a> {
-    debug_assert_eq!(from.len(), dimension);
-    debug_assert_eq!(to.len() % dimension, 0);
+    assert_batch_layout(from.len(), to.len(), dimension);
     Box::new(to.chunks_exact(dimension).map(|v| hamming(from, v)))
 }
 
@@ -1138,6 +1155,17 @@ mod tests {
 
         let y = vec![0b1101_1010, 0b1010_1010, 0b1010_1001];
         assert_eq!(hamming(&x, &y), 2.0);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "distance batch length must be divisible by dimension: batch=5, dimension=2"
+    )]
+    fn test_hamming_distance_batch_rejects_partial_vector() {
+        let query = [0, 0];
+        let targets = [u8::MAX, u8::MAX, 0, 1, 0];
+
+        let _ = hamming_distance_batch(&query, &targets, query.len());
     }
 
     #[test]
