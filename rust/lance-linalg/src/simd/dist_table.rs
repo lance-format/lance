@@ -67,6 +67,7 @@ pub unsafe fn sum_4bit_dist_table_uninit(
     debug_assert!(n.is_multiple_of(BATCH_SIZE));
     debug_assert!(dists.len() >= n);
     debug_assert!(codes.len() >= n * code_len);
+    debug_assert!(dist_table.len() >= BATCH_SIZE * code_len);
 
     match *SIMD_SUPPORT {
         #[cfg(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))]

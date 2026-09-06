@@ -2437,6 +2437,24 @@ impl QuantizerStorage for RabitQuantizationStorage {
             _ => distance_type,
         };
         validate_rq_num_bits(metadata.num_bits)?;
+        // The FastScan LUT is `4 * rotated_dim` bytes while the kernels index it
+        // as `BATCH_SIZE * rotated_dim.div_ceil(8)`, so the two agree only when
+        // the dimension is a multiple of 8. `RabitQuantizer::build` has rejected
+        // a non-multiple since #6024, but an index written before that still
+        // loads here, and the AVX-512, AVX2 and NEON kernels read the LUT
+        // through unchecked raw pointers. Only the scalar fallback panics.
+        //
+        // This has to go through `rotated_dim()`, not `metadata.code_dim`:
+        // `code_dim` was added by #6024 itself, so it deserializes to 0 for the
+        // very indices this rejects, and `rotated_dim()` recovers the real
+        // dimension from the rotation matrix that `parse_buffer` backfills.
+        let rotated_dim = metadata.rotated_dim();
+        if rotated_dim % 8 != 0 {
+            return Err(Error::invalid_input(format!(
+                "RabitQ vector dimension must be divisible by 8, got {rotated_dim}. \
+                 Rebuild the index."
+            )));
+        }
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
         let codes = batch[RABIT_CODE_COLUMN].as_fixed_size_list().clone();
         let expected_code_bytes = metadata.binary_code_bytes();
@@ -2988,6 +3006,37 @@ mod tests {
     fn make_test_metadata(code_dim: usize) -> RabitQuantizationMetadata {
         RabitQuantizer::new_with_rotation::<Float32Type>(1, code_dim as i32, RQRotationType::Fast)
             .metadata(None)
+    }
+
+    /// Indices written before #6024 could carry a `code_dim` that is not a
+    /// multiple of 8. The FastScan LUT is sized `4 * code_dim` while the kernels
+    /// index it as `BATCH_SIZE * code_dim.div_ceil(8)`, so loading one made the
+    /// kernels read past the LUT through raw pointers.
+    #[test]
+    fn test_try_from_batch_rejects_dim_not_multiple_of_eight() {
+        let code_dim = 12usize;
+        let metadata = make_test_metadata(code_dim);
+        assert_eq!(metadata.code_dim as usize, code_dim);
+        let code_bytes = metadata.binary_code_bytes();
+        let codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(vec![0u8; 2 * code_bytes]),
+            code_bytes as i32,
+        )
+        .unwrap();
+        let batch = make_test_batch(codes);
+
+        let err =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .expect_err("a dimension that is not a multiple of 8 must be rejected");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected variant: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("divisible by 8") && message.contains("12"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
