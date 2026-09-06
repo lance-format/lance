@@ -4259,6 +4259,7 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "env_logger",
+ "futures",
  "jni 0.21.1",
  "lance",
  "lance-core",

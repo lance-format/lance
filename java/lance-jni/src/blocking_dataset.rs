@@ -4165,27 +4165,69 @@ fn inner_get_zonemap_stats<'local>(
                             .unwrap_or_default()
                     });
 
-                    let mut batches = Vec::with_capacity(indices.len());
-                    for index in &indices {
-                        let index_store = Arc::new(
-                            LanceIndexStore::from_dataset_for_existing(&dataset, index)
+                    // Open and read segments concurrently. Multi-segment zonemap (one
+                    // IndexMetadata per fragment under a shared name) means N segments
+                    // for an N-fragment table; sequentially serialising N round-trips
+                    // dominates plan-time latency on cold object storage. `buffered`
+                    // preserves the fragment-id order established by the sort above
+                    // while limiting in-flight requests to a fixed window.
+                    use futures::stream::{self, StreamExt, TryStreamExt};
+                    let dataset_ref = &dataset;
+
+                    // Resolve each segment's index store first. This is cheap — store
+                    // handles are looked up (and deduplicated) in the session registry
+                    // with no segment-file I/O — so it does not reintroduce the
+                    // sequential round-trips this change removes.
+                    let index_stores: Vec<Arc<LanceIndexStore>> = stream::iter(indices.iter())
+                        .then(|index| async move {
+                            LanceIndexStore::from_dataset_for_existing(dataset_ref, index)
                                 .await
-                                .map_err(Error::from)?,
-                        );
-                        let index_file = index_store
-                            .open_index_file("zonemap.lance")
-                            .await
-                            .map_err(Error::from)?;
-                        if index_file.num_rows() == 0 {
-                            continue;
-                        }
-                        batches.push(
-                            index_file
-                                .read_range(0..index_file.num_rows(), None)
+                                .map(Arc::new)
+                                .map_err(Error::from)
+                        })
+                        .try_collect()
+                        .await?;
+
+                    // Concurrency window for the per-segment open+read stream. Derive it
+                    // from the index segments' own stores — the backend the reads actually
+                    // go through — matching the BTree scalar-index reader's
+                    // `.buffered(self.store.io_parallelism())` precedent. A base-scoped or
+                    // shallow-cloned index can resolve to a different backend than the
+                    // primary dataset store, so sizing the window from the dataset store
+                    // could under-parallelize a remote backend; take the max across segment
+                    // stores so a remote backend keeps its full window. Memory-constrained
+                    // callers can dial io_parallelism down via lance-io's storage options
+                    // instead of a hardcoded cap here.
+                    let max_concurrent_segment_reads = index_stores
+                        .iter()
+                        .map(|store| store.io_parallelism())
+                        .max()
+                        .unwrap_or(1);
+
+                    let batches: Vec<arrow_array::RecordBatch> = stream::iter(index_stores)
+                        .map(|index_store| async move {
+                            let index_file = index_store
+                                // Inlined so this commit has no cross-crate dependency. Once
+                                // `lance_index::scalar::zonemap::ZONEMAP_FILENAME` is publicly
+                                // exposed, switch this to the constant.
+                                .open_index_file("zonemap.lance")
                                 .await
-                                .map_err(Error::from)?,
-                        );
-                    }
+                                .map_err(Error::from)?;
+                            if index_file.num_rows() == 0 {
+                                Ok::<Option<arrow_array::RecordBatch>, Error>(None)
+                            } else {
+                                Ok(Some(
+                                    index_file
+                                        .read_range(0..index_file.num_rows(), None)
+                                        .await
+                                        .map_err(Error::from)?,
+                                ))
+                            }
+                        })
+                        .buffered(max_concurrent_segment_reads)
+                        .try_filter_map(|opt| std::future::ready(Ok(opt)))
+                        .try_collect()
+                        .await?;
                     Ok::<_, Error>(batches)
                 }
                 None => Ok(Vec::new()),
