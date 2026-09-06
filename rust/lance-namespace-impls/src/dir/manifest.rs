@@ -1819,8 +1819,13 @@ impl ManifestNamespace {
     }
 
     /// Resolve the commit handler for the `__manifest` dataset's storage backend.
-    async fn manifest_commit_handler(&self) -> Result<Arc<dyn CommitHandler>> {
-        commit_handler_from_url(&self.root, &None)
+    /// The capability is read from the exact store the commit is written through,
+    /// which for stores like `memory://` can differ from `self.object_store`.
+    async fn manifest_commit_handler(
+        &self,
+        object_store: &ObjectStore,
+    ) -> Result<Arc<dyn CommitHandler>> {
+        commit_handler_from_url(&self.root, &None, object_store.commit_handler_type())
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
@@ -1950,7 +1955,6 @@ impl ManifestNamespace {
         let max_retries = self.manifest_rewrite_commit_retries();
         let mut retries = 0;
         let build_indices = self.inline_optimization_enabled;
-        let commit_handler = self.manifest_commit_handler().await?;
 
         loop {
             let dataset_guard = self.manifest_dataset.get_refreshed().await?;
@@ -1963,6 +1967,9 @@ impl ManifestNamespace {
             // Staged files, indices, the commit, and cleanup must all use the dataset's
             // own object store (see `commit_manifest_overwrite`).
             let object_store = dataset.object_store(None).await?;
+            // Resolve the handler from that same committing store so an override
+            // registered for this scheme is honored (see manifest_commit_handler).
+            let commit_handler = self.manifest_commit_handler(&object_store).await?;
 
             let source = Self::manifest_projected_stream(&dataset).await?;
             let resolution = make_mutation().conflict_resolution();

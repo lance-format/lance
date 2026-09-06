@@ -23,7 +23,7 @@ use lance_file::versions::v1::writer::{
 };
 use lance_file::writer::{self as current_writer};
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
+    CommitHandlerType, ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
 };
 use lance_io::traits::Writer;
 use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
@@ -2015,6 +2015,7 @@ async fn resolve_commit_handler(
     uri: &str,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_options: &Option<ObjectStoreParams>,
+    capability: CommitHandlerType,
 ) -> Result<Arc<dyn CommitHandler>> {
     match commit_handler {
         None => {
@@ -2028,7 +2029,7 @@ async fn resolve_commit_handler(
                     "when creating a dataset with a custom object store the commit_handler must also be specified",
                 ));
             }
-            commit_handler_from_url(uri, store_options).await
+            commit_handler_from_url(uri, store_options, capability).await
         }
         Some(commit_handler) => {
             if uri.starts_with("s3+ddb") {

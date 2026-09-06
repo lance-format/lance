@@ -37,6 +37,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             // Listed in full: the store is already in memory, so a page costs no less than
             // the directory does.
             paginated_lister: None,
+            commit_handler_type: crate::object_store::CommitHandlerType::ConditionalPut,
         })
     }
 

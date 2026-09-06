@@ -318,14 +318,7 @@ impl<'a> CommitBuilder<'a> {
                     .unwrap_or_else(|| dataset.commit_handler.clone()),
             ),
             WriteDestination::Uri(uri) => {
-                let commit_handler = if let (Some(_), Some(commit_handler)) =
-                    (&self.object_store, &self.commit_handler)
-                {
-                    commit_handler.clone()
-                } else {
-                    resolve_commit_handler(uri, self.commit_handler.clone(), &self.store_params)
-                        .await?
-                };
+                let store_was_passed = self.object_store.is_some();
                 let (object_store, base_path) = if let Some(passed_store) = self.object_store {
                     (
                         passed_store,
@@ -336,6 +329,20 @@ impl<'a> CommitBuilder<'a> {
                         session.store_registry(),
                         uri,
                         &self.store_params.clone().unwrap_or_default(),
+                    )
+                    .await?
+                };
+                // Resolve the handler from the capability the constructed
+                // store carries, so the choice is bound to that store. An
+                // explicitly supplied handler alongside a custom store wins.
+                let commit_handler = if store_was_passed && self.commit_handler.is_some() {
+                    self.commit_handler.clone().expect("checked is_some")
+                } else {
+                    resolve_commit_handler(
+                        uri,
+                        self.commit_handler.clone(),
+                        &self.store_params,
+                        object_store.commit_handler_type(),
                     )
                     .await?
                 };

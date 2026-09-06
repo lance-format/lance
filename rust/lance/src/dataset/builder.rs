@@ -594,7 +594,12 @@ impl DatasetBuilder {
                     )),
                 })
             } else {
-                commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await?
+                commit_handler_from_url(
+                    &self.table_uri,
+                    &Some(self.options.clone()),
+                    object_store.commit_handler_type(),
+                )
+                .await?
             };
 
         Ok((object_store, base_path, commit_handler))
