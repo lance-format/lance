@@ -40,6 +40,7 @@ use crate::dataset::rowids::load_row_id_sequences;
 use crate::index::scalar::{
     IndexDetails, fetch_index_details, load_fts_training_data, load_training_data,
 };
+use crate::index::vector::details::clear_coarse_quantizer_fingerprint;
 use crate::index::vector_index_details_default;
 
 #[derive(Debug, Clone)]
@@ -1108,7 +1109,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 .to_string(),
                         )
                     })?;
-                let index_details = removed_indices
+                let mut index_details = removed_indices
                     .iter()
                     .rev()
                     .filter_map(|idx| idx.index_details.as_ref())
@@ -1122,6 +1123,9 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             .cloned()
                     })
                     .unwrap_or_else(vector_index_details_default);
+                if options.retrain {
+                    index_details = clear_coarse_quantizer_fingerprint(index_details)?;
+                }
                 let index_version = if let Some(metadata) = removed_indices.first() {
                     metadata.index_version as u32
                 } else {

@@ -3360,6 +3360,49 @@ def test_distributed_ivf_rq_shared_rotation(tmp_path):
     assert 0 < len(results) <= 5
 
 
+@pytest.mark.parametrize(
+    ("shared_coarse_quantizer", "expect_fingerprint"),
+    [(False, False), (True, True)],
+)
+def test_distributed_ivf_shared_coarse_quantizer_flag(
+    tmp_path, shared_coarse_quantizer, expect_fingerprint
+):
+    dim = 32
+    ds = _make_sample_dataset_base(
+        tmp_path,
+        f"shared_coarse_{shared_coarse_quantizer}",
+        n_rows=512,
+        dim=dim,
+        max_rows_per_file=256,
+    )
+    fragments = ds.get_fragments()
+    ivf_model = IndicesBuilder(ds, "vector").train_ivf(
+        num_partitions=2,
+        distance_type="l2",
+        sample_rate=8,
+        max_iters=2,
+    )
+    build_kwargs = {
+        "column": "vector",
+        "index_type": "IVF_FLAT",
+        "name": "vector_idx",
+        "num_partitions": 2,
+        "ivf_centroids": ivf_model.centroids,
+        "shared_coarse_quantizer": shared_coarse_quantizer,
+    }
+    segments = [
+        ds.create_index_uncommitted(
+            **build_kwargs,
+            fragment_ids=[fragment.fragment_id],
+        )
+        for fragment in fragments
+    ]
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", segments)
+
+    details = ds.describe_indices()[0].details
+    assert ("coarse_quantizer_fingerprint" in details) is expect_fingerprint
+
+
 def test_commit_existing_index_segments_accepts_uncommitted_vector_segments(tmp_path):
     dim = 32
     ds = _make_sample_dataset_base(

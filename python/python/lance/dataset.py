@@ -3848,6 +3848,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
+        shared_coarse_quantizer: Optional[bool] = None,
         require_commit: bool = True,
         **kwargs,
     ) -> Index:
@@ -4175,6 +4176,11 @@ class LanceDataset(pa.dataset.Dataset):
 
         if rabitq_model is not None:
             kwargs["rabitq_model"] = rabitq_model
+
+        if shared_coarse_quantizer is not None:
+            if shared_coarse_quantizer and ivf_centroids is None:
+                raise ValueError("shared_coarse_quantizer=True requires ivf_centroids")
+            kwargs["shared_coarse_quantizer"] = shared_coarse_quantizer
 
         # Add fragment_ids and index_uuid to kwargs if provided for
         # distributed indexing
@@ -4509,6 +4515,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
+        shared_coarse_quantizer: Optional[bool] = None,
         **kwargs,
     ) -> Index:
         """
@@ -4556,6 +4563,13 @@ class LanceDataset(pa.dataset.Dataset):
           rotation so every segment rotates vectors the same way. If omitted, each
           call generates its own random rotation, which is only safe for a single,
           non-merged segment.
+        - ``shared_coarse_quantizer``: controls whether externally supplied IVF
+          centroids are declared reusable across the committed segments. ``True``
+          requires ``ivf_centroids`` and records their identity for the shared
+          coarse-quantizer query path. ``False`` deliberately omits that identity
+          while keeping the supplied centroids unchanged, which is useful for an
+          isolated A/B benchmark. The default ``None`` enables the identity whenever
+          final external centroids are supplied.
 
         Returns
         -------
@@ -4617,6 +4631,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
             rabitq_model=rabitq_model,
+            shared_coarse_quantizer=shared_coarse_quantizer,
             require_commit=False,
             **kwargs,
         )

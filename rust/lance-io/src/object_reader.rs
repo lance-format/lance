@@ -25,7 +25,7 @@ use tokio::sync::OnceCell;
 use tracing::instrument;
 
 use crate::{
-    object_store::DEFAULT_CLOUD_IO_PARALLELISM,
+    object_store::{DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_DOWNLOAD_RETRY_COUNT},
     traits::{ByteStream, Reader},
 };
 
@@ -116,8 +116,11 @@ impl CloudObjectReader {
 // Retries for the initial request are handled by object store, but
 // there are no retries for failures that occur during the streaming
 // of the response body. Thus we add an outer retry loop here.
-async fn do_with_retry<'a, O>(f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone) -> OSResult<O> {
-    let mut retries = 3;
+async fn do_with_retry_count<'a, O>(
+    retry_count: usize,
+    f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone,
+) -> OSResult<O> {
+    let mut retries = retry_count;
     loop {
         let f = f.clone();
         match f().await {
@@ -130,6 +133,10 @@ async fn do_with_retry<'a, O>(f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone
             }
         }
     }
+}
+
+async fn do_with_retry<'a, O>(f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone) -> OSResult<O> {
+    do_with_retry_count(DEFAULT_DOWNLOAD_RETRY_COUNT, f).await
 }
 
 // We have a separate retry loop here.  This is because object_store does not
@@ -204,12 +211,13 @@ impl Reader for CloudObjectReader {
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
         let object_store = self.object_store.clone();
         let path = self.path.clone();
+        let download_retry_count = self.download_retry_count;
         let get_range = Range {
             start: range.start as u64,
             end: range.end as u64,
         };
         Box::pin(async move {
-            let bytes = do_with_retry(move || {
+            let bytes = do_with_retry_count(download_retry_count, move || {
                 let object_store = object_store.clone();
                 let path = path.clone();
                 let get_range = get_range.clone();
@@ -275,6 +283,37 @@ impl Reader for CloudObjectReader {
             let get_result = do_with_retry(move || get_request_clone.get_range()).await?;
             Ok(get_result.into_stream())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_configured_retry_count_is_honored() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_request = attempts.clone();
+
+        let result = do_with_retry_count(4, move || {
+            let attempt = attempts_for_request.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if attempt < 4 {
+                    Err(object_store::Error::Generic {
+                        store: "test",
+                        source: "transient download failure".into(),
+                    })
+                } else {
+                    Ok(42)
+                }
+            })
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
     }
 }
 

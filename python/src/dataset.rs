@@ -5181,6 +5181,15 @@ fn prepare_vector_index_params(
             .runtime_hints
             .insert("lancedb.accelerator".to_string(), acc.to_string());
     }
+    if let Some(kwargs) = kwargs
+        && let Some(enabled) = kwargs.get_item("shared_coarse_quantizer")?
+    {
+        let enabled: bool = enabled.extract()?;
+        params.runtime_hints.insert(
+            "lance.ivf.shared_coarse_quantizer".to_string(),
+            enabled.to_string(),
+        );
+    }
     Ok(params)
 }
 

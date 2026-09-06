@@ -188,6 +188,11 @@ message VectorIndex {
 
 // Details for vector indexes, stored in the manifest's index_details field.
 message VectorIndexDetails {
+  // Content-derived identity of the IVF coarse quantizer used by this segment.
+  // Readers may reuse coarse-quantizer search results only when every segment
+  // has the same well-formed fingerprint. The current encoding is a 32-byte
+  // SHA-256 digest of the metric, dimensions, and ordered centroid bits.
+
   VectorMetricType metric_type = 1;
 
   /* The target number of vectors per partition.
@@ -229,6 +234,10 @@ message VectorIndexDetails {
    * Unrecognized keys must be silently ignored by all runtimes.
    */
   map<string, string> runtime_hints = 9;
+
+  // Absent for independently trained and legacy segments. Presence means the
+  // builder derived the identity from final, externally supplied centroids.
+  optional bytes coarse_quantizer_fingerprint = 10;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.

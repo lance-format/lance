@@ -13,6 +13,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float16Type, Float32Type, Float64Type, Int8Type, UInt8Type};
+use arrow_array::{Array, FixedSizeListArray};
 use lance_file::reader::FileReaderOptions;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::pb::VectorMetricType;
@@ -25,6 +28,7 @@ use lance_io::utils::{CachedFileSize, read_last_block, read_version};
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use lance_index::vector::bq::{RQBuildParams, RQRotationType};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -36,6 +40,9 @@ use super::{StageParams, VectorIndexParams};
 use crate::dataset::Dataset;
 use crate::index::open_index_proto;
 use crate::{Error, Result};
+
+const COARSE_QUANTIZER_FINGERPRINT_DIGEST_SIZE: usize = 32;
+const SHARED_COARSE_QUANTIZER_HINT: &str = "lance.ivf.shared_coarse_quantizer";
 
 // Private structs for JSON serialization of VectorIndexDetails.
 // Changes to field names or structure are backwards-incompatible for users
@@ -52,6 +59,8 @@ struct VectorDetailsJson {
     compression: Option<CompressionDetailsJson>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     runtime_hints: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coarse_quantizer_fingerprint: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -80,6 +89,108 @@ enum CompressionDetailsJson {
         num_bits: u32,
         rotation_type: &'static str,
     },
+}
+
+fn update_centroid_bits(hasher: &mut Sha256, centroids: &FixedSizeListArray) -> Option<()> {
+    if centroids.null_count() != 0 || centroids.values().null_count() != 0 {
+        return None;
+    }
+
+    let values = centroids.values();
+    match values.data_type() {
+        arrow_schema::DataType::Float16 => {
+            hasher.update([1]);
+            for value in values.as_primitive::<Float16Type>().values() {
+                hasher.update(value.to_bits().to_le_bytes());
+            }
+        }
+        arrow_schema::DataType::Float32 => {
+            hasher.update([2]);
+            for value in values.as_primitive::<Float32Type>().values() {
+                hasher.update(value.to_bits().to_le_bytes());
+            }
+        }
+        arrow_schema::DataType::Float64 => {
+            hasher.update([3]);
+            for value in values.as_primitive::<Float64Type>().values() {
+                hasher.update(value.to_bits().to_le_bytes());
+            }
+        }
+        arrow_schema::DataType::UInt8 => {
+            hasher.update([4]);
+            hasher.update(values.as_primitive::<UInt8Type>().values().as_ref());
+        }
+        arrow_schema::DataType::Int8 => {
+            hasher.update([5]);
+            for value in values.as_primitive::<Int8Type>().values() {
+                hasher.update(value.to_le_bytes());
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Derive a stable identity only when the build uses final, externally supplied
+/// centroids. Independently trained or retrained segments intentionally omit it.
+fn coarse_quantizer_fingerprint(
+    params: &VectorIndexParams,
+    metric_type: VectorMetricType,
+) -> Option<Vec<u8>> {
+    if params
+        .runtime_hints
+        .get(SHARED_COARSE_QUANTIZER_HINT)
+        .is_some_and(|enabled| enabled == "false")
+    {
+        return None;
+    }
+    let ivf = params.stages.iter().find_map(|stage| match stage {
+        StageParams::Ivf(ivf) => Some(ivf),
+        _ => None,
+    })?;
+    if ivf.retrain {
+        return None;
+    }
+    let centroids = ivf.centroids.as_deref()?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"lance.coarse_quantizer.v1");
+    hasher.update((metric_type as i32).to_le_bytes());
+    hasher.update((centroids.len() as u64).to_le_bytes());
+    hasher.update((centroids.value_length() as u64).to_le_bytes());
+    update_centroid_bits(&mut hasher, centroids)?;
+
+    Some(hasher.finalize().to_vec())
+}
+
+/// Read a well-formed coarse-quantizer fingerprint from manifest metadata.
+/// Returning `None` forces the query path to preserve per-segment partition
+/// ranking.
+pub fn coarse_quantizer_fingerprint_from_metadata(index: &IndexMetadata) -> Option<Vec<u8>> {
+    let details = index
+        .index_details
+        .as_ref()?
+        .to_msg::<VectorIndexDetails>()
+        .ok()?;
+    details
+        .coarse_quantizer_fingerprint
+        .filter(|fingerprint| fingerprint.len() == COARSE_QUANTIZER_FINGERPRINT_DIGEST_SIZE)
+}
+
+/// Remove a stale coarse-quantizer identity when an operation retrains the IVF
+/// model but cannot surface the new final centroids to the manifest writer.
+pub fn clear_coarse_quantizer_fingerprint(details: prost_types::Any) -> Result<prost_types::Any> {
+    let mut details_message = details.to_msg::<VectorIndexDetails>().map_err(|error| {
+        Error::index(format!(
+            "Failed to clear coarse quantizer fingerprint from VectorIndexDetails: {error}"
+        ))
+    })?;
+    details_message.coarse_quantizer_fingerprint = None;
+    prost_types::Any::from_msg(&details_message).map_err(|error| {
+        Error::index(format!(
+            "Failed to encode VectorIndexDetails without coarse quantizer fingerprint: {error}"
+        ))
+    })
 }
 
 /// Build a `VectorIndexDetails` proto from build params at index creation time.
@@ -162,6 +273,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         hnsw_index_config,
         compression,
         runtime_hints,
+        coarse_quantizer_fingerprint: coarse_quantizer_fingerprint(params, metric_type),
     };
     prost_types::Any::from_msg(&details).unwrap()
 }
@@ -488,6 +600,12 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
         hnsw,
         compression,
         runtime_hints: d.runtime_hints,
+        coarse_quantizer_fingerprint: d.coarse_quantizer_fingerprint.map(|fingerprint| {
+            fingerprint
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }),
     };
 
     serde_json::to_string(&json).map_err(|e| Error::index(format!("Failed to serialize: {}", e)))
@@ -558,6 +676,7 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
         hnsw_index_config: None,
         compression,
         runtime_hints: Default::default(),
+        coarse_quantizer_fingerprint: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -697,6 +816,7 @@ async fn convert_v3_metadata_to_details(
         hnsw_index_config,
         compression,
         runtime_hints: Default::default(),
+        coarse_quantizer_fingerprint: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -732,6 +852,8 @@ async fn open_lance_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Float32Array;
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_index::pb::vector_index_details::*;
     use lance_index::pb::{HnswParameters, VectorIndexDetails};
 
@@ -746,6 +868,7 @@ mod tests {
             hnsw_index_config: hnsw,
             compression,
             runtime_hints: Default::default(),
+            coarse_quantizer_fingerprint: None,
         };
         prost_types::Any::from_msg(&details).unwrap()
     }
@@ -895,6 +1018,7 @@ mod tests {
                 hnsw_index_config: None,
                 compression: None,
                 runtime_hints: Default::default(),
+                coarse_quantizer_fingerprint: None,
             };
             prost_types::Any::from_msg(&d).unwrap()
         };
@@ -908,6 +1032,112 @@ mod tests {
     fn test_json_empty_details() {
         let details = vector_index_details_default();
         assert_eq!(vector_details_as_json(&details).unwrap(), "{}");
+    }
+
+    #[test]
+    fn test_coarse_quantizer_fingerprint_is_content_derived() {
+        fn params(values: Vec<f32>, metric: DistanceType) -> VectorIndexParams {
+            let centroids = Arc::new(
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), 2).unwrap(),
+            );
+            VectorIndexParams::with_ivf_flat_params(
+                metric,
+                IvfBuildParams::try_with_centroids(2, centroids).unwrap(),
+            )
+        }
+
+        fn fingerprint(params: &VectorIndexParams) -> Vec<u8> {
+            vector_index_details(params)
+                .to_msg::<VectorIndexDetails>()
+                .unwrap()
+                .coarse_quantizer_fingerprint
+                .unwrap()
+        }
+
+        let first = params(vec![1.0, 2.0, 3.0, 4.0], DistanceType::L2);
+        let same = params(vec![1.0, 2.0, 3.0, 4.0], DistanceType::L2);
+        let reordered = params(vec![3.0, 4.0, 1.0, 2.0], DistanceType::L2);
+        let other_metric = params(vec![1.0, 2.0, 3.0, 4.0], DistanceType::Dot);
+
+        let first_fingerprint = fingerprint(&first);
+        assert_eq!(first_fingerprint.len(), 32);
+        assert_eq!(first_fingerprint, fingerprint(&same));
+        assert_ne!(first_fingerprint, fingerprint(&reordered));
+        assert_ne!(first_fingerprint, fingerprint(&other_metric));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&vector_details_as_json(&vector_index_details(&first)).unwrap())
+                .unwrap();
+        assert_eq!(
+            json["coarse_quantizer_fingerprint"].as_str().unwrap().len(),
+            64
+        );
+    }
+
+    #[test]
+    fn test_coarse_quantizer_fingerprint_omitted_when_retraining() {
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]),
+                2,
+            )
+            .unwrap(),
+        );
+        let mut ivf = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+        ivf.retrain = true;
+        let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf);
+        let details = vector_index_details(&params)
+            .to_msg::<VectorIndexDetails>()
+            .unwrap();
+
+        assert!(details.coarse_quantizer_fingerprint.is_none());
+    }
+
+    #[test]
+    fn test_coarse_quantizer_fingerprint_can_be_disabled() {
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]),
+                2,
+            )
+            .unwrap(),
+        );
+        let mut params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(2, centroids).unwrap(),
+        );
+        params.runtime_hints.insert(
+            SHARED_COARSE_QUANTIZER_HINT.to_string(),
+            "false".to_string(),
+        );
+
+        let details = vector_index_details(&params)
+            .to_msg::<VectorIndexDetails>()
+            .unwrap();
+        assert!(details.coarse_quantizer_fingerprint.is_none());
+    }
+
+    #[test]
+    fn test_clear_coarse_quantizer_fingerprint_preserves_other_details() {
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]),
+                2,
+            )
+            .unwrap(),
+        );
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::Dot,
+            IvfBuildParams::try_with_centroids(2, centroids).unwrap(),
+        );
+
+        let cleared = clear_coarse_quantizer_fingerprint(vector_index_details(&params))
+            .unwrap()
+            .to_msg::<VectorIndexDetails>()
+            .unwrap();
+        assert!(cleared.coarse_quantizer_fingerprint.is_none());
+        assert_eq!(cleared.metric_type, VectorMetricType::Dot as i32);
+        assert!(matches!(cleared.compression, Some(Compression::Flat(_))));
     }
 
     #[test]
