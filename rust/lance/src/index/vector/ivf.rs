@@ -5516,6 +5516,63 @@ mod tests {
         assert_eq!(5, results[0].num_rows());
     }
 
+    /// A precomputed partitions file is user data. For IVF_PQ the residual step
+    /// reaches it first and used to panic out of a spawned transform; the
+    /// shuffler's own range check (`v3/shuffler.rs`) never got a chance to run.
+    #[tokio::test]
+    async fn test_create_ivf_pq_rejects_out_of_range_precomputed_partition() {
+        let test_dir = TempStrDir::default();
+        let test_uri = format!("{}/ds", test_dir.as_str());
+        let partitions_uri = format!("{}/parts", test_dir.as_str());
+
+        let (mut dataset, _) = generate_test_dataset(&test_uri, 0.0..1.0).await;
+        let num_rows = dataset.count_rows(None).await.unwrap() as u64;
+
+        // Partition 7 does not exist in a 2-partition index.
+        let parts_schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("partition", DataType::UInt32, false),
+        ]));
+        let parts_batch = RecordBatch::try_new(
+            parts_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(0..num_rows)),
+                Arc::new(UInt32Array::from_iter_values(
+                    (0..num_rows).map(|i| if i == 3 { 7 } else { 0 }),
+                )),
+            ],
+        )
+        .unwrap();
+        let parts_reader =
+            RecordBatchIterator::new(vec![parts_batch].into_iter().map(Ok), parts_schema);
+        Dataset::write(parts_reader, &partitions_uri, None)
+            .await
+            .unwrap();
+
+        let centroids = generate_random_array(2 * DIM);
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let mut ivf_params =
+            IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
+        ivf_params.precomputed_partitions_file = Some(partitions_uri);
+        let pq_params =
+            PQBuildParams::with_codebook(4, 8, Arc::new(generate_random_array(256 * DIM)));
+        let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
+
+        let error = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect_err("an out-of-range precomputed partition must be rejected");
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("partition id 7") && message.contains("2 centroids"),
+            "the error must name the id and the centroid count: {message}"
+        );
+    }
+
     fn partition_ids(mut ids: Vec<u64>, num_parts: u32) -> Vec<Vec<u64>> {
         if num_parts > ids.len() as u32 {
             panic!("Not enough ids to break into {num_parts} parts");
