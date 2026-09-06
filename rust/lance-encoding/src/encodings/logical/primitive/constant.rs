@@ -101,16 +101,25 @@ enum ScalarSource {
     ValueBuffer(usize),
 }
 
+/// The (scalar, rep, def) file ranges a constant page reads, in the order
+/// `init_ranges` appends and `init_from_buffers` consumes them.  Any field is
+/// `None` when that buffer is absent. Computed once at construction so the two
+/// halves share one source of truth and their buffer order cannot drift.
+#[derive(Debug)]
+struct ConstantBufferLayout {
+    scalar: Option<Range<u64>>,
+    rep: Option<Range<u64>>,
+    def: Option<Range<u64>>,
+}
+
 #[derive(Debug)]
 pub struct ConstantPageScheduler {
-    buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     scalar_source: ScalarSource,
-    rep_buf_idx: Option<usize>,
-    def_buf_idx: Option<usize>,
     data_type: DataType,
     def_meaning: Arc<[DefinitionInterpretation]>,
     max_rep: u16,
     max_visible_def: u16,
+    layout: ConstantBufferLayout,
     repdef: Option<Arc<CachedConstantState>>,
 }
 
@@ -169,85 +178,57 @@ impl ConstantPageScheduler {
                 }
             };
 
+        let range_of = |idx: usize| {
+            let (pos, len) = buffer_offsets_and_sizes[idx];
+            pos..pos + len
+        };
+        let layout = ConstantBufferLayout {
+            scalar: match &scalar_source {
+                ScalarSource::ValueBuffer(idx) => Some(range_of(*idx)),
+                ScalarSource::Inline(_) => None,
+            },
+            rep: rep_buf_idx
+                .filter(|&idx| buffer_offsets_and_sizes[idx].1 > 0)
+                .map(range_of),
+            def: def_buf_idx
+                .filter(|&idx| buffer_offsets_and_sizes[idx].1 > 0)
+                .map(range_of),
+        };
+
         Ok(Self {
-            buffer_offsets_and_sizes,
             scalar_source,
-            rep_buf_idx,
-            def_buf_idx,
             data_type,
             def_meaning,
             max_rep,
             max_visible_def,
+            layout,
             repdef: None,
         })
     }
 }
 
 impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantPageScheduler {
-    fn initialize<'a>(
+    fn init_ranges(&self) -> Result<Vec<Range<u64>>> {
+        // Order must match `init_from_buffers`' consumption: scalar, rep, def.
+        Ok([&self.layout.scalar, &self.layout.rep, &self.layout.def]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect())
+    }
+
+    fn init_from_buffers<'a>(
         &'a mut self,
-        io: &Arc<dyn EncodingsIo>,
+        buffers: Vec<Bytes>,
+        _io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        let rep_range = self
-            .rep_buf_idx
-            .and_then(|idx| self.buffer_offsets_and_sizes.get(idx).copied())
-            .filter(|(_, len)| *len > 0)
-            .map(|(pos, len)| pos..pos + len);
-
-        let def_range = self
-            .def_buf_idx
-            .and_then(|idx| self.buffer_offsets_and_sizes.get(idx).copied())
-            .filter(|(_, len)| *len > 0)
-            .map(|(pos, len)| pos..pos + len);
-
-        let scalar_range = match self.scalar_source {
-            ScalarSource::ValueBuffer(idx) => {
-                let (pos, len) = self.buffer_offsets_and_sizes[idx];
-                Some(pos..pos + len)
-            }
-            ScalarSource::Inline(_) => None,
-        };
-
-        let mut reads = Vec::with_capacity(3);
-        if let Some(r) = scalar_range {
-            reads.push(r);
-        }
-        if let Some(r) = rep_range.clone() {
-            reads.push(r);
-        }
-        if let Some(r) = def_range.clone() {
-            reads.push(r);
-        }
-
-        if reads.is_empty() {
-            let ScalarSource::Inline(inline) = &self.scalar_source else {
-                return std::future::ready(Err(Error::invalid_input(
-                    "Invalid constant layout: missing scalar source",
-                )))
-                .boxed();
-            };
-
-            let scalar = match lance_arrow::scalar::decode_scalar_from_inline_value(
-                &self.data_type,
-                inline.as_slice(),
-            ) {
-                Ok(s) => s,
-                Err(e) => return std::future::ready(Err(e.into())).boxed(),
-            };
-            let cached = Arc::new(CachedConstantState {
-                scalar,
-                rep: None,
-                def: None,
-            });
-            self.repdef = Some(cached.clone());
-            return std::future::ready(Ok(cached as Arc<dyn CachedPageData>)).boxed();
-        }
-
-        let data = io.submit_request(reads, 0);
+        // Consume `buffers` in the same scalar, rep, def order `init_ranges`
+        // appended them, using the shared layout's presence flags.
+        let (has_rep, has_def) = (self.layout.rep.is_some(), self.layout.def.is_some());
         let scalar_source = self.scalar_source.clone();
         let data_type = self.data_type.clone();
         async move {
-            let mut data_iter = data.await?.into_iter();
+            let mut data_iter = buffers.into_iter();
 
             let scalar = match scalar_source {
                 ScalarSource::Inline(inline) => {
@@ -260,13 +241,13 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
                 }
             };
 
-            let rep = rep_range.map(|_| {
+            let rep = has_rep.then(|| {
                 let rep = data_iter.next().unwrap();
                 let rep = LanceBuffer::from_bytes(rep, 2);
                 rep.borrow_to_typed_slice::<u16>()
             });
 
-            let def = def_range.map(|_| {
+            let def = has_def.then(|| {
                 let def = data_iter.next().unwrap();
                 let def = LanceBuffer::from_bytes(def, 2);
                 def.borrow_to_typed_slice::<u16>()
@@ -279,13 +260,11 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
         .boxed()
     }
 
-    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
-        self.repdef = Some(
-            data.clone()
-                .as_arc_any()
-                .downcast::<CachedConstantState>()
-                .unwrap(),
-        );
+    fn try_load(&mut self, data: &Arc<dyn CachedPageData>) -> Result<()> {
+        self.repdef = Some(data.clone().as_arc_any().downcast().map_err(|_| {
+            Error::invalid_input_source("Cached constant page data has an unexpected type".into())
+        })?);
+        Ok(())
     }
 
     fn schedule_ranges(

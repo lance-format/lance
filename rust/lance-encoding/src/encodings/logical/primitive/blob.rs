@@ -65,15 +65,24 @@ impl BlobDescriptionPageScheduler {
 }
 
 impl StructuralPageScheduler for BlobDescriptionPageScheduler {
-    fn initialize<'a>(
-        &'a mut self,
-        io: &Arc<dyn EncodingsIo>,
-    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        self.inner_scheduler.initialize(io)
+    fn needs_initialization(&self, ranges: &[Range<u64>]) -> Result<bool> {
+        self.inner_scheduler.needs_initialization(ranges)
     }
 
-    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
-        self.inner_scheduler.load(data);
+    fn init_ranges(&self) -> Result<Vec<Range<u64>>> {
+        self.inner_scheduler.init_ranges()
+    }
+
+    fn init_from_buffers<'a>(
+        &'a mut self,
+        buffers: Vec<Bytes>,
+        io: &Arc<dyn EncodingsIo>,
+    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
+        self.inner_scheduler.init_from_buffers(buffers, io)
+    }
+
+    fn try_load(&mut self, data: &Arc<dyn CachedPageData>) -> Result<()> {
+        self.inner_scheduler.try_load(data)
     }
 
     fn schedule_ranges(
@@ -277,14 +286,19 @@ impl BlobPageScheduler {
 }
 
 impl StructuralPageScheduler for BlobPageScheduler {
-    fn initialize<'a>(
+    fn init_ranges(&self) -> Result<Vec<Range<u64>>> {
+        self.inner_scheduler.init_ranges()
+    }
+
+    fn init_from_buffers<'a>(
         &'a mut self,
+        buffers: Vec<Bytes>,
         io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
         let io = io.clone();
         let num_rows = self.num_rows;
         async move {
-            let cached = self.inner_scheduler.initialize(&io).await?;
+            let cached = self.inner_scheduler.init_from_buffers(buffers, &io).await?;
             let mut desc_decoders = self.inner_scheduler.schedule_ranges(&[0..num_rows], &io)?;
             if desc_decoders.len() != 1 {
                 // This can't happen yet today so being a little lazy but if it did happen we just
@@ -329,15 +343,17 @@ impl StructuralPageScheduler for BlobPageScheduler {
         .boxed()
     }
 
-    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
+    fn try_load(&mut self, data: &Arc<dyn CachedPageData>) -> Result<()> {
         let blob_state = data
             .clone()
             .as_arc_any()
             .downcast::<BlobCacheableState>()
-            .unwrap();
+            .map_err(|_| {
+                Error::invalid_input_source("Cached blob page data has an unexpected type".into())
+            })?;
         self.positions = Some(blob_state.positions.clone());
         self.sizes = Some(blob_state.sizes.clone());
-        self.inner_scheduler.load(&blob_state.inner_state);
+        self.inner_scheduler.try_load(&blob_state.inner_state)
     }
 
     fn schedule_ranges(

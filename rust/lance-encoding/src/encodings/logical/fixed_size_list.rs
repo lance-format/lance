@@ -12,7 +12,7 @@ use std::{ops::Range, sync::Arc};
 use arrow_array::{Array, ArrayRef, GenericListArray, OffsetSizeTrait, StructArray, cast::AsArray};
 use arrow_buffer::{BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::DataType;
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{Error, Result};
 
@@ -123,6 +123,27 @@ impl StructuralFixedSizeListScheduler {
             dimension: dimension as u64,
         }
     }
+
+    fn child_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Range<u64>>> {
+        ranges
+            .iter()
+            .map(|range| {
+                let start = range.start.checked_mul(self.dimension).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "fixed-size-list child range start overflowed: {} * {}",
+                        range.start, self.dimension
+                    ))
+                })?;
+                let end = range.end.checked_mul(self.dimension).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "fixed-size-list child range end overflowed: {} * {}",
+                        range.end, self.dimension
+                    ))
+                })?;
+                Ok(start..end)
+            })
+            .collect()
+    }
 }
 
 impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
@@ -132,10 +153,7 @@ impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
         filter: &FilterExpression,
     ) -> Result<Box<dyn StructuralSchedulingJob + 'a>> {
         // Scale ranges by dimension for the child - each FSL row becomes `dimension` child rows
-        let child_ranges: Vec<Range<u64>> = ranges
-            .iter()
-            .map(|r| (r.start * self.dimension)..(r.end * self.dimension))
-            .collect();
+        let child_ranges = self.child_ranges(ranges)?;
         let child = self.child.schedule_ranges(&child_ranges, filter)?;
         Ok(Box::new(StructuralFixedSizeListSchedulingJob::new(
             child,
@@ -149,6 +167,24 @@ impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
         self.child.initialize(filter, context)
+    }
+
+    fn initialize_ranges<'a>(
+        &'a mut self,
+        requested_ranges: &'a [Range<u64>],
+        filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        let child_ranges = match self.child_ranges(requested_ranges) {
+            Ok(child_ranges) => child_ranges,
+            Err(error) => return std::future::ready(Err(error)).boxed(),
+        };
+        async move {
+            self.child
+                .initialize_ranges(&child_ranges, filter, context)
+                .await
+        }
+        .boxed()
     }
 }
 

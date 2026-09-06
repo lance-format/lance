@@ -3002,33 +3002,27 @@ impl SparseStructuralScheduler {
 }
 
 impl StructuralPageScheduler for SparseStructuralScheduler {
-    fn initialize<'a>(
-        &'a mut self,
-        io: &Arc<dyn EncodingsIo>,
-    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        let (meta_buf_position, meta_buf_size) = match self.metadata_buffer() {
-            Ok(buffer) => buffer,
-            Err(err) => return std::future::ready(Err(err)).boxed(),
-        };
-        let required_ranges = match (|| -> Result<Vec<Range<u64>>> {
-            let mut required_ranges = Vec::new();
-            required_ranges.push(Self::checked_buffer_range(
-                meta_buf_position,
-                meta_buf_size,
-                "metadata",
-            )?);
-            for (position, size) in self.buffer_offsets_and_sizes.iter().skip(2) {
-                required_ranges.push(Self::checked_buffer_range(*position, *size, "structural")?);
-            }
-            Ok(required_ranges)
-        })() {
-            Ok(ranges) => ranges,
-            Err(err) => return std::future::ready(Err(err)).boxed(),
-        };
-        let io_req = io.submit_request(required_ranges, 0);
+    fn init_ranges(&self) -> Result<Vec<Range<u64>>> {
+        let (meta_buf_position, meta_buf_size) = self.metadata_buffer()?;
+        let mut required_ranges = Vec::with_capacity(self.buffer_offsets_and_sizes.len() - 1);
+        required_ranges.push(Self::checked_buffer_range(
+            meta_buf_position,
+            meta_buf_size,
+            "metadata",
+        )?);
+        for (position, size) in self.buffer_offsets_and_sizes.iter().skip(2) {
+            required_ranges.push(Self::checked_buffer_range(*position, *size, "structural")?);
+        }
+        Ok(required_ranges)
+    }
 
+    fn init_from_buffers<'a>(
+        &'a mut self,
+        buffers: Vec<Bytes>,
+        _io: &Arc<dyn EncodingsIo>,
+    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
         async move {
-            let mut buffers = io_req.await?.into_iter();
+            let mut buffers = buffers.into_iter();
             let meta_bytes = buffers.next().ok_or_else(|| {
                 Error::invalid_input_source("Sparse layout is missing chunk metadata buffer".into())
             })?;
@@ -3075,12 +3069,11 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
         .boxed()
     }
 
-    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
-        self.page_meta = data
-            .clone()
-            .as_arc_any()
-            .downcast::<SparseStructuralCacheableState>()
-            .ok();
+    fn try_load(&mut self, data: &Arc<dyn CachedPageData>) -> Result<()> {
+        self.page_meta = Some(data.clone().as_arc_any().downcast().map_err(|_| {
+            Error::invalid_input_source("Cached sparse page data has an unexpected type".into())
+        })?);
+        Ok(())
     }
 
     fn schedule_ranges(
@@ -4692,6 +4685,14 @@ mod tests {
 
     use super::*;
 
+    async fn initialize_scheduler(
+        scheduler: &mut SparseStructuralScheduler,
+        io: &Arc<dyn EncodingsIo>,
+    ) -> Result<Arc<dyn CachedPageData>> {
+        let buffers = io.submit_request(scheduler.init_ranges()?, 0).await?;
+        scheduler.init_from_buffers(buffers, io).await
+    }
+
     fn position_set(
         positions: pb21::sparse_position_set::Positions,
         num_positions: u64,
@@ -5202,7 +5203,7 @@ mod tests {
         data.extend_from_slice(&8_u32.to_le_bytes());
         data.extend_from_slice(&[0xff; 4]);
         let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(data)));
-        let Err(err) = scheduler.initialize(&io).await else {
+        let Err(err) = initialize_scheduler(&mut scheduler, &io).await else {
             panic!("expected malformed General buffer to be rejected");
         };
         assert_invalid_input_contains(err, "decompression failed");
@@ -5231,7 +5232,7 @@ mod tests {
         data.extend_from_slice(&0_u16.to_le_bytes());
         data.extend_from_slice(&[0; 4]);
         let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(data)));
-        scheduler.initialize(&io).await.unwrap();
+        initialize_scheduler(&mut scheduler, &io).await.unwrap();
         let mut page_tasks = scheduler.schedule_ranges(&[0..1], &io).unwrap();
         let mut decoder = page_tasks.pop().unwrap().decoder_fut.await.unwrap();
         let Err(err) = decoder.drain(1).unwrap().decode() else {
@@ -5354,7 +5355,7 @@ mod tests {
         data.extend_from_slice(&0_u64.to_le_bytes());
         let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(data)));
 
-        let Err(err) = scheduler.initialize(&io).await else {
+        let Err(err) = initialize_scheduler(&mut scheduler, &io).await else {
             panic!("expected unordered sparse positions to be rejected");
         };
         assert_invalid_input_contains(err, "positions must be strictly increasing");
@@ -5378,7 +5379,7 @@ mod tests {
         data.extend_from_slice(&1_u32.to_le_bytes());
         data.extend_from_slice(&[0; 8]);
         let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(data)));
-        let Err(err) = scheduler.initialize(&io).await else {
+        let Err(err) = initialize_scheduler(&mut scheduler, &io).await else {
             panic!("expected chunk byte sum mismatch");
         };
         assert_invalid_input_contains(err, "describes 16 value bytes");
@@ -5400,7 +5401,7 @@ mod tests {
         data.extend_from_slice(&1_u32.to_le_bytes());
         data.extend_from_slice(&[0; 8]);
         let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(data)));
-        let Err(err) = scheduler.initialize(&io).await else {
+        let Err(err) = initialize_scheduler(&mut scheduler, &io).await else {
             panic!("expected chunk value sum mismatch");
         };
         assert_invalid_input_contains(err, "metadata has 1, layout has 2");
@@ -5424,7 +5425,7 @@ mod tests {
         data.extend_from_slice(&1_u32.to_le_bytes());
         data.extend_from_slice(&[0; 8]);
         let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(data)));
-        scheduler.initialize(&io).await.unwrap();
+        initialize_scheduler(&mut scheduler, &io).await.unwrap();
         let mut page_tasks = scheduler.schedule_ranges(&[0..1], &io).unwrap();
         let page_task = page_tasks.pop().unwrap();
         let mut decoder = page_task.decoder_fut.await.unwrap();
@@ -5454,7 +5455,7 @@ mod tests {
         metadata.extend_from_slice(&1_u32.to_le_bytes());
         let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(metadata)));
 
-        scheduler.initialize(&io).await.unwrap();
+        initialize_scheduler(&mut scheduler, &io).await.unwrap();
     }
 
     #[tokio::test]
@@ -5481,7 +5482,7 @@ mod tests {
         data.extend_from_slice(&[0; 16]);
         let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(data)));
 
-        let Err(err) = scheduler.initialize(&io).await else {
+        let Err(err) = initialize_scheduler(&mut scheduler, &io).await else {
             panic!("expected oversized value chunk to be rejected");
         };
         assert_invalid_input_contains(err, "exceeding the mini-block limit");
@@ -5561,7 +5562,9 @@ mod tests {
 
         let io = Arc::new(RecordingIo::new(Bytes::from(data)));
         let trait_io: Arc<dyn EncodingsIo> = io.clone();
-        scheduler.initialize(&trait_io).await.unwrap();
+        initialize_scheduler(&mut scheduler, &trait_io)
+            .await
+            .unwrap();
         let mut page_tasks = scheduler.schedule_ranges(&[2..3], &trait_io).unwrap();
         let page_task = page_tasks.pop().unwrap();
         let mut decoder = page_task.decoder_fut.await.unwrap();
@@ -5595,7 +5598,9 @@ mod tests {
         .unwrap();
         let io = Arc::new(RecordingIo::new(Bytes::new()));
         let trait_io: Arc<dyn EncodingsIo> = io.clone();
-        scheduler.initialize(&trait_io).await.unwrap();
+        initialize_scheduler(&mut scheduler, &trait_io)
+            .await
+            .unwrap();
         let mut page_tasks = scheduler.schedule_ranges(&[0..1], &trait_io).unwrap();
         let page_task = page_tasks.pop().unwrap();
         let mut decoder = page_task.decoder_fut.await.unwrap();

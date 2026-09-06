@@ -1123,9 +1123,43 @@ impl DecodeBatchScheduler {
         column_infos: &[Arc<ColumnInfo>],
         file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
         num_rows: u64,
+        decoder_plugins: Arc<DecoderPlugins>,
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<LanceCache>,
+        filter: &FilterExpression,
+        decoder_config: &DecoderConfig,
+    ) -> Result<Self> {
+        Self::try_new_with_ranges(
+            schema,
+            column_indices,
+            column_infos,
+            file_buffer_positions_and_sizes,
+            num_rows,
+            decoder_plugins,
+            io,
+            cache,
+            None,
+            filter,
+            decoder_config,
+        )
+        .await
+    }
+
+    /// Creates a decode scheduler and initializes only pages overlapping known ranges.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn try_new_with_ranges<'a>(
+        schema: &'a Schema,
+        column_indices: &[u32],
+        column_infos: &[Arc<ColumnInfo>],
+        file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
+        num_rows: u64,
         _decoder_plugins: Arc<DecoderPlugins>,
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
+        // The top-level row ranges that will be scheduled, if known. This lets
+        // the structural path initialize only the pages those ranges touch.
+        // `None` preserves `try_new`'s eager initialization behavior.
+        requested_ranges: Option<Arc<[Range<u64>]>>,
         filter: &FilterExpression,
         decoder_config: &DecoderConfig,
     ) -> Result<Self> {
@@ -1153,7 +1187,13 @@ impl DecodeBatchScheduler {
                 strategy.create_structural_field_scheduler(&root_field, &mut column_iter)?;
 
             let context = SchedulerContext::new(io, cache.clone());
-            root_scheduler.initialize(filter, &context).await?;
+            if let Some(requested_ranges) = requested_ranges {
+                root_scheduler
+                    .initialize_ranges(&requested_ranges, filter, &context)
+                    .await?;
+            } else {
+                root_scheduler.initialize(filter, &context).await?;
+            }
 
             Ok(Self {
                 root_scheduler: RootScheduler::Structural(root_scheduler),
@@ -2243,6 +2283,45 @@ pub fn create_decode_iterator(
     }
 }
 
+fn requested_rows_to_ranges(requested_rows: &RequestedRows) -> Result<Arc<[Range<u64>]>> {
+    match requested_rows {
+        RequestedRows::Ranges(ranges) => Ok(Arc::from(ranges.clone())),
+        RequestedRows::Indices(indices) => {
+            if indices.is_empty() {
+                return Ok(Arc::from([]));
+            }
+            if let Some((index, pair)) = indices
+                .windows(2)
+                .enumerate()
+                .find(|(_, pair)| pair[0] >= pair[1])
+            {
+                return Err(Error::invalid_input(format!(
+                    "Requested row indices are not strictly increasing at index {index}: {} then {}",
+                    pair[0], pair[1]
+                )));
+            }
+            let mut ranges = Vec::new();
+            let mut start = indices[0];
+            for pair in indices.windows(2) {
+                let end = pair[0].checked_add(1).ok_or_else(|| {
+                    Error::invalid_input("Requested row index cannot equal u64::MAX")
+                })?;
+                if pair[1] != end {
+                    ranges.push(start..end);
+                    start = pair[1];
+                }
+            }
+            let end = indices
+                .last()
+                .copied()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| Error::invalid_input("Requested row index cannot equal u64::MAX"))?;
+            ranges.push(start..end);
+            Ok(Arc::from(ranges))
+        }
+    }
+}
+
 async fn create_scheduler_decoder(
     column_infos: Vec<Arc<ColumnInfo>>,
     requested_rows: RequestedRows,
@@ -2277,8 +2356,10 @@ async fn create_scheduler_decoder(
     // The scheduler's `initialize` may perform I/O to load column metadata
     // unless that metadata is already in the cache.  This metadata loading
     // happens as part of this call and should be parallelized if reading
-    // multiple files.
-    let mut decode_scheduler = DecodeBatchScheduler::try_new(
+    // multiple files.  We pass the rows we are about to schedule so that the
+    // structural path only initializes the pages those rows touch.
+    let requested_ranges = requested_rows_to_ranges(&requested_rows)?;
+    let mut decode_scheduler = DecodeBatchScheduler::try_new_with_ranges(
         target_schema.as_ref(),
         &column_indices,
         &column_infos,
@@ -2287,6 +2368,7 @@ async fn create_scheduler_decoder(
         config.decoder_plugins,
         config.io.clone(),
         config.cache,
+        Some(requested_ranges),
         &filter,
         &config.decoder_config,
     )
@@ -2411,14 +2493,17 @@ pub fn schedule_and_decode_blocking(
         return Ok(Box::new(RecordBatchIterator::new(vec![], arrow_schema)));
     }
 
+    let requested_rows = requested_rows.trim_empty_ranges();
     let num_rows = requested_rows.num_rows();
     let is_structural = column_infos[0].is_structural();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     // Initialize the scheduler.  This is still "asynchronous" but we run it with a current-thread
-    // runtime.
-    let mut decode_scheduler = WAITER_RT.block_on(DecodeBatchScheduler::try_new(
+    // runtime.  Pass the rows we are about to schedule so the structural path
+    // only initializes the pages those rows touch.
+    let requested_ranges = requested_rows_to_ranges(&requested_rows)?;
+    let mut decode_scheduler = WAITER_RT.block_on(DecodeBatchScheduler::try_new_with_ranges(
         target_schema.as_ref(),
         &column_indices,
         &column_infos,
@@ -2427,6 +2512,7 @@ pub fn schedule_and_decode_blocking(
         config.decoder_plugins,
         config.io.clone(),
         config.cache,
+        Some(requested_ranges),
         &filter,
         &config.decoder_config,
     ))?;
@@ -2772,11 +2858,25 @@ impl FilterExpression {
 }
 
 pub trait StructuralFieldScheduler: Send + std::fmt::Debug {
+    /// Loads the per-page metadata this column needs before scheduling.
     fn initialize<'a>(
         &'a mut self,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>>;
+
+    /// Initializes metadata for pages overlapping the requested top-level rows.
+    ///
+    /// The default preserves compatibility for external schedulers by eagerly
+    /// initializing the complete field.
+    fn initialize_ranges<'a>(
+        &'a mut self,
+        _requested_ranges: &'a [Range<u64>],
+        filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        self.initialize(filter, context)
+    }
     fn schedule_ranges<'a>(
         &'a self,
         ranges: &[Range<u64>],
@@ -3032,6 +3132,21 @@ pub async fn decode_batch(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn requested_row_indices_convert_to_checked_ranges() {
+        let ranges =
+            requested_rows_to_ranges(&RequestedRows::Indices(vec![1, 2, 5, 8, 9])).unwrap();
+        assert_eq!(ranges.as_ref(), [1..3, 5..6, 8..10]);
+
+        let error = requested_rows_to_ranges(&RequestedRows::Indices(vec![2, 2])).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("not strictly increasing"));
+
+        let error = requested_rows_to_ranges(&RequestedRows::Indices(vec![u64::MAX])).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("u64::MAX"));
+    }
 
     #[derive(Debug)]
     struct FailingPageDecoder {

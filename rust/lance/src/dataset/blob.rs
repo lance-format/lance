@@ -5602,8 +5602,8 @@ mod tests {
     /// `Dataset` (and therefore a single cache scope) with different
     /// `BlobHandling` values must not panic in the structural decoder.
     ///
-    /// Background: `FieldDataCacheKey` previously keyed cached page data only
-    /// by `column_index`. A blob column has two valid decoder shapes — the
+    /// Background: the page-data cache key previously keyed cached page data
+    /// only by `column_index`. A blob column has two valid decoder shapes — the
     /// descriptor view (`Struct<position, size>`) used when scanning with
     /// `BlobHandling::BlobsDescriptions`, and the bytes view (`LargeBinary`)
     /// used when scanning with `BlobHandling::AllBinary`. Both views go through
