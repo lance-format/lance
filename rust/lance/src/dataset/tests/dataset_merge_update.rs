@@ -5521,3 +5521,54 @@ async fn test_concurrent_tightening_stress() {
     }
     assert!(totals[1] > 0, "nothing succeeded: {totals:?}");
 }
+
+#[rstest]
+#[case::row_id("_rowid")]
+#[case::row_addr("_rowaddr")]
+#[case::row_offset("_rowoffset")]
+#[case::row_created_at_version("_row_created_at_version")]
+#[case::row_last_updated_at_version("_row_last_updated_at_version")]
+#[tokio::test]
+async fn merge_rejects_reserved_system_column_names(#[case] reserved_name: &str) {
+    // merge pulls in the right-hand side's column names and has no guard of its
+    // own, so a reserved name reaches the commit-time guard and is rejected
+    // there. All five names take the same path.
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    let test_uri = TempStrDir::default();
+    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    Dataset::write(batches, &test_uri, None).await.unwrap();
+
+    let right_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i2", DataType::Int32, false),
+        ArrowField::new(reserved_name, DataType::Int32, true),
+    ]));
+    let right_batch = RecordBatch::try_new(
+        right_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    let right = RecordBatchIterator::new(vec![Ok(right_batch)], right_schema.clone());
+
+    let mut dataset = Dataset::open(&test_uri).await.unwrap();
+    let err = dataset
+        .merge(right, "i", "i2")
+        .await
+        .expect_err("merge bringing in a reserved column name should fail");
+    assert!(matches!(&err, Error::InvalidInput { .. }), "{err:?}");
+    assert!(
+        err.to_string().contains("reserved name"),
+        "unexpected merge error for {reserved_name}: {err}"
+    );
+}

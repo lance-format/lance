@@ -42,7 +42,7 @@ use lance_core::datatypes::{
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
 use lance_core::utils::parse::str_is_truthy;
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, is_system_column};
 use lance_file::version::ConcreteFileVersion;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
@@ -480,6 +480,36 @@ impl Transaction {
                 }
             }
         };
+
+        // System columns are virtual: injected at read time, never stored, so a
+        // stored top-level field sharing one of these names collides with the
+        // injected column on a later scan. Overwrite/Merge/Project are the only
+        // operations that install a new schema, and all commit through here, so
+        // guarding this one spot covers every write and schema-evolution path.
+        // The collision is top-level only, so `fields` is checked without
+        // recursing.
+        //
+        // A reserved name already in the current manifest is grandfathered:
+        // schema evolution re-commits the full existing schema, and older
+        // versions allowed some of these names, so rejecting a pre-existing one
+        // would lock the dataset out of all schema evolution. Only newly
+        // introduced names fail.
+        if matches!(
+            self.operation,
+            Operation::Overwrite { .. } | Operation::Merge { .. } | Operation::Project { .. }
+        ) {
+            let existing_names: HashSet<&str> = current_manifest
+                .map(|m| m.schema.fields.iter().map(|f| f.name.as_str()).collect())
+                .unwrap_or_default();
+            for field in &schema.fields {
+                if is_system_column(&field.name) && !existing_names.contains(field.name.as_str()) {
+                    return Err(Error::invalid_input(format!(
+                        "The column {} is a reserved name and cannot be used in a Lance dataset",
+                        field.name
+                    )));
+                }
+            }
+        }
 
         // Fragment ids are a high water mark for the whole dataset history: an id
         // must never name two different sets of rows, or per-fragment state keyed
@@ -3502,5 +3532,79 @@ mod tests {
             apply(&mut second, &read, &[0, 1], &read).unwrap();
             assert_eq!(coverage_for(&first, "idx"), coverage_for(&second, "idx"));
         }
+    }
+
+    // Build a Merge operation carrying `schema` on top of `current` and run it
+    // through `build_manifest`, returning the result.
+    fn run_merge_build_manifest(
+        current: &Manifest,
+        schema: LanceSchema,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        let tx = Transaction::new(
+            current.version,
+            Operation::Merge {
+                fragments: vec![],
+                schema,
+                preserves_nullability: true,
+            },
+            None,
+        );
+        tx.build_manifest(Some(current), vec![], "txn", &default_build_config())
+    }
+
+    fn manifest_with_schema(schema: LanceSchema) -> Manifest {
+        Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn build_manifest_rejects_newly_introduced_system_column_name() {
+        let manifest = manifest_with_schema(
+            LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+                "id",
+                DataType::Int32,
+                false,
+            )]))
+            .unwrap(),
+        );
+
+        let with_reserved = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(lance_core::ROW_CREATED_AT_VERSION, DataType::UInt64, true),
+        ]))
+        .unwrap();
+
+        let err = run_merge_build_manifest(&manifest, with_reserved)
+            .expect_err("a newly introduced reserved name must be rejected");
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("reserved name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_manifest_grandfathers_preexisting_system_column_name() {
+        // `Manifest::new` bypasses the write-path guard, so it can hold a legacy
+        // dataset's now-reserved column.
+        let legacy = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(lance_core::ROW_CREATED_AT_VERSION, DataType::UInt64, true),
+        ]))
+        .unwrap();
+        let manifest = manifest_with_schema(legacy.clone());
+
+        let (out, _) = run_merge_build_manifest(&manifest, legacy)
+            .expect("re-committing a grandfathered reserved name must succeed");
+        assert!(
+            out.schema
+                .fields
+                .iter()
+                .any(|f| f.name == lance_core::ROW_CREATED_AT_VERSION)
+        );
     }
 }
