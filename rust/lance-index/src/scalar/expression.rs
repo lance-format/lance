@@ -924,7 +924,11 @@ impl ScalarQueryParser for TextQueryParser {
         if args.len() < 2 {
             return None;
         }
-        // A non-string pattern cannot be handled.
+        // A non-string pattern cannot be handled. `maybe_scalar` coerces the
+        // literal to the indexed column's type, which for an ngram index is
+        // `Utf8` or `LargeUtf8` (the plugin rejects any other type at creation,
+        // and Lance normalizes a `Utf8View` column to `Utf8` at write time), so
+        // the coerced value here is never `Utf8View`.
         let (ScalarValue::Utf8(Some(pattern)) | ScalarValue::LargeUtf8(Some(pattern))) =
             maybe_scalar(&args[1], data_type)?
         else {
@@ -981,8 +985,14 @@ impl ScalarQueryParser for TextQueryParser {
         if !self.supports_regex || like.case_insensitive {
             return None;
         }
+        // Unlike the `contains` / `regexp_like` pattern, the LIKE pattern reaches
+        // us uncoerced (verbatim from the `Expr`), so a programmatically-built
+        // filter passed through `scan.filter_expr` can carry any string variant
+        // here, including `Utf8View`.
         let pattern_str = match pattern {
-            ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.as_str(),
+            ScalarValue::Utf8(Some(s))
+            | ScalarValue::LargeUtf8(Some(s))
+            | ScalarValue::Utf8View(Some(s)) => s.as_str(),
             _ => return None,
         };
         // Translate the LIKE pattern into a loose regex used only for candidate
@@ -1058,7 +1068,8 @@ fn like_to_regex(pattern: &str, escape: Option<char>) -> Option<String> {
 /// predicate to a full recheck rather than risk changing its semantics.
 fn apply_regex_flags(pattern: &str, flags_expr: &Expr) -> Option<String> {
     let (Expr::Literal(ScalarValue::Utf8(Some(flags)), _)
-    | Expr::Literal(ScalarValue::LargeUtf8(Some(flags)), _)) = flags_expr
+    | Expr::Literal(ScalarValue::LargeUtf8(Some(flags)), _)
+    | Expr::Literal(ScalarValue::Utf8View(Some(flags)), _)) = flags_expr
     else {
         return None;
     };
@@ -3497,31 +3508,71 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_apply_regex_flags() {
-        fn flags(s: &str) -> Expr {
-            Expr::Literal(ScalarValue::Utf8(Some(s.to_string())), None)
-        }
+    #[rstest]
+    // Empty flags leave the pattern untouched (no inline group emitted).
+    #[case::empty(ScalarValue::Utf8(Some(String::new())), Some("foo"))]
+    // Supported flags are folded into an inline `(?...)` prefix.
+    #[case::single_flag(ScalarValue::Utf8(Some("i".to_string())), Some("(?i)foo"))]
+    #[case::multiple_flags(ScalarValue::Utf8(Some("is".to_string())), Some("(?is)foo"))]
+    // A `LargeUtf8` / `Utf8View` flags literal is folded just like `Utf8`.
+    #[case::large_utf8(ScalarValue::LargeUtf8(Some("i".to_string())), Some("(?i)foo"))]
+    #[case::utf8_view(ScalarValue::Utf8View(Some("i".to_string())), Some("(?i)foo"))]
+    // An unrecognized flag bails out so the caller leaves the predicate to a
+    // full recheck rather than risk changing its semantics.
+    #[case::unsupported_flag(ScalarValue::Utf8(Some("g".to_string())), None)]
+    // A non-string (hence non-literal-flags) argument cannot be folded.
+    #[case::non_string(ScalarValue::Int32(Some(1)), None)]
+    fn test_apply_regex_flags(#[case] flags: ScalarValue, #[case] expected: Option<&str>) {
+        let flags_expr = Expr::Literal(flags, None);
+        assert_eq!(apply_regex_flags("foo", &flags_expr).as_deref(), expected);
+    }
 
-        // Empty flags leave the pattern untouched (no inline group emitted).
-        assert_eq!(apply_regex_flags("foo", &flags("")).as_deref(), Some("foo"));
-        // Supported flags are folded into an inline `(?...)` prefix.
-        assert_eq!(
-            apply_regex_flags("foo", &flags("i")).as_deref(),
-            Some("(?i)foo")
+    // The infix-LIKE pattern reaches `visit_like` uncoerced (verbatim from the
+    // `Expr`), so a programmatically-built filter passed through
+    // `scan.filter_expr` can carry a `Utf8View` literal that the parser must
+    // still match. (A `contains` / `regexp_like` pattern is coerced to the
+    // indexed column's type first, and an ngram index only ever covers a
+    // `Utf8` / `LargeUtf8` column, so that path never sees `Utf8View`.)
+    //
+    // `visit_like` is exercised directly so the test does not depend on
+    // DataFusion's LIKE type coercion choosing `Utf8View` for the pattern. The
+    // `Utf8` case is a parity control: the pre-existing path must keep behaving
+    // identically. Each case builds its `Like` from the same literal it hands
+    // to the parser, mirroring `visit_like_expr`, which reads the pattern out
+    // of `like.pattern`.
+    #[rstest]
+    #[case::utf8_view(ScalarValue::Utf8View(Some("%foobar%".to_string())))]
+    #[case::utf8(ScalarValue::Utf8(Some("%foobar%".to_string())))]
+    fn test_text_query_parser_utf8view(#[case] pattern: ScalarValue) {
+        let parser = TextQueryParser::new(
+            "color_idx".to_string(),
+            "NGram".to_string(),
+            true,
+            true,
+            // min_contains_chars: the ngram trigram width; unused by `visit_like`.
+            3,
         );
-        assert_eq!(
-            apply_regex_flags("foo", &flags("is")).as_deref(),
-            Some("(?is)foo")
+        let like = Like::new(
+            false,
+            Box::new(Expr::Column(Column::new_unqualified("color"))),
+            Box::new(Expr::Literal(pattern.clone(), None)),
+            None,
+            false,
         );
-        // An unrecognized flag bails out so the caller leaves the predicate to a
-        // full recheck rather than risk changing its semantics.
-        assert_eq!(apply_regex_flags("foo", &flags("g")), None);
-        // A non-string (hence non-literal-flags) argument cannot be folded.
+        let indexed = parser
+            .visit_like("color", &like, &pattern)
+            .expect("infix LIKE should use the ngram index");
+
+        let Some(ScalarIndexExpr::Query(search)) = indexed.scalar_query else {
+            panic!("expected an index query for {pattern:?}");
+        };
         assert_eq!(
-            apply_regex_flags("foo", &Expr::Literal(ScalarValue::Int32(Some(1)), None)),
-            None
+            search.query.as_any().downcast_ref::<TextQuery>(),
+            Some(&TextQuery::Regex(".*foobar.*".to_string())),
         );
+        // The recheck is the original predicate verbatim, so its literal keeps
+        // the variant that was exercised.
+        assert_eq!(indexed.refine_expr, Some(Expr::Like(like)));
     }
 
     #[test]
