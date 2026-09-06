@@ -14,6 +14,61 @@ pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7
 pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 pub const BATCH_SIZE: usize = 32;
 
+/// Which kernel a `dist_table` entry point prefers on this host. An entry point
+/// with no arm for the chosen backend falls through to scalar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DistTableBackend {
+    Avx512,
+    Avx2,
+    Neon,
+    Scalar,
+}
+
+/// Picks the kernel from a tier and two feature bits passed in, reading neither
+/// `SIMD_SUPPORT` nor the CPU, so the consequences of the tier ladder are
+/// testable without a host of each kind.
+///
+/// `avx512_kernel` says whether the calling entry point has an AVX-512 kernel to
+/// offer: `sum_4bit_dist_table_uninit` has one behind
+/// `kernel_support = "avx512_dist_table"`, and the hacc entry point has none.
+fn dist_table_backend(
+    support: SimdSupport,
+    avx512_kernel: bool,
+    has_avx512bw: bool,
+    has_avx2: bool,
+) -> DistTableBackend {
+    match support {
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 if avx512_kernel && has_avx512bw => {
+            DistTableBackend::Avx512
+        }
+        // `SIMD_SUPPORT` is a single exclusive tier, so an AVX-512 host reports
+        // `Avx512` or `Avx512FP16` and never `Avx2`. Naming only `Avx2` here
+        // would send an AVX-512 host that missed the arm above down the scalar
+        // path while it has AVX2.
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 | SimdSupport::Avx2 if has_avx2 => {
+            DistTableBackend::Avx2
+        }
+        SimdSupport::Neon => DistTableBackend::Neon,
+        _ => DistTableBackend::Scalar,
+    }
+}
+
+/// The two feature bits [`dist_table_backend`] needs, or `false` off x86_64.
+#[inline]
+fn x86_dist_table_features() -> (bool, bool) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        (
+            std::arch::is_x86_feature_detected!("avx512bw"),
+            std::arch::is_x86_feature_detected!("avx2"),
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (false, false)
+    }
+}
+
 // This function is used to sum the distance table for 4-bit codes.
 // the distance table is a 2D array, that dist_table[i][j] is the distance between the i-th subvector and the code j,
 // the distance table is stored as a flat array for better cache locality and SIMD instruction usage.
@@ -68,11 +123,18 @@ pub unsafe fn sum_4bit_dist_table_uninit(
     debug_assert!(dists.len() >= n);
     debug_assert!(codes.len() >= n * code_len);
 
-    match *SIMD_SUPPORT {
+    let (has_avx512bw, has_avx2) = x86_dist_table_features();
+    match dist_table_backend(
+        *SIMD_SUPPORT,
+        cfg!(all(
+            kernel_support = "avx512_dist_table",
+            target_arch = "x86_64"
+        )),
+        has_avx512bw,
+        has_avx2,
+    ) {
         #[cfg(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))]
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16
-            if std::arch::is_x86_feature_detected!("avx512bw") =>
-        {
+        DistTableBackend::Avx512 => {
             for i in (0..n).step_by(BATCH_SIZE) {
                 let codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
                 unsafe {
@@ -86,7 +148,7 @@ pub unsafe fn sum_4bit_dist_table_uninit(
             }
         }
         #[cfg(target_arch = "x86_64")]
-        SimdSupport::Avx2 => unsafe {
+        DistTableBackend::Avx2 => unsafe {
             for i in (0..n).step_by(BATCH_SIZE) {
                 sum_dist_table_32bytes_batch_avx2(
                     &codes[i * code_len..(i + BATCH_SIZE) * code_len],
@@ -96,7 +158,7 @@ pub unsafe fn sum_4bit_dist_table_uninit(
             }
         },
         #[cfg(target_arch = "aarch64")]
-        SimdSupport::Neon => unsafe {
+        DistTableBackend::Neon => unsafe {
             for i in (0..n).step_by(BATCH_SIZE) {
                 sum_dist_table_32bytes_batch_neon(
                     &codes[i * code_len..(i + BATCH_SIZE) * code_len],
@@ -105,10 +167,7 @@ pub unsafe fn sum_4bit_dist_table_uninit(
                 )
             }
         },
-        // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
-        // the AVX2 inner uses `_mm256_shuffle_epi8` / `_mm256_and_si256` /
-        // `_mm256_srli_epi16` / `_mm256_add_epi16` integer ops which
-        // neither AVX nor AVX+FMA provides. Scalar is the correct route.
+        // `Scalar`.
         _ => {
             dists[..n].fill(MaybeUninit::new(0));
             // Every slot was initialized immediately above.
@@ -236,11 +295,14 @@ pub unsafe fn sum_4bit_hacc_dist_table_uninit(
     debug_assert!(codes.len() >= n * code_len);
     debug_assert!(hacc_dist_table.len() >= code_len * 64);
 
-    match *SIMD_SUPPORT {
+    // `false` for the AVX-512 kernel: this entry point has none, so an AVX-512
+    // host with AVX2 takes AVX2 here. It has no NEON kernel either, and an
+    // aarch64 tier is `Neon` or `None`, so the selector returns `Neon` or
+    // `Scalar` and both land on the scalar `_` arm.
+    let (has_avx512bw, has_avx2) = x86_dist_table_features();
+    match dist_table_backend(*SIMD_SUPPORT, false, has_avx512bw, has_avx2) {
         #[cfg(target_arch = "x86_64")]
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16 | SimdSupport::Avx2
-            if std::arch::is_x86_feature_detected!("avx2") =>
-        {
+        DistTableBackend::Avx2 => {
             sum_4bit_hacc_dist_table_avx2(n, code_len, codes, hacc_dist_table, dists);
         }
         _ => {
@@ -646,6 +708,71 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `avx512_kernel` false covers both callers that reach it: the hacc entry
+    /// point, which has no AVX-512 kernel at all, and
+    /// `sum_4bit_dist_table_uninit` wherever its
+    /// `cfg!(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))`
+    /// is false, which is every non-x86_64 build as well as an x86_64 one that
+    /// compiled no AVX-512 C.
+    #[rstest::rstest]
+    // An AVX-512 host with the C kernel built and `avx512bw` present takes it.
+    #[case::avx512_ready(SimdSupport::Avx512, true, true, true, DistTableBackend::Avx512)]
+    #[case::avx512fp16_ready(SimdSupport::Avx512FP16, true, true, true, DistTableBackend::Avx512)]
+    // The two ways an AVX-512 host with AVX2 misses the AVX-512 arm. Both must
+    // reach AVX2 rather than scalar.
+    #[case::avx512_no_bw(SimdSupport::Avx512, true, false, true, DistTableBackend::Avx2)]
+    #[case::avx512_kernel_absent(SimdSupport::Avx512, false, true, true, DistTableBackend::Avx2)]
+    #[case::avx512fp16_no_bw(SimdSupport::Avx512FP16, true, false, true, DistTableBackend::Avx2)]
+    #[case::avx512fp16_kernel_absent(
+        SimdSupport::Avx512FP16,
+        false,
+        true,
+        true,
+        DistTableBackend::Avx2
+    )]
+    #[case::avx2_tier(SimdSupport::Avx2, true, false, true, DistTableBackend::Avx2)]
+    // The tier alone must not authorize the AVX2 kernel: it is
+    // `#[target_feature(enable = "avx2")]`. No host produces this pair, since
+    // `cpu.rs` selects `Avx2` only when the same `avx2` detection returned true,
+    // so this row pins the selector's contract rather than a real configuration.
+    #[case::avx2_tier_without_the_feature(
+        SimdSupport::Avx2,
+        false,
+        false,
+        false,
+        DistTableBackend::Scalar
+    )]
+    // Without AVX2 there is nothing to fall back to; this row pins the selector.
+    #[case::avx512_no_avx2(SimdSupport::Avx512, false, false, false, DistTableBackend::Scalar)]
+    #[case::avx_fma(SimdSupport::AvxFma, false, false, false, DistTableBackend::Scalar)]
+    #[case::avx(SimdSupport::Avx, false, false, false, DistTableBackend::Scalar)]
+    // An `Avx` tier that reports AVX2. `cpu.rs` notes that every shipping AVX2
+    // part has FMA, so no shipping part produces this pair, though a masked or
+    // feature-forced build can: the tier alone leaves it on scalar, even though
+    // the kernel needs no FMA.
+    #[case::avx_tier_with_avx2(SimdSupport::Avx, false, false, true, DistTableBackend::Scalar)]
+    // `Sse` is a variant the x86 ladder never produces, so this row pins the
+    // selector rather than a real host.
+    #[case::sse(SimdSupport::Sse, false, false, false, DistTableBackend::Scalar)]
+    #[case::none(SimdSupport::None, false, false, false, DistTableBackend::Scalar)]
+    #[case::neon(SimdSupport::Neon, false, false, false, DistTableBackend::Neon)]
+    // loongarch64 has LSX and LASX kernels elsewhere in this crate but none for
+    // this table, so both tiers belong on the scalar route.
+    #[case::lsx(SimdSupport::Lsx, false, false, false, DistTableBackend::Scalar)]
+    #[case::lasx(SimdSupport::Lasx, false, false, false, DistTableBackend::Scalar)]
+    fn dist_table_backend_follows_the_tier_ladder(
+        #[case] support: SimdSupport,
+        #[case] avx512_kernel: bool,
+        #[case] has_avx512bw: bool,
+        #[case] has_avx2: bool,
+        #[case] expected: DistTableBackend,
+    ) {
+        assert_eq!(
+            dist_table_backend(support, avx512_kernel, has_avx512bw, has_avx2),
+            expected
+        );
+    }
 
     #[test]
     fn test_perm0_inverse_matches_perm0() {
