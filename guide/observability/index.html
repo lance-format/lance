@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Observability — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/guide/observability/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab" href="../../quickstart/">Getting Started</a>
+      <a class="ld-toptab active" href="../read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../format/">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../community/">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      User Guide
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">User Guide</div>
+    <a href="../read_and_write/">Read and Write</a>
+    <a href="../data_types/">Data Types</a>
+    <a href="../data_evolution/">Data Evolution</a>
+    <a href="../blob/">Blob API</a>
+    <a href="../json/">JSON Support</a>
+    <a href="../tags_and_branches/">Tags and Branches</a>
+    <a href="../object_store/">Object Store Configuration</a>
+    <a class="active" href="./">Observability</a>
+    <a href="../distributed_write/">Distributed Write</a>
+    <a href="../distributed_indexing/">Distributed Indexing</a>
+    <a href="../migration/">Migration Guide</a>
+    <a href="../performance/">Performance Guide</a>
+    <a href="../tokenizer/">Tokenizer</a>
+    <a href="../arrays/">Extension Arrays</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>User Guide</span>
+        <span>/</span><b>Observability</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="observability">Observability<a class="headerlink" href="#observability" title="Permanent link">&para;</a></h1>
+<p>Lance can publish operational metrics to your monitoring stack. The table below
+is the authoritative catalogue of the metrics Lance emits, shared verbatim with
+the Rust <a href="https://github.com/lance-format/lance/blob/main/rust/lance/src/metrics.md"><code>lance::metrics</code></a>
+module documentation.</p>
+<p>Lance publishes metrics through the <a href="https://docs.rs/metrics"><code>metrics</code></a> crate
+facade. Install any recorder (Prometheus, OpenTelemetry, etc.) in your
+application and Lance will emit into it; when no recorder is installed, emission
+is a cheap no-op. Metrics are only emitted when Lance is built with the
+<code>metrics</code> feature.</p>
+<h2 id="object-store-metrics">Object store metrics<a class="headerlink" href="#object-store-metrics" title="Permanent link">&para;</a></h2>
+<p>These track I/O against the underlying object store. The <code>base</code> label
+identifies the store; its cardinality is controlled by the
+<code>LANCE_OBJECT_STORE_METRICS_LABEL</code> environment variable:</p>
+<ul>
+<li><code>scheme</code> (default) — the scheme only (<code>s3</code>, <code>gs</code>, <code>az</code>, <code>file</code>, <code>memory</code>);
+  low, bounded cardinality.</li>
+<li><code>full</code> — the store's unique prefix (<code>s3$my-bucket</code>, <code>az$container@account</code>
+  where Azure's account also matters), so multiple buckets on the same cloud
+  can be told apart. Cardinality grows with the number of stores accessed.</li>
+<li><code>off</code> — omit the <code>base</code> label entirely.</li>
+</ul>
+<p><code>operation</code> is one of <code>get</code>, <code>put</code>, <code>put_part</code>, <code>head</code>, <code>list</code>, <code>delete</code>,
+<code>copy</code>, <code>rename</code>, <code>complete_multipart</code>, or <code>abort_multipart</code>.</p>
+<p>Request counts are per logical operation: a <code>list</code> or <code>delete</code> that spans many
+objects is one request, matching how backends batch them.</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Type</th>
+<th>Labels</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lance_object_store_requests_total</code></td>
+<td>counter</td>
+<td><code>operation</code>, <code>base</code></td>
+<td>Object store requests issued.</td>
+</tr>
+<tr>
+<td><code>lance_object_store_request_bytes_total</code></td>
+<td>counter</td>
+<td><code>operation</code>, <code>base</code></td>
+<td>Bytes transferred by <code>get</code>/<code>put</code> requests. A <code>get</code> is counted once its response body has been fully read.</td>
+</tr>
+<tr>
+<td><code>lance_object_store_request_duration_seconds</code></td>
+<td>histogram</td>
+<td><code>operation</code>, <code>base</code></td>
+<td>Per-request latency, in seconds. For <code>get</code> this covers the full body transfer, not just time-to-first-byte.</td>
+</tr>
+<tr>
+<td><code>lance_object_store_errors_total</code></td>
+<td>counter</td>
+<td><code>operation</code>, <code>base</code></td>
+<td>Requests that returned an error.</td>
+</tr>
+<tr>
+<td><code>lance_object_store_in_flight_requests</code></td>
+<td>gauge</td>
+<td><code>operation</code>, <code>base</code></td>
+<td>Requests currently in flight.</td>
+</tr>
+<tr>
+<td><code>lance_object_store_throttle_total</code></td>
+<td>counter</td>
+<td><code>status</code>, <code>base</code></td>
+<td>Throttle responses (HTTP 429 / 503) seen at the HTTP layer, counted per attempt including retries. The <code>status</code> label is the numeric HTTP status.</td>
+</tr>
+<tr>
+<td><code>lance_object_store_retryable_responses_total</code></td>
+<td>counter</td>
+<td><code>status</code>, <code>base</code></td>
+<td>Retryable responses (HTTP 5xx / 429 / 408) seen at the HTTP layer, counted per attempt including retries. A superset of <code>throttle_total</code>; 409 (conflict) is excluded so commit conflicts are not counted.</td>
+</tr>
+</tbody>
+</table>
+<p><code>lance_object_store_throttle_total</code> and
+<code>lance_object_store_retryable_responses_total</code> are recorded only for the native
+cloud stores (S3, GCS, Azure); Opendal-backed stores bypass the HTTP client
+where the counters are installed, so they report the other object store metrics
+but not throttle/retryable counts.</p>
+<h2 id="collecting-metrics">Collecting metrics<a class="headerlink" href="#collecting-metrics" title="Permanent link">&para;</a></h2>
+<p>Lance emits through the <a href="https://docs.rs/metrics"><code>metrics</code></a> crate facade, so it
+is not tied to a specific backend — you install a recorder/exporter and route
+the metrics wherever you like. Metrics are available from the Rust, Python, and
+Java APIs.</p>
+<h3 id="rust">Rust<a class="headerlink" href="#rust" title="Permanent link">&para;</a></h3>
+<p>Enable the <code>metrics</code> feature on the <code>lance</code> crate:</p>
+<div class="language-toml highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">lance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">version</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"..."</span><span class="p">,</span><span class="w"> </span><span class="n">features</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"metrics"</span><span class="p">]</span><span class="w"> </span><span class="p">}</span>
+</span></code></pre></div>
+<p>Then install any <code>metrics</code>-compatible recorder once at startup, before opening
+datasets. For example, with
+<a href="https://docs.rs/metrics-exporter-prometheus"><code>metrics-exporter-prometheus</code></a>:</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">metrics_exporter_prometheus</span><span class="p">::</span><span class="n">PrometheusBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">()</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">    </span><span class="p">.</span><span class="n">install</span><span class="p">()</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"install Prometheus recorder"</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Any recorder works — Prometheus, StatsD, an OpenTelemetry bridge, and so on.
+When no recorder is installed, emission is a cheap no-op.</p>
+<h3 id="python">Python<a class="headerlink" href="#python" title="Permanent link">&para;</a></h3>
+<p>Unlike Rust, the Python bindings do not let you plug in an arbitrary recorder:
+bridging one across the FFI boundary into the Rust <code>metrics</code> facade would be
+complicated and inefficient. Instead <code>pylance</code> standardizes on OpenTelemetry,
+which has good Python support, as its recorder.</p>
+<p>The <code>pylance</code> wheels are built with the <code>metrics</code> feature enabled. Install the
+OpenTelemetry extra and call <code>instrument_lance_metrics</code>, which registers Lance's
+metrics as observable instruments on your OpenTelemetry <code>MeterProvider</code>:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">"pylance[otel]"</span>
+</span></code></pre></div>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance.otel</span><span class="w"> </span><span class="kn">import</span> <span class="n">instrument_lance_metrics</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="c1"># Uses the global MeterProvider; pass meter_provider=... to target a specific one.</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="n">instrument_lance_metrics</span><span class="p">()</span>
+</span></code></pre></div>
+<h3 id="java">Java<a class="headerlink" href="#java" title="Permanent link">&para;</a></h3>
+<p>The Java SDK includes an OpenTelemetry bridge in <code>org.lance.otel</code>. Register it
+before opening datasets or performing Lance IO so the process-global Rust
+recorder sees every emitted metric:</p>
+<div class="language-java highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">org.lance.otel.LanceMetrics</span><span class="p">;</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="n">LanceMetrics</span><span class="p">.</span><span class="na">instrument</span><span class="p">();</span>
+</span></code></pre></div>
+<p>The OpenTelemetry API is a dependency of the Java SDK. The application must
+still configure an OpenTelemetry SDK, metric reader, and exporter for collection
+and delivery.</p>
+<p>The no-argument method uses OpenTelemetry's global <code>MeterProvider</code>. To register
+with an explicitly configured provider, pass it directly:</p>
+<div class="language-java highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">SdkMeterProvider</span><span class="w"> </span><span class="n">provider</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SdkMeterProvider</span><span class="p">.</span><span class="na">builder</span><span class="p">()</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">    </span><span class="p">.</span><span class="na">registerMetricReader</span><span class="p">(</span><span class="n">metricReader</span><span class="p">)</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">    </span><span class="p">.</span><span class="na">build</span><span class="p">();</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="n">LanceMetrics</span><span class="p">.</span><span class="na">instrument</span><span class="p">(</span><span class="n">provider</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Repeated calls with the same provider are idempotent. Passing a different
+provider unregisters the existing callback before registering the new one. Call
+<code>LanceMetrics.close()</code> to stop exporting while retaining the process-global Rust
+metric state.</p>
+<p>From there the metrics flow through whatever OpenTelemetry pipeline you have
+configured (OTLP, Prometheus, console, …). Because OpenTelemetry has no
+asynchronous histogram instrument, histograms are exported Prometheus-style as
+three observable counters: <code>&lt;name&gt;_bucket</code>, <code>&lt;name&gt;_count</code>, and <code>&lt;name&gt;_sum</code>.
+Each <code>&lt;name&gt;_bucket</code> sample carries an <code>le</code> ("less than or equal") attribute
+giving that bucket's inclusive upper bound in the metric's unit; the bucket
+count is cumulative, covering every observation at or below <code>le</code>. For example, a
+<code>lance_object_store_request_duration_seconds_bucket</code> sample with <code>le="0.5"</code>
+counts all requests that completed in 0.5 seconds or less, while <code>le="+Inf"</code> is
+the total count.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../object_store/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Object Store Configuration</div>
+        </a>
+        <a class="next" href="../distributed_write/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Distributed Write</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#object-store-metrics">Object store metrics</a>
+      <a class="ld-toc__h2" href="#collecting-metrics">Collecting metrics</a>
+      <a class="ld-toc__h3" href="#rust">Rust</a>
+      <a class="ld-toc__h3" href="#python">Python</a>
+      <a class="ld-toc__h3" href="#java">Java</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../format/">Specification</a>
+        <a href="../../format/file/">File format</a>
+        <a href="../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../quickstart/">Getting started</a>
+        <a href="../read_and_write/">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>

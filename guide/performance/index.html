@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Performance Guide — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/guide/performance/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab" href="../../quickstart/">Getting Started</a>
+      <a class="ld-toptab active" href="../read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../format/">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../community/">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      User Guide
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">User Guide</div>
+    <a href="../read_and_write/">Read and Write</a>
+    <a href="../data_types/">Data Types</a>
+    <a href="../data_evolution/">Data Evolution</a>
+    <a href="../blob/">Blob API</a>
+    <a href="../json/">JSON Support</a>
+    <a href="../tags_and_branches/">Tags and Branches</a>
+    <a href="../object_store/">Object Store Configuration</a>
+    <a href="../observability/">Observability</a>
+    <a href="../distributed_write/">Distributed Write</a>
+    <a href="../distributed_indexing/">Distributed Indexing</a>
+    <a href="../migration/">Migration Guide</a>
+    <a class="active" href="./">Performance Guide</a>
+    <a href="../tokenizer/">Tokenizer</a>
+    <a href="../arrays/">Extension Arrays</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>User Guide</span>
+        <span>/</span><b>Performance Guide</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="lance-performance-guide">Lance Performance Guide<a class="headerlink" href="#lance-performance-guide" title="Permanent link">&para;</a></h1>
+<p>This guide provides tips and tricks for optimizing the performance of your Lance applications.</p>
+<h2 id="logging">Logging<a class="headerlink" href="#logging" title="Permanent link">&para;</a></h2>
+<p>Lance uses the <code>log</code> crate to log messages. Displaying these log messages will depend on the client
+library you are using. For rust, you will need to configure a logging subscriber. For more details
+ses the <a href="https://docs.rs/log/latest/log/">log</a> docs. The Python and Java clients configure a default
+logging subscriber that logs to stderr.</p>
+<p>The Python/Java logger can be configured with several environment variables:</p>
+<ul>
+<li><code>LANCE_LOG</code>: Controls log filtering based on log level and target. See the <a href="https://docs.rs/env_logger/latest/env_logger/">env_logger</a> docs for more details. The <code>LANCE_LOG</code> environment variable replaces the <code>RUST_LOG</code> environment variable.</li>
+<li><code>LANCE_TRACING</code>: Controls tracing filtering based on log level. Key tracing events described below are emitted at
+  the <code>info</code> level. However, additional spans and events are available at the <code>debug</code> level which may be useful for
+  debugging performance issues. The default tracing level is <code>info</code>.</li>
+<li><code>LANCE_LOG_STYLE</code>: Controls whether colors are used in the log messages. Valid values are <code>auto</code>, <code>always</code>, <code>never</code>.</li>
+<li><code>LANCE_LOG_TS_PRECISION</code>: The precision of the timestamp in the log messages. Valid values are <code>ns</code>, <code>us</code>, <code>ms</code>, <code>s</code>.</li>
+<li><code>LANCE_LOG_FILE</code>: Redirects Rust log messages to the specified file path instead of stderr. When set, Lance will create the file and any necessary parent directories. If the file cannot be created (e.g., due to permission issues), Lance will fall back to logging to stderr.</li>
+</ul>
+<h2 id="trace-events">Trace Events<a class="headerlink" href="#trace-events" title="Permanent link">&para;</a></h2>
+<p>Lance uses tracing to log events. If you are running <code>pylance</code> then these events will be emitted
+as log messages. For Rust connections you can use the <code>tracing</code> crate to capture these events.</p>
+<p>Rust tracing targets are listed below. In <code>pylance</code> logs, trace events are emitted under a
+<code>lance::events::</code> prefix so they can be filtered separately from normal log records. For example,
+<code>LANCE_LOG="warn,lance::events::object_store::throttle=info"</code> shows storage throttling events
+without enabling other Lance event logs.</p>
+<h3 id="file-audit">File Audit<a class="headerlink" href="#file-audit" title="Permanent link">&para;</a></h3>
+<p>File audit events are emitted when significant files are created or deleted.</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Parameter</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lance::file_audit</code></td>
+<td><code>mode</code></td>
+<td>The mode of I/O operation (create, delete, delete_unverified)</td>
+</tr>
+<tr>
+<td><code>lance::file_audit</code></td>
+<td><code>type</code></td>
+<td>The type of file affected (manifest, data file, index file, deletion file)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="dataset-events">Dataset Events<a class="headerlink" href="#dataset-events" title="Permanent link">&para;</a></h3>
+<p>Dataset events are emitted when datasets are loaded, written, committed, deleted, compacted, or cleaned.</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Parameter</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lance::dataset_events</code></td>
+<td><code>event</code></td>
+<td>The dataset event type (loading, writing, committed, deleting, and others)</td>
+</tr>
+<tr>
+<td><code>lance::dataset_events</code></td>
+<td><code>uri</code></td>
+<td>The dataset URI</td>
+</tr>
+<tr>
+<td><code>lance::dataset_events</code></td>
+<td><code>mode</code></td>
+<td>The write mode</td>
+</tr>
+<tr>
+<td><code>lance::dataset_events</code></td>
+<td><code>operation</code></td>
+<td>The committed transaction operation</td>
+</tr>
+<tr>
+<td><code>lance::dataset_events</code></td>
+<td><code>predicate</code></td>
+<td>The delete predicate</td>
+</tr>
+<tr>
+<td><code>lance::dataset_events</code></td>
+<td><code>columns</code></td>
+<td>The removed columns</td>
+</tr>
+</tbody>
+</table>
+<h3 id="object-store-throttle-events">Object Store Throttle Events<a class="headerlink" href="#object-store-throttle-events" title="Permanent link">&para;</a></h3>
+<p>Object store throttle events are emitted when Lance observes cloud storage throttle responses and
+reduces or retries request rates.</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Parameter</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lance::object_store::throttle</code></td>
+<td><code>previous_rate</code></td>
+<td>The request rate before AIMD adjustment</td>
+</tr>
+<tr>
+<td><code>lance::object_store::throttle</code></td>
+<td><code>new_rate</code></td>
+<td>The request rate after AIMD adjustment</td>
+</tr>
+<tr>
+<td><code>lance::object_store::throttle</code></td>
+<td><code>attempt</code></td>
+<td>The retry attempt for retry debug events</td>
+</tr>
+<tr>
+<td><code>lance::object_store::throttle</code></td>
+<td><code>error</code></td>
+<td>The underlying object store throttle error</td>
+</tr>
+</tbody>
+</table>
+<h3 id="io-events">I/O Events<a class="headerlink" href="#io-events" title="Permanent link">&para;</a></h3>
+<p>I/O events are emitted when significant I/O operations are performed, particularly
+those related to indices. These events are NOT emitted when the index is loaded from
+the in-memory cache. Correct cache utilization is important for performance and these
+events are intended to help you debug cache usage.</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Parameter</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lance::io_events</code></td>
+<td><code>type</code></td>
+<td>The type of I/O operation (open_scalar_index, open_vector_index, load_vector_part, load_scalar_part)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="execution-events">Execution Events<a class="headerlink" href="#execution-events" title="Permanent link">&para;</a></h3>
+<p>Execution events are emitted when an execution plan is run. These events are useful for
+debugging query performance.</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Parameter</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lance::execution</code></td>
+<td><code>type</code></td>
+<td>The type of execution event (plan_run is the only type today)</td>
+</tr>
+<tr>
+<td><code>lance::execution</code></td>
+<td><code>output_rows</code></td>
+<td>The number of rows in the output of the plan</td>
+</tr>
+<tr>
+<td><code>lance::execution</code></td>
+<td><code>iops</code></td>
+<td>The number of I/O operations performed by the plan</td>
+</tr>
+<tr>
+<td><code>lance::execution</code></td>
+<td><code>bytes_read</code></td>
+<td>The number of bytes read by the plan</td>
+</tr>
+<tr>
+<td><code>lance::execution</code></td>
+<td><code>indices_loaded</code></td>
+<td>The number of indices loaded by the plan</td>
+</tr>
+<tr>
+<td><code>lance::execution</code></td>
+<td><code>parts_loaded</code></td>
+<td>The number of index partitions loaded by the plan</td>
+</tr>
+<tr>
+<td><code>lance::execution</code></td>
+<td><code>index_comparisons</code></td>
+<td>The number of comparisons performed inside the various indices</td>
+</tr>
+</tbody>
+</table>
+<h2 id="threading-model">Threading Model<a class="headerlink" href="#threading-model" title="Permanent link">&para;</a></h2>
+<p>Lance is designed to be thread-safe and performant. Lance APIs can be called concurrently unless
+explicitly stated otherwise. Users may create multiple tables and share tables between threads.
+Operations may run in parallel on the same table, but some operations may lead to conflicts. For
+details see <a href="../../format/table/transaction/#conflict-resolution">conflict resolution</a>.</p>
+<p>Most Lance operations will use multiple threads to perform work in parallel. There are two thread
+pools in lance: the IO thread pool and the compute thread pool. The IO thread pool is used for
+reading and writing data from disk. The compute thread pool is used for performing computations
+on data. The number of threads in each pool can be configured by the user.</p>
+<p>The IO thread pool is used for reading and writing data from disk. The number of threads in the IO
+thread pool is determined by the object store that the operation is working with. Local object stores
+will use 8 threads by default. Cloud object stores will use 64 threads by default. This is a fairly
+conservative default and you may need 128 or 256 threads to saturate network bandwidth on some cloud
+providers. The <code>LANCE_IO_THREADS</code> environment variable can be used to override the number of IO
+threads. If you increase this variable you may also want to increase the <code>io_buffer_size</code>.</p>
+<p>The compute thread pool is used for performing computations on data. The number of threads in the
+compute thread pool is determined by the number of cores on the machine. The number of threads in
+the compute thread pool can be overridden by setting the <code>LANCE_CPU_THREADS</code> environment variable.
+This is commonly done when running multiple Lance processes on the same machine (e.g when working with
+tools like Ray). Keep in mind that decoding data is a compute intensive operation, even if a workload
+seems I/O bound (like scanning a table) it may still need quite a few compute threads to achieve peak
+performance.</p>
+<h2 id="memory-requirements">Memory Requirements<a class="headerlink" href="#memory-requirements" title="Permanent link">&para;</a></h2>
+<p>Lance is designed to be memory efficient. Operations should stream data from disk and not require
+loading the entire dataset into memory. However, there are a few components of Lance that can use
+a lot of memory.</p>
+<h3 id="metadata-cache">Metadata Cache<a class="headerlink" href="#metadata-cache" title="Permanent link">&para;</a></h3>
+<p>Lance uses a metadata cache to speed up operations. This cache holds various pieces of metadata such
+as file metadata, dataset manifests, etc. This cache is an LRU cache that is sized by bytes. The default
+size is 1 GiB.</p>
+<p>The metadata cache is not shared between tables by default. For best performance you should create a
+single table and share it across your application. Alternatively, you can create a single session
+and specify it when you open tables.</p>
+<p>Keys are often a composite of multiple fields and all keys are scoped to the dataset URI. The following items are stored in the metadata cache:</p>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Key</th>
+<th>What is stored</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dataset Manifests</td>
+<td>Dataset URI, version, and etag</td>
+<td>The manifest for the dataset</td>
+</tr>
+<tr>
+<td>Transactions</td>
+<td>Dataset URI, version</td>
+<td>The transaction for the dataset</td>
+</tr>
+<tr>
+<td>Deletion Files</td>
+<td>Dataset URI, fragment_id, version, id, file_type</td>
+<td>The deletion vector for a frag</td>
+</tr>
+<tr>
+<td>Row Id Mask</td>
+<td>Dataset URI, version</td>
+<td>The row id sequence for the dataset</td>
+</tr>
+<tr>
+<td>Row Id Index</td>
+<td>Dataset URI, version</td>
+<td>The row id index for the dataset</td>
+</tr>
+<tr>
+<td>Row Id Sequence</td>
+<td>Dataset URI, fragment_id, row_id_meta</td>
+<td>The row id sequence for a fragment</td>
+</tr>
+<tr>
+<td>Index Metadata</td>
+<td>Dataset URI, version</td>
+<td>The index metadata for the dataset</td>
+</tr>
+<tr>
+<td>Index Details¹</td>
+<td>Dataset URI, index uuid</td>
+<td>The index details for an index</td>
+</tr>
+<tr>
+<td>File Global Meta</td>
+<td>Dataset URI, file path</td>
+<td>The global metadata for a file</td>
+</tr>
+<tr>
+<td>File Column Meta</td>
+<td>Dataset URI, file path, column index</td>
+<td>The search cache for a column</td>
+</tr>
+</tbody>
+</table>
+<p>Notes:</p>
+<ol>
+<li>This is only stored for very old indexes which don't store their details in the manifest.</li>
+</ol>
+<h3 id="index-cache">Index Cache<a class="headerlink" href="#index-cache" title="Permanent link">&para;</a></h3>
+<p>Lance uses an index cache to speed up queries. This caches vector and scalar indices in memory. The
+max size of this cache can be configured when creating a <code>LanceDataset</code> using the <code>index_cache_size_bytes</code>
+parameter. This cache is an LRU cached that is sized by bytes. The default size is 6 GiB.
+You can view the size of this cache by inspecting the result of <code>dataset.session().size_bytes()</code>.</p>
+<p>The index cache is not shared between tables. For best performance you should create a single table and
+share it across your application.</p>
+<p><strong>Note</strong>: <code>index_cache_size</code> (specified in entries) was deprecated since version 0.30.0. Use
+<code>index_cache_size_bytes</code> (specified in bytes) for new code.</p>
+<h3 id="scanning-data">Scanning Data<a class="headerlink" href="#scanning-data" title="Permanent link">&para;</a></h3>
+<p>Searches (e.g. vector search, full text search) do not use a lot of memory to hold data because they don't
+typically return a lot of data. However, scanning data can use a lot of memory. Scanning is a streaming
+operation but we need enough memory to hold the data that we are scanning. The amount of memory needed is
+largely determined by the <code>io_buffer_size</code> and the <code>batch_size</code> variables.</p>
+<p>Each I/O thread should have enough memory to buffer an entire page of data. Pages today are typically between
+8 and 32 MB. This means, as a rule of thumb, you should generally have about 32MB of memory per I/O thread.
+The default <code>io_buffer_size</code> is 2GB which is enough to buffer 64 pages of data. If you increase the number
+of I/O threads you should also increase the <code>io_buffer_size</code>.</p>
+<p>Scans will also decode data (and run any filtering or compute) in parallel on CPU threads. The amount of data
+decoded at any one time is determined by the <code>batch_size</code> and the size of your rows. Each CPU thread will
+need enough memory to hold one batch. Once batches are delivered to your application, they are no longer tracked
+by Lance and so if memory is a concern then you should also be careful not to accumulate memory in your own
+application (e.g. by running <code>to_table</code> or otherwise collecting all batches in memory.)</p>
+<p>The default <code>batch_size</code> is 8192 rows. When you are working with mostly scalar data you want to keep batches
+around 1MB and so the amount of memory needed by the compute threads is fairly small. However, when working with
+large data you may need to turn down the <code>batch_size</code> to keep memory usage under control. For example, when
+working with 1024-dimensional vector embeddings (e.g. 32-bit floats) then 8192 rows would be 32MB of data. If you
+spread that across 16 CPU threads then you would need 512MB of compute memory per scan. You might find working
+with 1024 rows per batch is more appropriate.</p>
+<h4 id="tuning-remote-scans">Tuning remote scans<a class="headerlink" href="#tuning-remote-scans" title="Permanent link">&para;</a></h4>
+<p>An ordered dataset scan still overlaps I/O from multiple fragments. <code>scan_in_order=True</code> controls the order in
+which batches are returned; it does not make fragment reads sequential. This is why a dataset scan can issue
+more concurrent requests than scanning one fragment directly. The following controls tune different parts of
+the scan:</p>
+<ul>
+<li><code>fragment_readahead</code> limits how many fragments may have reads scheduled concurrently. Set it to <code>1</code> to match
+  the fragment-level I/O pattern, then increase it if the storage connection has spare bandwidth.</li>
+<li><code>LANCE_IO_THREADS</code> limits concurrent storage requests for the process. Cloud stores default to 64, which is
+  intended for high-bandwidth, in-region access and can be too aggressive across regions or over the public
+  internet.</li>
+<li><code>io_buffer_size</code> limits buffered I/O bytes and applies backpressure when decoding falls behind.</li>
+<li><code>batch_readahead</code> limits concurrent batch decoding. It does not control the size of storage range requests.</li>
+</ul>
+<p>For a bandwidth-constrained remote connection, start with conservative settings and tune upward:</p>
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nv">LANCE_IO_THREADS</span><span class="o">=</span><span class="m">8</span><span class="w"> </span>python<span class="w"> </span>scan.py
+</span></code></pre></div>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">scanner</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">scanner</span><span class="p">(</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>    <span class="n">fragment_readahead</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>    <span class="n">batch_readahead</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>    <span class="n">io_buffer_size</span><span class="o">=</span><span class="mi">64</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">,</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="p">)</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">scanner</span><span class="o">.</span><span class="n">to_batches</span><span class="p">():</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>    <span class="n">process</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+</span></code></pre></div>
+<p>Lance reads encoded pages from storage, so reducing <code>batch_size</code> changes the returned and decoded batch sizes
+but may not reduce the initial range request. The first batch can require loading one encoded page for each
+selected column.</p>
+<p>In summary, scans could use up to <code>(2 * io_buffer_size) + (batch_size * num_compute_threads)</code> bytes of memory.
+Keep in mind that <code>io_buffer_size</code> is a soft limit (e.g. we cannot read less than one page at a time right now)
+and so it is not necessarily a bug if you see memory usage exceed this limit by a small margin.</p>
+<h3 id="cloud-store-throttling">Cloud Store Throttling<a class="headerlink" href="#cloud-store-throttling" title="Permanent link">&para;</a></h3>
+<p>Cloud object stores (S3, GCS, Azure) are automatically wrapped with an AIMD (Additive Increase / Multiplicative
+Decrease) rate limiter. When the store returns throttle errors (HTTP 429/503), the request rate decreases
+multiplicatively. During sustained success, the rate increases additively. This applies to all operations
+(reads, writes, deletes, lists) and replaces the old <code>LANCE_PROCESS_IO_THREADS_LIMIT</code> process-wide cap.</p>
+<p>Local and in-memory stores are <strong>not</strong> throttled.</p>
+<p>The AIMD throttle can be tuned via storage options or environment variables. Storage options take precedence
+over environment variables:</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Storage Option Key</th>
+<th>Env Var</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Initial rate</td>
+<td><code>lance_aimd_initial_rate</code></td>
+<td><code>LANCE_AIMD_INITIAL_RATE</code></td>
+<td>2000</td>
+</tr>
+<tr>
+<td>Min rate</td>
+<td><code>lance_aimd_min_rate</code></td>
+<td><code>LANCE_AIMD_MIN_RATE</code></td>
+<td>1</td>
+</tr>
+<tr>
+<td>Max rate</td>
+<td><code>lance_aimd_max_rate</code></td>
+<td><code>LANCE_AIMD_MAX_RATE</code></td>
+<td>5000</td>
+</tr>
+<tr>
+<td>Decrease factor</td>
+<td><code>lance_aimd_decrease_factor</code></td>
+<td><code>LANCE_AIMD_DECREASE_FACTOR</code></td>
+<td>0.5</td>
+</tr>
+<tr>
+<td>Additive increment</td>
+<td><code>lance_aimd_additive_increment</code></td>
+<td><code>LANCE_AIMD_ADDITIVE_INCREMENT</code></td>
+<td>300</td>
+</tr>
+<tr>
+<td>Burst capacity</td>
+<td><code>lance_aimd_burst_capacity</code></td>
+<td><code>LANCE_AIMD_BURST_CAPACITY</code></td>
+<td>100</td>
+</tr>
+</tbody>
+</table>
+<p>These initial settings are balanced and should work for most
+use cases. For example, S3 can typically get up to 5000
+req/s and with these settings we should get there in about
+10 seconds.</p>
+<h2 id="fragment-sizing">Fragment Sizing<a class="headerlink" href="#fragment-sizing" title="Permanent link">&para;</a></h2>
+<p>A Lance table is a collection of fragments tracked by a manifest. How you size those fragments
+trades off two classes of work:</p>
+<ul>
+<li><strong>Manifest-level operations</strong> scale with the <em>number</em> of fragments. Every dataset mutation
+  (appends, metadata updates, schema changes, compactions, etc.) rewrites the manifest, so a
+  larger fragment list makes every write slower. Reads pay a similar cost up front: opening a
+  dataset, listing fragments, planning a scan, and resolving transaction conflicts at the
+  dataset level all walk the manifest.</li>
+<li><strong>Fragment-level operations</strong> scale with the <em>size</em> of a fragment. These include scans
+  against a matching fragment, compaction, updates, deletes, and <code>merge_insert</code>. Conflict
+  detection for these operations is also done at the fragment level.</li>
+</ul>
+<p>Fewer, larger fragments make manifest-level operations cheap but make each fragment-level
+operation heavier and increase the chance of conflicts when many writers target the same
+fragment. More, smaller fragments do the reverse.</p>
+<p>Practical guidance:</p>
+<ul>
+<li>The default of 1M rows per fragment works well up to ~1B rows. Past that, bumping toward
+  ~100M rows per fragment is reasonable, though fragment-count limits are rarely the bottleneck
+  in practice.</li>
+<li>Tens of thousands of fragments per table is generally fine.</li>
+<li>Keep individual fragments well under object-store object-size limits (S3 caps at 5 TB, and
+  stores tend to misbehave well before that). 10 GB–100 GB per fragment is a reasonable upper
+  range; 1 TB is a hard ceiling.</li>
+<li>If you run many concurrent updates, deletes, or <code>merge_insert</code> operations, err toward more
+  fragments — conflict detection is per-fragment, so too few fragments leads to excess
+  retries.</li>
+</ul>
+<h2 id="conflict-handling">Conflict Handling<a class="headerlink" href="#conflict-handling" title="Permanent link">&para;</a></h2>
+<p>Lance supports concurrent operations on the same table using optimistic concurrency control. When two
+operations conflict, one of them must be retried. Retries are handled automatically but they repeat
+work that has already been done, which can hurt throughput. Understanding and minimizing conflicts is
+important for maintaining good performance in write-heavy workloads.</p>
+<p>Common sources of conflicts include:</p>
+<ul>
+<li>Concurrent compaction and index building, since both need to modify the same indices</li>
+<li>Update operations that affect the same fragments, since both need to rewrite the same data files</li>
+</ul>
+<p>For more details on which operations conflict with each other, see
+<a href="../../format/table/transaction/#conflict-resolution">conflict resolution</a>.</p>
+<h3 id="fragment-reuse-index">Fragment Reuse Index<a class="headerlink" href="#fragment-reuse-index" title="Permanent link">&para;</a></h3>
+<p>Compaction is one of the most expensive write operations because it rewrites data files and, by
+default, remaps all indices to reflect the new row addresses. When compaction and index building
+run concurrently, they often conflict because both need to modify the same indices. This typically
+causes the compaction to fail and retry, and repeated failures can cause table layout to degrade
+over time.</p>
+<p>The Fragment Reuse Index (FRI) solves this by allowing compaction to skip the index remap step.
+Instead of immediately updating indices, compaction records a mapping from old fragment row
+addresses to new ones. When indices are loaded into the cache, the FRI is applied to translate
+the old row addresses to the current ones. This adds a small cost to index load time but does
+not affect query performance once the index is cached.</p>
+<p>This decoupling means compaction and index building no longer conflict, which is especially
+valuable for tables that are continuously ingesting data while also maintaining indices.</p>
+<p>To enable the FRI, set <code>defer_index_remap=True</code> when compacting:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">dataset</span><span class="o">.</span><span class="n">optimize</span><span class="o">.</span><span class="n">compact_files</span><span class="p">(</span><span class="n">defer_index_remap</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</span></code></pre></div>
+<p>For details on the index format and usage patterns, see the
+<a href="../../format/index/system/frag_reuse/">Fragment Reuse Index specification</a>.</p>
+<h2 id="indexes">Indexes<a class="headerlink" href="#indexes" title="Permanent link">&para;</a></h2>
+<p>Training and searching indexes can have unique requirements for compute and memory. This section provides some
+guidance on what can be expected for different index types.</p>
+<h3 id="btree-index">BTree Index<a class="headerlink" href="#btree-index" title="Permanent link">&para;</a></h3>
+<p>The BTree index is a two-level structure that provides efficient range queries and sorted access.
+It strikes a balance between an expensive memory structure containing all values and an expensive disk
+structure that can't be efficiently searched.</p>
+<p>Training a BTree index is done by sorting the column. This is done using an <a href="https://en.wikipedia.org/wiki/External_sorting">external sort</a> to constrain the total memory usage to a reasonable amount. Updating a BTree index does not
+require re-sorting the entire column. The new values are sorted and the existing values are merged into the new sorted
+values in linear time.</p>
+<h4 id="storage-requirements">Storage Requirements<a class="headerlink" href="#storage-requirements" title="Permanent link">&para;</a></h4>
+<p>The BTree index is essentially a sorted copy of a column. The storage requirements are therefore the same as the column
+but an additional 4 bytes per value is required to store the row ID and there is a small lookup structure which
+should be roughly 0.001% of the size of the column.</p>
+<h4 id="memory-requirements_1">Memory Requirements<a class="headerlink" href="#memory-requirements_1" title="Permanent link">&para;</a></h4>
+<p>Training a BTree index requires some RAM but the current implementation spills to disk rather aggressively and so the
+total memory usage is fairly low.</p>
+<p>When searching a BTree index, the index is loaded into the index cache in pages. Each page contains 4096 values.</p>
+<h4 id="performance">Performance<a class="headerlink" href="#performance" title="Permanent link">&para;</a></h4>
+<p>The sort stage is the most expensive step in training a BTree index. The time complexity is O(n log n) where n is the number of rows in the column. At very large scales this can be a bottleneck and a distributed sort may be necessary. Lance currently does
+not have anything builtin for this but work is underway to add this functionality. Training an index in parts as the data grows
+may be slightly more efficient than training the entire index at once if you have the flexibility to do so.</p>
+<p>When the BTree index is fully loaded into the index cache, the search time scales linearly with the number of rows that match the
+query. When the BTree index is not fully loaded into the index cache, the search time will be controlled by the number of pages
+that need to be loaded from disk and the speed of storage. The parts_loaded metric in the execution metrics can tell you how many
+pages were loaded from disk to satisfy a query.</p>
+<h3 id="bitmap-index">Bitmap Index<a class="headerlink" href="#bitmap-index" title="Permanent link">&para;</a></h3>
+<p>The Bitmap index is an inverted lookup table that stores a bitmap for each possible value in the column. These bitmaps are compressed and serialized as a <a href="https://roaringbitmap.org/">Roaring Bitmap</a>.</p>
+<p>A bitmap index is currently trained by accumulating the column into a hash map from value to a vector of row ids. Each value
+is then serialized into a bitmap and stored in a file.</p>
+<h3 id="storage-requirements_1">Storage Requirements<a class="headerlink" href="#storage-requirements_1" title="Permanent link">&para;</a></h3>
+<p>The size of a bitmap index is difficult to calculate precisely but will generally scale with the number of unique values in the
+column since a unique bitmap is required for each value and a single bitmap with all rows will compress more efficiently than
+many bitmaps with a small number of rows.</p>
+<h4 id="memory-requirements_2">Memory Requirements<a class="headerlink" href="#memory-requirements_2" title="Permanent link">&para;</a></h4>
+<p>Since training a bitmap index requires collecting the values into a hash map you will need at least 8 bytes of memory per row.
+In addition, if you have many unique values, then you will need additional memory for the keys of the hash map. Training large
+bitmaps with many unique values at scale can be memory intensive.</p>
+<p>When a bitmap index is searched, bitmaps are loaded into the session cache individually. The size of the bitmap will depend on
+the number of rows that match the token.</p>
+<h3 id="performance_1">Performance<a class="headerlink" href="#performance_1" title="Permanent link">&para;</a></h3>
+<p>When the bitmap index is fully loaded into the index cache, the search time scales linearly with the number of values that the
+query requires. This makes the bitmap very fast for equality queries or very small ranges. Queries against large ranges are
+currently extremely slow and the btree index is much faster for large range queries.</p>
+<p>When a bitmap index is not fully loaded into the index cache, the search time will be controlled by the number of bitmaps that
+need to be loaded from disk and the speed of storage. The parts_loaded metric in the execution metrics can tell you how many
+bitmaps were loaded from disk to satisfy a query.</p>
+<h3 id="vector-index">Vector Index<a class="headerlink" href="#vector-index" title="Permanent link">&para;</a></h3>
+<p>Vector indexes (IVF_PQ, IVF_HNSW_SQ, etc.) are built in multiple phases, each with different memory requirements.</p>
+<h4 id="ivf-training">IVF Training<a class="headerlink" href="#ivf-training" title="Permanent link">&para;</a></h4>
+<p>The IVF (Inverted File) phase clusters vectors into partitions using KMeans. To train the KMeans model, a sample of the
+dataset is loaded into memory. The size of this sample is determined by:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>training_data = num_partitions * sample_rate * dimension * sizeof(data_type)
+</span></code></pre></div>
+<p>The default <code>sample_rate</code> is 256. For example, with 1024 partitions, 768-dimensional float32 vectors, and the default
+sample rate:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>1024 * 256 * 768 * 4 bytes = 768 MiB
+</span></code></pre></div>
+<p>In addition to the training data, each KMeans iteration allocates membership and distance vectors proportional to the
+number of training vectors (8 bytes per vector). The centroids themselves require <code>num_partitions * dimension *
+sizeof(data_type)</code> bytes. In practice, the training data dominates and these additional allocations are small in
+comparison.</p>
+<p>If the dataset has fewer rows than <code>num_partitions * sample_rate</code>, the entire dataset is used for training instead.</p>
+<h4 id="quantizer-training">Quantizer Training<a class="headerlink" href="#quantizer-training" title="Permanent link">&para;</a></h4>
+<p>After IVF training, a quantizer (e.g. PQ, SQ) is trained to compress vectors. This phase may sample some of the
+dataset, but the sample size is tied to properties of the quantizer and the vector dimension rather than the size of the
+dataset. As a result, quantizer training typically requires very little RAM compared to the IVF phase.</p>
+<h4 id="shuffling">Shuffling<a class="headerlink" href="#shuffling" title="Permanent link">&para;</a></h4>
+<p>The final phase scans the entire vector column, transforms each vector (assigning it to an IVF partition and quantizing
+it), and writes the results into per-partition files on disk. This is a streaming operation — data is not accumulated in
+memory.</p>
+<p>The input scan uses a 2 GiB I/O readahead buffer by default (configurable via <code>LANCE_DEFAULT_IO_BUFFER_SIZE</code>) and reads
+batches of 8,192 rows. Incoming batches are transformed in parallel, with <code>num_cpus - 2</code> batches in flight at a time
+(configurable via <code>LANCE_CPU_THREADS</code>). Each batch is sorted by partition ID and the slices are written directly to the
+corresponding partition file. The in-flight memory during this phase is roughly:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>io_readahead_buffer + num_cpu_threads * batch_size * (raw_vector_size + transformed_vector_size)
+</span></code></pre></div>
+<p>Each partition has an open file writer with roughly 8 MiB of accumulation buffer. In practice there shouldn't be that
+much data accumulated in a single partition anyways. Instead, the max accumulation will be roughly the final size of
+the partitions which comes out to <code>num_rows * (num_sub_vectors + 8) bytes</code>. For example, 100M rows with a 1536-dimensional
+vector will have 96 sub-vectors and so the max accumulation will be ~10GB. The additional 8 bytes per row is for the row ID.</p>
+<h4 id="storage-requirements_2">Storage Requirements<a class="headerlink" href="#storage-requirements_2" title="Permanent link">&para;</a></h4>
+<p>The on-disk size of a vector index consists of the IVF centroids and the quantized vectors.</p>
+<p>The centroids require:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>num_partitions * dimension * sizeof(data_type)
+</span></code></pre></div>
+<p>This is typically small. For example, 10K partitions with 768-dimensional float32 vectors is only 30 MiB.</p>
+<p>The quantized vectors make up the bulk of the index. Each row stores a quantized code plus an 8-byte row ID. The
+exact size depends on the quantizer:</p>
+<p><strong>PQ (Product Quantization):</strong> Each sub-vector is quantized to a single byte, so each row requires
+<code>num_sub_vectors + 8</code> bytes. For example, 100M rows with 96 sub-vectors:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>100M * (96 + 8) = ~9.7 GiB
+</span></code></pre></div>
+<p><strong>SQ (Scalar Quantization):</strong> Each dimension is independently quantized to a single byte, so each row requires
+<code>dimension + 8</code> bytes. SQ preserves more information than PQ but requires more storage. For example, 100M rows with
+768-dimensional vectors:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>100M * (768 + 8) = ~72.3 GiB
+</span></code></pre></div>
+<p><strong>RQ (RaBitQ):</strong> New indexes default to 5 bits per dimension. Every bit width stores a 1-bit sign
+code plus three 4-byte correction factors. Multi-bit indexes also store the remaining bits in
+64-dimension-padded blocks and two additional 4-byte correction factors. Including the 8-byte row
+ID, the approximate size per row is:</p>
+<ul>
+<li>1-bit: <code>dimension / 8 + 20</code> bytes</li>
+<li>Multi-bit: <code>dimension / 8 + round_up(dimension, 64) * (num_bits - 1) / 8 + 28</code> bytes</li>
+</ul>
+<p>For example, the default 5-bit index for 100M rows with 768 dimensions requires:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>100M * (768 / 8 + 768 * 4 / 8 + 28) = ~47.3 GiB
+</span></code></pre></div>
+<p>The 5-bit default retains more information for the higher-fidelity distance estimates used by
+<code>Normal</code> and <code>Accurate</code> search modes, at the cost of more quantization work and index I/O during
+the build and a larger index. <code>Fast</code> search mode uses only the 1-bit sign code even when the index
+stores additional bits. Set <code>num_bits=1</code> explicitly to minimize index size and build I/O; the same
+100M-row example uses about 10.8 GiB, but searches cannot use the multi-bit distance estimate and
+may have lower recall.</p>
+<h4 id="amx-acceleration">AMX Acceleration<a class="headerlink" href="#amx-acceleration" title="Permanent link">&para;</a></h4>
+<p>On Linux x86_64 with an AMX-FP16 CPU (Intel Granite Rapids / Xeon 6 and newer), a <code>float16</code>
+vector column indexed with <code>dot</code> distance uses the AMX tile instructions, provided the build
+machine had clang &gt;= 16 or gcc &gt;= 13 to compile the kernel. There is nothing to enable —
+Lance checks the CPU at run time and falls back to the previous implementation everywhere else.</p>
+<p>The accelerated paths are also shape-gated, because below these sizes a tile pass costs more
+than it saves and the kernel declines the work:</p>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>float16</code> vectors, <code>dot</code> distance</td>
+<td>The kernel is fp16-specific; other types and metrics keep their existing paths</td>
+</tr>
+<tr>
+<td><code>dimension &gt;= 32</code></td>
+<td>One tile pass covers 32 dimensions; a shorter vector would be all scalar cleanup</td>
+</tr>
+<tr>
+<td><code>num_centroids &gt;= 32</code></td>
+<td>The GEMM steps its centroid loop by 32 and has no partial-tile path</td>
+</tr>
+</tbody>
+</table>
+<p>Anything outside them behaves exactly as it does today, so a small dataset or a low-dimensional
+column simply keeps the previous implementation rather than changing behaviour.</p>
+<p>Index build also changes algorithm where all of the above hold: comparing every vector against
+every centroid becomes affordable, so partition assignment is exact instead of approximated with
+a graph search over the centroids. Recall improves, and partition assignments differ from what an
+older build produced.</p>
+<p>Set <code>LANCE_DISABLE_AMX=1</code> to take the AMX paths out of service without rebuilding — for
+A/B measurement, or to get the previous behaviour back. Because it also moves partition
+assignment back to the approximate path, an index built with it set is not equivalent to one
+built without it; compare recall, not just build time.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../migration/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Migration Guide</div>
+        </a>
+        <a class="next" href="../tokenizer/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Tokenizer</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#logging">Logging</a>
+      <a class="ld-toc__h2" href="#trace-events">Trace Events</a>
+      <a class="ld-toc__h3" href="#file-audit">File Audit</a>
+      <a class="ld-toc__h3" href="#dataset-events">Dataset Events</a>
+      <a class="ld-toc__h3" href="#object-store-throttle-events">Object Store Throttle Events</a>
+      <a class="ld-toc__h3" href="#io-events">I/O Events</a>
+      <a class="ld-toc__h3" href="#execution-events">Execution Events</a>
+      <a class="ld-toc__h2" href="#threading-model">Threading Model</a>
+      <a class="ld-toc__h2" href="#memory-requirements">Memory Requirements</a>
+      <a class="ld-toc__h3" href="#metadata-cache">Metadata Cache</a>
+      <a class="ld-toc__h3" href="#index-cache">Index Cache</a>
+      <a class="ld-toc__h3" href="#scanning-data">Scanning Data</a>
+      <a class="ld-toc__h3" href="#cloud-store-throttling">Cloud Store Throttling</a>
+      <a class="ld-toc__h2" href="#fragment-sizing">Fragment Sizing</a>
+      <a class="ld-toc__h2" href="#conflict-handling">Conflict Handling</a>
+      <a class="ld-toc__h3" href="#fragment-reuse-index">Fragment Reuse Index</a>
+      <a class="ld-toc__h2" href="#indexes">Indexes</a>
+      <a class="ld-toc__h3" href="#btree-index">BTree Index</a>
+      <a class="ld-toc__h3" href="#bitmap-index">Bitmap Index</a>
+      <a class="ld-toc__h3" href="#storage-requirements_1">Storage Requirements</a>
+      <a class="ld-toc__h3" href="#performance_1">Performance</a>
+      <a class="ld-toc__h3" href="#vector-index">Vector Index</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../format/">Specification</a>
+        <a href="../../format/file/">File format</a>
+        <a href="../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../quickstart/">Getting started</a>
+        <a href="../read_and_write/">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>

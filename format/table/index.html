@@ -1,0 +1,1015 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Lance Table Format — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/table/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab" href="../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../community/">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../file/">Specification</a>
+    <a href="../file/encoding/">Encoding Strategy</a>
+    <a href="../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a class="active" href="./">Lance Table Format</a>
+    <a href="schema/">Schema</a>
+    <a href="versioning/">Versioning</a>
+    <a href="transaction/">Transactions</a>
+    <a href="layout/">Layout</a>
+    <a href="branch_tag/">Branch & Tag</a>
+    <a href="row_id_lineage/">Row ID & Lineage</a>
+    <a href="data_overlay_file/">Data Overlay Files</a>
+    <a href="mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../index/scalar/btree/">BTree</a>
+    <a href="../index/scalar/bitmap/">Bitmap</a>
+    <a href="../index/scalar/label_list/">Label List</a>
+    <a href="../index/scalar/zonemap/">Zone Map</a>
+    <a href="../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../index/scalar/fts/">Full Text Search</a>
+    <a href="../index/scalar/ngram/">N-gram</a>
+    <a href="../index/scalar/fmindex/">FM-Index</a>
+    <a href="../index/scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../namespace/">Overview</a>
+    <a href="../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../namespace/operations/">Overview</a>
+    <a href="../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../namespace/operations/models/">Operation Models</a>
+    <a href="../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../namespace/operations/models/Identity/">Identity</a>
+    <a href="../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../namespace/supported-catalogs/">Overview</a>
+    <a href="../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Table Format</span>
+        <span>/</span><b>Lance Table Format</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="lance-table-format">Lance Table Format<a class="headerlink" href="#lance-table-format" title="Permanent link">&para;</a></h1>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>The Lance table format organizes datasets as versioned collections of fragments, data files, deletion files, and indices. Each version is described by an immutable manifest that references the physical data for that snapshot.</p>
+<p>The format is designed for machine learning and highly selective workloads where column additions, index maintenance, and partial rewrites must be cheap. It supports ACID transactions, schema evolution, time travel, and efficient incremental updates through Multi-Version Concurrency Control (MVCC).</p>
+<h2 id="design-goals">Design Goals<a class="headerlink" href="#design-goals" title="Permanent link">&para;</a></h2>
+<h3 id="two-dimensional-storage">Two-Dimensional Storage<a class="headerlink" href="#two-dimensional-storage" title="Permanent link">&para;</a></h3>
+<p>Rows are partitioned into fragments, and each fragment can contain multiple data files that each provide one or more columns. This lets writers add or backfill columns by attaching new data files to existing fragments instead of rewriting the full table.</p>
+<h3 id="first-class-indices">First-Class Indices<a class="headerlink" href="#first-class-indices" title="Permanent link">&para;</a></h3>
+<p>Indices are part of the table format lifecycle. The table metadata describes index discovery and transactional coordination, while the detailed search structures remain separate index formats. This gives engines a uniform way to create, drop, update, and query indices without coupling the table format to any single indexing algorithm.</p>
+<h3 id="external-manifest-store">External Manifest Store<a class="headerlink" href="#external-manifest-store" title="Permanent link">&para;</a></h3>
+<p>Lance can commit directly to object storage, but deployments may also coordinate commits through an external manifest store. In that model, the external system helps serialize commits and apply governance checks, while the canonical table state is still persisted in the Lance table format.</p>
+<h2 id="manifest">Manifest<a class="headerlink" href="#manifest" title="Permanent link">&para;</a></h2>
+<p><img alt="Overview" src="../../images/table_overview.png" /></p>
+<p>A manifest describes a single version of the dataset.
+It contains the complete schema definition including nested fields, the list of data fragments comprising this version, 
+a monotonically increasing version number, and an optional reference to the index section that describes a list of index metadata.</p>
+<details>
+<summary>Manifest protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Manifest</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="c1">// All fields of the dataset, including the nested fields.</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">lance.file.Field</span><span class="w"> </span><span class="na">fields</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">  </span><span class="c1">// Schema metadata.</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">bytes</span><span class="p">&gt;</span><span class="w"> </span><span class="na">schema_metadata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">  </span><span class="c1">// Fragments of the dataset.</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFragment</span><span class="w"> </span><span class="na">fragments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">  </span><span class="c1">// Snapshot version number.</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="w">  </span><span class="cm">/* The file position of the version auxiliary data.</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="cm">   *  * It is not inheritable between versions.</span>
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="cm">   *  * It is not loaded by default during query.</span>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="cm">   */</span>
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">version_aux_data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">WriterVersion</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="w">    </span><span class="c1">// The name of the library that created this file.</span>
+</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a><span class="w">    </span><span class="kt">string</span><span class="w"> </span><span class="na">library</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="w">    </span><span class="cm">/* The version of the library that created this file. Because we cannot assume</span>
+</span><span id="__span-0-24"><a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="cm">     * that the library is semantically versioned, this is a string. However, if it</span>
+</span><span id="__span-0-25"><a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a><span class="cm">     * is semantically versioned, it should be a valid semver string without any 'v'</span>
+</span><span id="__span-0-26"><a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a><span class="cm">     * prefix. For example: `2.0.0`, `2.0.0-rc.1`.</span>
+</span><span id="__span-0-27"><a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a><span class="cm">     *</span>
+</span><span id="__span-0-28"><a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a><span class="cm">     * For forward compatibility with older readers, when writing new manifests this</span>
+</span><span id="__span-0-29"><a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a><span class="cm">     * field should contain only the core version (major.minor.patch) without any</span>
+</span><span id="__span-0-30"><a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a><span class="cm">     * prerelease or build metadata. The prerelease/build info should be stored in</span>
+</span><span id="__span-0-31"><a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a><span class="cm">     * the separate prerelease and build_metadata fields instead.</span>
+</span><span id="__span-0-32"><a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a><span class="cm">     */</span>
+</span><span id="__span-0-33"><a id="__codelineno-0-33" name="__codelineno-0-33" href="#__codelineno-0-33"></a><span class="w">    </span><span class="kt">string</span><span class="w"> </span><span class="na">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-34"><a id="__codelineno-0-34" name="__codelineno-0-34" href="#__codelineno-0-34"></a><span class="w">    </span><span class="cm">/* Optional semver prerelease identifier.</span>
+</span><span id="__span-0-35"><a id="__codelineno-0-35" name="__codelineno-0-35" href="#__codelineno-0-35"></a><span class="cm">     *</span>
+</span><span id="__span-0-36"><a id="__codelineno-0-36" name="__codelineno-0-36" href="#__codelineno-0-36"></a><span class="cm">     * This field stores the prerelease portion of a semantic version separately</span>
+</span><span id="__span-0-37"><a id="__codelineno-0-37" name="__codelineno-0-37" href="#__codelineno-0-37"></a><span class="cm">     * from the core version number. For example, if the full version is "2.0.0-rc.1",</span>
+</span><span id="__span-0-38"><a id="__codelineno-0-38" name="__codelineno-0-38" href="#__codelineno-0-38"></a><span class="cm">     * the version field would contain "2.0.0" and prerelease would contain "rc.1".</span>
+</span><span id="__span-0-39"><a id="__codelineno-0-39" name="__codelineno-0-39" href="#__codelineno-0-39"></a><span class="cm">     *</span>
+</span><span id="__span-0-40"><a id="__codelineno-0-40" name="__codelineno-0-40" href="#__codelineno-0-40"></a><span class="cm">     * This separation ensures forward compatibility: older readers can parse the</span>
+</span><span id="__span-0-41"><a id="__codelineno-0-41" name="__codelineno-0-41" href="#__codelineno-0-41"></a><span class="cm">     * clean version field without errors, while newer readers can reconstruct the</span>
+</span><span id="__span-0-42"><a id="__codelineno-0-42" name="__codelineno-0-42" href="#__codelineno-0-42"></a><span class="cm">     * full semantic version by combining version, prerelease, and build_metadata.</span>
+</span><span id="__span-0-43"><a id="__codelineno-0-43" name="__codelineno-0-43" href="#__codelineno-0-43"></a><span class="cm">     *</span>
+</span><span id="__span-0-44"><a id="__codelineno-0-44" name="__codelineno-0-44" href="#__codelineno-0-44"></a><span class="cm">     * If absent, the version field is used as-is.</span>
+</span><span id="__span-0-45"><a id="__codelineno-0-45" name="__codelineno-0-45" href="#__codelineno-0-45"></a><span class="cm">     */</span>
+</span><span id="__span-0-46"><a id="__codelineno-0-46" name="__codelineno-0-46" href="#__codelineno-0-46"></a><span class="w">    </span><span class="k">optional</span><span class="w"> </span><span class="kt">string</span><span class="w"> </span><span class="na">prerelease</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-0-47"><a id="__codelineno-0-47" name="__codelineno-0-47" href="#__codelineno-0-47"></a><span class="w">    </span><span class="cm">/* Optional semver build metadata.</span>
+</span><span id="__span-0-48"><a id="__codelineno-0-48" name="__codelineno-0-48" href="#__codelineno-0-48"></a><span class="cm">     *</span>
+</span><span id="__span-0-49"><a id="__codelineno-0-49" name="__codelineno-0-49" href="#__codelineno-0-49"></a><span class="cm">     * This field stores the build metadata portion of a semantic version separately</span>
+</span><span id="__span-0-50"><a id="__codelineno-0-50" name="__codelineno-0-50" href="#__codelineno-0-50"></a><span class="cm">     * from the core version number. For example, if the full version is</span>
+</span><span id="__span-0-51"><a id="__codelineno-0-51" name="__codelineno-0-51" href="#__codelineno-0-51"></a><span class="cm">     * "2.0.0-rc.1+build.123", the version field would contain "2.0.0", prerelease</span>
+</span><span id="__span-0-52"><a id="__codelineno-0-52" name="__codelineno-0-52" href="#__codelineno-0-52"></a><span class="cm">     * would contain "rc.1", and build_metadata would contain "build.123".</span>
+</span><span id="__span-0-53"><a id="__codelineno-0-53" name="__codelineno-0-53" href="#__codelineno-0-53"></a><span class="cm">     *</span>
+</span><span id="__span-0-54"><a id="__codelineno-0-54" name="__codelineno-0-54" href="#__codelineno-0-54"></a><span class="cm">     * If absent, no build metadata is present.</span>
+</span><span id="__span-0-55"><a id="__codelineno-0-55" name="__codelineno-0-55" href="#__codelineno-0-55"></a><span class="cm">     */</span>
+</span><span id="__span-0-56"><a id="__codelineno-0-56" name="__codelineno-0-56" href="#__codelineno-0-56"></a><span class="w">    </span><span class="k">optional</span><span class="w"> </span><span class="kt">string</span><span class="w"> </span><span class="na">build_metadata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-0-57"><a id="__codelineno-0-57" name="__codelineno-0-57" href="#__codelineno-0-57"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-58"><a id="__codelineno-0-58" name="__codelineno-0-58" href="#__codelineno-0-58"></a>
+</span><span id="__span-0-59"><a id="__codelineno-0-59" name="__codelineno-0-59" href="#__codelineno-0-59"></a><span class="w">  </span><span class="cm">/* The version of the writer that created this file.</span>
+</span><span id="__span-0-60"><a id="__codelineno-0-60" name="__codelineno-0-60" href="#__codelineno-0-60"></a><span class="cm">   *</span>
+</span><span id="__span-0-61"><a id="__codelineno-0-61" name="__codelineno-0-61" href="#__codelineno-0-61"></a><span class="cm">   * This information may be used to detect whether the file may have known bugs</span>
+</span><span id="__span-0-62"><a id="__codelineno-0-62" name="__codelineno-0-62" href="#__codelineno-0-62"></a><span class="cm">   * associated with that writer.</span>
+</span><span id="__span-0-63"><a id="__codelineno-0-63" name="__codelineno-0-63" href="#__codelineno-0-63"></a><span class="cm">   */</span>
+</span><span id="__span-0-64"><a id="__codelineno-0-64" name="__codelineno-0-64" href="#__codelineno-0-64"></a><span class="w">  </span><span class="n">WriterVersion</span><span class="w"> </span><span class="na">writer_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">13</span><span class="p">;</span>
+</span><span id="__span-0-65"><a id="__codelineno-0-65" name="__codelineno-0-65" href="#__codelineno-0-65"></a>
+</span><span id="__span-0-66"><a id="__codelineno-0-66" name="__codelineno-0-66" href="#__codelineno-0-66"></a><span class="w">  </span><span class="c1">// If present, the file position of the index metadata.</span>
+</span><span id="__span-0-67"><a id="__codelineno-0-67" name="__codelineno-0-67" href="#__codelineno-0-67"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">uint64</span><span class="w"> </span><span class="na">index_section</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-0-68"><a id="__codelineno-0-68" name="__codelineno-0-68" href="#__codelineno-0-68"></a>
+</span><span id="__span-0-69"><a id="__codelineno-0-69" name="__codelineno-0-69" href="#__codelineno-0-69"></a><span class="w">  </span><span class="c1">// Version creation Timestamp, UTC timezone</span>
+</span><span id="__span-0-70"><a id="__codelineno-0-70" name="__codelineno-0-70" href="#__codelineno-0-70"></a><span class="w">  </span><span class="n">google.protobuf.Timestamp</span><span class="w"> </span><span class="na">timestamp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-0-71"><a id="__codelineno-0-71" name="__codelineno-0-71" href="#__codelineno-0-71"></a>
+</span><span id="__span-0-72"><a id="__codelineno-0-72" name="__codelineno-0-72" href="#__codelineno-0-72"></a><span class="w">  </span><span class="c1">// Optional version tag</span>
+</span><span id="__span-0-73"><a id="__codelineno-0-73" name="__codelineno-0-73" href="#__codelineno-0-73"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">tag</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-0-74"><a id="__codelineno-0-74" name="__codelineno-0-74" href="#__codelineno-0-74"></a>
+</span><span id="__span-0-75"><a id="__codelineno-0-75" name="__codelineno-0-75" href="#__codelineno-0-75"></a><span class="w">  </span><span class="cm">/* Feature flags for readers.</span>
+</span><span id="__span-0-76"><a id="__codelineno-0-76" name="__codelineno-0-76" href="#__codelineno-0-76"></a><span class="cm">   *</span>
+</span><span id="__span-0-77"><a id="__codelineno-0-77" name="__codelineno-0-77" href="#__codelineno-0-77"></a><span class="cm">   * A bitmap of flags that indicate which features are required to be able to</span>
+</span><span id="__span-0-78"><a id="__codelineno-0-78" name="__codelineno-0-78" href="#__codelineno-0-78"></a><span class="cm">   * read the table. If a reader does not recognize a flag that is set, it</span>
+</span><span id="__span-0-79"><a id="__codelineno-0-79" name="__codelineno-0-79" href="#__codelineno-0-79"></a><span class="cm">   * should not attempt to read the dataset.</span>
+</span><span id="__span-0-80"><a id="__codelineno-0-80" name="__codelineno-0-80" href="#__codelineno-0-80"></a><span class="cm">   *</span>
+</span><span id="__span-0-81"><a id="__codelineno-0-81" name="__codelineno-0-81" href="#__codelineno-0-81"></a><span class="cm">   * Known flags:</span>
+</span><span id="__span-0-82"><a id="__codelineno-0-82" name="__codelineno-0-82" href="#__codelineno-0-82"></a><span class="cm">   * * 1 &lt;&lt; 0: deletion files are present</span>
+</span><span id="__span-0-83"><a id="__codelineno-0-83" name="__codelineno-0-83" href="#__codelineno-0-83"></a><span class="cm">   * * 1 &lt;&lt; 1: row ids are stable and stored as part of the fragment metadata.</span>
+</span><span id="__span-0-84"><a id="__codelineno-0-84" name="__codelineno-0-84" href="#__codelineno-0-84"></a><span class="cm">   * * 1 &lt;&lt; 2: use v2 format (deprecated)</span>
+</span><span id="__span-0-85"><a id="__codelineno-0-85" name="__codelineno-0-85" href="#__codelineno-0-85"></a><span class="cm">   * * 1 &lt;&lt; 3: table config is present</span>
+</span><span id="__span-0-86"><a id="__codelineno-0-86" name="__codelineno-0-86" href="#__codelineno-0-86"></a><span class="cm">   * * 1 &lt;&lt; 4: dataset uses multiple base paths</span>
+</span><span id="__span-0-87"><a id="__codelineno-0-87" name="__codelineno-0-87" href="#__codelineno-0-87"></a><span class="cm">   * * 1 &lt;&lt; 5: transaction file writes are disabled</span>
+</span><span id="__span-0-88"><a id="__codelineno-0-88" name="__codelineno-0-88" href="#__codelineno-0-88"></a><span class="cm">   * * 1 &lt;&lt; 6: data overlay files are present (see DataOverlayFile). Readers that do</span>
+</span><span id="__span-0-89"><a id="__codelineno-0-89" name="__codelineno-0-89" href="#__codelineno-0-89"></a><span class="cm">   *   not understand overlays must refuse the dataset, since ignoring an overlay</span>
+</span><span id="__span-0-90"><a id="__codelineno-0-90" name="__codelineno-0-90" href="#__codelineno-0-90"></a><span class="cm">   *   would silently return stale base values.</span>
+</span><span id="__span-0-91"><a id="__codelineno-0-91" name="__codelineno-0-91" href="#__codelineno-0-91"></a><span class="cm">   * * 1 &lt;&lt; 7: some index declares covering columns, so IndexMetadata.fields means</span>
+</span><span id="__span-0-92"><a id="__codelineno-0-92" name="__codelineno-0-92" href="#__codelineno-0-92"></a><span class="cm">   *   the keyed columns followed by the carried ones named in covering_fields (see</span>
+</span><span id="__span-0-93"><a id="__codelineno-0-93" name="__codelineno-0-93" href="#__codelineno-0-93"></a><span class="cm">   *   IndexMetadata). Readers that do not understand it must refuse the dataset,</span>
+</span><span id="__span-0-94"><a id="__codelineno-0-94" name="__codelineno-0-94" href="#__codelineno-0-94"></a><span class="cm">   *   since selecting an index by membership of fields would answer a query on a</span>
+</span><span id="__span-0-95"><a id="__codelineno-0-95" name="__codelineno-0-95" href="#__codelineno-0-95"></a><span class="cm">   *   merely-carried column with an index keyed on a different column. Writers must</span>
+</span><span id="__span-0-96"><a id="__codelineno-0-96" name="__codelineno-0-96" href="#__codelineno-0-96"></a><span class="cm">   *   refuse it too: one that treats every entry of fields as keyed would maintain</span>
+</span><span id="__span-0-97"><a id="__codelineno-0-97" name="__codelineno-0-97" href="#__codelineno-0-97"></a><span class="cm">   *   the index against the wrong dependency set.</span>
+</span><span id="__span-0-98"><a id="__codelineno-0-98" name="__codelineno-0-98" href="#__codelineno-0-98"></a><span class="cm">   * * 1 &lt;&lt; 8: reserved for datasets that may reference recognized V2 data files</span>
+</span><span id="__span-0-99"><a id="__codelineno-0-99" name="__codelineno-0-99" href="#__codelineno-0-99"></a><span class="cm">   *   with different exact versions. Implementations that do not support the</span>
+</span><span id="__span-0-100"><a id="__codelineno-0-100" name="__codelineno-0-100" href="#__codelineno-0-100"></a><span class="cm">   *   per-file exact-version contract must treat this bit as unknown.</span>
+</span><span id="__span-0-101"><a id="__codelineno-0-101" name="__codelineno-0-101" href="#__codelineno-0-101"></a><span class="cm">   */</span>
+</span><span id="__span-0-102"><a id="__codelineno-0-102" name="__codelineno-0-102" href="#__codelineno-0-102"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">reader_feature_flags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-0-103"><a id="__codelineno-0-103" name="__codelineno-0-103" href="#__codelineno-0-103"></a>
+</span><span id="__span-0-104"><a id="__codelineno-0-104" name="__codelineno-0-104" href="#__codelineno-0-104"></a><span class="w">  </span><span class="cm">/* Feature flags for writers.</span>
+</span><span id="__span-0-105"><a id="__codelineno-0-105" name="__codelineno-0-105" href="#__codelineno-0-105"></a><span class="cm">   *</span>
+</span><span id="__span-0-106"><a id="__codelineno-0-106" name="__codelineno-0-106" href="#__codelineno-0-106"></a><span class="cm">   * A bitmap of flags that indicate which features must be used when writing to the</span>
+</span><span id="__span-0-107"><a id="__codelineno-0-107" name="__codelineno-0-107" href="#__codelineno-0-107"></a><span class="cm">   * dataset. If a writer does not recognize a flag that is set, it should not attempt to</span>
+</span><span id="__span-0-108"><a id="__codelineno-0-108" name="__codelineno-0-108" href="#__codelineno-0-108"></a><span class="cm">   * write to the dataset.</span>
+</span><span id="__span-0-109"><a id="__codelineno-0-109" name="__codelineno-0-109" href="#__codelineno-0-109"></a><span class="cm">   *</span>
+</span><span id="__span-0-110"><a id="__codelineno-0-110" name="__codelineno-0-110" href="#__codelineno-0-110"></a><span class="cm">   * The flag identities are the same as for reader_feature_flags, but the values of</span>
+</span><span id="__span-0-111"><a id="__codelineno-0-111" name="__codelineno-0-111" href="#__codelineno-0-111"></a><span class="cm">   * reader_feature_flags and writer_feature_flags are not required to be identical.</span>
+</span><span id="__span-0-112"><a id="__codelineno-0-112" name="__codelineno-0-112" href="#__codelineno-0-112"></a><span class="cm">   */</span>
+</span><span id="__span-0-113"><a id="__codelineno-0-113" name="__codelineno-0-113" href="#__codelineno-0-113"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">writer_feature_flags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span><span id="__span-0-114"><a id="__codelineno-0-114" name="__codelineno-0-114" href="#__codelineno-0-114"></a>
+</span><span id="__span-0-115"><a id="__codelineno-0-115" name="__codelineno-0-115" href="#__codelineno-0-115"></a><span class="w">  </span><span class="cm">/* The highest fragment ID that has been used so far.</span>
+</span><span id="__span-0-116"><a id="__codelineno-0-116" name="__codelineno-0-116" href="#__codelineno-0-116"></a><span class="cm">   *</span>
+</span><span id="__span-0-117"><a id="__codelineno-0-117" name="__codelineno-0-117" href="#__codelineno-0-117"></a><span class="cm">   * This ID is not guaranteed to be present in the current version, but it may</span>
+</span><span id="__span-0-118"><a id="__codelineno-0-118" name="__codelineno-0-118" href="#__codelineno-0-118"></a><span class="cm">   * have been used in previous versions.</span>
+</span><span id="__span-0-119"><a id="__codelineno-0-119" name="__codelineno-0-119" href="#__codelineno-0-119"></a><span class="cm">   *</span>
+</span><span id="__span-0-120"><a id="__codelineno-0-120" name="__codelineno-0-120" href="#__codelineno-0-120"></a><span class="cm">   * For a single fragment, will be zero. For no fragments, will be absent.</span>
+</span><span id="__span-0-121"><a id="__codelineno-0-121" name="__codelineno-0-121" href="#__codelineno-0-121"></a><span class="cm">   */</span>
+</span><span id="__span-0-122"><a id="__codelineno-0-122" name="__codelineno-0-122" href="#__codelineno-0-122"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">uint32</span><span class="w"> </span><span class="na">max_fragment_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">11</span><span class="p">;</span>
+</span><span id="__span-0-123"><a id="__codelineno-0-123" name="__codelineno-0-123" href="#__codelineno-0-123"></a>
+</span><span id="__span-0-124"><a id="__codelineno-0-124" name="__codelineno-0-124" href="#__codelineno-0-124"></a><span class="w">  </span><span class="cm">/* Path to the transaction file, relative to `{root}/_transactions`. The file at that</span>
+</span><span id="__span-0-125"><a id="__codelineno-0-125" name="__codelineno-0-125" href="#__codelineno-0-125"></a><span class="cm">   * location contains a wire-format serialized Transaction message representing the</span>
+</span><span id="__span-0-126"><a id="__codelineno-0-126" name="__codelineno-0-126" href="#__codelineno-0-126"></a><span class="cm">   * transaction that created this version.</span>
+</span><span id="__span-0-127"><a id="__codelineno-0-127" name="__codelineno-0-127" href="#__codelineno-0-127"></a><span class="cm">   *</span>
+</span><span id="__span-0-128"><a id="__codelineno-0-128" name="__codelineno-0-128" href="#__codelineno-0-128"></a><span class="cm">   * This string field "transaction_file" may be empty if no transaction file was written.</span>
+</span><span id="__span-0-129"><a id="__codelineno-0-129" name="__codelineno-0-129" href="#__codelineno-0-129"></a><span class="cm">   *</span>
+</span><span id="__span-0-130"><a id="__codelineno-0-130" name="__codelineno-0-130" href="#__codelineno-0-130"></a><span class="cm">   * The path format is "{read_version}-{uuid}.txn" where {read_version} is the version of</span>
+</span><span id="__span-0-131"><a id="__codelineno-0-131" name="__codelineno-0-131" href="#__codelineno-0-131"></a><span class="cm">   * the table the transaction read from (serialized to decimal with no padding digits),</span>
+</span><span id="__span-0-132"><a id="__codelineno-0-132" name="__codelineno-0-132" href="#__codelineno-0-132"></a><span class="cm">   * and {uuid} is a hyphen-separated UUID.</span>
+</span><span id="__span-0-133"><a id="__codelineno-0-133" name="__codelineno-0-133" href="#__codelineno-0-133"></a><span class="cm">   */</span>
+</span><span id="__span-0-134"><a id="__codelineno-0-134" name="__codelineno-0-134" href="#__codelineno-0-134"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">transaction_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">12</span><span class="p">;</span>
+</span><span id="__span-0-135"><a id="__codelineno-0-135" name="__codelineno-0-135" href="#__codelineno-0-135"></a>
+</span><span id="__span-0-136"><a id="__codelineno-0-136" name="__codelineno-0-136" href="#__codelineno-0-136"></a><span class="w">  </span><span class="cm">/* The file position of the transaction content. None if transaction is empty</span>
+</span><span id="__span-0-137"><a id="__codelineno-0-137" name="__codelineno-0-137" href="#__codelineno-0-137"></a><span class="cm">   * This transaction content begins with the transaction content length as u32</span>
+</span><span id="__span-0-138"><a id="__codelineno-0-138" name="__codelineno-0-138" href="#__codelineno-0-138"></a><span class="cm">   * If the transaction proto message has a length of `len`, the message ends at `len` + 4</span>
+</span><span id="__span-0-139"><a id="__codelineno-0-139" name="__codelineno-0-139" href="#__codelineno-0-139"></a><span class="cm">   */</span>
+</span><span id="__span-0-140"><a id="__codelineno-0-140" name="__codelineno-0-140" href="#__codelineno-0-140"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">uint64</span><span class="w"> </span><span class="na">transaction_section</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">21</span><span class="p">;</span>
+</span><span id="__span-0-141"><a id="__codelineno-0-141" name="__codelineno-0-141" href="#__codelineno-0-141"></a>
+</span><span id="__span-0-142"><a id="__codelineno-0-142" name="__codelineno-0-142" href="#__codelineno-0-142"></a><span class="w">  </span><span class="cm">/* The next unused row id. If zero, then the table does not have any rows.</span>
+</span><span id="__span-0-143"><a id="__codelineno-0-143" name="__codelineno-0-143" href="#__codelineno-0-143"></a><span class="cm">   *</span>
+</span><span id="__span-0-144"><a id="__codelineno-0-144" name="__codelineno-0-144" href="#__codelineno-0-144"></a><span class="cm">   * This is only used if the "stable_row_ids" feature flag is set.</span>
+</span><span id="__span-0-145"><a id="__codelineno-0-145" name="__codelineno-0-145" href="#__codelineno-0-145"></a><span class="cm">   */</span>
+</span><span id="__span-0-146"><a id="__codelineno-0-146" name="__codelineno-0-146" href="#__codelineno-0-146"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">next_row_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">14</span><span class="p">;</span>
+</span><span id="__span-0-147"><a id="__codelineno-0-147" name="__codelineno-0-147" href="#__codelineno-0-147"></a>
+</span><span id="__span-0-148"><a id="__codelineno-0-148" name="__codelineno-0-148" href="#__codelineno-0-148"></a><span class="w">  </span><span class="kd">message</span><span class="w"> </span><span class="nc">DataStorageFormat</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-0-149"><a id="__codelineno-0-149" name="__codelineno-0-149" href="#__codelineno-0-149"></a><span class="w">    </span><span class="c1">// The format of the data files (e.g. "lance")</span>
+</span><span id="__span-0-150"><a id="__codelineno-0-150" name="__codelineno-0-150" href="#__codelineno-0-150"></a><span class="w">    </span><span class="kt">string</span><span class="w"> </span><span class="na">file_format</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-0-151"><a id="__codelineno-0-151" name="__codelineno-0-151" href="#__codelineno-0-151"></a><span class="w">    </span><span class="cm">/* The max format version of the data files. The format of the version can vary by</span>
+</span><span id="__span-0-152"><a id="__codelineno-0-152" name="__codelineno-0-152" href="#__codelineno-0-152"></a><span class="cm">     * file_format and is not required to follow semver.</span>
+</span><span id="__span-0-153"><a id="__codelineno-0-153" name="__codelineno-0-153" href="#__codelineno-0-153"></a><span class="cm">     *</span>
+</span><span id="__span-0-154"><a id="__codelineno-0-154" name="__codelineno-0-154" href="#__codelineno-0-154"></a><span class="cm">     * Every file in this version of the dataset has the same file_format version.</span>
+</span><span id="__span-0-155"><a id="__codelineno-0-155" name="__codelineno-0-155" href="#__codelineno-0-155"></a><span class="cm">     */</span>
+</span><span id="__span-0-156"><a id="__codelineno-0-156" name="__codelineno-0-156" href="#__codelineno-0-156"></a><span class="w">    </span><span class="kt">string</span><span class="w"> </span><span class="na">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-0-157"><a id="__codelineno-0-157" name="__codelineno-0-157" href="#__codelineno-0-157"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-0-158"><a id="__codelineno-0-158" name="__codelineno-0-158" href="#__codelineno-0-158"></a>
+</span><span id="__span-0-159"><a id="__codelineno-0-159" name="__codelineno-0-159" href="#__codelineno-0-159"></a><span class="w">  </span><span class="cm">/* The data storage format</span>
+</span><span id="__span-0-160"><a id="__codelineno-0-160" name="__codelineno-0-160" href="#__codelineno-0-160"></a><span class="cm">   *</span>
+</span><span id="__span-0-161"><a id="__codelineno-0-161" name="__codelineno-0-161" href="#__codelineno-0-161"></a><span class="cm">   * This specifies what format is used to store the data files.</span>
+</span><span id="__span-0-162"><a id="__codelineno-0-162" name="__codelineno-0-162" href="#__codelineno-0-162"></a><span class="cm">   */</span>
+</span><span id="__span-0-163"><a id="__codelineno-0-163" name="__codelineno-0-163" href="#__codelineno-0-163"></a><span class="w">  </span><span class="n">DataStorageFormat</span><span class="w"> </span><span class="na">data_format</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">15</span><span class="p">;</span>
+</span><span id="__span-0-164"><a id="__codelineno-0-164" name="__codelineno-0-164" href="#__codelineno-0-164"></a>
+</span><span id="__span-0-165"><a id="__codelineno-0-165" name="__codelineno-0-165" href="#__codelineno-0-165"></a><span class="w">  </span><span class="cm">/* Table config.</span>
+</span><span id="__span-0-166"><a id="__codelineno-0-166" name="__codelineno-0-166" href="#__codelineno-0-166"></a><span class="cm">   *</span>
+</span><span id="__span-0-167"><a id="__codelineno-0-167" name="__codelineno-0-167" href="#__codelineno-0-167"></a><span class="cm">   * Keys with the prefix "lance." are reserved for the Lance library. Other</span>
+</span><span id="__span-0-168"><a id="__codelineno-0-168" name="__codelineno-0-168" href="#__codelineno-0-168"></a><span class="cm">   * libraries may wish to similarly prefix their configuration keys</span>
+</span><span id="__span-0-169"><a id="__codelineno-0-169" name="__codelineno-0-169" href="#__codelineno-0-169"></a><span class="cm">   * appropriately.</span>
+</span><span id="__span-0-170"><a id="__codelineno-0-170" name="__codelineno-0-170" href="#__codelineno-0-170"></a><span class="cm">   */</span>
+</span><span id="__span-0-171"><a id="__codelineno-0-171" name="__codelineno-0-171" href="#__codelineno-0-171"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">string</span><span class="p">&gt;</span><span class="w"> </span><span class="na">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">16</span><span class="p">;</span>
+</span><span id="__span-0-172"><a id="__codelineno-0-172" name="__codelineno-0-172" href="#__codelineno-0-172"></a>
+</span><span id="__span-0-173"><a id="__codelineno-0-173" name="__codelineno-0-173" href="#__codelineno-0-173"></a><span class="w">  </span><span class="cm">/* Metadata associated with the table.</span>
+</span><span id="__span-0-174"><a id="__codelineno-0-174" name="__codelineno-0-174" href="#__codelineno-0-174"></a><span class="cm">   *</span>
+</span><span id="__span-0-175"><a id="__codelineno-0-175" name="__codelineno-0-175" href="#__codelineno-0-175"></a><span class="cm">   * This is a key-value map that can be used to store arbitrary metadata</span>
+</span><span id="__span-0-176"><a id="__codelineno-0-176" name="__codelineno-0-176" href="#__codelineno-0-176"></a><span class="cm">   * associated with the table.</span>
+</span><span id="__span-0-177"><a id="__codelineno-0-177" name="__codelineno-0-177" href="#__codelineno-0-177"></a><span class="cm">   *</span>
+</span><span id="__span-0-178"><a id="__codelineno-0-178" name="__codelineno-0-178" href="#__codelineno-0-178"></a><span class="cm">   * This is different than configuration, which is used to tell libraries how</span>
+</span><span id="__span-0-179"><a id="__codelineno-0-179" name="__codelineno-0-179" href="#__codelineno-0-179"></a><span class="cm">   * to read, write, or manage the table.</span>
+</span><span id="__span-0-180"><a id="__codelineno-0-180" name="__codelineno-0-180" href="#__codelineno-0-180"></a><span class="cm">   *</span>
+</span><span id="__span-0-181"><a id="__codelineno-0-181" name="__codelineno-0-181" href="#__codelineno-0-181"></a><span class="cm">   * This is different than schema metadata, which is used to describe the</span>
+</span><span id="__span-0-182"><a id="__codelineno-0-182" name="__codelineno-0-182" href="#__codelineno-0-182"></a><span class="cm">   * data itself and is attached to the output schema of scans.</span>
+</span><span id="__span-0-183"><a id="__codelineno-0-183" name="__codelineno-0-183" href="#__codelineno-0-183"></a><span class="cm">   */</span>
+</span><span id="__span-0-184"><a id="__codelineno-0-184" name="__codelineno-0-184" href="#__codelineno-0-184"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">string</span><span class="p">&gt;</span><span class="w"> </span><span class="na">table_metadata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">19</span><span class="p">;</span>
+</span><span id="__span-0-185"><a id="__codelineno-0-185" name="__codelineno-0-185" href="#__codelineno-0-185"></a>
+</span><span id="__span-0-186"><a id="__codelineno-0-186" name="__codelineno-0-186" href="#__codelineno-0-186"></a><span class="w">  </span><span class="c1">// Field number 17 (`blob_dataset_version`) was used for a secondary blob dataset.</span>
+</span><span id="__span-0-187"><a id="__codelineno-0-187" name="__codelineno-0-187" href="#__codelineno-0-187"></a><span class="w">  </span><span class="k">reserved</span><span class="w"> </span><span class="mi">17</span><span class="p">;</span>
+</span><span id="__span-0-188"><a id="__codelineno-0-188" name="__codelineno-0-188" href="#__codelineno-0-188"></a><span class="w">  </span><span class="k">reserved</span><span class="w"> </span><span class="s">"blob_dataset_version"</span><span class="p">;</span>
+</span><span id="__span-0-189"><a id="__codelineno-0-189" name="__codelineno-0-189" href="#__codelineno-0-189"></a>
+</span><span id="__span-0-190"><a id="__codelineno-0-190" name="__codelineno-0-190" href="#__codelineno-0-190"></a><span class="w">  </span><span class="cm">/* The base paths of data files.</span>
+</span><span id="__span-0-191"><a id="__codelineno-0-191" name="__codelineno-0-191" href="#__codelineno-0-191"></a><span class="cm">   *</span>
+</span><span id="__span-0-192"><a id="__codelineno-0-192" name="__codelineno-0-192" href="#__codelineno-0-192"></a><span class="cm">   * This is used to determine the base path of a data file. In common cases data file paths are under current dataset base path.</span>
+</span><span id="__span-0-193"><a id="__codelineno-0-193" name="__codelineno-0-193" href="#__codelineno-0-193"></a><span class="cm">   * But for shallow cloning, importing file and other multi-tier storage cases, the actual data files could be outside of the current dataset.</span>
+</span><span id="__span-0-194"><a id="__codelineno-0-194" name="__codelineno-0-194" href="#__codelineno-0-194"></a><span class="cm">   * This field is used with the `base_id` in `lance.file.File` and `lance.file.DeletionFile`.</span>
+</span><span id="__span-0-195"><a id="__codelineno-0-195" name="__codelineno-0-195" href="#__codelineno-0-195"></a><span class="cm">   *</span>
+</span><span id="__span-0-196"><a id="__codelineno-0-196" name="__codelineno-0-196" href="#__codelineno-0-196"></a><span class="cm">   * For example, if we have a dataset with base path `s3://bucket/dataset`, we have a DataFile with base_id 0, we get the actual data file path by:</span>
+</span><span id="__span-0-197"><a id="__codelineno-0-197" name="__codelineno-0-197" href="#__codelineno-0-197"></a><span class="cm">   * base_paths[id = 0] + /data/ + file.path</span>
+</span><span id="__span-0-198"><a id="__codelineno-0-198" name="__codelineno-0-198" href="#__codelineno-0-198"></a><span class="cm">   * the key(a.k.a index) starts from 0, increased by 1 for each new base path.</span>
+</span><span id="__span-0-199"><a id="__codelineno-0-199" name="__codelineno-0-199" href="#__codelineno-0-199"></a><span class="cm">   */</span>
+</span><span id="__span-0-200"><a id="__codelineno-0-200" name="__codelineno-0-200" href="#__codelineno-0-200"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">BasePath</span><span class="w"> </span><span class="na">base_paths</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">18</span><span class="p">;</span>
+</span><span id="__span-0-201"><a id="__codelineno-0-201" name="__codelineno-0-201" href="#__codelineno-0-201"></a>
+</span><span id="__span-0-202"><a id="__codelineno-0-202" name="__codelineno-0-202" href="#__codelineno-0-202"></a><span class="w">  </span><span class="c1">// The branch of the dataset. None means main branch.</span>
+</span><span id="__span-0-203"><a id="__codelineno-0-203" name="__codelineno-0-203" href="#__codelineno-0-203"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">string</span><span class="w"> </span><span class="na">branch</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">20</span><span class="p">;</span>
+</span><span id="__span-0-204"><a id="__codelineno-0-204" name="__codelineno-0-204" href="#__codelineno-0-204"></a>
+</span><span id="__span-0-205"><a id="__codelineno-0-205" name="__codelineno-0-205" href="#__codelineno-0-205"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h2 id="schema-fields">Schema &amp; Fields<a class="headerlink" href="#schema-fields" title="Permanent link">&para;</a></h2>
+<p>The schema of the table is written as a series of fields, plus a schema metadata map.
+The data types generally have a 1-1 correspondence with the Apache Arrow data types.
+Each field, including nested fields, have a unique integer id. At initial table creation time, fields are assigned ids in depth-first order.
+Afterwards, field IDs are assigned incrementally for newly added fields.</p>
+<p>Column encoding configurations are specified through field metadata using the <code>lance-encoding:</code> prefix.
+See <a href="../file/encoding/">File Format Encoding Specification</a> for details on available encodings, compression schemes, and configuration options.</p>
+<p>For complete schema specification details including supported data types, field ID assignment, and metadata handling,
+see the <a href="schema/">Schema Format Specification</a>.</p>
+<details>
+<summary>Field protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Field</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="kd">enum</span><span class="w"> </span><span class="n">Type</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="na">PARENT</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">    </span><span class="na">REPEATED</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">    </span><span class="na">LEAF</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">  </span><span class="n">Type</span><span class="w"> </span><span class="na">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">  </span><span class="c1">// Fully qualified name.</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="w">  </span><span class="cm">/* Field Id.</span>
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="cm">   *</span>
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="cm">   * See the comment in `DataFile.fields` for how field ids are assigned.</span>
+</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="cm">   */</span>
+</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="w">  </span><span class="kt">int32</span><span class="w"> </span><span class="na">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="w">  </span><span class="c1">/// Parent Field ID. If not set, this is a top-level column.</span>
+</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a><span class="w">  </span><span class="kt">int32</span><span class="w"> </span><span class="na">parent_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a>
+</span><span id="__span-1-19"><a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a><span class="w">  </span><span class="cm">/* Logical types, support parameterized Arrow Type.</span>
+</span><span id="__span-1-20"><a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a><span class="cm">   *</span>
+</span><span id="__span-1-21"><a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a><span class="cm">   * PARENT types will always have logical type "struct".</span>
+</span><span id="__span-1-22"><a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a><span class="cm">   *</span>
+</span><span id="__span-1-23"><a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a><span class="cm">   * REPEATED types may have logical types:</span>
+</span><span id="__span-1-24"><a id="__codelineno-1-24" name="__codelineno-1-24" href="#__codelineno-1-24"></a><span class="cm">   * * "list"</span>
+</span><span id="__span-1-25"><a id="__codelineno-1-25" name="__codelineno-1-25" href="#__codelineno-1-25"></a><span class="cm">   * * "large_list"</span>
+</span><span id="__span-1-26"><a id="__codelineno-1-26" name="__codelineno-1-26" href="#__codelineno-1-26"></a><span class="cm">   * * "list.struct"</span>
+</span><span id="__span-1-27"><a id="__codelineno-1-27" name="__codelineno-1-27" href="#__codelineno-1-27"></a><span class="cm">   * * "large_list.struct"</span>
+</span><span id="__span-1-28"><a id="__codelineno-1-28" name="__codelineno-1-28" href="#__codelineno-1-28"></a><span class="cm">   * The final two are used if the list values are structs, and therefore the</span>
+</span><span id="__span-1-29"><a id="__codelineno-1-29" name="__codelineno-1-29" href="#__codelineno-1-29"></a><span class="cm">   * field is both implicitly REPEATED and PARENT.</span>
+</span><span id="__span-1-30"><a id="__codelineno-1-30" name="__codelineno-1-30" href="#__codelineno-1-30"></a><span class="cm">   *</span>
+</span><span id="__span-1-31"><a id="__codelineno-1-31" name="__codelineno-1-31" href="#__codelineno-1-31"></a><span class="cm">   * LEAF types may have logical types:</span>
+</span><span id="__span-1-32"><a id="__codelineno-1-32" name="__codelineno-1-32" href="#__codelineno-1-32"></a><span class="cm">   * * "null"</span>
+</span><span id="__span-1-33"><a id="__codelineno-1-33" name="__codelineno-1-33" href="#__codelineno-1-33"></a><span class="cm">   * * "bool"</span>
+</span><span id="__span-1-34"><a id="__codelineno-1-34" name="__codelineno-1-34" href="#__codelineno-1-34"></a><span class="cm">   * * "int8" / "uint8"</span>
+</span><span id="__span-1-35"><a id="__codelineno-1-35" name="__codelineno-1-35" href="#__codelineno-1-35"></a><span class="cm">   * * "int16" / "uint16"</span>
+</span><span id="__span-1-36"><a id="__codelineno-1-36" name="__codelineno-1-36" href="#__codelineno-1-36"></a><span class="cm">   * * "int32" / "uint32"</span>
+</span><span id="__span-1-37"><a id="__codelineno-1-37" name="__codelineno-1-37" href="#__codelineno-1-37"></a><span class="cm">   * * "int64" / "uint64"</span>
+</span><span id="__span-1-38"><a id="__codelineno-1-38" name="__codelineno-1-38" href="#__codelineno-1-38"></a><span class="cm">   * * "halffloat" / "float" / "double"</span>
+</span><span id="__span-1-39"><a id="__codelineno-1-39" name="__codelineno-1-39" href="#__codelineno-1-39"></a><span class="cm">   * * "string" / "large_string"</span>
+</span><span id="__span-1-40"><a id="__codelineno-1-40" name="__codelineno-1-40" href="#__codelineno-1-40"></a><span class="cm">   * * "binary" / "large_binary"</span>
+</span><span id="__span-1-41"><a id="__codelineno-1-41" name="__codelineno-1-41" href="#__codelineno-1-41"></a><span class="cm">   * * "date32:day"</span>
+</span><span id="__span-1-42"><a id="__codelineno-1-42" name="__codelineno-1-42" href="#__codelineno-1-42"></a><span class="cm">   * * "date64:ms"</span>
+</span><span id="__span-1-43"><a id="__codelineno-1-43" name="__codelineno-1-43" href="#__codelineno-1-43"></a><span class="cm">   * * "decimal:128:{precision}:{scale}" / "decimal:256:{precision}:{scale}"</span>
+</span><span id="__span-1-44"><a id="__codelineno-1-44" name="__codelineno-1-44" href="#__codelineno-1-44"></a><span class="cm">   * * "time:{unit}" / "timestamp:{unit}" / "duration:{unit}", where unit is</span>
+</span><span id="__span-1-45"><a id="__codelineno-1-45" name="__codelineno-1-45" href="#__codelineno-1-45"></a><span class="cm">   * "s", "ms", "us", "ns"</span>
+</span><span id="__span-1-46"><a id="__codelineno-1-46" name="__codelineno-1-46" href="#__codelineno-1-46"></a><span class="cm">   * * "dict:{value_type}:{index_type}:false"</span>
+</span><span id="__span-1-47"><a id="__codelineno-1-47" name="__codelineno-1-47" href="#__codelineno-1-47"></a><span class="cm">   */</span>
+</span><span id="__span-1-48"><a id="__codelineno-1-48" name="__codelineno-1-48" href="#__codelineno-1-48"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">logical_type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-1-49"><a id="__codelineno-1-49" name="__codelineno-1-49" href="#__codelineno-1-49"></a><span class="w">  </span><span class="c1">// If this field is nullable.</span>
+</span><span id="__span-1-50"><a id="__codelineno-1-50" name="__codelineno-1-50" href="#__codelineno-1-50"></a><span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="na">nullable</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-1-51"><a id="__codelineno-1-51" name="__codelineno-1-51" href="#__codelineno-1-51"></a>
+</span><span id="__span-1-52"><a id="__codelineno-1-52" name="__codelineno-1-52" href="#__codelineno-1-52"></a><span class="w">  </span><span class="c1">// optional field metadata (e.g. extension type name/parameters)</span>
+</span><span id="__span-1-53"><a id="__codelineno-1-53" name="__codelineno-1-53" href="#__codelineno-1-53"></a><span class="w">  </span><span class="n">map</span><span class="p">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">bytes</span><span class="p">&gt;</span><span class="w"> </span><span class="na">metadata</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span><span class="w">  </span>
+</span><span id="__span-1-54"><a id="__codelineno-1-54" name="__codelineno-1-54" href="#__codelineno-1-54"></a>
+</span><span id="__span-1-55"><a id="__codelineno-1-55" name="__codelineno-1-55" href="#__codelineno-1-55"></a><span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="na">unenforced_primary_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">12</span><span class="p">;</span>
+</span><span id="__span-1-56"><a id="__codelineno-1-56" name="__codelineno-1-56" href="#__codelineno-1-56"></a>
+</span><span id="__span-1-57"><a id="__codelineno-1-57" name="__codelineno-1-57" href="#__codelineno-1-57"></a><span class="w">  </span><span class="cm">/* Position of this field in the primary key (1-based).</span>
+</span><span id="__span-1-58"><a id="__codelineno-1-58" name="__codelineno-1-58" href="#__codelineno-1-58"></a><span class="cm">   * 0 means the field is part of the primary key but uses schema field id for ordering.</span>
+</span><span id="__span-1-59"><a id="__codelineno-1-59" name="__codelineno-1-59" href="#__codelineno-1-59"></a><span class="cm">   * When set to a positive value, primary key fields are ordered by this position.</span>
+</span><span id="__span-1-60"><a id="__codelineno-1-60" name="__codelineno-1-60" href="#__codelineno-1-60"></a><span class="cm">   */</span>
+</span><span id="__span-1-61"><a id="__codelineno-1-61" name="__codelineno-1-61" href="#__codelineno-1-61"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">unenforced_primary_key_position</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">13</span><span class="p">;</span>
+</span><span id="__span-1-62"><a id="__codelineno-1-62" name="__codelineno-1-62" href="#__codelineno-1-62"></a>
+</span><span id="__span-1-63"><a id="__codelineno-1-63" name="__codelineno-1-63" href="#__codelineno-1-63"></a><span class="w">  </span><span class="c1">// Reserved for future use. Use unenforced_clustering_key_position instead.</span>
+</span><span id="__span-1-64"><a id="__codelineno-1-64" name="__codelineno-1-64" href="#__codelineno-1-64"></a><span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="na">unenforced_clustering_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">14</span><span class="p">;</span>
+</span><span id="__span-1-65"><a id="__codelineno-1-65" name="__codelineno-1-65" href="#__codelineno-1-65"></a>
+</span><span id="__span-1-66"><a id="__codelineno-1-66" name="__codelineno-1-66" href="#__codelineno-1-66"></a><span class="w">  </span><span class="cm">/* Position of this field in the clustering key (1-based).</span>
+</span><span id="__span-1-67"><a id="__codelineno-1-67" name="__codelineno-1-67" href="#__codelineno-1-67"></a><span class="cm">   * 0 means the field is not part of the clustering key.</span>
+</span><span id="__span-1-68"><a id="__codelineno-1-68" name="__codelineno-1-68" href="#__codelineno-1-68"></a><span class="cm">   */</span>
+</span><span id="__span-1-69"><a id="__codelineno-1-69" name="__codelineno-1-69" href="#__codelineno-1-69"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">unenforced_clustering_key_position</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">15</span><span class="p">;</span>
+</span><span id="__span-1-70"><a id="__codelineno-1-70" name="__codelineno-1-70" href="#__codelineno-1-70"></a>
+</span><span id="__span-1-71"><a id="__codelineno-1-71" name="__codelineno-1-71" href="#__codelineno-1-71"></a><span class="w">  </span><span class="c1">// DEPRECATED ----------------------------------------------------------------</span>
+</span><span id="__span-1-72"><a id="__codelineno-1-72" name="__codelineno-1-72" href="#__codelineno-1-72"></a>
+</span><span id="__span-1-73"><a id="__codelineno-1-73" name="__codelineno-1-73" href="#__codelineno-1-73"></a><span class="w">  </span><span class="cm">/* Deprecated: Only used in V1 file format. V2 uses variable encodings defined</span>
+</span><span id="__span-1-74"><a id="__codelineno-1-74" name="__codelineno-1-74" href="#__codelineno-1-74"></a><span class="cm">   * per page.</span>
+</span><span id="__span-1-75"><a id="__codelineno-1-75" name="__codelineno-1-75" href="#__codelineno-1-75"></a><span class="cm">   *</span>
+</span><span id="__span-1-76"><a id="__codelineno-1-76" name="__codelineno-1-76" href="#__codelineno-1-76"></a><span class="cm">   * The global encoding to use for this field.</span>
+</span><span id="__span-1-77"><a id="__codelineno-1-77" name="__codelineno-1-77" href="#__codelineno-1-77"></a><span class="cm">   */</span>
+</span><span id="__span-1-78"><a id="__codelineno-1-78" name="__codelineno-1-78" href="#__codelineno-1-78"></a><span class="w">  </span><span class="n">Encoding</span><span class="w"> </span><span class="na">encoding</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-1-79"><a id="__codelineno-1-79" name="__codelineno-1-79" href="#__codelineno-1-79"></a>
+</span><span id="__span-1-80"><a id="__codelineno-1-80" name="__codelineno-1-80" href="#__codelineno-1-80"></a><span class="w">  </span><span class="cm">/* Deprecated: Only used in V1 file format. V2 dynamically chooses when to</span>
+</span><span id="__span-1-81"><a id="__codelineno-1-81" name="__codelineno-1-81" href="#__codelineno-1-81"></a><span class="cm">   * do dictionary encoding and keeps the dictionary in the data files.</span>
+</span><span id="__span-1-82"><a id="__codelineno-1-82" name="__codelineno-1-82" href="#__codelineno-1-82"></a><span class="cm">   *</span>
+</span><span id="__span-1-83"><a id="__codelineno-1-83" name="__codelineno-1-83" href="#__codelineno-1-83"></a><span class="cm">   * The file offset for storing the dictionary value.</span>
+</span><span id="__span-1-84"><a id="__codelineno-1-84" name="__codelineno-1-84" href="#__codelineno-1-84"></a><span class="cm">   * It is only valid if encoding is DICTIONARY.</span>
+</span><span id="__span-1-85"><a id="__codelineno-1-85" name="__codelineno-1-85" href="#__codelineno-1-85"></a><span class="cm">   *</span>
+</span><span id="__span-1-86"><a id="__codelineno-1-86" name="__codelineno-1-86" href="#__codelineno-1-86"></a><span class="cm">   * The logic type presents the value type of the column, i.e., string value.</span>
+</span><span id="__span-1-87"><a id="__codelineno-1-87" name="__codelineno-1-87" href="#__codelineno-1-87"></a><span class="cm">   */</span>
+</span><span id="__span-1-88"><a id="__codelineno-1-88" name="__codelineno-1-88" href="#__codelineno-1-88"></a><span class="w">  </span><span class="n">Dictionary</span><span class="w"> </span><span class="na">dictionary</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-1-89"><a id="__codelineno-1-89" name="__codelineno-1-89" href="#__codelineno-1-89"></a>
+</span><span id="__span-1-90"><a id="__codelineno-1-90" name="__codelineno-1-90" href="#__codelineno-1-90"></a><span class="w">  </span><span class="cm">/* Deprecated: optional extension type name, use metadata field</span>
+</span><span id="__span-1-91"><a id="__codelineno-1-91" name="__codelineno-1-91" href="#__codelineno-1-91"></a><span class="cm">   * ARROW:extension:name</span>
+</span><span id="__span-1-92"><a id="__codelineno-1-92" name="__codelineno-1-92" href="#__codelineno-1-92"></a><span class="cm">   */</span>
+</span><span id="__span-1-93"><a id="__codelineno-1-93" name="__codelineno-1-93" href="#__codelineno-1-93"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">extension_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-1-94"><a id="__codelineno-1-94" name="__codelineno-1-94" href="#__codelineno-1-94"></a>
+</span><span id="__span-1-95"><a id="__codelineno-1-95" name="__codelineno-1-95" href="#__codelineno-1-95"></a><span class="w">  </span><span class="cm">/* Field number 11 was previously `string storage_class`.</span>
+</span><span id="__span-1-96"><a id="__codelineno-1-96" name="__codelineno-1-96" href="#__codelineno-1-96"></a><span class="cm">   * Keep it reserved so older manifests remain compatible while new writers</span>
+</span><span id="__span-1-97"><a id="__codelineno-1-97" name="__codelineno-1-97" href="#__codelineno-1-97"></a><span class="cm">   * avoid reusing the slot.</span>
+</span><span id="__span-1-98"><a id="__codelineno-1-98" name="__codelineno-1-98" href="#__codelineno-1-98"></a><span class="cm">   */</span>
+</span><span id="__span-1-99"><a id="__codelineno-1-99" name="__codelineno-1-99" href="#__codelineno-1-99"></a><span class="w">  </span><span class="k">reserved</span><span class="w"> </span><span class="mi">11</span><span class="p">;</span>
+</span><span id="__span-1-100"><a id="__codelineno-1-100" name="__codelineno-1-100" href="#__codelineno-1-100"></a><span class="w">  </span><span class="k">reserved</span><span class="w"> </span><span class="s">"storage_class"</span><span class="p">;</span>
+</span><span id="__span-1-101"><a id="__codelineno-1-101" name="__codelineno-1-101" href="#__codelineno-1-101"></a>
+</span><span id="__span-1-102"><a id="__codelineno-1-102" name="__codelineno-1-102" href="#__codelineno-1-102"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h3 id="unenforced-primary-key">Unenforced Primary Key<a class="headerlink" href="#unenforced-primary-key" title="Permanent link">&para;</a></h3>
+<p>Lance supports defining an unenforced primary key through field metadata.
+This is useful for deduplication during merge-insert operations and other use cases that benefit from logical row identity.
+The primary key is "unenforced" meaning Lance does not always validate uniqueness constraints.
+Users can use specific workloads like merge-insert to enforce it if necessary.
+The primary key is fixed after initial setting and must not be updated or removed.</p>
+<p>A primary key field must satisfy:</p>
+<ul>
+<li>The field, and all its ancestors, must not be nullable.</li>
+<li>The field must be a leaf field (primitive data type without children).</li>
+<li>The field must not be within a list or map type.</li>
+</ul>
+<p>When using an Arrow schema to create a Lance table, add the following metadata to the Arrow field to mark it as part of the primary key:</p>
+<ul>
+<li><code>lance-schema:unenforced-primary-key</code>: Set to <code>true</code>, <code>1</code>, or <code>yes</code> (case-insensitive) to indicate the field is part of the primary key.</li>
+<li><code>lance-schema:unenforced-primary-key:position</code> (optional): A 1-based integer specifying the position within a composite primary key.</li>
+</ul>
+<p>For composite primary keys with multiple columns, the position determines the primary key field ordering:</p>
+<ul>
+<li>When positions are specified, fields are ordered by their position values (1, 2, 3, ...).</li>
+<li>When positions are not specified, fields are ordered by their schema field id.</li>
+<li>Fields with explicit positions are ordered before fields without.</li>
+</ul>
+<h2 id="fragments">Fragments<a class="headerlink" href="#fragments" title="Permanent link">&para;</a></h2>
+<p><img alt="Fragment Structure" src="../../images/fragment_structure.png" /></p>
+<p>A fragment represents a horizontal partition of the dataset containing a subset of rows.
+Each fragment has a unique <code>uint32</code> identifier assigned incrementally based on the dataset's maximum fragment ID.
+Each fragment consists of one or more data files storing columns, plus an optional deletion file.
+If present, the deletion file stores the positions (0-based) of the rows that have been deleted from the fragment.
+The fragment tracks the total row count including deleted rows in its physical rows field.
+Column subsets can be read without accessing all data files, and each data file is independently compressed and encoded.</p>
+<details>
+<summary>DataFragment protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">DataFragment</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="c1">// The ID of a DataFragment is unique within a dataset.</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataFile</span><span class="w"> </span><span class="na">files</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">  </span><span class="cm">/* Optional overlay files for this fragment, which supply new values for a</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="cm">   * subset of cells without rewriting the base data files. This MUST be empty</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="cm">   * if the data overlay files feature flag (64) is not set in the manifest.</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="cm">   *</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="cm">   * Order is significant: a later entry is newer than an earlier one. When two</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="cm">   * overlays cover the same (offset, field) and share a `committed_version`, the</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="cm">   * later entry wins. See DataOverlayFile for the full resolution rules.</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="cm">   */</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">DataOverlayFile</span><span class="w"> </span><span class="na">overlays</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">11</span><span class="p">;</span>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="w">  </span><span class="c1">// File that indicates which rows, if any, should be considered deleted.</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="w">  </span><span class="n">DeletionFile</span><span class="w"> </span><span class="na">deletion_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="w">  </span><span class="c1">// TODO: What's the simplest way we can allow an inline tombstone bitmap?</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a><span class="w">  </span><span class="cm">/* A serialized RowIdSequence message (see rowids.proto).</span>
+</span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a><span class="cm">   *</span>
+</span><span id="__span-2-24"><a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a><span class="cm">   * These are the row ids for the fragment, in order of the rows as they appear.</span>
+</span><span id="__span-2-25"><a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a><span class="cm">   * That is, if a fragment has 3 rows, and the row ids are [1, 42, 3], then the</span>
+</span><span id="__span-2-26"><a id="__codelineno-2-26" name="__codelineno-2-26" href="#__codelineno-2-26"></a><span class="cm">   * first row is row 1, the second row is row 42, and the third row is row 3.</span>
+</span><span id="__span-2-27"><a id="__codelineno-2-27" name="__codelineno-2-27" href="#__codelineno-2-27"></a><span class="cm">   */</span>
+</span><span id="__span-2-28"><a id="__codelineno-2-28" name="__codelineno-2-28" href="#__codelineno-2-28"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">row_id_sequence</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-29"><a id="__codelineno-2-29" name="__codelineno-2-29" href="#__codelineno-2-29"></a><span class="w">    </span><span class="c1">// If small (&lt; 200KB), the row ids are stored inline.</span>
+</span><span id="__span-2-30"><a id="__codelineno-2-30" name="__codelineno-2-30" href="#__codelineno-2-30"></a><span class="w">    </span><span class="kt">bytes</span><span class="w"> </span><span class="na">inline_row_ids</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-2-31"><a id="__codelineno-2-31" name="__codelineno-2-31" href="#__codelineno-2-31"></a><span class="w">    </span><span class="c1">// Otherwise, stored as part of a file.</span>
+</span><span id="__span-2-32"><a id="__codelineno-2-32" name="__codelineno-2-32" href="#__codelineno-2-32"></a><span class="w">    </span><span class="n">ExternalFile</span><span class="w"> </span><span class="na">external_row_ids</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-2-33"><a id="__codelineno-2-33" name="__codelineno-2-33" href="#__codelineno-2-33"></a><span class="w">  </span><span class="p">}</span><span class="w"> </span><span class="c1">// row_id_sequence</span>
+</span><span id="__span-2-34"><a id="__codelineno-2-34" name="__codelineno-2-34" href="#__codelineno-2-34"></a>
+</span><span id="__span-2-35"><a id="__codelineno-2-35" name="__codelineno-2-35" href="#__codelineno-2-35"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">last_updated_at_version_sequence</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-36"><a id="__codelineno-2-36" name="__codelineno-2-36" href="#__codelineno-2-36"></a><span class="w">    </span><span class="c1">// If small (&lt; 200KB), the row latest updated versions are stored inline.</span>
+</span><span id="__span-2-37"><a id="__codelineno-2-37" name="__codelineno-2-37" href="#__codelineno-2-37"></a><span class="w">    </span><span class="kt">bytes</span><span class="w"> </span><span class="na">inline_last_updated_at_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-2-38"><a id="__codelineno-2-38" name="__codelineno-2-38" href="#__codelineno-2-38"></a><span class="w">    </span><span class="c1">// Otherwise, stored as part of a file.</span>
+</span><span id="__span-2-39"><a id="__codelineno-2-39" name="__codelineno-2-39" href="#__codelineno-2-39"></a><span class="w">    </span><span class="n">ExternalFile</span><span class="w"> </span><span class="na">external_last_updated_at_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-2-40"><a id="__codelineno-2-40" name="__codelineno-2-40" href="#__codelineno-2-40"></a><span class="w">  </span><span class="p">}</span><span class="w"> </span><span class="c1">// last_updated_at_version_sequence</span>
+</span><span id="__span-2-41"><a id="__codelineno-2-41" name="__codelineno-2-41" href="#__codelineno-2-41"></a>
+</span><span id="__span-2-42"><a id="__codelineno-2-42" name="__codelineno-2-42" href="#__codelineno-2-42"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">created_at_version_sequence</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-43"><a id="__codelineno-2-43" name="__codelineno-2-43" href="#__codelineno-2-43"></a><span class="w">    </span><span class="c1">// If small (&lt; 200KB), the row created at versions are stored inline.</span>
+</span><span id="__span-2-44"><a id="__codelineno-2-44" name="__codelineno-2-44" href="#__codelineno-2-44"></a><span class="w">    </span><span class="kt">bytes</span><span class="w"> </span><span class="na">inline_created_at_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-2-45"><a id="__codelineno-2-45" name="__codelineno-2-45" href="#__codelineno-2-45"></a><span class="w">    </span><span class="c1">// Otherwise, stored as part of a file.</span>
+</span><span id="__span-2-46"><a id="__codelineno-2-46" name="__codelineno-2-46" href="#__codelineno-2-46"></a><span class="w">    </span><span class="n">ExternalFile</span><span class="w"> </span><span class="na">external_created_at_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span><span id="__span-2-47"><a id="__codelineno-2-47" name="__codelineno-2-47" href="#__codelineno-2-47"></a><span class="w">  </span><span class="p">}</span><span class="w"> </span><span class="c1">// created_at_version_sequence</span>
+</span><span id="__span-2-48"><a id="__codelineno-2-48" name="__codelineno-2-48" href="#__codelineno-2-48"></a>
+</span><span id="__span-2-49"><a id="__codelineno-2-49" name="__codelineno-2-49" href="#__codelineno-2-49"></a><span class="w">  </span><span class="cm">/* Number of original rows in the fragment, this includes rows that are now marked with</span>
+</span><span id="__span-2-50"><a id="__codelineno-2-50" name="__codelineno-2-50" href="#__codelineno-2-50"></a><span class="cm">   * deletion tombstones. To compute the current number of rows, subtract</span>
+</span><span id="__span-2-51"><a id="__codelineno-2-51" name="__codelineno-2-51" href="#__codelineno-2-51"></a><span class="cm">   * `deletion_file.num_deleted_rows` from this value.</span>
+</span><span id="__span-2-52"><a id="__codelineno-2-52" name="__codelineno-2-52" href="#__codelineno-2-52"></a><span class="cm">   */</span>
+</span><span id="__span-2-53"><a id="__codelineno-2-53" name="__codelineno-2-53" href="#__codelineno-2-53"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">physical_rows</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-2-54"><a id="__codelineno-2-54" name="__codelineno-2-54" href="#__codelineno-2-54"></a>
+</span><span id="__span-2-55"><a id="__codelineno-2-55" name="__codelineno-2-55" href="#__codelineno-2-55"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h3 id="data-evolution">Data Evolution<a class="headerlink" href="#data-evolution" title="Permanent link">&para;</a></h3>
+<p>This fragment design enables a new concept called data evolution, which means efficient schema evolution (add column, update column, drop column) with backfill.
+For example, when adding a new column, new column data are added by appending new data files to each fragment, with values computed for all existing rows in the fragment.
+There is no need to rewrite the entire table to just add data for a single column.
+This enables efficient feature engineering and embedding updates for ML/AI workloads.</p>
+<p>Each data file should contain a distinct set of field ids. 
+It is not required that all field ids in the dataset schema are found in one of the data files. 
+If there is no corresponding data file, that column should be read as entirely <code>NULL</code>.</p>
+<p>Field ids might be replaced with <code>-2</code>, a tombstone value. 
+In this case that column should be ignored. This used, for example, when rewriting a column: 
+The old data file replaces the field id with <code>-2</code> to ignore the old data, and a new data file is appended to the fragment.</p>
+<h2 id="data-files">Data Files<a class="headerlink" href="#data-files" title="Permanent link">&para;</a></h2>
+<p>Data files store column data for a fragment using the Lance file format.
+Each data file stores a subset of the columns in the fragment.
+Field IDs are assigned either sequentially based on schema position (for Lance file format v1) 
+or independently of column indices due to variable encoding widths (for Lance file format v2).</p>
+<details>
+<summary>DataFile protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">DataFile</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span><span class="c1">// Path to the root relative to the dataset's URI.</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="kt">string</span><span class="w"> </span><span class="na">path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span><span class="cm">/* The ids of the fields/columns in this file.</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="cm">   *</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="cm">   * When a DataFile object is created in memory, every value in fields is assigned -1 by</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="cm">   * default. An object with a value in fields of -1 must not be stored to disk. -2 is</span>
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="cm">   * used for "tombstoned", meaning a field that is no longer in use. This is often</span>
+</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="cm">   * because the original field id was reassigned to a different data file.</span>
+</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="cm">   *</span>
+</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="cm">   * In Lance v1 IDs are assigned based on position in the file, offset by the max</span>
+</span><span id="__span-3-12"><a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="cm">   * existing field id in the table (if any already). So when a fragment is first created</span>
+</span><span id="__span-3-13"><a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="cm">   * with one file of N columns, the field ids will be 1, 2, ..., N. If a second fragment</span>
+</span><span id="__span-3-14"><a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="cm">   * is created with M columns, the field ids will be N+1, N+2, ..., N+M.</span>
+</span><span id="__span-3-15"><a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a><span class="cm">   *</span>
+</span><span id="__span-3-16"><a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a><span class="cm">   * In Lance v1 there is one field for each field in the input schema, this includes</span>
+</span><span id="__span-3-17"><a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a><span class="cm">   * nested fields (both struct and list).  Fixed size list fields have only a single</span>
+</span><span id="__span-3-18"><a id="__codelineno-3-18" name="__codelineno-3-18" href="#__codelineno-3-18"></a><span class="cm">   * field id (these are not considered nested fields in Lance v1).</span>
+</span><span id="__span-3-19"><a id="__codelineno-3-19" name="__codelineno-3-19" href="#__codelineno-3-19"></a><span class="cm">   *</span>
+</span><span id="__span-3-20"><a id="__codelineno-3-20" name="__codelineno-3-20" href="#__codelineno-3-20"></a><span class="cm">   * This allows column indices to be calculated from field IDs and the input schema.</span>
+</span><span id="__span-3-21"><a id="__codelineno-3-21" name="__codelineno-3-21" href="#__codelineno-3-21"></a><span class="cm">   *</span>
+</span><span id="__span-3-22"><a id="__codelineno-3-22" name="__codelineno-3-22" href="#__codelineno-3-22"></a><span class="cm">   * In Lance v2 the field IDs generally follow the same pattern but there is no</span>
+</span><span id="__span-3-23"><a id="__codelineno-3-23" name="__codelineno-3-23" href="#__codelineno-3-23"></a><span class="cm">   * way to calculate the column index from the field ID.  This is because a given</span>
+</span><span id="__span-3-24"><a id="__codelineno-3-24" name="__codelineno-3-24" href="#__codelineno-3-24"></a><span class="cm">   * field could be encoded in many different ways, some of which occupy a different</span>
+</span><span id="__span-3-25"><a id="__codelineno-3-25" name="__codelineno-3-25" href="#__codelineno-3-25"></a><span class="cm">   * number of columns.  For example, a struct field could be encoded into N + 1 columns</span>
+</span><span id="__span-3-26"><a id="__codelineno-3-26" name="__codelineno-3-26" href="#__codelineno-3-26"></a><span class="cm">   * or it could be encoded into a single packed column.  To determine column indices</span>
+</span><span id="__span-3-27"><a id="__codelineno-3-27" name="__codelineno-3-27" href="#__codelineno-3-27"></a><span class="cm">   * the column_indices property should be used instead.</span>
+</span><span id="__span-3-28"><a id="__codelineno-3-28" name="__codelineno-3-28" href="#__codelineno-3-28"></a><span class="cm">   *</span>
+</span><span id="__span-3-29"><a id="__codelineno-3-29" name="__codelineno-3-29" href="#__codelineno-3-29"></a><span class="cm">   * In Lance v1 these ids must be sorted but might not always be contiguous.</span>
+</span><span id="__span-3-30"><a id="__codelineno-3-30" name="__codelineno-3-30" href="#__codelineno-3-30"></a><span class="cm">   */</span>
+</span><span id="__span-3-31"><a id="__codelineno-3-31" name="__codelineno-3-31" href="#__codelineno-3-31"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">int32</span><span class="w"> </span><span class="na">fields</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-3-32"><a id="__codelineno-3-32" name="__codelineno-3-32" href="#__codelineno-3-32"></a><span class="w">  </span><span class="cm">/* The top-level column indices for each field in the file.</span>
+</span><span id="__span-3-33"><a id="__codelineno-3-33" name="__codelineno-3-33" href="#__codelineno-3-33"></a><span class="cm">   *</span>
+</span><span id="__span-3-34"><a id="__codelineno-3-34" name="__codelineno-3-34" href="#__codelineno-3-34"></a><span class="cm">   * If the data file is version 1 then this property will be empty</span>
+</span><span id="__span-3-35"><a id="__codelineno-3-35" name="__codelineno-3-35" href="#__codelineno-3-35"></a><span class="cm">   *</span>
+</span><span id="__span-3-36"><a id="__codelineno-3-36" name="__codelineno-3-36" href="#__codelineno-3-36"></a><span class="cm">   * Otherwise there must be one entry for each field in `fields`.</span>
+</span><span id="__span-3-37"><a id="__codelineno-3-37" name="__codelineno-3-37" href="#__codelineno-3-37"></a><span class="cm">   *</span>
+</span><span id="__span-3-38"><a id="__codelineno-3-38" name="__codelineno-3-38" href="#__codelineno-3-38"></a><span class="cm">   * Some fields may not correspond to a top-level column in the file.  In these cases</span>
+</span><span id="__span-3-39"><a id="__codelineno-3-39" name="__codelineno-3-39" href="#__codelineno-3-39"></a><span class="cm">   * the index will -1.</span>
+</span><span id="__span-3-40"><a id="__codelineno-3-40" name="__codelineno-3-40" href="#__codelineno-3-40"></a><span class="cm">   *</span>
+</span><span id="__span-3-41"><a id="__codelineno-3-41" name="__codelineno-3-41" href="#__codelineno-3-41"></a><span class="cm">   * For example, consider the schema:</span>
+</span><span id="__span-3-42"><a id="__codelineno-3-42" name="__codelineno-3-42" href="#__codelineno-3-42"></a><span class="cm">   *</span>
+</span><span id="__span-3-43"><a id="__codelineno-3-43" name="__codelineno-3-43" href="#__codelineno-3-43"></a><span class="cm">   * - dimension: packed-struct (0):</span>
+</span><span id="__span-3-44"><a id="__codelineno-3-44" name="__codelineno-3-44" href="#__codelineno-3-44"></a><span class="cm">   *   - x: u32 (1)</span>
+</span><span id="__span-3-45"><a id="__codelineno-3-45" name="__codelineno-3-45" href="#__codelineno-3-45"></a><span class="cm">   *   - y: u32 (2)</span>
+</span><span id="__span-3-46"><a id="__codelineno-3-46" name="__codelineno-3-46" href="#__codelineno-3-46"></a><span class="cm">   * - path: `list&lt;u32&gt;` (3)</span>
+</span><span id="__span-3-47"><a id="__codelineno-3-47" name="__codelineno-3-47" href="#__codelineno-3-47"></a><span class="cm">   * - embedding: `fsl&lt;768&gt;` (4)</span>
+</span><span id="__span-3-48"><a id="__codelineno-3-48" name="__codelineno-3-48" href="#__codelineno-3-48"></a><span class="cm">   *   - fp64</span>
+</span><span id="__span-3-49"><a id="__codelineno-3-49" name="__codelineno-3-49" href="#__codelineno-3-49"></a><span class="cm">   * - borders: `fsl&lt;4&gt;` (5)</span>
+</span><span id="__span-3-50"><a id="__codelineno-3-50" name="__codelineno-3-50" href="#__codelineno-3-50"></a><span class="cm">   *   - simple-struct (6)</span>
+</span><span id="__span-3-51"><a id="__codelineno-3-51" name="__codelineno-3-51" href="#__codelineno-3-51"></a><span class="cm">   *     - margin: fp64 (7)</span>
+</span><span id="__span-3-52"><a id="__codelineno-3-52" name="__codelineno-3-52" href="#__codelineno-3-52"></a><span class="cm">   *     - padding: fp64 (8)</span>
+</span><span id="__span-3-53"><a id="__codelineno-3-53" name="__codelineno-3-53" href="#__codelineno-3-53"></a><span class="cm">   *</span>
+</span><span id="__span-3-54"><a id="__codelineno-3-54" name="__codelineno-3-54" href="#__codelineno-3-54"></a><span class="cm">   * One possible column indices array could be:</span>
+</span><span id="__span-3-55"><a id="__codelineno-3-55" name="__codelineno-3-55" href="#__codelineno-3-55"></a><span class="cm">   * [0, -1, -1, 1, 3, 4, 5, 6, 7]</span>
+</span><span id="__span-3-56"><a id="__codelineno-3-56" name="__codelineno-3-56" href="#__codelineno-3-56"></a><span class="cm">   *</span>
+</span><span id="__span-3-57"><a id="__codelineno-3-57" name="__codelineno-3-57" href="#__codelineno-3-57"></a><span class="cm">   * This reflects quite a few phenomenon:</span>
+</span><span id="__span-3-58"><a id="__codelineno-3-58" name="__codelineno-3-58" href="#__codelineno-3-58"></a><span class="cm">   * - The packed struct is encoded into a single column and there is no top-level column</span>
+</span><span id="__span-3-59"><a id="__codelineno-3-59" name="__codelineno-3-59" href="#__codelineno-3-59"></a><span class="cm">   *   for the x or y fields</span>
+</span><span id="__span-3-60"><a id="__codelineno-3-60" name="__codelineno-3-60" href="#__codelineno-3-60"></a><span class="cm">   * - The variable sized list is encoded into two columns</span>
+</span><span id="__span-3-61"><a id="__codelineno-3-61" name="__codelineno-3-61" href="#__codelineno-3-61"></a><span class="cm">   * - The embedding is encoded into a single column (common for FSL of primitive) and there</span>
+</span><span id="__span-3-62"><a id="__codelineno-3-62" name="__codelineno-3-62" href="#__codelineno-3-62"></a><span class="cm">   *   is not "FSL column"</span>
+</span><span id="__span-3-63"><a id="__codelineno-3-63" name="__codelineno-3-63" href="#__codelineno-3-63"></a><span class="cm">   * - The borders field actually does have an "FSL column"</span>
+</span><span id="__span-3-64"><a id="__codelineno-3-64" name="__codelineno-3-64" href="#__codelineno-3-64"></a><span class="cm">   *</span>
+</span><span id="__span-3-65"><a id="__codelineno-3-65" name="__codelineno-3-65" href="#__codelineno-3-65"></a><span class="cm">   * The column indices table may not have duplicates (other than -1)</span>
+</span><span id="__span-3-66"><a id="__codelineno-3-66" name="__codelineno-3-66" href="#__codelineno-3-66"></a><span class="cm">   */</span>
+</span><span id="__span-3-67"><a id="__codelineno-3-67" name="__codelineno-3-67" href="#__codelineno-3-67"></a><span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="kt">int32</span><span class="w"> </span><span class="na">column_indices</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-3-68"><a id="__codelineno-3-68" name="__codelineno-3-68" href="#__codelineno-3-68"></a><span class="w">  </span><span class="c1">// The major file version used to create the file</span>
+</span><span id="__span-3-69"><a id="__codelineno-3-69" name="__codelineno-3-69" href="#__codelineno-3-69"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">file_major_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-3-70"><a id="__codelineno-3-70" name="__codelineno-3-70" href="#__codelineno-3-70"></a><span class="w">  </span><span class="cm">/* The minor file version used to create the file</span>
+</span><span id="__span-3-71"><a id="__codelineno-3-71" name="__codelineno-3-71" href="#__codelineno-3-71"></a><span class="cm">   *</span>
+</span><span id="__span-3-72"><a id="__codelineno-3-72" name="__codelineno-3-72" href="#__codelineno-3-72"></a><span class="cm">   * If both `file_major_version` and `file_minor_version` are set to 0,</span>
+</span><span id="__span-3-73"><a id="__codelineno-3-73" name="__codelineno-3-73" href="#__codelineno-3-73"></a><span class="cm">   * then this is a version 0.1 or version 0.2 file.</span>
+</span><span id="__span-3-74"><a id="__codelineno-3-74" name="__codelineno-3-74" href="#__codelineno-3-74"></a><span class="cm">   */</span>
+</span><span id="__span-3-75"><a id="__codelineno-3-75" name="__codelineno-3-75" href="#__codelineno-3-75"></a><span class="w">  </span><span class="kt">uint32</span><span class="w"> </span><span class="na">file_minor_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-3-76"><a id="__codelineno-3-76" name="__codelineno-3-76" href="#__codelineno-3-76"></a>
+</span><span id="__span-3-77"><a id="__codelineno-3-77" name="__codelineno-3-77" href="#__codelineno-3-77"></a><span class="w">  </span><span class="cm">/* The known size of the file on disk in bytes.</span>
+</span><span id="__span-3-78"><a id="__codelineno-3-78" name="__codelineno-3-78" href="#__codelineno-3-78"></a><span class="cm">   *</span>
+</span><span id="__span-3-79"><a id="__codelineno-3-79" name="__codelineno-3-79" href="#__codelineno-3-79"></a><span class="cm">   * This is used to quickly find the footer of the file.</span>
+</span><span id="__span-3-80"><a id="__codelineno-3-80" name="__codelineno-3-80" href="#__codelineno-3-80"></a><span class="cm">   *</span>
+</span><span id="__span-3-81"><a id="__codelineno-3-81" name="__codelineno-3-81" href="#__codelineno-3-81"></a><span class="cm">   * When this is zero, it should be interpreted as "unknown".</span>
+</span><span id="__span-3-82"><a id="__codelineno-3-82" name="__codelineno-3-82" href="#__codelineno-3-82"></a><span class="cm">   */</span>
+</span><span id="__span-3-83"><a id="__codelineno-3-83" name="__codelineno-3-83" href="#__codelineno-3-83"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">file_size_bytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-3-84"><a id="__codelineno-3-84" name="__codelineno-3-84" href="#__codelineno-3-84"></a>
+</span><span id="__span-3-85"><a id="__codelineno-3-85" name="__codelineno-3-85" href="#__codelineno-3-85"></a><span class="w">  </span><span class="cm">/* The base path index of the data file. Used when the file is imported or referred from another dataset.</span>
+</span><span id="__span-3-86"><a id="__codelineno-3-86" name="__codelineno-3-86" href="#__codelineno-3-86"></a><span class="cm">   * Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.</span>
+</span><span id="__span-3-87"><a id="__codelineno-3-87" name="__codelineno-3-87" href="#__codelineno-3-87"></a><span class="cm">   */</span>
+</span><span id="__span-3-88"><a id="__codelineno-3-88" name="__codelineno-3-88" href="#__codelineno-3-88"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">uint32</span><span class="w"> </span><span class="na">base_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-3-89"><a id="__codelineno-3-89" name="__codelineno-3-89" href="#__codelineno-3-89"></a>
+</span><span id="__span-3-90"><a id="__codelineno-3-90" name="__codelineno-3-90" href="#__codelineno-3-90"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<div class="admonition note">
+<p class="admonition-title">Field-to-column mapping differs between data storage versions</p>
+<p>In <strong>2.0</strong>, all fields (including non-leaf fields like struct and list containers) are assigned
+sequential column indices in <code>column_indices</code>.</p>
+<p>In <strong>2.1+</strong>, non-leaf fields (unpacked structs, list containers) are assigned <code>-1</code> in
+<code>column_indices</code> because their validity information is folded into repetition/definition
+levels. Only leaf fields and packed structs have column indices.</p>
+<p>See the <a href="../../guide/migration/#500">5.0.0 migration guide</a> for a detailed example.</p>
+</div>
+<h2 id="deletion-files">Deletion Files<a class="headerlink" href="#deletion-files" title="Permanent link">&para;</a></h2>
+<p>Deletion files (a.k.a. deletion vectors) track deleted rows without rewriting data files.
+Each fragment can have at most one deletion file per version.</p>
+<p>Deletion files support two storage formats.
+The Arrow IPC format (<code>.arrow</code> extension) stores a flat Int32Array of deleted row offsets and is efficient for sparse deletions.
+The Roaring Bitmap format (<code>.bin</code> extension) stores a compressed roaring bitmap and is efficient for dense deletions.
+Readers must filter rows whose offsets appear in the deletion file for the fragment.</p>
+<p>Deletions can be materialized by rewriting data files with deleted rows removed.
+However, this invalidates row addresses and requires rebuilding indices, which can be expensive.</p>
+<details>
+<summary>DeletionFile protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">DeletionFile</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span><span class="cm">/* Type of deletion file, intended as a way to increase efficiency of the storage of deleted row</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="cm">   * offsets. If there are sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="cm">   * are densely deleted rows, then BITMAP is the most efficient.</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="cm">   */</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">  </span><span class="kd">enum</span><span class="w"> </span><span class="n">DeletionFileType</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">    </span><span class="cm">/* A single Int32Array of deleted row offsets, stored as an Arrow IPC file with one batch and</span>
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="cm">     * one column. Has a .arrow extension.</span>
+</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="cm">     */</span>
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="w">    </span><span class="na">ARROW_ARRAY</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="w">    </span><span class="c1">// A Roaring Bitmap of deleted row offsets. Has a .bin extension.</span>
+</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a><span class="w">    </span><span class="na">BITMAP</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-4-14"><a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>
+</span><span id="__span-4-15"><a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a><span class="w">  </span><span class="c1">// Type of deletion file.</span>
+</span><span id="__span-4-16"><a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a><span class="w">  </span><span class="n">DeletionFileType</span><span class="w"> </span><span class="na">file_type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-4-17"><a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a><span class="w">  </span><span class="c1">// The version of the dataset this deletion file was built from.</span>
+</span><span id="__span-4-18"><a id="__codelineno-4-18" name="__codelineno-4-18" href="#__codelineno-4-18"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">read_version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-4-19"><a id="__codelineno-4-19" name="__codelineno-4-19" href="#__codelineno-4-19"></a><span class="w">  </span><span class="cm">/* An opaque id used to differentiate this file from others written by concurrent</span>
+</span><span id="__span-4-20"><a id="__codelineno-4-20" name="__codelineno-4-20" href="#__codelineno-4-20"></a><span class="cm">   * writers.</span>
+</span><span id="__span-4-21"><a id="__codelineno-4-21" name="__codelineno-4-21" href="#__codelineno-4-21"></a><span class="cm">   */</span>
+</span><span id="__span-4-22"><a id="__codelineno-4-22" name="__codelineno-4-22" href="#__codelineno-4-22"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-4-23"><a id="__codelineno-4-23" name="__codelineno-4-23" href="#__codelineno-4-23"></a><span class="w">  </span><span class="c1">// The number of rows that are marked as deleted.</span>
+</span><span id="__span-4-24"><a id="__codelineno-4-24" name="__codelineno-4-24" href="#__codelineno-4-24"></a><span class="w">  </span><span class="kt">uint64</span><span class="w"> </span><span class="na">num_deleted_rows</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span>
+</span><span id="__span-4-25"><a id="__codelineno-4-25" name="__codelineno-4-25" href="#__codelineno-4-25"></a><span class="w">  </span><span class="cm">/* The base path index of the deletion file. Used when the file is imported or referred from another</span>
+</span><span id="__span-4-26"><a id="__codelineno-4-26" name="__codelineno-4-26" href="#__codelineno-4-26"></a><span class="cm">   * dataset. Lance uses it as key of the base_paths field in Manifest to determine the actual base</span>
+</span><span id="__span-4-27"><a id="__codelineno-4-27" name="__codelineno-4-27" href="#__codelineno-4-27"></a><span class="cm">   * path of the deletion file.</span>
+</span><span id="__span-4-28"><a id="__codelineno-4-28" name="__codelineno-4-28" href="#__codelineno-4-28"></a><span class="cm">   */</span>
+</span><span id="__span-4-29"><a id="__codelineno-4-29" name="__codelineno-4-29" href="#__codelineno-4-29"></a><span class="w">  </span><span class="k">optional</span><span class="w"> </span><span class="kt">uint32</span><span class="w"> </span><span class="na">base_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-4-30"><a id="__codelineno-4-30" name="__codelineno-4-30" href="#__codelineno-4-30"></a>
+</span><span id="__span-4-31"><a id="__codelineno-4-31" name="__codelineno-4-31" href="#__codelineno-4-31"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h2 id="data-overlay-files">Data Overlay Files<a class="headerlink" href="#data-overlay-files" title="Permanent link">&para;</a></h2>
+<div class="admonition warning">
+<p class="admonition-title">Experimental</p>
+<p>This feature is currently experimental and not yet supported in any library.</p>
+</div>
+<!-- TODO: When overlay file support is implemented, update this note to state
+     the released version that first supports the feature. -->
+
+<div class="admonition note">
+<p class="admonition-title">Overlay files require feature flag 64 (data overlay files)</p>
+</div>
+<p>Overlay files supply new values for a subset of cells within
+a fragment without rewriting the base data files. They make updates cheap when only
+a small percentage of rows and/or columns change: a writer appends a small file
+carrying just the changed cells instead of rewriting whole columns or moving rows
+to a new fragment.</p>
+<p>For the full specification — coverage and resolution rules, dense vs. sparse layout,
+versioning, index integration, compaction, and a worked example — see the
+<a href="data_overlay_file/">Data Overlay Files Specification</a>.</p>
+<h2 id="related-specifications">Related Specifications<a class="headerlink" href="#related-specifications" title="Permanent link">&para;</a></h2>
+<h3 id="storage-layout">Storage Layout<a class="headerlink" href="#storage-layout" title="Permanent link">&para;</a></h3>
+<p>File organization, base path system, and multi-location storage.</p>
+<p>See <a href="layout/">Storage Layout Specification</a></p>
+<h3 id="transactions">Transactions<a class="headerlink" href="#transactions" title="Permanent link">&para;</a></h3>
+<p>MVCC, commit protocol, transaction types, and conflict resolution.</p>
+<p>See <a href="transaction/">Transaction Specification</a></p>
+<h3 id="row-lineage">Row Lineage<a class="headerlink" href="#row-lineage" title="Permanent link">&para;</a></h3>
+<p>Row address, Stable row ID, row version tracking, and change data feed.</p>
+<p>See <a href="row_id_lineage/">Row ID &amp; Lineage Specification</a></p>
+<h3 id="indices">Indices<a class="headerlink" href="#indices" title="Permanent link">&para;</a></h3>
+<p>Vector indices, scalar indices, full-text search, and index management.</p>
+<p>See <a href="../index/">Index Formats</a></p>
+<h3 id="versioning">Versioning<a class="headerlink" href="#versioning" title="Permanent link">&para;</a></h3>
+<p>Feature flags and format version compatibility.</p>
+<p>See <a href="versioning/">Format Versioning Specification</a></p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../file/versioning/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Versioning</div>
+        </a>
+        <a class="next" href="schema/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Schema</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#overview">Overview</a>
+      <a class="ld-toc__h2" href="#design-goals">Design Goals</a>
+      <a class="ld-toc__h3" href="#two-dimensional-storage">Two-Dimensional Storage</a>
+      <a class="ld-toc__h3" href="#first-class-indices">First-Class Indices</a>
+      <a class="ld-toc__h3" href="#external-manifest-store">External Manifest Store</a>
+      <a class="ld-toc__h2" href="#manifest">Manifest</a>
+      <a class="ld-toc__h2" href="#schema-fields">Schema &amp; Fields</a>
+      <a class="ld-toc__h3" href="#unenforced-primary-key">Unenforced Primary Key</a>
+      <a class="ld-toc__h2" href="#fragments">Fragments</a>
+      <a class="ld-toc__h3" href="#data-evolution">Data Evolution</a>
+      <a class="ld-toc__h2" href="#data-files">Data Files</a>
+      <a class="ld-toc__h2" href="#deletion-files">Deletion Files</a>
+      <a class="ld-toc__h2" href="#data-overlay-files">Data Overlay Files</a>
+      <a class="ld-toc__h2" href="#related-specifications">Related Specifications</a>
+      <a class="ld-toc__h3" href="#storage-layout">Storage Layout</a>
+      <a class="ld-toc__h3" href="#transactions">Transactions</a>
+      <a class="ld-toc__h3" href="#row-lineage">Row Lineage</a>
+      <a class="ld-toc__h3" href="#indices">Indices</a>
+      <a class="ld-toc__h3" href="#versioning">Versioning</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../">Specification</a>
+        <a href="../file/">File format</a>
+        <a href="./">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../quickstart/">Getting started</a>
+        <a href="../../guide/read_and_write/">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>

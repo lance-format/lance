@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Performance — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/spark/performance/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../">Overview</a>
+    <a href="../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../pytorch/">PyTorch</a>
+    <a href="../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../duckdb/">Overview</a>
+    <a href="../../duckdb/sql/">SQL Reference</a>
+    <a href="../../duckdb/rest/">REST Namespace</a>
+    <a href="../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../huggingface/">Home</a>
+    <a href="../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../">Welcome</a>
+    <a href="../install/">Install</a>
+    <a href="../config/">Config</a>
+    <a class="active" href="./">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../operations/ddl/create-namespace/">CREATE NAMESPACE</a>
+    <a href="../operations/ddl/drop-namespace/">DROP NAMESPACE</a>
+    <a href="../operations/ddl/show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../operations/ddl/describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../operations/ddl/create-table/">CREATE TABLE</a>
+    <a href="../operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../operations/ddl/describe-table/">DESCRIBE TABLE</a>
+    <a href="../operations/ddl/alter-table/">ALTER TABLE</a>
+    <a href="../operations/ddl/show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../operations/ddl/drop-table/">DROP TABLE</a>
+    <a href="../operations/ddl/create-index/">CREATE INDEX</a>
+    <a href="../operations/ddl/show-indexes/">SHOW INDEXES</a>
+    <a href="../operations/ddl/create-branch/">CREATE BRANCH</a>
+    <a href="../operations/ddl/drop-branch/">DROP BRANCH</a>
+    <a href="../operations/ddl/show-branches/">SHOW BRANCHES</a>
+    <a href="../operations/ddl/create-tag/">CREATE TAG</a>
+    <a href="../operations/ddl/drop-tag/">DROP TAG</a>
+    <a href="../operations/ddl/show-tags/">SHOW TAGS</a>
+    <a href="../operations/ddl/optimize/">OPTIMIZE</a>
+    <a href="../operations/ddl/vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../operations/dql/select/">SELECT</a>
+    <a href="../operations/dql/fts/">Full-Text Search</a>
+    <a href="../operations/dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../operations/dql/search/">SEARCH</a>
+    <a href="../operations/dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../operations/dml/insert-into/">INSERT INTO</a>
+    <a href="../operations/dml/update/">UPDATE SET</a>
+    <a href="../operations/dml/delete/">DELETE FROM</a>
+    <a href="../operations/dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../operations/dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../ray/">Welcome</a>
+    <a href="../../ray/read/">Read</a>
+    <a href="../../ray/write/">Write</a>
+    <a href="../../ray/distributed-indexing/">Index</a>
+    <a href="../../ray/compaction/">Compaction</a>
+    <a href="../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../trino/">Welcome</a>
+    <a href="../../trino/install/">Install</a>
+    <a href="../../trino/config/">Config</a>
+    <a href="../../trino/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../trino/operations/data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../trino/operations/ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../trino/operations/ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../trino/operations/ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../trino/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../trino/operations/ddl/describe-table/">DESCRIBE</a>
+    <a href="../../trino/operations/ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../trino/operations/ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../trino/operations/dml/insert/">INSERT</a>
+    <a href="../../trino/operations/dml/update/">UPDATE</a>
+    <a href="../../trino/operations/dml/delete/">DELETE</a>
+    <a href="../../trino/operations/dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../trino/operations/dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../context/">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../context/guide/quickstart/">Quickstart</a>
+    <a href="../../context/guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../context/guide/storage/">Storage backends</a>
+    <a href="../../context/guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../../context/specs/rollout-schema-design/">Rollout schema</a>
+    <a href="../../context/specs/rollout-deployment/">Rollout deployment</a>
+    <a href="../../context/specs/rollout-blob-streaming/">Blob streaming</a>
+    <a href="../../context/specs/datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../../context/design/partitioned-namespace/">Partitioned namespace</a>
+    <a href="../../context/design/auto-dream/">Auto-dream</a>
+    <a href="../../context/design/using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Apache Spark</span>
+        <span>/</span><b>Performance</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="performance-tuning">Performance Tuning<a class="headerlink" href="#performance-tuning" title="Permanent link">&para;</a></h1>
+<p>This guide covers performance tuning for Lance Spark operations in large-scale ETL and batch processing scenarios.</p>
+<h2 id="understanding-lances-default-optimization">Understanding Lance's Default Optimization<a class="headerlink" href="#understanding-lances-default-optimization" title="Permanent link">&para;</a></h2>
+<p>Lance is <strong>optimized by default for random access patterns</strong> - fast point lookups, vector searches, and selective column reads.
+These defaults work well for ML/AI workloads where you frequently access individual records or small batches.</p>
+<p>For <strong>large-scale batch ETL and scan-heavy OLAP operations</strong> (writing millions of rows, full table scans, bulk exports),
+you can tune Lance's environment variables and Spark options to better utilize available resources.</p>
+<h2 id="general-recommendations">General Recommendations<a class="headerlink" href="#general-recommendations" title="Permanent link">&para;</a></h2>
+<p>For optimal performance with Lance, we recommend:</p>
+<ol>
+<li>
+<p><strong>Use fixed-size lists for vector columns</strong> - Store embedding vectors as <code>ARRAY&lt;FLOAT&gt;</code> with a fixed dimension. This enables efficient SIMD operations and better compression. See <a href="../operations/ddl/create-table/#vector-columns">Vector Columns</a>.</p>
+</li>
+<li>
+<p><strong>Use blob encoding for multimodal data</strong> - Store large binary data (images, audio, video) using Lance's unique blob encoding to enable efficient access. See <a href="../operations/ddl/create-table/#blob-columns">Blob Columns</a>.</p>
+</li>
+<li>
+<p><strong>Use large varchar for large text</strong> - When storing very large string values for use cases like full text search, use the large varchar type to avoid out of memory issues. See <a href="../operations/ddl/create-table/#large-string-columns">Large String Columns</a>.</p>
+</li>
+</ol>
+<h2 id="write-performance">Write Performance<a class="headerlink" href="#write-performance" title="Permanent link">&para;</a></h2>
+<h3 id="upload-concurrency">Upload Concurrency<a class="headerlink" href="#upload-concurrency" title="Permanent link">&para;</a></h3>
+<p>Set via environment variable <code>LANCE_UPLOAD_CONCURRENCY</code> (default: 10).</p>
+<p>Controls the number of concurrent multipart upload streams to S3. 
+Increasing this to match your CPU core count can improve throughput.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">LANCE_UPLOAD_CONCURRENCY</span><span class="o">=</span><span class="m">32</span>
+</span></code></pre></div>
+<h3 id="upload-part-size">Upload Part Size<a class="headerlink" href="#upload-part-size" title="Permanent link">&para;</a></h3>
+<p>Set via environment variable <code>LANCE_INITIAL_UPLOAD_SIZE</code> (default: 5MB).</p>
+<p>Controls the initial part size for S3 multipart uploads. 
+Larger part sizes reduce the number of API calls and can improve throughput for large writes. 
+However, larger part sizes use more memory and may increase latency for small writes. 
+Use the default for interactive workloads.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Lance automatically increments the multipart upload size by 5MB every 100 uploads,
+  so large file writes progressively use increasingly large upload parts.
+  There is no configuration for a fixed upload size.</p>
+</div>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">LANCE_INITIAL_UPLOAD_SIZE</span><span class="o">=</span><span class="m">33554432</span><span class="w">  </span><span class="c1"># 32MB</span>
+</span></code></pre></div>
+<h3 id="queued-write-buffer-experimental">Queued Write Buffer (Experimental)<a class="headerlink" href="#queued-write-buffer-experimental" title="Permanent link">&para;</a></h3>
+<p>Set via Spark write option <code>use_queued_write_buffer</code> (default: false).</p>
+<p>Enables a buffered write mode that improves throughput for large batch writes.
+When enabled, Lance uses a queue-based buffer instead of the default semaphore-based buffer
+that batches data more efficiently before writing to storage,
+avoiding small lock waiting operations between Spark producer and Lance writer.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>This feature is currently in experimental mode.
+  It will be set to true by default after the community considers it mature. </p>
+</div>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">df</span><span class="o">.</span><span class="n">write</span> \
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="s2">"lance"</span><span class="p">)</span> \
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">"use_queued_write_buffer"</span><span class="p">,</span> <span class="s2">"true"</span><span class="p">)</span> \
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>    <span class="o">.</span><span class="n">mode</span><span class="p">(</span><span class="s2">"append"</span><span class="p">)</span> \
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>    <span class="o">.</span><span class="n">saveAsTable</span><span class="p">(</span><span class="s2">"my_table"</span><span class="p">)</span>
+</span></code></pre></div>
+<h3 id="max-batch-bytes">Max Batch Bytes<a class="headerlink" href="#max-batch-bytes" title="Permanent link">&para;</a></h3>
+<p>Set via Spark write option <code>max_batch_bytes</code> (default: 268435456, i.e. 256MB).</p>
+<p>Controls the maximum in-memory size of each Arrow batch before it is flushed.
+Batches are flushed when either the row count reaches <code>batch_size</code> or the allocated memory
+reaches <code>max_batch_bytes</code>, whichever comes first.</p>
+<p>This prevents OOM when writing tables with very large rows — wide schemas, large binary/string
+columns, or high-dimensional vector embeddings — where even a modest number of rows can exhaust
+memory before the row-count threshold is reached.</p>
+<p>Small-row workloads are unaffected because the row-count limit is hit first.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>When using the queued write buffer, total in-flight Arrow memory can be roughly
+  <code>queue_depth * max_batch_bytes</code>. You may need to tune <code>queue_depth</code> and <code>max_batch_bytes</code>
+  together to stay within memory limits.</p>
+</div>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">df</span><span class="o">.</span><span class="n">write</span> \
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    <span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="s2">"lance"</span><span class="p">)</span> \
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    <span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">"max_batch_bytes"</span><span class="p">,</span> <span class="s2">"134217728"</span><span class="p">)</span> \
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>    <span class="o">.</span><span class="n">mode</span><span class="p">(</span><span class="s2">"append"</span><span class="p">)</span> \
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>    <span class="o">.</span><span class="n">saveAsTable</span><span class="p">(</span><span class="s2">"my_table"</span><span class="p">)</span>  <span class="c1"># 128MB per batch</span>
+</span></code></pre></div>
+<h3 id="max-rows-per-file">Max Rows Per File<a class="headerlink" href="#max-rows-per-file" title="Permanent link">&para;</a></h3>
+<p>Set via Spark write option <code>max_row_per_file</code> (default: 1,000,000).</p>
+<p>Controls the maximum number of rows per Lance fragment file.
+There is no specific recommended value, but be aware the default is 1 million rows.
+If you store many multimodal data columns (images, audio, embeddings)
+without using <a href="../operations/dml/insert-into/#writing-blob-data">Lance blob encoding</a>,
+or store a lot of long text columns, the file size might become very large.
+From Lance's perspective, having very large files does not impact your read performance.
+But you may want to reduce this value depending on the limits in your choice of object storage.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="n">df</span><span class="o">.</span><span class="n">write</span> \
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>    <span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="s2">"lance"</span><span class="p">)</span> \
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    <span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">"max_row_per_file"</span><span class="p">,</span> <span class="s2">"500000"</span><span class="p">)</span> \
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>    <span class="o">.</span><span class="n">mode</span><span class="p">(</span><span class="s2">"append"</span><span class="p">)</span> \
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>    <span class="o">.</span><span class="n">saveAsTable</span><span class="p">(</span><span class="s2">"my_table"</span><span class="p">)</span>
+</span></code></pre></div>
+<h3 id="large-var-types">Large Var Types<a class="headerlink" href="#large-var-types" title="Permanent link">&para;</a></h3>
+<p>Set via Spark write option <code>use_large_var_types</code> (default: false).</p>
+<p>Switches all string and binary columns to use 64-bit offset Arrow vectors
+(<code>LargeVarCharVector</code> / <code>LargeVarBinaryVector</code>) instead of the default 32-bit offset vectors.
+This removes the 2GB-per-batch data buffer limit that can cause <code>OversizedAllocationException</code>
+when writing rows with very large string or binary values.</p>
+<p>Use this when your rows contain large values (hundreds of KB or more per row) and you
+hit the 2GB overflow error. There is no meaningful performance overhead -- the only
+difference is 8 bytes per row for the offset buffer instead of 4.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">df</span><span class="o">.</span><span class="n">write</span> \
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>    <span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="s2">"lance"</span><span class="p">)</span> \
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">"use_large_var_types"</span><span class="p">,</span> <span class="s2">"true"</span><span class="p">)</span> \
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>    <span class="o">.</span><span class="n">mode</span><span class="p">(</span><span class="s2">"append"</span><span class="p">)</span> \
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>    <span class="o">.</span><span class="n">saveAsTable</span><span class="p">(</span><span class="s2">"my_table"</span><span class="p">)</span>
+</span></code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>For per-column control at table creation time, see the
+<a href="../operations/ddl/create-table/#large-string-columns"><code>arrow.large_var_char</code> table property</a>.</p>
+</div>
+<h2 id="read-performance">Read Performance<a class="headerlink" href="#read-performance" title="Permanent link">&para;</a></h2>
+<h3 id="io-threads">I/O Threads<a class="headerlink" href="#io-threads" title="Permanent link">&para;</a></h3>
+<p>Set via environment variable <code>LANCE_IO_THREADS</code> (default: 64).</p>
+<p>Controls the number of I/O threads used for parallel reads from storage. 
+For large scans, increasing this to match your CPU core count enables more concurrent S3 requests.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">LANCE_IO_THREADS</span><span class="o">=</span><span class="m">128</span>
+</span></code></pre></div>
+<h3 id="custom-read-metrics">Custom Read Metrics<a class="headerlink" href="#custom-read-metrics" title="Permanent link">&para;</a></h3>
+<p>Lance Spark reports per-task custom metrics on the Spark UI Scan node, viewable in the SQL tab's
+physical plan. These are useful for diagnosing read-path performance — pruning effectiveness, JNI
+overhead, and where time is being spent.</p>
+<p>Naming conventions:</p>
+<ul>
+<li>Counters use the <code>num*</code> prefix.</li>
+<li>Durations use the <code>*TimeNs</code> suffix and are displayed in the UI as formatted strings
+  (e.g. <code>1.2 s</code>, <code>350 ms</code>, <code>47 us</code>) rather than raw nanoseconds.</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>numFragmentsScanned</code></td>
+<td>counter</td>
+<td>Lance fragments actually opened by this task. Compare against the table fragment count to verify pruning is working.</td>
+</tr>
+<tr>
+<td><code>numBatchesLoaded</code></td>
+<td>counter</td>
+<td>Arrow batches returned from the JNI scanner.</td>
+</tr>
+<tr>
+<td><code>numRowsScanned</code></td>
+<td>counter</td>
+<td>Rows read from storage before filter evaluation. Pair with Spark's built-in <code>numOutputRows</code> to compute filter selectivity (<code>numOutputRows / numRowsScanned</code>).</td>
+</tr>
+<tr>
+<td><code>numIops</code></td>
+<td>counter</td>
+<td>Number of I/O operations performed by the scanner.</td>
+</tr>
+<tr>
+<td><code>numRequests</code></td>
+<td>counter</td>
+<td>Number of requests made to the storage layer.</td>
+</tr>
+<tr>
+<td><code>numBytesRead</code></td>
+<td>counter</td>
+<td>Total bytes read from storage by the scanner.</td>
+</tr>
+<tr>
+<td><code>numIndicesLoaded</code></td>
+<td>counter</td>
+<td>Number of top-level indices loaded.</td>
+</tr>
+<tr>
+<td><code>numPartsLoaded</code></td>
+<td>counter</td>
+<td>Number of index partitions loaded.</td>
+</tr>
+<tr>
+<td><code>numIndexComparisons</code></td>
+<td>counter</td>
+<td>Number of index comparisons performed during vector search.</td>
+</tr>
+<tr>
+<td><code>datasetOpenTimeNs</code></td>
+<td>duration</td>
+<td>Time spent in <code>Dataset.open(...)</code> — manifest load, namespace lookup, credential fetch. High values indicate catalog or metadata cache misses.</td>
+</tr>
+<tr>
+<td><code>scannerCreateTimeNs</code></td>
+<td>duration</td>
+<td>Time spent in <code>fragment.newScan(...)</code> — scan planning, predicate compilation, index lookup setup.</td>
+</tr>
+<tr>
+<td><code>batchLoadTimeNs</code></td>
+<td>duration</td>
+<td>Wall-clock time inside <code>loadNextBatch</code> — JNI crossing, IO, and Arrow IPC deserialization. Divide by <code>numBatchesLoaded</code> to get per-batch cost.</td>
+</tr>
+</tbody>
+</table>
+<p>How to read these together:</p>
+<ul>
+<li><strong>Pushdown verification</strong>: a low <code>numRowsScanned / numOutputRows</code> ratio means filters are being
+  pushed down effectively. A 1:1 ratio means every row is being scanned and filtered in Spark —
+  check whether your predicate is supported for pushdown.</li>
+<li><strong>Per-batch JNI cost</strong>: <code>batchLoadTimeNs / numBatchesLoaded</code> gives the average cost of one batch
+  crossing JNI. If this is high relative to total query time, consider increasing
+  <code>LanceSparkReadOptions.batchSize</code> to amortize JNI overhead over more rows.</li>
+<li><strong>Catalog overhead</strong>: <code>datasetOpenTimeNs</code> accumulates per fragment opened. If many fragments are
+  opened per task, this can dominate; metadata cache size and namespace caching matter most here.</li>
+</ul>
+<h2 id="caching">Caching<a class="headerlink" href="#caching" title="Permanent link">&para;</a></h2>
+<p>Lance Spark uses a multi-level caching strategy to minimize redundant I/O and improve query performance.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Caches are isolated per Spark catalog. For multi-tenant deployments, configure one Lance catalog per tenant to provide complete cache and credential isolation. If you configure multiple catalogs, total memory usage is multiplied by the number of catalogs. For example, with default settings (6GB index + 1GB metadata) and 3 catalogs, the maximum cache memory is 21GB (3 × 7GB).</p>
+</div>
+<h3 id="how-caching-works">How Caching Works<a class="headerlink" href="#how-caching-works" title="Permanent link">&para;</a></h3>
+<p>Lance Spark implements two levels of caching:</p>
+<ol>
+<li>
+<p><strong>Session Cache</strong> - Contains index and metadata caches:</p>
+<ul>
+<li><strong>Index Cache</strong>: Caches opened vector indices, fragment reuse indices, and index metadata</li>
+<li><strong>Metadata Cache</strong>: Caches manifests, transactions, deletion files, row ID indices, and file metadata</li>
+</ul>
+</li>
+<li>
+<p><strong>Dataset Cache</strong> - Caches opened datasets by <code>(catalog, URI, version)</code> key. Since a dataset at a specific version is immutable, this ensures:</p>
+<ul>
+<li>Each dataset is opened only once per worker</li>
+<li>All workers read the same version for snapshot isolation</li>
+<li>Fragments are pre-loaded and cached per dataset</li>
+</ul>
+</li>
+</ol>
+<h3 id="cache-backend">Cache Backend<a class="headerlink" href="#cache-backend" title="Permanent link">&para;</a></h3>
+<p>The index and metadata cache backend can be selected independently for each Spark catalog. For
+example:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>--conf<span class="w"> </span><span class="s1">'spark.sql.catalog.lance.index_cache_backend=moka://?capacity=8589934592'</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>--conf<span class="w"> </span><span class="s1">'spark.sql.catalog.lance.metadata_cache_backend=moka://?capacity=2147483648'</span>
+</span></code></pre></div>
+<p>See <a href="../config/#cache-backends">Cache Backends</a> for backend registration, switching, and precedence.</p>
+<h3 id="index-cache-size">Index Cache Size<a class="headerlink" href="#index-cache-size" title="Permanent link">&para;</a></h3>
+<p>Set via environment variable <code>LANCE_INDEX_CACHE_SIZE</code> (default: 6GB from Lance native).</p>
+<p>Controls the size of the index cache in bytes.
+The index cache stores vector indices which can be large but provide significant speedup for vector search queries.
+Increase this if you frequently query tables with vector indices.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">LANCE_INDEX_CACHE_SIZE</span><span class="o">=</span><span class="m">8589934592</span><span class="w">  </span><span class="c1"># 8GB</span>
+</span></code></pre></div>
+<h3 id="metadata-cache-size">Metadata Cache Size<a class="headerlink" href="#metadata-cache-size" title="Permanent link">&para;</a></h3>
+<p>Set via environment variable <code>LANCE_METADATA_CACHE_SIZE</code> (default: 1GB from Lance native).</p>
+<p>Controls the size of the metadata cache in bytes.
+The metadata cache stores manifests, file metadata, and other dataset metadata.
+Each column's metadata can be around 40MB, so increase this if your tables have many columns.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">LANCE_METADATA_CACHE_SIZE</span><span class="o">=</span><span class="m">2147483648</span><span class="w">  </span><span class="c1"># 2GB</span>
+</span></code></pre></div>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../config/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Config</div>
+        </a>
+        <a class="next" href="../operations/ddl/create-namespace/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">CREATE NAMESPACE</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#understanding-lances-default-optimization">Understanding Lance's Default Optimization</a>
+      <a class="ld-toc__h2" href="#general-recommendations">General Recommendations</a>
+      <a class="ld-toc__h2" href="#write-performance">Write Performance</a>
+      <a class="ld-toc__h3" href="#upload-concurrency">Upload Concurrency</a>
+      <a class="ld-toc__h3" href="#upload-part-size">Upload Part Size</a>
+      <a class="ld-toc__h3" href="#queued-write-buffer-experimental">Queued Write Buffer (Experimental)</a>
+      <a class="ld-toc__h3" href="#max-batch-bytes">Max Batch Bytes</a>
+      <a class="ld-toc__h3" href="#max-rows-per-file">Max Rows Per File</a>
+      <a class="ld-toc__h3" href="#large-var-types">Large Var Types</a>
+      <a class="ld-toc__h2" href="#read-performance">Read Performance</a>
+      <a class="ld-toc__h3" href="#io-threads">I/O Threads</a>
+      <a class="ld-toc__h3" href="#custom-read-metrics">Custom Read Metrics</a>
+      <a class="ld-toc__h2" href="#caching">Caching</a>
+      <a class="ld-toc__h3" href="#how-caching-works">How Caching Works</a>
+      <a class="ld-toc__h3" href="#cache-backend">Cache Backend</a>
+      <a class="ld-toc__h3" href="#index-cache-size">Index Cache Size</a>
+      <a class="ld-toc__h3" href="#metadata-cache-size">Metadata Cache Size</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../format/">Specification</a>
+        <a href="../../../format/file/">File format</a>
+        <a href="../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>

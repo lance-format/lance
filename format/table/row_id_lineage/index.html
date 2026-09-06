@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Row ID & Lineage — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/format/table/row_id_lineage/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab active" href="../../">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Specification
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specification</div>
+    <a href="../../">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">File Format</div>
+    <a href="../../file/">Specification</a>
+    <a href="../../file/encoding/">Encoding Strategy</a>
+    <a href="../../file/versioning/">Versioning</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Table Format</div>
+    <a href="../">Lance Table Format</a>
+    <a href="../schema/">Schema</a>
+    <a href="../versioning/">Versioning</a>
+    <a href="../transaction/">Transactions</a>
+    <a href="../layout/">Layout</a>
+    <a href="../branch_tag/">Branch & Tag</a>
+    <a class="active" href="./">Row ID & Lineage</a>
+    <a href="../data_overlay_file/">Data Overlay Files</a>
+    <a href="../mem_wal/">MemTable & WAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Index Formats</div>
+    <a href="../../index/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Scalar Indices</div>
+    <a href="../../index/scalar/btree/">BTree</a>
+    <a href="../../index/scalar/bitmap/">Bitmap</a>
+    <a href="../../index/scalar/label_list/">Label List</a>
+    <a href="../../index/scalar/zonemap/">Zone Map</a>
+    <a href="../../index/scalar/bloom_filter/">Bloom Filter</a>
+    <a href="../../index/scalar/fts/">Full Text Search</a>
+    <a href="../../index/scalar/ngram/">N-gram</a>
+    <a href="../../index/scalar/fmindex/">FM-Index</a>
+    <a href="../../index/scalar/rtree/">RTree</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vector Indices</div>
+    <a href="../../index/vector/">Vector Indices</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">System Indices</div>
+    <a href="../../index/system/frag_reuse/">Fragment Reuse</a>
+    <a href="../../index/system/mem_wal/">MemWAL</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Catalog Specs</div>
+    <a href="../../catalog/">Overview</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Directory Catalog</div>
+    <a href="../../catalog/dir/">Lance Directory Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">REST Catalog</div>
+    <a href="../../catalog/rest/">Lance REST Catalog</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Namespace Client Spec</div>
+    <a href="../../namespace/">Overview</a>
+    <a href="../../namespace/object-relationship/">Objects & Relationships</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../namespace/operations/">Overview</a>
+    <a href="../../namespace/operations/errors/">Errors</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Models</div>
+    <a href="../../namespace/operations/models/">Operation Models</a>
+    <a href="../../namespace/operations/models/AddColumnsEntry/">AddColumnsEntry</a>
+    <a href="../../namespace/operations/models/AddVirtualColumnEntry/">AddVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AlterColumnsEntry/">AlterColumnsEntry</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsRequest/">AlterTableAddColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAddColumnsResponse/">AlterTableAddColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsRequest/">AlterTableAlterColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableAlterColumnsResponse/">AlterTableAlterColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsRequest/">AlterTableBackfillColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableBackfillColumnsResponse/">AlterTableBackfillColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsRequest/">AlterTableDropColumnsRequest</a>
+    <a href="../../namespace/operations/models/AlterTableDropColumnsResponse/">AlterTableDropColumnsResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionAction/">AlterTransactionAction</a>
+    <a href="../../namespace/operations/models/AlterTransactionRequest/">AlterTransactionRequest</a>
+    <a href="../../namespace/operations/models/AlterTransactionResponse/">AlterTransactionResponse</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetProperty/">AlterTransactionSetProperty</a>
+    <a href="../../namespace/operations/models/AlterTransactionSetStatus/">AlterTransactionSetStatus</a>
+    <a href="../../namespace/operations/models/AlterTransactionUnsetProperty/">AlterTransactionUnsetProperty</a>
+    <a href="../../namespace/operations/models/AlterVirtualColumnEntry/">AlterVirtualColumnEntry</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanRequest/">AnalyzeTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/AnalyzeTableQueryPlanResponse/">AnalyzeTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesRequest/">BatchCommitTablesRequest</a>
+    <a href="../../namespace/operations/models/BatchCommitTablesResponse/">BatchCommitTablesResponse</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsRequest/">BatchCreateTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchCreateTableVersionsResponse/">BatchCreateTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsRequest/">BatchDeleteTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/BatchDeleteTableVersionsResponse/">BatchDeleteTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/BooleanQuery/">BooleanQuery</a>
+    <a href="../../namespace/operations/models/BoostQuery/">BoostQuery</a>
+    <a href="../../namespace/operations/models/CommitTableOperation/">CommitTableOperation</a>
+    <a href="../../namespace/operations/models/CommitTableResult/">CommitTableResult</a>
+    <a href="../../namespace/operations/models/CountTableRowsRequest/">CountTableRowsRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceRequest/">CreateNamespaceRequest</a>
+    <a href="../../namespace/operations/models/CreateNamespaceResponse/">CreateNamespaceResponse</a>
+    <a href="../../namespace/operations/models/CreateTableIndexRequest/">CreateTableIndexRequest</a>
+    <a href="../../namespace/operations/models/CreateTableIndexResponse/">CreateTableIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableRequest/">CreateTableRequest</a>
+    <a href="../../namespace/operations/models/CreateTableResponse/">CreateTableResponse</a>
+    <a href="../../namespace/operations/models/CreateTableScalarIndexResponse/">CreateTableScalarIndexResponse</a>
+    <a href="../../namespace/operations/models/CreateTableTagRequest/">CreateTableTagRequest</a>
+    <a href="../../namespace/operations/models/CreateTableTagResponse/">CreateTableTagResponse</a>
+    <a href="../../namespace/operations/models/CreateTableVersionEntry/">CreateTableVersionEntry</a>
+    <a href="../../namespace/operations/models/CreateTableVersionRequest/">CreateTableVersionRequest</a>
+    <a href="../../namespace/operations/models/CreateTableVersionResponse/">CreateTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DeclareTableRequest/">DeclareTableRequest</a>
+    <a href="../../namespace/operations/models/DeclareTableResponse/">DeclareTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteFromTableRequest/">DeleteFromTableRequest</a>
+    <a href="../../namespace/operations/models/DeleteFromTableResponse/">DeleteFromTableResponse</a>
+    <a href="../../namespace/operations/models/DeleteTableTagRequest/">DeleteTableTagRequest</a>
+    <a href="../../namespace/operations/models/DeleteTableTagResponse/">DeleteTableTagResponse</a>
+    <a href="../../namespace/operations/models/DeregisterTableRequest/">DeregisterTableRequest</a>
+    <a href="../../namespace/operations/models/DeregisterTableResponse/">DeregisterTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceRequest/">DescribeNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DescribeNamespaceResponse/">DescribeNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsRequest/">DescribeTableIndexStatsRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableIndexStatsResponse/">DescribeTableIndexStatsResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableRequest/">DescribeTableRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableResponse/">DescribeTableResponse</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionRequest/">DescribeTableVersionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTableVersionResponse/">DescribeTableVersionResponse</a>
+    <a href="../../namespace/operations/models/DescribeTransactionRequest/">DescribeTransactionRequest</a>
+    <a href="../../namespace/operations/models/DescribeTransactionResponse/">DescribeTransactionResponse</a>
+    <a href="../../namespace/operations/models/DropNamespaceRequest/">DropNamespaceRequest</a>
+    <a href="../../namespace/operations/models/DropNamespaceResponse/">DropNamespaceResponse</a>
+    <a href="../../namespace/operations/models/DropTableIndexRequest/">DropTableIndexRequest</a>
+    <a href="../../namespace/operations/models/DropTableIndexResponse/">DropTableIndexResponse</a>
+    <a href="../../namespace/operations/models/DropTableRequest/">DropTableRequest</a>
+    <a href="../../namespace/operations/models/DropTableResponse/">DropTableResponse</a>
+    <a href="../../namespace/operations/models/ErrorResponse/">ErrorResponse</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanRequest/">ExplainTableQueryPlanRequest</a>
+    <a href="../../namespace/operations/models/ExplainTableQueryPlanResponse/">ExplainTableQueryPlanResponse</a>
+    <a href="../../namespace/operations/models/FragmentStats/">FragmentStats</a>
+    <a href="../../namespace/operations/models/FragmentSummary/">FragmentSummary</a>
+    <a href="../../namespace/operations/models/FtsQuery/">FtsQuery</a>
+    <a href="../../namespace/operations/models/GetTableStatsRequest/">GetTableStatsRequest</a>
+    <a href="../../namespace/operations/models/GetTableStatsResponse/">GetTableStatsResponse</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionRequest/">GetTableTagVersionRequest</a>
+    <a href="../../namespace/operations/models/GetTableTagVersionResponse/">GetTableTagVersionResponse</a>
+    <a href="../../namespace/operations/models/Identity/">Identity</a>
+    <a href="../../namespace/operations/models/IndexContent/">IndexContent</a>
+    <a href="../../namespace/operations/models/InsertIntoTableRequest/">InsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/InsertIntoTableResponse/">InsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/JsonArrowDataType/">JsonArrowDataType</a>
+    <a href="../../namespace/operations/models/JsonArrowField/">JsonArrowField</a>
+    <a href="../../namespace/operations/models/JsonArrowSchema/">JsonArrowSchema</a>
+    <a href="../../namespace/operations/models/ListNamespacesRequest/">ListNamespacesRequest</a>
+    <a href="../../namespace/operations/models/ListNamespacesResponse/">ListNamespacesResponse</a>
+    <a href="../../namespace/operations/models/ListTableIndicesRequest/">ListTableIndicesRequest</a>
+    <a href="../../namespace/operations/models/ListTableIndicesResponse/">ListTableIndicesResponse</a>
+    <a href="../../namespace/operations/models/ListTableTagsRequest/">ListTableTagsRequest</a>
+    <a href="../../namespace/operations/models/ListTableTagsResponse/">ListTableTagsResponse</a>
+    <a href="../../namespace/operations/models/ListTableVersionsRequest/">ListTableVersionsRequest</a>
+    <a href="../../namespace/operations/models/ListTableVersionsResponse/">ListTableVersionsResponse</a>
+    <a href="../../namespace/operations/models/ListTablesRequest/">ListTablesRequest</a>
+    <a href="../../namespace/operations/models/ListTablesResponse/">ListTablesResponse</a>
+    <a href="../../namespace/operations/models/MatchQuery/">MatchQuery</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableRequest/">MergeInsertIntoTableRequest</a>
+    <a href="../../namespace/operations/models/MergeInsertIntoTableResponse/">MergeInsertIntoTableResponse</a>
+    <a href="../../namespace/operations/models/MultiMatchQuery/">MultiMatchQuery</a>
+    <a href="../../namespace/operations/models/NamespaceExistsRequest/">NamespaceExistsRequest</a>
+    <a href="../../namespace/operations/models/PartitionField/">PartitionField</a>
+    <a href="../../namespace/operations/models/PartitionSpec/">PartitionSpec</a>
+    <a href="../../namespace/operations/models/PartitionTransform/">PartitionTransform</a>
+    <a href="../../namespace/operations/models/PhraseQuery/">PhraseQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequest/">QueryTableRequest</a>
+    <a href="../../namespace/operations/models/QueryTableRequestColumns/">QueryTableRequestColumns</a>
+    <a href="../../namespace/operations/models/QueryTableRequestFullTextQuery/">QueryTableRequestFullTextQuery</a>
+    <a href="../../namespace/operations/models/QueryTableRequestVector/">QueryTableRequestVector</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewRequest/">RefreshMaterializedViewRequest</a>
+    <a href="../../namespace/operations/models/RefreshMaterializedViewResponse/">RefreshMaterializedViewResponse</a>
+    <a href="../../namespace/operations/models/RegisterTableRequest/">RegisterTableRequest</a>
+    <a href="../../namespace/operations/models/RegisterTableResponse/">RegisterTableResponse</a>
+    <a href="../../namespace/operations/models/RenameTableRequest/">RenameTableRequest</a>
+    <a href="../../namespace/operations/models/RenameTableResponse/">RenameTableResponse</a>
+    <a href="../../namespace/operations/models/RestoreTableRequest/">RestoreTableRequest</a>
+    <a href="../../namespace/operations/models/RestoreTableResponse/">RestoreTableResponse</a>
+    <a href="../../namespace/operations/models/StringFtsQuery/">StringFtsQuery</a>
+    <a href="../../namespace/operations/models/StructuredFtsQuery/">StructuredFtsQuery</a>
+    <a href="../../namespace/operations/models/TableBasicStats/">TableBasicStats</a>
+    <a href="../../namespace/operations/models/TableExistsRequest/">TableExistsRequest</a>
+    <a href="../../namespace/operations/models/TableVersion/">TableVersion</a>
+    <a href="../../namespace/operations/models/TagContents/">TagContents</a>
+    <a href="../../namespace/operations/models/UpdateTableRequest/">UpdateTableRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableResponse/">UpdateTableResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataRequest/">UpdateTableSchemaMetadataRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableSchemaMetadataResponse/">UpdateTableSchemaMetadataResponse</a>
+    <a href="../../namespace/operations/models/UpdateTableTagRequest/">UpdateTableTagRequest</a>
+    <a href="../../namespace/operations/models/UpdateTableTagResponse/">UpdateTableTagResponse</a>
+    <a href="../../namespace/operations/models/VersionRange/">VersionRange</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Supported Catalogs</div>
+    <a href="../../namespace/supported-catalogs/">Overview</a>
+    <a href="../../namespace/supported-catalogs/lance-dir/">Lance Directory Catalog</a>
+    <a href="../../namespace/supported-catalogs/lance-rest/">Lance REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/gravitino/">Apache Gravitino</a>
+    <a href="../../namespace/supported-catalogs/hive2/">Apache Hive MetaStore V2</a>
+    <a href="../../namespace/supported-catalogs/hive3/">Apache Hive MetaStore V3</a>
+    <a href="../../namespace/supported-catalogs/iceberg/">Apache Iceberg REST Catalog</a>
+    <a href="../../namespace/supported-catalogs/polaris/">Apache Polaris</a>
+    <a href="../../namespace/supported-catalogs/glue/">AWS Glue</a>
+    <a href="../../namespace/supported-catalogs/biglake/">Google BigLake</a>
+    <a href="../../namespace/supported-catalogs/dataproc/">Google Dataproc</a>
+    <a href="../../namespace/supported-catalogs/onelake/">Microsoft OneLake</a>
+    <a href="../../namespace/supported-catalogs/unity/">Unity Catalog</a>
+    <a href="../../namespace/supported-catalogs/template/">Template</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Specification</span>
+        <span>/</span><span>Table Format</span>
+        <span>/</span><b>Row ID & Lineage</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="row-id-and-lineage-specification">Row ID and Lineage Specification<a class="headerlink" href="#row-id-and-lineage-specification" title="Permanent link">&para;</a></h1>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>Lance provides row identification and lineage tracking capabilities.
+Row addressing enables efficient random access to rows within the table through a physical location encoding.
+Stable row IDs provide persistent identifiers that remain constant throughout a row's lifetime, even as its physical location changes.
+Row version tracking records when rows were created and last modified, enabling incremental processing, change data capture, and time-travel queries.</p>
+<h2 id="row-identifier-forms">Row Identifier Forms<a class="headerlink" href="#row-identifier-forms" title="Permanent link">&para;</a></h2>
+<p>A row in Lance has two forms of row identifiers:</p>
+<ul>
+<li><strong>Row address</strong> - the current physical location of the row in the dataset.</li>
+<li><strong>Row ID</strong> - a logical identifier of the row. When stable row IDs are enabled, this remains stable for the lifetime of a logical row. When disabled (default mode), it is exactly equal to the row address.</li>
+</ul>
+<h3 id="row-address">Row Address<a class="headerlink" href="#row-address" title="Permanent link">&para;</a></h3>
+<p>Row address is the physical location of a row in the table, represented as a 64-bit identifier composed of two 32-bit values:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>row_address = (fragment_id &lt;&lt; 32) | local_row_offset
+</span></code></pre></div>
+<p>This addressing scheme enables efficient random access: given a row address, the fragment and offset are extracted with bit operations.
+Row addresses change when data is reorganized through compaction or updates.</p>
+<p>Row address is currently the primary form of identifier used for indexing purposes.
+Secondary indices (vector indices, scalar indices, full-text search indices) reference rows by their row addresses.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Work to support stable row IDs in indices is in progress.</p>
+</div>
+<h3 id="row-id">Row ID<a class="headerlink" href="#row-id" title="Permanent link">&para;</a></h3>
+<p>Row ID is a logical identifier for a row.</p>
+<h4 id="stable-row-id">Stable Row ID<a class="headerlink" href="#stable-row-id" title="Permanent link">&para;</a></h4>
+<p>When a dataset is created with stable row IDs enabled, each row is assigned a unique auto-incrementing <code>u64</code> identifier that remains constant throughout the row's lifetime, even when the row's physical location (row address) changes.
+The <code>_rowid</code> system column exposes this logical identifier to users.
+See the next section for more details on assignment and update semantics.</p>
+<h4 id="historicalunstable-usage">Historical/unstable usage<a class="headerlink" href="#historicalunstable-usage" title="Permanent link">&para;</a></h4>
+<p>Historically, the term "row id" was often used to refer to the physical row address (<code>_rowaddr</code>), which is not stable across compaction or updates.</p>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>With the introduction of stable row IDs, there may still be places in code and documentation that mix the terms "row ID" and "row address" or "row ID" and "stable row ID".
+  Please raise a PR if you find any place incorrect or confusing.</p>
+</div>
+<h2 id="stable-row-id_1">Stable Row ID<a class="headerlink" href="#stable-row-id_1" title="Permanent link">&para;</a></h2>
+<h3 id="row-id-assignment">Row ID Assignment<a class="headerlink" href="#row-id-assignment" title="Permanent link">&para;</a></h3>
+<p>Row IDs are assigned using a monotonically increasing <code>next_row_id</code> counter stored in the manifest.</p>
+<p><strong>Assignment Protocol:</strong></p>
+<ol>
+<li>Writer reads the current <code>next_row_id</code> from the manifest at the read version</li>
+<li>Writer assigns row IDs sequentially starting from <code>next_row_id</code> for new rows</li>
+<li>Writer updates <code>next_row_id</code> in the new manifest to <code>next_row_id + num_new_rows</code></li>
+<li>If commit fails due to conflict, writer rebases:</li>
+<li>Re-reads the new <code>next_row_id</code> from the latest version</li>
+<li>Reassigns row IDs to new rows using the updated counter</li>
+<li>Retries commit</li>
+</ol>
+<p>This protocol mirrors fragment ID assignment and ensures row IDs are unique across all table versions.</p>
+<h3 id="enabling-stable-row-ids">Enabling Stable Row IDs<a class="headerlink" href="#enabling-stable-row-ids" title="Permanent link">&para;</a></h3>
+<p>Stable row IDs are a dataset-level feature recorded in the table manifest.</p>
+<ul>
+<li>Stable row IDs <strong>must be enabled when the dataset is first created</strong>.</li>
+<li>Currently, they <strong>cannot be turned on later</strong> for an existing dataset. Attempts to write with <code>enable_stable_row_ids = true</code> against a dataset that was created without stable row IDs will not change the dataset's configuration.</li>
+<li>When stable row IDs are disabled, the <code>_rowid</code> column (if requested) is not stable and should not be used as a persistent identifier.</li>
+</ul>
+<p>Row-level version tracking (<code>_row_created_at_version</code>, <code>_row_last_updated_at_version</code>) and the row ID index described below are only available when stable row IDs are enabled.</p>
+<h3 id="row-id-behavior-on-updates">Row ID Behavior on Updates<a class="headerlink" href="#row-id-behavior-on-updates" title="Permanent link">&para;</a></h3>
+<p>When stable row IDs are enabled, updates preserve the logical row ID and remap it to a new physical address instead of assigning a new ID.</p>
+<p><strong>Update Workflow:</strong></p>
+<ol>
+<li>Original row with <code>_rowid = R</code> exists at address <code>(F1, O1)</code>.</li>
+<li>An update operation writes a new physical row with the updated values at address <code>(F2, O2)</code>.</li>
+<li>The new physical row is assigned the same <code>_rowid = R</code>, so the logical identifier is preserved.</li>
+<li>The original physical row at <code>(F1, O1)</code> is marked deleted using the deletion vector for fragment <code>F1</code>.</li>
+<li>The row ID index for the new dataset version maps <code>_rowid = R</code> to <code>(F2, O2)</code>, and uses deletion vectors and fragment bitmaps to avoid returning the tombstoned row at <code>(F1, O1)</code>.</li>
+</ol>
+<p>This design keeps <code>_rowid</code> stable for the lifetime of a logical row while allowing physical storage and secondary indices to be maintained independently.</p>
+<h3 id="row-id-sequences">Row ID Sequences<a class="headerlink" href="#row-id-sequences" title="Permanent link">&para;</a></h3>
+<h4 id="storage-format">Storage Format<a class="headerlink" href="#storage-format" title="Permanent link">&para;</a></h4>
+<p>Row ID sequences are stored using the <code>RowIdSequence</code> protobuf message.
+The sequence is partitioned into segments, each encoded optimally based on the data pattern.</p>
+<details>
+<summary>RowIdSequence protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">RowIdSequence</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">U64Segment</span><span class="w"> </span><span class="na">segments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="segment-encodings">Segment Encodings<a class="headerlink" href="#segment-encodings" title="Permanent link">&para;</a></h4>
+<p>Each segment uses one of five encodings optimized for different data patterns:</p>
+<h5 id="range-contiguous-values">Range (Contiguous Values)<a class="headerlink" href="#range-contiguous-values" title="Permanent link">&para;</a></h5>
+<p>For sorted, contiguous values with no gaps.
+Example: Row IDs <code>[100, 101, 102, 103, 104]</code> → <code>Range{start: 100, end: 105}</code>.
+Used for new fragments where row IDs are assigned sequentially.</p>
+<details>
+<summary>Range protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">Range</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">    </span><span class="c1">/// The start of the range, inclusive.</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">    </span><span class="kt">uint64</span><span class="w"> </span><span class="na">start</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">    </span><span class="c1">/// The end of the range, exclusive.</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">    </span><span class="kt">uint64</span><span class="w"> </span><span class="na">end</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h5 id="range-with-holes-sparse-deletions">Range with Holes (Sparse Deletions)<a class="headerlink" href="#range-with-holes-sparse-deletions" title="Permanent link">&para;</a></h5>
+<p>For sorted values with few gaps.
+Example: Row IDs <code>[100, 101, 103, 104]</code> (missing 102) → <code>RangeWithHoles{start: 100, end: 105, holes: [102]}</code>.
+Used for fragments with sparse deletions where maintaining the range is efficient.</p>
+<details>
+<summary>RangeWithHoles protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">RangeWithHoles</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">    </span><span class="c1">/// The start of the range, inclusive.</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">    </span><span class="kt">uint64</span><span class="w"> </span><span class="na">start</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">    </span><span class="c1">/// The end of the range, exclusive.</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">    </span><span class="kt">uint64</span><span class="w"> </span><span class="na">end</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">    </span><span class="cm">/* The holes in the range, as a sorted array of values;</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="cm">     * Binary search can be used to check whether a value is a hole and should</span>
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="cm">     * be skipped. This can also be used to count the number of holes before a</span>
+</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="cm">     * given value, if you need to find the logical offset of a value in the</span>
+</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="cm">     * segment.</span>
+</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="cm">     */</span>
+</span><span id="__span-3-12"><a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="w">    </span><span class="n">EncodedU64Array</span><span class="w"> </span><span class="na">holes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-3-13"><a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h5 id="range-with-bitmap-dense-deletions">Range with Bitmap (Dense Deletions)<a class="headerlink" href="#range-with-bitmap-dense-deletions" title="Permanent link">&para;</a></h5>
+<p>For sorted values with many gaps.
+The bitmap encodes 8 values per byte, with the most significant bit representing the first value.
+Used for fragments with dense deletion patterns.</p>
+<details>
+<summary>RangeWithBitmap protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">RangeWithBitmap</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">    </span><span class="c1">/// The start of the range, inclusive.</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">    </span><span class="kt">uint64</span><span class="w"> </span><span class="na">start</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">    </span><span class="c1">/// The end of the range, exclusive.</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">    </span><span class="kt">uint64</span><span class="w"> </span><span class="na">end</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">    </span><span class="cm">/* A bitmap of the values in the range. The bitmap is a sequence of bytes,</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="cm">     * where each byte represents 8 values. The first byte represents values</span>
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="cm">     * start to start + 7, the second byte represents values start + 8 to</span>
+</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="cm">     * start + 15, and so on. The most significant bit of each byte represents</span>
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="cm">     * the first value in the range, and the least significant bit represents</span>
+</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="cm">     * the last value in the range. If the bit is set, the value is in the</span>
+</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a><span class="cm">     * range; if it is not set, the value is not in the range.</span>
+</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a><span class="cm">     */</span>
+</span><span id="__span-4-14"><a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a><span class="w">    </span><span class="kt">bytes</span><span class="w"> </span><span class="na">bitmap</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-4-15"><a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h5 id="sorted-array-sparse-values">Sorted Array (Sparse Values)<a class="headerlink" href="#sorted-array-sparse-values" title="Permanent link">&para;</a></h5>
+<p>For sorted but non-contiguous values, stored as an <code>EncodedU64Array</code>.
+Used for merged fragments or fragments after compaction.</p>
+<h5 id="unsorted-array-general-case">Unsorted Array (General Case)<a class="headerlink" href="#unsorted-array-general-case" title="Permanent link">&para;</a></h5>
+<p>For unsorted values, stored as an <code>EncodedU64Array</code>.
+Rare; most operations maintain sorted order.</p>
+<h4 id="encoded-u64-arrays">Encoded U64 Arrays<a class="headerlink" href="#encoded-u64-arrays" title="Permanent link">&para;</a></h4>
+<p>The <code>EncodedU64Array</code> message supports bitpacked encoding to minimize storage.
+The implementation selects the most compact encoding based on the value range, choosing between base + 16-bit offsets, base + 32-bit offsets, or full 64-bit values.</p>
+<details>
+<summary>EncodedU64Array protobuf message</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">EncodedU64Array</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">    </span><span class="kd">message</span><span class="w"> </span><span class="nc">U16Array</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">        </span><span class="kt">uint64</span><span class="w"> </span><span class="na">base</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">        </span><span class="cm">/* The deltas are stored as 16-bit unsigned integers.</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="cm">         * (protobuf doesn't support 16-bit integers, so we use bytes instead)</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="cm">         */</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="w">        </span><span class="kt">bytes</span><span class="w"> </span><span class="na">offsets</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="w">    </span><span class="kd">message</span><span class="w"> </span><span class="nc">U32Array</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="w">        </span><span class="kt">uint64</span><span class="w"> </span><span class="na">base</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="w">        </span><span class="cm">/* The deltas are stored as 32-bit unsigned integers.</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="cm">         * (we use bytes instead of uint32 to avoid overhead of varint encoding)</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="cm">         */</span>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="w">        </span><span class="kt">bytes</span><span class="w"> </span><span class="na">offsets</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a>
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a><span class="w">    </span><span class="kd">message</span><span class="w"> </span><span class="nc">U64Array</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="w">        </span><span class="c1">/// (We use bytes instead of uint64 to avoid overhead of varint encoding)</span>
+</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="w">        </span><span class="kt">bytes</span><span class="w"> </span><span class="na">values</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a>
+</span><span id="__span-5-23"><a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a><span class="w">    </span><span class="k">oneof</span><span class="w"> </span><span class="n">array</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-5-24"><a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a><span class="w">        </span><span class="n">U16Array</span><span class="w"> </span><span class="na">u16_array</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-5-25"><a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a><span class="w">        </span><span class="n">U32Array</span><span class="w"> </span><span class="na">u32_array</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-5-26"><a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a><span class="w">        </span><span class="n">U64Array</span><span class="w"> </span><span class="na">u64_array</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span>
+</span><span id="__span-5-27"><a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a><span class="w">    </span><span class="p">}</span>
+</span><span id="__span-5-28"><a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a>
+</span><span id="__span-5-29"><a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h4 id="inline-vs-external-storage">Inline vs External Storage<a class="headerlink" href="#inline-vs-external-storage" title="Permanent link">&para;</a></h4>
+<p>Row ID sequences are stored either inline in the fragment metadata or in external files.
+Sequences smaller than ~200KB are stored inline to avoid additional I/O, while larger sequences are written to external files referenced by path and offset.
+This threshold balances manifest size against the overhead of separate file reads.</p>
+<details>
+<summary>DataFragment row_id_sequence field</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">DataFragment</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">row_id_sequence</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">    </span><span class="kt">bytes</span><span class="w"> </span><span class="na">inline_row_ids</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">    </span><span class="n">ExternalFile</span><span class="w"> </span><span class="na">external_row_ids</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h3 id="row-id-index">Row ID Index<a class="headerlink" href="#row-id-index" title="Permanent link">&para;</a></h3>
+<h4 id="construction">Construction<a class="headerlink" href="#construction" title="Permanent link">&para;</a></h4>
+<p>The row ID index is built at table load time by aggregating row ID sequences from all fragments:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>For each fragment F with ID f:
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>  For each (position p, row_id r) in F.row_id_sequence:
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>    index[r] = (f, p)
+</span></code></pre></div>
+<p>This creates a mapping from row ID to current row address.</p>
+<h4 id="index-invalidation-with-updates">Index Invalidation with Updates<a class="headerlink" href="#index-invalidation-with-updates" title="Permanent link">&para;</a></h4>
+<p>When rows are updated and stable row IDs are enabled, the row ID index for a given dataset version only contains mappings for live physical rows. Tombstoned rows are excluded using deletion vectors, and logical row IDs whose contents have changed simply map to new row addresses.</p>
+<p><strong>Example Scenario:</strong></p>
+<ol>
+<li>Initial state (version V): Fragment 1 contains rows with IDs <code>[1, 2, 3]</code> at offsets <code>[0, 1, 2]</code>.</li>
+<li>An update operation modifies the row with <code>_rowid = 2</code>:<ul>
+<li>A new fragment 2 is created with a row for <code>_rowid = 2</code> at offset <code>0</code>.</li>
+<li>In fragment 1, the original physical row at offset <code>1</code> is marked deleted in the deletion vector.</li>
+</ul>
+</li>
+<li>Row ID index in version V+1:<ul>
+<li><code>1 → (1, 0)</code> ✓ Valid</li>
+<li><code>2 → (2, 0)</code> ✓ Valid (updated row in fragment 2)</li>
+<li><code>3 → (1, 2)</code> ✓ Valid</li>
+</ul>
+</li>
+</ol>
+<p>The address <code>(1, 1)</code> is no longer reachable via the row ID index because it is filtered out by the deletion vector when the index is constructed.</p>
+<h4 id="fragment-bitmaps-for-index-masking">Fragment Bitmaps for Index Masking<a class="headerlink" href="#fragment-bitmaps-for-index-masking" title="Permanent link">&para;</a></h4>
+<p>Secondary indices use fragment bitmaps to track which row IDs remain valid:</p>
+<p><strong>Without Row Updates:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>String Index on column "str":
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>  Fragment Bitmap: {1, 2}  (covers fragments 1 and 2)
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>  All indexed row addresses are valid
+</span></code></pre></div>
+<p><strong>With Row Updates:</strong></p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>Vector Index on column "vec":
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>  Fragment Bitmap: {1}  (only fragment 1)
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>  The row with _rowid = 2 was updated, so the index entry that points to its old physical address is stale
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>  Index queries filter out the stale address using deletion vectors while returning the row at its new address
+</span></code></pre></div>
+<p>This bitmap-based approach allows indices to remain immutable while accounting for row modifications.</p>
+<h2 id="row-version-tracking">Row Version Tracking<a class="headerlink" href="#row-version-tracking" title="Permanent link">&para;</a></h2>
+<p>Row version tracking is available for datasets that use stable row IDs. Version sequences are aligned with the stable <code>_rowid</code> ordering within each fragment.</p>
+<h3 id="created-at-version">Created At Version<a class="headerlink" href="#created-at-version" title="Permanent link">&para;</a></h3>
+<p>Each row tracks the version at which it was created.
+For rows that are later updated, this creation version remains the version in which the row first appeared; updates do not change it.
+The sequence uses run-length encoding for efficient storage, where each run specifies a span of consecutive rows and the version they were created in.</p>
+<p>Example: Fragment with 1000 rows created in version 5:
+<div class="language-text highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>RowDatasetVersionSequence {
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>  runs: [
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>    RowDatasetVersionRun { span: Range{start: 0, end: 1000}, version: 5 }
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>  ]
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>}
+</span></code></pre></div></p>
+<details>
+<summary>DataFragment created_at_version_sequence field</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">DataFragment</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">created_at_version_sequence</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="w">    </span><span class="kt">bytes</span><span class="w"> </span><span class="na">inline_created_at_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">9</span><span class="p">;</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">    </span><span class="n">ExternalFile</span><span class="w"> </span><span class="na">external_created_at_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<details>
+<summary>RowDatasetVersionSequence protobuf messages</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">RowDatasetVersionSequence</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">    </span><span class="k">repeated</span><span class="w"> </span><span class="n">RowDatasetVersionRun</span><span class="w"> </span><span class="na">runs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h3 id="last-updated-at-version">Last Updated At Version<a class="headerlink" href="#last-updated-at-version" title="Permanent link">&para;</a></h3>
+<p>Each row tracks the version at which it was last modified.
+When a row is created, <code>last_updated_at_version</code> equals <code>created_at_version</code>.</p>
+<p>When stable row IDs are enabled and a row is updated, Lance writes a new physical row for the same logical <code>_rowid</code> while tombstoning the old physical row. The <code>created_at_version</code> for that logical row is preserved from the original row, and <code>last_updated_at_version</code> is set to the current dataset version at the time of the update.</p>
+<p>Example: Row created in version 3, updated in version 7:
+<div class="language-text highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>Old physical row (tombstoned):
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>  _rowid: R
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>  created_at_version: 3
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>  last_updated_at_version: 3
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>
+</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>New physical row (current):
+</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a>  _rowid: R
+</span><span id="__span-13-8"><a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a>  created_at_version: 3
+</span><span id="__span-13-9"><a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a>  last_updated_at_version: 7
+</span></code></pre></div></p>
+<details>
+<summary>DataFragment last_updated_at_version_sequence field</summary>
+
+<div class="language-protobuf highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="kd">message</span><span class="w"> </span><span class="nc">DataFragment</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="w">  </span><span class="k">oneof</span><span class="w"> </span><span class="n">last_updated_at_version_sequence</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="w">    </span><span class="kt">bytes</span><span class="w"> </span><span class="na">inline_last_updated_at_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="w">    </span><span class="n">ExternalFile</span><span class="w"> </span><span class="na">external_last_updated_at_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span>
+</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a><span class="w">  </span><span class="p">}</span>
+</span><span id="__span-14-6"><a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a><span class="p">}</span>
+</span></code></pre></div>
+
+</details>
+
+<h2 id="change-data-feed">Change Data Feed<a class="headerlink" href="#change-data-feed" title="Permanent link">&para;</a></h2>
+<p>Lance supports querying rows that changed between versions through version tracking columns.
+These queries can be expressed as standard SQL predicates on the <code>_row_created_at_version</code> and <code>_row_last_updated_at_version</code> columns.</p>
+<h3 id="inserted-rows">Inserted Rows<a class="headerlink" href="#inserted-rows" title="Permanent link">&para;</a></h3>
+<p>Rows created between two versions can be retrieved by filtering on <code>_row_created_at_version</code>:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">dataset</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">_row_created_at_version</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="err">{</span><span class="n">begin_version</span><span class="err">}</span>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">_row_created_at_version</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="err">{</span><span class="n">end_version</span><span class="err">}</span>
+</span></code></pre></div>
+<p>This query returns all rows inserted in the specified version range, including the version metadata columns <code>_row_created_at_version</code>, <code>_row_last_updated_at_version</code>, and <code>_rowid</code>.</p>
+<h3 id="updated-rows">Updated Rows<a class="headerlink" href="#updated-rows" title="Permanent link">&para;</a></h3>
+<p>Rows modified (but not newly created) between two versions can be retrieved by combining filters on both version columns:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">dataset</span>
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="k">WHERE</span><span class="w"> </span><span class="n">_row_created_at_version</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="err">{</span><span class="n">begin_version</span><span class="err">}</span>
+</span><span id="__span-16-3"><a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">_row_last_updated_at_version</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="err">{</span><span class="n">begin_version</span><span class="err">}</span>
+</span><span id="__span-16-4"><a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">_row_last_updated_at_version</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="err">{</span><span class="n">end_version</span><span class="err">}</span>
+</span></code></pre></div>
+<p>This query excludes newly inserted rows by requiring <code>_row_created_at_version &lt;= {begin_version}</code>, ensuring only pre-existing rows that were subsequently updated are returned.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../branch_tag/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Branch & Tag</div>
+        </a>
+        <a class="next" href="../data_overlay_file/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Data Overlay Files</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#overview">Overview</a>
+      <a class="ld-toc__h2" href="#row-identifier-forms">Row Identifier Forms</a>
+      <a class="ld-toc__h3" href="#row-address">Row Address</a>
+      <a class="ld-toc__h3" href="#row-id">Row ID</a>
+      <a class="ld-toc__h2" href="#stable-row-id_1">Stable Row ID</a>
+      <a class="ld-toc__h3" href="#row-id-assignment">Row ID Assignment</a>
+      <a class="ld-toc__h3" href="#enabling-stable-row-ids">Enabling Stable Row IDs</a>
+      <a class="ld-toc__h3" href="#row-id-behavior-on-updates">Row ID Behavior on Updates</a>
+      <a class="ld-toc__h3" href="#row-id-sequences">Row ID Sequences</a>
+      <a class="ld-toc__h3" href="#row-id-index">Row ID Index</a>
+      <a class="ld-toc__h2" href="#row-version-tracking">Row Version Tracking</a>
+      <a class="ld-toc__h3" href="#created-at-version">Created At Version</a>
+      <a class="ld-toc__h3" href="#last-updated-at-version">Last Updated At Version</a>
+      <a class="ld-toc__h2" href="#change-data-feed">Change Data Feed</a>
+      <a class="ld-toc__h3" href="#inserted-rows">Inserted Rows</a>
+      <a class="ld-toc__h3" href="#updated-rows">Updated Rows</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../">Specification</a>
+        <a href="../../file/">File format</a>
+        <a href="../">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>

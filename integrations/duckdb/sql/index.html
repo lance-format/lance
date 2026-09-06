@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>SQL Reference — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/duckdb/sql/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../">Overview</a>
+    <a href="../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../pytorch/">PyTorch</a>
+    <a href="../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../">Overview</a>
+    <a class="active" href="./">SQL Reference</a>
+    <a href="../rest/">REST Namespace</a>
+    <a href="../cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../huggingface/">Home</a>
+    <a href="../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../../spark/">Welcome</a>
+    <a href="../../spark/install/">Install</a>
+    <a href="../../spark/config/">Config</a>
+    <a href="../../spark/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../spark/operations/ddl/create-namespace/">CREATE NAMESPACE</a>
+    <a href="../../spark/operations/ddl/drop-namespace/">DROP NAMESPACE</a>
+    <a href="../../spark/operations/ddl/show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../../spark/operations/ddl/describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../../spark/operations/ddl/create-table/">CREATE TABLE</a>
+    <a href="../../spark/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../spark/operations/ddl/describe-table/">DESCRIBE TABLE</a>
+    <a href="../../spark/operations/ddl/alter-table/">ALTER TABLE</a>
+    <a href="../../spark/operations/ddl/show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../../spark/operations/ddl/drop-table/">DROP TABLE</a>
+    <a href="../../spark/operations/ddl/create-index/">CREATE INDEX</a>
+    <a href="../../spark/operations/ddl/show-indexes/">SHOW INDEXES</a>
+    <a href="../../spark/operations/ddl/create-branch/">CREATE BRANCH</a>
+    <a href="../../spark/operations/ddl/drop-branch/">DROP BRANCH</a>
+    <a href="../../spark/operations/ddl/show-branches/">SHOW BRANCHES</a>
+    <a href="../../spark/operations/ddl/create-tag/">CREATE TAG</a>
+    <a href="../../spark/operations/ddl/drop-tag/">DROP TAG</a>
+    <a href="../../spark/operations/ddl/show-tags/">SHOW TAGS</a>
+    <a href="../../spark/operations/ddl/optimize/">OPTIMIZE</a>
+    <a href="../../spark/operations/ddl/vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../spark/operations/dql/select/">SELECT</a>
+    <a href="../../spark/operations/dql/fts/">Full-Text Search</a>
+    <a href="../../spark/operations/dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../../spark/operations/dql/search/">SEARCH</a>
+    <a href="../../spark/operations/dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../spark/operations/dml/insert-into/">INSERT INTO</a>
+    <a href="../../spark/operations/dml/update/">UPDATE SET</a>
+    <a href="../../spark/operations/dml/delete/">DELETE FROM</a>
+    <a href="../../spark/operations/dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../../spark/operations/dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../../spark/vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../ray/">Welcome</a>
+    <a href="../../ray/read/">Read</a>
+    <a href="../../ray/write/">Write</a>
+    <a href="../../ray/distributed-indexing/">Index</a>
+    <a href="../../ray/compaction/">Compaction</a>
+    <a href="../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../trino/">Welcome</a>
+    <a href="../../trino/install/">Install</a>
+    <a href="../../trino/config/">Config</a>
+    <a href="../../trino/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../trino/operations/data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../trino/operations/ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../trino/operations/ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../trino/operations/ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../trino/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../trino/operations/ddl/describe-table/">DESCRIBE</a>
+    <a href="../../trino/operations/ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../trino/operations/ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../trino/operations/dml/insert/">INSERT</a>
+    <a href="../../trino/operations/dml/update/">UPDATE</a>
+    <a href="../../trino/operations/dml/delete/">DELETE</a>
+    <a href="../../trino/operations/dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../trino/operations/dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../context/">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../context/guide/quickstart/">Quickstart</a>
+    <a href="../../context/guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../context/guide/storage/">Storage backends</a>
+    <a href="../../context/guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../../context/specs/rollout-schema-design/">Rollout schema</a>
+    <a href="../../context/specs/rollout-deployment/">Rollout deployment</a>
+    <a href="../../context/specs/rollout-blob-streaming/">Blob streaming</a>
+    <a href="../../context/specs/datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../../context/design/partitioned-namespace/">Partitioned namespace</a>
+    <a href="../../context/design/auto-dream/">Auto-dream</a>
+    <a href="../../context/design/using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>DuckDB</span>
+        <span>/</span><b>SQL Reference</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="sql-reference">SQL Reference<a class="headerlink" href="#sql-reference" title="Permanent link">&para;</a></h1>
+<p>This document lists the SQL surface currently supported by the <code>lance</code> DuckDB extension, with short examples.</p>
+<h2 id="loading">Loading<a class="headerlink" href="#loading" title="Permanent link">&para;</a></h2>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">INSTALL</span><span class="w"> </span><span class="n">lance</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">community</span><span class="p">;</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">LOAD</span><span class="w"> </span><span class="n">lance</span><span class="p">;</span>
+</span></code></pre></div>
+<p>For local development builds, load the extension artifact directly:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">LOAD</span><span class="w"> </span><span class="s1">'build/release/extension/lance/lance.duckdb_extension'</span><span class="p">;</span>
+</span></code></pre></div>
+<h2 id="scan">Scan<a class="headerlink" href="#scan" title="Permanent link">&para;</a></h2>
+<p>Query a dataset by selecting from its URI directly:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="k">FROM</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="k">LIMIT</span><span class="w"> </span><span class="mi">10</span><span class="p">;</span>
+</span></code></pre></div>
+<h2 id="search">Search<a class="headerlink" href="#search" title="Permanent link">&para;</a></h2>
+<h3 id="vector-search-lance_vector_search">Vector search: <code>lance_vector_search</code><a class="headerlink" href="#vector-search-lance_vector_search" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1">-- Search a vector column, returning distances in `_distance` (smaller is closer)</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">_distance</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance_vector_search</span><span class="p">(</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span><span class="s1">'path/to/dataset.lance'</span><span class="p">,</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">  </span><span class="s1">'vec'</span><span class="p">,</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">  </span><span class="p">[</span><span class="mi">0</span><span class="p">.</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">4</span><span class="p">]::</span><span class="nb">FLOAT</span><span class="p">[</span><span class="mi">4</span><span class="p">],</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">  </span><span class="n">k</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="w">  </span><span class="n">use_index</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">true</span><span class="p">,</span>
+</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="w">  </span><span class="n">nprobs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="w">  </span><span class="n">refine_factor</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="w">  </span><span class="n">prefilter</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">true</span>
+</span><span id="__span-3-12"><a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="p">)</span>
+</span><span id="__span-3-13"><a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">_distance</span><span class="w"> </span><span class="k">ASC</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Signature: <code>lance_vector_search(uri, vector_column, query_vector, ...)</code></p>
+<p>Positional arguments:
+- <code>uri</code> (VARCHAR): Dataset root path, object store URI (e.g. <code>s3://...</code>), or an attached Lance table name.
+- <code>vector_column</code> (VARCHAR): Vector column name.
+- <code>query_vector</code> (FLOAT[dim] or DOUBLE[dim], preferred): Query vector (must be non-empty; values are cast to float32). <code>FLOAT[]</code> / <code>DOUBLE[]</code> are also accepted.</p>
+<p>Named parameters:
+- <code>k</code> (BIGINT, default <code>10</code>): Number of results to return. Must be &gt; 0.
+- <code>use_index</code> (BOOLEAN, default <code>true</code>): If <code>true</code>, allow ANN index usage when available.
+- <code>nprobs</code> (BIGINT, optional): Number of IVF partitions to probe when using a vector index. Must be &gt; 0. Only affects IVF-based vector indices.
+- <code>refine_factor</code> (BIGINT, optional): Over-fetch factor for re-ranking using original vectors. Must be &gt; 0. A value of <code>1</code> still enables re-ranking.
+- <code>prefilter</code> (BOOLEAN, default <code>false</code>): If <code>true</code>, filters are applied before top-k selection.
+- <code>explain_verbose</code> (BOOLEAN, default <code>false</code>): Emit a more verbose Lance plan in <code>EXPLAIN</code> output.
+- <code>filter</code> (VARCHAR, optional): Namespace <code>query_table</code> filter expression. Only supported when <code>uri</code> resolves to an attached Lance namespace table.</p>
+<p>Output:
+- Dataset columns plus <code>_distance</code> (smaller is closer).</p>
+<p>Filter semantics:
+- If <code>prefilter=false</code>, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
+- If <code>prefilter=true</code>, prefilterable filters must be pushed down, otherwise the query fails with an error.
+- For attached namespace tables, DuckDB <code>WHERE</code> filters are applied after the namespace search result. Use the explicit <code>filter</code> parameter to send a filter expression to Lance Namespace <code>query_table</code>; <code>prefilter=true</code> on namespace tables requires this explicit <code>filter</code>.</p>
+<h3 id="full-text-search-lance_fts">Full-text search: <code>lance_fts</code><a class="headerlink" href="#full-text-search-lance_fts" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1">-- Search a text column, returning BM25-like scores in `_score` (larger is better)</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="nb">text</span><span class="p">,</span><span class="w"> </span><span class="n">_score</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance_fts</span><span class="p">(</span><span class="s1">'path/to/dataset.lance'</span><span class="p">,</span><span class="w"> </span><span class="s1">'text'</span><span class="p">,</span><span class="w"> </span><span class="s1">'puppy'</span><span class="p">,</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="n">prefilter</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">true</span><span class="p">)</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">_score</span><span class="w"> </span><span class="k">DESC</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Signature: <code>lance_fts(uri, text_column, query, ...)</code></p>
+<p>Positional arguments:
+- <code>uri</code> (VARCHAR): Dataset root path, object store URI (e.g. <code>s3://...</code>), or an attached Lance table name.
+- <code>text_column</code> (VARCHAR): Text column name.
+- <code>query</code> (VARCHAR): Query string.</p>
+<p>Named parameters:
+- <code>k</code> (BIGINT, default <code>10</code>): Number of results to return. Must be &gt; 0.
+- <code>prefilter</code> (BOOLEAN, default <code>false</code>): If <code>true</code>, filters are applied before top-k selection.
+- <code>filter</code> (VARCHAR, optional): Namespace <code>query_table</code> filter expression. Only supported when <code>uri</code> resolves to an attached Lance namespace table.</p>
+<p>Output:
+- Dataset columns plus <code>_score</code> (larger is better).</p>
+<p>Filter semantics:
+- If <code>prefilter=false</code>, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
+- If <code>prefilter=true</code>, prefilterable filters must be pushed down, otherwise the query fails with an error.
+- For attached namespace tables, DuckDB <code>WHERE</code> filters are applied after the namespace search result. Use the explicit <code>filter</code> parameter to send a filter expression to Lance Namespace <code>query_table</code>; <code>prefilter=true</code> on namespace tables requires this explicit <code>filter</code>.</p>
+<h3 id="hybrid-search-lance_hybrid_search">Hybrid search: <code>lance_hybrid_search</code><a class="headerlink" href="#hybrid-search-lance_hybrid_search" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1">-- Combine vector and text scores, returning `_hybrid_score` (larger is better)</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">_hybrid_score</span><span class="p">,</span><span class="w"> </span><span class="n">_distance</span><span class="p">,</span><span class="w"> </span><span class="n">_score</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="k">FROM</span><span class="w"> </span><span class="n">lance_hybrid_search</span><span class="p">(</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">  </span><span class="s1">'path/to/dataset.lance'</span><span class="p">,</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="w">  </span><span class="s1">'vec'</span><span class="p">,</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="w">  </span><span class="p">[</span><span class="mi">0</span><span class="p">.</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">4</span><span class="p">]::</span><span class="nb">FLOAT</span><span class="p">[</span><span class="mi">4</span><span class="p">],</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="w">  </span><span class="s1">'text'</span><span class="p">,</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="w">  </span><span class="s1">'puppy'</span><span class="p">,</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="w">  </span><span class="n">k</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="w">  </span><span class="n">prefilter</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">false</span><span class="p">,</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="w">  </span><span class="n">alpha</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">5</span><span class="p">,</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="w">  </span><span class="n">oversample_factor</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="p">)</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">_hybrid_score</span><span class="w"> </span><span class="k">DESC</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Signature: <code>lance_hybrid_search(uri, vector_column, query_vector, text_column, query, ...)</code></p>
+<p>Positional arguments:
+- <code>uri</code> (VARCHAR): Dataset root path or object store URI (e.g. <code>s3://...</code>).
+- <code>vector_column</code> (VARCHAR): Vector column name.
+- <code>query_vector</code> (FLOAT[dim] or DOUBLE[dim], preferred): Query vector (must be non-empty; values are cast to float32). <code>FLOAT[]</code> / <code>DOUBLE[]</code> are also accepted.
+- <code>text_column</code> (VARCHAR): Text column name.
+- <code>query</code> (VARCHAR): Query string.</p>
+<p>Named parameters:
+- <code>k</code> (BIGINT, default <code>10</code>): Number of results to return. Must be &gt; 0.
+- <code>nprobs</code> (BIGINT, optional): Number of IVF partitions to probe when using a vector index. Must be &gt; 0. Only affects IVF-based vector indices.
+- <code>refine_factor</code> (BIGINT, optional): Refine factor for the vector branch. Must be &gt; 0.
+- <code>prefilter</code> (BOOLEAN, default <code>false</code>): If <code>true</code>, filters are applied before top-k selection.
+- <code>use_index</code> (BOOLEAN, default <code>true</code>): If <code>true</code>, allow ANN index usage for the vector branch when available. If <code>false</code>, the vector branch runs exact KNN.
+- <code>alpha</code> (FLOAT, default <code>0.5</code>): Vector/text mixing weight. Larger values weigh vector similarity more heavily.
+- <code>oversample_factor</code> (INTEGER, default <code>4</code>): Oversample factor for candidate generation. If provided, must be &gt; 0.</p>
+<p>Output:
+- Dataset columns plus <code>_hybrid_score</code> (larger is better), <code>_distance</code>, and <code>_score</code>.</p>
+<p>Filter semantics:
+- If <code>prefilter=false</code>, filter pushdown is best-effort. If pushdown fails, the query is retried without pushed filters and DuckDB applies filters for correctness.
+- If <code>prefilter=true</code>, prefilterable filters must be pushed down, otherwise the query fails with an error.</p>
+<h2 id="namespaces">Namespaces<a class="headerlink" href="#namespaces" title="Permanent link">&para;</a></h2>
+<p>Namespaces let you treat a directory (or a remote namespace service) as a database catalog and access datasets as tables.</p>
+<h3 id="directory-namespace">Directory namespace<a class="headerlink" href="#directory-namespace" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="n">ATTACH</span><span class="w"> </span><span class="s1">'path/to/dir'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="p">(</span><span class="k">TYPE</span><span class="w"> </span><span class="n">LANCE</span><span class="p">);</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="c1">-- A dataset stored at path/to/dir/my_table.lance becomes ns.main.my_table</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="k">SELECT</span><span class="w"> </span><span class="k">count</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="p">;</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="k">SHOW</span><span class="w"> </span><span class="n">TABLES</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">;</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="n">DETACH</span><span class="w"> </span><span class="n">ns</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="rest-namespace">REST namespace<a class="headerlink" href="#rest-namespace" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="n">ATTACH</span><span class="w"> </span><span class="s1">'namespace_id'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="p">(</span><span class="k">TYPE</span><span class="w"> </span><span class="n">LANCE</span><span class="p">,</span><span class="w"> </span><span class="n">ENDPOINT</span><span class="w"> </span><span class="s1">'http://127.0.0.1:2333'</span><span class="p">);</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="k">SHOW</span><span class="w"> </span><span class="n">TABLES</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">;</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="k">SELECT</span><span class="w"> </span><span class="k">count</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">some_table</span><span class="p">;</span>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>
+</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="n">DETACH</span><span class="w"> </span><span class="n">ns</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Scans of REST namespace tables use the Lance Namespace <code>query_table</code> API.
+Projection, supported filters, and <code>LIMIT</code>/<code>OFFSET</code> pairs are pushed into the
+request; unsupported filters and standalone <code>OFFSET</code> operations remain in
+DuckDB. Directory namespace scans continue to read the Lance dataset directly.</p>
+<h2 id="write-datasets">Write datasets<a class="headerlink" href="#write-datasets" title="Permanent link">&para;</a></h2>
+<h3 id="copy-to-format-lance"><code>COPY ... TO ... (FORMAT lance, ...)</code><a class="headerlink" href="#copy-to-format-lance" title="Permanent link">&para;</a></h3>
+<p>Write a new dataset (or overwrite an existing one):</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">COPY</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span><span class="k">SELECT</span><span class="w"> </span><span class="mi">1</span><span class="p">::</span><span class="nb">BIGINT</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="s1">'a'</span><span class="p">::</span><span class="nb">VARCHAR</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">s</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">  </span><span class="k">UNION</span><span class="w"> </span><span class="k">ALL</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">  </span><span class="k">SELECT</span><span class="w"> </span><span class="mi">2</span><span class="p">::</span><span class="nb">BIGINT</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="s1">'b'</span><span class="p">::</span><span class="nb">VARCHAR</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">s</span>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="p">)</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="s1">'path/to/out.lance'</span><span class="w"> </span><span class="p">(</span><span class="n">FORMAT</span><span class="w"> </span><span class="n">lance</span><span class="p">,</span><span class="w"> </span><span class="k">mode</span><span class="w"> </span><span class="s1">'overwrite'</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Append to an existing dataset:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">COPY</span><span class="w"> </span><span class="p">(</span><span class="k">SELECT</span><span class="w"> </span><span class="mi">3</span><span class="p">::</span><span class="nb">BIGINT</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="s1">'c'</span><span class="p">::</span><span class="nb">VARCHAR</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">s</span><span class="p">)</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="k">TO</span><span class="w"> </span><span class="s1">'path/to/out.lance'</span><span class="w"> </span><span class="p">(</span><span class="n">FORMAT</span><span class="w"> </span><span class="n">lance</span><span class="p">,</span><span class="w"> </span><span class="k">mode</span><span class="w"> </span><span class="s1">'append'</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Create an empty dataset (schema only):</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="k">COPY</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">  </span><span class="k">SELECT</span><span class="w"> </span><span class="mi">1</span><span class="p">::</span><span class="nb">BIGINT</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="s1">'x'</span><span class="p">::</span><span class="nb">VARCHAR</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">s</span>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="w">  </span><span class="k">LIMIT</span><span class="w"> </span><span class="mi">0</span>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="p">)</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="s1">'path/to/empty.lance'</span><span class="w"> </span><span class="p">(</span><span class="n">FORMAT</span><span class="w"> </span><span class="n">lance</span><span class="p">,</span><span class="w"> </span><span class="k">mode</span><span class="w"> </span><span class="s1">'overwrite'</span><span class="p">,</span><span class="w"> </span><span class="n">write_empty_file</span><span class="w"> </span><span class="k">true</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Notes:
+- <code>mode</code> supports at least <code>overwrite</code> and <code>append</code>.
+- <code>data_storage_version</code> defaults to <code>2.2</code> when <code>COPY</code> creates or overwrites a dataset. Appends preserve the existing storage version.
+- <code>write_empty_file</code> controls whether an empty dataset is materialized when the input produces zero rows.</p>
+<h3 id="create-table-ctas-in-an-attached-namespace"><code>CREATE TABLE</code> / <code>CTAS</code> in an attached namespace<a class="headerlink" href="#create-table-ctas-in-an-attached-namespace" title="Permanent link">&para;</a></h3>
+<p>When a directory is attached as a namespace, <code>CREATE TABLE</code> and <code>CREATE TABLE AS SELECT</code> write datasets into the namespace root.</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="n">ATTACH</span><span class="w"> </span><span class="s1">'path/to/dir'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="p">(</span><span class="k">TYPE</span><span class="w"> </span><span class="n">LANCE</span><span class="p">);</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="c1">-- Schema-only (creates an empty dataset)</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">OR</span><span class="w"> </span><span class="k">REPLACE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_empty</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">,</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="nb">VARCHAR</span><span class="p">);</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="c1">-- CTAS (writes query results)</span>
+</span><span id="__span-11-7"><a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">OR</span><span class="w"> </span><span class="k">REPLACE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_dataset</span><span class="w"> </span><span class="k">AS</span>
+</span><span id="__span-11-8"><a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a><span class="w">  </span><span class="k">SELECT</span><span class="w"> </span><span class="mi">1</span><span class="p">::</span><span class="nb">BIGINT</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="s1">'a'</span><span class="p">::</span><span class="nb">VARCHAR</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">s</span>
+</span><span id="__span-11-9"><a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a><span class="w">  </span><span class="k">UNION</span><span class="w"> </span><span class="k">ALL</span>
+</span><span id="__span-11-10"><a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a><span class="w">  </span><span class="k">SELECT</span><span class="w"> </span><span class="mi">2</span><span class="p">::</span><span class="nb">BIGINT</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="s1">'b'</span><span class="p">::</span><span class="nb">VARCHAR</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">s</span><span class="p">;</span>
+</span><span id="__span-11-11"><a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a>
+</span><span id="__span-11-12"><a id="__codelineno-11-12" name="__codelineno-11-12" href="#__codelineno-11-12"></a><span class="k">SELECT</span><span class="w"> </span><span class="k">count</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_dataset</span><span class="p">;</span>
+</span><span id="__span-11-13"><a id="__codelineno-11-13" name="__codelineno-11-13" href="#__codelineno-11-13"></a><span class="n">DETACH</span><span class="w"> </span><span class="n">ns</span><span class="p">;</span>
+</span></code></pre></div>
+<p><code>CREATE TABLE</code> and CTAS default to data storage version <code>2.2</code>. Override it with
+<code>WITH (data_storage_version = '&lt;version&gt;')</code> when another version is required.</p>
+<h2 id="dml-on-attached-tables">DML on attached tables<a class="headerlink" href="#dml-on-attached-tables" title="Permanent link">&para;</a></h2>
+<p>These statements apply to tables inside an attached namespace (e.g. <code>ns.main.my_table</code>).</p>
+<h3 id="insert"><code>INSERT</code><a class="headerlink" href="#insert" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="n">ATTACH</span><span class="w"> </span><span class="s1">'path/to/dir'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="p">(</span><span class="k">TYPE</span><span class="w"> </span><span class="n">LANCE</span><span class="p">);</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">3</span><span class="p">::</span><span class="nb">BIGINT</span><span class="p">,</span><span class="w"> </span><span class="s1">'c'</span><span class="p">::</span><span class="nb">VARCHAR</span><span class="p">);</span>
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="mi">4</span><span class="p">::</span><span class="nb">BIGINT</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="s1">'d'</span><span class="p">::</span><span class="nb">VARCHAR</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">s</span><span class="p">;</span>
+</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a>
+</span><span id="__span-12-6"><a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="n">DETACH</span><span class="w"> </span><span class="n">ns</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="update"><code>UPDATE</code><a class="headerlink" href="#update" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="n">ATTACH</span><span class="w"> </span><span class="s1">'path/to/dir'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="p">(</span><span class="k">TYPE</span><span class="w"> </span><span class="n">LANCE</span><span class="p">);</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="k">UPDATE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'bb'</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="k">UPDATE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'x'</span><span class="p">;</span><span class="w"> </span><span class="c1">-- update all rows</span>
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="k">UPDATE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">DEFAULT</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>
+</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a><span class="n">DETACH</span><span class="w"> </span><span class="n">ns</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="delete"><code>DELETE</code><a class="headerlink" href="#delete" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="n">ATTACH</span><span class="w"> </span><span class="s1">'path/to/dir'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="p">(</span><span class="k">TYPE</span><span class="w"> </span><span class="n">LANCE</span><span class="p">);</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">id</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="k">DELETE</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="p">;</span><span class="w"> </span><span class="c1">-- delete all rows</span>
+</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>
+</span><span id="__span-14-6"><a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a><span class="n">DETACH</span><span class="w"> </span><span class="n">ns</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="merge-into"><code>MERGE INTO</code><a class="headerlink" href="#merge-into" title="Permanent link">&para;</a></h3>
+<p><code>MERGE</code> is supported on Lance tables, including:
+- <code>WHEN MATCHED</code> with <code>UPDATE</code> / <code>DELETE</code> / <code>DO NOTHING</code> / <code>ERROR</code>
+- <code>WHEN NOT MATCHED</code> (<code>BY TARGET</code>) with <code>INSERT</code> / <code>DO NOTHING</code>
+- <code>WHEN NOT MATCHED BY SOURCE</code> with <code>UPDATE</code> / <code>DELETE</code> / <code>DO NOTHING</code>
+- <code>RETURNING</code> (including DuckDB's <code>merge_action</code> virtual column)</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="n">ATTACH</span><span class="w"> </span><span class="s1">'path/to/dir'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="p">(</span><span class="k">TYPE</span><span class="w"> </span><span class="n">LANCE</span><span class="p">);</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="n">MERGE</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">t</span>
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a><span class="k">USING</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-15-5"><a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a><span class="w">  </span><span class="k">SELECT</span><span class="w"> </span><span class="mi">2</span><span class="p">::</span><span class="nb">BIGINT</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="s1">'bb'</span><span class="p">::</span><span class="nb">VARCHAR</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">s</span>
+</span><span id="__span-15-6"><a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a><span class="w">  </span><span class="k">UNION</span><span class="w"> </span><span class="k">ALL</span>
+</span><span id="__span-15-7"><a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a><span class="w">  </span><span class="k">SELECT</span><span class="w"> </span><span class="mi">3</span><span class="p">::</span><span class="nb">BIGINT</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="s1">'c'</span><span class="p">::</span><span class="nb">VARCHAR</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">s</span>
+</span><span id="__span-15-8"><a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">src</span>
+</span><span id="__span-15-9"><a id="__codelineno-15-9" name="__codelineno-15-9" href="#__codelineno-15-9"></a><span class="k">ON</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">src</span><span class="p">.</span><span class="n">id</span>
+</span><span id="__span-15-10"><a id="__codelineno-15-10" name="__codelineno-15-10" href="#__codelineno-15-10"></a><span class="k">WHEN</span><span class="w"> </span><span class="n">MATCHED</span><span class="w"> </span><span class="k">THEN</span><span class="w"> </span><span class="k">UPDATE</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">src</span><span class="p">.</span><span class="n">s</span>
+</span><span id="__span-15-11"><a id="__codelineno-15-11" name="__codelineno-15-11" href="#__codelineno-15-11"></a><span class="k">WHEN</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="n">MATCHED</span><span class="w"> </span><span class="k">THEN</span><span class="w"> </span><span class="k">INSERT</span><span class="w"> </span><span class="p">(</span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="n">src</span><span class="p">.</span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">src</span><span class="p">.</span><span class="n">s</span><span class="p">);</span>
+</span><span id="__span-15-12"><a id="__codelineno-15-12" name="__codelineno-15-12" href="#__codelineno-15-12"></a>
+</span><span id="__span-15-13"><a id="__codelineno-15-13" name="__codelineno-15-13" href="#__codelineno-15-13"></a><span class="n">MERGE</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">t</span>
+</span><span id="__span-15-14"><a id="__codelineno-15-14" name="__codelineno-15-14" href="#__codelineno-15-14"></a><span class="k">USING</span><span class="w"> </span><span class="p">(</span><span class="k">SELECT</span><span class="w"> </span><span class="mi">3</span><span class="p">::</span><span class="nb">BIGINT</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">id</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">src</span>
+</span><span id="__span-15-15"><a id="__codelineno-15-15" name="__codelineno-15-15" href="#__codelineno-15-15"></a><span class="k">ON</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">src</span><span class="p">.</span><span class="n">id</span>
+</span><span id="__span-15-16"><a id="__codelineno-15-16" name="__codelineno-15-16" href="#__codelineno-15-16"></a><span class="k">WHEN</span><span class="w"> </span><span class="n">MATCHED</span><span class="w"> </span><span class="k">THEN</span><span class="w"> </span><span class="k">DELETE</span>
+</span><span id="__span-15-17"><a id="__codelineno-15-17" name="__codelineno-15-17" href="#__codelineno-15-17"></a><span class="n">RETURNING</span><span class="w"> </span><span class="n">merge_action</span><span class="p">,</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">s</span><span class="p">;</span>
+</span><span id="__span-15-18"><a id="__codelineno-15-18" name="__codelineno-15-18" href="#__codelineno-15-18"></a>
+</span><span id="__span-15-19"><a id="__codelineno-15-19" name="__codelineno-15-19" href="#__codelineno-15-19"></a><span class="n">DETACH</span><span class="w"> </span><span class="n">ns</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Notes:
+- Mutating the same target row more than once in a single <code>MERGE</code> raises a constraint error.
+- <code>MERGE</code> uses a single Lance transaction per statement.</p>
+<h3 id="truncate-table"><code>TRUNCATE TABLE</code><a class="headerlink" href="#truncate-table" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="n">ATTACH</span><span class="w"> </span><span class="s1">'path/to/dir'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="p">(</span><span class="k">TYPE</span><span class="w"> </span><span class="n">LANCE</span><span class="p">);</span>
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>
+</span><span id="__span-16-3"><a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a><span class="k">TRUNCATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="p">;</span>
+</span><span id="__span-16-4"><a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a>
+</span><span id="__span-16-5"><a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a><span class="n">DETACH</span><span class="w"> </span><span class="n">ns</span><span class="p">;</span>
+</span></code></pre></div>
+<h2 id="ddl-on-attached-tables">DDL on attached tables<a class="headerlink" href="#ddl-on-attached-tables" title="Permanent link">&para;</a></h2>
+<h3 id="drop-table"><code>DROP TABLE</code><a class="headerlink" href="#drop-table" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="n">ATTACH</span><span class="w"> </span><span class="s1">'path/to/dir'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="p">(</span><span class="k">TYPE</span><span class="w"> </span><span class="n">LANCE</span><span class="p">);</span>
+</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a>
+</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a><span class="k">DROP</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="p">;</span>
+</span><span id="__span-17-4"><a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="k">DROP</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="p">;</span>
+</span><span id="__span-17-5"><a id="__codelineno-17-5" name="__codelineno-17-5" href="#__codelineno-17-5"></a>
+</span><span id="__span-17-6"><a id="__codelineno-17-6" name="__codelineno-17-6" href="#__codelineno-17-6"></a><span class="n">DETACH</span><span class="w"> </span><span class="n">ns</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Notes:
+- Directory namespaces reject unsafe dataset names that attempt path traversal.</p>
+<h3 id="alter-table"><code>ALTER TABLE</code><a class="headerlink" href="#alter-table" title="Permanent link">&para;</a></h3>
+<p>Schema evolution:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="n">ATTACH</span><span class="w"> </span><span class="s1">'path/to/dir'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="p">(</span><span class="k">TYPE</span><span class="w"> </span><span class="n">LANCE</span><span class="p">);</span>
+</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a>
+</span><span id="__span-18-3"><a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span>
+</span><span id="__span-18-4"><a id="__codelineno-18-4" name="__codelineno-18-4" href="#__codelineno-18-4"></a><span class="w">  </span><span class="k">ADD</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="n">age_plus_one</span><span class="w"> </span><span class="nb">BIGINT</span><span class="w"> </span><span class="k">DEFAULT</span><span class="w"> </span><span class="p">(</span><span class="n">age</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+</span><span id="__span-18-5"><a id="__codelineno-18-5" name="__codelineno-18-5" href="#__codelineno-18-5"></a>
+</span><span id="__span-18-6"><a id="__codelineno-18-6" name="__codelineno-18-6" href="#__codelineno-18-6"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">RENAME</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="n">score</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">score2</span><span class="p">;</span>
+</span><span id="__span-18-7"><a id="__codelineno-18-7" name="__codelineno-18-7" href="#__codelineno-18-7"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">ALTER</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="n">age</span><span class="w"> </span><span class="k">TYPE</span><span class="w"> </span><span class="nb">BIGINT</span><span class="p">;</span>
+</span><span id="__span-18-8"><a id="__codelineno-18-8" name="__codelineno-18-8" href="#__codelineno-18-8"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">ALTER</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="n">embedding</span><span class="w"> </span><span class="k">TYPE</span><span class="w"> </span><span class="nb">FLOAT</span><span class="p">[</span><span class="mi">128</span><span class="p">];</span>
+</span><span id="__span-18-9"><a id="__codelineno-18-9" name="__codelineno-18-9" href="#__codelineno-18-9"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">DROP</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="n">score2</span><span class="p">;</span>
+</span><span id="__span-18-10"><a id="__codelineno-18-10" name="__codelineno-18-10" href="#__codelineno-18-10"></a>
+</span><span id="__span-18-11"><a id="__codelineno-18-11" name="__codelineno-18-11" href="#__codelineno-18-11"></a><span class="n">DETACH</span><span class="w"> </span><span class="n">ns</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Table and column comments:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-19-1"><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="n">ATTACH</span><span class="w"> </span><span class="s1">'path/to/dir'</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="p">(</span><span class="k">TYPE</span><span class="w"> </span><span class="n">LANCE</span><span class="p">);</span>
+</span><span id="__span-19-2"><a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>
+</span><span id="__span-19-3"><a id="__codelineno-19-3" name="__codelineno-19-3" href="#__codelineno-19-3"></a><span class="k">COMMENT</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="w"> </span><span class="k">IS</span><span class="w"> </span><span class="s1">'table comment'</span><span class="p">;</span>
+</span><span id="__span-19-4"><a id="__codelineno-19-4" name="__codelineno-19-4" href="#__codelineno-19-4"></a><span class="k">COMMENT</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">COLUMN</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">main</span><span class="p">.</span><span class="n">my_table</span><span class="p">.</span><span class="n">age_plus_one</span><span class="w"> </span><span class="k">IS</span><span class="w"> </span><span class="s1">'col comment'</span><span class="p">;</span>
+</span><span id="__span-19-5"><a id="__codelineno-19-5" name="__codelineno-19-5" href="#__codelineno-19-5"></a>
+</span><span id="__span-19-6"><a id="__codelineno-19-6" name="__codelineno-19-6" href="#__codelineno-19-6"></a><span class="n">DETACH</span><span class="w"> </span><span class="n">ns</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Notes:
+- <code>ALTER COLUMN ... SET NOT NULL</code> is currently not supported.</p>
+<h2 id="index-ddl">Index DDL<a class="headerlink" href="#index-ddl" title="Permanent link">&para;</a></h2>
+<p>The extension supports index DDL targeting a dataset path.</p>
+<h3 id="create-index"><code>CREATE INDEX</code><a class="headerlink" href="#create-index" title="Permanent link">&para;</a></h3>
+<p>Vector ANN index:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-20-1"><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">vec_idx</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span><span class="w"> </span><span class="p">(</span><span class="n">vec</span><span class="p">)</span>
+</span><span id="__span-20-2"><a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a><span class="k">USING</span><span class="w"> </span><span class="n">IVF_FLAT</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">num_partitions</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">metric_type</span><span class="o">=</span><span class="s1">'l2'</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Scalar index:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-21-1"><a id="__codelineno-21-1" name="__codelineno-21-1" href="#__codelineno-21-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">label_idx</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span><span class="w"> </span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+</span><span id="__span-21-2"><a id="__codelineno-21-2" name="__codelineno-21-2" href="#__codelineno-21-2"></a><span class="k">USING</span><span class="w"> </span><span class="n">BTREE</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Full-text index:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-22-1"><a id="__codelineno-22-1" name="__codelineno-22-1" href="#__codelineno-22-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">text_idx</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span><span class="w"> </span><span class="p">(</span><span class="nb">text</span><span class="p">)</span>
+</span><span id="__span-22-2"><a id="__codelineno-22-2" name="__codelineno-22-2" href="#__codelineno-22-2"></a><span class="k">USING</span><span class="w"> </span><span class="n">INVERTED</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Notes:
+- <code>CREATE INDEX</code> currently supports a single column.
+- Vector indices require a fixed-size vector column. If a dataset was written with
+  <code>FLOAT[]</code> / <code>DOUBLE[]</code>, first cast it with <code>ALTER TABLE ... ALTER COLUMN ... TYPE FLOAT[N]</code>
+  (or <code>DOUBLE[N]</code>) and then create the index.</p>
+<h3 id="show-indexes"><code>SHOW INDEXES</code><a class="headerlink" href="#show-indexes" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-23-1"><a id="__codelineno-23-1" name="__codelineno-23-1" href="#__codelineno-23-1"></a><span class="k">SHOW</span><span class="w"> </span><span class="n">INDEXES</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="drop-index"><code>DROP INDEX</code><a class="headerlink" href="#drop-index" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-24-1"><a id="__codelineno-24-1" name="__codelineno-24-1" href="#__codelineno-24-1"></a><span class="k">DROP</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">vec_idx</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="alter-index-optimize"><code>ALTER INDEX ... OPTIMIZE</code><a class="headerlink" href="#alter-index-optimize" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-25-1"><a id="__codelineno-25-1" name="__codelineno-25-1" href="#__codelineno-25-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">vec_idx</span>
+</span><span id="__span-25-2"><a id="__codelineno-25-2" name="__codelineno-25-2" href="#__codelineno-25-2"></a><span class="k">ON</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span>
+</span><span id="__span-25-3"><a id="__codelineno-25-3" name="__codelineno-25-3" href="#__codelineno-25-3"></a><span class="n">OPTIMIZE</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="k">mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'append'</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Supported <code>mode</code> values:
+- <code>append</code>
+- <code>merge</code> (<code>num_indices_to_merge</code> is supported)
+- <code>retrain</code></p>
+<h2 id="maintenance-sql">Maintenance SQL<a class="headerlink" href="#maintenance-sql" title="Permanent link">&para;</a></h2>
+<p>Maintenance statements accept either:
+- A dataset path string literal (for example <code>'path/to/dataset.lance'</code>)
+- An attached Lance table name (for example <code>ns.main.my_table</code>)</p>
+<h3 id="optimize"><code>OPTIMIZE</code><a class="headerlink" href="#optimize" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-26-1"><a id="__codelineno-26-1" name="__codelineno-26-1" href="#__codelineno-26-1"></a><span class="n">OPTIMIZE</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-26-2"><a id="__codelineno-26-2" name="__codelineno-26-2" href="#__codelineno-26-2"></a><span class="w">  </span><span class="n">target_rows_per_fragment</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1048576</span><span class="p">,</span>
+</span><span id="__span-26-3"><a id="__codelineno-26-3" name="__codelineno-26-3" href="#__codelineno-26-3"></a><span class="w">  </span><span class="n">max_rows_per_group</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1024</span><span class="p">,</span>
+</span><span id="__span-26-4"><a id="__codelineno-26-4" name="__codelineno-26-4" href="#__codelineno-26-4"></a><span class="w">  </span><span class="n">max_bytes_per_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+</span><span id="__span-26-5"><a id="__codelineno-26-5" name="__codelineno-26-5" href="#__codelineno-26-5"></a><span class="w">  </span><span class="n">materialize_deletions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">true</span><span class="p">,</span>
+</span><span id="__span-26-6"><a id="__codelineno-26-6" name="__codelineno-26-6" href="#__codelineno-26-6"></a><span class="w">  </span><span class="n">materialize_deletions_threshold</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-26-7"><a id="__codelineno-26-7" name="__codelineno-26-7" href="#__codelineno-26-7"></a><span class="w">  </span><span class="n">num_threads</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+</span><span id="__span-26-8"><a id="__codelineno-26-8" name="__codelineno-26-8" href="#__codelineno-26-8"></a><span class="w">  </span><span class="n">batch_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+</span><span id="__span-26-9"><a id="__codelineno-26-9" name="__codelineno-26-9" href="#__codelineno-26-9"></a><span class="w">  </span><span class="n">defer_index_remap</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">false</span>
+</span><span id="__span-26-10"><a id="__codelineno-26-10" name="__codelineno-26-10" href="#__codelineno-26-10"></a><span class="p">);</span>
+</span></code></pre></div>
+<p>Returns:
+- <code>Operation</code> (<code>compact</code>)
+- <code>Target</code>
+- <code>MetricsJSON</code> (compaction metrics)</p>
+<h3 id="vacuum-lance"><code>VACUUM LANCE</code><a class="headerlink" href="#vacuum-lance" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-27-1"><a id="__codelineno-27-1" name="__codelineno-27-1" href="#__codelineno-27-1"></a><span class="k">VACUUM</span><span class="w"> </span><span class="n">LANCE</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-27-2"><a id="__codelineno-27-2" name="__codelineno-27-2" href="#__codelineno-27-2"></a><span class="w">  </span><span class="n">older_than_seconds</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1209600</span><span class="p">,</span>
+</span><span id="__span-27-3"><a id="__codelineno-27-3" name="__codelineno-27-3" href="#__codelineno-27-3"></a><span class="w">  </span><span class="n">delete_unverified</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">false</span><span class="p">,</span>
+</span><span id="__span-27-4"><a id="__codelineno-27-4" name="__codelineno-27-4" href="#__codelineno-27-4"></a><span class="w">  </span><span class="n">error_if_tagged_old_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">true</span><span class="p">,</span>
+</span><span id="__span-27-5"><a id="__codelineno-27-5" name="__codelineno-27-5" href="#__codelineno-27-5"></a><span class="w">  </span><span class="n">retain_n_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
+</span><span id="__span-27-6"><a id="__codelineno-27-6" name="__codelineno-27-6" href="#__codelineno-27-6"></a><span class="p">);</span>
+</span></code></pre></div>
+<p>Returns:
+- <code>Operation</code> (<code>cleanup</code>)
+- <code>Target</code>
+- <code>MetricsJSON</code> (cleanup metrics such as removed bytes / versions)</p>
+<h3 id="alter-index-optimize_1"><code>ALTER INDEX ... OPTIMIZE</code><a class="headerlink" href="#alter-index-optimize_1" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-28-1"><a id="__codelineno-28-1" name="__codelineno-28-1" href="#__codelineno-28-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">vec_idx</span>
+</span><span id="__span-28-2"><a id="__codelineno-28-2" name="__codelineno-28-2" href="#__codelineno-28-2"></a><span class="k">ON</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span>
+</span><span id="__span-28-3"><a id="__codelineno-28-3" name="__codelineno-28-3" href="#__codelineno-28-3"></a><span class="n">OPTIMIZE</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-28-4"><a id="__codelineno-28-4" name="__codelineno-28-4" href="#__codelineno-28-4"></a><span class="w">  </span><span class="k">mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'merge'</span><span class="p">,</span>
+</span><span id="__span-28-5"><a id="__codelineno-28-5" name="__codelineno-28-5" href="#__codelineno-28-5"></a><span class="w">  </span><span class="n">num_indices_to_merge</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span>
+</span><span id="__span-28-6"><a id="__codelineno-28-6" name="__codelineno-28-6" href="#__codelineno-28-6"></a><span class="p">);</span>
+</span></code></pre></div>
+<p>Supported <code>mode</code> values:
+- <code>append</code>
+- <code>merge</code> (<code>num_indices_to_merge</code> is supported)
+- <code>retrain</code></p>
+<p>Returns:
+- <code>Operation</code> (<code>optimize_index</code>)
+- <code>Target</code>
+- <code>MetricsJSON</code></p>
+<h3 id="auto-cleanup-configuration">Auto cleanup configuration<a class="headerlink" href="#auto-cleanup-configuration" title="Permanent link">&para;</a></h3>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-29-1"><a id="__codelineno-29-1" name="__codelineno-29-1" href="#__codelineno-29-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span>
+</span><span id="__span-29-2"><a id="__codelineno-29-2" name="__codelineno-29-2" href="#__codelineno-29-2"></a><span class="k">SET</span><span class="w"> </span><span class="n">AUTO_CLEANUP</span><span class="w"> </span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="nb">interval</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">older_than</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'1h'</span><span class="p">,</span><span class="w"> </span><span class="n">retain_versions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="p">);</span>
+</span><span id="__span-29-3"><a id="__codelineno-29-3" name="__codelineno-29-3" href="#__codelineno-29-3"></a>
+</span><span id="__span-29-4"><a id="__codelineno-29-4" name="__codelineno-29-4" href="#__codelineno-29-4"></a><span class="k">ALTER</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span><span class="w"> </span><span class="n">UNSET</span><span class="w"> </span><span class="n">AUTO_CLEANUP</span><span class="p">;</span>
+</span><span id="__span-29-5"><a id="__codelineno-29-5" name="__codelineno-29-5" href="#__codelineno-29-5"></a>
+</span><span id="__span-29-6"><a id="__codelineno-29-6" name="__codelineno-29-6" href="#__codelineno-29-6"></a><span class="k">SHOW</span><span class="w"> </span><span class="n">MAINTENANCE</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="s1">'path/to/dataset.lance'</span><span class="p">;</span>
+</span></code></pre></div>
+<p><code>SHOW MAINTENANCE</code> returns key/value rows including:
+- <code>enabled</code>
+- <code>interval</code> (if configured)
+- <code>older_than</code> (if configured)
+- <code>retain_versions</code> (if configured)</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Overview</div>
+        </a>
+        <a class="next" href="../rest/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">REST Namespace</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#loading">Loading</a>
+      <a class="ld-toc__h2" href="#scan">Scan</a>
+      <a class="ld-toc__h2" href="#search">Search</a>
+      <a class="ld-toc__h3" href="#vector-search-lance_vector_search">Vector search: lance_vector_search</a>
+      <a class="ld-toc__h3" href="#full-text-search-lance_fts">Full-text search: lance_fts</a>
+      <a class="ld-toc__h3" href="#hybrid-search-lance_hybrid_search">Hybrid search: lance_hybrid_search</a>
+      <a class="ld-toc__h2" href="#namespaces">Namespaces</a>
+      <a class="ld-toc__h3" href="#directory-namespace">Directory namespace</a>
+      <a class="ld-toc__h3" href="#rest-namespace">REST namespace</a>
+      <a class="ld-toc__h2" href="#write-datasets">Write datasets</a>
+      <a class="ld-toc__h3" href="#copy-to-format-lance">COPY ... TO ... (FORMAT lance, ...)</a>
+      <a class="ld-toc__h3" href="#create-table-ctas-in-an-attached-namespace">CREATE TABLE / CTAS in an attached namespace</a>
+      <a class="ld-toc__h2" href="#dml-on-attached-tables">DML on attached tables</a>
+      <a class="ld-toc__h3" href="#insert">INSERT</a>
+      <a class="ld-toc__h3" href="#update">UPDATE</a>
+      <a class="ld-toc__h3" href="#delete">DELETE</a>
+      <a class="ld-toc__h3" href="#merge-into">MERGE INTO</a>
+      <a class="ld-toc__h3" href="#truncate-table">TRUNCATE TABLE</a>
+      <a class="ld-toc__h2" href="#ddl-on-attached-tables">DDL on attached tables</a>
+      <a class="ld-toc__h3" href="#drop-table">DROP TABLE</a>
+      <a class="ld-toc__h3" href="#alter-table">ALTER TABLE</a>
+      <a class="ld-toc__h2" href="#index-ddl">Index DDL</a>
+      <a class="ld-toc__h3" href="#create-index">CREATE INDEX</a>
+      <a class="ld-toc__h3" href="#show-indexes">SHOW INDEXES</a>
+      <a class="ld-toc__h3" href="#drop-index">DROP INDEX</a>
+      <a class="ld-toc__h3" href="#alter-index-optimize">ALTER INDEX ... OPTIMIZE</a>
+      <a class="ld-toc__h2" href="#maintenance-sql">Maintenance SQL</a>
+      <a class="ld-toc__h3" href="#optimize">OPTIMIZE</a>
+      <a class="ld-toc__h3" href="#vacuum-lance">VACUUM LANCE</a>
+      <a class="ld-toc__h3" href="#alter-index-optimize_1">ALTER INDEX ... OPTIMIZE</a>
+      <a class="ld-toc__h3" href="#auto-cleanup-configuration">Auto cleanup configuration</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../format/">Specification</a>
+        <a href="../../../format/file/">File format</a>
+        <a href="../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>

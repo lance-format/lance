@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Object Store Configuration — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/guide/object_store/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab" href="../../quickstart/">Getting Started</a>
+      <a class="ld-toptab active" href="../read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../format/">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../community/">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      User Guide
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">User Guide</div>
+    <a href="../read_and_write/">Read and Write</a>
+    <a href="../data_types/">Data Types</a>
+    <a href="../data_evolution/">Data Evolution</a>
+    <a href="../blob/">Blob API</a>
+    <a href="../json/">JSON Support</a>
+    <a href="../tags_and_branches/">Tags and Branches</a>
+    <a class="active" href="./">Object Store Configuration</a>
+    <a href="../observability/">Observability</a>
+    <a href="../distributed_write/">Distributed Write</a>
+    <a href="../distributed_indexing/">Distributed Indexing</a>
+    <a href="../migration/">Migration Guide</a>
+    <a href="../performance/">Performance Guide</a>
+    <a href="../tokenizer/">Tokenizer</a>
+    <a href="../arrays/">Extension Arrays</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>User Guide</span>
+        <span>/</span><b>Object Store Configuration</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="object-store-configuration">Object Store Configuration<a class="headerlink" href="#object-store-configuration" title="Permanent link">&para;</a></h1>
+<p>Lance supports object stores such as AWS S3 (and compatible stores), Azure Blob Store,
+and Google Cloud Storage. Which object store to use is determined by the URI scheme of
+the dataset path. For example, <code>s3://bucket/path</code> will use S3, <code>az://bucket/path</code>
+will use Azure, and <code>gs://bucket/path</code> will use GCS.</p>
+<p>These object stores take additional configuration objects. There are two ways to
+specify these configurations: by setting environment variables or by passing them
+to the <code>storage_options</code> parameter of <code>lance.dataset</code> and
+<code>lance.write_dataset</code>. So for example, to globally set a higher timeout,
+you would run in your shell:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">TIMEOUT</span><span class="o">=</span>60s
+</span></code></pre></div>
+<p>If you only want to set the timeout for a single dataset, you can pass it as a
+storage option:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"s3://path"</span><span class="p">,</span> <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span><span class="s2">"timeout"</span><span class="p">:</span> <span class="s2">"60s"</span><span class="p">})</span>
+</span></code></pre></div>
+<h2 id="general-configuration">General Configuration<a class="headerlink" href="#general-configuration" title="Permanent link">&para;</a></h2>
+<p>These options apply to all object stores.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>allow_http</code></td>
+<td>Allow non-TLS, i.e. non-HTTPS connections. Default, <code>False</code>.</td>
+</tr>
+<tr>
+<td><code>download_retry_count</code></td>
+<td>Number of times to retry a download. Default, <code>3</code>. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of <code>timeout</code>.</td>
+</tr>
+<tr>
+<td><code>allow_invalid_certificates</code></td>
+<td>Skip certificate validation on https connections. Default, <code>False</code>. Warning: This is insecure and should only be used for testing.</td>
+</tr>
+<tr>
+<td><code>connect_timeout</code></td>
+<td>Timeout for only the connect phase of a Client. Default, <code>5s</code>.</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td>Timeout for the entire request, from connection until the response body has finished. Default, <code>30s</code>. This applies to each individual request, so on a large write it must cover one complete multipart part upload; raise it alongside <code>LANCE_INITIAL_UPLOAD_SIZE</code>.</td>
+</tr>
+<tr>
+<td><code>user_agent</code></td>
+<td>User agent string to use in requests.</td>
+</tr>
+<tr>
+<td><code>proxy_url</code></td>
+<td>URL of a proxy server to use for requests. Default, <code>None</code>.</td>
+</tr>
+<tr>
+<td><code>proxy_ca_certificate</code></td>
+<td>PEM-formatted CA certificate for proxy connections</td>
+</tr>
+<tr>
+<td><code>proxy_excludes</code></td>
+<td>List of hosts that bypass proxy. This is a comma separated list of domains and IP masks. Any subdomain of the provided domain will be bypassed. For example, <code>example.com, 192.168.1.0/24</code> would bypass <code>https://api.example.com</code>, <code>https://www.example.com</code>, and any IP in the range <code>192.168.1.0/24</code>.</td>
+</tr>
+<tr>
+<td><code>client_max_retries</code></td>
+<td>Number of times for the object store client to retry the request. Default, <code>3</code>.</td>
+</tr>
+<tr>
+<td><code>client_retry_timeout</code></td>
+<td>Timeout for the object store client to retry the request in seconds. Default, <code>180</code>.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="bulk-copy-strategy">Bulk copy strategy<a class="headerlink" href="#bulk-copy-strategy" title="Permanent link">&para;</a></h3>
+<p>Lance streams bulk index-file movement and dataset deep-clone files through
+read and write APIs by default. This avoids requiring a provider-native copy
+operation and works across different object stores.</p>
+<p>Set <code>LANCE_IO_SERVER_SIDE_COPY_ENABLED</code> to a truthy value (<code>1</code>, <code>true</code>, <code>on</code>,
+<code>yes</code>, or <code>y</code>, case-insensitive) to opt cloud copies whose source and destination
+share the same object-store client into the provider-native server-side copy
+operation. Cross-client, cross-store, and local copies do not use this setting.
+Native copy can reduce client bandwidth and transfer cost, but it requires copy
+support from the object-store integration and is subject to the provider
+request's timeout and retry behavior.</p>
+<p>Deep clone bounds non-local file movement to four concurrent files by default.
+Set <code>LANCE_DEEP_CLONE_STREAM_CONCURRENCY</code> to a positive integer to override this
+operation-specific limit. The bound also applies when server-side copy is
+enabled because S3 and GCS copies above the provider's single-copy size limit
+fall back to streaming through Lance.</p>
+<h2 id="per-base-configuration">Per-Base Configuration<a class="headerlink" href="#per-base-configuration" title="Permanent link">&para;</a></h2>
+<p>A dataset can register additional base paths that store part of its data, and each
+base may live in a different bucket, account, or storage provider. A storage option
+key of the form <code>base_&lt;id&gt;.&lt;key&gt;</code> applies <code>&lt;key&gt;</code> only to the base path with that
+manifest id. Every base inherits the unscoped options; base-scoped entries add to or
+override them for that base only.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="s2">"az://account-a/path"</span><span class="p">,</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>        <span class="c1"># Shared defaults, used by the primary dataset and inherited by bases</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>        <span class="s2">"account_name"</span><span class="p">:</span> <span class="s2">"account-a"</span><span class="p">,</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>        <span class="s2">"account_key"</span><span class="p">:</span> <span class="s2">"key-a"</span><span class="p">,</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>        <span class="c1"># Overrides for the base path with id 1</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>        <span class="s2">"base_1.account_name"</span><span class="p">:</span> <span class="s2">"account-b"</span><span class="p">,</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>        <span class="s2">"base_1.account_key"</span><span class="p">:</span> <span class="s2">"key-b"</span><span class="p">,</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>    <span class="p">},</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>Base ids are assigned when bases are registered (<code>initial_bases</code> ids are assigned
+sequentially starting at 1, in order) and can be inspected through the manifest base
+paths. Keys that do not match <code>base_&lt;id&gt;.&lt;key&gt;</code> exactly (e.g. <code>base_url</code>) are treated
+as regular storage options. Exact per-base parameter maps (<code>base_store_params</code>,
+keyed by base path URI) take precedence over base-scoped keys for that base.</p>
+<h2 id="s3-configuration">S3 Configuration<a class="headerlink" href="#s3-configuration" title="Permanent link">&para;</a></h2>
+<p>S3 (and S3-compatible stores) have additional configuration options that configure
+authorization and S3-specific features (such as server-side encryption).</p>
+<p>AWS credentials can be set in the environment variables <code>AWS_ACCESS_KEY_ID</code>,
+<code>AWS_SECRET_ACCESS_KEY</code>, and <code>AWS_SESSION_TOKEN</code>. Alternatively, they can be
+passed as parameters to the <code>storage_options</code> parameter:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    <span class="s2">"s3://bucket/path"</span><span class="p">,</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>        <span class="s2">"access_key_id"</span><span class="p">:</span> <span class="s2">"my-access-key"</span><span class="p">,</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>        <span class="s2">"secret_access_key"</span><span class="p">:</span> <span class="s2">"my-secret-key"</span><span class="p">,</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>        <span class="s2">"session_token"</span><span class="p">:</span> <span class="s2">"my-session-token"</span><span class="p">,</span>
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>    <span class="p">}</span>
+</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>If you are using AWS SSO, you can specify the <code>AWS_PROFILE</code> environment variable.
+It cannot be specified in the <code>storage_options</code> parameter.</p>
+<p>The following keys can be used as both environment variables or keys in the
+<code>storage_options</code> parameter:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>aws_region</code> / <code>region</code></td>
+<td>The AWS region the bucket is in. This can be automatically detected when using AWS S3, but must be specified for S3-compatible stores.</td>
+</tr>
+<tr>
+<td><code>aws_access_key_id</code> / <code>access_key_id</code></td>
+<td>The AWS access key ID to use.</td>
+</tr>
+<tr>
+<td><code>aws_secret_access_key</code> / <code>secret_access_key</code></td>
+<td>The AWS secret access key to use.</td>
+</tr>
+<tr>
+<td><code>aws_session_token</code> / <code>session_token</code></td>
+<td>The AWS session token to use.</td>
+</tr>
+<tr>
+<td><code>aws_endpoint</code> / <code>endpoint</code></td>
+<td>The endpoint to use for S3-compatible stores.</td>
+</tr>
+<tr>
+<td><code>aws_virtual_hosted_style_request</code> / <code>virtual_hosted_style_request</code></td>
+<td>Whether to use virtual hosted-style requests, where bucket name is part of the endpoint. Meant to be used with <code>aws_endpoint</code>. Default, <code>False</code>.</td>
+</tr>
+<tr>
+<td><code>aws_s3_express</code> / <code>s3_express</code></td>
+<td>Whether to use S3 Express One Zone endpoints. Default, <code>False</code>. See more details below.</td>
+</tr>
+<tr>
+<td><code>aws_server_side_encryption</code></td>
+<td>The server-side encryption algorithm to use. Must be one of <code>"AES256"</code>, <code>"aws:kms"</code>, or <code>"aws:kms:dsse"</code>. Default, <code>None</code>.</td>
+</tr>
+<tr>
+<td><code>aws_sse_kms_key_id</code></td>
+<td>The KMS key ID to use for server-side encryption. If set, <code>aws_server_side_encryption</code> must be <code>"aws:kms"</code> or <code>"aws:kms:dsse"</code>.</td>
+</tr>
+<tr>
+<td><code>aws_sse_bucket_key_enabled</code></td>
+<td>Whether to use bucket keys for server-side encryption.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="credential-provider-selection">Credential provider selection<a class="headerlink" href="#credential-provider-selection" title="Permanent link">&para;</a></h3>
+<p>By default, Lance uses the standard AWS credential provider chain (environment
+variables, shared config file, web identity tokens, ECS, EC2 instance metadata).</p>
+<p>The <code>aws_provider_scheme</code> storage option pins a dataset to a specific credential
+provider, which is useful when two datasets in the same process need different
+AWS auth (for example, one bucket using IRSA and another using ECS container
+credentials).</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>token</code></td>
+<td>Use static access-key credentials. Returns an error if <code>aws_access_key_id</code> and <code>aws_secret_access_key</code> are not set.</td>
+</tr>
+<tr>
+<td><code>ecs</code></td>
+<td>Use the ECS/Pod Identity container credential endpoint. Reads <code>AWS_CONTAINER_CREDENTIALS_FULL_URI</code> or <code>AWS_CONTAINER_CREDENTIALS_RELATIVE_URI</code> from the environment.</td>
+</tr>
+<tr>
+<td><code>irsa</code></td>
+<td>Use IRSA (IAM Roles for Service Accounts) web identity token credentials. Reads <code>AWS_WEB_IDENTITY_TOKEN_FILE</code> and <code>AWS_ROLE_ARN</code> from the environment.</td>
+</tr>
+</tbody>
+</table>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="c1"># Bucket A — use IRSA (web identity token from the environment)</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="n">ds_a</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>    <span class="s2">"s3://bucket-a/path"</span><span class="p">,</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span><span class="s2">"aws_provider_scheme"</span><span class="p">:</span> <span class="s2">"irsa"</span><span class="p">},</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="p">)</span>
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>
+</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="c1"># Bucket B — use ECS container credentials</span>
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="n">ds_b</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a>    <span class="s2">"s3://bucket-b/path"</span><span class="p">,</span>
+</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span><span class="s2">"aws_provider_scheme"</span><span class="p">:</span> <span class="s2">"ecs"</span><span class="p">},</span>
+</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a><span class="p">)</span>
+</span></code></pre></div>
+<h3 id="s3-compatible-stores">S3-compatible stores<a class="headerlink" href="#s3-compatible-stores" title="Permanent link">&para;</a></h3>
+<p>Lance can also connect to S3-compatible stores, such as MinIO. To do so, you must
+specify both region and endpoint:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="s2">"s3://bucket/path"</span><span class="p">,</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>        <span class="s2">"region"</span><span class="p">:</span> <span class="s2">"us-east-1"</span><span class="p">,</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>        <span class="s2">"endpoint"</span><span class="p">:</span> <span class="s2">"http://minio:9000"</span><span class="p">,</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>    <span class="p">}</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>This can also be done with the <code>AWS_ENDPOINT</code> and <code>AWS_DEFAULT_REGION</code> environment variables.</p>
+<h3 id="s3-express-directory-bucket">S3 Express (Directory Bucket)<a class="headerlink" href="#s3-express-directory-bucket" title="Permanent link">&para;</a></h3>
+<p>Lance supports <a href="https://aws.amazon.com/s3/storage-classes/express-one-zone/">S3 Express One Zone</a> buckets,
+a.k.a. S3 directory buckets.
+S3 Express buckets only support connecting from an EC2 instance within the same
+region.
+By default, Lance automatically recognize the <code>--x-s3</code> suffix of an express bucket,
+there is no special configuration needed.</p>
+<p>In case of an access point or private link that hides the bucket name,
+you can configure express bucket access explicitly through storage option <code>s3_express</code>.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>    <span class="s2">"s3://my-bucket--use1-az4--x-s3/path/imagenet.lance"</span><span class="p">,</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>        <span class="s2">"region"</span><span class="p">:</span> <span class="s2">"us-east-1"</span><span class="p">,</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>        <span class="s2">"s3_express"</span><span class="p">:</span> <span class="s2">"true"</span><span class="p">,</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>    <span class="p">}</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="p">)</span>
+</span></code></pre></div>
+<h2 id="google-cloud-storage-configuration">Google Cloud Storage Configuration<a class="headerlink" href="#google-cloud-storage-configuration" title="Permanent link">&para;</a></h2>
+<p>GCS credentials are configured by setting the <code>GOOGLE_SERVICE_ACCOUNT</code> environment
+variable to the path of a JSON file containing the service account credentials.
+Alternatively, you can pass the path to the JSON file in the <code>storage_options</code></p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>    <span class="s2">"gs://my-bucket/my-dataset"</span><span class="p">,</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>        <span class="s2">"service_account"</span><span class="p">:</span> <span class="s2">"path/to/service-account.json"</span><span class="p">,</span>
+</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a>    <span class="p">}</span>
+</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="p">)</span>
+</span></code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>By default, GCS uses HTTP/1 for communication, as opposed to HTTP/2. This improves
+maximum throughput significantly. However, if you wish to use HTTP/2 for some reason,
+you can set the environment variable <code>HTTP1_ONLY</code> to <code>false</code>.</p>
+</div>
+<p>The following keys can be used as both environment variables or keys in the
+<code>storage_options</code> parameter:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>google_service_account</code> / <code>service_account</code></td>
+<td>Path to the service account JSON file.</td>
+</tr>
+<tr>
+<td><code>google_service_account_key</code> / <code>service_account_key</code></td>
+<td>The serialized service account key.</td>
+</tr>
+<tr>
+<td><code>google_application_credentials</code> / <code>application_credentials</code></td>
+<td>Path to the application credentials.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="azure-blob-storage-configuration">Azure Blob Storage Configuration<a class="headerlink" href="#azure-blob-storage-configuration" title="Permanent link">&para;</a></h2>
+<p>Azure Blob Storage credentials can be configured by setting the <code>AZURE_STORAGE_ACCOUNT_NAME</code>
+and <code>AZURE_STORAGE_ACCOUNT_KEY</code> environment variables. Alternatively, you can pass
+the account name and key in the <code>storage_options</code> parameter:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>    <span class="s2">"az://my-container/my-dataset"</span><span class="p">,</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>        <span class="s2">"account_name"</span><span class="p">:</span> <span class="s2">"some-account"</span><span class="p">,</span>
+</span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>        <span class="s2">"account_key"</span><span class="p">:</span> <span class="s2">"some-key"</span><span class="p">,</span>
+</span><span id="__span-8-7"><a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>    <span class="p">}</span>
+</span><span id="__span-8-8"><a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>These keys can be used as both environment variables or keys in the <code>storage_options</code> parameter:</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>azure_storage_account_name</code> / <code>account_name</code></td>
+<td>The name of the azure storage account.</td>
+</tr>
+<tr>
+<td><code>azure_storage_account_key</code> / <code>account_key</code></td>
+<td>The serialized service account key.</td>
+</tr>
+<tr>
+<td><code>azure_client_id</code> / <code>client_id</code></td>
+<td>Service principal client id for authorizing requests.</td>
+</tr>
+<tr>
+<td><code>azure_client_secret</code> / <code>client_secret</code></td>
+<td>Service principal client secret for authorizing requests.</td>
+</tr>
+<tr>
+<td><code>azure_tenant_id</code> / <code>tenant_id</code></td>
+<td>Tenant id used in oauth flows.</td>
+</tr>
+<tr>
+<td><code>azure_storage_sas_key</code> / <code>azure_storage_sas_token</code> / <code>sas_key</code> / <code>sas_token</code></td>
+<td>Shared access signature. The signature is expected to be percent-encoded, much like they are provided in the azure storage explorer or azure portal.</td>
+</tr>
+<tr>
+<td><code>azure_storage_token</code> / <code>bearer_token</code> / <code>token</code></td>
+<td>Bearer token.</td>
+</tr>
+<tr>
+<td><code>azure_storage_use_emulator</code> / <code>object_store_use_emulator</code> / <code>use_emulator</code></td>
+<td>Use object store with azurite storage emulator.</td>
+</tr>
+<tr>
+<td><code>azure_endpoint</code> / <code>endpoint</code></td>
+<td>Override the endpoint used to communicate with blob storage.</td>
+</tr>
+<tr>
+<td><code>azure_use_fabric_endpoint</code> / <code>use_fabric_endpoint</code></td>
+<td>Use object store with url scheme account.dfs.fabric.microsoft.com.</td>
+</tr>
+<tr>
+<td><code>azure_msi_endpoint</code> / <code>azure_identity_endpoint</code> / <code>identity_endpoint</code> / <code>msi_endpoint</code></td>
+<td>Endpoint to request a imds managed identity token.</td>
+</tr>
+<tr>
+<td><code>azure_object_id</code> / <code>object_id</code></td>
+<td>Object id for use with managed identity authentication.</td>
+</tr>
+<tr>
+<td><code>azure_msi_resource_id</code> / <code>msi_resource_id</code></td>
+<td>Msi resource id for use with managed identity authentication.</td>
+</tr>
+<tr>
+<td><code>azure_federated_token_file</code> / <code>federated_token_file</code></td>
+<td>File containing token for Azure AD workload identity federation.</td>
+</tr>
+<tr>
+<td><code>azure_use_azure_cli</code> / <code>use_azure_cli</code></td>
+<td>Use azure cli for acquiring access token.</td>
+</tr>
+<tr>
+<td><code>azure_disable_tagging</code> / <code>disable_tagging</code></td>
+<td>Disables tagging objects. This can be desirable if not supported by the backing store.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="alicloud-object-storage-service-configuration">AliCloud Object Storage Service Configuration<a class="headerlink" href="#alicloud-object-storage-service-configuration" title="Permanent link">&para;</a></h2>
+<p>OSS credentials can be set in the environment variables <code>OSS_ACCESS_KEY_ID</code>,
+<code>OSS_ACCESS_KEY_SECRET</code>, <code>OSS_REGION</code>, and <code>OSS_SECURITY_TOKEN</code>. Alternatively, they can be
+passed as parameters to the <code>storage_options</code> parameter:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>    <span class="s2">"oss://bucket/path"</span><span class="p">,</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>        <span class="s2">"oss_region"</span><span class="p">:</span> <span class="s2">"oss-region"</span><span class="p">,</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>        <span class="s2">"oss_endpoint"</span><span class="p">:</span> <span class="s2">"oss-endpoint"</span><span class="p">,</span>
+</span><span id="__span-9-7"><a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a>        <span class="s2">"oss_access_key_id"</span><span class="p">:</span> <span class="s2">"my-access-key"</span><span class="p">,</span>
+</span><span id="__span-9-8"><a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a>        <span class="s2">"oss_secret_access_key"</span><span class="p">:</span> <span class="s2">"my-secret-key"</span><span class="p">,</span>
+</span><span id="__span-9-9"><a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a>        <span class="s2">"oss_security_token"</span><span class="p">:</span> <span class="s2">"my-session-token"</span><span class="p">,</span>
+</span><span id="__span-9-10"><a id="__codelineno-9-10" name="__codelineno-9-10" href="#__codelineno-9-10"></a>    <span class="p">}</span>
+</span><span id="__span-9-11"><a id="__codelineno-9-11" name="__codelineno-9-11" href="#__codelineno-9-11"></a><span class="p">)</span>
+</span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>oss_endpoint</code></td>
+<td>OSS endpoint. Required (for example, <code>https://oss-cn-hangzhou.aliyuncs.com</code>).</td>
+</tr>
+<tr>
+<td><code>oss_access_key_id</code></td>
+<td>Access key ID used for OSS authentication. Optional if credentials are provided by environment.</td>
+</tr>
+<tr>
+<td><code>oss_secret_access_key</code></td>
+<td>Access key secret used for OSS authentication. Optional if credentials are provided by environment.</td>
+</tr>
+<tr>
+<td><code>oss_region</code></td>
+<td>OSS region (for example, <code>cn-hangzhou</code>). Optional.</td>
+</tr>
+<tr>
+<td><code>oss_security_token</code></td>
+<td>Security token for temporary credentials (STS). Optional.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="volcengine-tos-configuration">Volcengine TOS Configuration<a class="headerlink" href="#volcengine-tos-configuration" title="Permanent link">&para;</a></h2>
+<p>TOS credentials can be set in the environment variables <code>TOS_ACCESS_KEY_ID</code>,
+<code>TOS_SECRET_ACCESS_KEY</code>, <code>TOS_ENDPOINT</code>, <code>TOS_REGION</code>, and <code>TOS_SECURITY_TOKEN</code>.
+Lance also accepts the corresponding <code>VOLCENGINE_</code> environment variable prefix.
+Alternatively, credentials can be passed as parameters to the <code>storage_options</code>
+parameter; explicit <code>storage_options</code> override environment variables:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>    <span class="s2">"tos://bucket/path"</span><span class="p">,</span>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>        <span class="s2">"tos_endpoint"</span><span class="p">:</span> <span class="s2">"https://tos-cn-beijing.volces.com"</span><span class="p">,</span>
+</span><span id="__span-10-6"><a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a>        <span class="s2">"tos_region"</span><span class="p">:</span> <span class="s2">"cn-beijing"</span><span class="p">,</span>
+</span><span id="__span-10-7"><a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a>        <span class="s2">"tos_access_key_id"</span><span class="p">:</span> <span class="s2">"my-access-key"</span><span class="p">,</span>
+</span><span id="__span-10-8"><a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a>        <span class="s2">"tos_secret_access_key"</span><span class="p">:</span> <span class="s2">"my-secret-key"</span><span class="p">,</span>
+</span><span id="__span-10-9"><a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a>        <span class="s2">"tos_security_token"</span><span class="p">:</span> <span class="s2">"my-session-token"</span><span class="p">,</span>
+</span><span id="__span-10-10"><a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a>    <span class="p">}</span>
+</span><span id="__span-10-11"><a id="__codelineno-10-11" name="__codelineno-10-11" href="#__codelineno-10-11"></a><span class="p">)</span>
+</span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tos_endpoint</code></td>
+<td>TOS endpoint. Required (for example, <code>https://tos-cn-beijing.volces.com</code>).</td>
+</tr>
+<tr>
+<td><code>tos_region</code></td>
+<td>TOS signing region (for example, <code>cn-beijing</code>). Optional.</td>
+</tr>
+<tr>
+<td><code>tos_access_key_id</code></td>
+<td>Access key ID used for TOS authentication. Optional if credentials are provided by environment.</td>
+</tr>
+<tr>
+<td><code>tos_secret_access_key</code></td>
+<td>Secret access key used for TOS authentication. Optional if credentials are provided by environment.</td>
+</tr>
+<tr>
+<td><code>tos_security_token</code></td>
+<td>Security token for temporary credentials. Optional.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="tencent-cloud-cos-configuration">Tencent Cloud COS Configuration<a class="headerlink" href="#tencent-cloud-cos-configuration" title="Permanent link">&para;</a></h2>
+<p><a href="https://cloud.tencent.com/product/cos">COS (Cloud Object Storage)</a> credentials can be set in environment variables prefixed
+with <code>COS_</code> or <code>TENCENTCLOUD_</code> (for example, <code>COS_ENDPOINT</code>, <code>COS_SECRET_ID</code>,
+<code>COS_SECRET_KEY</code>, <code>TENCENTCLOUD_REGION</code>, <code>TENCENTCLOUD_SECURITY_TOKEN</code>).
+Alternatively, credentials can be passed as parameters to the <code>storage_options</code>
+parameter; explicit <code>storage_options</code> override environment variables:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="1:2"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">Python</label><label for="__tabbed_1_2">Rust</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>    <span class="s2">"cos://bucket/path"</span><span class="p">,</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>        <span class="s2">"cos_endpoint"</span><span class="p">:</span> <span class="s2">"https://cos.ap-guangzhou.myqcloud.com"</span><span class="p">,</span>
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>        <span class="s2">"cos_secret_id"</span><span class="p">:</span> <span class="s2">"my-secret-id"</span><span class="p">,</span>
+</span><span id="__span-11-7"><a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a>        <span class="s2">"cos_secret_key"</span><span class="p">:</span> <span class="s2">"my-secret-key"</span><span class="p">,</span>
+</span><span id="__span-11-8"><a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a>    <span class="p">}</span>
+</span><span id="__span-11-9"><a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a><span class="p">)</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<p>In this Lance distribution, <code>tencent</code> is already part of the <strong>default
+features</strong> of the <code>lance</code> crate, so simply depending on <code>lance</code> is enough:</p>
+<div class="language-toml highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="k">[dependencies]</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="n">lance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"*"</span>
+</span></code></pre></div>
+<p>You only need to enable the <code>tencent</code> feature explicitly in the following
+cases:</p>
+<ul>
+<li>You opted out of default features, e.g.
+  <code>lance = { version = "*", default-features = false, features = ["tencent", ...] }</code>.</li>
+<li>You depend on <code>lance-io</code> directly (without <code>lance</code>); <code>tencent</code> is <strong>not</strong>
+  a default feature of <code>lance-io</code>:
+  <code>lance-io = { version = "*", features = ["tencent"] }</code>.</li>
+</ul>
+</div>
+</div>
+</div>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cos_endpoint</code></td>
+<td>COS endpoint. Required (for example, <code>https://cos.ap-guangzhou.myqcloud.com</code>). Can also be set via the <code>COS_ENDPOINT</code> environment variable.</td>
+</tr>
+<tr>
+<td><code>cos_secret_id</code></td>
+<td>Secret ID used for COS authentication. Optional if credentials are provided by environment.</td>
+</tr>
+<tr>
+<td><code>cos_secret_key</code></td>
+<td>Secret key used for COS authentication. Optional if credentials are provided by environment.</td>
+</tr>
+<tr>
+<td><code>cos_enable_versioning</code></td>
+<td>Whether to enable object versioning on the bucket. Optional.</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Tencent COS does not reliably enforce put-if-not-exists on buckets that have
+ever had versioning enabled, even if versioning is now suspended. To prevent
+silent manifest overwrites, Lance requires a custom distributed commit lock
+for COS writes. Pass the same <code>commit_lock</code> implementation to every Python
+writer, or provide a custom <code>CommitHandler</code> in Rust. Reads do not require a
+commit lock.</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The OpenDAL <code>CosConfig</code> currently exposes a limited set of options. Additional
+settings such as the security token (<code>TENCENTCLOUD_SECURITY_TOKEN</code>) and region
+(<code>TENCENTCLOUD_REGION</code>) must be configured via environment variables.</p>
+</div>
+<h2 id="goosefs-configuration">GooseFS Configuration<a class="headerlink" href="#goosefs-configuration" title="Permanent link">&para;</a></h2>
+<p><a href="https://cloud.tencent.com/product/goosefs">GooseFS</a> is a distributed caching
+filesystem. Lance accesses GooseFS through its Master gRPC service. The URL format
+is <code>goosefs://host:port/path</code>, where <code>host:port</code> is the GooseFS Master address
+(default port: <code>9200</code>, may be omitted, e.g. <code>goosefs://10.0.0.1/path</code>) and
+<code>/path</code> is the filesystem path within GooseFS.</p>
+<p>Manifest commits on <code>goosefs://</code> use <code>ConditionalPutCommitHandler</code>
+(<code>PutMode::Create</code> / if-not-exists), backed by GooseFS master's atomic
+no-replace rename so concurrent writers cannot clobber each other's
+versioned manifests.</p>
+<div class="admonition warning">
+<p class="admonition-title">Mixed-version writers are NOT safe</p>
+<p>The <code>if-not-exists</code> guarantee only holds when <strong>every</strong> writer for a
+dataset routes through this new handler. A writer running an older
+Lance release still selects <code>UnsafeCommitHandler</code> for <code>goosefs://</code>
+and writes the version path unconditionally, which can overwrite a
+manifest that an upgraded writer has already won. Safe concurrent
+commits therefore require:</p>
+<ul>
+<li>all writers for the dataset run a Lance release that includes this
+  routing change, <strong>or</strong></li>
+<li>writers share an external coordination boundary (e.g. a single-writer
+  queue, table-level lock, or a gateway that serializes commits) that
+  prevents the old code path from racing the new one.</li>
+</ul>
+<p>When upgrading in place, quiesce all writers (drain jobs, scale
+clients to zero, or route traffic through a writer coordinator) before
+rolling out the new Lance version, then bring writers back on the new
+version together.</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title">About the dataset path</p>
+<p><code>/path</code> is just an arbitrary directory inside GooseFS — Lance does <strong>not</strong>
+require the path to end with a <code>.lance</code> suffix. Any valid GooseFS directory
+works, for example:</p>
+<ul>
+<li><code>goosefs://10.0.0.1:9200/data/my-dataset</code></li>
+<li><code>goosefs://10.0.0.1:9200/data/my-dataset.lance</code></li>
+<li><code>goosefs://10.0.0.1:9200/lance-test/lance-io</code></li>
+</ul>
+<p>The <code>.lance</code> suffix used in the examples below is only a naming convention
+that makes it easy to recognize a Lance dataset directory at a glance; it
+has no special meaning to Lance itself. The only requirement is that the
+same path is used consistently for reads and writes of a given dataset.</p>
+</div>
+<div class="tabbed-set tabbed-alternate" data-tabs="2:3"><input checked="checked" id="__tabbed_2_1" name="__tabbed_2" type="radio" /><input id="__tabbed_2_2" name="__tabbed_2" type="radio" /><input id="__tabbed_2_3" name="__tabbed_2" type="radio" /><div class="tabbed-labels"><label for="__tabbed_2_1">Python</label><label for="__tabbed_2_2">Rust</label><label for="__tabbed_2_3">Java</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>    <span class="s2">"goosefs://10.0.0.1:9200/data/my-dataset.lance"</span><span class="p">,</span>
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>        <span class="s2">"goosefs_auth_type"</span><span class="p">:</span> <span class="s2">"simple"</span><span class="p">,</span>
+</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a>        <span class="s2">"goosefs_auth_username"</span><span class="p">:</span> <span class="s2">"lance"</span><span class="p">,</span>
+</span><span id="__span-13-8"><a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a>    <span class="p">},</span>
+</span><span id="__span-13-9"><a id="__codelineno-13-9" name="__codelineno-13-9" href="#__codelineno-13-9"></a><span class="p">)</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<p>In this Lance distribution, <code>goosefs</code> is already part of the <strong>default
+features</strong> of the <code>lance</code> crate, so simply depending on <code>lance</code> is enough:</p>
+<div class="language-toml highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="k">[dependencies]</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="n">lance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"*"</span>
+</span></code></pre></div>
+<p>You only need to enable the <code>goosefs</code> feature explicitly in the following
+cases:</p>
+<ul>
+<li>You opted out of default features, e.g.
+  <code>lance = { version = "*", default-features = false, features = ["goosefs", ...] }</code>.</li>
+<li>You depend on <code>lance-io</code> directly (without <code>lance</code>); <code>goosefs</code> is <strong>not</strong>
+  a default feature of <code>lance-io</code>:
+  <code>lance-io = { version = "*", features = ["goosefs"] }</code>.</li>
+</ul>
+<p>Open the underlying <code>lance_io::object_store::ObjectStore</code> directly (mirrors
+the integration test in <code>rust/lance-io/tests/goosefs_integration.rs</code>):</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="k">use</span><span class="w"> </span><span class="n">lance_io</span><span class="p">::</span><span class="n">object_store</span><span class="p">::</span><span class="n">ObjectStore</span><span class="p">;</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">uri</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">"goosefs://10.0.0.1:9200/lance-test/lance-io"</span><span class="p">;</span>
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ObjectStore</span><span class="p">::</span><span class="n">from_uri</span><span class="p">(</span><span class="n">uri</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-15-5"><a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a>
+</span><span id="__span-15-6"><a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a><span class="c1">// Read / write through the underlying `object_store::ObjectStore` API</span>
+</span><span id="__span-15-7"><a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a><span class="n">store</span><span class="p">.</span><span class="n">inner</span><span class="p">.</span><span class="n">put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="o">&amp;</span><span class="s">b"hello"</span><span class="p">[</span><span class="o">..</span><span class="p">]).</span><span class="n">into</span><span class="p">()).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-15-8"><a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">store</span><span class="p">.</span><span class="n">inner</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">path</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-15-9"><a id="__codelineno-15-9" name="__codelineno-15-9" href="#__codelineno-15-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">result</span><span class="p">.</span><span class="n">bytes</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span></code></pre></div>
+<p>Open a Lance dataset with custom storage options:</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">collections</span><span class="p">::</span><span class="n">HashMap</span><span class="p">;</span>
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="k">use</span><span class="w"> </span><span class="n">lance</span><span class="p">::</span><span class="n">dataset</span><span class="p">::</span><span class="n">DatasetBuilder</span><span class="p">;</span>
+</span><span id="__span-16-3"><a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a>
+</span><span id="__span-16-4"><a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">storage_options</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">HashMap</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+</span><span id="__span-16-5"><a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a><span class="n">storage_options</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="s">"goosefs_master_addr"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span><span class="w"> </span><span class="s">"10.0.0.1:9200"</span><span class="p">.</span><span class="n">to_string</span><span class="p">());</span>
+</span><span id="__span-16-6"><a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a><span class="n">storage_options</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="s">"goosefs_auth_type"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span><span class="w"> </span><span class="s">"simple"</span><span class="p">.</span><span class="n">to_string</span><span class="p">());</span>
+</span><span id="__span-16-7"><a id="__codelineno-16-7" name="__codelineno-16-7" href="#__codelineno-16-7"></a><span class="n">storage_options</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="s">"goosefs_auth_username"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span><span class="w"> </span><span class="s">"lance"</span><span class="p">.</span><span class="n">to_string</span><span class="p">());</span>
+</span><span id="__span-16-8"><a id="__codelineno-16-8" name="__codelineno-16-8" href="#__codelineno-16-8"></a>
+</span><span id="__span-16-9"><a id="__codelineno-16-9" name="__codelineno-16-9" href="#__codelineno-16-9"></a><span class="kd">let</span><span class="w"> </span><span class="n">dataset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">DatasetBuilder</span><span class="p">::</span><span class="n">from_uri</span><span class="p">(</span><span class="s">"goosefs://10.0.0.1:9200/data/my-dataset.lance"</span><span class="p">)</span>
+</span><span id="__span-16-10"><a id="__codelineno-16-10" name="__codelineno-16-10" href="#__codelineno-16-10"></a><span class="w">    </span><span class="p">.</span><span class="n">with_storage_options</span><span class="p">(</span><span class="n">storage_options</span><span class="p">)</span>
+</span><span id="__span-16-11"><a id="__codelineno-16-11" name="__codelineno-16-11" href="#__codelineno-16-11"></a><span class="w">    </span><span class="p">.</span><span class="n">load</span><span class="p">()</span>
+</span><span id="__span-16-12"><a id="__codelineno-16-12" name="__codelineno-16-12" href="#__codelineno-16-12"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<p>Pass the GooseFS configuration through <code>ReadOptions.setStorageOptions</code>
+when opening the dataset:</p>
+<div class="language-java highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">org.lance.Dataset</span><span class="p">;</span>
+</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">org.lance.ReadOptions</span><span class="p">;</span>
+</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a>
+</span><span id="__span-17-4"><a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="kn">import</span><span class="w"> </span><span class="nn">java.util.HashMap</span><span class="p">;</span>
+</span><span id="__span-17-5"><a id="__codelineno-17-5" name="__codelineno-17-5" href="#__codelineno-17-5"></a><span class="kn">import</span><span class="w"> </span><span class="nn">java.util.Map</span><span class="p">;</span>
+</span><span id="__span-17-6"><a id="__codelineno-17-6" name="__codelineno-17-6" href="#__codelineno-17-6"></a>
+</span><span id="__span-17-7"><a id="__codelineno-17-7" name="__codelineno-17-7" href="#__codelineno-17-7"></a><span class="n">Map</span><span class="o">&lt;</span><span class="n">String</span><span class="p">,</span><span class="w"> </span><span class="n">String</span><span class="o">&gt;</span><span class="w"> </span><span class="n">storageOptions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">HashMap</span><span class="o">&lt;&gt;</span><span class="p">();</span>
+</span><span id="__span-17-8"><a id="__codelineno-17-8" name="__codelineno-17-8" href="#__codelineno-17-8"></a><span class="n">storageOptions</span><span class="p">.</span><span class="na">put</span><span class="p">(</span><span class="s">"goosefs_master_addr"</span><span class="p">,</span><span class="w"> </span><span class="s">"10.0.0.1:9200"</span><span class="p">);</span>
+</span><span id="__span-17-9"><a id="__codelineno-17-9" name="__codelineno-17-9" href="#__codelineno-17-9"></a><span class="n">storageOptions</span><span class="p">.</span><span class="na">put</span><span class="p">(</span><span class="s">"goosefs_auth_type"</span><span class="p">,</span><span class="w"> </span><span class="s">"simple"</span><span class="p">);</span>
+</span><span id="__span-17-10"><a id="__codelineno-17-10" name="__codelineno-17-10" href="#__codelineno-17-10"></a><span class="n">storageOptions</span><span class="p">.</span><span class="na">put</span><span class="p">(</span><span class="s">"goosefs_auth_username"</span><span class="p">,</span><span class="w"> </span><span class="s">"lance"</span><span class="p">);</span>
+</span><span id="__span-17-11"><a id="__codelineno-17-11" name="__codelineno-17-11" href="#__codelineno-17-11"></a>
+</span><span id="__span-17-12"><a id="__codelineno-17-12" name="__codelineno-17-12" href="#__codelineno-17-12"></a><span class="n">ReadOptions</span><span class="w"> </span><span class="n">options</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ReadOptions</span><span class="p">.</span><span class="na">Builder</span><span class="p">()</span>
+</span><span id="__span-17-13"><a id="__codelineno-17-13" name="__codelineno-17-13" href="#__codelineno-17-13"></a><span class="w">    </span><span class="p">.</span><span class="na">setStorageOptions</span><span class="p">(</span><span class="n">storageOptions</span><span class="p">)</span>
+</span><span id="__span-17-14"><a id="__codelineno-17-14" name="__codelineno-17-14" href="#__codelineno-17-14"></a><span class="w">    </span><span class="p">.</span><span class="na">build</span><span class="p">();</span>
+</span><span id="__span-17-15"><a id="__codelineno-17-15" name="__codelineno-17-15" href="#__codelineno-17-15"></a>
+</span><span id="__span-17-16"><a id="__codelineno-17-16" name="__codelineno-17-16" href="#__codelineno-17-16"></a><span class="k">try</span><span class="w"> </span><span class="p">(</span><span class="n">Dataset</span><span class="w"> </span><span class="n">dataset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Dataset</span><span class="p">.</span><span class="na">open</span><span class="p">()</span>
+</span><span id="__span-17-17"><a id="__codelineno-17-17" name="__codelineno-17-17" href="#__codelineno-17-17"></a><span class="w">        </span><span class="p">.</span><span class="na">uri</span><span class="p">(</span><span class="s">"goosefs://10.0.0.1:9200/data/my-dataset.lance"</span><span class="p">)</span>
+</span><span id="__span-17-18"><a id="__codelineno-17-18" name="__codelineno-17-18" href="#__codelineno-17-18"></a><span class="w">        </span><span class="p">.</span><span class="na">readOptions</span><span class="p">(</span><span class="n">options</span><span class="p">)</span>
+</span><span id="__span-17-19"><a id="__codelineno-17-19" name="__codelineno-17-19" href="#__codelineno-17-19"></a><span class="w">        </span><span class="p">.</span><span class="na">build</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-17-20"><a id="__codelineno-17-20" name="__codelineno-17-20" href="#__codelineno-17-20"></a><span class="w">    </span><span class="c1">// ... use the dataset</span>
+</span><span id="__span-17-21"><a id="__codelineno-17-21" name="__codelineno-17-21" href="#__codelineno-17-21"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>For writes, the same <code>storageOptions(...)</code> setter is available on
+<code>WriteDatasetBuilder</code> and <code>WriteFragmentBuilder</code>.</p>
+</div>
+</div>
+</div>
+<p>The Master address can be resolved from (in priority order):</p>
+<ol>
+<li>The <code>goosefs_master_addr</code> storage option (supports HA: <code>"addr1:port,addr2:port"</code>).</li>
+<li>The <code>GOOSEFS_MASTER_ADDR</code> environment variable.</li>
+<li>The host and port from the URL authority.</li>
+</ol>
+<p><code>storage_options</code> keys <strong>must be lowercase</strong>. Uppercase or mixed-case spellings
+such as <code>GOOSEFS_MASTER_ADDR</code> are rejected with an explicit error — they are
+not ignored, and they are not treated as the matching environment variable.
+Environment variables keep the <code>GOOSEFS_*</code> form.</p>
+<table>
+<thead>
+<tr>
+<th>storage_options key</th>
+<th>env var</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>goosefs_master_addr</code></td>
+<td><code>GOOSEFS_MASTER_ADDR</code></td>
+<td>GooseFS Master address. Supports a single address (<code>host:port</code>) or comma-separated HA addresses (<code>addr1:port,addr2:port</code>). Optional if the address is provided in the URL.</td>
+</tr>
+<tr>
+<td><code>goosefs_write_type</code></td>
+<td><code>GOOSEFS_WRITE_TYPE</code></td>
+<td>Write type, e.g. <code>MUST_CACHE</code>, <code>CACHE_THROUGH</code>, <code>THROUGH</code>, <code>ASYNC_THROUGH</code>. Optional.</td>
+</tr>
+<tr>
+<td><code>goosefs_block_size</code></td>
+<td><code>GOOSEFS_BLOCK_SIZE</code></td>
+<td>GooseFS block size (this is the GooseFS-side block size, not Lance's I/O block size). Accepts a raw byte count or GooseFS suffixes such as <code>64MB</code> (binary units: <code>1KB = 1024</code>). Optional.</td>
+</tr>
+<tr>
+<td><code>goosefs_chunk_size</code></td>
+<td><code>GOOSEFS_CHUNK_SIZE</code></td>
+<td>Chunk size used when reading or writing files. Accepts a raw byte count or GooseFS suffixes such as <code>4MB</code> (binary units: <code>1KB = 1024</code>). Optional.</td>
+</tr>
+<tr>
+<td><code>goosefs_auth_type</code></td>
+<td><code>GOOSEFS_AUTH_TYPE</code></td>
+<td>Authentication type. Either <code>nosasl</code> or <code>simple</code> (case-insensitive; the value is passed through to OpenDAL). Optional.</td>
+</tr>
+<tr>
+<td><code>goosefs_auth_username</code></td>
+<td><code>GOOSEFS_AUTH_USERNAME</code></td>
+<td>Username used in <code>simple</code> authentication mode. Optional.</td>
+</tr>
+</tbody>
+</table>
+<div class="admonition note">
+<p class="admonition-title">Running the GooseFS integration tests</p>
+<p>The Rust integration tests for GooseFS live at
+<code>rust/lance-io/tests/goosefs_integration.rs</code> and are gated behind feature
+flags. They require a reachable GooseFS cluster (configured via the
+<code>GOOSEFS_MASTER_ADDR</code> and <code>GOOSEFS_AUTH_TYPE</code> environment variables) and
+can be run with:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>-p<span class="w"> </span>lance-io<span class="w"> </span>--features<span class="w"> </span><span class="s2">"goosefs goosefs-test"</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="w">    </span>--test<span class="w"> </span>goosefs_integration<span class="w"> </span>--<span class="w"> </span>--ignored<span class="w"> </span>--nocapture<span class="w"> </span>--test-threads<span class="o">=</span><span class="m">1</span>
+</span></code></pre></div>
+</div>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../tags_and_branches/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Tags and Branches</div>
+        </a>
+        <a class="next" href="../observability/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Observability</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#general-configuration">General Configuration</a>
+      <a class="ld-toc__h3" href="#bulk-copy-strategy">Bulk copy strategy</a>
+      <a class="ld-toc__h2" href="#per-base-configuration">Per-Base Configuration</a>
+      <a class="ld-toc__h2" href="#s3-configuration">S3 Configuration</a>
+      <a class="ld-toc__h3" href="#credential-provider-selection">Credential provider selection</a>
+      <a class="ld-toc__h3" href="#s3-compatible-stores">S3-compatible stores</a>
+      <a class="ld-toc__h3" href="#s3-express-directory-bucket">S3 Express (Directory Bucket)</a>
+      <a class="ld-toc__h2" href="#google-cloud-storage-configuration">Google Cloud Storage Configuration</a>
+      <a class="ld-toc__h2" href="#azure-blob-storage-configuration">Azure Blob Storage Configuration</a>
+      <a class="ld-toc__h2" href="#alicloud-object-storage-service-configuration">AliCloud Object Storage Service Configuration</a>
+      <a class="ld-toc__h2" href="#volcengine-tos-configuration">Volcengine TOS Configuration</a>
+      <a class="ld-toc__h2" href="#tencent-cloud-cos-configuration">Tencent Cloud COS Configuration</a>
+      <a class="ld-toc__h2" href="#goosefs-configuration">GooseFS Configuration</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../format/">Specification</a>
+        <a href="../../format/file/">File format</a>
+        <a href="../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../quickstart/">Getting started</a>
+        <a href="../read_and_write/">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Partitioned namespace — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/context/design/partitioned-namespace/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../../">Integrations</a>
+      <a class="ld-toptab" href="../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../../">Overview</a>
+    <a href="../../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../../pytorch/">PyTorch</a>
+    <a href="../../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../../duckdb/">Overview</a>
+    <a href="../../../duckdb/sql/">SQL Reference</a>
+    <a href="../../../duckdb/rest/">REST Namespace</a>
+    <a href="../../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../../huggingface/">Home</a>
+    <a href="../../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../../../spark/">Welcome</a>
+    <a href="../../../spark/install/">Install</a>
+    <a href="../../../spark/config/">Config</a>
+    <a href="../../../spark/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../spark/operations/ddl/create-namespace/">CREATE NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/drop-namespace/">DROP NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../../../spark/operations/ddl/describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/create-table/">CREATE TABLE</a>
+    <a href="../../../spark/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../spark/operations/ddl/describe-table/">DESCRIBE TABLE</a>
+    <a href="../../../spark/operations/ddl/alter-table/">ALTER TABLE</a>
+    <a href="../../../spark/operations/ddl/show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../../../spark/operations/ddl/drop-table/">DROP TABLE</a>
+    <a href="../../../spark/operations/ddl/create-index/">CREATE INDEX</a>
+    <a href="../../../spark/operations/ddl/show-indexes/">SHOW INDEXES</a>
+    <a href="../../../spark/operations/ddl/create-branch/">CREATE BRANCH</a>
+    <a href="../../../spark/operations/ddl/drop-branch/">DROP BRANCH</a>
+    <a href="../../../spark/operations/ddl/show-branches/">SHOW BRANCHES</a>
+    <a href="../../../spark/operations/ddl/create-tag/">CREATE TAG</a>
+    <a href="../../../spark/operations/ddl/drop-tag/">DROP TAG</a>
+    <a href="../../../spark/operations/ddl/show-tags/">SHOW TAGS</a>
+    <a href="../../../spark/operations/ddl/optimize/">OPTIMIZE</a>
+    <a href="../../../spark/operations/ddl/vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../spark/operations/dql/select/">SELECT</a>
+    <a href="../../../spark/operations/dql/fts/">Full-Text Search</a>
+    <a href="../../../spark/operations/dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../../../spark/operations/dql/search/">SEARCH</a>
+    <a href="../../../spark/operations/dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../spark/operations/dml/insert-into/">INSERT INTO</a>
+    <a href="../../../spark/operations/dml/update/">UPDATE SET</a>
+    <a href="../../../spark/operations/dml/delete/">DELETE FROM</a>
+    <a href="../../../spark/operations/dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../../../spark/operations/dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../../../spark/vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../../ray/">Welcome</a>
+    <a href="../../../ray/read/">Read</a>
+    <a href="../../../ray/write/">Write</a>
+    <a href="../../../ray/distributed-indexing/">Index</a>
+    <a href="../../../ray/compaction/">Compaction</a>
+    <a href="../../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../../trino/">Welcome</a>
+    <a href="../../../trino/install/">Install</a>
+    <a href="../../../trino/config/">Config</a>
+    <a href="../../../trino/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../../trino/operations/data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../trino/operations/ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../../trino/operations/ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../../trino/operations/ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../../trino/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../trino/operations/ddl/describe-table/">DESCRIBE</a>
+    <a href="../../../trino/operations/ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../../trino/operations/ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../trino/operations/dml/insert/">INSERT</a>
+    <a href="../../../trino/operations/dml/update/">UPDATE</a>
+    <a href="../../../trino/operations/dml/delete/">DELETE</a>
+    <a href="../../../trino/operations/dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../trino/operations/dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../guide/quickstart/">Quickstart</a>
+    <a href="../../guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../guide/storage/">Storage backends</a>
+    <a href="../../guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../../specs/rollout-schema-design/">Rollout schema</a>
+    <a href="../../specs/rollout-deployment/">Rollout deployment</a>
+    <a href="../../specs/rollout-blob-streaming/">Blob streaming</a>
+    <a href="../../specs/datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a class="active" href="./">Partitioned namespace</a>
+    <a href="../auto-dream/">Auto-dream</a>
+    <a href="../using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Lance Context</span>
+        <span>/</span><span>Design</span>
+        <span>/</span><b>Partitioned namespace</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="design-partitioned-namespace-layout-for-scoped-agent-context">Design: Partitioned-Namespace Layout for Scoped Agent Context<a class="headerlink" href="#design-partitioned-namespace-layout-for-scoped-agent-context" title="Permanent link">&para;</a></h1>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Status</strong></td>
+<td>Draft — for discussion</td>
+</tr>
+<tr>
+<td><strong>Issue</strong></td>
+<td><a href="https://github.com/lance-format/lance-context/issues/90">#90 — Explore partitioned namespace layout for scoped agent context</a></td>
+</tr>
+<tr>
+<td><strong>Supersedes / refines</strong></td>
+<td><a href="https://github.com/lance-format/lance-context/issues/37">#37 — Change the management of data tables and add some interface exposure for agent</a></td>
+</tr>
+<tr>
+<td><strong>References</strong></td>
+<td><a href="https://lance.org/format/namespace/partitioning-spec/">Lance Partitioning Spec</a> · <a href="https://lance.org/format/namespace/">Lance Namespace Spec</a></td>
+</tr>
+<tr>
+<td><strong>Scope</strong></td>
+<td>Conventions + a thin helper API. No new storage engine, no catalog/database.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="1-summary">1. Summary<a class="headerlink" href="#1-summary" title="Permanent link">&para;</a></h2>
+<p><code>lance-context</code> today is a <strong>single fat table</strong>: one Lance dataset per context URI, holding
+one <code>ContextRecord</code> schema that already carries scope-ish fields (<code>bot_id</code>, <code>session_id</code>,
+<code>run_id</code>), a free-form <code>metadata</code> JSON blob, embeddings, relationships, and lifecycle
+columns. Scoping is done entirely with <strong>metadata filters inside that one dataset</strong>.</p>
+<p>This works well until a deployment needs <em>physical</em> isolation between scopes — separate
+tenants, agents, environments, or content "directions" (memory vs. knowledge base vs.
+skills) that want independent lifecycle, compaction, vector indexes, deletion, or access
+control. The natural temptation (and the original direction in #37) is to grow into many
+purpose-built tables (<code>ctx_agent</code>, <code>ctx_kb</code>, <code>ctx_meta</code>) plus an <code>information_schema</code>-style
+registry. Maintainer guidance on #37 pushed back on that:</p>
+<blockquote>
+<p>I'm hesitating to make lance-context as a database with an information_schema.
+Maintaining the schema of each table would be a pain in the future.
+Any chance to use the partitioned namespace instead of making it as a database?</p>
+</blockquote>
+<p>This document takes that suggestion seriously. It proposes that scoped isolation be
+expressed as a <strong>Lance Partitioned Namespace</strong> over the <strong>existing single <code>ContextRecord</code>
+schema</strong>, rather than as a family of bespoke tables with a hand-rolled catalog. A
+partitioned namespace is, by definition, <em>"a collection of tables that share a common
+schema … physically separated and independent, but logically related through partition
+fields"</em> — which is exactly the shape we want: <strong>one schema to maintain, many physically
+isolated partitions, and an optional unified cross-partition view.</strong></p>
+<p>The deliverable here is <strong>conventions + a small, optional URI/namespace helper</strong> — not a
+catalog, not table families, not an <code>information_schema</code>.</p>
+<h2 id="2-background">2. Background<a class="headerlink" href="#2-background" title="Permanent link">&para;</a></h2>
+<h3 id="21-where-we-are-today">2.1 Where we are today<a class="headerlink" href="#21-where-we-are-today" title="Permanent link">&para;</a></h3>
+<p>A <code>Context</code> is created over a single URI and is backed by exactly one Lance dataset:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">ctx</span> <span class="o">=</span> <span class="n">Context</span><span class="o">.</span><span class="n">create</span><span class="p">(</span><span class="s2">"s3://bucket/prefix/context.lance"</span><span class="p">)</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="n">ctx</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="s2">"user"</span><span class="p">,</span> <span class="s2">"…"</span><span class="p">,</span> <span class="n">bot_id</span><span class="o">=</span><span class="s2">"support-bot"</span><span class="p">,</span> <span class="n">session_id</span><span class="o">=</span><span class="s2">"incident-123"</span><span class="p">,</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>        <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">"tenant"</span><span class="p">:</span> <span class="s2">"acme"</span><span class="p">,</span> <span class="s2">"scope"</span><span class="p">:</span> <span class="s2">"team"</span><span class="p">,</span> <span class="s2">"source_uri"</span><span class="p">:</span> <span class="s2">"docs://…"</span><span class="p">})</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">ctx</span><span class="o">.</span><span class="n">list</span><span class="p">(</span><span class="n">filters</span><span class="o">=</span><span class="p">{</span><span class="s2">"bot_id"</span><span class="p">:</span> <span class="s2">"support-bot"</span><span class="p">,</span> <span class="s2">"session_id"</span><span class="p">:</span> <span class="s2">"incident-123"</span><span class="p">,</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>                  <span class="s2">"scope"</span><span class="p">:</span> <span class="s2">"team"</span><span class="p">})</span>
+</span></code></pre></div>
+<p>Scope is carried two ways:</p>
+<ul>
+<li><strong>Typed columns</strong> that already exist on <code>ContextRecord</code>: <code>bot_id</code>, <code>session_id</code>,
+  <code>run_id</code>, <code>role</code>, <code>content_type</code>, plus lifecycle columns.</li>
+<li><strong>Free-form <code>metadata</code> JSON</strong> (e.g. <code>tenant</code>, <code>scope</code>, <code>tags</code>, <code>source_uri</code>), filtered
+  by <code>list</code>/<code>search</code>/<code>retrieve</code>.</li>
+</ul>
+<p>Everything lives in one dataset. That is simple and correct, and <strong>must stay the default.</strong></p>
+<h3 id="22-what-37-was-really-asking-for">2.2 What #37 was really asking for<a class="headerlink" href="#22-what-37-was-really-asking-for" title="Permanent link">&para;</a></h3>
+<p>The #37 thread had two distinct ideas tangled together:</p>
+<ol>
+<li><strong>Layering (L0/L1/L2)</strong> — summary / structured+vector / raw. This is a <em>per-record</em>
+   property, orthogonal to isolation.</li>
+<li><strong>"Different directions"</strong> — memory, knowledge base, skills, tool calls — which the
+   author modeled as separate table families (<code>ctx_agent</code> / <code>ctx_kb</code> / <code>ctx_meta</code>) and an
+   <code>information_schema</code> (<code>ctx_meta</code>) to register them.</li>
+</ol>
+<p>The maintainer's objection is specifically to #2: a growing set of tables, each with its
+own schema, plus a registry we have to maintain, turns <code>lance-context</code> into a small
+database. The cost is schema sprawl and migration pain.</p>
+<h3 id="23-why-a-partitioned-namespace-fits">2.3 Why a partitioned namespace fits<a class="headerlink" href="#23-why-a-partitioned-namespace-fits" title="Permanent link">&para;</a></h3>
+<p>The Lance Partitioning Spec already solves "many physically separate tables that share one
+schema and one lifecycle, queryable together when needed":</p>
+<ul>
+<li>All partitions <strong>share a single namespace schema</strong>; the spec <em>requires</em> that "all
+  partition table schemas must be consistent with each other, as well as with the
+  namespace schema." → <strong>one schema to maintain</strong>, which is the whole point of #37's
+  pushback.</li>
+<li>The registry is the spec's own <strong><code>__manifest</code> table</strong>, maintained by the namespace
+  format — not a bespoke <code>information_schema</code> we own.</li>
+<li>Each partition is <strong>a standard, independently accessible Lance <code>Dataset</code></strong> — so a single
+  partition is exactly today's <code>Context</code>, unchanged.</li>
+<li>Cross-partition queries are supported via <strong>partition pruning</strong> over <code>__manifest</code>.</li>
+</ul>
+<p>So we get physical isolation <em>and</em> a unified view, without becoming a database.</p>
+<h2 id="3-goals-non-goals">3. Goals / Non-goals<a class="headerlink" href="#3-goals-non-goals" title="Permanent link">&para;</a></h2>
+<p>Mirrors #90.</p>
+<p><strong>Goals</strong></p>
+<ul>
+<li>Recommend upstream-friendly <strong>partition naming / spec conventions</strong> for scoped context
+  (tenant, agent, session, source, environment).</li>
+<li>Clarify <strong>which scope dimensions belong in path/namespace layout vs. record metadata.</strong></li>
+<li>Sketch a <strong>small helper API</strong> to resolve/open a partition without a catalog.</li>
+<li>Show <strong>when to use one context with metadata filters vs. separate partitions.</strong></li>
+<li>Give <strong>migration guidance</strong>: start with one dataset, split by scope later.</li>
+<li>Stay compatible with the single fat-table model and the #37 guidance.</li>
+</ul>
+<p><strong>Non-goals</strong></p>
+<ul>
+<li>No <code>information_schema</code>, table-family management, SQL catalog, or database abstraction.</li>
+<li><code>lance-context</code> does <strong>not</strong> own tenant authN/Z or policy enforcement.</li>
+<li>Not a replacement for metadata filters <em>inside</em> a single context dataset.</li>
+<li>No new storage engine; no change to the <code>ContextRecord</code> payload model.</li>
+</ul>
+<h2 id="4-lance-partitioned-namespace-in-brief">4. Lance partitioned namespace, in brief<a class="headerlink" href="#4-lance-partitioned-namespace-in-brief" title="Permanent link">&para;</a></h2>
+<p>(Condensed from the <a href="https://lance.org/format/namespace/partitioning-spec/">Partitioning Spec</a>;
+read it for the authoritative version.)</p>
+<p>A partitioned namespace is a directory catalog whose <code>__manifest</code> table metadata declares
+one or more <strong>partition specs</strong>. Logical layout:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>Root Namespace  (__manifest Lance table)
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>  metadata:
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>    schema          = &lt;shared ContextRecord schema&gt;
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>    partition_spec_v1 = [tenant, agent]
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>        │
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>        ▼
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>   Spec Version Level  ──  v1, v2, …   (one per partition-spec version)
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>        │
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>        ▼
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>   Partition Namespaces  ──  one level per partition field, in spec order
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>        │                    (names are random 16-char base36 ids)
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>        ▼
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>   Partition Table  ──  fixed name "dataset" = a normal Lance Dataset
+</span></code></pre></div>
+<p>Key properties we rely on:</p>
+<ul>
+<li><strong>Shared schema.</strong> Field IDs (<code>lance:field_id</code>) are stable; partition specs reference
+  source columns by id, so columns can be renamed without breaking partitioning.</li>
+<li><strong>Partition spec</strong> = <code>{ id, fields: [{ field_id, source_ids, transform|expression,
+  result_type }] }</code>. Built-in transforms: <code>identity</code>, <code>year</code>/<code>month</code>/<code>day</code>/<code>hour</code>,
+  <code>bucket(N)</code>, <code>multi_bucket(N)</code>, <code>truncate(W)</code>; or a custom DataFusion <code>expression</code>.</li>
+<li><strong>Random-id partition namespaces.</strong> Partition <em>values</em> are <strong>not</strong> put in the path
+  (avoids <code>/</code>, <code>=</code>, <code>$</code> issues in tenant/source ids); they live in <code>__manifest</code> columns
+  named <code>partition_field_{field_id}</code>.</li>
+<li><strong><code>__manifest</code> is the registry.</strong> Query engines push predicates onto its partition
+  columns to prune to the matching <code>dataset</code> tables (no path parsing).</li>
+<li><strong>Partition evolution</strong> via new spec versions (<code>v2</code>, …). Old data under <code>v1</code> stays
+  queryable; no rewrite required.</li>
+<li><strong>Transactions.</strong> A single partition is fully ACID (it is a Lance table). Cross-partition
+  writes/reads are <em>not</em> atomic by default, but the spec defines an optional
+  <code>read_version</code>/<code>read_branch</code>/<code>read_tag</code> commit protocol on <code>__manifest</code> for all-or-nothing
+  multi-partition visibility.</li>
+</ul>
+<h2 id="5-design">5. Design<a class="headerlink" href="#5-design" title="Permanent link">&para;</a></h2>
+<h3 id="51-principle-one-schema-many-partitions">5.1 Principle: one schema, many partitions<a class="headerlink" href="#51-principle-one-schema-many-partitions" title="Permanent link">&para;</a></h3>
+<p>Keep <strong>one <code>ContextRecord</code> schema</strong> as the namespace schema. Isolation is achieved by
+<em>splitting rows across partitions</em>, never by giving each direction its own schema. This is
+the single decision that keeps us out of "database with an information_schema" territory:</p>
+<ul>
+<li>"memory", "knowledge base", "skills", "tool calls" are <strong>values of a partition field</strong>
+  (or scalar columns), <strong>not</strong> separate tables with separate schemas.</li>
+<li>The thing #37 called <code>ctx_meta</code> / <code>information_schema</code> is replaced by the spec's
+  <code>__manifest</code> table, which we do not design or maintain.</li>
+</ul>
+<h3 id="52-which-dimensions-go-in-the-layout-vs-the-record">5.2 Which dimensions go in the layout vs. the record<a class="headerlink" href="#52-which-dimensions-go-in-the-layout-vs-the-record" title="Permanent link">&para;</a></h3>
+<p>This is the core guidance #90 asks for.</p>
+<blockquote>
+<p>Put a dimension in the <strong>partition layout</strong> when you routinely scope an <em>entire</em> operation
+to one value of it, and you want that value's data physically isolated. Keep a dimension
+in <strong>record fields/metadata</strong> when it is high-cardinality, cross-cutting, or combined
+ad-hoc with other filters.</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Typical cardinality</th>
+<th>Recommended placement</th>
+<th>Rationale</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tenant</code> / org</td>
+<td>low–med</td>
+<td><strong>Partition</strong> (<code>identity</code>)</td>
+<td>Hard isolation boundary; per-tenant delete/retention/access; queries almost always tenant-scoped.</td>
+</tr>
+<tr>
+<td><code>environment</code> (prod/stage)</td>
+<td>tiny</td>
+<td><strong>Partition</strong> (<code>identity</code>)</td>
+<td>Never want stage data bleeding into prod recall.</td>
+</tr>
+<tr>
+<td><code>agent</code> / bot (<code>bot_id</code>)</td>
+<td>low–med</td>
+<td><strong>Partition</strong> (<code>identity</code>) <em>if</em> agents need independent indexes/lifecycle; else <strong>column</strong></td>
+<td><code>bot_id</code> is already a column. Partition only when isolation matters.</td>
+</tr>
+<tr>
+<td><code>source</code> / <code>kind</code> (memory | knowledge | skill | tool_call)</td>
+<td>tiny (enum)</td>
+<td><strong>Partition</strong> (<code>identity</code>) <em>or</em> scalar column</td>
+<td>The #37 "directions". Partition when lifecycles diverge (e.g. KB is bulk-rebuilt, memory is append/prune).</td>
+</tr>
+<tr>
+<td><code>user</code></td>
+<td>high</td>
+<td><strong>Column</strong> + metadata; <strong><code>bucket(N)</code></strong> if isolation needed</td>
+<td>Don't create millions of partitions; hash into N buckets if you must partition.</td>
+</tr>
+<tr>
+<td><code>session_id</code></td>
+<td>very high</td>
+<td><strong>Column</strong> (<code>session_id</code>)</td>
+<td>Already a column; fine-grained, cross-cut by other filters.</td>
+</tr>
+<tr>
+<td><code>run_id</code>, <code>role</code>, <code>content_type</code>, <code>tags</code>, <code>confidence</code>, <code>source_uri</code></td>
+<td>high / cross-cutting</td>
+<td><strong>Column / <code>metadata</code></strong></td>
+<td>Ad-hoc filter material; never a directory boundary.</td>
+</tr>
+<tr>
+<td>time</td>
+<td>continuous</td>
+<td><strong>Column</strong> (<code>created_at</code>); <code>day</code>/<code>month</code> transform only for cold archival</td>
+<td>Recall filters by range, not by exact partition; reserve time partitions for archive tiers.</td>
+</tr>
+</tbody>
+</table>
+<p>Rules of thumb:</p>
+<ol>
+<li><strong>Few coarse boundaries → partition.</strong> Many fine values → filter.</li>
+<li><strong>Physical needs → partition.</strong> If you need an independent vector index, independent
+   compaction cadence, drop-to-delete, or per-scope ACLs at the storage layer, it must be a
+   partition. Pure logical filtering can stay a column.</li>
+<li><strong>Cap the partition count.</strong> Keep the total number of <code>dataset</code> tables in the low
+   thousands. For a dimension you need to isolate but whose cardinality is high, use
+   <code>bucket(field, N)</code> instead of <code>identity</code>.</li>
+<li><strong>A dimension you partition on must be a typed column</strong> in the shared schema (see
+   §5.5) — partition specs reference columns by field id, so they cannot read keys buried
+   in the <code>metadata</code> JSON blob.</li>
+</ol>
+<h3 id="53-recommended-partition-specs">5.3 Recommended partition specs<a class="headerlink" href="#53-recommended-partition-specs" title="Permanent link">&para;</a></h3>
+<p>Three conventions, smallest-useful first. Field ids are stable strings.</p>
+<p><strong>A. Tenant-isolated (most common).</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">{</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="nt">"fields"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">"field_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"tenant"</span><span class="p">,</span><span class="w"> </span><span class="nt">"source_ids"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">&lt;id</span><span class="w"> </span><span class="err">o</span><span class="kc">f</span><span class="w"> </span><span class="kc">tenant</span><span class="w"> </span><span class="err">col&gt;</span><span class="p">],</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">      </span><span class="nt">"transform"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"identity"</span><span class="w"> </span><span class="p">},</span><span class="w"> </span><span class="nt">"result_type"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"utf8"</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">  </span><span class="p">]</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><strong>B. Tenant → agent → source (multi-direction, answers #37).</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">{</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="nt">"fields"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">"field_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"tenant"</span><span class="p">,</span><span class="w"> </span><span class="nt">"source_ids"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">&lt;</span><span class="kc">tenant</span><span class="err">&gt;</span><span class="p">],</span><span class="w"> </span><span class="nt">"transform"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"identity"</span><span class="p">},</span><span class="w"> </span><span class="nt">"result_type"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"utf8"</span><span class="p">}</span><span class="w"> </span><span class="p">},</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">"field_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"agent"</span><span class="p">,</span><span class="w">  </span><span class="nt">"source_ids"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">&lt;bo</span><span class="kc">t</span><span class="err">_id&gt;</span><span class="p">],</span><span class="w"> </span><span class="nt">"transform"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"identity"</span><span class="p">},</span><span class="w"> </span><span class="nt">"result_type"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"utf8"</span><span class="p">}</span><span class="w"> </span><span class="p">},</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">"field_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"source"</span><span class="p">,</span><span class="w"> </span><span class="nt">"source_ids"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">&lt;source&gt;</span><span class="p">],</span><span class="w"> </span><span class="nt">"transform"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"identity"</span><span class="p">},</span><span class="w"> </span><span class="nt">"result_type"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"utf8"</span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">  </span><span class="p">]</span>
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="p">}</span>
+</span></code></pre></div>
+<p><code>source ∈ {memory, knowledge, skill, tool_call}</code> — the #37 "directions" become partition
+values, not tables. Order matters: outer levels are the coarsest, most-often-scoped
+dimensions (the spec nests partition namespaces in field order).</p>
+<p><strong>C. High-cardinality user isolation via bucketing.</strong></p>
+<div class="language-json highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="p">{</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span><span class="nt">"fields"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">"field_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"tenant"</span><span class="p">,</span><span class="w"> </span><span class="nt">"source_ids"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">&lt;</span><span class="kc">tenant</span><span class="err">&gt;</span><span class="p">],</span><span class="w"> </span><span class="nt">"transform"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"identity"</span><span class="p">},</span><span class="w"> </span><span class="nt">"result_type"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"utf8"</span><span class="p">}</span><span class="w"> </span><span class="p">},</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">"field_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"user_bucket"</span><span class="p">,</span><span class="w"> </span><span class="nt">"source_ids"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">&lt;user_id&gt;</span><span class="p">],</span><span class="w"> </span><span class="nt">"transform"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"bucket"</span><span class="p">,</span><span class="w"> </span><span class="nt">"num_buckets"</span><span class="p">:</span><span class="w"> </span><span class="mi">64</span><span class="p">},</span><span class="w"> </span><span class="nt">"result_type"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"int32"</span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">  </span><span class="p">]</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="p">}</span>
+</span></code></pre></div>
+<p>Caps per-tenant partitions at 64 while still giving physical separation and enabling
+storage-partitioned joins against other namespaces bucketed compatibly.</p>
+<h3 id="54-path-uri-conventions-caller-facing">5.4 Path / URI conventions (caller-facing)<a class="headerlink" href="#54-path-uri-conventions-caller-facing" title="Permanent link">&para;</a></h3>
+<p>Per the spec, <strong>physical</strong> partition directories are random-id names like
+<code>b4a3c2d1_v1$k7m2n9p4q8r5s3t6$dataset/</code>, and partition values live in <code>__manifest</code>. Callers
+should never construct these by hand. What we standardize is the <strong>caller-facing</strong> address:</p>
+<ul>
+<li>A <strong>namespace root URI</strong> — the directory containing <code>__manifest</code>, e.g.
+  <code>s3://bucket/acme-contexts/</code>. This replaces "one <code>.lance</code> dataset" as the top-level
+  handle when partitioning is in use.</li>
+<li>A <strong>partition selector</strong> — a dict of <code>{field_id: value}</code> resolved against the spec, e.g.
+  <code>{"tenant": "acme", "agent": "support-bot", "source": "memory"}</code>.</li>
+</ul>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>s3://bucket/acme-contexts/                # namespace root (holds __manifest)
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>   └── (resolved by spec+manifest) ──►  one Lance "dataset" table == a normal Context
+</span></code></pre></div>
+<p>Because partition values are stored in <code>__manifest</code>, <strong>tenant/source ids may contain any
+characters</strong> (<code>/</code>, <code>:</code>, spaces) without escaping — a real advantage over encoding scope
+into the path ourselves.</p>
+<h3 id="55-schema-implication-promote-partition-keys-to-columns">5.5 Schema implication: promote partition keys to columns<a class="headerlink" href="#55-schema-implication-promote-partition-keys-to-columns" title="Permanent link">&para;</a></h3>
+<p>To partition by a dimension, it must be a first-class column referenced by <code>source_ids</code>.
+Status of the candidate keys on <code>ContextRecord</code> today:</p>
+<ul>
+<li><strong>Already columns</strong> (usable now): <code>bot_id</code> (→ agent), <code>session_id</code>, <code>run_id</code>, <code>role</code>,
+  <code>content_type</code>, <code>created_at</code>.</li>
+<li><strong>Currently in <code>metadata</code> JSON</strong> (would need promotion to typed columns to partition on):
+  <code>tenant</code>, <code>source</code>/<code>kind</code>, <code>environment</code>, <code>user_id</code>.</li>
+</ul>
+<p>Recommendation: when (and only when) we implement partitioning, add nullable typed columns
+for the dimensions a deployment wants to partition by (start with <code>tenant</code> and <code>source</code>).
+This is additive and backward compatible — existing single datasets simply leave them null.
+Keeping these as real columns also makes them filterable in <code>list</code>/<code>search</code> regardless of
+whether they are partitioned, which is strictly better than the JSON blob.</p>
+<h3 id="56-querying-single-partition-fast-path-cross-partition-fan-out">5.6 Querying: single-partition fast path, cross-partition fan-out<a class="headerlink" href="#56-querying-single-partition-fast-path-cross-partition-fan-out" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Single partition (the 95% path).</strong> Resolve the selector to one <code>dataset</code> and open it as
+  today's <code>Context</code>. Full ACID, full speed, identical semantics to the current code. Vector
+  search, hybrid <code>retrieve</code>, <code>list</code>, lifecycle — all unchanged, just scoped.</li>
+<li><strong>Cross-partition (the unified view).</strong> Two sub-cases:</li>
+<li><em>Pruned scan</em>: a partial selector (e.g. <code>{"tenant": "acme"}</code>, all sources) → query
+    <code>__manifest</code> for matching <code>dataset</code> paths, then fan out and merge. For vector search,
+    run top-k per partition and merge by distance; for <code>retrieve</code>, fuse per-partition RRF
+    results. This is partition pruning from the spec applied to recall.</li>
+<li><em>Full scan</em>: no selector → every partition. Discouraged for vector search at scale;
+    intended for analytics/export.</li>
+</ul>
+<p>Cross-partition reads are <strong>not</strong> isolated by default (each partition may be at a different
+version). When a consistent multi-partition snapshot is required, use the spec's
+<code>read_version</code>/<code>read_tag</code> columns on <code>__manifest</code>. We treat strongly-consistent
+multi-partition transactions as a later, opt-in phase (§8).</p>
+<h3 id="57-helper-api-sketch-thin-resolver-not-a-catalog">5.7 Helper API sketch (thin resolver, not a catalog)<a class="headerlink" href="#57-helper-api-sketch-thin-resolver-not-a-catalog" title="Permanent link">&para;</a></h3>
+<p>A small layer that (1) reads/writes <code>__manifest</code>, (2) resolves a selector to a <code>dataset</code>
+URI, and (3) returns a normal <code>Context</code>. It deliberately exposes <strong>no</strong> create-table /
+alter-schema / list-schemas surface — that would be the catalog we are avoiding.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance_context.namespace</span><span class="w"> </span><span class="kn">import</span> <span class="n">ContextNamespace</span><span class="p">,</span> <span class="n">PartitionSpec</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="c1"># Define once, at namespace creation. The schema is the single ContextRecord schema.</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="n">ns</span> <span class="o">=</span> <span class="n">ContextNamespace</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>    <span class="s2">"s3://bucket/acme-contexts/"</span><span class="p">,</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>    <span class="n">partition_spec</span><span class="o">=</span><span class="n">PartitionSpec</span><span class="p">(</span><span class="n">fields</span><span class="o">=</span><span class="p">[</span><span class="s2">"tenant"</span><span class="p">,</span> <span class="s2">"agent"</span><span class="p">,</span> <span class="s2">"source"</span><span class="p">]),</span>  <span class="c1"># spec B</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>    <span class="n">storage_options</span><span class="o">=</span><span class="p">{</span><span class="o">...</span><span class="p">},</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="p">)</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="c1"># Open exactly one partition -&gt; a normal Context (today's object, unchanged).</span>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="n">ctx</span> <span class="o">=</span> <span class="n">ns</span><span class="o">.</span><span class="n">context</span><span class="p">(</span><span class="n">tenant</span><span class="o">=</span><span class="s2">"acme"</span><span class="p">,</span> <span class="n">agent</span><span class="o">=</span><span class="s2">"support-bot"</span><span class="p">,</span> <span class="n">source</span><span class="o">=</span><span class="s2">"memory"</span><span class="p">)</span>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="n">ctx</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="s2">"assistant"</span><span class="p">,</span> <span class="s2">"runbook owner is the platform team"</span><span class="p">,</span> <span class="n">embedding</span><span class="o">=</span><span class="n">vec</span><span class="p">)</span>
+</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a>
+</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a><span class="c1"># Partial selector -&gt; cross-partition, pruned via __manifest.</span>
+</span><span id="__span-6-15"><a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="n">hits</span> <span class="o">=</span> <span class="n">ns</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="n">vec</span><span class="p">,</span> <span class="n">limit</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span> <span class="n">where</span><span class="o">=</span><span class="p">{</span><span class="s2">"tenant"</span><span class="p">:</span> <span class="s2">"acme"</span><span class="p">})</span>          <span class="c1"># all agents+sources</span>
+</span><span id="__span-6-16"><a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a><span class="n">hits</span> <span class="o">=</span> <span class="n">ns</span><span class="o">.</span><span class="n">retrieve</span><span class="p">(</span><span class="n">text</span><span class="o">=</span><span class="s2">"runbook owner"</span><span class="p">,</span> <span class="n">vector</span><span class="o">=</span><span class="n">vec</span><span class="p">,</span> <span class="n">limit</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span>
+</span><span id="__span-6-17"><a id="__codelineno-6-17" name="__codelineno-6-17" href="#__codelineno-6-17"></a>                   <span class="n">where</span><span class="o">=</span><span class="p">{</span><span class="s2">"tenant"</span><span class="p">:</span> <span class="s2">"acme"</span><span class="p">,</span> <span class="s2">"source"</span><span class="p">:</span> <span class="s2">"knowledge"</span><span class="p">})</span>
+</span><span id="__span-6-18"><a id="__codelineno-6-18" name="__codelineno-6-18" href="#__codelineno-6-18"></a>
+</span><span id="__span-6-19"><a id="__codelineno-6-19" name="__codelineno-6-19" href="#__codelineno-6-19"></a><span class="c1"># Introspection is read-only and comes straight from __manifest (no info_schema we own).</span>
+</span><span id="__span-6-20"><a id="__codelineno-6-20" name="__codelineno-6-20" href="#__codelineno-6-20"></a><span class="k">for</span> <span class="n">part</span> <span class="ow">in</span> <span class="n">ns</span><span class="o">.</span><span class="n">partitions</span><span class="p">(</span><span class="n">where</span><span class="o">=</span><span class="p">{</span><span class="s2">"tenant"</span><span class="p">:</span> <span class="s2">"acme"</span><span class="p">}):</span>
+</span><span id="__span-6-21"><a id="__codelineno-6-21" name="__codelineno-6-21" href="#__codelineno-6-21"></a>    <span class="nb">print</span><span class="p">(</span><span class="n">part</span><span class="o">.</span><span class="n">values</span><span class="p">,</span> <span class="n">part</span><span class="o">.</span><span class="n">uri</span><span class="p">,</span> <span class="n">part</span><span class="o">.</span><span class="n">version</span><span class="p">)</span>
+</span></code></pre></div>
+<p>Rust mirror (sketch):</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kd">let</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ContextNamespace</span><span class="p">::</span><span class="n">create</span><span class="p">(</span><span class="n">root_uri</span><span class="p">,</span><span class="w"> </span><span class="n">PartitionSpec</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="p">[</span><span class="s">"tenant"</span><span class="p">,</span><span class="w"> </span><span class="s">"agent"</span><span class="p">,</span><span class="w"> </span><span class="s">"source"</span><span class="p">])).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">context</span><span class="p">(</span><span class="o">&amp;</span><span class="p">[(</span><span class="s">"tenant"</span><span class="p">,</span><span class="s">"acme"</span><span class="p">),</span><span class="w"> </span><span class="p">(</span><span class="s">"agent"</span><span class="p">,</span><span class="s">"support-bot"</span><span class="p">),</span><span class="w"> </span><span class="p">(</span><span class="s">"source"</span><span class="p">,</span><span class="s">"memory"</span><span class="p">)]).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="n">ctx</span><span class="p">.</span><span class="n">add</span><span class="p">(</span><span class="o">&amp;</span><span class="n">records</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">hits</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ns</span><span class="p">.</span><span class="n">search</span><span class="p">(</span><span class="o">&amp;</span><span class="n">query</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="p">[(</span><span class="s">"tenant"</span><span class="p">,</span><span class="s">"acme"</span><span class="p">)]).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span><span class="w"> </span><span class="c1">// fan-out + merge</span>
+</span></code></pre></div>
+<p><code>ContextNamespace</code> is optional sugar; opening a single partition directly by its resolved
+dataset URI must keep working so nothing depends on the helper.</p>
+<h2 id="6-when-to-partition-vs-filter-inside-one-context">6. When to partition vs. filter inside one context<a class="headerlink" href="#6-when-to-partition-vs-filter-inside-one-context" title="Permanent link">&para;</a></h2>
+<p>A decision aid for users (the doc #90 asks for):</p>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Recommendation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One app, one team, &lt; ~10M records, scopes only differ logically</td>
+<td><strong>One <code>Context</code></strong>, use <code>metadata</code>/column filters. Don't partition.</td>
+</tr>
+<tr>
+<td>Multiple tenants needing data isolation, independent deletion/retention, or per-tenant ACLs</td>
+<td><strong>Partition by <code>tenant</code>.</strong></td>
+</tr>
+<tr>
+<td>KB is bulk re-imported on a schedule while chat memory is append+prune</td>
+<td><strong>Partition by <code>source</code></strong> so you can rebuild/compact/index each independently.</td>
+</tr>
+<tr>
+<td>Millions of users, each needing isolation</td>
+<td><strong><code>bucket(user_id, N)</code></strong>, not a partition per user.</td>
+</tr>
+<tr>
+<td>You filter by <code>session_id</code>, <code>tags</code>, <code>role</code>, time range, <code>confidence</code></td>
+<td><strong>Keep as columns/metadata</strong>; never a partition.</td>
+</tr>
+<tr>
+<td>You need vector indexes tuned differently per scope</td>
+<td><strong>Partition</strong> (each <code>dataset</code> has its own index).</td>
+</tr>
+<tr>
+<td>You occasionally need a cross-scope view</td>
+<td>Fine — that's the unified namespace; use a partial/empty selector.</td>
+</tr>
+</tbody>
+</table>
+<p>Default remains: <strong>start with one context and metadata filters.</strong> Reach for partitions only
+when a <em>physical</em> property (isolation, lifecycle, index, deletion, ACL) demands it.</p>
+<h2 id="7-migration-evolution">7. Migration &amp; evolution<a class="headerlink" href="#7-migration-evolution" title="Permanent link">&para;</a></h2>
+<h3 id="71-single-dataset-partitioned-namespace">7.1 Single dataset → partitioned namespace<a class="headerlink" href="#71-single-dataset-partitioned-namespace" title="Permanent link">&para;</a></h3>
+<p>Existing single-dataset <code>Context</code>s keep working with no change; the namespace layer is
+purely additive. To adopt partitioning:</p>
+<ol>
+<li><strong>New deployments</strong>: create a <code>ContextNamespace</code> with <code>partition_spec_v1</code>; write through
+   it from day one.</li>
+<li><strong>Existing single dataset</strong>: stand up a namespace root, register the current dataset as
+   the initial partition (e.g. the <code>default</code>/legacy scope) in <code>__manifest</code>, and route new
+   scoped writes to new partitions. No bulk rewrite of existing rows is required to <em>start</em>;
+   backfilling the new partition-key columns can be incremental (rows without the key sort
+   into a null/<code>default</code> partition).</li>
+</ol>
+<h3 id="72-partition-spec-evolution">7.2 Partition spec evolution<a class="headerlink" href="#72-partition-spec-evolution" title="Permanent link">&para;</a></h3>
+<p>Use spec versions exactly as the spec intends:</p>
+<ul>
+<li>Start at <code>partition_spec_v1 = [tenant]</code>.</li>
+<li>Later add agent/source: introduce <code>partition_spec_v2 = [tenant, agent, source]</code>. New
+  writes land under <code>v2/</code>; <code>v1/</code> data stays queryable; cross-version queries reconcile via
+  each version's spec. <strong>No migration of old partitions needed.</strong></li>
+</ul>
+<p>Because partition fields are referenced by stable field id, renaming the underlying column
+later does not break existing specs.</p>
+<h2 id="8-interaction-with-existing-features">8. Interaction with existing features<a class="headerlink" href="#8-interaction-with-existing-features" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Versioning / time-travel</strong>: each partition is a normal Lance dataset, so <code>checkout</code>,
+  <code>snapshot</code>, <code>fork</code> work per partition unchanged. Namespace-wide consistent snapshots are
+  the opt-in <code>read_version</code>/<code>read_tag</code> mechanism (Phase 3).</li>
+<li><strong>Compaction</strong>: per partition (a key benefit — compact hot memory partitions without
+  touching a large static KB).</li>
+<li><strong>Vector / FTS indexes</strong>: per partition; tune independently. Cross-partition search merges
+  per-partition results.</li>
+<li><strong>Delete / <code>forget</code></strong>: still a versioned logical tombstone within a partition; dropping an
+  entire partition becomes a clean physical delete path for "forget this whole tenant".</li>
+<li><strong><code>storage_options</code></strong>: unchanged; applies to the namespace root and inherited by
+  partitions.</li>
+<li><strong>Relationships / GraphRAG</strong>: edges are within-record and unaffected. Note: relationship
+  <em>traversal</em> is naturally partition-local; cross-partition edges resolve through the
+  fan-out path. Call this out as a known limitation, not a feature, for v1.</li>
+</ul>
+<h2 id="9-alternatives-considered">9. Alternatives considered<a class="headerlink" href="#9-alternatives-considered" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Table families + <code>information_schema</code> (original #37).</strong> Rejected per maintainer
+   guidance: per-table schemas and a hand-maintained registry are ongoing maintenance and
+   migration cost — i.e. building a database.</li>
+<li><strong>Metadata filters only (status quo, forever).</strong> Insufficient when a scope needs physical
+   isolation: no independent deletion/retention, no per-scope index tuning, no storage-level
+   ACL, and one giant dataset to compact. Great default, wrong ceiling.</li>
+<li><strong>Many independent <code>.lance</code> datasets with an app-side map.</strong> Loses the shared-schema
+   guarantee, the <code>__manifest</code> registry, partition pruning, and cross-scope query — every
+   consumer reinvents discovery. The partitioned namespace <em>is</em> the standardized version of
+   this, so we should use it rather than re-implement it badly.</li>
+<li><strong>Partition by every dimension (incl. session/user).</strong> Rejected: directory/partition
+   explosion. Hence the §5.2 cardinality rules and <code>bucket(N)</code>.</li>
+</ol>
+<h2 id="10-open-questions">10. Open questions<a class="headerlink" href="#10-open-questions" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Default <code>source</code>/<code>kind</code> vocabulary</strong>: do we bless an enum (<code>memory</code>/<code>knowledge</code>/<code>skill</code>/
+  <code>tool_call</code>) or leave it free-form? Leaning: document the convention, don't enforce.</li>
+<li><strong>Cross-partition vector search ranking</strong>: top-k-per-partition + merge is simple but reads
+  every selected partition. Is a coarse L0-style summary partition (ties back to #37's L0)
+  worth it as a pre-filter? Probably a later optimization.</li>
+<li><strong>Manifest dependency</strong>: do we depend on <code>lance-namespace</code> clients, or implement the
+  minimal <code>__manifest</code> read/resolve ourselves to keep the dependency surface small? Affects
+  Phase 2 scope.</li>
+<li><strong>Helper ergonomics</strong>: is <code>ContextNamespace</code> the right primitive, or should <code>Context.open</code>
+  simply accept a <code>partition={…}</code> kwarg over a namespace root?</li>
+</ul>
+<h2 id="11-phased-rollout">11. Phased rollout<a class="headerlink" href="#11-phased-rollout" title="Permanent link">&para;</a></h2>
+<p>Incremental, docs-first, each phase independently shippable (matches #90's acceptance
+criteria):</p>
+<ul>
+<li><strong>Phase 0 (this doc).</strong> Conventions agreed: dimension placement (§5.2), partition specs
+  (§5.3), URI conventions (§5.4), when-to-partition guidance (§6).</li>
+<li><strong>Phase 1 — read/resolve helper.</strong> Promote <code>tenant</code>/<code>source</code> to typed columns; a thin
+  <code>ContextNamespace</code> that creates <code>__manifest</code>, resolves a full selector to one <code>dataset</code>,
+  and returns today's <code>Context</code>. Single-partition only. No semantics change for existing
+  users.</li>
+<li><strong>Phase 2 — cross-partition reads.</strong> Partition pruning over <code>__manifest</code>; fan-out +
+  merge for <code>search</code>/<code>retrieve</code>/<code>list</code>; read-only <code>partitions()</code> introspection.</li>
+<li><strong>Phase 3 — multi-partition consistency (opt-in).</strong> <code>read_version</code>/<code>read_tag</code> commit
+  protocol for consistent cross-partition snapshots; whole-partition drop as physical
+  <code>forget</code>.</li>
+</ul>
+<h2 id="12-acceptance-criteria-mapping-90">12. Acceptance criteria mapping (#90)<a class="headerlink" href="#12-acceptance-criteria-mapping-90" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>#90 criterion</th>
+<th>Where addressed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Propose upstream-friendly partition naming conventions</td>
+<td>§5.3, §5.4</td>
+</tr>
+<tr>
+<td>Clarify path/namespace layout vs. record metadata</td>
+<td>§5.2 (decision table + rules)</td>
+</tr>
+<tr>
+<td>Follow-up implementation can be incremental (docs first / small helper)</td>
+<td>§11</td>
+</tr>
+<tr>
+<td>Compatible with single-table model and #37 guidance</td>
+<td>§5.1, §5.5, §8, §9</td>
+</tr>
+</tbody>
+</table>
+<h2 id="13-references">13. References<a class="headerlink" href="#13-references" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Lance Partitioning Spec — <a href="https://lance.org/format/namespace/partitioning-spec/">https://lance.org/format/namespace/partitioning-spec/</a></li>
+<li>Lance Namespace Spec — <a href="https://lance.org/format/namespace/">https://lance.org/format/namespace/</a></li>
+<li>Issue #37 — table management &amp; agent interfaces (and maintainer guidance)</li>
+<li>Issue #90 — explore partitioned namespace layout for scoped agent context</li>
+</ul>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../../specs/datagen-checkpoint-schema/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Datagen checkpoints</div>
+        </a>
+        <a class="next" href="../auto-dream/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Auto-dream</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#1-summary">1. Summary</a>
+      <a class="ld-toc__h2" href="#2-background">2. Background</a>
+      <a class="ld-toc__h3" href="#21-where-we-are-today">2.1 Where we are today</a>
+      <a class="ld-toc__h3" href="#22-what-37-was-really-asking-for">2.2 What #37 was really asking for</a>
+      <a class="ld-toc__h3" href="#23-why-a-partitioned-namespace-fits">2.3 Why a partitioned namespace fits</a>
+      <a class="ld-toc__h2" href="#3-goals-non-goals">3. Goals / Non-goals</a>
+      <a class="ld-toc__h2" href="#4-lance-partitioned-namespace-in-brief">4. Lance partitioned namespace, in brief</a>
+      <a class="ld-toc__h2" href="#5-design">5. Design</a>
+      <a class="ld-toc__h3" href="#51-principle-one-schema-many-partitions">5.1 Principle: one schema, many partitions</a>
+      <a class="ld-toc__h3" href="#52-which-dimensions-go-in-the-layout-vs-the-record">5.2 Which dimensions go in the layout vs. the record</a>
+      <a class="ld-toc__h3" href="#53-recommended-partition-specs">5.3 Recommended partition specs</a>
+      <a class="ld-toc__h3" href="#54-path-uri-conventions-caller-facing">5.4 Path / URI conventions (caller-facing)</a>
+      <a class="ld-toc__h3" href="#55-schema-implication-promote-partition-keys-to-columns">5.5 Schema implication: promote partition keys to columns</a>
+      <a class="ld-toc__h3" href="#56-querying-single-partition-fast-path-cross-partition-fan-out">5.6 Querying: single-partition fast path, cross-partition fan-out</a>
+      <a class="ld-toc__h3" href="#57-helper-api-sketch-thin-resolver-not-a-catalog">5.7 Helper API sketch (thin resolver, not a catalog)</a>
+      <a class="ld-toc__h2" href="#6-when-to-partition-vs-filter-inside-one-context">6. When to partition vs. filter inside one context</a>
+      <a class="ld-toc__h2" href="#7-migration-evolution">7. Migration &amp; evolution</a>
+      <a class="ld-toc__h3" href="#71-single-dataset-partitioned-namespace">7.1 Single dataset → partitioned namespace</a>
+      <a class="ld-toc__h3" href="#72-partition-spec-evolution">7.2 Partition spec evolution</a>
+      <a class="ld-toc__h2" href="#8-interaction-with-existing-features">8. Interaction with existing features</a>
+      <a class="ld-toc__h2" href="#9-alternatives-considered">9. Alternatives considered</a>
+      <a class="ld-toc__h2" href="#10-open-questions">10. Open questions</a>
+      <a class="ld-toc__h2" href="#11-phased-rollout">11. Phased rollout</a>
+      <a class="ld-toc__h2" href="#12-acceptance-criteria-mapping-90">12. Acceptance criteria mapping (#90)</a>
+      <a class="ld-toc__h2" href="#13-references">13. References</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../../format/">Specification</a>
+        <a href="../../../../format/file/">File format</a>
+        <a href="../../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>

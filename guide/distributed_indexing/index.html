@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Distributed Indexing — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/guide/distributed_indexing/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab" href="../../quickstart/">Getting Started</a>
+      <a class="ld-toptab active" href="../read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../format/">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../community/">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      User Guide
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">User Guide</div>
+    <a href="../read_and_write/">Read and Write</a>
+    <a href="../data_types/">Data Types</a>
+    <a href="../data_evolution/">Data Evolution</a>
+    <a href="../blob/">Blob API</a>
+    <a href="../json/">JSON Support</a>
+    <a href="../tags_and_branches/">Tags and Branches</a>
+    <a href="../object_store/">Object Store Configuration</a>
+    <a href="../observability/">Observability</a>
+    <a href="../distributed_write/">Distributed Write</a>
+    <a class="active" href="./">Distributed Indexing</a>
+    <a href="../migration/">Migration Guide</a>
+    <a href="../performance/">Performance Guide</a>
+    <a href="../tokenizer/">Tokenizer</a>
+    <a href="../arrays/">Extension Arrays</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>User Guide</span>
+        <span>/</span><b>Distributed Indexing</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="distributed-indexing">Distributed Indexing<a class="headerlink" href="#distributed-indexing" title="Permanent link">&para;</a></h1>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Lance exposes public APIs that can be integrated into an external
+distributed index build workflow, but Lance itself does not provide a full
+distributed scheduler or end-to-end orchestration layer.</p>
+<p>This page describes the current model, terminology, and execution flow so
+that callers can integrate these APIs correctly.</p>
+</div>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>Distributed index build in Lance follows the same high-level pattern as distributed
+write:</p>
+<ol>
+<li>multiple workers build index data in parallel</li>
+<li>the caller invokes Lance segment build APIs for one distributed build</li>
+<li>Lance plans and builds index artifacts from the worker outputs supplied by the caller</li>
+<li>the built artifacts are committed into the dataset manifest</li>
+</ol>
+<p>For vector indices and segment-native scalar indices, the worker outputs are
+segments stored directly under <code>indices/&lt;segment_uuid&gt;/</code>. Lance can turn these
+outputs into one or more physical segments and then commit them as one logical
+index.</p>
+<p><img alt="Distributed Vector Segment Build" src="../../images/distributed_vector_segment_build.svg" /></p>
+<h2 id="terminology">Terminology<a class="headerlink" href="#terminology" title="Permanent link">&para;</a></h2>
+<p>This guide uses the following terms consistently:</p>
+<ul>
+<li><strong>Segment</strong>: one worker output written by <code>execute_uncommitted()</code> under
+  <code>indices/&lt;segment_uuid&gt;/</code></li>
+<li><strong>Physical segment</strong>: one index segment that is ready to be committed into
+  the manifest</li>
+<li><strong>Logical index</strong>: the user-visible index identified by name; a logical index
+  may contain one or more physical segments</li>
+</ul>
+<p>For example, a distributed vector build may create a layout like:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>indices/&lt;segment_uuid_0&gt;/
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>├── index.idx
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>└── auxiliary.idx
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>indices/&lt;segment_uuid_1&gt;/
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>├── index.idx
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>└── auxiliary.idx
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>indices/&lt;segment_uuid_2&gt;/
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>├── index.idx
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>└── auxiliary.idx
+</span></code></pre></div>
+<p>After segment build, Lance produces one or more segment directories:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>indices/&lt;physical_segment_uuid_0&gt;/
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>├── index.idx
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>└── auxiliary.idx
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>indices/&lt;physical_segment_uuid_1&gt;/
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>├── index.idx
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>└── auxiliary.idx
+</span></code></pre></div>
+<p>These physical segments are then committed together as one logical index. In the
+common no-merge case, the input segments are already the physical
+segments and can be committed directly.</p>
+<h2 id="roles">Roles<a class="headerlink" href="#roles" title="Permanent link">&para;</a></h2>
+<p>There are two parties involved in distributed indexing:</p>
+<ul>
+<li><strong>Workers</strong> build segments</li>
+<li><strong>The caller</strong> launches workers, chooses how those segments should be turned
+  into final segments, optionally merges caller-defined groups, and commits the
+  final result</li>
+</ul>
+<p>Lance does not provide a distributed scheduler. The caller is responsible for
+launching workers and driving the overall workflow.</p>
+<h2 id="current-model">Current Model<a class="headerlink" href="#current-model" title="Permanent link">&para;</a></h2>
+<p>The current model for distributed indexing has two layers of parallelism.</p>
+<h3 id="worker-build">Worker Build<a class="headerlink" href="#worker-build" title="Permanent link">&para;</a></h3>
+<p>First, multiple workers build segments in parallel:</p>
+<ol>
+<li>on each worker, call a shard-build API such as
+   <code>create_index_builder(...).fragments(...).execute_uncommitted()</code>
+   or Python <code>create_index_uncommitted(..., fragment_ids=...)</code></li>
+<li>each worker writes one segment under <code>indices/&lt;segment_uuid&gt;/</code></li>
+</ol>
+<h3 id="segment-merge">Segment Merge<a class="headerlink" href="#segment-merge" title="Permanent link">&para;</a></h3>
+<p>Then the caller decides whether those existing segments should be committed as-is
+or merged into larger segments:</p>
+<ol>
+<li>keep the worker outputs as-is and commit them directly with
+   <code>commit_existing_index_segments(...)</code>, or</li>
+<li>group one or more existing segments and call
+   <code>merge_existing_index_segments(...)</code> for each caller-defined group</li>
+<li>commit the final segment list with <code>commit_existing_index_segments(...)</code></li>
+</ol>
+<p>Within a single commit, built segments must have disjoint fragment coverage.</p>
+<p><code>merge_existing_index_segments(...)</code> currently supports vector, inverted,
+bitmap, BTree, and zone map segments. Other scalar index families can still
+commit multiple compatible segments directly when their build path supports
+fragment-scoped segments, but cannot be merged into a larger physical segment
+until they add a merge implementation.</p>
+<h3 id="vector-model-scope">Vector Model Scope<a class="headerlink" href="#vector-model-scope" title="Permanent link">&para;</a></h3>
+<p>Distributed vector builds support two model scopes.</p>
+<p><strong>Shared model artifacts</strong>: the caller trains or provides IVF centroids once and
+passes the same artifacts to every worker. For IVF-PQ segments that should be
+physically mergeable, workers should also use the same PQ codebook. This makes
+partition ids and quantizer state have the same meaning across segments.</p>
+<p><strong>Independent segment models</strong>: each worker trains the IVF/PQ model for its own
+<code>fragment_ids</code>. The resulting segments can be committed together as one logical
+index without sharing centroids or codebooks.</p>
+<p>At query time, Lance searches each physical segment independently:</p>
+<ol>
+<li>Lance opens each segment by index UUID</li>
+<li>each segment ranks IVF partitions using its own centroids</li>
+<li>each segment searches the selected partitions using its own quantizer storage</li>
+<li>Lance merges the candidate rows from all segments by <code>_distance</code></li>
+</ol>
+<p>Because partition ids are interpreted only within a segment during this fanout
+query path, independently trained committed segments can return valid results.
+For L2 and cosine IVF-PQ, each segment computes residuals against its own IVF
+centroid during both build and query, so distances remain estimates of the
+original query-to-vector metric.</p>
+<p>Physical merge is a separate operation. It rewrites several segment artifacts
+into one artifact with one model metadata scope. Use shared compatible model
+artifacts for segments you plan to merge physically, or keep independently
+trained segments as separate physical segments.</p>
+<h2 id="internal-finalize-model">Internal Finalize Model<a class="headerlink" href="#internal-finalize-model" title="Permanent link">&para;</a></h2>
+<p>Internally, Lance models distributed segment build as:</p>
+<ol>
+<li><strong>build</strong> one uncommitted segment per worker</li>
+<li><strong>optionally merge</strong> caller-defined groups of existing segments</li>
+<li><strong>commit</strong> the resulting segments as one logical index</li>
+</ol>
+<p>The merge step is driven directly by the <code>IndexMetadata</code> returned from
+<code>execute_uncommitted()</code>.</p>
+<p>This is intentionally a storage-level model:</p>
+<ul>
+<li>segments are worker outputs that are not yet published</li>
+<li>physical segments are durable artifacts referenced by the manifest</li>
+<li>the logical index identity is attached only at commit time</li>
+</ul>
+<h2 id="segment-grouping">Segment Grouping<a class="headerlink" href="#segment-grouping" title="Permanent link">&para;</a></h2>
+<p>The caller chooses the final segment grouping:</p>
+<ul>
+<li>keep segment boundaries, so each worker output is committed directly</li>
+<li>merge multiple existing segments into a larger segment before commit</li>
+</ul>
+<p>The grouping decision is separate from worker build. Workers only build
+segments; Lance applies the segment build policy when it plans
+physical segments.</p>
+<h2 id="responsibility-boundaries">Responsibility Boundaries<a class="headerlink" href="#responsibility-boundaries" title="Permanent link">&para;</a></h2>
+<p>The caller is expected to know:</p>
+<ul>
+<li>which distributed build is ready for segment build</li>
+<li>the segment metadata returned by worker builds</li>
+<li>how the resulting physical segments should be published</li>
+</ul>
+<p>Lance is responsible for:</p>
+<ul>
+<li>writing segment artifacts</li>
+<li>planning physical segments from the supplied segment set</li>
+<li>merging segment storage into physical segment artifacts</li>
+<li>committing physical segments into the manifest</li>
+</ul>
+<p>If a staging root or built segment directory is never committed, it remains an
+unreferenced index directory under <code>_indices/</code>. These artifacts are cleaned up
+by <code>cleanup_old_versions(...)</code> using the same age-based rules as other
+unreferenced index files.</p>
+<p>This split keeps distributed scheduling outside the storage engine while still
+letting Lance own the on-disk index format.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../distributed_write/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Distributed Write</div>
+        </a>
+        <a class="next" href="../migration/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Migration Guide</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#overview">Overview</a>
+      <a class="ld-toc__h2" href="#terminology">Terminology</a>
+      <a class="ld-toc__h2" href="#roles">Roles</a>
+      <a class="ld-toc__h2" href="#current-model">Current Model</a>
+      <a class="ld-toc__h3" href="#worker-build">Worker Build</a>
+      <a class="ld-toc__h3" href="#segment-merge">Segment Merge</a>
+      <a class="ld-toc__h3" href="#vector-model-scope">Vector Model Scope</a>
+      <a class="ld-toc__h2" href="#internal-finalize-model">Internal Finalize Model</a>
+      <a class="ld-toc__h2" href="#segment-grouping">Segment Grouping</a>
+      <a class="ld-toc__h2" href="#responsibility-boundaries">Responsibility Boundaries</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../format/">Specification</a>
+        <a href="../../format/file/">File format</a>
+        <a href="../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../quickstart/">Getting started</a>
+        <a href="../read_and_write/">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>

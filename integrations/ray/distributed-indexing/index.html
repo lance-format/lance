@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Index — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/ray/distributed-indexing/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../">Overview</a>
+    <a href="../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../pytorch/">PyTorch</a>
+    <a href="../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../duckdb/">Overview</a>
+    <a href="../../duckdb/sql/">SQL Reference</a>
+    <a href="../../duckdb/rest/">REST Namespace</a>
+    <a href="../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../huggingface/">Home</a>
+    <a href="../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../../spark/">Welcome</a>
+    <a href="../../spark/install/">Install</a>
+    <a href="../../spark/config/">Config</a>
+    <a href="../../spark/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../spark/operations/ddl/create-namespace/">CREATE NAMESPACE</a>
+    <a href="../../spark/operations/ddl/drop-namespace/">DROP NAMESPACE</a>
+    <a href="../../spark/operations/ddl/show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../../spark/operations/ddl/describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../../spark/operations/ddl/create-table/">CREATE TABLE</a>
+    <a href="../../spark/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../spark/operations/ddl/describe-table/">DESCRIBE TABLE</a>
+    <a href="../../spark/operations/ddl/alter-table/">ALTER TABLE</a>
+    <a href="../../spark/operations/ddl/show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../../spark/operations/ddl/drop-table/">DROP TABLE</a>
+    <a href="../../spark/operations/ddl/create-index/">CREATE INDEX</a>
+    <a href="../../spark/operations/ddl/show-indexes/">SHOW INDEXES</a>
+    <a href="../../spark/operations/ddl/create-branch/">CREATE BRANCH</a>
+    <a href="../../spark/operations/ddl/drop-branch/">DROP BRANCH</a>
+    <a href="../../spark/operations/ddl/show-branches/">SHOW BRANCHES</a>
+    <a href="../../spark/operations/ddl/create-tag/">CREATE TAG</a>
+    <a href="../../spark/operations/ddl/drop-tag/">DROP TAG</a>
+    <a href="../../spark/operations/ddl/show-tags/">SHOW TAGS</a>
+    <a href="../../spark/operations/ddl/optimize/">OPTIMIZE</a>
+    <a href="../../spark/operations/ddl/vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../spark/operations/dql/select/">SELECT</a>
+    <a href="../../spark/operations/dql/fts/">Full-Text Search</a>
+    <a href="../../spark/operations/dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../../spark/operations/dql/search/">SEARCH</a>
+    <a href="../../spark/operations/dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../spark/operations/dml/insert-into/">INSERT INTO</a>
+    <a href="../../spark/operations/dml/update/">UPDATE SET</a>
+    <a href="../../spark/operations/dml/delete/">DELETE FROM</a>
+    <a href="../../spark/operations/dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../../spark/operations/dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../../spark/vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../">Welcome</a>
+    <a href="../read/">Read</a>
+    <a href="../write/">Write</a>
+    <a class="active" href="./">Index</a>
+    <a href="../compaction/">Compaction</a>
+    <a href="../data-evolution/">Data Evolution</a>
+    <a href="../examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../trino/">Welcome</a>
+    <a href="../../trino/install/">Install</a>
+    <a href="../../trino/config/">Config</a>
+    <a href="../../trino/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../trino/operations/data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../trino/operations/ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../trino/operations/ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../trino/operations/ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../trino/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../trino/operations/ddl/describe-table/">DESCRIBE</a>
+    <a href="../../trino/operations/ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../trino/operations/ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../trino/operations/dml/insert/">INSERT</a>
+    <a href="../../trino/operations/dml/update/">UPDATE</a>
+    <a href="../../trino/operations/dml/delete/">DELETE</a>
+    <a href="../../trino/operations/dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../trino/operations/dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../context/">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../context/guide/quickstart/">Quickstart</a>
+    <a href="../../context/guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../context/guide/storage/">Storage backends</a>
+    <a href="../../context/guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../../context/specs/rollout-schema-design/">Rollout schema</a>
+    <a href="../../context/specs/rollout-deployment/">Rollout deployment</a>
+    <a href="../../context/specs/rollout-blob-streaming/">Blob streaming</a>
+    <a href="../../context/specs/datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../../context/design/partitioned-namespace/">Partitioned namespace</a>
+    <a href="../../context/design/auto-dream/">Auto-dream</a>
+    <a href="../../context/design/using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Ray</span>
+        <span>/</span><b>Index</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="distributed-index-building">Distributed Index Building<a class="headerlink" href="#distributed-index-building" title="Permanent link">&para;</a></h1>
+<p>Lance-Ray provides distributed index building functionality that leverages Ray's distributed computing capabilities to efficiently create indices for Lance datasets. This is particularly useful for large-scale datasets as it can distribute index building work across multiple Ray worker nodes.</p>
+<h2 id="distributed-apis">Distributed APIs<a class="headerlink" href="#distributed-apis" title="Permanent link">&para;</a></h2>
+<h3 id="scalar-indexing">Scalar Indexing<a class="headerlink" href="#scalar-indexing" title="Permanent link">&para;</a></h3>
+<p><code>create_scalar_index()</code> - Distributedly create scalar index using ray. Currently Inverted/FTS/BTREE/BITMAP/LABEL_LIST/NGRAM/ZONEMAP/BLOOMFILTER/RTREE are supported. Will add more index type support in the future.</p>
+<p>To construct GeoArrow data for an RTREE index, install the PyLance geo extra:</p>
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">"pylance[geo]"</span>
+</span></code></pre></div>
+<h4 id="how-it-works">How It Works<a class="headerlink" href="#how-it-works" title="Permanent link">&para;</a></h4>
+<p>The <code>create_scalar_index</code> function allows you to create scalar indices for Lance datasets using the Ray distributed computing framework. This function distributes the index building process across multiple Ray worker nodes, with each node responsible for creating uncommitted index segments for a subset of dataset fragments. These segments are then committed as a single index.</p>
+<p><strong><code>create_scalar_index</code></strong></p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">create_scalar_index</span><span class="p">(</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>    <span class="n">uri</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>    <span class="o">*</span><span class="p">,</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>    <span class="n">column</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>    <span class="n">index_type</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>        <span class="n">Literal</span><span class="p">[</span><span class="s2">"BTREE"</span><span class="p">],</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>        <span class="n">Literal</span><span class="p">[</span><span class="s2">"BITMAP"</span><span class="p">],</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>        <span class="n">Literal</span><span class="p">[</span><span class="s2">"LABEL_LIST"</span><span class="p">],</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>        <span class="n">Literal</span><span class="p">[</span><span class="s2">"INVERTED"</span><span class="p">],</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>        <span class="n">Literal</span><span class="p">[</span><span class="s2">"FTS"</span><span class="p">],</span>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>        <span class="n">Literal</span><span class="p">[</span><span class="s2">"NGRAM"</span><span class="p">],</span>
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>        <span class="n">Literal</span><span class="p">[</span><span class="s2">"ZONEMAP"</span><span class="p">],</span>
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>        <span class="n">Literal</span><span class="p">[</span><span class="s2">"BLOOMFILTER"</span><span class="p">],</span>
+</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>        <span class="n">Literal</span><span class="p">[</span><span class="s2">"RTREE"</span><span class="p">],</span>
+</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a>        <span class="n">IndexConfig</span><span class="p">,</span>
+</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a>    <span class="p">],</span>
+</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>    <span class="n">table_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a>    <span class="n">name</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-1-19"><a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a>    <span class="n">replace</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-1-20"><a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a>    <span class="n">train</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-1-21"><a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a>    <span class="n">fragment_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-1-22"><a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a>    <span class="n">index_uuid</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-1-23"><a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a>    <span class="n">num_workers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-1-24"><a id="__codelineno-1-24" name="__codelineno-1-24" href="#__codelineno-1-24"></a>    <span class="n">num_segments</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-1-25"><a id="__codelineno-1-25" name="__codelineno-1-25" href="#__codelineno-1-25"></a>    <span class="n">storage_options</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-1-26"><a id="__codelineno-1-26" name="__codelineno-1-26" href="#__codelineno-1-26"></a>    <span class="n">block_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-1-27"><a id="__codelineno-1-27" name="__codelineno-1-27" href="#__codelineno-1-27"></a>    <span class="n">namespace_impl</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-1-28"><a id="__codelineno-1-28" name="__codelineno-1-28" href="#__codelineno-1-28"></a>    <span class="n">namespace_properties</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-1-29"><a id="__codelineno-1-29" name="__codelineno-1-29" href="#__codelineno-1-29"></a>    <span class="n">ray_remote_args</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-1-30"><a id="__codelineno-1-30" name="__codelineno-1-30" href="#__codelineno-1-30"></a>    <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">,</span>
+</span><span id="__span-1-31"><a id="__codelineno-1-31" name="__codelineno-1-31" href="#__codelineno-1-31"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"lance.LanceDataset"</span><span class="p">:</span>
+</span></code></pre></div>
+<h4 id="parameters">Parameters<a class="headerlink" href="#parameters" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>uri</code></td>
+<td><code>str</code>, optional</td>
+<td>The URI of the Lance dataset. Either <code>uri</code> OR (<code>namespace_impl</code> + <code>table_id</code>) must be provided.</td>
+</tr>
+<tr>
+<td><code>column</code></td>
+<td><code>str</code></td>
+<td>Column name to index</td>
+</tr>
+<tr>
+<td><code>index_type</code></td>
+<td><code>str</code> or <code>IndexConfig</code></td>
+<td>Index type, can be <code>"INVERTED"</code>, <code>"FTS"</code>, <code>"BTREE"</code>, <code>"BITMAP"</code>, <code>"LABEL_LIST"</code>, <code>"NGRAM"</code>, <code>"ZONEMAP"</code>, <code>"BLOOMFILTER"</code>, <code>"RTREE"</code>, or <code>IndexConfig</code> object</td>
+</tr>
+<tr>
+<td><code>table_id</code></td>
+<td><code>list[str]</code>, optional</td>
+<td>The table identifier as a list of strings.</td>
+</tr>
+<tr>
+<td><code>name</code></td>
+<td><code>str</code>, optional</td>
+<td>Index name, auto-generated if not provided</td>
+</tr>
+<tr>
+<td><code>replace</code></td>
+<td><code>bool</code>, optional</td>
+<td>Whether to replace existing index with the same name, default is <code>True</code></td>
+</tr>
+<tr>
+<td><code>train</code></td>
+<td><code>bool</code>, optional</td>
+<td>Whether to train the index, default is <code>True</code></td>
+</tr>
+<tr>
+<td><code>fragment_ids</code></td>
+<td><code>list[int]</code>, optional</td>
+<td>Optional list of fragment IDs to build index on</td>
+</tr>
+<tr>
+<td><code>index_uuid</code></td>
+<td><code>str</code>, optional</td>
+<td>Optional fragment UUID for distributed indexing</td>
+</tr>
+<tr>
+<td><code>num_workers</code></td>
+<td><code>int</code>, optional</td>
+<td>Maximum number of Ray Pool workers to use, default is 4</td>
+</tr>
+<tr>
+<td><code>num_segments</code></td>
+<td><code>int</code>, optional</td>
+<td>Number of fragment batches / index segments to create. Defaults to <code>num_workers</code> for backwards compatibility</td>
+</tr>
+<tr>
+<td><code>storage_options</code></td>
+<td><code>Dict[str, str]</code>, optional</td>
+<td>Storage options for the dataset</td>
+</tr>
+<tr>
+<td><code>block_size</code></td>
+<td><code>int</code>, optional</td>
+<td>Block size in bytes to use when loading the dataset</td>
+</tr>
+<tr>
+<td><code>namespace_impl</code></td>
+<td><code>str</code>, optional</td>
+<td>The namespace implementation type (e.g., <code>"rest"</code>, <code>"dir"</code>)</td>
+</tr>
+<tr>
+<td><code>namespace_properties</code></td>
+<td><code>Dict[str, str]</code>, optional</td>
+<td>Properties for connecting to the namespace</td>
+</tr>
+<tr>
+<td><code>ray_remote_args</code></td>
+<td><code>Dict[str, Any]</code>, optional</td>
+<td>Ray task options (e.g., <code>num_cpus</code>, <code>resources</code>)</td>
+</tr>
+<tr>
+<td><code>**kwargs</code></td>
+<td><code>Any</code></td>
+<td>Additional arguments passed to <code>create_scalar_index</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Note:</strong> For distributed scalar indexing, currently <code>"INVERTED"</code>, <code>"FTS"</code>, <code>"BTREE"</code>, <code>"BITMAP"</code>, <code>"LABEL_LIST"</code>, <code>"NGRAM"</code>, <code>"ZONEMAP"</code>, <code>"BLOOMFILTER"</code>, and <code>"RTREE"</code> index types are supported.</p>
+<h4 id="return-value">Return Value<a class="headerlink" href="#return-value" title="Permanent link">&para;</a></h4>
+<p>The function returns an updated Lance dataset with the newly created index.</p>
+<h3 id="vector-indexing">Vector Indexing<a class="headerlink" href="#vector-indexing" title="Permanent link">&para;</a></h3>
+<p><code>create_index()</code> - Distributedly create vector indices using Ray. It leverages Ray to parallelize the index building process across multiple workers.</p>
+<h4 id="supported-index-types">Supported Index Types<a class="headerlink" href="#supported-index-types" title="Permanent link">&para;</a></h4>
+<p>The following vector index types are supported for distributed building:
+- <code>IVF_FLAT</code>
+- <code>IVF_PQ</code>
+- <code>IVF_RQ</code>
+- <code>IVF_SQ</code>
+- <code>IVF_HNSW_FLAT</code>
+- <code>IVF_HNSW_PQ</code>
+- <code>IVF_HNSW_SQ</code></p>
+<h4 id="create_index"><code>create_index</code><a class="headerlink" href="#create_index" title="Permanent link">&para;</a></h4>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">create_index</span><span class="p">(</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="n">uri</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"lance.LanceDataset"</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="n">column</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">,</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>    <span class="n">index_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span><span class="p">,</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>    <span class="n">name</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    <span class="o">*</span><span class="p">,</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>    <span class="n">replace</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    <span class="n">num_workers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>    <span class="n">num_segments</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    <span class="n">storage_options</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>    <span class="n">block_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>    <span class="n">namespace_impl</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>    <span class="n">namespace_properties</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>    <span class="n">table_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>    <span class="n">ray_remote_args</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>    <span class="n">metric</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"l2"</span><span class="p">,</span>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>    <span class="n">num_partitions</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>    <span class="n">num_sub_vectors</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>    <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">256</span><span class="p">,</span>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>    <span class="n">ivf_centroids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="s2">"pyarrow.Array"</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>    <span class="n">pq_codebook</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="s2">"pyarrow.Array"</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a>    <span class="n">rabitq_model</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a>    <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">,</span>
+</span><span id="__span-2-24"><a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"lance.LanceDataset"</span><span class="p">:</span>
+</span></code></pre></div>
+<h4 id="parameters_1">Parameters<a class="headerlink" href="#parameters_1" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>uri</code></td>
+<td><code>str</code> or <code>lance.LanceDataset</code>, optional</td>
+<td>Lance dataset object, or its URI. Either <code>uri</code> OR (<code>namespace_impl</code> + <code>table_id</code>) must be provided when using URI mode. If you pass a <code>lance.LanceDataset</code> object, namespace parameters are ignored.</td>
+</tr>
+<tr>
+<td><code>column</code></td>
+<td><code>str</code></td>
+<td>Vector column name to index</td>
+</tr>
+<tr>
+<td><code>index_type</code></td>
+<td><code>str</code></td>
+<td>Vector index type (e.g., <code>"IVF_PQ"</code>, <code>"IVF_RQ"</code>, <code>"IVF_SQ"</code>, <code>"IVF_FLAT"</code>)</td>
+</tr>
+<tr>
+<td><code>name</code></td>
+<td><code>str</code>, optional</td>
+<td>Index name, auto-generated if not provided</td>
+</tr>
+<tr>
+<td><code>replace</code></td>
+<td><code>bool</code>, optional</td>
+<td>Whether to replace existing index, default is <code>True</code></td>
+</tr>
+<tr>
+<td><code>num_workers</code></td>
+<td><code>int</code>, optional</td>
+<td>Maximum number of Ray Pool workers to use, default is 4</td>
+</tr>
+<tr>
+<td><code>num_segments</code></td>
+<td><code>int</code>, optional</td>
+<td>Number of fragment batches / index segments to create. Defaults to <code>num_workers</code> for backwards compatibility</td>
+</tr>
+<tr>
+<td><code>storage_options</code></td>
+<td><code>Dict[str, str]</code>, optional</td>
+<td>Storage options for the dataset. These are merged with the storage options returned by the namespace (if any).</td>
+</tr>
+<tr>
+<td><code>block_size</code></td>
+<td><code>int</code>, optional</td>
+<td>Block size in bytes to use when loading the dataset</td>
+</tr>
+<tr>
+<td><code>namespace_impl</code></td>
+<td><code>str</code>, optional</td>
+<td>The namespace implementation type (e.g., <code>"rest"</code>, <code>"dir"</code>)</td>
+</tr>
+<tr>
+<td><code>namespace_properties</code></td>
+<td><code>Dict[str, str]</code>, optional</td>
+<td>Properties for connecting to the namespace</td>
+</tr>
+<tr>
+<td><code>table_id</code></td>
+<td><code>list[str]</code>, optional</td>
+<td>The table identifier as a list of strings. Must be provided together with <code>namespace_impl</code>.</td>
+</tr>
+<tr>
+<td><code>ray_remote_args</code></td>
+<td><code>Dict[str, Any]</code>, optional</td>
+<td>Ray task options (e.g., <code>num_cpus</code>, <code>resources</code>)</td>
+</tr>
+<tr>
+<td><code>metric</code></td>
+<td><code>str</code>, optional</td>
+<td>Distance metric to use (e.g., <code>"l2"</code>, <code>"cosine"</code>, <code>"dot"</code>, <code>"hamming"</code>), default is <code>"l2"</code></td>
+</tr>
+<tr>
+<td><code>num_partitions</code></td>
+<td><code>int</code>, optional</td>
+<td>Number of IVF partitions</td>
+</tr>
+<tr>
+<td><code>num_sub_vectors</code></td>
+<td><code>int</code>, optional</td>
+<td>Number of PQ sub-vectors</td>
+</tr>
+<tr>
+<td><code>sample_rate</code></td>
+<td><code>int</code>, optional</td>
+<td>Number of rows sampled per IVF partition and PQ centroid, default is 256</td>
+</tr>
+<tr>
+<td><code>ivf_centroids</code></td>
+<td><code>pyarrow.Array</code>, optional</td>
+<td>Pre-computed IVF centroids (advanced)</td>
+</tr>
+<tr>
+<td><code>pq_codebook</code></td>
+<td><code>pyarrow.Array</code>, optional</td>
+<td>Pre-computed PQ codebook for PQ-based indices (advanced)</td>
+</tr>
+<tr>
+<td><code>rabitq_model</code></td>
+<td><code>str</code>, optional</td>
+<td>Pre-built RaBitQ model for IVF_RQ. If omitted for IVF_RQ, Lance-Ray builds one shared model on the driver</td>
+</tr>
+<tr>
+<td><code>num_bits</code></td>
+<td><code>int</code>, optional</td>
+<td>RaBitQ bits per vector dimension for IVF_RQ, default is 1. Passed through to Lance for validation</td>
+</tr>
+<tr>
+<td><code>**kwargs</code></td>
+<td><code>Any</code></td>
+<td>Additional arguments to pass through to Lance index creation</td>
+</tr>
+</tbody>
+</table>
+<p>For <code>IVF_RQ</code>, Lance-Ray builds one shared RaBitQ rotation model on the driver
+when <code>rabitq_model</code> is not provided, then passes that same model to every
+fragment worker. To pin or reuse a model yourself, pass the JSON string returned
+by <code>lance.lance.indices.build_rq_model(...)</code> as <code>rabitq_model</code>.</p>
+<p>The RaBitQ model dimension is the vector column width and must be divisible by
+8. <code>num_bits</code> controls how many RaBitQ code bits are used per vector dimension:
+larger values can increase quantized-code fidelity at the cost of more index
+storage and memory. The default is 1, matching Lance's IVF_RQ default, and
+supported values are validated by Lance.</p>
+<h4 id="return-value_1">Return Value<a class="headerlink" href="#return-value_1" title="Permanent link">&para;</a></h4>
+<p>The function returns an updated Lance dataset with the newly created vector index.</p>
+<h3 id="index-optimization-incremental-updates">Index Optimization (Incremental Updates)<a class="headerlink" href="#index-optimization-incremental-updates" title="Permanent link">&para;</a></h3>
+<p><code>optimize_indices()</code> - Incrementally update existing indices for newly appended data.</p>
+<p>This is useful when you frequently append/overwrite data and want to restore search performance without rebuilding indices from scratch.</p>
+<h4 id="optimize_indices"><code>optimize_indices</code><a class="headerlink" href="#optimize_indices" title="Permanent link">&para;</a></h4>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">optimize_indices</span><span class="p">(</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    <span class="n">uri</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    <span class="o">*</span><span class="p">,</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>    <span class="n">table_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>    <span class="n">indices</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>    <span class="n">num_indices_to_merge</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>    <span class="n">retrain</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>    <span class="n">storage_options</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-3-9"><a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>    <span class="n">namespace_impl</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-3-10"><a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a>    <span class="n">namespace_properties</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-3-11"><a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a>    <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">,</span>
+</span><span id="__span-3-12"><a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"lance.LanceDataset"</span><span class="p">:</span>
+</span></code></pre></div>
+<h4 id="parameters_2">Parameters<a class="headerlink" href="#parameters_2" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>uri</code></td>
+<td><code>str</code>, optional</td>
+<td>Dataset URI. Either <code>uri</code> OR (<code>namespace_impl</code> + <code>table_id</code>) must be provided.</td>
+</tr>
+<tr>
+<td><code>table_id</code></td>
+<td><code>list[str]</code>, optional</td>
+<td>The table identifier as a list of strings. Must be provided together with <code>namespace_impl</code>.</td>
+</tr>
+<tr>
+<td><code>indices</code></td>
+<td><code>list[str]</code>, optional</td>
+<td>Index names to optimize. If not provided, all indices are optimized.</td>
+</tr>
+<tr>
+<td><code>num_indices_to_merge</code></td>
+<td><code>int</code>, optional</td>
+<td>Number of delta indices to merge (default 1). Set to 0 to create a new delta index without merging.</td>
+</tr>
+<tr>
+<td><code>retrain</code></td>
+<td><code>bool</code>, optional</td>
+<td>If <code>True</code>, retrain the whole index from current data (default <code>False</code>).</td>
+</tr>
+<tr>
+<td><code>storage_options</code></td>
+<td><code>Dict[str, str]</code>, optional</td>
+<td>Storage options for the dataset</td>
+</tr>
+<tr>
+<td><code>namespace_impl</code></td>
+<td><code>str</code>, optional</td>
+<td>The namespace implementation type (e.g., <code>"rest"</code>, <code>"dir"</code>)</td>
+</tr>
+<tr>
+<td><code>namespace_properties</code></td>
+<td><code>Dict[str, str]</code>, optional</td>
+<td>Properties for connecting to the namespace</td>
+</tr>
+<tr>
+<td><code>**kwargs</code></td>
+<td><code>Any</code></td>
+<td>Passed through to Lance <code>DatasetOptimizer.optimize_indices</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="return-value_2">Return Value<a class="headerlink" href="#return-value_2" title="Permanent link">&para;</a></h4>
+<p>The function returns the Lance dataset instance (optimization is applied on storage).</p>
+<h3 id="distributed-vector-search">Distributed Vector Search<a class="headerlink" href="#distributed-vector-search" title="Permanent link">&para;</a></h3>
+<p><code>vector_search()</code> - Run vector search with Ray workers and merge the global top-k on the driver.</p>
+<p>The driver opens one fixed dataset version, reads vector index segment metadata once, and plans work by index segment ownership.  Indexed worker tasks receive only their assigned <code>index_segments</code>, so a segment covering multiple fragments is never split across workers.  Fragments not covered by an index can be included as separate flat-search fallback work unless <code>fast_search=True</code>; fallback tasks use regular fragment scans and compute vector distances in Lance-Ray.</p>
+<h4 id="vector_search"><code>vector_search</code><a class="headerlink" href="#vector_search" title="Permanent link">&para;</a></h4>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="k">def</span><span class="w"> </span><span class="nf">vector_search</span><span class="p">(</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>    <span class="n">uri</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"lance.LanceDataset"</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    <span class="o">*</span><span class="p">,</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>    <span class="n">nearest</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">],</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>    <span class="n">index_name</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>    <span class="n">columns</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>    <span class="nb">filter</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>    <span class="n">storage_options</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a>    <span class="n">block_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a>    <span class="n">namespace_impl</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a>    <span class="n">namespace_properties</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a>    <span class="n">table_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a>    <span class="n">num_workers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-4-14"><a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>    <span class="n">ray_remote_args</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-4-15"><a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a>    <span class="n">oversample_factor</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span>
+</span><span id="__span-4-16"><a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a>    <span class="n">include_unindexed</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-4-17"><a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a>    <span class="n">fast_search</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+</span><span id="__span-4-18"><a id="__codelineno-4-18" name="__codelineno-4-18" href="#__codelineno-4-18"></a>    <span class="n">analyze_plan</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+</span><span id="__span-4-19"><a id="__codelineno-4-19" name="__codelineno-4-19" href="#__codelineno-4-19"></a>    <span class="n">scanner_options</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+</span><span id="__span-4-20"><a id="__codelineno-4-20" name="__codelineno-4-20" href="#__codelineno-4-20"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="n">pyarrow</span><span class="o">.</span><span class="n">Table</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+</span></code></pre></div>
+<h4 id="parameters_3">Parameters<a class="headerlink" href="#parameters_3" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>uri</code></td>
+<td><code>str</code> or <code>lance.LanceDataset</code>, optional</td>
+<td>Lance dataset object, or its URI. Either <code>uri</code> OR (<code>namespace_impl</code> + <code>table_id</code>) must be provided when using URI mode. If a <code>LanceDataset</code> object is provided, namespace parameters are ignored and workers reopen the same dataset URI/version.</td>
+</tr>
+<tr>
+<td><code>nearest</code></td>
+<td><code>dict[str, Any]</code></td>
+<td>Lance vector search options. Must include <code>column</code>, <code>q</code>, and <code>k</code>. Other Lance nearest options such as <code>minimum_nprobes</code>, <code>maximum_nprobes</code>, <code>refine_factor</code>, and distance range are forwarded to every worker. Lance-Ray raises worker-side <code>k</code> to at least <code>k * oversample_factor</code> before global merge.</td>
+</tr>
+<tr>
+<td><code>index_name</code></td>
+<td><code>str</code>, optional</td>
+<td>Vector index name to use. If provided and not found, <code>vector_search()</code> raises <code>ValueError</code> instead of silently falling back. If omitted, Lance-Ray uses the first vector index covering <code>nearest["column"]</code>; if none exists, the search uses flat fallback plans unless <code>fast_search=True</code>.</td>
+</tr>
+<tr>
+<td><code>columns</code></td>
+<td><code>list[str]</code> or <code>dict[str, str]</code>, optional</td>
+<td>Projection passed to the Lance scanner. When a list is provided and <code>_distance</code> is missing, Lance-Ray appends <code>_distance</code> automatically because the driver needs it for global top-k merge.</td>
+</tr>
+<tr>
+<td><code>filter</code></td>
+<td><code>Any</code>, optional</td>
+<td>Filter passed unchanged to every worker scanner.</td>
+</tr>
+<tr>
+<td><code>storage_options</code></td>
+<td><code>Dict[str, Any]</code>, optional</td>
+<td>Storage options for the dataset. These are merged with namespace storage options when available.</td>
+</tr>
+<tr>
+<td><code>block_size</code></td>
+<td><code>int</code>, optional</td>
+<td>Block size in bytes to use when loading the dataset on the driver and workers.</td>
+</tr>
+<tr>
+<td><code>namespace_impl</code></td>
+<td><code>str</code>, optional</td>
+<td>Namespace implementation type, such as <code>"dir"</code> or <code>"rest"</code>.</td>
+</tr>
+<tr>
+<td><code>namespace_properties</code></td>
+<td><code>Dict[str, str]</code>, optional</td>
+<td>Namespace connection properties used with <code>namespace_impl</code>.</td>
+</tr>
+<tr>
+<td><code>table_id</code></td>
+<td><code>list[str]</code>, optional</td>
+<td>Table identifier used with namespace parameters. Must be provided together with <code>namespace_impl</code> in namespace mode.</td>
+</tr>
+<tr>
+<td><code>num_workers</code></td>
+<td><code>int</code>, optional</td>
+<td>Maximum number of Ray Pool workers to use. Lance-Ray may create fewer worker tasks when there are fewer search plans.</td>
+</tr>
+<tr>
+<td><code>ray_remote_args</code></td>
+<td><code>Dict[str, Any]</code>, optional</td>
+<td>Ray task options for Pool workers, such as <code>num_cpus</code> or custom resources.</td>
+</tr>
+<tr>
+<td><code>oversample_factor</code></td>
+<td><code>float</code>, optional</td>
+<td>Multiplier for local worker candidates. Each worker returns at least <code>nearest["k"] * oversample_factor</code> rows before driver-side merge. Must be greater than or equal to 1.</td>
+</tr>
+<tr>
+<td><code>include_unindexed</code></td>
+<td><code>bool</code>, optional</td>
+<td>Include fragments not covered by vector index segments using separate flat-search fallback plans. Fallback plans use regular fragment scans and compute vector distance in Lance-Ray. Ignored when <code>fast_search=True</code>.</td>
+</tr>
+<tr>
+<td><code>fast_search</code></td>
+<td><code>bool</code>, optional</td>
+<td>Search only indexed data. When enabled, Lance-Ray does not schedule flat-search fallback plans for fragments not covered by vector index segments.</td>
+</tr>
+<tr>
+<td><code>analyze_plan</code></td>
+<td><code>bool</code>, optional</td>
+<td>If <code>True</code>, call <code>LanceScanner.analyze_plan()</code> for each planned shard and return a string containing the per-shard analysis instead of executing search and returning a table.</td>
+</tr>
+<tr>
+<td><code>scanner_options</code></td>
+<td><code>Dict[str, Any]</code>, optional</td>
+<td>Extra Lance scanner options, such as <code>batch_size</code>, <code>prefilter</code>, <code>with_row_id</code>, or <code>late_materialization</code>. Lance-Ray manages <code>nearest</code>, <code>fragments</code>, <code>index_segments</code>, <code>fast_search</code>, <code>limit</code>, and <code>offset</code> internally, so those options cannot be supplied here.</td>
+</tr>
+</tbody>
+</table>
+<h4 id="return-value_3">Return Value<a class="headerlink" href="#return-value_3" title="Permanent link">&para;</a></h4>
+<p>The function returns a <code>pyarrow.Table</code> containing the global top-k rows sorted by <code>_distance</code>. If <code>analyze_plan=True</code>, it returns a <code>str</code> containing one Lance scanner analysis section per planned shard.</p>
+<h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
+<h3 id="fts-index-scalar">FTS Index (Scalar)<a class="headerlink" href="#fts-index-scalar" title="Permanent link">&para;</a></h3>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance_ray</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">lr</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="c1"># Create or load Lance dataset</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"path/to/dataset"</span><span class="p">)</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="c1"># Build distributed index</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>   <span class="n">uri</span><span class="o">=</span><span class="n">dataset</span><span class="o">.</span><span class="n">uri</span><span class="p">,</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>   <span class="n">column</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>   <span class="n">index_type</span><span class="o">=</span><span class="s2">"INVERTED"</span><span class="p">,</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>   <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="p">)</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="c1"># Verify index creation</span>
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="n">indices</span> <span class="o">=</span> <span class="n">updated_dataset</span><span class="o">.</span><span class="n">describe_indices</span><span class="p">()</span>
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Index list: </span><span class="si">{</span><span class="n">indices</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a>
+</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="c1"># Use index for search</span>
+</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="n">results</span> <span class="o">=</span> <span class="n">updated_dataset</span><span class="o">.</span><span class="n">scanner</span><span class="p">(</span>
+</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a>   <span class="n">full_text_query</span><span class="o">=</span><span class="s2">"search term"</span><span class="p">,</span>
+</span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a>   <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"id"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">]</span>
+</span><span id="__span-5-23"><a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a><span class="p">)</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span>
+</span><span id="__span-5-24"><a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Search results: </span><span class="si">{</span><span class="n">results</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+</span></code></pre></div>
+<h3 id="btree-index-scalar">BTREE Index (Scalar)<a class="headerlink" href="#btree-index-scalar" title="Permanent link">&para;</a></h3>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1"># Assume a LanceDataset with a numeric column "id" exists at this path</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance_ray</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">lr</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>    <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset"</span><span class="p">,</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>    <span class="n">column</span><span class="o">=</span><span class="s2">"id"</span><span class="p">,</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>    <span class="n">index_type</span><span class="o">=</span><span class="s2">"BTREE"</span><span class="p">,</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>    <span class="n">name</span><span class="o">=</span><span class="s2">"btree_multiple_fragment_idx"</span><span class="p">,</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>    <span class="n">replace</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>    <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="p">)</span>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>
+</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a><span class="c1"># Example queries</span>
+</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a><span class="n">updated_dataset</span><span class="o">.</span><span class="n">scanner</span><span class="p">(</span><span class="nb">filter</span><span class="o">=</span><span class="s2">"id = 100"</span><span class="p">,</span> <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"id"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">])</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span>
+</span><span id="__span-6-15"><a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="n">updated_dataset</span><span class="o">.</span><span class="n">scanner</span><span class="p">(</span><span class="nb">filter</span><span class="o">=</span><span class="s2">"id &gt;= 200 AND id &lt; 800"</span><span class="p">,</span> <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"id"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">])</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span>
+</span></code></pre></div>
+<h3 id="vector-index-ivf_pq-ivf_rq-ivf_sq-ivf_flat">Vector Index (IVF_PQ / IVF_RQ / IVF_SQ / IVF_FLAT)<a class="headerlink" href="#vector-index-ivf_pq-ivf_rq-ivf_sq-ivf_flat" title="Permanent link">&para;</a></h3>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance_ray</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">lr</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="c1"># Build a distributed IVF_PQ index</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">create_index</span><span class="p">(</span>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>    <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset.lance"</span><span class="p">,</span>
+</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a>    <span class="n">column</span><span class="o">=</span><span class="s2">"vector"</span><span class="p">,</span>
+</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a>    <span class="n">index_type</span><span class="o">=</span><span class="s2">"IVF_PQ"</span><span class="p">,</span>
+</span><span id="__span-7-8"><a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>    <span class="n">name</span><span class="o">=</span><span class="s2">"idx_ivf_pq"</span><span class="p">,</span>
+</span><span id="__span-7-9"><a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a>    <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-7-10"><a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a>    <span class="n">num_partitions</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span>
+</span><span id="__span-7-11"><a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a>    <span class="n">num_sub_vectors</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span>
+</span><span id="__span-7-12"><a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a>    <span class="n">sample_rate</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+</span><span id="__span-7-13"><a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a>    <span class="n">metric</span><span class="o">=</span><span class="s2">"l2"</span>
+</span><span id="__span-7-14"><a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="p">)</span>
+</span><span id="__span-7-15"><a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a>
+</span><span id="__span-7-16"><a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a><span class="c1"># Build a distributed IVF_SQ index</span>
+</span><span id="__span-7-17"><a id="__codelineno-7-17" name="__codelineno-7-17" href="#__codelineno-7-17"></a><span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">create_index</span><span class="p">(</span>
+</span><span id="__span-7-18"><a id="__codelineno-7-18" name="__codelineno-7-18" href="#__codelineno-7-18"></a>    <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset.lance"</span><span class="p">,</span>
+</span><span id="__span-7-19"><a id="__codelineno-7-19" name="__codelineno-7-19" href="#__codelineno-7-19"></a>    <span class="n">column</span><span class="o">=</span><span class="s2">"vector"</span><span class="p">,</span>
+</span><span id="__span-7-20"><a id="__codelineno-7-20" name="__codelineno-7-20" href="#__codelineno-7-20"></a>    <span class="n">index_type</span><span class="o">=</span><span class="s2">"IVF_SQ"</span><span class="p">,</span>
+</span><span id="__span-7-21"><a id="__codelineno-7-21" name="__codelineno-7-21" href="#__codelineno-7-21"></a>    <span class="n">name</span><span class="o">=</span><span class="s2">"idx_ivf_sq"</span><span class="p">,</span>
+</span><span id="__span-7-22"><a id="__codelineno-7-22" name="__codelineno-7-22" href="#__codelineno-7-22"></a>    <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-7-23"><a id="__codelineno-7-23" name="__codelineno-7-23" href="#__codelineno-7-23"></a>    <span class="n">num_partitions</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span>
+</span><span id="__span-7-24"><a id="__codelineno-7-24" name="__codelineno-7-24" href="#__codelineno-7-24"></a><span class="p">)</span>
+</span><span id="__span-7-25"><a id="__codelineno-7-25" name="__codelineno-7-25" href="#__codelineno-7-25"></a>
+</span><span id="__span-7-26"><a id="__codelineno-7-26" name="__codelineno-7-26" href="#__codelineno-7-26"></a><span class="c1"># Build a distributed IVF_RQ index</span>
+</span><span id="__span-7-27"><a id="__codelineno-7-27" name="__codelineno-7-27" href="#__codelineno-7-27"></a><span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">create_index</span><span class="p">(</span>
+</span><span id="__span-7-28"><a id="__codelineno-7-28" name="__codelineno-7-28" href="#__codelineno-7-28"></a>    <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset.lance"</span><span class="p">,</span>
+</span><span id="__span-7-29"><a id="__codelineno-7-29" name="__codelineno-7-29" href="#__codelineno-7-29"></a>    <span class="n">column</span><span class="o">=</span><span class="s2">"vector"</span><span class="p">,</span>
+</span><span id="__span-7-30"><a id="__codelineno-7-30" name="__codelineno-7-30" href="#__codelineno-7-30"></a>    <span class="n">index_type</span><span class="o">=</span><span class="s2">"IVF_RQ"</span><span class="p">,</span>
+</span><span id="__span-7-31"><a id="__codelineno-7-31" name="__codelineno-7-31" href="#__codelineno-7-31"></a>    <span class="n">name</span><span class="o">=</span><span class="s2">"idx_ivf_rq"</span><span class="p">,</span>
+</span><span id="__span-7-32"><a id="__codelineno-7-32" name="__codelineno-7-32" href="#__codelineno-7-32"></a>    <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-7-33"><a id="__codelineno-7-33" name="__codelineno-7-33" href="#__codelineno-7-33"></a>    <span class="n">num_partitions</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span>
+</span><span id="__span-7-34"><a id="__codelineno-7-34" name="__codelineno-7-34" href="#__codelineno-7-34"></a><span class="p">)</span>
+</span><span id="__span-7-35"><a id="__codelineno-7-35" name="__codelineno-7-35" href="#__codelineno-7-35"></a>
+</span><span id="__span-7-36"><a id="__codelineno-7-36" name="__codelineno-7-36" href="#__codelineno-7-36"></a><span class="c1"># Or provide a pre-built shared RaBitQ model explicitly.</span>
+</span><span id="__span-7-37"><a id="__codelineno-7-37" name="__codelineno-7-37" href="#__codelineno-7-37"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance.lance</span><span class="w"> </span><span class="kn">import</span> <span class="n">indices</span>
+</span><span id="__span-7-38"><a id="__codelineno-7-38" name="__codelineno-7-38" href="#__codelineno-7-38"></a>
+</span><span id="__span-7-39"><a id="__codelineno-7-39" name="__codelineno-7-39" href="#__codelineno-7-39"></a><span class="n">rabitq_model</span> <span class="o">=</span> <span class="n">indices</span><span class="o">.</span><span class="n">build_rq_model</span><span class="p">(</span><span class="n">dimension</span><span class="o">=</span><span class="mi">128</span><span class="p">,</span> <span class="n">num_bits</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+</span><span id="__span-7-40"><a id="__codelineno-7-40" name="__codelineno-7-40" href="#__codelineno-7-40"></a><span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">create_index</span><span class="p">(</span>
+</span><span id="__span-7-41"><a id="__codelineno-7-41" name="__codelineno-7-41" href="#__codelineno-7-41"></a>    <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset.lance"</span><span class="p">,</span>
+</span><span id="__span-7-42"><a id="__codelineno-7-42" name="__codelineno-7-42" href="#__codelineno-7-42"></a>    <span class="n">column</span><span class="o">=</span><span class="s2">"vector"</span><span class="p">,</span>
+</span><span id="__span-7-43"><a id="__codelineno-7-43" name="__codelineno-7-43" href="#__codelineno-7-43"></a>    <span class="n">index_type</span><span class="o">=</span><span class="s2">"IVF_RQ"</span><span class="p">,</span>
+</span><span id="__span-7-44"><a id="__codelineno-7-44" name="__codelineno-7-44" href="#__codelineno-7-44"></a>    <span class="n">name</span><span class="o">=</span><span class="s2">"idx_ivf_rq"</span><span class="p">,</span>
+</span><span id="__span-7-45"><a id="__codelineno-7-45" name="__codelineno-7-45" href="#__codelineno-7-45"></a>    <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-7-46"><a id="__codelineno-7-46" name="__codelineno-7-46" href="#__codelineno-7-46"></a>    <span class="n">num_partitions</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span>
+</span><span id="__span-7-47"><a id="__codelineno-7-47" name="__codelineno-7-47" href="#__codelineno-7-47"></a>    <span class="n">num_bits</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-7-48"><a id="__codelineno-7-48" name="__codelineno-7-48" href="#__codelineno-7-48"></a>    <span class="n">rabitq_model</span><span class="o">=</span><span class="n">rabitq_model</span><span class="p">,</span>
+</span><span id="__span-7-49"><a id="__codelineno-7-49" name="__codelineno-7-49" href="#__codelineno-7-49"></a><span class="p">)</span>
+</span><span id="__span-7-50"><a id="__codelineno-7-50" name="__codelineno-7-50" href="#__codelineno-7-50"></a>
+</span><span id="__span-7-51"><a id="__codelineno-7-51" name="__codelineno-7-51" href="#__codelineno-7-51"></a><span class="c1"># Build a distributed IVF_FLAT index</span>
+</span><span id="__span-7-52"><a id="__codelineno-7-52" name="__codelineno-7-52" href="#__codelineno-7-52"></a><span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">create_index</span><span class="p">(</span>
+</span><span id="__span-7-53"><a id="__codelineno-7-53" name="__codelineno-7-53" href="#__codelineno-7-53"></a>    <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset.lance"</span><span class="p">,</span>
+</span><span id="__span-7-54"><a id="__codelineno-7-54" name="__codelineno-7-54" href="#__codelineno-7-54"></a>    <span class="n">column</span><span class="o">=</span><span class="s2">"vector"</span><span class="p">,</span>
+</span><span id="__span-7-55"><a id="__codelineno-7-55" name="__codelineno-7-55" href="#__codelineno-7-55"></a>    <span class="n">index_type</span><span class="o">=</span><span class="s2">"IVF_FLAT"</span><span class="p">,</span>
+</span><span id="__span-7-56"><a id="__codelineno-7-56" name="__codelineno-7-56" href="#__codelineno-7-56"></a>    <span class="n">name</span><span class="o">=</span><span class="s2">"idx_ivf_flat"</span><span class="p">,</span>
+</span><span id="__span-7-57"><a id="__codelineno-7-57" name="__codelineno-7-57" href="#__codelineno-7-57"></a>    <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-7-58"><a id="__codelineno-7-58" name="__codelineno-7-58" href="#__codelineno-7-58"></a>    <span class="n">num_partitions</span><span class="o">=</span><span class="mi">256</span><span class="p">,</span>
+</span><span id="__span-7-59"><a id="__codelineno-7-59" name="__codelineno-7-59" href="#__codelineno-7-59"></a><span class="p">)</span>
+</span><span id="__span-7-60"><a id="__codelineno-7-60" name="__codelineno-7-60" href="#__codelineno-7-60"></a>
+</span><span id="__span-7-61"><a id="__codelineno-7-61" name="__codelineno-7-61" href="#__codelineno-7-61"></a><span class="c1"># Run distributed vector search against index-owned shards.</span>
+</span><span id="__span-7-62"><a id="__codelineno-7-62" name="__codelineno-7-62" href="#__codelineno-7-62"></a><span class="n">results</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">vector_search</span><span class="p">(</span>
+</span><span id="__span-7-63"><a id="__codelineno-7-63" name="__codelineno-7-63" href="#__codelineno-7-63"></a>    <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset.lance"</span><span class="p">,</span>
+</span><span id="__span-7-64"><a id="__codelineno-7-64" name="__codelineno-7-64" href="#__codelineno-7-64"></a>    <span class="n">nearest</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-7-65"><a id="__codelineno-7-65" name="__codelineno-7-65" href="#__codelineno-7-65"></a>        <span class="s2">"column"</span><span class="p">:</span> <span class="s2">"vector"</span><span class="p">,</span>
+</span><span id="__span-7-66"><a id="__codelineno-7-66" name="__codelineno-7-66" href="#__codelineno-7-66"></a>        <span class="s2">"q"</span><span class="p">:</span> <span class="n">query_vector</span><span class="p">,</span>
+</span><span id="__span-7-67"><a id="__codelineno-7-67" name="__codelineno-7-67" href="#__codelineno-7-67"></a>        <span class="s2">"k"</span><span class="p">:</span> <span class="mi">10</span><span class="p">,</span>
+</span><span id="__span-7-68"><a id="__codelineno-7-68" name="__codelineno-7-68" href="#__codelineno-7-68"></a>        <span class="s2">"minimum_nprobes"</span><span class="p">:</span> <span class="mi">20</span><span class="p">,</span>
+</span><span id="__span-7-69"><a id="__codelineno-7-69" name="__codelineno-7-69" href="#__codelineno-7-69"></a>    <span class="p">},</span>
+</span><span id="__span-7-70"><a id="__codelineno-7-70" name="__codelineno-7-70" href="#__codelineno-7-70"></a>    <span class="n">index_name</span><span class="o">=</span><span class="s2">"idx_ivf_flat"</span><span class="p">,</span>
+</span><span id="__span-7-71"><a id="__codelineno-7-71" name="__codelineno-7-71" href="#__codelineno-7-71"></a>    <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"id"</span><span class="p">,</span> <span class="s2">"vector"</span><span class="p">],</span>
+</span><span id="__span-7-72"><a id="__codelineno-7-72" name="__codelineno-7-72" href="#__codelineno-7-72"></a>    <span class="n">num_workers</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+</span><span id="__span-7-73"><a id="__codelineno-7-73" name="__codelineno-7-73" href="#__codelineno-7-73"></a>    <span class="n">oversample_factor</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+</span><span id="__span-7-74"><a id="__codelineno-7-74" name="__codelineno-7-74" href="#__codelineno-7-74"></a>    <span class="n">fast_search</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+</span><span id="__span-7-75"><a id="__codelineno-7-75" name="__codelineno-7-75" href="#__codelineno-7-75"></a><span class="p">)</span>
+</span><span id="__span-7-76"><a id="__codelineno-7-76" name="__codelineno-7-76" href="#__codelineno-7-76"></a>
+</span><span id="__span-7-77"><a id="__codelineno-7-77" name="__codelineno-7-77" href="#__codelineno-7-77"></a><span class="c1"># Inspect the per-shard Lance scanner plans instead of executing the search.</span>
+</span><span id="__span-7-78"><a id="__codelineno-7-78" name="__codelineno-7-78" href="#__codelineno-7-78"></a><span class="n">plan</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">vector_search</span><span class="p">(</span>
+</span><span id="__span-7-79"><a id="__codelineno-7-79" name="__codelineno-7-79" href="#__codelineno-7-79"></a>    <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset.lance"</span><span class="p">,</span>
+</span><span id="__span-7-80"><a id="__codelineno-7-80" name="__codelineno-7-80" href="#__codelineno-7-80"></a>    <span class="n">nearest</span><span class="o">=</span><span class="p">{</span><span class="s2">"column"</span><span class="p">:</span> <span class="s2">"vector"</span><span class="p">,</span> <span class="s2">"q"</span><span class="p">:</span> <span class="n">query_vector</span><span class="p">,</span> <span class="s2">"k"</span><span class="p">:</span> <span class="mi">10</span><span class="p">},</span>
+</span><span id="__span-7-81"><a id="__codelineno-7-81" name="__codelineno-7-81" href="#__codelineno-7-81"></a>    <span class="n">index_name</span><span class="o">=</span><span class="s2">"idx_ivf_flat"</span><span class="p">,</span>
+</span><span id="__span-7-82"><a id="__codelineno-7-82" name="__codelineno-7-82" href="#__codelineno-7-82"></a>    <span class="n">analyze_plan</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-7-83"><a id="__codelineno-7-83" name="__codelineno-7-83" href="#__codelineno-7-83"></a><span class="p">)</span>
+</span><span id="__span-7-84"><a id="__codelineno-7-84" name="__codelineno-7-84" href="#__codelineno-7-84"></a><span class="nb">print</span><span class="p">(</span><span class="n">plan</span><span class="p">)</span>
+</span></code></pre></div>
+<h3 id="custom-ray-options">Custom Ray Options<a class="headerlink" href="#custom-ray-options" title="Permanent link">&para;</a></h3>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>   <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset"</span><span class="p">,</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>   <span class="n">column</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>   <span class="n">index_type</span><span class="o">=</span><span class="s2">"INVERTED"</span><span class="p">,</span>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>   <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+</span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>   <span class="n">ray_remote_args</span><span class="o">=</span><span class="p">{</span><span class="s2">"num_cpus"</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span> <span class="s2">"resources"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"custom_resource"</span><span class="p">:</span> <span class="mi">1</span><span class="p">}}</span>
+</span><span id="__span-8-7"><a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="p">)</span>
+</span></code></pre></div>
+<h3 id="reusing-a-ray-pool">Reusing a Ray Pool<a class="headerlink" href="#reusing-a-ray-pool" title="Permanent link">&para;</a></h3>
+<p>Creating a Ray Pool can be expensive if you repeatedly run distributed vector searches in the same process.  You can explicitly initialize a process-wide Pool with <code>init_global_pool()</code>.  After that, Lance-Ray will reuse this global Pool for <code>vector_search()</code> calls instead of creating a new local Pool each time.</p>
+<p>Use this when the same driver process will call <code>vector_search()</code> multiple times in a serial workflow:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance_ray</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">lr</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="n">lr</span><span class="o">.</span><span class="n">init_global_pool</span><span class="p">(</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>    <span class="n">processes</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>    <span class="n">ray_remote_args</span><span class="o">=</span><span class="p">{</span><span class="s2">"num_cpus"</span><span class="p">:</span> <span class="mi">2</span><span class="p">},</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="p">)</span>
+</span><span id="__span-9-7"><a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a>
+</span><span id="__span-9-8"><a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a><span class="k">try</span><span class="p">:</span>
+</span><span id="__span-9-9"><a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a>    <span class="n">results</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">vector_search</span><span class="p">(</span>
+</span><span id="__span-9-10"><a id="__codelineno-9-10" name="__codelineno-9-10" href="#__codelineno-9-10"></a>        <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset.lance"</span><span class="p">,</span>
+</span><span id="__span-9-11"><a id="__codelineno-9-11" name="__codelineno-9-11" href="#__codelineno-9-11"></a>        <span class="n">nearest</span><span class="o">=</span><span class="p">{</span><span class="s2">"column"</span><span class="p">:</span> <span class="s2">"vector"</span><span class="p">,</span> <span class="s2">"q"</span><span class="p">:</span> <span class="n">query_vector</span><span class="p">,</span> <span class="s2">"k"</span><span class="p">:</span> <span class="mi">10</span><span class="p">},</span>
+</span><span id="__span-9-12"><a id="__codelineno-9-12" name="__codelineno-9-12" href="#__codelineno-9-12"></a>        <span class="n">num_workers</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span>
+</span><span id="__span-9-13"><a id="__codelineno-9-13" name="__codelineno-9-13" href="#__codelineno-9-13"></a>    <span class="p">)</span>
+</span><span id="__span-9-14"><a id="__codelineno-9-14" name="__codelineno-9-14" href="#__codelineno-9-14"></a><span class="k">finally</span><span class="p">:</span>
+</span><span id="__span-9-15"><a id="__codelineno-9-15" name="__codelineno-9-15" href="#__codelineno-9-15"></a>    <span class="n">lr</span><span class="o">.</span><span class="n">clear_global_pool</span><span class="p">(</span><span class="n">close</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</span></code></pre></div>
+<p><code>init_global_pool()</code> is idempotent while a global Pool exists: later calls return the existing Pool instead of replacing it.  If a global Pool exists, <code>vector_search()</code> reuses it and does not close it after the operation.  In that case, the Pool's original <code>processes</code> and <code>ray_remote_args</code> control the workers; per-call <code>num_workers</code> and <code>ray_remote_args</code> are only used when Lance-Ray has to create a local Pool for that call.  Lance-Ray logs a warning when it can determine that the requested worker count differs from the configured global Pool size.</p>
+<p>Call <code>clear_global_pool(close=True)</code> when the driver is done with the shared Pool.  If you manage the Pool lifecycle yourself, use <code>set_global_pool(pool)</code> to register it and <code>clear_global_pool(close=False)</code> to clear Lance-Ray's reference without closing the Pool.</p>
+<p>The global Pool registry is protected for basic set/get/clear operations, but the intended usage is still a single driver process that reuses the Pool serially across operations.  Avoid concurrently mutating the global Pool while other threads are running Lance-Ray operations.</p>
+<p>The current global Pool integration is limited to <code>vector_search()</code>.  The same pattern can be applied to I/O, index building, and compaction in follow-up changes.</p>
+<h3 id="index-replacement-control">Index Replacement Control<a class="headerlink" href="#index-replacement-control" title="Permanent link">&para;</a></h3>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="c1"># Create index with custom name</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>   <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset"</span><span class="p">,</span>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>   <span class="n">column</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>   <span class="n">index_type</span><span class="o">=</span><span class="s2">"INVERTED"</span><span class="p">,</span>
+</span><span id="__span-10-6"><a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a>   <span class="n">name</span><span class="o">=</span><span class="s2">"my_text_index"</span><span class="p">,</span>
+</span><span id="__span-10-7"><a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a>   <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span>
+</span><span id="__span-10-8"><a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="p">)</span>
+</span><span id="__span-10-9"><a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a>
+</span><span id="__span-10-10"><a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a><span class="c1"># Try to create another index with the same name (will replace by default)</span>
+</span><span id="__span-10-11"><a id="__codelineno-10-11" name="__codelineno-10-11" href="#__codelineno-10-11"></a><span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span>
+</span><span id="__span-10-12"><a id="__codelineno-10-12" name="__codelineno-10-12" href="#__codelineno-10-12"></a>   <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset"</span><span class="p">,</span>
+</span><span id="__span-10-13"><a id="__codelineno-10-13" name="__codelineno-10-13" href="#__codelineno-10-13"></a>   <span class="n">column</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-10-14"><a id="__codelineno-10-14" name="__codelineno-10-14" href="#__codelineno-10-14"></a>   <span class="n">index_type</span><span class="o">=</span><span class="s2">"INVERTED"</span><span class="p">,</span>
+</span><span id="__span-10-15"><a id="__codelineno-10-15" name="__codelineno-10-15" href="#__codelineno-10-15"></a>   <span class="n">name</span><span class="o">=</span><span class="s2">"my_text_index"</span><span class="p">,</span>  <span class="c1"># Same name as before</span>
+</span><span id="__span-10-16"><a id="__codelineno-10-16" name="__codelineno-10-16" href="#__codelineno-10-16"></a>   <span class="n">replace</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>          <span class="c1"># Explicitly allow replacement (default behavior)</span>
+</span><span id="__span-10-17"><a id="__codelineno-10-17" name="__codelineno-10-17" href="#__codelineno-10-17"></a>   <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span>
+</span><span id="__span-10-18"><a id="__codelineno-10-18" name="__codelineno-10-18" href="#__codelineno-10-18"></a><span class="p">)</span>
+</span><span id="__span-10-19"><a id="__codelineno-10-19" name="__codelineno-10-19" href="#__codelineno-10-19"></a>
+</span><span id="__span-10-20"><a id="__codelineno-10-20" name="__codelineno-10-20" href="#__codelineno-10-20"></a><span class="c1"># Prevent index replacement</span>
+</span><span id="__span-10-21"><a id="__codelineno-10-21" name="__codelineno-10-21" href="#__codelineno-10-21"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance_ray</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">lr</span>
+</span><span id="__span-10-22"><a id="__codelineno-10-22" name="__codelineno-10-22" href="#__codelineno-10-22"></a>
+</span><span id="__span-10-23"><a id="__codelineno-10-23" name="__codelineno-10-23" href="#__codelineno-10-23"></a><span class="k">try</span><span class="p">:</span>
+</span><span id="__span-10-24"><a id="__codelineno-10-24" name="__codelineno-10-24" href="#__codelineno-10-24"></a>    <span class="n">updated_dataset</span> <span class="o">=</span> <span class="n">lr</span><span class="o">.</span><span class="n">create_scalar_index</span><span class="p">(</span>
+</span><span id="__span-10-25"><a id="__codelineno-10-25" name="__codelineno-10-25" href="#__codelineno-10-25"></a>       <span class="n">uri</span><span class="o">=</span><span class="s2">"path/to/dataset"</span><span class="p">,</span>
+</span><span id="__span-10-26"><a id="__codelineno-10-26" name="__codelineno-10-26" href="#__codelineno-10-26"></a>       <span class="n">column</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span>
+</span><span id="__span-10-27"><a id="__codelineno-10-27" name="__codelineno-10-27" href="#__codelineno-10-27"></a>       <span class="n">index_type</span><span class="o">=</span><span class="s2">"INVERTED"</span><span class="p">,</span>
+</span><span id="__span-10-28"><a id="__codelineno-10-28" name="__codelineno-10-28" href="#__codelineno-10-28"></a>       <span class="n">name</span><span class="o">=</span><span class="s2">"my_text_index"</span><span class="p">,</span>  <span class="c1"># Same name as existing index</span>
+</span><span id="__span-10-29"><a id="__codelineno-10-29" name="__codelineno-10-29" href="#__codelineno-10-29"></a>       <span class="n">replace</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>         <span class="c1"># Prevent replacement</span>
+</span><span id="__span-10-30"><a id="__codelineno-10-30" name="__codelineno-10-30" href="#__codelineno-10-30"></a>       <span class="n">num_workers</span><span class="o">=</span><span class="mi">4</span>
+</span><span id="__span-10-31"><a id="__codelineno-10-31" name="__codelineno-10-31" href="#__codelineno-10-31"></a>    <span class="p">)</span>
+</span><span id="__span-10-32"><a id="__codelineno-10-32" name="__codelineno-10-32" href="#__codelineno-10-32"></a><span class="k">except</span> <span class="ne">ValueError</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+</span><span id="__span-10-33"><a id="__codelineno-10-33" name="__codelineno-10-33" href="#__codelineno-10-33"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Index creation failed: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+</span><span id="__span-10-34"><a id="__codelineno-10-34" name="__codelineno-10-34" href="#__codelineno-10-34"></a>    <span class="c1"># Handle the error appropriately</span>
+</span></code></pre></div>
+<h3 id="performance-considerations">Performance Considerations<a class="headerlink" href="#performance-considerations" title="Permanent link">&para;</a></h3>
+<ul>
+<li>For very large datasets, use Ray worker nodes with sufficient CPU and memory. Increasing <code>num_workers</code> can improve index build speed when there are enough segment batches to process, but requires more cluster resources.</li>
+<li><code>num_segments</code> determines the number of index segments. More segments can slow FTS queries because more index segments need to be loaded during search.</li>
+<li><code>num_segments</code> is capped at the number of fragments, and <code>num_workers</code> is capped at the number of non-empty segment batches.</li>
+</ul>
+<h3 id="important-notes">Important Notes<a class="headerlink" href="#important-notes" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Index Type Support</strong>: For distributed indexing, currently only <code>"INVERTED"</code>/<code>"FTS"</code>/<code>"BTREE"</code>/<code>"BITMAP"</code>/<code>"ZONEMAP"</code> index types are supported, even though the function signature accepts other index types.</li>
+<li><strong>Default Behavior</strong>: The <code>replace</code> parameter defaults to <code>True</code>, meaning existing indices with the same name will be replaced without warning. Set <code>replace=False</code> to prevent accidental overwrites.</li>
+<li><strong>Fragment Selection</strong>: Use <code>fragment_ids</code> parameter to build indices on specific fragments only. This is useful for incremental index building or testing.</li>
+<li><strong>Error Handling</strong>: When <code>replace=False</code> and an index with the same name exists, a <code>ValueError</code> or <code>RuntimeError</code> will be raised depending on the execution context.</li>
+</ul>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../write/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Write</div>
+        </a>
+        <a class="next" href="../compaction/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Compaction</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#distributed-apis">Distributed APIs</a>
+      <a class="ld-toc__h3" href="#scalar-indexing">Scalar Indexing</a>
+      <a class="ld-toc__h3" href="#vector-indexing">Vector Indexing</a>
+      <a class="ld-toc__h3" href="#index-optimization-incremental-updates">Index Optimization (Incremental Updates)</a>
+      <a class="ld-toc__h3" href="#distributed-vector-search">Distributed Vector Search</a>
+      <a class="ld-toc__h2" href="#examples">Examples</a>
+      <a class="ld-toc__h3" href="#fts-index-scalar">FTS Index (Scalar)</a>
+      <a class="ld-toc__h3" href="#btree-index-scalar">BTREE Index (Scalar)</a>
+      <a class="ld-toc__h3" href="#vector-index-ivf_pq-ivf_rq-ivf_sq-ivf_flat">Vector Index (IVF_PQ / IVF_RQ / IVF_SQ / IVF_FLAT)</a>
+      <a class="ld-toc__h3" href="#custom-ray-options">Custom Ray Options</a>
+      <a class="ld-toc__h3" href="#reusing-a-ray-pool">Reusing a Ray Pool</a>
+      <a class="ld-toc__h3" href="#index-replacement-control">Index Replacement Control</a>
+      <a class="ld-toc__h3" href="#performance-considerations">Performance Considerations</a>
+      <a class="ld-toc__h3" href="#important-notes">Important Notes</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../format/">Specification</a>
+        <a href="../../../format/file/">File format</a>
+        <a href="../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>

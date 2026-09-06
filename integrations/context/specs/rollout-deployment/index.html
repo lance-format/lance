@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Rollout deployment — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/context/specs/rollout-deployment/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../../">Integrations</a>
+      <a class="ld-toptab" href="../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../../">Overview</a>
+    <a href="../../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../../pytorch/">PyTorch</a>
+    <a href="../../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../../duckdb/">Overview</a>
+    <a href="../../../duckdb/sql/">SQL Reference</a>
+    <a href="../../../duckdb/rest/">REST Namespace</a>
+    <a href="../../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../../huggingface/">Home</a>
+    <a href="../../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../../../spark/">Welcome</a>
+    <a href="../../../spark/install/">Install</a>
+    <a href="../../../spark/config/">Config</a>
+    <a href="../../../spark/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../spark/operations/ddl/create-namespace/">CREATE NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/drop-namespace/">DROP NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../../../spark/operations/ddl/describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/create-table/">CREATE TABLE</a>
+    <a href="../../../spark/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../spark/operations/ddl/describe-table/">DESCRIBE TABLE</a>
+    <a href="../../../spark/operations/ddl/alter-table/">ALTER TABLE</a>
+    <a href="../../../spark/operations/ddl/show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../../../spark/operations/ddl/drop-table/">DROP TABLE</a>
+    <a href="../../../spark/operations/ddl/create-index/">CREATE INDEX</a>
+    <a href="../../../spark/operations/ddl/show-indexes/">SHOW INDEXES</a>
+    <a href="../../../spark/operations/ddl/create-branch/">CREATE BRANCH</a>
+    <a href="../../../spark/operations/ddl/drop-branch/">DROP BRANCH</a>
+    <a href="../../../spark/operations/ddl/show-branches/">SHOW BRANCHES</a>
+    <a href="../../../spark/operations/ddl/create-tag/">CREATE TAG</a>
+    <a href="../../../spark/operations/ddl/drop-tag/">DROP TAG</a>
+    <a href="../../../spark/operations/ddl/show-tags/">SHOW TAGS</a>
+    <a href="../../../spark/operations/ddl/optimize/">OPTIMIZE</a>
+    <a href="../../../spark/operations/ddl/vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../spark/operations/dql/select/">SELECT</a>
+    <a href="../../../spark/operations/dql/fts/">Full-Text Search</a>
+    <a href="../../../spark/operations/dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../../../spark/operations/dql/search/">SEARCH</a>
+    <a href="../../../spark/operations/dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../spark/operations/dml/insert-into/">INSERT INTO</a>
+    <a href="../../../spark/operations/dml/update/">UPDATE SET</a>
+    <a href="../../../spark/operations/dml/delete/">DELETE FROM</a>
+    <a href="../../../spark/operations/dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../../../spark/operations/dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../../../spark/vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../../ray/">Welcome</a>
+    <a href="../../../ray/read/">Read</a>
+    <a href="../../../ray/write/">Write</a>
+    <a href="../../../ray/distributed-indexing/">Index</a>
+    <a href="../../../ray/compaction/">Compaction</a>
+    <a href="../../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../../trino/">Welcome</a>
+    <a href="../../../trino/install/">Install</a>
+    <a href="../../../trino/config/">Config</a>
+    <a href="../../../trino/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../../trino/operations/data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../trino/operations/ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../../trino/operations/ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../../trino/operations/ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../../trino/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../trino/operations/ddl/describe-table/">DESCRIBE</a>
+    <a href="../../../trino/operations/ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../../trino/operations/ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../trino/operations/dml/insert/">INSERT</a>
+    <a href="../../../trino/operations/dml/update/">UPDATE</a>
+    <a href="../../../trino/operations/dml/delete/">DELETE</a>
+    <a href="../../../trino/operations/dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../trino/operations/dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../guide/quickstart/">Quickstart</a>
+    <a href="../../guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../guide/storage/">Storage backends</a>
+    <a href="../../guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../rollout-schema-design/">Rollout schema</a>
+    <a class="active" href="./">Rollout deployment</a>
+    <a href="../rollout-blob-streaming/">Blob streaming</a>
+    <a href="../datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../../design/partitioned-namespace/">Partitioned namespace</a>
+    <a href="../../design/auto-dream/">Auto-dream</a>
+    <a href="../../design/using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Lance Context</span>
+        <span>/</span><span>Specs</span>
+        <span>/</span><b>Rollout deployment</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="deployment-distributed-rollout-ingest-with-server-id-sharding">Deployment: Distributed Rollout Ingest with Server-ID Sharding<a class="headerlink" href="#deployment-distributed-rollout-ingest-with-server-id-sharding" title="Permanent link">&para;</a></h1>
+<p><strong>Status:</strong> Draft
+<strong>Author:</strong> Beinan Wang
+<strong>Date:</strong> 2026-07-09
+<strong>Scope:</strong> How to deploy the <code>lance-context-server</code> rollout store as a multi-instance service behind a plain load balancer, and how server-id MemWAL sharding makes high fan-in ingest correct by construction.</p>
+<hr />
+<h2 id="1-summary">1. Summary<a class="headerlink" href="#1-summary" title="Permanent link">&para;</a></h2>
+<p>Rollout ingest is high fan-in: thousands of generation workers append trajectories concurrently (schema-design §2). To serve that from more than one server instance without a coordinator, each instance writes through Lance's <strong>MemWAL</strong> to a shard it owns exclusively, keyed by its <strong>stable server/instance id</strong>.</p>
+<p>The result is a service you can scale horizontally behind an ordinary round-robin load balancer:</p>
+<ul>
+<li><strong>No write coordination.</strong> Each instance owns one shard; no two instances share a shard, so MemWAL's single-writer + epoch-fencing invariant holds <em>by construction</em> — there is never a write war, no matter how the load balancer spreads requests.</li>
+<li><strong>No read affinity.</strong> Every append is flushed to object storage before the request returns, and the read path rebuilds from object storage across all shards. Any instance sees every instance's writes.</li>
+<li><strong>No client changes.</strong> Sharding is entirely server-side. Workers just POST to a load-balancer VIP.</li>
+</ul>
+<p>The one hard rule: <strong>each instance must present a distinct, stable id.</strong> A Kubernetes StatefulSet gives you exactly that for free.</p>
+<hr />
+<h2 id="2-the-sharding-model">2. The sharding model<a class="headerlink" href="#2-the-sharding-model" title="Permanent link">&para;</a></h2>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>              ┌──────── clients: generation workers (append) + learner (read) ────────┐
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>              │   POST /rollouts/{name}        GET /rollouts/{name}/{id}               │
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>              └───────────────────────────────────┬───────────────────────────────────┘
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>                                                   │  round-robin, no session affinity
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>                                          ┌────────▼────────┐
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>                                          │  Service  (LB)  │
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>                                          └───┬─────────┬───┘
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>                        ┌─────────────────────┘         └─────────────────────┐
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>                  ┌─────▼─────┐                                          ┌─────▼─────┐
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>                  │ rollout-0 │  owns shard = uuid5("rollout-0")         │ rollout-1 │  owns shard = uuid5("rollout-1")
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>                  │   (Pod)   │  single active writer                    │   (Pod)   │  single active writer
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>                  └─────┬─────┘                                          └─────┬─────┘
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>                        │       close-per-append → flush to storage            │
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>                        └───────────────────────┬──────────────────────────────┘
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>                                        ┌────────▼────────┐
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>                                        │  object storage │   ONE Lance dataset:
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>                                        │   (S3 / GCS)    │   base  ∪  _mem_wal/{shard}/generations
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>                                        └─────────────────┘
+</span></code></pre></div>
+<ul>
+<li><strong>One instance = one shard.</strong> The write shard is derived deterministically from the instance id: <code>shard_uuid = uuid_v5(NAMESPACE_OID, instance_id)</code> (<code>derive_shard_id</code> in <code>rollout_store.rs</code>). The same id always maps to the same shard across restarts and reschedules.</li>
+<li><strong>One dataset, many shards.</strong> All instances open the <em>same</em> Lance dataset (same URI on shared object storage) and write disjoint shards of it under the <code>_mem_wal/{shard}/</code> namespace. They do not each get a private dataset.</li>
+<li><strong>Single active writer per shard, two ways:</strong> across instances by distinct shard ids; within an instance because <code>RolloutStore::add</code> takes <code>&amp;mut self</code> and the server holds a per-store write lock, serializing that instance's own appends.</li>
+</ul>
+<h3 id="instance-id-resolution">Instance-id resolution<a class="headerlink" href="#instance-id-resolution" title="Permanent link">&para;</a></h3>
+<p>The server resolves its id in this order (<code>ServerConfig::resolved_instance_id</code> in <code>config.rs</code>):</p>
+<ol>
+<li><code>--instance-id</code> flag or <code>INSTANCE_ID</code> env var, if set;</li>
+<li>otherwise the <code>HOSTNAME</code> env var (a StatefulSet pod's hostname is its stable ordinal name, e.g. <code>rollout-0</code>);</li>
+<li>otherwise a single fixed <code>"default"</code> shard.</li>
+</ol>
+<p>Because Kubernetes sets <code>HOSTNAME</code> to the pod name automatically, a StatefulSet needs <strong>no explicit configuration</strong> to shard correctly — though setting <code>INSTANCE_ID</code> explicitly (§5) makes the intent obvious and is recommended.</p>
+<blockquote>
+<p><strong>The <code>default</code> fallback is single-instance only.</strong> If you run several instances that all resolve to <code>default</code> (or you set the <em>same</em> id on two of them), they contend for one shard and MemWAL fences all but one writer — appends start failing. Multi-instance deployments <strong>must</strong> give each instance a distinct id.</p>
+</blockquote>
+<hr />
+<h2 id="3-why-this-is-correct-single-writer-epoch-fencing">3. Why this is correct: single-writer + epoch fencing<a class="headerlink" href="#3-why-this-is-correct-single-writer-epoch-fencing" title="Permanent link">&para;</a></h2>
+<p>MemWAL is a log-structured writer. Each shard has a manifest chain in object storage, and advancing it is a compare-and-set (<code>PUT-IF-NOT-EXISTS</code> with epoch fencing): if two writers try to extend the same shard concurrently, exactly one wins and the other is fenced and must fail or retry. This is the invariant that makes MemWAL safe without a lock service — <strong>but it assumes a single active writer per shard.</strong></p>
+<p>Consistent hashing, a write-forwarding leader, or a distributed lock are the usual ways to guarantee that. Server-id sharding gets it for free: since the shard id is a pure function of the instance id, and instance ids are distinct and stable, <strong>no two instances ever target the same shard.</strong> The fencing path is never exercised in normal operation; it exists only as a backstop against the misconfiguration in §2 (two writers, one id).</p>
+<p>This is why a <em>dumb</em> load balancer is sufficient. Correctness does not depend on <em>which</em> instance a request lands on — only on each instance owning its own shard. Round-robin, least-connections, random: all fine.</p>
+<hr />
+<h2 id="4-read-your-writes-and-cross-instance-visibility">4. Read-your-writes and cross-instance visibility<a class="headerlink" href="#4-read-your-writes-and-cross-instance-visibility" title="Permanent link">&para;</a></h2>
+<p>Writes are made durable synchronously, so reads need no affinity:</p>
+<ul>
+<li><strong>Write (<code>RolloutStore::add</code>):</strong> append the batch to the shard's memtable (<code>put</code>) and then <code>close()</code> the writer. <code>close()</code> freezes the memtable and blocks until the flush produces a Lance fragment in <code>_mem_wal/{shard}/</code> on object storage. When <code>add</code> returns, the rows are durable — not merely buffered in the writing instance's memory.</li>
+<li><strong>Read (<code>RolloutStore::lsm_scanner</code>):</strong> on every call, list the dataset's shard ids (<code>list_mem_wal_latest_shard_ids</code>), read each shard's latest manifest from object storage (<code>ShardManifestStore::read_latest</code>), and scan the union of the base table and every shard's flushed generations, de-duplicated by <code>id</code>.</li>
+</ul>
+<p>Because the read snapshot is rebuilt from object storage — not from any instance's local state — an instance sees <strong>every</strong> instance's flushed appends, including its own most recent one. A worker can <code>POST</code> a rollout to <code>rollout-0</code> and the learner can immediately <code>GET</code> it via <code>rollout-1</code>; the load balancer may route the two requests anywhere.</p>
+<p>Trade-off: this is the durability-favoring end of the dial. <code>close</code>-per-append flushes each batch to object storage, which bounds throughput per shard by flush latency. High aggregate fan-in is absorbed by <strong>adding shards (instances)</strong>, not by batching many appends into one flush. If you later need higher per-shard throughput, group multiple trajectories into a single <code>add</code> call at the client.</p>
+<hr />
+<h2 id="5-kubernetes-deployment">5. Kubernetes deployment<a class="headerlink" href="#5-kubernetes-deployment" title="Permanent link">&para;</a></h2>
+<p>Two pieces: a <strong>StatefulSet</strong> (stable per-pod ids) and a <strong>Service</strong> (the load-balancer VIP clients talk to). A headless Service backs the StatefulSet's stable DNS; a normal Service fronts it for load balancing.</p>
+<div class="language-yaml highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1"># Headless service: stable network identity for the StatefulSet pods.</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="nt">metadata</span><span class="p">:</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rollout-headless</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="nt">spec</span><span class="p">:</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">  </span><span class="nt">clusterIP</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">None</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">  </span><span class="nt">selector</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> app</span><span class="p">:</span><span class="w"> </span><span class="nv">rollout</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">  </span><span class="nt">ports</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[{</span><span class="nt"> name</span><span class="p">:</span><span class="w"> </span><span class="nv">http</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">3000</span><span class="w"> </span><span class="p p-Indicator">}]</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="nn">---</span>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="c1"># Load-balancer service: the single VIP clients POST/GET against.</span>
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span>
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service</span>
+</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="nt">metadata</span><span class="p">:</span>
+</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rollout</span>
+</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="nt">spec</span><span class="p">:</span>
+</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a><span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">LoadBalancer</span><span class="w">          </span><span class="c1"># or ClusterIP behind an Ingress</span>
+</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="w">  </span><span class="nt">selector</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> app</span><span class="p">:</span><span class="w"> </span><span class="nv">rollout</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</span><span id="__span-1-19"><a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a><span class="w">  </span><span class="nt">ports</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[{</span><span class="nt"> name</span><span class="p">:</span><span class="w"> </span><span class="nv">http</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">80</span><span class="p p-Indicator">,</span><span class="nt"> targetPort</span><span class="p">:</span><span class="w"> </span><span class="nv">3000</span><span class="w"> </span><span class="p p-Indicator">}]</span>
+</span><span id="__span-1-20"><a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a><span class="nn">---</span>
+</span><span id="__span-1-21"><a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">apps/v1</span>
+</span><span id="__span-1-22"><a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">StatefulSet</span>
+</span><span id="__span-1-23"><a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a><span class="nt">metadata</span><span class="p">:</span>
+</span><span id="__span-1-24"><a id="__codelineno-1-24" name="__codelineno-1-24" href="#__codelineno-1-24"></a><span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rollout</span>
+</span><span id="__span-1-25"><a id="__codelineno-1-25" name="__codelineno-1-25" href="#__codelineno-1-25"></a><span class="nt">spec</span><span class="p">:</span>
+</span><span id="__span-1-26"><a id="__codelineno-1-26" name="__codelineno-1-26" href="#__codelineno-1-26"></a><span class="w">  </span><span class="nt">serviceName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rollout-headless</span>
+</span><span id="__span-1-27"><a id="__codelineno-1-27" name="__codelineno-1-27" href="#__codelineno-1-27"></a><span class="w">  </span><span class="nt">replicas</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span><span class="w">                 </span><span class="c1"># rollout-0 .. rollout-3, each owns one shard</span>
+</span><span id="__span-1-28"><a id="__codelineno-1-28" name="__codelineno-1-28" href="#__codelineno-1-28"></a><span class="w">  </span><span class="nt">selector</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> matchLabels</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> app</span><span class="p">:</span><span class="w"> </span><span class="nv">rollout</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</span><span id="__span-1-29"><a id="__codelineno-1-29" name="__codelineno-1-29" href="#__codelineno-1-29"></a><span class="w">  </span><span class="nt">template</span><span class="p">:</span>
+</span><span id="__span-1-30"><a id="__codelineno-1-30" name="__codelineno-1-30" href="#__codelineno-1-30"></a><span class="w">    </span><span class="nt">metadata</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> labels</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> app</span><span class="p">:</span><span class="w"> </span><span class="nv">rollout</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</span><span id="__span-1-31"><a id="__codelineno-1-31" name="__codelineno-1-31" href="#__codelineno-1-31"></a><span class="w">    </span><span class="nt">spec</span><span class="p">:</span>
+</span><span id="__span-1-32"><a id="__codelineno-1-32" name="__codelineno-1-32" href="#__codelineno-1-32"></a><span class="w">      </span><span class="nt">containers</span><span class="p">:</span>
+</span><span id="__span-1-33"><a id="__codelineno-1-33" name="__codelineno-1-33" href="#__codelineno-1-33"></a><span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">server</span>
+</span><span id="__span-1-34"><a id="__codelineno-1-34" name="__codelineno-1-34" href="#__codelineno-1-34"></a><span class="w">          </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">lance-context-server:latest</span>
+</span><span id="__span-1-35"><a id="__codelineno-1-35" name="__codelineno-1-35" href="#__codelineno-1-35"></a><span class="w">          </span><span class="nt">args</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">"--host"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"0.0.0.0"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"--port"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"3000"</span><span class="p p-Indicator">,</span>
+</span><span id="__span-1-36"><a id="__codelineno-1-36" name="__codelineno-1-36" href="#__codelineno-1-36"></a><span class="w">                 </span><span class="s">"--data-dir"</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">"s3://my-bucket/rollouts"</span><span class="p p-Indicator">]</span>
+</span><span id="__span-1-37"><a id="__codelineno-1-37" name="__codelineno-1-37" href="#__codelineno-1-37"></a><span class="w">          </span><span class="nt">env</span><span class="p">:</span>
+</span><span id="__span-1-38"><a id="__codelineno-1-38" name="__codelineno-1-38" href="#__codelineno-1-38"></a><span class="w">            </span><span class="c1"># Stable per-pod id → stable shard. metadata.name is rollout-0,</span>
+</span><span id="__span-1-39"><a id="__codelineno-1-39" name="__codelineno-1-39" href="#__codelineno-1-39"></a><span class="w">            </span><span class="c1"># rollout-1, ... (This is also what HOSTNAME resolves to, so this</span>
+</span><span id="__span-1-40"><a id="__codelineno-1-40" name="__codelineno-1-40" href="#__codelineno-1-40"></a><span class="w">            </span><span class="c1"># block is belt-and-suspenders — but explicit is clearer.)</span>
+</span><span id="__span-1-41"><a id="__codelineno-1-41" name="__codelineno-1-41" href="#__codelineno-1-41"></a><span class="w">            </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">INSTANCE_ID</span>
+</span><span id="__span-1-42"><a id="__codelineno-1-42" name="__codelineno-1-42" href="#__codelineno-1-42"></a><span class="w">              </span><span class="nt">valueFrom</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> fieldRef</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> fieldPath</span><span class="p">:</span><span class="w"> </span><span class="nv">metadata.name</span><span class="w"> </span><span class="p p-Indicator">}</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</span><span id="__span-1-43"><a id="__codelineno-1-43" name="__codelineno-1-43" href="#__codelineno-1-43"></a><span class="w">            </span><span class="c1"># Object-store credentials (example: S3).</span>
+</span><span id="__span-1-44"><a id="__codelineno-1-44" name="__codelineno-1-44" href="#__codelineno-1-44"></a><span class="w">            </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">AWS_REGION</span>
+</span><span id="__span-1-45"><a id="__codelineno-1-45" name="__codelineno-1-45" href="#__codelineno-1-45"></a><span class="w">              </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">us-east-1</span>
+</span><span id="__span-1-46"><a id="__codelineno-1-46" name="__codelineno-1-46" href="#__codelineno-1-46"></a><span class="w">            </span><span class="c1"># AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from a Secret, etc.</span>
+</span><span id="__span-1-47"><a id="__codelineno-1-47" name="__codelineno-1-47" href="#__codelineno-1-47"></a><span class="w">          </span><span class="nt">ports</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[{</span><span class="nt"> containerPort</span><span class="p">:</span><span class="w"> </span><span class="nv">3000</span><span class="w"> </span><span class="p p-Indicator">}]</span>
+</span></code></pre></div>
+<p>Key points:</p>
+<ul>
+<li><strong>Shared dataset on object storage.</strong> <code>--data-dir</code> must point at shared object storage (<code>s3://…</code>, <code>gs://…</code>, …) that <strong>all</strong> pods open at the <strong>same</strong> URI. Rollout datasets live at <code>{data_dir}/{name}.rollout.lance</code>. Do <strong>not</strong> give each pod a private <code>PersistentVolumeClaim</code> for the data dir — that would create N separate datasets, and reads would not union across them. (PVCs for logs/scratch are fine.)</li>
+<li><strong>StatefulSet, not Deployment.</strong> A Deployment assigns random pod names, so ids would not be stable across rollouts. A StatefulSet's ordinal names (<code>rollout-0…</code>) are stable and reused on reschedule.</li>
+<li><strong>Replicas = shard count.</strong> Scaling <code>replicas</code> changes how many shards absorb the ingest fan-in.</li>
+</ul>
+<hr />
+<h2 id="6-scaling-rescheduling-and-failure">6. Scaling, rescheduling, and failure<a class="headerlink" href="#6-scaling-rescheduling-and-failure" title="Permanent link">&para;</a></h2>
+<p>Every append is flushed before <code>add</code> returns and every flushed generation is recorded in the shard manifest on object storage, so instance lifecycle is safe:</p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>What happens</th>
+<th>Safe?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Pod reschedule</strong> (<code>rollout-2</code> dies, K8s recreates it)</td>
+<td>Same pod name → same instance id → same shard uuid. The new pod resumes writing the same physical shard. Nothing was buffered in memory (close-per-append), so nothing is lost.</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><strong>Scale up</strong> (<code>replicas: 4 → 6</code>)</td>
+<td>New pods <code>rollout-4</code>, <code>rollout-5</code> derive fresh distinct shards and begin writing immediately; their rows are visible to all readers on first flush.</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><strong>Scale down</strong> (<code>replicas: 6 → 4</code>)</td>
+<td>Retired pods stop writing. Their already-flushed shard generations remain in object storage and are still read (the shard manifest persists). The shard simply receives no new appends.</td>
+<td>✅</td>
+</tr>
+<tr>
+<td><strong>Two writers, one id</strong> (misconfig: same <code>INSTANCE_ID</code> on two pods, or several <code>default</code>s)</td>
+<td>Both target one shard; MemWAL epoch-fencing lets one win and fails the other. Appends error.</td>
+<td>❌ Avoid — see §2.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="61-bounding-read-amplification-count-triggered-self-merge">6.1 Bounding read amplification: count-triggered self-merge<a class="headerlink" href="#61-bounding-read-amplification-count-triggered-self-merge" title="Permanent link">&para;</a></h3>
+<p>By default (<code>--rollout-merge-after-generations 0</code>) there is no compaction step: rollout rows are append-only (§7), so each <code>add</code> leaves a new flushed generation in <code>_mem_wal/{shard}/</code> and every read unions all of them. That is correct, but read cost grows linearly with the number of un-merged generations — a shard that has absorbed thousands of appends makes every <code>list</code>/<code>get</code> open thousands of generation datasets.</p>
+<p>To bound this, an instance can <strong>merge its own shard back into the base table</strong> on a size trigger. Set <code>--rollout-merge-after-generations N</code> (env <code>ROLLOUT_MERGE_AFTER_GENERATIONS</code>, or <code>RolloutStoreOptions::merge_after_generations</code>). After an append flushes a generation, if this instance's shard has accumulated ≥ N un-merged generations, the same <code>add</code> call synchronously:</p>
+<ol>
+<li>reads up to <code>--rollout-merge-max-generations M</code> flushed generations, oldest first (each is a self-contained Lance dataset under <code>_mem_wal/{shard}/</code>),</li>
+<li>appends their rows to the <strong>base table</strong> (<code>Dataset::append</code>), and</li>
+<li><code>commit_update</code>s the shard manifest to drain <strong>exactly the generations it merged</strong> out of <code>flushed_generations</code> — leaving <code>replay_after_wal_entry_position</code> untouched, so a reopened writer never re-replays already-merged WAL entries.</li>
+</ol>
+<p><strong>Bounding merge memory (<code>--rollout-merge-max-generations</code>, env <code>ROLLOUT_MERGE_MAX_GENERATIONS</code>, default 8).</strong> Step 1 buffers the rows it is about to append <strong>entirely in memory</strong> — <code>Dataset::append</code> takes a synchronous <code>RecordBatchReader</code>, so the batches cannot be streamed lazily off object storage without pushing that IO into the writer's commit window. Peak merge memory is therefore proportional to the bytes in the generations folded by one pass, and rollout rows carry inline <code>binary_payload</code> blobs. Left unbounded, a shard that accumulated many large generations makes a single merge allocate the whole shard at once — the failure mode that OOM-killed workers in production.</p>
+<p><code>M</code> caps that: one pass folds at most <code>M</code> generations and leaves the rest pending for the next pass. This is safe because the step-3 drain is <em>surgical</em> — it removes only the generations actually merged, rather than clearing the list — so a partial merge is just a smaller version of a full one, with the same crash-safety argument below. Repeated passes drain the backlog incrementally at bounded peak memory. <code>M = 0</code> restores the unbounded "fold everything in one pass" behavior.</p>
+<p>Note that <code>M</code> binds independently of <code>N</code>: the time-triggered cleanup path merges at a threshold of 1 generation, so it does not consult <code>N</code> at all, but it is still capped by <code>M</code>.</p>
+<p>This is the "external compactor" path that Lance's MemWAL LSM design explicitly anticipates. Two properties make it safe under the §2 deployment model:</p>
+<ul>
+<li><strong>No fencing of peers.</strong> The merge <code>claim_epoch</code>s the shard, which bumps its writer epoch — but each instance merges <em>only the shard it writes</em>, and that shard has no other live writer to fence (§3). The next <code>add</code> on this instance simply re-claims the now-current epoch.</li>
+<li><strong>Crash-safe by immutability.</strong> Rollout rows are immutable and de-duplicated by <code>id</code> at read time. If a crash lands between step 2 and step 3 (rows in base, manifest not yet drained), a reader sees the rows via <em>both</em> the base table and the still-listed generation and de-dups them — no double counting. The next merge attempt drains the manifest.</li>
+</ul>
+<p><strong>Trade-off — synchronous tail latency.</strong> The merge runs inline, so the single append that crosses the threshold pays the full merge cost while the other N−1 appends stay fast. Choose N to amortize that spike: larger N ⇒ rarer but heavier merges and higher steady-state read amplification; smaller N ⇒ smoother reads but a merge cost folded into more appends. <code>N = 0</code> keeps the pure-accumulation 0.6.0 behavior.</p>
+<p><strong>Measured impact.</strong> A micro-benchmark (<code>bench_merge_read_amplification</code>, single-row appends, local FS, release build) shows how sharply read cost grows with un-merged generations:</p>
+<table>
+<thead>
+<tr>
+<th>Read (<code>list</code> scan of 200 rows)</th>
+<th>Latency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>over <strong>200 un-merged generations</strong></td>
+<td>~654 ms</td>
+</tr>
+<tr>
+<td>after <strong>merge into the base table</strong></td>
+<td>~50 ms</td>
+</tr>
+<tr>
+<td><strong>speedup</strong></td>
+<td><strong>~13×</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The merge itself was cheap here — the slowest single <code>add</code> (which folded the shard on every append at <code>N=1</code>) was ~20 ms. The read amplification is the real cost accumulation avoids; the exact ratio grows with generation count.</p>
+<blockquote>
+<p>This is <em>self-merge</em>, not a coordinator: no cronjob, no admin endpoint, no cross-instance lock. A load balancer can keep spraying appends across instances; each instance independently keeps its own shard compact.</p>
+</blockquote>
+<hr />
+<h2 id="7-reproducibility-is-a-filter-not-a-checkout">7. Reproducibility is a filter, not a <code>checkout</code><a class="headerlink" href="#7-reproducibility-is-a-filter-not-a-checkout" title="Permanent link">&para;</a></h2>
+<p>Rollout rows are <strong>append-only and immutable</strong> — no updates, no deletes. This changes how "exactly which rollouts trained checkpoint N" is answered, versus the earlier atomic-append design:</p>
+<ul>
+<li>MemWAL appends land in the <code>_mem_wal/</code> namespace and <strong>do not advance the base dataset version.</strong> So a per-<code>add</code> <code>checkout(version)</code> no longer isolates a single append the way plain <code>Dataset::append</code> did. <code>RolloutStore::add</code> still returns the base version, but for API compatibility only — not as a per-append snapshot handle.</li>
+<li>Reproducibility is instead a <strong>filter over immutable rows</strong> — e.g. <code>policy_version = 'ckpt-N'</code>, or an explicit set of <code>rollout_id</code>s recorded by the trainer. This is correct precisely <em>because</em> the rows never change: the same filter always selects the same bytes.</li>
+</ul>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">rows</span> <span class="o">=</span> <span class="k">await</span> <span class="n">store</span><span class="o">.</span><span class="n">list</span><span class="p">(</span><span class="n">filters</span><span class="o">=</span><span class="p">{</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="s2">"policy_version"</span><span class="p">:</span> <span class="s2">"ckpt-N"</span><span class="p">,</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="s2">"include_in_training"</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="p">})</span>
+</span></code></pre></div>
+<p><code>checkout</code> remains available for base-table time travel, but is not the mechanism for per-checkpoint rollout reproducibility. (See schema-design §3 and §7 — and note that <code>learner_iteration</code> is likewise a column, not a dataset version.)</p>
+<hr />
+<h2 id="8-artifacts-are-stored-inline-not-blob-offloaded">8. Artifacts are stored inline, not blob-offloaded<a class="headerlink" href="#8-artifacts-are-stored-inline-not-blob-offloaded" title="Permanent link">&para;</a></h2>
+<p>Schema-design §6 anticipated storing <code>binary_payload</code> as a <strong>blob v2 offloaded</strong> column. That is <strong>incompatible with the MemWAL read path</strong>, which is the only read path for rollouts: the LSM scanner has no blob-materialization step, so a blob-v2 (<code>lance-encoding:blob</code>) column reads back as <code>None</code>, and <code>get_blob</code> / the <code>…/blob</code> endpoint would return nothing. This resolves the schema-design §9 open item ("confirm the blob v2 encoding marker against the pinned Lance version"): <strong>do not</strong> use blob-v2 offload for rollout artifacts.</p>
+<p>Artifacts are therefore stored as a plain inline <code>LargeBinary</code> column. The schema-design §2 property — <em>the learner does not pay for artifacts it does not read</em> — is preserved <strong>columnar-ly</strong> rather than by physical offload:</p>
+<ul>
+<li><code>list</code> and <code>get_by_id</code> <strong>project <code>binary_payload</code> out</strong>, so bulk/hot-path scans never materialize artifact bytes.</li>
+<li><code>get_blob</code> (HTTP <code>GET /rollouts/{name}/{id}/blob</code>) projects the column <strong>in</strong> and returns the bytes on demand.</li>
+</ul>
+<p>From a client's perspective the behavior is unchanged: metadata scans are cheap, and artifact bytes are fetched explicitly by id.</p>
+<hr />
+<h2 id="9-operational-checklist">9. Operational checklist<a class="headerlink" href="#9-operational-checklist" title="Permanent link">&para;</a></h2>
+<ul>
+<li>[ ] Deploy as a <strong>StatefulSet</strong> (stable ordinal pod names), not a Deployment.</li>
+<li>[ ] Point <code>--data-dir</code> at <strong>shared object storage</strong> at the <strong>same URI for every pod</strong>; no per-pod PVC for the dataset.</li>
+<li>[ ] Ensure each instance has a <strong>distinct stable id</strong> — <code>INSTANCE_ID</code> from <code>metadata.name</code>, or rely on the pod <code>HOSTNAME</code>. Never reuse an id across live instances.</li>
+<li>[ ] Front the pods with an ordinary round-robin <strong>Service / LB</strong>; no session affinity or consistent hashing required.</li>
+<li>[ ] Size <strong>replicas</strong> to the ingest fan-in; scale up/down freely (§6).</li>
+<li>[ ] For long-running ingest, set <strong><code>--rollout-merge-after-generations N</code></strong> so each instance folds its own shard back into the base table and read cost stays bounded (§6.1). Leave <code>0</code> only for short-lived or low-volume stores.</li>
+<li>[ ] Reproduce training sets by <strong>filtering immutable rows</strong> (e.g. <code>policy_version</code>), not by <code>checkout</code> (§7).</li>
+</ul>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../rollout-schema-design/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Rollout schema</div>
+        </a>
+        <a class="next" href="../rollout-blob-streaming/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Blob streaming</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#1-summary">1. Summary</a>
+      <a class="ld-toc__h2" href="#2-the-sharding-model">2. The sharding model</a>
+      <a class="ld-toc__h3" href="#instance-id-resolution">Instance-id resolution</a>
+      <a class="ld-toc__h2" href="#3-why-this-is-correct-single-writer-epoch-fencing">3. Why this is correct: single-writer + epoch fencing</a>
+      <a class="ld-toc__h2" href="#4-read-your-writes-and-cross-instance-visibility">4. Read-your-writes and cross-instance visibility</a>
+      <a class="ld-toc__h2" href="#5-kubernetes-deployment">5. Kubernetes deployment</a>
+      <a class="ld-toc__h2" href="#6-scaling-rescheduling-and-failure">6. Scaling, rescheduling, and failure</a>
+      <a class="ld-toc__h3" href="#61-bounding-read-amplification-count-triggered-self-merge">6.1 Bounding read amplification: count-triggered self-merge</a>
+      <a class="ld-toc__h2" href="#7-reproducibility-is-a-filter-not-a-checkout">7. Reproducibility is a filter, not a checkout</a>
+      <a class="ld-toc__h2" href="#8-artifacts-are-stored-inline-not-blob-offloaded">8. Artifacts are stored inline, not blob-offloaded</a>
+      <a class="ld-toc__h2" href="#9-operational-checklist">9. Operational checklist</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../../format/">Specification</a>
+        <a href="../../../../format/file/">File format</a>
+        <a href="../../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>

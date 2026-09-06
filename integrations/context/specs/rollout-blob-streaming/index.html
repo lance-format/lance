@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Blob streaming — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/context/specs/rollout-blob-streaming/">
+<link rel="icon" href="../../../../logo/logo.png">
+<link rel="stylesheet" href="../../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../../.." aria-label="Lance">
+      <img src="../../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../../..">Home</a>
+      <a class="ld-toptab" href="../../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../../">Integrations</a>
+      <a class="ld-toptab" href="../../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../../">Overview</a>
+    <a href="../../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../../pytorch/">PyTorch</a>
+    <a href="../../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../../duckdb/">Overview</a>
+    <a href="../../../duckdb/sql/">SQL Reference</a>
+    <a href="../../../duckdb/rest/">REST Namespace</a>
+    <a href="../../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../../huggingface/">Home</a>
+    <a href="../../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../../../spark/">Welcome</a>
+    <a href="../../../spark/install/">Install</a>
+    <a href="../../../spark/config/">Config</a>
+    <a href="../../../spark/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../spark/operations/ddl/create-namespace/">CREATE NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/drop-namespace/">DROP NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../../../spark/operations/ddl/describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../../../spark/operations/ddl/create-table/">CREATE TABLE</a>
+    <a href="../../../spark/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../spark/operations/ddl/describe-table/">DESCRIBE TABLE</a>
+    <a href="../../../spark/operations/ddl/alter-table/">ALTER TABLE</a>
+    <a href="../../../spark/operations/ddl/show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../../../spark/operations/ddl/drop-table/">DROP TABLE</a>
+    <a href="../../../spark/operations/ddl/create-index/">CREATE INDEX</a>
+    <a href="../../../spark/operations/ddl/show-indexes/">SHOW INDEXES</a>
+    <a href="../../../spark/operations/ddl/create-branch/">CREATE BRANCH</a>
+    <a href="../../../spark/operations/ddl/drop-branch/">DROP BRANCH</a>
+    <a href="../../../spark/operations/ddl/show-branches/">SHOW BRANCHES</a>
+    <a href="../../../spark/operations/ddl/create-tag/">CREATE TAG</a>
+    <a href="../../../spark/operations/ddl/drop-tag/">DROP TAG</a>
+    <a href="../../../spark/operations/ddl/show-tags/">SHOW TAGS</a>
+    <a href="../../../spark/operations/ddl/optimize/">OPTIMIZE</a>
+    <a href="../../../spark/operations/ddl/vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../spark/operations/dql/select/">SELECT</a>
+    <a href="../../../spark/operations/dql/fts/">Full-Text Search</a>
+    <a href="../../../spark/operations/dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../../../spark/operations/dql/search/">SEARCH</a>
+    <a href="../../../spark/operations/dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../spark/operations/dml/insert-into/">INSERT INTO</a>
+    <a href="../../../spark/operations/dml/update/">UPDATE SET</a>
+    <a href="../../../spark/operations/dml/delete/">DELETE FROM</a>
+    <a href="../../../spark/operations/dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../../../spark/operations/dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../../../spark/vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../../ray/">Welcome</a>
+    <a href="../../../ray/read/">Read</a>
+    <a href="../../../ray/write/">Write</a>
+    <a href="../../../ray/distributed-indexing/">Index</a>
+    <a href="../../../ray/compaction/">Compaction</a>
+    <a href="../../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../../trino/">Welcome</a>
+    <a href="../../../trino/install/">Install</a>
+    <a href="../../../trino/config/">Config</a>
+    <a href="../../../trino/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../../trino/operations/data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../../trino/operations/ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../../trino/operations/ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../../trino/operations/ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../../trino/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../../trino/operations/ddl/describe-table/">DESCRIBE</a>
+    <a href="../../../trino/operations/ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../../trino/operations/ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../../trino/operations/dml/insert/">INSERT</a>
+    <a href="../../../trino/operations/dml/update/">UPDATE</a>
+    <a href="../../../trino/operations/dml/delete/">DELETE</a>
+    <a href="../../../trino/operations/dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../../trino/operations/dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../guide/quickstart/">Quickstart</a>
+    <a href="../../guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../guide/storage/">Storage backends</a>
+    <a href="../../guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../rollout-schema-design/">Rollout schema</a>
+    <a href="../rollout-deployment/">Rollout deployment</a>
+    <a class="active" href="./">Blob streaming</a>
+    <a href="../datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../../design/partitioned-namespace/">Partitioned namespace</a>
+    <a href="../../design/auto-dream/">Auto-dream</a>
+    <a href="../../design/using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Lance Context</span>
+        <span>/</span><span>Specs</span>
+        <span>/</span><b>Blob streaming</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="rollout-artifact-blobs-memory-behavior-and-streaming-roadmap">Rollout artifact blobs: memory behavior and streaming roadmap<a class="headerlink" href="#rollout-artifact-blobs-memory-behavior-and-streaming-roadmap" title="Permanent link">&para;</a></h1>
+<p>Status: describes the memory characteristics of the rollout <code>binary_payload</code>
+("blob") path after the download-streaming + budget work, and proposes the next
+(larger) step toward true streaming storage. The first three items below are
+<strong>implemented</strong>; the fourth (§4) is a <strong>proposal</strong>, not yet built.</p>
+<h2 id="background-where-blob-bytes-live-in-memory">Background: where blob bytes live in memory<a class="headerlink" href="#background-where-blob-bytes-live-in-memory" title="Permanent link">&para;</a></h2>
+<p><code>binary_payload</code> is stored as a plain <strong>inline <code>LargeBinary</code></strong> column, not a
+lance blob-v2 (<code>lance-encoding:blob</code>) offloaded column. This is deliberate:
+rollout reads go through the MemWAL LSM scanner, which has no blob-materialization
+step, so a blob-v2 column reads back as <code>None</code> there. Inline storage is currently
+the only encoding that round-trips (see the module docs in
+<code>crates/lance-context-core/src/rollout_store.rs</code>).</p>
+<p>The consequence is that <strong>every blob is fully materialized in RAM</strong> at each hop:</p>
+<ul>
+<li><strong>Upload</strong>: the whole request body is buffered — JSON base64 (~+33% expansion)
+  via <code>axum::body::to_bytes</code>, or each multipart part via <code>field.bytes()</code> — then
+  appended into a <code>LargeBinaryBuilder</code> whose <code>finish()</code> copies it into a
+  contiguous Arrow buffer.</li>
+<li><strong>Download</strong>: <code>get_blob</code> locates the row, then <code>take_rows</code> materializes the
+  <code>binary_payload</code> Arrow buffer and <code>.to_vec()</code> copies it into an owned <code>Vec&lt;u8&gt;</code>
+  (≈2× the blob size at that instant).</li>
+</ul>
+<p>With a 1 GiB per-request ceiling (<code>MAX_ROLLOUT_UPLOAD_BYTES</code>) and no concurrency
+cap, N concurrent large requests needed ≈<code>2 × size × N</code> bytes and could OOM the
+worker.</p>
+<h2 id="1-streaming-downloads-implemented">1. Streaming downloads (implemented)<a class="headerlink" href="#1-streaming-downloads-implemented" title="Permanent link">&para;</a></h2>
+<p>Both blob-serving handlers — worker <code>fetch_rollout_blob</code> and master
+<code>download_experiment_blob</code> — now send the payload as a <strong>chunked</strong> body
+(<code>blob_stream_body</code>, 256 KiB frames) instead of one <code>Body::from(Vec&lt;u8&gt;)</code> frame.
+Frames are refcounted <code>Bytes</code> slices of the one backing allocation (no per-frame
+copy). This removes the extra full-blob copy the HTTP send path would otherwise
+hold and lets a slow client apply backpressure at frame granularity rather than
+after the entire payload is queued. A <code>Content-Length</code> header is still set so the
+response is not chunked-transfer on the wire when the length is known.</p>
+<blockquote>
+<p>Note: this does <strong>not</strong> remove the single in-RAM <code>Vec&lt;u8&gt;</code> produced by
+<code>get_blob</code> — the bytes are still fully read from storage first. True
+read-from-storage-in-frames requires §4.</p>
+</blockquote>
+<h2 id="2-single-scan-record-blob-for-downloads-implemented">2. Single-scan record + blob for downloads (implemented)<a class="headerlink" href="#2-single-scan-record-blob-for-downloads-implemented" title="Permanent link">&para;</a></h2>
+<p><code>download_experiment_blob</code> previously did <code>get_by_id</code> (a full-row point scan) and
+then <code>get_blob</code> (a second point scan over the same shard) — two scans to serve
+one download. <code>RolloutStore::get_record_with_blob</code> folds these into one
+base-first scan that returns <code>(record, payload)</code> together, halving the scan work
+on the master download path. It keeps the base-table-first fast path and the
+NotFound-tolerant WAL fallback semantics.</p>
+<h2 id="3-in-flight-blob-byte-budget-implemented">3. In-flight blob-byte budget (implemented)<a class="headerlink" href="#3-in-flight-blob-byte-budget-implemented" title="Permanent link">&para;</a></h2>
+<p>A process-wide admission budget (<code>BlobBudget</code> in the worker's <code>AppState</code>, sized by
+<code>ROLLOUT_MAX_INFLIGHT_BLOB_BYTES</code>, <code>0</code> = disabled) bounds the total blob payload
+held in memory across concurrent uploads and downloads:</p>
+<ul>
+<li><strong>Uploads</strong> reserve their declared <code>Content-Length</code> before the body is
+  buffered; the reservation is held for the whole handler.</li>
+<li><strong>Downloads</strong> reserve the payload size once known and hold the reservation
+  inside the streamed body, so a slow client keeps the bytes accounted for until
+  the last frame flushes.</li>
+<li>When the budget cannot admit a request it is rejected with <strong><code>503</code> <code>OVERLOADED</code></strong>
+  (a <code>rollout_blob_budget_rejections_total</code> metric is incremented) instead of
+  proceeding to allocate. Backpressure moves to the edge, not the allocator.</li>
+</ul>
+<p>The budget bounds <em>concurrency</em>, not maximum blob size: a lone request larger
+than the whole budget is admitted when the instance is otherwise idle, so a
+single big blob never permanently 503s against its own limit.</p>
+<p>Operational guidance: size <code>ROLLOUT_MAX_INFLIGHT_BLOB_BYTES</code> to a fraction of the
+pod's memory limit that leaves headroom for the ≈2× transient copy per in-flight
+download plus base overhead — e.g. for a 4 GiB pod, a budget of ~1–1.5 GiB.</p>
+<h2 id="4-true-streaming-storage-proposal-not-implemented">4. True streaming storage (proposal — NOT implemented)<a class="headerlink" href="#4-true-streaming-storage-proposal-not-implemented" title="Permanent link">&para;</a></h2>
+<p>Items 1–3 bound and smooth memory but every blob is still fully resident once per
+request. Eliminating that requires storing/reading blobs in a form that supports
+<strong>ranged, chunked I/O</strong>, i.e. lance blob-v2 offloaded columns + <code>BlobFile</code> range
+reads.</p>
+<h3 id="the-blocker">The blocker<a class="headerlink" href="#the-blocker" title="Permanent link">&para;</a></h3>
+<p>The rollout read path is the MemWAL LSM scanner, which unions the base table with
+flushed WAL generations and has <strong>no blob-materialization step</strong> — a
+<code>lance-encoding:blob</code> column reads back as <code>None</code> through it. So we cannot simply
+flip <code>binary_payload</code> to blob-v2 without the scanner learning to resolve blob
+descriptors.</p>
+<h3 id="proposed-approach-two-sub-steps-each-shippable">Proposed approach (two sub-steps, each shippable)<a class="headerlink" href="#proposed-approach-two-sub-steps-each-shippable" title="Permanent link">&para;</a></h3>
+<ol>
+<li>
+<p><strong>Reader-side: <code>BlobFile</code> range read for the base table.</strong>
+   Keep <code>binary_payload</code> inline in the WAL (small, short-lived generations) but,
+   for the <em>base table</em>, store artifact bytes as a blob-v2 column. Change
+   <code>get_blob</code>/<code>get_record_with_blob</code> so that on a base-table hit it opens the row's
+   blob descriptor and returns a <code>BlobFile</code>/reader that streams ranges from object
+   storage, wiring that reader into <code>blob_stream_body</code> (frames pulled from storage
+   on demand rather than from an in-RAM <code>Vec</code>). WAL-fallback rows stay inline (they
+   are the un-merged tail and are folded into the base on merge). This gives
+   streaming reads for the common already-merged case — the 99% path — without
+   touching the LSM union.</p>
+</li>
+<li>
+<p><strong>Writer-side: streamed ingest into the blob column.</strong>
+   Replace the "buffer whole body → <code>LargeBinaryBuilder</code>" ingest with a streamed
+   writer that appends blob bytes to the blob-v2 column in frames as the request
+   body arrives (multipart parts stream naturally; JSON base64 would need a
+   streaming base64 decoder or be deprecated in favor of multipart for large
+   blobs). Upload peak memory drops from O(blob) to O(frame).</p>
+</li>
+</ol>
+<h3 id="effort-risk">Effort / risk<a class="headerlink" href="#effort-risk" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Sub-step 1 is a core (<code>rollout_store.rs</code>) change plus a lance API dependency on
+  <code>BlobFile</code> range reads; medium effort, low blast radius (reads only, base-only).</li>
+<li>Sub-step 2 touches the ingest handler and the write path; higher effort and
+  needs care around the atomicity guarantees of a rollout append (currently one
+  <code>RolloutStore::add</code>).</li>
+<li>Merge/compaction must learn to carry blob-v2 columns from WAL-inline to
+  base-offloaded; verify the LSM merge path preserves the descriptors.</li>
+</ul>
+<h3 id="recommendation">Recommendation<a class="headerlink" href="#recommendation" title="Permanent link">&para;</a></h3>
+<p>Ship §1–3 now (this PR). Schedule sub-step 1 (base-table <code>BlobFile</code> streaming
+reads) next as its own PR — it delivers the bulk of the read-side memory win —
+and treat sub-step 2 (streamed ingest) as a follow-up once the read path proves
+out.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../rollout-deployment/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Rollout deployment</div>
+        </a>
+        <a class="next" href="../datagen-checkpoint-schema/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Datagen checkpoints</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#background-where-blob-bytes-live-in-memory">Background: where blob bytes live in memory</a>
+      <a class="ld-toc__h2" href="#1-streaming-downloads-implemented">1. Streaming downloads (implemented)</a>
+      <a class="ld-toc__h2" href="#2-single-scan-record-blob-for-downloads-implemented">2. Single-scan record + blob for downloads (implemented)</a>
+      <a class="ld-toc__h2" href="#3-in-flight-blob-byte-budget-implemented">3. In-flight blob-byte budget (implemented)</a>
+      <a class="ld-toc__h2" href="#4-true-streaming-storage-proposal-not-implemented">4. True streaming storage (proposal — NOT implemented)</a>
+      <a class="ld-toc__h3" href="#the-blocker">The blocker</a>
+      <a class="ld-toc__h3" href="#proposed-approach-two-sub-steps-each-shippable">Proposed approach (two sub-steps, each shippable)</a>
+      <a class="ld-toc__h3" href="#effort-risk">Effort / risk</a>
+      <a class="ld-toc__h3" href="#recommendation">Recommendation</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../../format/">Specification</a>
+        <a href="../../../../format/file/">File format</a>
+        <a href="../../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../../quickstart/">Getting started</a>
+        <a href="../../../../guide/read_and_write/">User guide</a>
+        <a href="../../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../../..";</script>
+<script src="../../../../assets/site.js" defer></script>
+</body>
+</html>

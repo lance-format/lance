@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Config — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/integrations/spark/config/">
+<link rel="icon" href="../../../logo/logo.png">
+<link rel="stylesheet" href="../../../assets/tokens.css">
+<link rel="stylesheet" href="../../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../../.." aria-label="Lance">
+      <img src="../../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../../..">Home</a>
+      <a class="ld-toptab" href="../../../quickstart/">Getting Started</a>
+      <a class="ld-toptab" href="../../../guide/read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../../format/">Specification</a>
+      <a class="ld-toptab" href="../../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab active" href="../../">Integrations</a>
+      <a class="ld-toptab" href="../../../community/">Community</a>
+      <a class="ld-toptab" href="../../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      Integrations
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Integrations</div>
+    <a href="../../">Overview</a>
+    <a href="../../datafusion/">Apache DataFusion</a>
+    <a href="https://github.com/lance-format/pglance" target="_blank" rel="noopener">PostgreSQL <span class="ext">↗</span></a>
+    <a href="../../pytorch/">PyTorch</a>
+    <a href="../../tensorflow/">TensorFlow</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DuckDB</div>
+    <a href="../../duckdb/">Overview</a>
+    <a href="../../duckdb/sql/">SQL Reference</a>
+    <a href="../../duckdb/rest/">REST Namespace</a>
+    <a href="../../duckdb/cloud/">Cloud Storage</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Huggingface</div>
+    <a href="../../huggingface/">Home</a>
+    <a href="../../huggingface/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Apache Spark</div>
+    <a href="../">Welcome</a>
+    <a href="../install/">Install</a>
+    <a class="active" href="./">Config</a>
+    <a href="../performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../operations/ddl/create-namespace/">CREATE NAMESPACE</a>
+    <a href="../operations/ddl/drop-namespace/">DROP NAMESPACE</a>
+    <a href="../operations/ddl/show-namespaces/">SHOW NAMESPACES</a>
+    <a href="../operations/ddl/describe-namespace/">DESCRIBE NAMESPACE</a>
+    <a href="../operations/ddl/create-table/">CREATE TABLE</a>
+    <a href="../operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../operations/ddl/describe-table/">DESCRIBE TABLE</a>
+    <a href="../operations/ddl/alter-table/">ALTER TABLE</a>
+    <a href="../operations/ddl/show-tblproperties/">SHOW TBLPROPERTIES</a>
+    <a href="../operations/ddl/drop-table/">DROP TABLE</a>
+    <a href="../operations/ddl/create-index/">CREATE INDEX</a>
+    <a href="../operations/ddl/show-indexes/">SHOW INDEXES</a>
+    <a href="../operations/ddl/create-branch/">CREATE BRANCH</a>
+    <a href="../operations/ddl/drop-branch/">DROP BRANCH</a>
+    <a href="../operations/ddl/show-branches/">SHOW BRANCHES</a>
+    <a href="../operations/ddl/create-tag/">CREATE TAG</a>
+    <a href="../operations/ddl/drop-tag/">DROP TAG</a>
+    <a href="../operations/ddl/show-tags/">SHOW TAGS</a>
+    <a href="../operations/ddl/optimize/">OPTIMIZE</a>
+    <a href="../operations/ddl/vacuum/">VACUUM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../operations/dql/select/">SELECT</a>
+    <a href="../operations/dql/fts/">Full-Text Search</a>
+    <a href="../operations/dql/vector-search/">VECTOR_SEARCH</a>
+    <a href="../operations/dql/search/">SEARCH</a>
+    <a href="../operations/dql/hybrid-search/">HYBRID_SEARCH</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../operations/dml/insert-into/">INSERT INTO</a>
+    <a href="../operations/dml/update/">UPDATE SET</a>
+    <a href="../operations/dml/delete/">DELETE FROM</a>
+    <a href="../operations/dml/add-columns/">ADD COLUMNS FROM</a>
+    <a href="../operations/dml/update-columns/">UPDATE COLUMNS FROM</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Vendors</div>
+    <a href="../vendors/databricks/">Databricks</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Ray</div>
+    <a href="../../ray/">Welcome</a>
+    <a href="../../ray/read/">Read</a>
+    <a href="../../ray/write/">Write</a>
+    <a href="../../ray/distributed-indexing/">Index</a>
+    <a href="../../ray/compaction/">Compaction</a>
+    <a href="../../ray/data-evolution/">Data Evolution</a>
+    <a href="../../ray/examples/">Examples</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Trino</div>
+    <a href="../../trino/">Welcome</a>
+    <a href="../../trino/install/">Install</a>
+    <a href="../../trino/config/">Config</a>
+    <a href="../../trino/performance/">Performance</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Operations</div>
+    <a href="../../trino/operations/data-types/">Data Types</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DDL</div>
+    <a href="../../trino/operations/ddl/show-schemas/">SHOW SCHEMAS</a>
+    <a href="../../trino/operations/ddl/create-schema/">CREATE SCHEMA</a>
+    <a href="../../trino/operations/ddl/drop-schema/">DROP SCHEMA</a>
+    <a href="../../trino/operations/ddl/show-tables/">SHOW TABLES</a>
+    <a href="../../trino/operations/ddl/describe-table/">DESCRIBE</a>
+    <a href="../../trino/operations/ddl/create-table/">CREATE TABLE / REPLACE TABLE</a>
+    <a href="../../trino/operations/ddl/drop-table/">DROP TABLE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DML</div>
+    <a href="../../trino/operations/dml/insert/">INSERT</a>
+    <a href="../../trino/operations/dml/update/">UPDATE</a>
+    <a href="../../trino/operations/dml/delete/">DELETE</a>
+    <a href="../../trino/operations/dml/merge/">MERGE</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">DQL</div>
+    <a href="../../trino/operations/dql/select/">SELECT</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Lance Context</div>
+    <a href="../../context/">Home</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Guide</div>
+    <a href="../../context/guide/quickstart/">Quickstart</a>
+    <a href="../../context/guide/rollouts/">Rollouts (RolloutDB)</a>
+    <a href="../../context/guide/storage/">Storage backends</a>
+    <a href="../../context/guide/development/">Development</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Specs</div>
+    <a href="../../context/specs/rollout-schema-design/">Rollout schema</a>
+    <a href="../../context/specs/rollout-deployment/">Rollout deployment</a>
+    <a href="../../context/specs/rollout-blob-streaming/">Blob streaming</a>
+    <a href="../../context/specs/datagen-checkpoint-schema/">Datagen checkpoints</a>
+  </div><div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Design</div>
+    <a href="../../context/design/partitioned-namespace/">Partitioned namespace</a>
+    <a href="../../context/design/auto-dream/">Auto-dream</a>
+    <a href="../../context/design/using-datagen-store/">Using the datagen store</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>Integrations</span>
+        <span>/</span><span>Apache Spark</span>
+        <span>/</span><b>Config</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="configuration">Configuration<a class="headerlink" href="#configuration" title="Permanent link">&para;</a></h1>
+<p>Spark DSV2 catalog integrates with Lance through <a href="https://github.com/lance-format/lance-namespace">Lance Namespace</a>.</p>
+<h2 id="spark-sql-extensions">Spark SQL Extensions<a class="headerlink" href="#spark-sql-extensions" title="Permanent link">&para;</a></h2>
+<p>Lance provides SQL extensions that add additional functionality beyond standard Spark SQL. To enable these extensions, configure your Spark application with:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="1:5"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><input id="__tabbed_1_3" name="__tabbed_1" type="radio" /><input id="__tabbed_1_4" name="__tabbed_1" type="radio" /><input id="__tabbed_1_5" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">PySpark</label><label for="__tabbed_1_2">Scala</label><label for="__tabbed_1_3">Java</label><label for="__tabbed_1_4">Spark Shell</label><label for="__tabbed_1_5">Spark Submit</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>    <span class="o">.</span><span class="n">appName</span><span class="p">(</span><span class="s2">"lance-example"</span><span class="p">)</span> \
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.extensions"</span><span class="p">,</span> <span class="s2">"org.lance.spark.extensions.LanceSparkSessionExtensions"</span><span class="p">)</span> \
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-scala highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kd">val</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nc">SparkSession</span><span class="p">.</span><span class="n">builder</span><span class="p">()</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">    </span><span class="p">.</span><span class="n">appName</span><span class="p">(</span><span class="s">"lance-example"</span><span class="p">)</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.extensions"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.extensions.LanceSparkSessionExtensions"</span><span class="p">)</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">    </span><span class="p">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-java highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">SparkSession</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SparkSession</span><span class="p">.</span><span class="na">builder</span><span class="p">()</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">    </span><span class="p">.</span><span class="na">appName</span><span class="p">(</span><span class="s">"lance-example"</span><span class="p">)</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.extensions"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.extensions.LanceSparkSessionExtensions"</span><span class="p">)</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">    </span><span class="p">.</span><span class="na">getOrCreate</span><span class="p">();</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>spark-shell<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span>--packages<span class="w"> </span>org.lance:lance-spark-bundle-3.5_2.12:0.4.0<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.extensions<span class="o">=</span>org.lance.spark.extensions.LanceSparkSessionExtensions
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>spark-submit<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span>--packages<span class="w"> </span>org.lance:lance-spark-bundle-3.5_2.12:0.4.0<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.extensions<span class="o">=</span>org.lance.spark.extensions.LanceSparkSessionExtensions<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">  </span>your-application.jar
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="features-requiring-extensions">Features Requiring Extensions<a class="headerlink" href="#features-requiring-extensions" title="Permanent link">&para;</a></h3>
+<p>The following features require the Lance Spark SQL extension to be enabled:</p>
+<ul>
+<li><a href="../operations/dql/vector-search/">VECTOR_SEARCH</a> - Run vector similarity search through Lance namespace execution</li>
+<li><a href="../operations/dql/search/">SEARCH</a> - Run full-text search through Lance namespace execution</li>
+<li><a href="../operations/dql/hybrid-search/">HYBRID_SEARCH</a> - Combine vector and full-text search with reciprocal rank fusion</li>
+<li><a href="../operations/dql/fts/">Full-Text Search</a> - <code>lance_match</code>, <code>lance_match_phrase</code>, and <code>lance_multi_match</code> SQL functions for querying FTS indexes</li>
+<li><a href="../operations/dml/add-columns/">ADD COLUMNS with backfill</a> - Add new columns and backfill existing rows with data</li>
+<li><a href="../operations/dml/update-columns/">UPDATE COLUMNS with backfill</a> - Update existing columns using data from a source</li>
+<li><a href="../operations/ddl/optimize/">OPTIMIZE</a> - Compact table fragments for improved query performance</li>
+<li><a href="../operations/ddl/vacuum/">VACUUM</a> - Remove old versions and reclaim storage space</li>
+</ul>
+<h2 id="basic-setup">Basic Setup<a class="headerlink" href="#basic-setup" title="Permanent link">&para;</a></h2>
+<p>Configure Spark with the <code>LanceNamespaceSparkCatalog</code> by setting the appropriate Spark catalog implementation
+and namespace-specific options:</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>spark.sql.catalog.{name}</code></td>
+<td>String</td>
+<td>✓</td>
+<td>Set to <code>org.lance.spark.LanceNamespaceSparkCatalog</code></td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.impl</code></td>
+<td>String</td>
+<td>✓</td>
+<td>Namespace implementation, short name like <code>dir</code>, <code>rest</code>, <code>hive3</code>, <code>glue</code> or full Java implementation class</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.storage.*</code></td>
+<td>-</td>
+<td>✗</td>
+<td>Lance IO storage options. See <a href="https://lance.org/guide/object_store">Lance Object Store Guide</a> for all available options.</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.index_cache_backend</code></td>
+<td>String</td>
+<td>✗</td>
+<td>Registered native index cache backend URI, for example <code>moka://?capacity=6442450944</code>.</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.metadata_cache_backend</code></td>
+<td>String</td>
+<td>✗</td>
+<td>Registered native metadata cache backend URI, for example <code>moka://?capacity=1073741824</code>.</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.single_level_ns</code></td>
+<td>Boolean</td>
+<td>✗</td>
+<td>Enable single-level mode with virtual "default" namespace. Default: <code>false</code>. See <a href="#note-on-namespace-levels">Note on Namespace Levels</a>.</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.parent</code></td>
+<td>String</td>
+<td>✗</td>
+<td>Parent prefix for multi-level namespaces. See <a href="#note-on-namespace-levels">Note on Namespace Levels</a>.</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.parent_delimiter</code></td>
+<td>String</td>
+<td>✗</td>
+<td>Delimiter for parent prefix (default: <code>.</code>). See <a href="#note-on-namespace-levels">Note on Namespace Levels</a>.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="cache-backends">Cache Backends<a class="headerlink" href="#cache-backends" title="Permanent link">&para;</a></h2>
+<p>Each Spark catalog owns an isolated Lance <code>Session</code>. Select registered native cache backends for
+the index and metadata cache independently by setting backend URIs:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance"</span><span class="p">,</span> <span class="s2">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span> \
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.impl"</span><span class="p">,</span> <span class="s2">"dir"</span><span class="p">)</span> \
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.root"</span><span class="p">,</span> <span class="s2">"/path/to/lance/database"</span><span class="p">)</span> \
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>        <span class="s2">"spark.sql.catalog.lance.index_cache_backend"</span><span class="p">,</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>        <span class="s2">"moka://?capacity=6442450944"</span><span class="p">,</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="p">)</span> \
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>        <span class="s2">"spark.sql.catalog.lance.metadata_cache_backend"</span><span class="p">,</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>        <span class="s2">"moka://?capacity=1073741824"</span><span class="p">,</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>    <span class="p">)</span> \
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+<p><code>moka</code> is registered by Lance Core. Other backend kinds must already be registered by the native
+Lance runtime packaged with the application. These options select a registered backend; they do
+not register a Java cache implementation.</p>
+<p>The connector serializes the backend URIs with its read and write options, so driver and executor
+JVMs create equivalent process-local sessions. A catalog's session is fixed when that catalog is
+first used. To switch backends in one Spark application, configure a second catalog:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.memory_lance"</span><span class="p">,</span> <span class="s2">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span> \
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.memory_lance.impl"</span><span class="p">,</span> <span class="s2">"dir"</span><span class="p">)</span> \
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.memory_lance.root"</span><span class="p">,</span> <span class="s2">"/path/to/lance/database"</span><span class="p">)</span> \
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>        <span class="s2">"spark.sql.catalog.memory_lance.index_cache_backend"</span><span class="p">,</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>        <span class="s2">"moka://?capacity=6442450944"</span><span class="p">,</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>    <span class="p">)</span> \
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.other_lance"</span><span class="p">,</span> <span class="s2">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span> \
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.other_lance.impl"</span><span class="p">,</span> <span class="s2">"dir"</span><span class="p">)</span> \
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.other_lance.root"</span><span class="p">,</span> <span class="s2">"/path/to/lance/database"</span><span class="p">)</span> \
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span>
+</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a>        <span class="s2">"spark.sql.catalog.other_lance.index_cache_backend"</span><span class="p">,</span>
+</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a>        <span class="s2">"other://?option=value"</span><span class="p">,</span>
+</span><span id="__span-6-15"><a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a>    <span class="p">)</span> \
+</span><span id="__span-6-16"><a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+<p>For structured Java SDK configuration, build a <code>Session</code> with <code>CacheBackendConfig</code> and register it
+before the catalog is first used:</p>
+<div class="language-java highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">org.lance.CacheBackendConfig</span><span class="p">;</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">org.lance.Session</span><span class="p">;</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="kn">import</span><span class="w"> </span><span class="nn">org.lance.spark.LanceRuntime</span><span class="p">;</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="n">Session</span><span class="w"> </span><span class="n">session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Session</span><span class="p">.</span><span class="na">builder</span><span class="p">()</span>
+</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">    </span><span class="p">.</span><span class="na">indexCacheBackend</span><span class="p">(</span>
+</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="w">        </span><span class="n">CacheBackendConfig</span><span class="p">.</span><span class="na">builder</span><span class="p">(</span><span class="s">"moka"</span><span class="p">)</span>
+</span><span id="__span-7-8"><a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a><span class="w">            </span><span class="p">.</span><span class="na">option</span><span class="p">(</span><span class="s">"capacity"</span><span class="p">,</span><span class="w"> </span><span class="s">"6442450944"</span><span class="p">)</span>
+</span><span id="__span-7-9"><a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="w">            </span><span class="p">.</span><span class="na">build</span><span class="p">())</span>
+</span><span id="__span-7-10"><a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="w">    </span><span class="p">.</span><span class="na">metadataCacheBackend</span><span class="p">(</span>
+</span><span id="__span-7-11"><a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a><span class="w">        </span><span class="n">CacheBackendConfig</span><span class="p">.</span><span class="na">builder</span><span class="p">(</span><span class="s">"moka"</span><span class="p">)</span>
+</span><span id="__span-7-12"><a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a><span class="w">            </span><span class="p">.</span><span class="na">option</span><span class="p">(</span><span class="s">"capacity"</span><span class="p">,</span><span class="w"> </span><span class="s">"1073741824"</span><span class="p">)</span>
+</span><span id="__span-7-13"><a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a><span class="w">            </span><span class="p">.</span><span class="na">build</span><span class="p">())</span>
+</span><span id="__span-7-14"><a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="w">    </span><span class="p">.</span><span class="na">build</span><span class="p">();</span>
+</span><span id="__span-7-15"><a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a><span class="n">LanceRuntime</span><span class="p">.</span><span class="na">registerSession</span><span class="p">(</span><span class="s">"lance"</span><span class="p">,</span><span class="w"> </span><span class="n">session</span><span class="p">);</span>
+</span></code></pre></div>
+<p>Registration transfers session ownership to <code>LanceRuntime</code>; do not close it directly. In cluster
+mode, programmatic registration must run in every JVM that accesses Lance. Catalog URI options are
+recommended when the same configuration should be distributed automatically.</p>
+<p>The corresponding environment fallbacks are <code>LANCE_INDEX_CACHE_BACKEND</code> and
+<code>LANCE_METADATA_CACHE_BACKEND</code>. Per-catalog URIs take precedence over environment backend URIs.
+Backend URIs take precedence over the legacy <code>LANCE_INDEX_CACHE_SIZE</code> and
+<code>LANCE_METADATA_CACHE_SIZE</code> settings for the same cache tier.</p>
+<h2 id="opentelemetry-metrics">OpenTelemetry Metrics<a class="headerlink" href="#opentelemetry-metrics" title="Permanent link">&para;</a></h2>
+<p>Lance Spark can bridge Lance's native Java metrics into the JVM OpenTelemetry
+pipeline. Enable it with:</p>
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>--conf<span class="w"> </span>spark.lance.otel.enabled<span class="o">=</span><span class="nb">true</span>
+</span></code></pre></div>
+<p>You can also set the JVM system property
+<code>-Dspark.lance.otel.enabled=true</code>, or set
+<code>LANCE_SPARK_OTEL_ENABLED=true</code> in each JVM environment. When multiple sources
+are set, Spark configuration takes precedence over the JVM system property,
+which takes precedence over the environment variable. Values must be <code>true</code> or
+<code>false</code> (case-insensitive); invalid values disable the bridge and produce a
+warning.</p>
+<p>The bridge uses the OpenTelemetry <code>GlobalOpenTelemetry</code> meter provider, so
+configure your exporter, resource, and reader with the standard OpenTelemetry
+Java SDK settings. Spark driver and executor JVMs are independent processes;
+set the Spark conf or environment variable for every process that should emit
+Lance metrics.</p>
+<h2 id="example-namespace-implementations">Example Namespace Implementations<a class="headerlink" href="#example-namespace-implementations" title="Permanent link">&para;</a></h2>
+<h3 id="directory-namespace">Directory Namespace<a class="headerlink" href="#directory-namespace" title="Permanent link">&para;</a></h3>
+<div class="tabbed-set tabbed-alternate" data-tabs="2:4"><input checked="checked" id="__tabbed_2_1" name="__tabbed_2" type="radio" /><input id="__tabbed_2_2" name="__tabbed_2" type="radio" /><input id="__tabbed_2_3" name="__tabbed_2" type="radio" /><input id="__tabbed_2_4" name="__tabbed_2" type="radio" /><div class="tabbed-labels"><label for="__tabbed_2_1">Scala</label><label for="__tabbed_2_2">Java</label><label for="__tabbed_2_3">Spark Shell</label><label for="__tabbed_2_4">Spark Submit</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-scala highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">import</span><span class="w"> </span><span class="nn">org</span><span class="p">.</span><span class="nn">apache</span><span class="p">.</span><span class="nn">spark</span><span class="p">.</span><span class="nn">sql</span><span class="p">.</span><span class="nc">SparkSession</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="kd">val</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nc">SparkSession</span><span class="p">.</span><span class="n">builder</span><span class="p">()</span>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="w">    </span><span class="p">.</span><span class="n">appName</span><span class="p">(</span><span class="s">"lance-dir-example"</span><span class="p">)</span>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.impl"</span><span class="p">,</span><span class="w"> </span><span class="s">"dir"</span><span class="p">)</span>
+</span><span id="__span-9-7"><a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.root"</span><span class="p">,</span><span class="w"> </span><span class="s">"/path/to/lance/database"</span><span class="p">)</span>
+</span><span id="__span-9-8"><a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a><span class="w">    </span><span class="p">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-java highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">org.apache.spark.sql.SparkSession</span><span class="p">;</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="n">SparkSession</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SparkSession</span><span class="p">.</span><span class="na">builder</span><span class="p">()</span>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="w">    </span><span class="p">.</span><span class="na">appName</span><span class="p">(</span><span class="s">"lance-dir-example"</span><span class="p">)</span>
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span>
+</span><span id="__span-10-6"><a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.impl"</span><span class="p">,</span><span class="w"> </span><span class="s">"dir"</span><span class="p">)</span>
+</span><span id="__span-10-7"><a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.root"</span><span class="p">,</span><span class="w"> </span><span class="s">"/path/to/lance/database"</span><span class="p">)</span>
+</span><span id="__span-10-8"><a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="w">    </span><span class="p">.</span><span class="na">getOrCreate</span><span class="p">();</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>spark-shell<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="w">  </span>--packages<span class="w"> </span>org.lance:lance-spark-bundle-3.5_2.12:0.4.0<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance<span class="o">=</span>org.lance.spark.LanceNamespaceSparkCatalog<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.impl<span class="o">=</span>dir<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.root<span class="o">=</span>/path/to/lance/database
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>spark-submit<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">  </span>--packages<span class="w"> </span>org.lance:lance-spark-bundle-3.5_2.12:0.4.0<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance<span class="o">=</span>org.lance.spark.LanceNamespaceSparkCatalog<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.impl<span class="o">=</span>dir<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.root<span class="o">=</span>/path/to/lance/database<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-12-6"><a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="w">  </span>your-application.jar
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h4 id="directory-configuration-parameters">Directory Configuration Parameters<a class="headerlink" href="#directory-configuration-parameters" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>spark.sql.catalog.{name}.root</code></td>
+<td>✗</td>
+<td>Storage root location (default: current directory)</td>
+</tr>
+</tbody>
+</table>
+<p>Example settings:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="3:3"><input checked="checked" id="__tabbed_3_1" name="__tabbed_3" type="radio" /><input id="__tabbed_3_2" name="__tabbed_3" type="radio" /><input id="__tabbed_3_3" name="__tabbed_3" type="radio" /><div class="tabbed-labels"><label for="__tabbed_3_1">Local Storage</label><label for="__tabbed_3_2">S3</label><label for="__tabbed_3_3">MinIO</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">pyspark.sql</span><span class="w"> </span><span class="kn">import</span> <span class="n">SparkSession</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>    <span class="o">.</span><span class="n">appName</span><span class="p">(</span><span class="s2">"lance-dir-local-example"</span><span class="p">)</span> \
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance"</span><span class="p">,</span> <span class="s2">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span> \
+</span><span id="__span-13-6"><a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.impl"</span><span class="p">,</span> <span class="s2">"dir"</span><span class="p">)</span> \
+</span><span id="__span-13-7"><a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.root"</span><span class="p">,</span> <span class="s2">"/path/to/lance/database"</span><span class="p">)</span> \
+</span><span id="__span-13-8"><a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">pyspark.sql</span><span class="w"> </span><span class="kn">import</span> <span class="n">SparkSession</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>    <span class="o">.</span><span class="n">appName</span><span class="p">(</span><span class="s2">"lance-dir-minio-example"</span><span class="p">)</span> \
+</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance"</span><span class="p">,</span> <span class="s2">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span> \
+</span><span id="__span-14-6"><a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.impl"</span><span class="p">,</span> <span class="s2">"dir"</span><span class="p">)</span> \
+</span><span id="__span-14-7"><a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.root"</span><span class="p">,</span> <span class="s2">"s3://bucket-name/lance-data"</span><span class="p">)</span> \
+</span><span id="__span-14-8"><a id="__codelineno-14-8" name="__codelineno-14-8" href="#__codelineno-14-8"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.storage.access_key_id"</span><span class="p">,</span> <span class="s2">"abc"</span><span class="p">)</span> \
+</span><span id="__span-14-9"><a id="__codelineno-14-9" name="__codelineno-14-9" href="#__codelineno-14-9"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.storage.secret_access_key"</span><span class="p">,</span> <span class="s2">"def"</span><span class="p">)</span>
+</span><span id="__span-14-10"><a id="__codelineno-14-10" name="__codelineno-14-10" href="#__codelineno-14-10"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.storage.session_token"</span><span class="p">,</span> <span class="s2">"ghi"</span><span class="p">)</span> \
+</span><span id="__span-14-11"><a id="__codelineno-14-11" name="__codelineno-14-11" href="#__codelineno-14-11"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">pyspark.sql</span><span class="w"> </span><span class="kn">import</span> <span class="n">SparkSession</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a>    <span class="o">.</span><span class="n">appName</span><span class="p">(</span><span class="s2">"lance-dir-minio-example"</span><span class="p">)</span> \
+</span><span id="__span-15-5"><a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance"</span><span class="p">,</span> <span class="s2">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span> \
+</span><span id="__span-15-6"><a id="__codelineno-15-6" name="__codelineno-15-6" href="#__codelineno-15-6"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.impl"</span><span class="p">,</span> <span class="s2">"dir"</span><span class="p">)</span> \
+</span><span id="__span-15-7"><a id="__codelineno-15-7" name="__codelineno-15-7" href="#__codelineno-15-7"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.root"</span><span class="p">,</span> <span class="s2">"s3://bucket-name/lance-data"</span><span class="p">)</span> \
+</span><span id="__span-15-8"><a id="__codelineno-15-8" name="__codelineno-15-8" href="#__codelineno-15-8"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.storage.endpoint"</span><span class="p">,</span> <span class="s2">"http://minio:9000"</span><span class="p">)</span> \
+</span><span id="__span-15-9"><a id="__codelineno-15-9" name="__codelineno-15-9" href="#__codelineno-15-9"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.storage.aws_allow_http"</span><span class="p">,</span> <span class="s2">"true"</span><span class="p">)</span> \
+</span><span id="__span-15-10"><a id="__codelineno-15-10" name="__codelineno-15-10" href="#__codelineno-15-10"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.storage.access_key_id"</span><span class="p">,</span> <span class="s2">"admin"</span><span class="p">)</span> \
+</span><span id="__span-15-11"><a id="__codelineno-15-11" name="__codelineno-15-11" href="#__codelineno-15-11"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.storage.secret_access_key"</span><span class="p">,</span> <span class="s2">"password"</span><span class="p">)</span> \
+</span><span id="__span-15-12"><a id="__codelineno-15-12" name="__codelineno-15-12" href="#__codelineno-15-12"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h3 id="rest-namespace">REST Namespace<a class="headerlink" href="#rest-namespace" title="Permanent link">&para;</a></h3>
+<p>Here we use LanceDB Cloud as an example of the REST namespace:</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="4:5"><input checked="checked" id="__tabbed_4_1" name="__tabbed_4" type="radio" /><input id="__tabbed_4_2" name="__tabbed_4" type="radio" /><input id="__tabbed_4_3" name="__tabbed_4" type="radio" /><input id="__tabbed_4_4" name="__tabbed_4" type="radio" /><input id="__tabbed_4_5" name="__tabbed_4" type="radio" /><div class="tabbed-labels"><label for="__tabbed_4_1">PySpark</label><label for="__tabbed_4_2">Scala</label><label for="__tabbed_4_3">Java</label><label for="__tabbed_4_4">Spark Shell</label><label for="__tabbed_4_5">Spark Submit</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>    <span class="o">.</span><span class="n">appName</span><span class="p">(</span><span class="s2">"lance-rest-example"</span><span class="p">)</span> \
+</span><span id="__span-16-3"><a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance"</span><span class="p">,</span> <span class="s2">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span> \
+</span><span id="__span-16-4"><a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.impl"</span><span class="p">,</span> <span class="s2">"rest"</span><span class="p">)</span> \
+</span><span id="__span-16-5"><a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.headers.x-api-key"</span><span class="p">,</span> <span class="s2">"your-api-key"</span><span class="p">)</span> \
+</span><span id="__span-16-6"><a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.headers.x-lancedb-database"</span><span class="p">,</span> <span class="s2">"your-database"</span><span class="p">)</span> \
+</span><span id="__span-16-7"><a id="__codelineno-16-7" name="__codelineno-16-7" href="#__codelineno-16-7"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.uri"</span><span class="p">,</span> <span class="s2">"https://your-database.us-east-1.api.lancedb.com"</span><span class="p">)</span> \
+</span><span id="__span-16-8"><a id="__codelineno-16-8" name="__codelineno-16-8" href="#__codelineno-16-8"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-scala highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="kd">val</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nc">SparkSession</span><span class="p">.</span><span class="n">builder</span><span class="p">()</span>
+</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="w">    </span><span class="p">.</span><span class="n">appName</span><span class="p">(</span><span class="s">"lance-rest-example"</span><span class="p">)</span>
+</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span>
+</span><span id="__span-17-4"><a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.impl"</span><span class="p">,</span><span class="w"> </span><span class="s">"rest"</span><span class="p">)</span>
+</span><span id="__span-17-5"><a id="__codelineno-17-5" name="__codelineno-17-5" href="#__codelineno-17-5"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.headers.x-api-key"</span><span class="p">,</span><span class="w"> </span><span class="s">"your-api-key"</span><span class="p">)</span>
+</span><span id="__span-17-6"><a id="__codelineno-17-6" name="__codelineno-17-6" href="#__codelineno-17-6"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.headers.x-lancedb-database"</span><span class="p">,</span><span class="w"> </span><span class="s">"your-database"</span><span class="p">)</span>
+</span><span id="__span-17-7"><a id="__codelineno-17-7" name="__codelineno-17-7" href="#__codelineno-17-7"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.uri"</span><span class="p">,</span><span class="w"> </span><span class="s">"https://your-database.us-east-1.api.lancedb.com"</span><span class="p">)</span>
+</span><span id="__span-17-8"><a id="__codelineno-17-8" name="__codelineno-17-8" href="#__codelineno-17-8"></a><span class="w">    </span><span class="p">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-java highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="n">SparkSession</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SparkSession</span><span class="p">.</span><span class="na">builder</span><span class="p">()</span>
+</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="w">    </span><span class="p">.</span><span class="na">appName</span><span class="p">(</span><span class="s">"lance-rest-example"</span><span class="p">)</span>
+</span><span id="__span-18-3"><a id="__codelineno-18-3" name="__codelineno-18-3" href="#__codelineno-18-3"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span>
+</span><span id="__span-18-4"><a id="__codelineno-18-4" name="__codelineno-18-4" href="#__codelineno-18-4"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.impl"</span><span class="p">,</span><span class="w"> </span><span class="s">"rest"</span><span class="p">)</span>
+</span><span id="__span-18-5"><a id="__codelineno-18-5" name="__codelineno-18-5" href="#__codelineno-18-5"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.headers.x-api-key"</span><span class="p">,</span><span class="w"> </span><span class="s">"your-api-key"</span><span class="p">)</span>
+</span><span id="__span-18-6"><a id="__codelineno-18-6" name="__codelineno-18-6" href="#__codelineno-18-6"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.headers.x-lancedb-database"</span><span class="p">,</span><span class="w"> </span><span class="s">"your-database"</span><span class="p">)</span>
+</span><span id="__span-18-7"><a id="__codelineno-18-7" name="__codelineno-18-7" href="#__codelineno-18-7"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.uri"</span><span class="p">,</span><span class="w"> </span><span class="s">"https://your-database.us-east-1.api.lancedb.com"</span><span class="p">)</span>
+</span><span id="__span-18-8"><a id="__codelineno-18-8" name="__codelineno-18-8" href="#__codelineno-18-8"></a><span class="w">    </span><span class="p">.</span><span class="na">getOrCreate</span><span class="p">();</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-19-1"><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a>spark-shell<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-19-2"><a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a><span class="w">  </span>--packages<span class="w"> </span>org.lance:lance-spark-bundle-3.5_2.12:0.4.0<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-19-3"><a id="__codelineno-19-3" name="__codelineno-19-3" href="#__codelineno-19-3"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance<span class="o">=</span>org.lance.spark.LanceNamespaceSparkCatalog<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-19-4"><a id="__codelineno-19-4" name="__codelineno-19-4" href="#__codelineno-19-4"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.impl<span class="o">=</span>rest<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-19-5"><a id="__codelineno-19-5" name="__codelineno-19-5" href="#__codelineno-19-5"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.headers.x-api-key<span class="o">=</span>your-api-key<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-19-6"><a id="__codelineno-19-6" name="__codelineno-19-6" href="#__codelineno-19-6"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.headers.x-lancedb-database<span class="o">=</span>your-database<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-19-7"><a id="__codelineno-19-7" name="__codelineno-19-7" href="#__codelineno-19-7"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.uri<span class="o">=</span>https://your-database.us-east-1.api.lancedb.com
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-20-1"><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a>spark-submit<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-20-2"><a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a><span class="w">  </span>--packages<span class="w"> </span>org.lance:lance-spark-bundle-3.5_2.12:0.4.0<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-20-3"><a id="__codelineno-20-3" name="__codelineno-20-3" href="#__codelineno-20-3"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance<span class="o">=</span>org.lance.spark.LanceNamespaceSparkCatalog<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-20-4"><a id="__codelineno-20-4" name="__codelineno-20-4" href="#__codelineno-20-4"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.impl<span class="o">=</span>rest<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-20-5"><a id="__codelineno-20-5" name="__codelineno-20-5" href="#__codelineno-20-5"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.headers.x-api-key<span class="o">=</span>your-api-key<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-20-6"><a id="__codelineno-20-6" name="__codelineno-20-6" href="#__codelineno-20-6"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.headers.x-lancedb-database<span class="o">=</span>your-database<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-20-7"><a id="__codelineno-20-7" name="__codelineno-20-7" href="#__codelineno-20-7"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.uri<span class="o">=</span>https://your-database.us-east-1.api.lancedb.com<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-20-8"><a id="__codelineno-20-8" name="__codelineno-20-8" href="#__codelineno-20-8"></a><span class="w">  </span>your-application.jar
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h4 id="rest-configuration-parameters">REST Configuration Parameters<a class="headerlink" href="#rest-configuration-parameters" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>spark.sql.catalog.{name}.uri</code></td>
+<td>✓</td>
+<td>REST API endpoint URL (e.g., <code>https://api.lancedb.com</code>)</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.headers.*</code></td>
+<td>✗</td>
+<td>HTTP headers for authentication (e.g., <code>headers.x-api-key</code>)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="aws-glue-namespace">AWS Glue Namespace<a class="headerlink" href="#aws-glue-namespace" title="Permanent link">&para;</a></h3>
+<p>AWS Glue is Amazon's managed metastore service that provides a centralized catalog for your data assets.</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="5:3"><input checked="checked" id="__tabbed_5_1" name="__tabbed_5" type="radio" /><input id="__tabbed_5_2" name="__tabbed_5" type="radio" /><input id="__tabbed_5_3" name="__tabbed_5" type="radio" /><div class="tabbed-labels"><label for="__tabbed_5_1">PySpark</label><label for="__tabbed_5_2">Scala</label><label for="__tabbed_5_3">Java</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-21-1"><a id="__codelineno-21-1" name="__codelineno-21-1" href="#__codelineno-21-1"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-21-2"><a id="__codelineno-21-2" name="__codelineno-21-2" href="#__codelineno-21-2"></a>    <span class="o">.</span><span class="n">appName</span><span class="p">(</span><span class="s2">"lance-glue-example"</span><span class="p">)</span> \
+</span><span id="__span-21-3"><a id="__codelineno-21-3" name="__codelineno-21-3" href="#__codelineno-21-3"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance"</span><span class="p">,</span> <span class="s2">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span> \
+</span><span id="__span-21-4"><a id="__codelineno-21-4" name="__codelineno-21-4" href="#__codelineno-21-4"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.impl"</span><span class="p">,</span> <span class="s2">"glue"</span><span class="p">)</span> \
+</span><span id="__span-21-5"><a id="__codelineno-21-5" name="__codelineno-21-5" href="#__codelineno-21-5"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.region"</span><span class="p">,</span> <span class="s2">"us-east-1"</span><span class="p">)</span> \
+</span><span id="__span-21-6"><a id="__codelineno-21-6" name="__codelineno-21-6" href="#__codelineno-21-6"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.catalog_id"</span><span class="p">,</span> <span class="s2">"123456789012"</span><span class="p">)</span> \
+</span><span id="__span-21-7"><a id="__codelineno-21-7" name="__codelineno-21-7" href="#__codelineno-21-7"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.access_key_id"</span><span class="p">,</span> <span class="s2">"your-access-key"</span><span class="p">)</span> \
+</span><span id="__span-21-8"><a id="__codelineno-21-8" name="__codelineno-21-8" href="#__codelineno-21-8"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.secret_access_key"</span><span class="p">,</span> <span class="s2">"your-secret-key"</span><span class="p">)</span> \
+</span><span id="__span-21-9"><a id="__codelineno-21-9" name="__codelineno-21-9" href="#__codelineno-21-9"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.root"</span><span class="p">,</span> <span class="s2">"s3://your-bucket/lance"</span><span class="p">)</span> \
+</span><span id="__span-21-10"><a id="__codelineno-21-10" name="__codelineno-21-10" href="#__codelineno-21-10"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-scala highlight"><pre><span></span><code><span id="__span-22-1"><a id="__codelineno-22-1" name="__codelineno-22-1" href="#__codelineno-22-1"></a><span class="kd">val</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nc">SparkSession</span><span class="p">.</span><span class="n">builder</span><span class="p">()</span>
+</span><span id="__span-22-2"><a id="__codelineno-22-2" name="__codelineno-22-2" href="#__codelineno-22-2"></a><span class="w">    </span><span class="p">.</span><span class="n">appName</span><span class="p">(</span><span class="s">"lance-glue-example"</span><span class="p">)</span>
+</span><span id="__span-22-3"><a id="__codelineno-22-3" name="__codelineno-22-3" href="#__codelineno-22-3"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span>
+</span><span id="__span-22-4"><a id="__codelineno-22-4" name="__codelineno-22-4" href="#__codelineno-22-4"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.impl"</span><span class="p">,</span><span class="w"> </span><span class="s">"glue"</span><span class="p">)</span>
+</span><span id="__span-22-5"><a id="__codelineno-22-5" name="__codelineno-22-5" href="#__codelineno-22-5"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.region"</span><span class="p">,</span><span class="w"> </span><span class="s">"us-east-1"</span><span class="p">)</span>
+</span><span id="__span-22-6"><a id="__codelineno-22-6" name="__codelineno-22-6" href="#__codelineno-22-6"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.catalog_id"</span><span class="p">,</span><span class="w"> </span><span class="s">"123456789012"</span><span class="p">)</span>
+</span><span id="__span-22-7"><a id="__codelineno-22-7" name="__codelineno-22-7" href="#__codelineno-22-7"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.access_key_id"</span><span class="p">,</span><span class="w"> </span><span class="s">"your-access-key"</span><span class="p">)</span>
+</span><span id="__span-22-8"><a id="__codelineno-22-8" name="__codelineno-22-8" href="#__codelineno-22-8"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.secret_access_key"</span><span class="p">,</span><span class="w"> </span><span class="s">"your-secret-key"</span><span class="p">)</span>
+</span><span id="__span-22-9"><a id="__codelineno-22-9" name="__codelineno-22-9" href="#__codelineno-22-9"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.root"</span><span class="p">,</span><span class="w"> </span><span class="s">"s3://your-bucket/lance"</span><span class="p">)</span>
+</span><span id="__span-22-10"><a id="__codelineno-22-10" name="__codelineno-22-10" href="#__codelineno-22-10"></a><span class="w">    </span><span class="p">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-java highlight"><pre><span></span><code><span id="__span-23-1"><a id="__codelineno-23-1" name="__codelineno-23-1" href="#__codelineno-23-1"></a><span class="n">SparkSession</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SparkSession</span><span class="p">.</span><span class="na">builder</span><span class="p">()</span>
+</span><span id="__span-23-2"><a id="__codelineno-23-2" name="__codelineno-23-2" href="#__codelineno-23-2"></a><span class="w">    </span><span class="p">.</span><span class="na">appName</span><span class="p">(</span><span class="s">"lance-glue-example"</span><span class="p">)</span>
+</span><span id="__span-23-3"><a id="__codelineno-23-3" name="__codelineno-23-3" href="#__codelineno-23-3"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span>
+</span><span id="__span-23-4"><a id="__codelineno-23-4" name="__codelineno-23-4" href="#__codelineno-23-4"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.impl"</span><span class="p">,</span><span class="w"> </span><span class="s">"glue"</span><span class="p">)</span>
+</span><span id="__span-23-5"><a id="__codelineno-23-5" name="__codelineno-23-5" href="#__codelineno-23-5"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.region"</span><span class="p">,</span><span class="w"> </span><span class="s">"us-east-1"</span><span class="p">)</span>
+</span><span id="__span-23-6"><a id="__codelineno-23-6" name="__codelineno-23-6" href="#__codelineno-23-6"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.catalog_id"</span><span class="p">,</span><span class="w"> </span><span class="s">"123456789012"</span><span class="p">)</span>
+</span><span id="__span-23-7"><a id="__codelineno-23-7" name="__codelineno-23-7" href="#__codelineno-23-7"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.access_key_id"</span><span class="p">,</span><span class="w"> </span><span class="s">"your-access-key"</span><span class="p">)</span>
+</span><span id="__span-23-8"><a id="__codelineno-23-8" name="__codelineno-23-8" href="#__codelineno-23-8"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.secret_access_key"</span><span class="p">,</span><span class="w"> </span><span class="s">"your-secret-key"</span><span class="p">)</span>
+</span><span id="__span-23-9"><a id="__codelineno-23-9" name="__codelineno-23-9" href="#__codelineno-23-9"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.root"</span><span class="p">,</span><span class="w"> </span><span class="s">"s3://your-bucket/lance"</span><span class="p">)</span>
+</span><span id="__span-23-10"><a id="__codelineno-23-10" name="__codelineno-23-10" href="#__codelineno-23-10"></a><span class="w">    </span><span class="p">.</span><span class="na">getOrCreate</span><span class="p">();</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h4 id="additional-dependencies">Additional Dependencies<a class="headerlink" href="#additional-dependencies" title="Permanent link">&para;</a></h4>
+<p>Using the Glue namespace requires additional dependencies beyond the main Lance Spark bundle:
+- <code>lance-namespace-glue</code>: Lance Glue namespace implementation
+- AWS Glue related dependencies: The easiest way is to use <code>software.amazon.awssdk:bundle</code> which includes all necessary AWS SDK components, though you can specify individual dependencies if preferred</p>
+<p>Example with Spark Shell:
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-24-1"><a id="__codelineno-24-1" name="__codelineno-24-1" href="#__codelineno-24-1"></a>spark-shell<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-24-2"><a id="__codelineno-24-2" name="__codelineno-24-2" href="#__codelineno-24-2"></a><span class="w">  </span>--packages<span class="w"> </span>org.lance:lance-spark-bundle-3.5_2.12:0.4.0,org.lance:lance-namespace-glue:0.3.0,software.amazon.awssdk:bundle:2.20.0<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-24-3"><a id="__codelineno-24-3" name="__codelineno-24-3" href="#__codelineno-24-3"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance<span class="o">=</span>org.lance.spark.LanceNamespaceSparkCatalog<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-24-4"><a id="__codelineno-24-4" name="__codelineno-24-4" href="#__codelineno-24-4"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.impl<span class="o">=</span>glue<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-24-5"><a id="__codelineno-24-5" name="__codelineno-24-5" href="#__codelineno-24-5"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.root<span class="o">=</span>s3://your-bucket/lance
+</span></code></pre></div></p>
+<h4 id="glue-configuration-parameters">Glue Configuration Parameters<a class="headerlink" href="#glue-configuration-parameters" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>spark.sql.catalog.{name}.region</code></td>
+<td>✗</td>
+<td>AWS region for Glue operations (e.g., <code>us-east-1</code>). If not specified, derives from the default AWS region chain</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.catalog_id</code></td>
+<td>✗</td>
+<td>Glue catalog ID, defaults to the AWS account ID of the caller</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.endpoint</code></td>
+<td>✗</td>
+<td>Custom Glue service endpoint for connecting to compatible metastores</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.access_key_id</code></td>
+<td>✗</td>
+<td>AWS access key ID for static credentials</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.secret_access_key</code></td>
+<td>✗</td>
+<td>AWS secret access key for static credentials</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.session_token</code></td>
+<td>✗</td>
+<td>AWS session token for temporary credentials</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.root</code></td>
+<td>✗</td>
+<td>Storage root location (e.g., <code>s3://bucket/path</code>), defaults to current directory</td>
+</tr>
+</tbody>
+</table>
+<h3 id="apache-hive-namespace">Apache Hive Namespace<a class="headerlink" href="#apache-hive-namespace" title="Permanent link">&para;</a></h3>
+<p>Lance supports both Hive 2.x and Hive 3.x metastores for metadata management.</p>
+<h4 id="hive-3x-namespace">Hive 3.x Namespace<a class="headerlink" href="#hive-3x-namespace" title="Permanent link">&para;</a></h4>
+<div class="tabbed-set tabbed-alternate" data-tabs="6:3"><input checked="checked" id="__tabbed_6_1" name="__tabbed_6" type="radio" /><input id="__tabbed_6_2" name="__tabbed_6" type="radio" /><input id="__tabbed_6_3" name="__tabbed_6" type="radio" /><div class="tabbed-labels"><label for="__tabbed_6_1">PySpark</label><label for="__tabbed_6_2">Scala</label><label for="__tabbed_6_3">Java</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-25-1"><a id="__codelineno-25-1" name="__codelineno-25-1" href="#__codelineno-25-1"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-25-2"><a id="__codelineno-25-2" name="__codelineno-25-2" href="#__codelineno-25-2"></a>    <span class="o">.</span><span class="n">appName</span><span class="p">(</span><span class="s2">"lance-hive3-example"</span><span class="p">)</span> \
+</span><span id="__span-25-3"><a id="__codelineno-25-3" name="__codelineno-25-3" href="#__codelineno-25-3"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance"</span><span class="p">,</span> <span class="s2">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span> \
+</span><span id="__span-25-4"><a id="__codelineno-25-4" name="__codelineno-25-4" href="#__codelineno-25-4"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.impl"</span><span class="p">,</span> <span class="s2">"hive3"</span><span class="p">)</span> \
+</span><span id="__span-25-5"><a id="__codelineno-25-5" name="__codelineno-25-5" href="#__codelineno-25-5"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.parent"</span><span class="p">,</span> <span class="s2">"hive"</span><span class="p">)</span> \
+</span><span id="__span-25-6"><a id="__codelineno-25-6" name="__codelineno-25-6" href="#__codelineno-25-6"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.hadoop.hive.metastore.uris"</span><span class="p">,</span> <span class="s2">"thrift://metastore:9083"</span><span class="p">)</span> \
+</span><span id="__span-25-7"><a id="__codelineno-25-7" name="__codelineno-25-7" href="#__codelineno-25-7"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.client.pool-size"</span><span class="p">,</span> <span class="s2">"5"</span><span class="p">)</span> \
+</span><span id="__span-25-8"><a id="__codelineno-25-8" name="__codelineno-25-8" href="#__codelineno-25-8"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.root"</span><span class="p">,</span> <span class="s2">"hdfs://namenode:8020/lance"</span><span class="p">)</span> \
+</span><span id="__span-25-9"><a id="__codelineno-25-9" name="__codelineno-25-9" href="#__codelineno-25-9"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-scala highlight"><pre><span></span><code><span id="__span-26-1"><a id="__codelineno-26-1" name="__codelineno-26-1" href="#__codelineno-26-1"></a><span class="kd">val</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nc">SparkSession</span><span class="p">.</span><span class="n">builder</span><span class="p">()</span>
+</span><span id="__span-26-2"><a id="__codelineno-26-2" name="__codelineno-26-2" href="#__codelineno-26-2"></a><span class="w">    </span><span class="p">.</span><span class="n">appName</span><span class="p">(</span><span class="s">"lance-hive3-example"</span><span class="p">)</span>
+</span><span id="__span-26-3"><a id="__codelineno-26-3" name="__codelineno-26-3" href="#__codelineno-26-3"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span>
+</span><span id="__span-26-4"><a id="__codelineno-26-4" name="__codelineno-26-4" href="#__codelineno-26-4"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.impl"</span><span class="p">,</span><span class="w"> </span><span class="s">"hive3"</span><span class="p">)</span>
+</span><span id="__span-26-5"><a id="__codelineno-26-5" name="__codelineno-26-5" href="#__codelineno-26-5"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.parent"</span><span class="p">,</span><span class="w"> </span><span class="s">"hive"</span><span class="p">)</span>
+</span><span id="__span-26-6"><a id="__codelineno-26-6" name="__codelineno-26-6" href="#__codelineno-26-6"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.hadoop.hive.metastore.uris"</span><span class="p">,</span><span class="w"> </span><span class="s">"thrift://metastore:9083"</span><span class="p">)</span>
+</span><span id="__span-26-7"><a id="__codelineno-26-7" name="__codelineno-26-7" href="#__codelineno-26-7"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.client.pool-size"</span><span class="p">,</span><span class="w"> </span><span class="s">"5"</span><span class="p">)</span>
+</span><span id="__span-26-8"><a id="__codelineno-26-8" name="__codelineno-26-8" href="#__codelineno-26-8"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.root"</span><span class="p">,</span><span class="w"> </span><span class="s">"hdfs://namenode:8020/lance"</span><span class="p">)</span>
+</span><span id="__span-26-9"><a id="__codelineno-26-9" name="__codelineno-26-9" href="#__codelineno-26-9"></a><span class="w">    </span><span class="p">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-java highlight"><pre><span></span><code><span id="__span-27-1"><a id="__codelineno-27-1" name="__codelineno-27-1" href="#__codelineno-27-1"></a><span class="n">SparkSession</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SparkSession</span><span class="p">.</span><span class="na">builder</span><span class="p">()</span>
+</span><span id="__span-27-2"><a id="__codelineno-27-2" name="__codelineno-27-2" href="#__codelineno-27-2"></a><span class="w">    </span><span class="p">.</span><span class="na">appName</span><span class="p">(</span><span class="s">"lance-hive3-example"</span><span class="p">)</span>
+</span><span id="__span-27-3"><a id="__codelineno-27-3" name="__codelineno-27-3" href="#__codelineno-27-3"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span>
+</span><span id="__span-27-4"><a id="__codelineno-27-4" name="__codelineno-27-4" href="#__codelineno-27-4"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.impl"</span><span class="p">,</span><span class="w"> </span><span class="s">"hive3"</span><span class="p">)</span>
+</span><span id="__span-27-5"><a id="__codelineno-27-5" name="__codelineno-27-5" href="#__codelineno-27-5"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.parent"</span><span class="p">,</span><span class="w"> </span><span class="s">"hive"</span><span class="p">)</span>
+</span><span id="__span-27-6"><a id="__codelineno-27-6" name="__codelineno-27-6" href="#__codelineno-27-6"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.hadoop.hive.metastore.uris"</span><span class="p">,</span><span class="w"> </span><span class="s">"thrift://metastore:9083"</span><span class="p">)</span>
+</span><span id="__span-27-7"><a id="__codelineno-27-7" name="__codelineno-27-7" href="#__codelineno-27-7"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.client.pool-size"</span><span class="p">,</span><span class="w"> </span><span class="s">"5"</span><span class="p">)</span>
+</span><span id="__span-27-8"><a id="__codelineno-27-8" name="__codelineno-27-8" href="#__codelineno-27-8"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.root"</span><span class="p">,</span><span class="w"> </span><span class="s">"hdfs://namenode:8020/lance"</span><span class="p">)</span>
+</span><span id="__span-27-9"><a id="__codelineno-27-9" name="__codelineno-27-9" href="#__codelineno-27-9"></a><span class="w">    </span><span class="p">.</span><span class="na">getOrCreate</span><span class="p">();</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h4 id="hive-2x-namespace">Hive 2.x Namespace<a class="headerlink" href="#hive-2x-namespace" title="Permanent link">&para;</a></h4>
+<div class="tabbed-set tabbed-alternate" data-tabs="7:3"><input checked="checked" id="__tabbed_7_1" name="__tabbed_7" type="radio" /><input id="__tabbed_7_2" name="__tabbed_7" type="radio" /><input id="__tabbed_7_3" name="__tabbed_7" type="radio" /><div class="tabbed-labels"><label for="__tabbed_7_1">PySpark</label><label for="__tabbed_7_2">Scala</label><label for="__tabbed_7_3">Java</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-28-1"><a id="__codelineno-28-1" name="__codelineno-28-1" href="#__codelineno-28-1"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-28-2"><a id="__codelineno-28-2" name="__codelineno-28-2" href="#__codelineno-28-2"></a>    <span class="o">.</span><span class="n">appName</span><span class="p">(</span><span class="s2">"lance-hive2-example"</span><span class="p">)</span> \
+</span><span id="__span-28-3"><a id="__codelineno-28-3" name="__codelineno-28-3" href="#__codelineno-28-3"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance"</span><span class="p">,</span> <span class="s2">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span> \
+</span><span id="__span-28-4"><a id="__codelineno-28-4" name="__codelineno-28-4" href="#__codelineno-28-4"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.impl"</span><span class="p">,</span> <span class="s2">"hive2"</span><span class="p">)</span> \
+</span><span id="__span-28-5"><a id="__codelineno-28-5" name="__codelineno-28-5" href="#__codelineno-28-5"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.hadoop.hive.metastore.uris"</span><span class="p">,</span> <span class="s2">"thrift://metastore:9083"</span><span class="p">)</span> \
+</span><span id="__span-28-6"><a id="__codelineno-28-6" name="__codelineno-28-6" href="#__codelineno-28-6"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.client.pool-size"</span><span class="p">,</span> <span class="s2">"3"</span><span class="p">)</span> \
+</span><span id="__span-28-7"><a id="__codelineno-28-7" name="__codelineno-28-7" href="#__codelineno-28-7"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.root"</span><span class="p">,</span> <span class="s2">"hdfs://namenode:8020/lance"</span><span class="p">)</span> \
+</span><span id="__span-28-8"><a id="__codelineno-28-8" name="__codelineno-28-8" href="#__codelineno-28-8"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-scala highlight"><pre><span></span><code><span id="__span-29-1"><a id="__codelineno-29-1" name="__codelineno-29-1" href="#__codelineno-29-1"></a><span class="kd">val</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nc">SparkSession</span><span class="p">.</span><span class="n">builder</span><span class="p">()</span>
+</span><span id="__span-29-2"><a id="__codelineno-29-2" name="__codelineno-29-2" href="#__codelineno-29-2"></a><span class="w">    </span><span class="p">.</span><span class="n">appName</span><span class="p">(</span><span class="s">"lance-hive2-example"</span><span class="p">)</span>
+</span><span id="__span-29-3"><a id="__codelineno-29-3" name="__codelineno-29-3" href="#__codelineno-29-3"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span>
+</span><span id="__span-29-4"><a id="__codelineno-29-4" name="__codelineno-29-4" href="#__codelineno-29-4"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.impl"</span><span class="p">,</span><span class="w"> </span><span class="s">"hive2"</span><span class="p">)</span>
+</span><span id="__span-29-5"><a id="__codelineno-29-5" name="__codelineno-29-5" href="#__codelineno-29-5"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.hadoop.hive.metastore.uris"</span><span class="p">,</span><span class="w"> </span><span class="s">"thrift://metastore:9083"</span><span class="p">)</span>
+</span><span id="__span-29-6"><a id="__codelineno-29-6" name="__codelineno-29-6" href="#__codelineno-29-6"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.client.pool-size"</span><span class="p">,</span><span class="w"> </span><span class="s">"3"</span><span class="p">)</span>
+</span><span id="__span-29-7"><a id="__codelineno-29-7" name="__codelineno-29-7" href="#__codelineno-29-7"></a><span class="w">    </span><span class="p">.</span><span class="n">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.root"</span><span class="p">,</span><span class="w"> </span><span class="s">"hdfs://namenode:8020/lance"</span><span class="p">)</span>
+</span><span id="__span-29-8"><a id="__codelineno-29-8" name="__codelineno-29-8" href="#__codelineno-29-8"></a><span class="w">    </span><span class="p">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-java highlight"><pre><span></span><code><span id="__span-30-1"><a id="__codelineno-30-1" name="__codelineno-30-1" href="#__codelineno-30-1"></a><span class="n">SparkSession</span><span class="w"> </span><span class="n">spark</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SparkSession</span><span class="p">.</span><span class="na">builder</span><span class="p">()</span>
+</span><span id="__span-30-2"><a id="__codelineno-30-2" name="__codelineno-30-2" href="#__codelineno-30-2"></a><span class="w">    </span><span class="p">.</span><span class="na">appName</span><span class="p">(</span><span class="s">"lance-hive2-example"</span><span class="p">)</span>
+</span><span id="__span-30-3"><a id="__codelineno-30-3" name="__codelineno-30-3" href="#__codelineno-30-3"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance"</span><span class="p">,</span><span class="w"> </span><span class="s">"org.lance.spark.LanceNamespaceSparkCatalog"</span><span class="p">)</span>
+</span><span id="__span-30-4"><a id="__codelineno-30-4" name="__codelineno-30-4" href="#__codelineno-30-4"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.impl"</span><span class="p">,</span><span class="w"> </span><span class="s">"hive2"</span><span class="p">)</span>
+</span><span id="__span-30-5"><a id="__codelineno-30-5" name="__codelineno-30-5" href="#__codelineno-30-5"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.hadoop.hive.metastore.uris"</span><span class="p">,</span><span class="w"> </span><span class="s">"thrift://metastore:9083"</span><span class="p">)</span>
+</span><span id="__span-30-6"><a id="__codelineno-30-6" name="__codelineno-30-6" href="#__codelineno-30-6"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.client.pool-size"</span><span class="p">,</span><span class="w"> </span><span class="s">"3"</span><span class="p">)</span>
+</span><span id="__span-30-7"><a id="__codelineno-30-7" name="__codelineno-30-7" href="#__codelineno-30-7"></a><span class="w">    </span><span class="p">.</span><span class="na">config</span><span class="p">(</span><span class="s">"spark.sql.catalog.lance.root"</span><span class="p">,</span><span class="w"> </span><span class="s">"hdfs://namenode:8020/lance"</span><span class="p">)</span>
+</span><span id="__span-30-8"><a id="__codelineno-30-8" name="__codelineno-30-8" href="#__codelineno-30-8"></a><span class="w">    </span><span class="p">.</span><span class="na">getOrCreate</span><span class="p">();</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<h4 id="additional-dependencies_1">Additional Dependencies<a class="headerlink" href="#additional-dependencies_1" title="Permanent link">&para;</a></h4>
+<p>Using Hive namespaces requires additional JARs beyond the main Lance Spark bundle:
+- For Hive 2.x: <code>lance-namespace-hive2</code>
+- For Hive 3.x: <code>lance-namespace-hive3</code></p>
+<p>Example with Spark Shell for Hive 3.x:
+<div class="language-shell highlight"><pre><span></span><code><span id="__span-31-1"><a id="__codelineno-31-1" name="__codelineno-31-1" href="#__codelineno-31-1"></a>spark-shell<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-31-2"><a id="__codelineno-31-2" name="__codelineno-31-2" href="#__codelineno-31-2"></a><span class="w">  </span>--packages<span class="w"> </span>org.lance:lance-spark-bundle-3.5_2.12:0.4.0,org.lance:lance-namespace-hive3:0.3.0<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-31-3"><a id="__codelineno-31-3" name="__codelineno-31-3" href="#__codelineno-31-3"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance<span class="o">=</span>org.lance.spark.LanceNamespaceSparkCatalog<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-31-4"><a id="__codelineno-31-4" name="__codelineno-31-4" href="#__codelineno-31-4"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.impl<span class="o">=</span>hive3<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-31-5"><a id="__codelineno-31-5" name="__codelineno-31-5" href="#__codelineno-31-5"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.hadoop.hive.metastore.uris<span class="o">=</span>thrift://metastore:9083<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-31-6"><a id="__codelineno-31-6" name="__codelineno-31-6" href="#__codelineno-31-6"></a><span class="w">  </span>--conf<span class="w"> </span>spark.sql.catalog.lance.root<span class="o">=</span>hdfs://namenode:8020/lance
+</span></code></pre></div></p>
+<h4 id="hive-configuration-parameters">Hive Configuration Parameters<a class="headerlink" href="#hive-configuration-parameters" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>spark.sql.catalog.{name}.hadoop.*</code></td>
+<td>✗</td>
+<td>Additional Hadoop configuration options, will override the default Hadoop configuration</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.client.pool-size</code></td>
+<td>✗</td>
+<td>Connection pool size for metastore clients (default: 3)</td>
+</tr>
+<tr>
+<td><code>spark.sql.catalog.{name}.root</code></td>
+<td>✗</td>
+<td>Storage root location for Lance tables (default: current directory)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="note-on-namespace-levels">Note on Namespace Levels<a class="headerlink" href="#note-on-namespace-levels" title="Permanent link">&para;</a></h2>
+<p>Spark provides at least a 3 level hierarchy of <strong>catalog → multi-level namespace → table</strong>.
+Most users treat Spark as a 3 level hierarchy with 1 level namespace.</p>
+<h3 id="for-namespaces-with-less-than-3-levels">For Namespaces with Less Than 3 Levels<a class="headerlink" href="#for-namespaces-with-less-than-3-levels" title="Permanent link">&para;</a></h3>
+<p>Some namespace implementations have a flat 2-level hierarchy of <strong>root namespace → table</strong>. The <code>LanceNamespaceSparkCatalog</code> provides a configuration <code>single_level_ns</code> to enable single-level mode with a virtual "default" namespace.</p>
+<p><strong>DirectoryNamespace</strong>: By default, uses multi-level namespace mode with manifest-based storage. Tables are stored with hash-prefixed paths for better scalability.</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="8:2"><input checked="checked" id="__tabbed_8_1" name="__tabbed_8" type="radio" /><input id="__tabbed_8_2" name="__tabbed_8" type="radio" /><div class="tabbed-labels"><label for="__tabbed_8_1">Multi-level namespace (default, recommended)</label><label for="__tabbed_8_2">Single-level with virtual namespace</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-32-1"><a id="__codelineno-32-1" name="__codelineno-32-1" href="#__codelineno-32-1"></a><span class="c1"># Default: multi-level namespace mode with manifest-based storage</span>
+</span><span id="__span-32-2"><a id="__codelineno-32-2" name="__codelineno-32-2" href="#__codelineno-32-2"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-32-3"><a id="__codelineno-32-3" name="__codelineno-32-3" href="#__codelineno-32-3"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.impl"</span><span class="p">,</span> <span class="s2">"dir"</span><span class="p">)</span> \
+</span><span id="__span-32-4"><a id="__codelineno-32-4" name="__codelineno-32-4" href="#__codelineno-32-4"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.root"</span><span class="p">,</span> <span class="s2">"s3://bucket/lance"</span><span class="p">)</span> \
+</span><span id="__span-32-5"><a id="__codelineno-32-5" name="__codelineno-32-5" href="#__codelineno-32-5"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span><span id="__span-32-6"><a id="__codelineno-32-6" name="__codelineno-32-6" href="#__codelineno-32-6"></a>
+</span><span id="__span-32-7"><a id="__codelineno-32-7" name="__codelineno-32-7" href="#__codelineno-32-7"></a><span class="c1"># Create namespaces explicitly, then create tables</span>
+</span><span id="__span-32-8"><a id="__codelineno-32-8" name="__codelineno-32-8" href="#__codelineno-32-8"></a><span class="n">spark</span><span class="o">.</span><span class="n">sql</span><span class="p">(</span><span class="s2">"CREATE NAMESPACE lance.mydb"</span><span class="p">)</span>
+</span><span id="__span-32-9"><a id="__codelineno-32-9" name="__codelineno-32-9" href="#__codelineno-32-9"></a><span class="n">spark</span><span class="o">.</span><span class="n">sql</span><span class="p">(</span><span class="s2">"CREATE TABLE lance.mydb.users (id INT, name STRING)"</span><span class="p">)</span>
+</span></code></pre></div>
+</div>
+<div class="tabbed-block">
+<div class="language-python highlight"><pre><span></span><code><span id="__span-33-1"><a id="__codelineno-33-1" name="__codelineno-33-1" href="#__codelineno-33-1"></a><span class="c1"># Enable single-level mode for backward compatibility</span>
+</span><span id="__span-33-2"><a id="__codelineno-33-2" name="__codelineno-33-2" href="#__codelineno-33-2"></a><span class="n">spark</span> <span class="o">=</span> <span class="n">SparkSession</span><span class="o">.</span><span class="n">builder</span> \
+</span><span id="__span-33-3"><a id="__codelineno-33-3" name="__codelineno-33-3" href="#__codelineno-33-3"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.impl"</span><span class="p">,</span> <span class="s2">"dir"</span><span class="p">)</span> \
+</span><span id="__span-33-4"><a id="__codelineno-33-4" name="__codelineno-33-4" href="#__codelineno-33-4"></a>    <span class="o">.</span><span class="n">config</span><span class="p">(</span><span class="s2">"spark.sql.catalog.lance.single_level_ns"</span><span class="p">,</span> <span class="s2">"true"</span><span class="p">)</span> \
+</span><span id="__span-33-5"><a id="__codelineno-33-5" name="__codelineno-33-5" href="#__codelineno-33-5"></a>    <span class="o">.</span><span class="n">getOrCreate</span><span class="p">()</span>
+</span><span id="__span-33-6"><a id="__codelineno-33-6" name="__codelineno-33-6" href="#__codelineno-33-6"></a>
+</span><span id="__span-33-7"><a id="__codelineno-33-7" name="__codelineno-33-7" href="#__codelineno-33-7"></a><span class="c1"># Use the virtual "default" namespace (no CREATE NAMESPACE needed)</span>
+</span><span id="__span-33-8"><a id="__codelineno-33-8" name="__codelineno-33-8" href="#__codelineno-33-8"></a><span class="n">spark</span><span class="o">.</span><span class="n">sql</span><span class="p">(</span><span class="s2">"CREATE TABLE lance.default.users (id INT, name STRING)"</span><span class="p">)</span>
+</span></code></pre></div>
+</div>
+</div>
+</div>
+<p><strong>RestNamespace</strong>: If <code>ListNamespaces</code> returns an error, <code>single_level_ns=true</code> is automatically enabled.</p>
+<h3 id="for-namespaces-with-more-than-3-levels">For Namespaces with More Than 3 Levels<a class="headerlink" href="#for-namespaces-with-more-than-3-levels" title="Permanent link">&para;</a></h3>
+<p>Some namespace implementations like Hive3 support more than 3 levels of hierarchy.
+For example, Hive3 has a 4 level hierarchy: <strong>root metastore → catalog → database → table</strong>.</p>
+<p>To handle this, the <code>LanceNamespaceSparkCatalog</code> provides <code>parent</code> and <code>parent_delimiter</code> configurations which
+allow you to specify a parent prefix that gets prepended to all namespace operations.</p>
+<p>For example, with Hive3:</p>
+<ul>
+<li>Setting <code>parent=hive</code> (using default <code>parent_delimiter=.</code>)</li>
+<li>When Spark requests namespace <code>["database1"]</code>, it gets transformed to <code>["hive.database1"]</code> for the API call</li>
+<li>This allows the 4-level Hive3 structure to work within Spark's 3-level model</li>
+</ul>
+<p>The parent configuration effectively "anchors" your Spark catalog at a specific level within the deeper namespace
+hierarchy, making the extra levels transparent to Spark users while maintaining compatibility with the underlying
+namespace implementation.</p>
+<h2 id="branch-read-option">Branch Read Option<a class="headerlink" href="#branch-read-option" title="Permanent link">&para;</a></h2>
+<p>Set <code>branch</code> to read the current head of a named branch. Do not set <code>version</code> on the same read.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-34-1"><a id="__codelineno-34-1" name="__codelineno-34-1" href="#__codelineno-34-1"></a><span class="n">df</span> <span class="o">=</span> <span class="n">spark</span><span class="o">.</span><span class="n">read</span> \
+</span><span id="__span-34-2"><a id="__codelineno-34-2" name="__codelineno-34-2" href="#__codelineno-34-2"></a>    <span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="s2">"lance"</span><span class="p">)</span> \
+</span><span id="__span-34-3"><a id="__codelineno-34-3" name="__codelineno-34-3" href="#__codelineno-34-3"></a>    <span class="o">.</span><span class="n">option</span><span class="p">(</span><span class="s2">"branch"</span><span class="p">,</span> <span class="s2">"audit"</span><span class="p">)</span> \
+</span><span id="__span-34-4"><a id="__codelineno-34-4" name="__codelineno-34-4" href="#__codelineno-34-4"></a>    <span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="s2">"/path/to/dataset.lance"</span><span class="p">)</span>
+</span></code></pre></div>
+<h2 id="memory-configuration">Memory Configuration<a class="headerlink" href="#memory-configuration" title="Permanent link">&para;</a></h2>
+<p>Lance Spark uses Arrow for data transfer between native code and Spark, and maintains caches for improved performance.</p>
+<h3 id="arrow-allocator">Arrow Allocator<a class="headerlink" href="#arrow-allocator" title="Permanent link">&para;</a></h3>
+<p>Set via environment variable <code>LANCE_ALLOCATOR_SIZE</code> (default: unlimited).</p>
+<p>Controls the maximum memory allocation for Arrow buffers used in data transfer between Lance native code and Spark.</p>
+<table>
+<thead>
+<tr>
+<th>Environment Variable</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>LANCE_ALLOCATOR_SIZE</code></td>
+<td><code>Long.MAX_VALUE</code></td>
+<td>Arrow allocator size in bytes (global).</td>
+</tr>
+</tbody>
+</table>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-35-1"><a id="__codelineno-35-1" name="__codelineno-35-1" href="#__codelineno-35-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">LANCE_ALLOCATOR_SIZE</span><span class="o">=</span><span class="m">4294967296</span><span class="w">  </span><span class="c1"># 4GB</span>
+</span></code></pre></div>
+<h3 id="caching">Caching<a class="headerlink" href="#caching" title="Permanent link">&para;</a></h3>
+<p>Lance Spark maintains index and metadata caches to minimize redundant I/O. Cache sizes are configured via environment variables:</p>
+<table>
+<thead>
+<tr>
+<th>Environment Variable</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>LANCE_INDEX_CACHE_SIZE</code></td>
+<td>6GB</td>
+<td>Index cache size in bytes.</td>
+</tr>
+<tr>
+<td><code>LANCE_METADATA_CACHE_SIZE</code></td>
+<td>1GB</td>
+<td>Metadata cache size in bytes.</td>
+</tr>
+</tbody>
+</table>
+<p>For details on how caching works and tuning recommendations, see <a href="../performance/#caching">Performance Tuning - Caching</a>.</p>
+<h2 id="blob-v2-reads">Blob v2 Reads<a class="headerlink" href="#blob-v2-reads" title="Permanent link">&para;</a></h2>
+<p>Lance exposes blob v2 columns as <code>struct&lt;kind:short, position:long, size:long, blob_id:long, blob_uri:string&gt;</code>. Descriptor queries do not fetch bytes.</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-36-1"><a id="__codelineno-36-1" name="__codelineno-36-1" href="#__codelineno-36-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">payload</span><span class="p">.</span><span class="k">size</span><span class="p">,</span><span class="w"> </span><span class="n">payload</span><span class="p">.</span><span class="n">kind</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">ns</span><span class="p">.</span><span class="n">tbl</span><span class="p">;</span>
+</span></code></pre></div>
+<p>A column is blob v2 when the Arrow field has <code>ARROW:extension:name = lance.blob.v2</code>.</p>
+<p>SQL filter pushdown is disabled on blob v2 tables; zonemap fragment pruning still runs. See <a href="#blob-v2-writes">Blob v2 Writes</a> for copying blobs between tables.</p>
+<h2 id="blob-v2-writes">Blob v2 Writes<a class="headerlink" href="#blob-v2-writes" title="Permanent link">&para;</a></h2>
+<p>To write blob v2 columns, set <code>file_format_version</code> to <code>2.2</code> or higher and
+<code>&lt;column&gt;.lance.encoding = blob</code> in <code>TBLPROPERTIES</code>.</p>
+<p>Spark accepts <code>BINARY</code> on write. The connector maps that to the Arrow blob write struct at encode time. On read the same columns come back as descriptor structs (<a href="#blob-v2-reads">Blob v2 Reads</a>).</p>
+<p>Copy blobs between Lance tables with a direct column select in <code>INSERT ... SELECT</code> or CTAS. See <a href="../operations/dml/insert-into/#copying-blob-v2-columns">INSERT INTO</a> and <a href="../operations/ddl/create-table/#blob-v2-columns">CREATE TABLE</a>.</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-37-1"><a id="__codelineno-37-1" name="__codelineno-37-1" href="#__codelineno-37-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">lance</span><span class="p">.</span><span class="n">mydb</span><span class="p">.</span><span class="n">users</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-37-2"><a id="__codelineno-37-2" name="__codelineno-37-2" href="#__codelineno-37-2"></a><span class="w">    </span><span class="n">id</span><span class="w"> </span><span class="nb">INT</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span>
+</span><span id="__span-37-3"><a id="__codelineno-37-3" name="__codelineno-37-3" href="#__codelineno-37-3"></a><span class="w">    </span><span class="n">content</span><span class="w"> </span><span class="nb">BINARY</span>
+</span><span id="__span-37-4"><a id="__codelineno-37-4" name="__codelineno-37-4" href="#__codelineno-37-4"></a><span class="p">)</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">lance</span>
+</span><span id="__span-37-5"><a id="__codelineno-37-5" name="__codelineno-37-5" href="#__codelineno-37-5"></a><span class="n">TBLPROPERTIES</span><span class="w"> </span><span class="p">(</span>
+</span><span id="__span-37-6"><a id="__codelineno-37-6" name="__codelineno-37-6" href="#__codelineno-37-6"></a><span class="w">    </span><span class="s1">'content.lance.encoding'</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'blob'</span><span class="p">,</span>
+</span><span id="__span-37-7"><a id="__codelineno-37-7" name="__codelineno-37-7" href="#__codelineno-37-7"></a><span class="w">    </span><span class="s1">'file_format_version'</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">'2.2'</span>
+</span><span id="__span-37-8"><a id="__codelineno-37-8" name="__codelineno-37-8" href="#__codelineno-37-8"></a><span class="p">);</span>
+</span></code></pre></div>
+<p>With <code>file_format_version = '2.2'</code> or higher, blob columns are written using blob v2
+encoding and <code>ARROW:extension:name = lance.blob.v2 metadata</code>.</p>
+<p>With an older version, or when <code>file_format_version</code> is not set, blob columns use the
+legacy v1 encoding with <code>lance-encoding:blob = true</code> metadata.</p>
+<p>Blob encoding requires a numeric <code>file_format_version</code>, such as <code>2.2</code>.</p>
+<p>Blob v2 writes must go through the catalog path. Use SQL DDL with <code>TBLPROPERTIES</code>, as
+shown above, or use the <code>DataFrameWriterV2</code> API:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-38-1"><a id="__codelineno-38-1" name="__codelineno-38-1" href="#__codelineno-38-1"></a><span class="n">df</span><span class="o">.</span><span class="n">writeTo</span><span class="p">(</span><span class="s2">"lance.ns.users"</span><span class="p">)</span> \
+</span><span id="__span-38-2"><a id="__codelineno-38-2" name="__codelineno-38-2" href="#__codelineno-38-2"></a>    <span class="o">.</span><span class="n">tableProperty</span><span class="p">(</span><span class="s2">"content.lance.encoding"</span><span class="p">,</span> <span class="s2">"blob"</span><span class="p">)</span> \
+</span><span id="__span-38-3"><a id="__codelineno-38-3" name="__codelineno-38-3" href="#__codelineno-38-3"></a>    <span class="o">.</span><span class="n">tableProperty</span><span class="p">(</span><span class="s2">"file_format_version"</span><span class="p">,</span> <span class="s2">"2.2"</span><span class="p">)</span> \
+</span><span id="__span-38-4"><a id="__codelineno-38-4" name="__codelineno-38-4" href="#__codelineno-38-4"></a>    <span class="o">.</span><span class="n">create</span><span class="p">()</span>
+</span></code></pre></div>
+<p>Setting only <code>file_format_version</code> does not enable blob encoding. Without
+<code>&lt;column&gt;.lance.encoding = blob</code>, the column is written as plain <code>BINARY</code>.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../install/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Install</div>
+        </a>
+        <a class="next" href="../performance/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Performance</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#spark-sql-extensions">Spark SQL Extensions</a>
+      <a class="ld-toc__h3" href="#features-requiring-extensions">Features Requiring Extensions</a>
+      <a class="ld-toc__h2" href="#basic-setup">Basic Setup</a>
+      <a class="ld-toc__h2" href="#cache-backends">Cache Backends</a>
+      <a class="ld-toc__h2" href="#opentelemetry-metrics">OpenTelemetry Metrics</a>
+      <a class="ld-toc__h2" href="#example-namespace-implementations">Example Namespace Implementations</a>
+      <a class="ld-toc__h3" href="#directory-namespace">Directory Namespace</a>
+      <a class="ld-toc__h3" href="#rest-namespace">REST Namespace</a>
+      <a class="ld-toc__h3" href="#aws-glue-namespace">AWS Glue Namespace</a>
+      <a class="ld-toc__h3" href="#apache-hive-namespace">Apache Hive Namespace</a>
+      <a class="ld-toc__h2" href="#note-on-namespace-levels">Note on Namespace Levels</a>
+      <a class="ld-toc__h3" href="#for-namespaces-with-less-than-3-levels">For Namespaces with Less Than 3 Levels</a>
+      <a class="ld-toc__h3" href="#for-namespaces-with-more-than-3-levels">For Namespaces with More Than 3 Levels</a>
+      <a class="ld-toc__h2" href="#branch-read-option">Branch Read Option</a>
+      <a class="ld-toc__h2" href="#memory-configuration">Memory Configuration</a>
+      <a class="ld-toc__h3" href="#arrow-allocator">Arrow Allocator</a>
+      <a class="ld-toc__h3" href="#caching">Caching</a>
+      <a class="ld-toc__h2" href="#blob-v2-reads">Blob v2 Reads</a>
+      <a class="ld-toc__h2" href="#blob-v2-writes">Blob v2 Writes</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../../format/">Specification</a>
+        <a href="../../../format/file/">File format</a>
+        <a href="../../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../../quickstart/">Getting started</a>
+        <a href="../../../guide/read_and_write/">User guide</a>
+        <a href="../../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../../..";</script>
+<script src="../../../assets/site.js" defer></script>
+</body>
+</html>

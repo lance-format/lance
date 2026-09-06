@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Read and Write — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/guide/read_and_write/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab" href="../../quickstart/">Getting Started</a>
+      <a class="ld-toptab active" href="./">User Guide</a>
+      <a class="ld-toptab" href="../../format/">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../community/">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      User Guide
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">User Guide</div>
+    <a class="active" href="./">Read and Write</a>
+    <a href="../data_types/">Data Types</a>
+    <a href="../data_evolution/">Data Evolution</a>
+    <a href="../blob/">Blob API</a>
+    <a href="../json/">JSON Support</a>
+    <a href="../tags_and_branches/">Tags and Branches</a>
+    <a href="../object_store/">Object Store Configuration</a>
+    <a href="../observability/">Observability</a>
+    <a href="../distributed_write/">Distributed Write</a>
+    <a href="../distributed_indexing/">Distributed Indexing</a>
+    <a href="../migration/">Migration Guide</a>
+    <a href="../performance/">Performance Guide</a>
+    <a href="../tokenizer/">Tokenizer</a>
+    <a href="../arrays/">Extension Arrays</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>User Guide</span>
+        <span>/</span><b>Read and Write</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="read-and-write-data">Read and Write Data<a class="headerlink" href="#read-and-write-data" title="Permanent link">&para;</a></h1>
+<h2 id="writing-lance-dataset">Writing Lance Dataset<a class="headerlink" href="#writing-lance-dataset" title="Permanent link">&para;</a></h2>
+<p>If you're familiar with <a href="https://arrow.apache.org/docs/python/getstarted.html">Apache PyArrow</a>, you'll find that creating a Lance dataset is straightforward.
+Begin by writing a <code>pyarrow.Table</code> using the <code>lance.write_dataset</code> function.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">Table</span><span class="o">.</span><span class="n">from_pylist</span><span class="p">([{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">20</span><span class="p">},</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>                              <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Bob"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">30</span><span class="p">}])</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span><span class="n">table</span><span class="p">,</span> <span class="s2">"./alice_and_bob.lance"</span><span class="p">)</span>
+</span></code></pre></div>
+<p>If the dataset is too large to fully load into memory, you can stream data using <code>lance.write_dataset</code>
+also supports <code>Iterator</code> of <code>pyarrow.RecordBatch</code> es.
+You will need to provide a <code>pyarrow.Schema</code> for the dataset in this case.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterator</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="k">def</span><span class="w"> </span><span class="nf">producer</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">Iterator</span><span class="p">[</span><span class="n">pa</span><span class="o">.</span><span class="n">RecordBatch</span><span class="p">]:</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">    </span><span class="sd">"""An iterator of RecordBatches."""</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>    <span class="k">yield</span> <span class="n">pa</span><span class="o">.</span><span class="n">RecordBatch</span><span class="o">.</span><span class="n">from_pylist</span><span class="p">([{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">20</span><span class="p">}])</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>    <span class="k">yield</span> <span class="n">pa</span><span class="o">.</span><span class="n">RecordBatch</span><span class="o">.</span><span class="n">from_pylist</span><span class="p">([{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Bob"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">30</span><span class="p">}])</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="n">schema</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">schema</span><span class="p">([</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>    <span class="p">(</span><span class="s2">"name"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">string</span><span class="p">()),</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>    <span class="p">(</span><span class="s2">"age"</span><span class="p">,</span> <span class="n">pa</span><span class="o">.</span><span class="n">int32</span><span class="p">()),</span>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="p">])</span>
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span><span class="n">producer</span><span class="p">(),</span>
+</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>                         <span class="s2">"./alice_and_bob.lance"</span><span class="p">,</span>
+</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a>                         <span class="n">schema</span><span class="o">=</span><span class="n">schema</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"overwrite"</span><span class="p">)</span>
+</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="nb">print</span><span class="p">(</span><span class="n">ds</span><span class="o">.</span><span class="n">count_rows</span><span class="p">())</span>  <span class="c1"># Output: 2</span>
+</span></code></pre></div>
+<p><code>lance.write_dataset</code> supports writing <code>pyarrow.Table</code>, <code>pandas.DataFrame</code>,
+<code>pyarrow.dataset.Dataset</code>, and <code>Iterator[pyarrow.RecordBatch]</code>.</p>
+<h2 id="adding-rows">Adding Rows<a class="headerlink" href="#adding-rows" title="Permanent link">&para;</a></h2>
+<p>To insert data into your dataset, you can use either <code>LanceDataset.insert</code>
+or <code>lance.write_dataset</code> with <code>mode=append</code>.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="n">table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">Table</span><span class="o">.</span><span class="n">from_pylist</span><span class="p">([{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">20</span><span class="p">},</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>                              <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Bob"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">30</span><span class="p">}])</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span><span class="n">table</span><span class="p">,</span> <span class="s2">"./insert_example.lance"</span><span class="p">)</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="n">new_table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">Table</span><span class="o">.</span><span class="n">from_pylist</span><span class="p">([{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Carla"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">37</span><span class="p">}])</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="n">ds</span><span class="o">.</span><span class="n">insert</span><span class="p">(</span><span class="n">new_table</span><span class="p">)</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="nb">print</span><span class="p">(</span><span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="c1">#     name  age</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="c1"># 0  Alice   20</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="c1"># 1    Bob   30</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="c1"># 2  Carla   37</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="n">new_table2</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">Table</span><span class="o">.</span><span class="n">from_pylist</span><span class="p">([{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"David"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">42</span><span class="p">}])</span>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span><span class="n">new_table2</span><span class="p">,</span> <span class="n">ds</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"append"</span><span class="p">)</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="nb">print</span><span class="p">(</span><span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="c1">#     name  age</span>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="c1"># 0  Alice   20</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a><span class="c1"># 1    Bob   30</span>
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a><span class="c1"># 2  Carla   37</span>
+</span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a><span class="c1"># 3  David   42</span>
+</span></code></pre></div>
+<h2 id="deleting-rows">Deleting rows<a class="headerlink" href="#deleting-rows" title="Permanent link">&para;</a></h2>
+<p>Lance supports deleting rows from a dataset using a SQL filter, as described in <a href="#filter-push-down">Filter push-down</a>.
+For example, to delete Bob's row from the dataset above, one could use:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./alice_and_bob.lance"</span><span class="p">)</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="n">dataset</span><span class="o">.</span><span class="n">delete</span><span class="p">(</span><span class="s2">"name = 'Bob'"</span><span class="p">)</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="n">dataset2</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./alice_and_bob.lance"</span><span class="p">)</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="nb">print</span><span class="p">(</span><span class="n">dataset2</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="c1">#     name  age</span>
+</span><span id="__span-3-8"><a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="c1"># 0  Alice   20</span>
+</span></code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p><a href="../../format/">Lance Format is immutable</a>. Each write operation creates a new version of the dataset,
+so users must reopen the dataset to see the changes. Likewise, rows are removed by marking
+them as deleted in a separate deletion index, rather than rewriting the files. This approach
+is faster and avoids invalidating any indices that reference the files, ensuring that subsequent
+queries do not return the deleted rows.</p>
+</div>
+<h2 id="updating-rows">Updating rows<a class="headerlink" href="#updating-rows" title="Permanent link">&para;</a></h2>
+<p>Lance supports updating rows based on SQL expressions with the
+<code>lance.LanceDataset.update</code> method. For example, if we notice
+that Bob's name in our dataset has been sometimes written as <code>Blob</code>, we can fix
+that with:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./alice_and_bob.lance"</span><span class="p">)</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="n">dataset</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"'Bob'"</span><span class="p">},</span> <span class="n">where</span><span class="o">=</span><span class="s2">"name = 'Blob'"</span><span class="p">)</span>
+</span></code></pre></div>
+<p>The update values are SQL expressions, which is why <code>'Bob'</code> is wrapped in single
+quotes. This means we can use complex expressions that reference existing columns if
+we wish. For example, if two years have passed and we wish to update the ages
+of Alice and Bob in the same example, we could write:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./alice_and_bob.lance"</span><span class="p">)</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="n">dataset</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="s2">"age"</span><span class="p">:</span> <span class="s2">"age + 2"</span><span class="p">})</span>
+</span></code></pre></div>
+<p>If you are trying to update a set of individual rows with new values then it is often
+more efficient to use the merge insert operation described below.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="c1"># Change the ages of both Alice and Bob</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="n">new_table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">Table</span><span class="o">.</span><span class="n">from_pylist</span><span class="p">([{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">30</span><span class="p">},</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>                                  <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Bob"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">20</span><span class="p">}])</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="c1"># This works, but is inefficient, see below for a better approach</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./alice_and_bob.lance"</span><span class="p">)</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="k">for</span> <span class="n">idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">new_table</span><span class="o">.</span><span class="n">num_rows</span><span class="p">):</span>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>  <span class="n">name</span> <span class="o">=</span> <span class="n">new_table</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="n">idx</span><span class="p">]</span><span class="o">.</span><span class="n">as_py</span><span class="p">()</span>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>  <span class="n">new_age</span> <span class="o">=</span> <span class="n">new_table</span><span class="p">[</span><span class="mi">1</span><span class="p">][</span><span class="n">idx</span><span class="p">]</span><span class="o">.</span><span class="n">as_py</span><span class="p">()</span>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>  <span class="n">dataset</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="s2">"age"</span><span class="p">:</span> <span class="n">new_age</span><span class="p">},</span> <span class="n">where</span><span class="o">=</span><span class="sa">f</span><span class="s2">"name='</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">'"</span><span class="p">)</span>
+</span></code></pre></div>
+<h2 id="merge-insert">Merge Insert<a class="headerlink" href="#merge-insert" title="Permanent link">&para;</a></h2>
+<p>Lance supports a merge insert operation. This can be used to add new data in bulk
+while also (potentially) matching against existing data. This operation can be used
+for a number of different use cases.</p>
+<h3 id="bulk-update">Bulk Update<a class="headerlink" href="#bulk-update" title="Permanent link">&para;</a></h3>
+<p>The <code>lance.LanceDataset.update</code> method is useful for updating rows based on
+a filter. However, if we want to replace existing rows with new rows then a <code>lance.LanceDataset.merge_insert</code>
+operation would be more efficient:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./alice_and_bob.lance"</span><span class="p">)</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="nb">print</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="c1">#     name  age</span>
+</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="c1"># 0  Alice   20</span>
+</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="c1"># 1    Bob   30</span>
+</span><span id="__span-7-8"><a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>
+</span><span id="__span-7-9"><a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="c1"># Change the ages of both Alice and Bob</span>
+</span><span id="__span-7-10"><a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="n">new_table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">Table</span><span class="o">.</span><span class="n">from_pylist</span><span class="p">([{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">2</span><span class="p">},</span>
+</span><span id="__span-7-11"><a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a>                                  <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Bob"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">3</span><span class="p">}])</span>
+</span><span id="__span-7-12"><a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a><span class="c1"># This will use `name` as the key for matching rows.  Merge insert</span>
+</span><span id="__span-7-13"><a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a><span class="c1"># uses a JOIN internally and so you typically want this column to</span>
+</span><span id="__span-7-14"><a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="c1"># be a unique key or id of some kind.</span>
+</span><span id="__span-7-15"><a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a><span class="n">rst</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">merge_insert</span><span class="p">(</span><span class="s2">"name"</span><span class="p">)</span> \
+</span><span id="__span-7-16"><a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a>       <span class="o">.</span><span class="n">when_matched_update_all</span><span class="p">()</span> \
+</span><span id="__span-7-17"><a id="__codelineno-7-17" name="__codelineno-7-17" href="#__codelineno-7-17"></a>       <span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="n">new_table</span><span class="p">)</span>
+</span><span id="__span-7-18"><a id="__codelineno-7-18" name="__codelineno-7-18" href="#__codelineno-7-18"></a><span class="nb">print</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span><span id="__span-7-19"><a id="__codelineno-7-19" name="__codelineno-7-19" href="#__codelineno-7-19"></a><span class="c1">#     name  age</span>
+</span><span id="__span-7-20"><a id="__codelineno-7-20" name="__codelineno-7-20" href="#__codelineno-7-20"></a><span class="c1"># 0  Alice    2</span>
+</span><span id="__span-7-21"><a id="__codelineno-7-21" name="__codelineno-7-21" href="#__codelineno-7-21"></a><span class="c1"># 1    Bob    3</span>
+</span></code></pre></div>
+<p>Note that, similar to the update operation, rows that are modified will
+be removed and inserted back into the table, changing their position to
+the end. Also, the relative order of these rows could change because we
+are using a hash-join operation internally.</p>
+<h3 id="insert-if-not-exists">Insert if not Exists<a class="headerlink" href="#insert-if-not-exists" title="Permanent link">&para;</a></h3>
+<p>Sometimes we only want to insert data if we haven't already inserted it
+before. This can happen, for example, when we have a batch of data but
+we don't know which rows we've added previously and we don't want to
+create duplicate rows. We can use the merge insert operation to achieve
+this:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="c1"># Bob is already in the table, but Carla is new</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="n">new_table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">Table</span><span class="o">.</span><span class="n">from_pylist</span><span class="p">([{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Bob"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">30</span><span class="p">},</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>                                  <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Carla"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">37</span><span class="p">}])</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./alice_and_bob.lance"</span><span class="p">)</span>
+</span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>
+</span><span id="__span-8-7"><a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="c1"># This will insert Carla but leave Bob unchanged</span>
+</span><span id="__span-8-8"><a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a><span class="n">_</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">merge_insert</span><span class="p">(</span><span class="s2">"name"</span><span class="p">)</span> \
+</span><span id="__span-8-9"><a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a>       <span class="o">.</span><span class="n">when_not_matched_insert_all</span><span class="p">()</span> \
+</span><span id="__span-8-10"><a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a>       <span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="n">new_table</span><span class="p">)</span>
+</span><span id="__span-8-11"><a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a><span class="c1"># Verify that Carla was added but Bob remains unchanged</span>
+</span><span id="__span-8-12"><a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a><span class="nb">print</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span><span id="__span-8-13"><a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a><span class="c1">#     name  age</span>
+</span><span id="__span-8-14"><a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a><span class="c1"># 0  Alice   20</span>
+</span><span id="__span-8-15"><a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a><span class="c1"># 1    Bob   30</span>
+</span><span id="__span-8-16"><a id="__codelineno-8-16" name="__codelineno-8-16" href="#__codelineno-8-16"></a><span class="c1"># 2  Carla   37</span>
+</span></code></pre></div>
+<h3 id="update-or-insert-upsert">Update or Insert (Upsert)<a class="headerlink" href="#update-or-insert-upsert" title="Permanent link">&para;</a></h3>
+<p>Sometimes we want to combine both of the above behaviors. If a row
+already exists we want to update it. If the row does not exist we want
+to add it. This operation is sometimes called "upsert". We can use
+the merge insert operation to do this as well:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>
+</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="c1"># Change Carla's age and insert David</span>
+</span><span id="__span-9-5"><a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="n">new_table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">Table</span><span class="o">.</span><span class="n">from_pylist</span><span class="p">([{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Carla"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">27</span><span class="p">},</span>
+</span><span id="__span-9-6"><a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a>                                  <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"David"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">42</span><span class="p">}])</span>
+</span><span id="__span-9-7"><a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a>
+</span><span id="__span-9-8"><a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./alice_and_bob.lance"</span><span class="p">)</span>
+</span><span id="__span-9-9"><a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a>
+</span><span id="__span-9-10"><a id="__codelineno-9-10" name="__codelineno-9-10" href="#__codelineno-9-10"></a><span class="c1"># This will update Carla and insert David</span>
+</span><span id="__span-9-11"><a id="__codelineno-9-11" name="__codelineno-9-11" href="#__codelineno-9-11"></a><span class="n">_</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">merge_insert</span><span class="p">(</span><span class="s2">"name"</span><span class="p">)</span> \
+</span><span id="__span-9-12"><a id="__codelineno-9-12" name="__codelineno-9-12" href="#__codelineno-9-12"></a>       <span class="o">.</span><span class="n">when_matched_update_all</span><span class="p">()</span> \
+</span><span id="__span-9-13"><a id="__codelineno-9-13" name="__codelineno-9-13" href="#__codelineno-9-13"></a>       <span class="o">.</span><span class="n">when_not_matched_insert_all</span><span class="p">()</span> \
+</span><span id="__span-9-14"><a id="__codelineno-9-14" name="__codelineno-9-14" href="#__codelineno-9-14"></a>       <span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="n">new_table</span><span class="p">)</span>
+</span><span id="__span-9-15"><a id="__codelineno-9-15" name="__codelineno-9-15" href="#__codelineno-9-15"></a><span class="c1"># Verify the results</span>
+</span><span id="__span-9-16"><a id="__codelineno-9-16" name="__codelineno-9-16" href="#__codelineno-9-16"></a><span class="nb">print</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span><span id="__span-9-17"><a id="__codelineno-9-17" name="__codelineno-9-17" href="#__codelineno-9-17"></a><span class="c1">#     name  age</span>
+</span><span id="__span-9-18"><a id="__codelineno-9-18" name="__codelineno-9-18" href="#__codelineno-9-18"></a><span class="c1"># 0  Alice   20</span>
+</span><span id="__span-9-19"><a id="__codelineno-9-19" name="__codelineno-9-19" href="#__codelineno-9-19"></a><span class="c1"># 1    Bob   30</span>
+</span><span id="__span-9-20"><a id="__codelineno-9-20" name="__codelineno-9-20" href="#__codelineno-9-20"></a><span class="c1"># 2  Carla   27</span>
+</span><span id="__span-9-21"><a id="__codelineno-9-21" name="__codelineno-9-21" href="#__codelineno-9-21"></a><span class="c1"># 3  David   42</span>
+</span></code></pre></div>
+<h3 id="replace-a-portion-of-data">Replace a Portion of Data<a class="headerlink" href="#replace-a-portion-of-data" title="Permanent link">&para;</a></h3>
+<p>A less common, but still useful, behavior can be to replace some region
+of existing rows (defined by a filter) with new data. This is similar
+to performing both a delete and an insert in a single transaction. For
+example:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="n">new_table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">Table</span><span class="o">.</span><span class="n">from_pylist</span><span class="p">([{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Edgar"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">46</span><span class="p">},</span>
+</span><span id="__span-10-5"><a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>                                  <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Francene"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">44</span><span class="p">}])</span>
+</span><span id="__span-10-6"><a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a>
+</span><span id="__span-10-7"><a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./alice_and_bob.lance"</span><span class="p">)</span>
+</span><span id="__span-10-8"><a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="nb">print</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span><span id="__span-10-9"><a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a><span class="c1">#       name  age</span>
+</span><span id="__span-10-10"><a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a><span class="c1"># 0    Alice   20</span>
+</span><span id="__span-10-11"><a id="__codelineno-10-11" name="__codelineno-10-11" href="#__codelineno-10-11"></a><span class="c1"># 1      Bob   30</span>
+</span><span id="__span-10-12"><a id="__codelineno-10-12" name="__codelineno-10-12" href="#__codelineno-10-12"></a><span class="c1"># 2  Charlie   45</span>
+</span><span id="__span-10-13"><a id="__codelineno-10-13" name="__codelineno-10-13" href="#__codelineno-10-13"></a><span class="c1"># 3    Donna   50</span>
+</span><span id="__span-10-14"><a id="__codelineno-10-14" name="__codelineno-10-14" href="#__codelineno-10-14"></a>
+</span><span id="__span-10-15"><a id="__codelineno-10-15" name="__codelineno-10-15" href="#__codelineno-10-15"></a><span class="c1"># This will remove anyone above 40 and insert our new data</span>
+</span><span id="__span-10-16"><a id="__codelineno-10-16" name="__codelineno-10-16" href="#__codelineno-10-16"></a><span class="n">_</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">merge_insert</span><span class="p">(</span><span class="s2">"name"</span><span class="p">)</span> \
+</span><span id="__span-10-17"><a id="__codelineno-10-17" name="__codelineno-10-17" href="#__codelineno-10-17"></a>       <span class="o">.</span><span class="n">when_not_matched_insert_all</span><span class="p">()</span> \
+</span><span id="__span-10-18"><a id="__codelineno-10-18" name="__codelineno-10-18" href="#__codelineno-10-18"></a>       <span class="o">.</span><span class="n">when_not_matched_by_source_delete</span><span class="p">(</span><span class="s2">"age &gt;= 40"</span><span class="p">)</span> \
+</span><span id="__span-10-19"><a id="__codelineno-10-19" name="__codelineno-10-19" href="#__codelineno-10-19"></a>       <span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="n">new_table</span><span class="p">)</span>
+</span><span id="__span-10-20"><a id="__codelineno-10-20" name="__codelineno-10-20" href="#__codelineno-10-20"></a><span class="c1"># Verify the results - people over 40 replaced with new data</span>
+</span><span id="__span-10-21"><a id="__codelineno-10-21" name="__codelineno-10-21" href="#__codelineno-10-21"></a><span class="nb">print</span><span class="p">(</span><span class="n">dataset</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span><span id="__span-10-22"><a id="__codelineno-10-22" name="__codelineno-10-22" href="#__codelineno-10-22"></a><span class="c1">#        name  age</span>
+</span><span id="__span-10-23"><a id="__codelineno-10-23" name="__codelineno-10-23" href="#__codelineno-10-23"></a><span class="c1"># 0     Alice   20</span>
+</span><span id="__span-10-24"><a id="__codelineno-10-24" name="__codelineno-10-24" href="#__codelineno-10-24"></a><span class="c1"># 1       Bob   30</span>
+</span><span id="__span-10-25"><a id="__codelineno-10-25" name="__codelineno-10-25" href="#__codelineno-10-25"></a><span class="c1"># 2     Edgar   46</span>
+</span><span id="__span-10-26"><a id="__codelineno-10-26" name="__codelineno-10-26" href="#__codelineno-10-26"></a><span class="c1"># 3  Francene   44</span>
+</span></code></pre></div>
+<h2 id="reading-lance-dataset">Reading Lance Dataset<a class="headerlink" href="#reading-lance-dataset" title="Permanent link">&para;</a></h2>
+<p>To open a Lance dataset, use the <code>lance.dataset</code> function:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"s3://bucket/path/imagenet.lance"</span><span class="p">)</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="c1"># Or local path</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./imagenet.lance"</span><span class="p">)</span>
+</span></code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Lance supports local file system, AWS <code>s3</code> and Google Cloud Storage(<code>gs</code>) as storage backends
+at the moment. Read more in <a href="../object_store/">Object Store Configuration</a>.</p>
+</div>
+<p>The most straightforward approach for reading a Lance dataset is to utilize the <code>lance.LanceDataset.to_table</code>
+method in order to load the entire dataset into memory.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="n">table</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">()</span>
+</span></code></pre></div>
+<p>Due to Lance being a high-performance columnar format, it enables efficient reading of subsets of the dataset by utilizing
+<strong>Column (projection)</strong> push-down and <strong>filter (predicates)</strong> push-downs.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="n">table</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_table</span><span class="p">(</span>
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>    <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">,</span> <span class="s2">"label"</span><span class="p">],</span>
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>    <span class="nb">filter</span><span class="o">=</span><span class="s2">"label = 2 AND text IS NOT NULL"</span><span class="p">,</span>
+</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>    <span class="n">limit</span><span class="o">=</span><span class="mi">1000</span><span class="p">,</span>
+</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>    <span class="n">offset</span><span class="o">=</span><span class="mi">3000</span><span class="p">)</span>
+</span></code></pre></div>
+<p>Lance understands the cost of reading heavy columns such as <code>image</code>.
+Consequently, it employs an optimized query plan to execute the operation efficiently.</p>
+<h3 id="iterative-read">Iterative Read<a class="headerlink" href="#iterative-read" title="Permanent link">&para;</a></h3>
+<p>If the dataset is too large to fit in memory, you can read it in batches
+using the <code>lance.LanceDataset.to_batches</code> method:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">ds</span><span class="o">.</span><span class="n">to_batches</span><span class="p">(</span><span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">],</span> <span class="nb">filter</span><span class="o">=</span><span class="s2">"label = 10"</span><span class="p">):</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>    <span class="c1"># do something with batch</span>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>    <span class="n">compute_on_batch</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+</span></code></pre></div>
+<p>Unsurprisingly, <code>lance.LanceDataset.to_batches</code> takes the same parameters
+as <code>lance.LanceDataset.to_table</code> function.</p>
+<h3 id="filter-push-down">Filter push-down<a class="headerlink" href="#filter-push-down" title="Permanent link">&para;</a></h3>
+<p>Lance embraces the utilization of standard SQL expressions as predicates for dataset filtering.
+By pushing down the SQL predicates directly to the storage system,
+the overall I/O load during a scan is significantly reduced.</p>
+<p>Currently, Lance supports a growing list of expressions.</p>
+<ul>
+<li><code>&gt;</code>, <code>&gt;=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>=</code></li>
+<li><code>AND</code>, <code>OR</code>, <code>NOT</code></li>
+<li><code>IS NULL</code>, <code>IS NOT NULL</code></li>
+<li><code>IS TRUE</code>, <code>IS NOT TRUE</code>, <code>IS FALSE</code>, <code>IS NOT FALSE</code></li>
+<li><code>IN</code></li>
+<li><code>LIKE</code>, <code>NOT LIKE</code></li>
+<li><code>regexp_match(column, pattern)</code></li>
+<li><code>CAST</code></li>
+</ul>
+<p>For example, the following filter string is acceptable:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="p">((</span><span class="n">label</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">[</span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="mi">20</span><span class="p">])</span><span class="w"> </span><span class="k">AND</span><span class="w"> </span><span class="p">(</span><span class="n">note</span><span class="p">[</span><span class="s1">'email'</span><span class="p">]</span><span class="w"> </span><span class="k">IS</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">))</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="w">    </span><span class="k">OR</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="n">note</span><span class="p">[</span><span class="s1">'created'</span><span class="p">]</span>
+</span></code></pre></div>
+<p>Nested fields can be accessed using the subscripts. Struct fields can be
+subscripted using field names, while list fields can be subscripted using
+indices.</p>
+<p>If your column name contains special characters or is a <a href="https://docs.rs/sqlparser/latest/sqlparser/keywords/index.html">SQL Keyword</a>,
+you can use backtick (<code>`</code>) to escape it. For nested fields, each segment of the
+path must be wrapped in backticks.</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="o">`</span><span class="k">CUBE</span><span class="o">`</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span><span class="w"> </span><span class="k">AND</span><span class="w"> </span><span class="o">`</span><span class="k">column</span><span class="w"> </span><span class="n">name</span><span class="w"> </span><span class="k">with</span><span class="w"> </span><span class="k">space</span><span class="o">`</span><span class="w"> </span><span class="k">IS</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span>
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="o">`</span><span class="n">nested</span><span class="w"> </span><span class="k">with</span><span class="w"> </span><span class="k">space</span><span class="o">`</span><span class="p">.</span><span class="o">`</span><span class="k">inner</span><span class="w"> </span><span class="k">with</span><span class="w"> </span><span class="k">space</span><span class="o">`</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">2</span>
+</span></code></pre></div>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Field names containing periods (<code>.</code>) are not supported.</p>
+</div>
+<p>Literals for dates, timestamps, and decimals can be written by writing the string
+value after the type name. For example</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="n">date_col</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">date</span><span class="w"> </span><span class="s1">'2021-01-01'</span>
+</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a><span class="k">and</span><span class="w"> </span><span class="n">timestamp_col</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">timestamp</span><span class="w"> </span><span class="s1">'2021-01-01 00:00:00'</span>
+</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a><span class="k">and</span><span class="w"> </span><span class="n">decimal_col</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">decimal</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span><span class="mi">3</span><span class="p">)</span><span class="w"> </span><span class="s1">'1.000'</span>
+</span></code></pre></div>
+<p>For timestamp columns, the precision can be specified as a number in the type
+parameter. Microsecond precision (6) is the default.</p>
+<table>
+<thead>
+<tr>
+<th>SQL</th>
+<th>Time unit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>timestamp(0)</code></td>
+<td>Seconds</td>
+</tr>
+<tr>
+<td><code>timestamp(3)</code></td>
+<td>Milliseconds</td>
+</tr>
+<tr>
+<td><code>timestamp(6)</code></td>
+<td>Microseconds</td>
+</tr>
+<tr>
+<td><code>timestamp(9)</code></td>
+<td>Nanoseconds</td>
+</tr>
+</tbody>
+</table>
+<p>Lance internally stores data in Arrow format. The mapping from SQL types to Arrow is:</p>
+<table>
+<thead>
+<tr>
+<th>SQL type</th>
+<th>Arrow type</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>boolean</code></td>
+<td><code>Boolean</code></td>
+</tr>
+<tr>
+<td><code>tinyint</code> / <code>tinyint unsigned</code></td>
+<td><code>Int8</code> / <code>UInt8</code></td>
+</tr>
+<tr>
+<td><code>smallint</code> / <code>smallint unsigned</code></td>
+<td><code>Int16</code> / <code>UInt16</code></td>
+</tr>
+<tr>
+<td><code>int</code> or <code>integer</code> / <code>int unsigned</code> or <code>integer unsigned</code></td>
+<td><code>Int32</code> / <code>UInt32</code></td>
+</tr>
+<tr>
+<td><code>bigint</code> / <code>bigint unsigned</code></td>
+<td><code>Int64</code> / <code>UInt64</code></td>
+</tr>
+<tr>
+<td><code>float</code></td>
+<td><code>Float32</code></td>
+</tr>
+<tr>
+<td><code>double</code></td>
+<td><code>Float64</code></td>
+</tr>
+<tr>
+<td><code>decimal(precision, scale)</code></td>
+<td><code>Decimal128</code></td>
+</tr>
+<tr>
+<td><code>date</code></td>
+<td><code>Date32</code></td>
+</tr>
+<tr>
+<td><code>timestamp</code></td>
+<td><code>Timestamp</code> (1)</td>
+</tr>
+<tr>
+<td><code>string</code></td>
+<td><code>Utf8</code></td>
+</tr>
+<tr>
+<td><code>binary</code></td>
+<td><code>Binary</code></td>
+</tr>
+</tbody>
+</table>
+<p>(1) See precision mapping in previous table.</p>
+<h3 id="random-read">Random read<a class="headerlink" href="#random-read" title="Permanent link">&para;</a></h3>
+<p>One distinct feature of Lance, as columnar format, is that it allows you to read random samples quickly.</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="c1"># Access the 2nd, 101th and 501th rows</span>
+</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="n">data</span> <span class="o">=</span> <span class="n">ds</span><span class="o">.</span><span class="n">take</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span> <span class="mi">100</span><span class="p">,</span> <span class="mi">500</span><span class="p">],</span> <span class="n">columns</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">,</span> <span class="s2">"label"</span><span class="p">])</span>
+</span></code></pre></div>
+<p>The ability to achieve fast random access to individual rows plays a crucial role in facilitating various workflows
+such as random sampling and shuffling in ML training.
+Additionally, it empowers users to construct secondary indices,
+enabling swift execution of queries for enhanced performance.</p>
+<h2 id="table-maintenance">Table Maintenance<a class="headerlink" href="#table-maintenance" title="Permanent link">&para;</a></h2>
+<p>Some operations over time will cause a Lance dataset to have a poor layout. For
+example, many small appends will lead to a large number of small fragments. Or
+deleting many rows will lead to slower queries due to the need to filter out
+deleted rows.</p>
+<p>To address this, Lance provides methods for optimizing dataset layout.</p>
+<h3 id="compact-data-files">Compact data files<a class="headerlink" href="#compact-data-files" title="Permanent link">&para;</a></h3>
+<p>Data files can be rewritten so there are fewer files. When passing a
+<code>target_rows_per_fragment</code> to <code>lance.dataset.DatasetOptimizer.compact_files</code>,
+Lance will skip any fragments that are already above that row count, and rewrite
+others. Fragments will be merged according to their fragment ids, so the inherent
+ordering of the data will be preserved.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Compaction creates a new version of the table. It does not delete the old
+version of the table and the files referenced by it.</p>
+</div>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-19-1"><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-19-2"><a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a>
+</span><span id="__span-19-3"><a id="__codelineno-19-3" name="__codelineno-19-3" href="#__codelineno-19-3"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./alice_and_bob.lance"</span><span class="p">)</span>
+</span><span id="__span-19-4"><a id="__codelineno-19-4" name="__codelineno-19-4" href="#__codelineno-19-4"></a><span class="n">dataset</span><span class="o">.</span><span class="n">optimize</span><span class="o">.</span><span class="n">compact_files</span><span class="p">(</span><span class="n">target_rows_per_fragment</span><span class="o">=</span><span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">)</span>
+</span></code></pre></div>
+<p>During compaction, Lance can also remove deleted rows. Rewritten fragments will
+not have deletion files. This can improve scan performance since the soft deleted
+rows don't have to be skipped during the scan.</p>
+<p>When files are rewritten, the original row addresses are invalidated. This means the
+affected files are no longer part of any ANN index if they were before. Because
+of this, it's recommended to rewrite files before re-building indices.</p>
+<!-- TODO: remove this last comment once stable row ids are default. -->
+
+<h3 id="cleanup-old-versions">Cleanup old versions<a class="headerlink" href="#cleanup-old-versions" title="Permanent link">&para;</a></h3>
+<p>Lance is an immutable format — every write creates a new version. The new version
+only writes the data that changed, so an insert writes the new rows and an update
+rewrites the affected columns for the affected rows. Even a delete creates a
+small deletion file. However, old versions still reference the previous data
+files, so those files are kept on disk until explicitly removed. Over time this
+means storage grows with each operation — inserts, updates, and deletes alike.</p>
+<p>Keeping old versions has important benefits: readers that opened an older version
+can continue reading it without interference from concurrent writers, providing
+snapshot isolation. Old versions also enable time travel queries, letting you
+read the dataset as it existed at any prior point in time.</p>
+<p><code>cleanup_old_versions</code> deletes old version metadata and any data files that are
+no longer referenced by any version, reclaiming the accumulated storage.</p>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Once old versions are cleaned up, time travel queries to those versions are
+no longer possible. Choose your retention window (<code>older_than</code>) accordingly —
+any version removed by cleanup cannot be recovered.</p>
+</div>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-20-1"><a id="__codelineno-20-1" name="__codelineno-20-1" href="#__codelineno-20-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-20-2"><a id="__codelineno-20-2" name="__codelineno-20-2" href="#__codelineno-20-2"></a>
+</span><span id="__span-20-3"><a id="__codelineno-20-3" name="__codelineno-20-3" href="#__codelineno-20-3"></a><span class="n">dataset</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./my_dataset.lance"</span><span class="p">)</span>
+</span><span id="__span-20-4"><a id="__codelineno-20-4" name="__codelineno-20-4" href="#__codelineno-20-4"></a><span class="n">dataset</span><span class="o">.</span><span class="n">cleanup_old_versions</span><span class="p">()</span>
+</span></code></pre></div>
+<p>By default, versions older than 7 days are removed. You can override this with
+the <code>older_than</code> parameter (a <code>timedelta</code>):</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-21-1"><a id="__codelineno-21-1" name="__codelineno-21-1" href="#__codelineno-21-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">datetime</span><span class="w"> </span><span class="kn">import</span> <span class="n">timedelta</span>
+</span><span id="__span-21-2"><a id="__codelineno-21-2" name="__codelineno-21-2" href="#__codelineno-21-2"></a>
+</span><span id="__span-21-3"><a id="__codelineno-21-3" name="__codelineno-21-3" href="#__codelineno-21-3"></a><span class="n">dataset</span><span class="o">.</span><span class="n">cleanup_old_versions</span><span class="p">(</span><span class="n">older_than</span><span class="o">=</span><span class="n">timedelta</span><span class="p">(</span><span class="n">days</span><span class="o">=</span><span class="mi">1</span><span class="p">))</span>
+</span></code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Tagged versions are exempt from cleanup. See <a href="../tags_and_branches/">Tags and Branches</a>
+for details.</p>
+</div>
+<p>By default, Lance only removes files that it can <strong>verify</strong> are no longer needed.
+A file is verified when Lance can see that it was referenced by an older version
+and is no longer referenced by any newer version. However, some orphaned files
+cannot be verified this way — for example, files left behind by aborted or failed
+commits that were never recorded in any version. These files are
+indistinguishable from files being written by an in-progress operation.</p>
+<p>Cleanup will never delete the current (active) version. This means passing
+<code>older_than=timedelta(0)</code> is safe and will delete all versions except the current
+one.</p>
+<p>The <code>delete_unverified</code> flag enables a more aggressive strategy that will also
+delete these unverified files:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-22-1"><a id="__codelineno-22-1" name="__codelineno-22-1" href="#__codelineno-22-1"></a><span class="n">dataset</span><span class="o">.</span><span class="n">cleanup_old_versions</span><span class="p">(</span>
+</span><span id="__span-22-2"><a id="__codelineno-22-2" name="__codelineno-22-2" href="#__codelineno-22-2"></a>    <span class="n">older_than</span><span class="o">=</span><span class="n">timedelta</span><span class="p">(</span><span class="n">hours</span><span class="o">=</span><span class="mi">2</span><span class="p">),</span>
+</span><span id="__span-22-3"><a id="__codelineno-22-3" name="__codelineno-22-3" href="#__codelineno-22-3"></a>    <span class="n">delete_unverified</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-22-4"><a id="__codelineno-22-4" name="__codelineno-22-4" href="#__codelineno-22-4"></a><span class="p">)</span>
+</span></code></pre></div>
+<div class="admonition danger">
+<p class="admonition-title">Danger</p>
+<p>Only use <code>delete_unverified=True</code> when you are confident that no other
+concurrent operation has been in-progress for longer than the <code>older_than</code>
+duration. Lance uses the file's age to decide whether an unverified file is
+safe to remove, so any operation that is still running past the <code>older_than</code>
+window risks having its files deleted out from under it.</p>
+<p>In particular, combining <code>delete_unverified=True</code> with <code>older_than=timedelta(0)</code>
+is <strong>extremely dangerous</strong> — if any other operation is in-progress at all,
+its data files may be deleted, leading to dataset corruption.</p>
+</div>
+<h3 id="automatic-cleanup">Automatic cleanup<a class="headerlink" href="#automatic-cleanup" title="Permanent link">&para;</a></h3>
+<p>Instead of calling <code>cleanup_old_versions</code> manually, you can configure Lance to
+clean up old versions automatically during writes. When auto cleanup is enabled,
+Lance will run cleanup every <em>N</em> commits (the <strong>interval</strong>), removing versions
+older than a specified duration.</p>
+<p>Auto cleanup can be enabled when creating a new dataset:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-23-1"><a id="__codelineno-23-1" name="__codelineno-23-1" href="#__codelineno-23-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">lance</span>
+</span><span id="__span-23-2"><a id="__codelineno-23-2" name="__codelineno-23-2" href="#__codelineno-23-2"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
+</span><span id="__span-23-3"><a id="__codelineno-23-3" name="__codelineno-23-3" href="#__codelineno-23-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">lance.dataset</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoCleanupConfig</span>
+</span><span id="__span-23-4"><a id="__codelineno-23-4" name="__codelineno-23-4" href="#__codelineno-23-4"></a>
+</span><span id="__span-23-5"><a id="__codelineno-23-5" name="__codelineno-23-5" href="#__codelineno-23-5"></a><span class="n">table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">({</span><span class="s2">"id"</span><span class="p">:</span> <span class="nb">range</span><span class="p">(</span><span class="mi">100</span><span class="p">)})</span>
+</span><span id="__span-23-6"><a id="__codelineno-23-6" name="__codelineno-23-6" href="#__codelineno-23-6"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">write_dataset</span><span class="p">(</span>
+</span><span id="__span-23-7"><a id="__codelineno-23-7" name="__codelineno-23-7" href="#__codelineno-23-7"></a>    <span class="n">table</span><span class="p">,</span>
+</span><span id="__span-23-8"><a id="__codelineno-23-8" name="__codelineno-23-8" href="#__codelineno-23-8"></a>    <span class="s2">"./my_dataset.lance"</span><span class="p">,</span>
+</span><span id="__span-23-9"><a id="__codelineno-23-9" name="__codelineno-23-9" href="#__codelineno-23-9"></a>    <span class="n">auto_cleanup_options</span><span class="o">=</span><span class="n">AutoCleanupConfig</span><span class="p">(</span>
+</span><span id="__span-23-10"><a id="__codelineno-23-10" name="__codelineno-23-10" href="#__codelineno-23-10"></a>        <span class="n">interval</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>             <span class="c1"># run cleanup every 20 commits</span>
+</span><span id="__span-23-11"><a id="__codelineno-23-11" name="__codelineno-23-11" href="#__codelineno-23-11"></a>        <span class="n">older_than_seconds</span><span class="o">=</span><span class="mi">3600</span><span class="p">,</span> <span class="c1"># remove versions older than 1 hour</span>
+</span><span id="__span-23-12"><a id="__codelineno-23-12" name="__codelineno-23-12" href="#__codelineno-23-12"></a>    <span class="p">),</span>
+</span><span id="__span-23-13"><a id="__codelineno-23-13" name="__codelineno-23-13" href="#__codelineno-23-13"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>Or enabled on an existing dataset:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-24-1"><a id="__codelineno-24-1" name="__codelineno-24-1" href="#__codelineno-24-1"></a><span class="n">ds</span> <span class="o">=</span> <span class="n">lance</span><span class="o">.</span><span class="n">dataset</span><span class="p">(</span><span class="s2">"./my_dataset.lance"</span><span class="p">)</span>
+</span><span id="__span-24-2"><a id="__codelineno-24-2" name="__codelineno-24-2" href="#__codelineno-24-2"></a><span class="n">ds</span><span class="o">.</span><span class="n">optimize</span><span class="o">.</span><span class="n">enable_auto_cleanup</span><span class="p">(</span>
+</span><span id="__span-24-3"><a id="__codelineno-24-3" name="__codelineno-24-3" href="#__codelineno-24-3"></a>    <span class="n">AutoCleanupConfig</span><span class="p">(</span>
+</span><span id="__span-24-4"><a id="__codelineno-24-4" name="__codelineno-24-4" href="#__codelineno-24-4"></a>        <span class="n">interval</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>
+</span><span id="__span-24-5"><a id="__codelineno-24-5" name="__codelineno-24-5" href="#__codelineno-24-5"></a>        <span class="n">older_than_seconds</span><span class="o">=</span><span class="mi">3600</span><span class="p">,</span>
+</span><span id="__span-24-6"><a id="__codelineno-24-6" name="__codelineno-24-6" href="#__codelineno-24-6"></a>    <span class="p">)</span>
+</span><span id="__span-24-7"><a id="__codelineno-24-7" name="__codelineno-24-7" href="#__codelineno-24-7"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>And disabled again:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-25-1"><a id="__codelineno-25-1" name="__codelineno-25-1" href="#__codelineno-25-1"></a><span class="n">ds</span><span class="o">.</span><span class="n">optimize</span><span class="o">.</span><span class="n">disable_auto_cleanup</span><span class="p">()</span>
+</span></code></pre></div>
+<p>Auto cleanup parameters can also be set directly via dataset config keys:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-26-1"><a id="__codelineno-26-1" name="__codelineno-26-1" href="#__codelineno-26-1"></a><span class="n">ds</span><span class="o">.</span><span class="n">update_config</span><span class="p">({</span>
+</span><span id="__span-26-2"><a id="__codelineno-26-2" name="__codelineno-26-2" href="#__codelineno-26-2"></a>    <span class="s2">"lance.auto_cleanup.interval"</span><span class="p">:</span> <span class="s2">"20"</span><span class="p">,</span>
+</span><span id="__span-26-3"><a id="__codelineno-26-3" name="__codelineno-26-3" href="#__codelineno-26-3"></a>    <span class="s2">"lance.auto_cleanup.older_than"</span><span class="p">:</span> <span class="s2">"3600s"</span><span class="p">,</span>
+</span><span id="__span-26-4"><a id="__codelineno-26-4" name="__codelineno-26-4" href="#__codelineno-26-4"></a><span class="p">})</span>
+</span></code></pre></div>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Auto cleanup runs as part of the commit path. If your writer does not have
+delete permissions, or you are doing high-frequency writes where the extra
+latency matters, pass <code>skip_auto_cleanup=True</code> to <code>write_dataset</code> to skip it
+on a per-write basis.</p>
+</div>
+<h3 id="other-cleanup-strategies">Other cleanup strategies<a class="headerlink" href="#other-cleanup-strategies" title="Permanent link">&para;</a></h3>
+<p>It is common to run cleanup as a periodic background task on a dedicated server
+(for example, via a cron job or scheduled workflow). This keeps cleanup off the
+write path entirely, avoiding any impact to write latency, but requires setting
+up and maintaining additional infrastructure.</p>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../../quickstart/full-text-search/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Full-Text Search</div>
+        </a>
+        <a class="next" href="../data_types/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Data Types</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#writing-lance-dataset">Writing Lance Dataset</a>
+      <a class="ld-toc__h2" href="#adding-rows">Adding Rows</a>
+      <a class="ld-toc__h2" href="#deleting-rows">Deleting rows</a>
+      <a class="ld-toc__h2" href="#updating-rows">Updating rows</a>
+      <a class="ld-toc__h2" href="#merge-insert">Merge Insert</a>
+      <a class="ld-toc__h3" href="#bulk-update">Bulk Update</a>
+      <a class="ld-toc__h3" href="#insert-if-not-exists">Insert if not Exists</a>
+      <a class="ld-toc__h3" href="#update-or-insert-upsert">Update or Insert (Upsert)</a>
+      <a class="ld-toc__h3" href="#replace-a-portion-of-data">Replace a Portion of Data</a>
+      <a class="ld-toc__h2" href="#reading-lance-dataset">Reading Lance Dataset</a>
+      <a class="ld-toc__h3" href="#iterative-read">Iterative Read</a>
+      <a class="ld-toc__h3" href="#filter-push-down">Filter push-down</a>
+      <a class="ld-toc__h3" href="#random-read">Random read</a>
+      <a class="ld-toc__h2" href="#table-maintenance">Table Maintenance</a>
+      <a class="ld-toc__h3" href="#compact-data-files">Compact data files</a>
+      <a class="ld-toc__h3" href="#cleanup-old-versions">Cleanup old versions</a>
+      <a class="ld-toc__h3" href="#automatic-cleanup">Automatic cleanup</a>
+      <a class="ld-toc__h3" href="#other-cleanup-strategies">Other cleanup strategies</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../format/">Specification</a>
+        <a href="../../format/file/">File format</a>
+        <a href="../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../quickstart/">Getting started</a>
+        <a href="./">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>
