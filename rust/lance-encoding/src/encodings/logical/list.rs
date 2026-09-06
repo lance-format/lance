@@ -1611,6 +1611,7 @@ mod tests {
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata).await;
     }
 
+<<<<<<< HEAD
     #[test]
     fn test_plan_decoded_bytes_list_i32_not_supported() {
         // Lists encode items using repetition levels so the number of decoded
@@ -1654,5 +1655,43 @@ mod tests {
             err.to_string().contains("repetition"),
             "error should mention repetition, got: {err}"
         );
+=======
+    // --------------------------------------------------------------------------
+    // plan_decoded_bytes tests (commit 4)
+    // --------------------------------------------------------------------------
+
+    #[test]
+    fn test_plan_decoded_bytes_list_does_not_panic() {
+        use crate::decoder::{CANDIDATE_BATCH_SIZES, StructuralFieldDecoder};
+        use crate::encodings::logical::primitive::StructuralPrimitiveFieldDecoder;
+        use arrow_schema::{DataType, Field as ArrowField};
+        use std::sync::Arc;
+
+        // List<Int32>: child decoder is a StructuralPrimitiveFieldDecoder for Int32.
+        let child_field = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let child_decoder: Box<dyn crate::decoder::StructuralFieldDecoder> =
+            Box::new(StructuralPrimitiveFieldDecoder::new(&child_field, false));
+
+        let list_data_type =
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true)));
+        let decoder = super::StructuralListDecoder::new(child_decoder, list_data_type);
+
+        // Calling plan_decoded_bytes must not panic and must return Ok.
+        let result = decoder.plan_decoded_bytes(100);
+        assert!(result.is_ok(), "plan_decoded_bytes on List must return Ok");
+
+        let out = result.unwrap();
+        assert_eq!(out.len(), 8, "must return 8 candidate byte counts");
+        assert_eq!(CANDIDATE_BATCH_SIZES.len(), 8);
+
+        // The list decoder delegates to the child; monotonicity is expected.
+        for (i, window) in out.windows(2).enumerate() {
+            assert!(
+                window[1] >= window[0],
+                "candidate[{}] should be >= candidate[{i}]",
+                i + 1
+            );
+        }
+>>>>>>> 17e4794f3 (feat(encoding): implement plan_decoded_bytes for struct and list structural decoders)
     }
 }
