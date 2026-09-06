@@ -146,6 +146,10 @@ name = "kmeans"
 harness = false
 
 [[bench]]
+name = "kmeans_recompute"
+harness = false
+
+[[bench]]
 name = "compute_partition"
 harness = false
 
