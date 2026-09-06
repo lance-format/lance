@@ -310,7 +310,7 @@ impl IVFIndex {
                     )));
                 }
 
-                let range = self.ivf.row_range(partition_id);
+                let range = self.ivf.try_row_range(partition_id)?;
                 let idx = self
                     .sub_index
                     .load_partition(
@@ -2947,7 +2947,7 @@ async fn write_hnsw_root_index_from_auxiliary(
         .await?;
 
     for partition_id in 0..aux_ivf.num_partitions() {
-        let row_range = aux_ivf.row_range(partition_id);
+        let row_range = aux_ivf.try_row_range(partition_id)?;
         if row_range.is_empty() {
             index_ivf.add_partition(0);
             partition_index_metadata.push(String::new());

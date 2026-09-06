@@ -1311,7 +1311,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let batch = match self.reader.metadata().num_rows {
             0 => RecordBatch::new_empty(schema),
             _ => {
-                let row_range = self.ivf.row_range(partition_id);
+                let row_range = self.ivf.try_row_range(partition_id)?;
                 if row_range.is_empty() {
                     RecordBatch::new_empty(schema)
                 } else {
@@ -5449,7 +5449,7 @@ mod tests {
             .expect("HNSW declares a read projection");
         assert_eq!(projection.schema.fields.len(), 2);
 
-        let row_range = hnsw.ivf.row_range(0);
+        let row_range = hnsw.ivf.try_row_range(0).unwrap();
         assert!(!row_range.is_empty(), "partition 0 should hold rows");
         let store = dataset.object_store.as_ref();
 
@@ -5528,7 +5528,7 @@ mod tests {
 
         let mut compared = 0;
         for partition_id in 0..hnsw.ivf.num_partitions() {
-            let range = hnsw.ivf.row_range(partition_id);
+            let range = hnsw.ivf.try_row_range(partition_id).unwrap();
             if range.is_empty() {
                 continue;
             }

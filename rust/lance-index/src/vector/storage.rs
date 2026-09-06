@@ -673,7 +673,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         part_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<Q::Storage> {
-        let range = self.ivf.row_range(part_id);
+        let range = self.ivf.try_row_range(part_id)?;
         let batch = if range.is_empty() {
             let schema = self.reader.schema();
             let arrow_schema = arrow_schema::Schema::from(schema.as_ref());
