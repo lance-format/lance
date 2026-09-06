@@ -67,6 +67,11 @@ jobs:
         with:
           repository: lance-format/lance-context
           path: lance-context
+      - name: Checkout lance-flink
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: lance-format/lance-flink
+          path: lance-flink
       - name: Configure Git Credentials
         run: |
           git config user.name github-actions[bot]
@@ -89,6 +94,7 @@ jobs:
           LANCE_DUCKDB_REPO: ${{ github.workspace }}/lance-duckdb
           LANCE_HUGGINGFACE_REPO: ${{ github.workspace }}/lance-huggingface
           LANCE_CONTEXT_REPO: ${{ github.workspace }}/lance-context
+          LANCE_FLINK_REPO: ${{ github.workspace }}/lance-flink
         run: |
           docs/make-full-website.sh
       - name: Deploy

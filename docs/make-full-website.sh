@@ -14,6 +14,7 @@ Override any repo path with the matching environment variable:
   LANCE_DUCKDB_REPO
   LANCE_HUGGINGFACE_REPO
   LANCE_CONTEXT_REPO
+  LANCE_FLINK_REPO
 Defaults:
   LANCE_NAMESPACE_REPO=$HOME/oss/lance-namespace
   LANCE_NAMESPACE_IMPLS_REPO=$HOME/oss/lance-namespace-impls
@@ -23,6 +24,7 @@ Defaults:
   LANCE_DUCKDB_REPO=$HOME/oss/lance-duckdb
   LANCE_HUGGINGFACE_REPO=$HOME/oss/lance-huggingface
   LANCE_CONTEXT_REPO=$HOME/oss/lance-context
+  LANCE_FLINK_REPO=$HOME/oss/lance-flink
 EOF
 }
 
@@ -63,6 +65,7 @@ trino_repo_input=${LANCE_TRINO_REPO:-$HOME/oss/lance-trino}
 duckdb_repo_input=${LANCE_DUCKDB_REPO:-$HOME/oss/lance-duckdb}
 huggingface_repo_input=${LANCE_HUGGINGFACE_REPO:-$HOME/oss/lance-huggingface}
 context_repo_input=${LANCE_CONTEXT_REPO:-$HOME/oss/lance-context}
+flink_repo_input=${LANCE_FLINK_REPO:-$HOME/oss/lance-flink}
 
 copy_docs_dir() {
     local source_dir="$1"
@@ -138,6 +141,7 @@ trino_repo=$(resolve_repo_dir "$trino_repo_input")
 duckdb_repo=$(resolve_repo_dir "$duckdb_repo_input")
 huggingface_repo=$(resolve_repo_dir "$huggingface_repo_input")
 context_repo=$(resolve_repo_dir "$context_repo_input")
+flink_repo=$(resolve_repo_dir "$flink_repo_input")
 
 "$script_dir/clean-full-website.sh"
 
@@ -275,6 +279,12 @@ else
     warn_missing_repo "Lance Context docs" "$context_repo/docs/src"
 fi
 
+if copy_docs_dir "$flink_repo/docs/src" "$docs_src/integrations/flink"; then
+    integration_entries+=("  - Apache Flink: flink")
+else
+    warn_missing_repo "Lance Flink docs" "$flink_repo/docs/src"
+fi
+
 {
     echo "nav:"
     for entry in "${integration_entries[@]}"; do
@@ -317,6 +327,10 @@ fi
 
 if copy_file_if_exists "$context_repo/CONTRIBUTING.md" "$docs_src/community/project-specific/context.md"; then
     project_entries+=("  - Lance Context: context.md")
+fi
+
+if copy_file_if_exists "$flink_repo/CONTRIBUTING.md" "$docs_src/community/project-specific/flink.md"; then
+    project_entries+=("  - Lance Flink: flink.md")
 fi
 
 {
