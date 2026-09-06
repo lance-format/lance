@@ -1467,11 +1467,12 @@ impl Dataset {
     /// # Arguments
     ///
     /// * `older_than` - Versions older than this will be deleted.
-    /// * `delete_unverified` - If false (the default) then files will only be deleted if they
-    ///                        are listed in at least one manifest.  Otherwise these files will
-    ///                        be kept since they cannot be distinguished from an in-progress
-    ///                        transaction.  Set to true to delete these files if you are sure
-    ///                        there are no other in-progress dataset operations.
+    /// * `delete_unverified` - If false (the default), files that are not referenced by any
+    ///                        manifest will only be deleted if they are more than 7 days old.
+    ///                        Otherwise these files will be kept since they cannot be
+    ///                        distinguished from an in-progress transaction. Set to true to
+    ///                        delete these files if you are sure there are no other
+    ///                        in-progress dataset operations.
     ///
     /// # Returns
     ///

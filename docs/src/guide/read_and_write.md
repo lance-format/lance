@@ -506,14 +506,16 @@ A file is verified when Lance can see that it was referenced by an older version
 and is no longer referenced by any newer version. However, some orphaned files
 cannot be verified this way — for example, files left behind by aborted or failed
 commits that were never recorded in any version. These files are
-indistinguishable from files being written by an in-progress operation.
+indistinguishable from files being written by an in-progress operation, so their
+**age** is the only evidence that no operation still owns them: by default Lance
+removes an unverifiable file only if it is at least **7 days** old.
 
 Cleanup will never delete the current (active) version. This means passing
 `older_than=timedelta(0)` is safe and will delete all versions except the current
 one.
 
 The `delete_unverified` flag enables a more aggressive strategy that will also
-delete these unverified files:
+delete unverified files regardless of their age:
 
 ```python
 dataset.cleanup_old_versions(
@@ -524,15 +526,14 @@ dataset.cleanup_old_versions(
 
 !!! danger
 
-    Only use `delete_unverified=True` when you are confident that no other
-    concurrent operation has been in-progress for longer than the `older_than`
-    duration. Lance uses the file's age to decide whether an unverified file is
-    safe to remove, so any operation that is still running past the `older_than`
-    window risks having its files deleted out from under it.
+    `delete_unverified=True` removes the 7-day age protection entirely: an
+    unverifiable file is deleted whatever its age. Age is the only thing that
+    distinguishes an abandoned file from one an operation is still writing, so with
+    the flag set there is nothing left to make that distinction.
 
-    In particular, combining `delete_unverified=True` with `older_than=timedelta(0)`
-    is **extremely dangerous** — if any other operation is in-progress at all,
-    its data files may be deleted, leading to dataset corruption.
+    Only use it when you can guarantee that **no other process is operating on the
+    dataset at all**. Any concurrent write may have its files deleted out from under
+    it, leaving the dataset corrupted.
 
 ### Automatic cleanup
 
