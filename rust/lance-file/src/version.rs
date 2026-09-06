@@ -17,7 +17,7 @@ pub const V2_FORMAT_2_3: &str = "2.3";
 
 /// Resolve the current stable release policy to an exact file version.
 pub const fn stable_file_version() -> ConcreteFileVersion {
-    ConcreteFileVersion::V2_1
+    ConcreteFileVersion::V2_2
 }
 
 /// Resolve the current next release policy to an exact file version.
@@ -35,12 +35,12 @@ pub enum LanceFileVersion {
     Legacy,
     /// Exact v2.0.
     V2_0,
-    /// Exact v2.1 and the current default.
-    #[default]
+    /// Exact v2.1.
     V2_1,
     /// The latest stable release.
     Stable,
-    /// Exact v2.2.
+    /// Exact v2.2 and the current default.
+    #[default]
     V2_2,
     /// The latest unstable release.
     Next,
@@ -274,7 +274,7 @@ mod tests {
             (LanceFileVersion::Legacy, ConcreteFileVersion::V1),
             (LanceFileVersion::V2_0, ConcreteFileVersion::V2_0),
             (LanceFileVersion::V2_1, ConcreteFileVersion::V2_1),
-            (LanceFileVersion::Stable, ConcreteFileVersion::V2_1),
+            (LanceFileVersion::Stable, ConcreteFileVersion::V2_2),
             (LanceFileVersion::V2_2, ConcreteFileVersion::V2_2),
             (LanceFileVersion::Next, ConcreteFileVersion::V2_3),
             (LanceFileVersion::V2_3, ConcreteFileVersion::V2_3),
@@ -283,6 +283,7 @@ mod tests {
         for (selector, expected) in cases {
             assert_eq!(selector.resolve(), expected);
         }
+        assert_eq!(LanceFileVersion::default(), LanceFileVersion::V2_2);
     }
 
     #[test]

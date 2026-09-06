@@ -5053,7 +5053,7 @@ mod tests {
                 .unwrap();
 
             let dataset = Arc::new(
-                TestDatasetGenerator::new(data.clone(), LanceFileVersion::default())
+                TestDatasetGenerator::new(data.clone(), LanceFileVersion::V2_1)
                     .make_hostile(&test_dir)
                     .await,
             );
@@ -5353,7 +5353,18 @@ mod tests {
         };
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        let dataset = Arc::new(Dataset::write(reader, &test_dir, None).await.unwrap());
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_1),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
 
         let blobs = dataset
             .take_blobs_by_indices(&[0, 1, 2, 3], "blob")
@@ -5544,6 +5555,7 @@ mod tests {
 
         // Write with enable_stable_row_ids=true and force multiple fragments
         let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_1),
             enable_stable_row_ids: true,
             max_rows_per_file: 3, // Force 2 fragments with 3 rows each
             ..Default::default()

@@ -132,7 +132,7 @@ def test_blob_compaction(tmp_path: Path):
         base_dir,
         schema=schema,
         max_rows_per_file=1,
-        data_storage_version="stable",
+        data_storage_version="2.1",
     )
     assert len(dataset.get_fragments()) == 2
 

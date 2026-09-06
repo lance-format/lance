@@ -3566,6 +3566,7 @@ mod tests {
             reader,
             &test_dir,
             Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
                 max_rows_per_file: 1,
                 ..Default::default()
             }),

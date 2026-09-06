@@ -13487,7 +13487,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "memory://test",
             Some(WriteParams {
                 commit_handler: Some(Arc::new(RenameCommitHandler)),
-                data_storage_version: Some(LanceFileVersion::Stable),
+                data_storage_version: Some(LanceFileVersion::V2_1),
                 ..Default::default()
             }),
         )
@@ -13575,7 +13575,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "memory://test",
             Some(WriteParams {
                 commit_handler: Some(Arc::new(RenameCommitHandler)),
-                data_storage_version: Some(LanceFileVersion::Stable),
+                data_storage_version: Some(LanceFileVersion::V2_1),
                 ..Default::default()
             }),
         )
