@@ -431,11 +431,16 @@ impl DecodeMiniBlockTask {
                 }
             };
 
-            // We hit this case when all we needed was the preamble
+            // Empty row ranges can occur when nested scheduling aligns child decode tasks.  Such a
+            // range either requests only the preamble or no values at all.
             if range.start == range.end {
-                debug_assert!(preamble_action == PreambleAction::Take);
                 debug_assert!(items_in_preamble <= total_items);
-                return (0..items_in_preamble, 0..first_row_start);
+                let (item_start, level_start) = if preamble_action == PreambleAction::Take {
+                    (0, 0)
+                } else {
+                    (items_in_preamble, first_row_start)
+                };
+                return (item_start..items_in_preamble, level_start..first_row_start);
             }
             assert!(range.start < range.end);
 
@@ -7742,6 +7747,7 @@ mod tests {
             assert_eq!(level_range, expected_level_range);
         };
 
+        check(0..0, 0..0, 0..0);
         check(0..1, 0..3, 0..3);
         check(1..2, 3..5, 3..5);
         check(2..3, 5..5, 5..6);
@@ -7906,6 +7912,7 @@ mod tests {
             assert_eq!(level_range, expected_level_range);
         };
 
+        check(0..0, 1..1, 1..1);
         check(0..1, 1..3, 1..3);
         check(1..2, 3..3, 3..4);
         check(0..2, 1..3, 1..4);
@@ -8969,6 +8976,34 @@ mod tests {
             .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);
 
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await
+    }
+
+    // https://github.com/lance-format/lance/issues/8558
+    #[tokio::test]
+    async fn test_take_multichunk_string_lists() {
+        use arrow_array::builder::{ListBuilder, StringBuilder};
+
+        let mut list_builder = ListBuilder::new(StringBuilder::new());
+        for row in 0..3 {
+            for item in 0..512 {
+                list_builder
+                    .values()
+                    .append_value(format!("r{row:03}i{item:06}xaaaa"));
+            }
+            list_builder.append(true);
+        }
+        let list_array: ArrayRef = Arc::new(list_builder.finish());
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+        );
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralU16)
+            .with_indices(vec![0, 2]);
+
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, metadata).await;
     }
 
     async fn test_minichunk_size_helper(
