@@ -20,6 +20,9 @@ use smallvec::SmallVec;
 
 use crate::metrics::MetricsCollector;
 
+#[path = "wand_intersection.rs"]
+mod intersection;
+
 use super::{
     CompressedPositionStorage,
     documents::{DocId, DocLengths, DocVisibility},
@@ -243,7 +246,7 @@ impl CompetitiveFloorMode {
 // skipping plus a slice-level merge over decompressed blocks, replacing the
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
 // LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto enables the
-// bulk path only for its consistently faster two- and three-clause kernels.
+// bulk path for two and three clauses and for wider current-format conjunctions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BulkAndMode {
     #[default]
@@ -2230,6 +2233,7 @@ struct AndWindowStats {
     range_blocks_scanned: usize,
     candidates_returned: usize,
     score_first_rejections: usize,
+    pairwise_intersections: usize,
 }
 
 impl Eq for TailPosting {}
@@ -2548,10 +2552,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 .lead
                 .iter()
                 .all(|posting| posting.is_compressed() && !posting.has_grouped_terms())
-            && self
-                .bulk_and_mode_override
-                .unwrap_or_else(|| *BULK_AND_MODE)
-                .enabled_for(self.lead.len())
+            && {
+                let mode = self
+                    .bulk_and_mode_override
+                    .unwrap_or_else(|| *BULK_AND_MODE);
+                mode.enabled_for(self.lead.len())
+                    || (mode == BulkAndMode::Auto
+                        && self.lead.len() >= 4
+                        && self.lead.iter().all(|posting| {
+                            matches!(&posting.list, PostingList::Compressed(list)
+                                if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+                        }))
+            }
         {
             #[cfg(test)]
             {
@@ -3745,6 +3757,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return Ok(vec![]);
         }
         let num_lists = self.lead.len();
+        let use_pairwise_intersection = num_lists >= 4
+            && self.lead.iter().all(|posting| {
+                matches!(&posting.list, PostingList::Compressed(list)
+                    if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+            });
         let phrase_slop = params.phrase_slop;
         let mut score_order = (0..num_lists).collect::<Vec<_>>();
         score_order.sort_unstable_by_key(|&index| {
@@ -4034,6 +4051,73 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
         }
 
+        #[inline]
+        fn merge_window_docs_pairwise(
+            wins: &[WindowList],
+            scratch: &mut Vec<u32>,
+            docs_out: &mut Vec<u32>,
+            offs_out: &mut Vec<u8>,
+        ) {
+            // Every slice belongs to one decoded block and has at most 256
+            // entries. Shrink candidates clause by clause, so later clauses
+            // only intersect documents that survived the earlier clauses.
+            let first = &wins[0];
+            // SAFETY: window construction keeps these decoded blocks alive
+            // and unchanged until both intersection and scoring complete.
+            docs_out.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(first.docs.add(first.pos), first.end - first.pos)
+            });
+            for win in &wins[1..] {
+                let slice =
+                    unsafe { std::slice::from_raw_parts(win.docs.add(win.pos), win.end - win.pos) };
+                let first_doc = slice[0];
+                let last_doc = slice[slice.len() - 1];
+                // Sorted distinct IDs with this span contain every integer
+                // in the interval. This exact certificate also handles a
+                // dense follower covering a sparse set of candidates.
+                if u64::from(last_doc) - u64::from(first_doc) + 1 == slice.len() as u64 {
+                    if docs_out[0] >= first_doc && docs_out[docs_out.len() - 1] <= last_doc {
+                        continue;
+                    }
+                    let lo = docs_out.partition_point(|&doc| doc < first_doc);
+                    let hi = docs_out.partition_point(|&doc| doc <= last_doc);
+                    if lo != 0 {
+                        docs_out.copy_within(lo..hi, 0);
+                    }
+                    docs_out.truncate(hi - lo);
+                } else {
+                    intersection::intersect(docs_out, slice, scratch);
+                    std::mem::swap(docs_out, scratch);
+                }
+                if docs_out.is_empty() {
+                    return;
+                }
+            }
+
+            // Recover posting offsets only for the final intersection. No
+            // frequencies or intermediate per-clause offset tables are needed.
+            offs_out.resize(docs_out.len() * wins.len(), 0);
+            for (clause, win) in wins.iter().enumerate() {
+                let first_doc = unsafe { *win.docs.add(win.pos) };
+                let last_doc = unsafe { *win.docs.add(win.end - 1) };
+                let is_dense =
+                    u64::from(last_doc) - u64::from(first_doc) + 1 == (win.end - win.pos) as u64;
+                let mut pos = win.pos;
+                for (candidate, &doc) in docs_out.iter().enumerate() {
+                    pos = if is_dense {
+                        win.pos + (doc - first_doc) as usize
+                    } else {
+                        unsafe { find_next_geq(win.docs, pos, win.end, doc) }
+                    };
+                    debug_assert!(
+                        pos < win.end,
+                        "intersection must be present in every clause"
+                    );
+                    offs_out[candidate * wins.len() + clause] = pos as u8;
+                }
+            }
+        }
+
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons: usize = 0;
         let mut wins: Vec<WindowList> = Vec::with_capacity(num_lists);
@@ -4047,6 +4131,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut batch_lens: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
         let mut batch_norms: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
         let mut cursor_scratch: Vec<usize> = Vec::with_capacity(num_lists);
+        let mut intersection_scratch: Vec<u32> = Vec::new();
         // Norm cache: one byte-norm load plus a cached addend replaces the
         // per-clause BM25 denominator recompute in pass B.
         let mut norm_k = None;
@@ -4221,6 +4306,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (3, _, false) => unsafe {
                         merge_window_docs_3(&wins, &mut batch_docs, &mut batch_offs)
                     },
+                    (_, _, false) if use_pairwise_intersection => {
+                        #[cfg(test)]
+                        {
+                            self.and_window_stats.pairwise_intersections += 1;
+                        }
+                        merge_window_docs_pairwise(
+                            &wins,
+                            &mut intersection_scratch,
+                            &mut batch_docs,
+                            &mut batch_offs,
+                        )
+                    }
                     (_, _, false) => merge_window_docs_n(
                         &wins,
                         &mut cursor_scratch,
@@ -6144,9 +6241,15 @@ mod tests {
         assert_eq!(wand.maxscore_general_windows > 0, !single_essential);
     }
 
-    #[test]
-    fn bulk_and_and_classic_publish_identical_query_order_score_bits() {
-        let contributions = [0.002_972_301_6_f32, 0.001_982_450_7_f32, 0.001_882_293_f32];
+    #[rstest]
+    fn bulk_and_and_classic_publish_identical_query_order_score_bits(
+        #[values(3, 4, 5, 8, 16)] num_clauses: usize,
+    ) {
+        let contributions = [0.002_972_301_6_f32, 0.001_982_450_7_f32, 0.001_882_293_f32]
+            .into_iter()
+            .cycle()
+            .take(num_clauses)
+            .collect::<Vec<_>>();
         let bounds = [0.002_99_f32, 0.001_99_f32, 0.003_f32];
         // Different posting lengths force cost order 1, 2, 0 instead of query
         // order 0, 1, 2.
@@ -6158,9 +6261,10 @@ mod tests {
 
         let run = |mode| {
             let postings = contributions
-                .into_iter()
-                .zip(bounds)
-                .zip(clause_docs.iter())
+                .iter()
+                .copied()
+                .zip(bounds.into_iter().cycle())
+                .zip(clause_docs.iter().cycle())
                 .enumerate()
                 .map(|(position, ((query_weight, max_score), doc_ids))| {
                     PostingIterator::with_query_weight(
@@ -6198,7 +6302,13 @@ mod tests {
         assert_eq!(classic.len(), 1);
         assert_eq!(bulk[0].document, 0);
         assert_eq!(classic[0].document, 0);
-        assert_eq!(bulk_score, 0x3be0_094c);
+        assert_eq!(
+            bulk_score,
+            contributions
+                .iter()
+                .fold(0.0_f32, |sum, value| sum + value)
+                .to_bits()
+        );
         assert_eq!(classic_score, bulk_score);
     }
 
@@ -9568,9 +9678,13 @@ mod tests {
     #[case::and_k10(false, 0, 10, 3)]
     #[case::and_k3(false, 0, 3, 3)]
     #[case::and_two_clauses(false, 0, 10, 2)]
+    #[case::and_one_clause(false, 0, 10, 1)]
     #[case::and_four_clauses(false, 0, 10, 4)]
     #[case::and_five_clauses(false, 0, 10, 5)]
     #[case::and_six_clauses(false, 0, 10, 6)]
+    #[case::and_eight_clauses(false, 0, 10, 8)]
+    #[case::and_twelve_clauses(false, 0, 10, 12)]
+    #[case::and_sixteen_clauses(false, 0, 10, 16)]
     #[case::phrase_k10(true, 0, 10, 3)]
     #[case::phrase_k3(true, 0, 3, 3)]
     #[case::phrase_slop_three(true, 3, 10, 3)]
@@ -9578,6 +9692,8 @@ mod tests {
     #[case::phrase_four_clauses(true, 0, 10, 4)]
     #[case::phrase_five_clauses(true, 0, 10, 5)]
     #[case::phrase_six_clauses(true, 0, 10, 6)]
+    #[case::phrase_eight_clauses(true, 0, 10, 8)]
+    #[case::phrase_sixteen_clauses(true, 0, 10, 16)]
     fn test_bulk_and_matches_classic(
         #[case] phrase: bool,
         #[case] slop: u32,
@@ -9605,8 +9721,11 @@ mod tests {
             clause_docs(3, 41),
             clause_docs(3, 7),
             clause_docs(4, 13),
-        ][..num_clauses]
-            .to_vec();
+        ]
+        .into_iter()
+        .cycle()
+        .take(num_clauses)
+        .collect::<Vec<_>>();
 
         let build_postings = || {
             clauses
@@ -9665,16 +9784,18 @@ mod tests {
         };
 
         let run = |mode| {
+            let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
             let mut wand = Wand::new(
                 Operator::And,
                 build_postings().into_iter(),
                 &docs,
                 UnitScorer,
             )
-            .with_bulk_and_mode(mode);
+            .with_bulk_and_mode(mode)
+            .with_shared_threshold(shared_floor.clone());
             let rows = normalize(wand.search(&params, &NoOpMetricsCollector).unwrap());
             let used_bulk = wand.bulk_and_searches > 0;
-            (rows, used_bulk)
+            ((rows, shared_floor.load(Ordering::Relaxed)), used_bulk)
         };
 
         let (bulk, bulk_used) = run(BulkAndMode::On);
@@ -9683,13 +9804,16 @@ mod tests {
         assert!(bulk_used, "on should use bulk conjunction search");
         assert!(!classic_used, "off should use classic conjunction search");
         assert_eq!(auto_used, matches!(num_clauses, 2 | 3));
-        assert!(!bulk.is_empty(), "test corpus should produce matches");
+        assert!(!bulk.0.is_empty(), "test corpus should produce matches");
         assert_eq!(bulk, classic);
         assert_eq!(auto, classic);
     }
 
     #[rstest]
     #[case::bulk_two(BulkAndMode::On, 2)]
+    #[case::bulk_four(BulkAndMode::On, 4)]
+    #[case::bulk_eight(BulkAndMode::On, 8)]
+    #[case::bulk_sixteen(BulkAndMode::On, 16)]
     #[case::classic_four(BulkAndMode::Off, 4)]
     #[case::classic_five(BulkAndMode::Off, 5)]
     fn underfilled_disjoint_and_decodes_no_frequencies_or_bounds(
@@ -9840,8 +9964,267 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bulk_and_activates_frequencies_and_bounds_after_heap_fills() {
+    #[rstest]
+    #[case::dense("dense")]
+    #[case::sparse("sparse")]
+    #[case::shifted("shifted")]
+    #[case::underfilled_five("five")]
+    #[case::underfilled_zero("zero")]
+    #[case::max_doc_id("max")]
+    fn pairwise_and_matches_classic(
+        #[case] shape: &str,
+        #[values(4, 5, 8, 16)] num_clauses: usize,
+        #[values(0.0, 0.1)] initial_floor: f32,
+    ) {
+        let posting_len = MAX_POSTING_BLOCK_SIZE * 3 + 7;
+        let docs = CostOnlyDocuments {
+            total_docs: posting_len * 2 + num_clauses,
+            visible_cost_upper_bound: posting_len * 2 + num_clauses,
+        };
+        let run = |mode| {
+            let postings = (0..num_clauses)
+                .map(|term| {
+                    let doc_ids = (0..posting_len)
+                        .map(|index| match shape {
+                            "dense" => index as u32,
+                            "shifted" => (index + term) as u32,
+                            "sparse" => (index * 3) as u32,
+                            "max" => u32::MAX - ((posting_len - index - 1) * 1_000_003) as u32,
+                            "zero" | "five" => {
+                                let is_last_clause = term + 1 == num_clauses;
+                                let is_match = shape == "five" && index >= posting_len - 5;
+                                (index * 2 + usize::from(is_last_clause && !is_match)) as u32
+                            }
+                            _ => unreachable!(),
+                        })
+                        .collect::<Vec<_>>();
+                    let frequencies = (0..posting_len)
+                        .map(|index| 1 + ((index + term) % 7) as u32)
+                        .collect::<Vec<_>>();
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term as u32,
+                        term as u32,
+                        [0.002_972_301_6, 0.001_982_450_7, 0.001_882_293][term % 3],
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            doc_ids,
+                            frequencies,
+                            vec![1; posting_len],
+                            MAX_POSTING_BLOCK_SIZE,
+                        ),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let shared_floor = Arc::new(AtomicU32::new(initial_floor.to_bits()));
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode)
+                .with_shared_threshold(shared_floor.clone());
+            let hits = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(10)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            let mut rows = hits
+                .into_iter()
+                .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            if mode == BulkAndMode::On {
+                assert_eq!(
+                    wand.and_window_stats.pairwise_intersections > 0,
+                    initial_floor == 0.0
+                );
+                if initial_floor == 0.0 && matches!(shape, "five" | "zero") {
+                    assert_eq!(rows.len(), if shape == "five" { 5 } else { 0 });
+                    assert_eq!(
+                        wand.lead
+                            .iter()
+                            .map(|posting| posting.frequency_blocks_decoded())
+                            .sum::<usize>(),
+                        if shape == "five" { num_clauses } else { 0 },
+                        "only final matching blocks need frequency decoding"
+                    );
+                    assert_eq!(
+                        wand.lead
+                            .iter()
+                            .map(|posting| posting.impact_bound_computations())
+                            .sum::<usize>(),
+                        0
+                    );
+                }
+            }
+            (rows, shared_floor.load(Ordering::Relaxed))
+        };
+        let classic = run(BulkAndMode::Off);
+        assert_eq!(run(BulkAndMode::On), classic);
+        assert_eq!(run(BulkAndMode::Auto), classic);
+    }
+
+    #[rstest]
+    fn pairwise_and_preserves_phrase_and_visibility(
+        #[values(4, 8, 16)] num_clauses: u32,
+        #[values(None, Some(0), Some(3))] phrase_slop: Option<u32>,
+        #[values(false, true)] is_filtered: bool,
+    ) {
+        let num_docs = MAX_POSTING_BLOCK_SIZE * 2 + 7;
+        let mut docs = DocSet::default();
+        for doc in 0..num_docs {
+            docs.append(doc as u64, 1);
+        }
+        let mask = if is_filtered {
+            RowAddrMask::from_block([0, (num_docs - 1) as u64].into_iter().collect())
+        } else {
+            RowAddrMask::all_rows()
+        };
+        let documents = LegacyWandDocuments::new(&docs, &mask);
+        let run = |mode| {
+            let postings = (0..num_clauses)
+                .map(|term| {
+                    let mut list = generate_impact_posting_list_with_freqs_and_block_size(
+                        (0..num_docs as u32).collect(),
+                        vec![1; num_docs],
+                        vec![1; num_docs],
+                        MAX_POSTING_BLOCK_SIZE,
+                    );
+                    let mut bytes = Vec::new();
+                    let mut offsets = Vec::new();
+                    for start in (0..num_docs).step_by(MAX_POSTING_BLOCK_SIZE) {
+                        let end = (start + MAX_POSTING_BLOCK_SIZE).min(num_docs);
+                        let positions = (start..end)
+                            .map(|doc| {
+                                if doc >= num_docs - 5 {
+                                    5 + term
+                                } else {
+                                    5 + term * 8
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        offsets.push(bytes.len() as u32);
+                        encode_position_stream_block_into(
+                            &positions,
+                            &vec![1; end - start],
+                            PositionStreamCodec::VarintDocDelta,
+                            &mut bytes,
+                        )
+                        .unwrap();
+                    }
+                    if let PostingList::Compressed(list) = &mut list {
+                        list.positions = Some(CompressedPositionStorage::SharedStream(
+                            SharedPositionStream::new(
+                                PositionStreamCodec::VarintDocDelta,
+                                offsets,
+                                bytes.into(),
+                            ),
+                        ));
+                    }
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term,
+                        term,
+                        1.0,
+                        list,
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &documents, UnitScorer)
+                .with_bulk_and_mode(mode);
+            let mut params = FtsSearchParams::default().with_limit(Some(10));
+            params.phrase_slop = phrase_slop;
+            let mut hits = wand
+                .search(&params, &NoOpMetricsCollector)
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.document, hit.freqs))
+                .collect::<Vec<_>>();
+            hits.sort_unstable();
+            if mode == BulkAndMode::On {
+                assert!(wand.and_window_stats.pairwise_intersections > 0);
+            }
+            assert_eq!(
+                hits.len(),
+                if phrase_slop.is_some() {
+                    5 - usize::from(is_filtered)
+                } else {
+                    10
+                }
+            );
+            (hits, wand.threshold.to_bits())
+        };
+        let classic = run(BulkAndMode::Off);
+        assert_eq!(run(BulkAndMode::On), classic);
+        assert_eq!(run(BulkAndMode::Auto), classic);
+    }
+
+    #[rstest]
+    fn pairwise_and_requires_current_posting_blocks(
+        #[values(BulkAndMode::On, BulkAndMode::Auto)] mode: BulkAndMode,
+        #[values(2, 3, 4, 16)] num_clauses: usize,
+        #[values(crate::scalar::inverted::LEGACY_BLOCK_SIZE, MAX_POSTING_BLOCK_SIZE)]
+        block_size: usize,
+        #[values(false, true)] has_impacts: bool,
+        #[values(false, true)] has_grouped_terms: bool,
+    ) {
+        let docs = CostOnlyDocuments {
+            total_docs: 5,
+            visible_cost_upper_bound: 5,
+        };
+        let postings = (0..num_clauses)
+            .map(|term| {
+                let mut list = generate_impact_posting_list_with_freqs_and_block_size(
+                    vec![0, 2, 4, 6, 8],
+                    vec![1; 5],
+                    vec![1; 5],
+                    block_size,
+                );
+                if !has_impacts && let PostingList::Compressed(list) = &mut list {
+                    list.impacts = None;
+                }
+                let grouped_terms = has_grouped_terms.then(|| {
+                    Arc::<[GroupedTermScorer]>::from([GroupedTermScorer::new(1.0, &list)])
+                });
+                let posting = PostingIterator::with_query_weight(
+                    format!("t{term}"),
+                    term as u32,
+                    term as u32,
+                    1.0,
+                    list,
+                    docs.len(),
+                );
+                if let Some(grouped_terms) = grouped_terms {
+                    posting.with_grouped_terms(grouped_terms)
+                } else {
+                    posting
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(mode);
+        let hits = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 5);
+        assert_eq!(
+            wand.and_window_stats.pairwise_intersections > 0,
+            num_clauses >= 4
+                && block_size == MAX_POSTING_BLOCK_SIZE
+                && has_impacts
+                && !has_grouped_terms
+        );
+        if has_grouped_terms {
+            assert_eq!(wand.bulk_and_searches, 0);
+        }
+    }
+
+    #[rstest]
+    fn bulk_and_activates_frequencies_and_bounds_after_heap_fills(
+        #[values(2, 4, 8, 16)] num_clauses: u32,
+    ) {
         let num_docs = (BLOCK_SIZE * 2) as u32;
         let mut docs = DocSet::default();
         for doc_id in 0..num_docs {
@@ -9850,7 +10233,7 @@ mod tests {
         let frequencies = (0..num_docs)
             .map(|doc| if doc < BLOCK_SIZE as u32 { 1 } else { 10 })
             .collect::<Vec<_>>();
-        let postings = (0..2)
+        let postings = (0..num_clauses)
             .map(|term| {
                 PostingIterator::with_query_weight(
                     format!("t{term}"),
