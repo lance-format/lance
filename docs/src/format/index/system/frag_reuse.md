@@ -153,9 +153,11 @@ is the cumulative count of label `d` through the end of block `b`. There is no
 extra initial zero row. Before block zero all counts are zero. The last matrix
 row supplies destination totals. The matrix must have exactly the declared
 length, nondecreasing counts per destination, and a sum of per-block count
-increments no larger than that block's physical row count. Destination totals
-must equal `new_fragments.physical_rows`; total labels must equal the sum of
-source physical rows, and NULL counts must match source deletion counts.
+increments no larger than that block's physical row count. Each matrix cell must
+agree with the cumulative count of its label in the label column. Destination totals must equal the corresponding
+`Transition.destinations[].physical_rows`; total labels must equal the sum of
+source physical rows, and NULL counts within each source must match that
+source digest's `num_deleted_rows`.
 
 To translate a source address, sum the physical lengths of preceding sources
 and add its offset to obtain position `g`. Read the label at `g`; NULL translates
@@ -174,7 +176,9 @@ The first commit publishing the extensible representation sets
 `FLAG_FRAGMENT_REUSE_INDEX` (512) in both manifest flag fields. Both bits persist
 in subsequent versions. A client must implement the following rules before
 advertising support. Existing V1 clients must reject the required capability;
-otherwise they attempt legacy bitmap decoding or single-entry maintenance.
+otherwise a legacy decoder can ignore the new `transitions` field and load
+only `legacy_versions`, while a legacy writer can discard tagged transitions
+when replacing the history.
 
 A reader uses known encodings to translate addresses and derive queryable index
 coverage. An unknown encoding does not provide queryable coverage through that
