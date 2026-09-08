@@ -2,11 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! The indexed `combined_fields` entry point: load every term's postings across
-//! the target columns, merge them into the shared row-id space, and score every
-//! candidate.
+//! the target columns, merge them into the shared row-id space, and rank them
+//! with MAXSCORE.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap};
 use std::sync::Arc;
 
 use lance_core::Result;
@@ -15,7 +14,8 @@ use lance_core::utils::tokio::spawn_cpu;
 use super::super::documents::AddressKeyedDocuments;
 use super::super::query::{FtsSearchParams, Operator, Tokens};
 use super::super::scorer::CombinedFieldsBM25Scorer;
-use super::cursor::{CombinedTermPostings, LoadedSource, build_term_postings};
+use super::cursor::{LoadedSource, MaterializedTerm, build_materialized_term};
+use super::maxscore::{MaxscoreStats, combined_maxscore};
 use super::{CombinedFieldColumn, unique_terms};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
@@ -26,23 +26,24 @@ use crate::vector::graph::OrderedFloat;
 /// `classify_wand_exactness_certificate`.
 ///
 /// [`ScoredDoc`](super::super::builder::ScoredDoc) compares on score alone, which
-/// is not enough for a bounded heap: among equal scores it evicts whichever row
-/// the heap happens to hold at the bottom, so rows that belong in the top-k are
-/// dropped and no later sort can bring them back. A fully covered plan returns
-/// this search's output directly, with no `SortExec` above it, so the order and
-/// the membership both have to be settled here.
+/// is not enough for the bounded heap [`combined_maxscore`] collects into: among
+/// equal scores it evicts whichever row the heap happens to hold at the bottom, so
+/// rows that belong in the top-k are dropped and no later sort can bring them
+/// back. A fully covered plan returns this search's output directly, with no
+/// `SortExec` above it, so the order and the membership both have to be settled
+/// here.
 ///
 /// `row_id` is stored reversed so that the derived lexicographic ordering ranks a
 /// higher row id lower. The heap's smallest element is then the lowest score with
 /// the highest row id, which is exactly the candidate a full heap should evict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct RankedDoc {
-    score: OrderedFloat,
-    row_id: Reverse<u64>,
+pub(super) struct RankedDoc {
+    pub(super) score: OrderedFloat,
+    pub(super) row_id: Reverse<u64>,
 }
 
 impl RankedDoc {
-    fn new(row_id: u64, score: f32) -> Self {
+    pub(super) fn new(row_id: u64, score: f32) -> Self {
         Self {
             score: OrderedFloat(score),
             row_id: Reverse(row_id),
@@ -53,10 +54,15 @@ impl RankedDoc {
 /// Exact cross-field BM25F search over the target columns.
 ///
 /// Loads each query term's postings across every column and partition, then
-/// scores the union of those postings and keeps a bounded top-k. Every candidate
-/// is scored; there is no pruning, so the result is exact by construction.
+/// ranks them with the term-at-a-time `combined_maxscore`, which skips scoring
+/// a candidate whose upper bound cannot reach the running k-th score. That bound
+/// only ever drops a candidate the collector would have rejected anyway, so the
+/// top-k is the exhaustive scan's top-k.
+///
 /// Results come back ordered by `score DESC, row_id ASC`, which is a total order,
-/// so the same data always yields the same top-k even when scores tie.
+/// so the same data always yields the same top-k even when scores tie. Candidates
+/// are discovered in ascending row-id order and `RankedDoc` settles ties, so
+/// neither the membership nor the order depends on heap internals.
 ///
 /// `operator` applies across the virtual field: `And` keeps only docs where
 /// every query term appears in at least one column; `Or` keeps docs matching
@@ -70,10 +76,36 @@ pub async fn combined_fields_search(
     prefilter: Arc<dyn PreFilter>,
     metrics: &dyn MetricsCollector,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
+    let (row_ids, scores, _stats) = combined_fields_search_with_stats(
+        columns, tokens, params, operator, scorer, prefilter, metrics,
+    )
+    .await?;
+    Ok((row_ids, scores))
+}
+
+/// [`combined_fields_search`] plus the [`MaxscoreStats`] of the scan, for a bench
+/// that wants to report how much candidate scoring the pruning saved.
+///
+/// This is the whole implementation; [`combined_fields_search`] is the same call
+/// with the stats dropped. The stats are three counters the MAXSCORE loop keeps
+/// either way, so the default path does no extra work.
+///
+/// Reachable outside the crate only under `cfg(test)` or the `test-scan-stats`
+/// feature: per-candidate counters are not something the production
+/// `MetricsCollector` carries.
+pub async fn combined_fields_search_with_stats(
+    columns: &[CombinedFieldColumn],
+    tokens: &Tokens,
+    params: &FtsSearchParams,
+    operator: Operator,
+    scorer: &CombinedFieldsBM25Scorer,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: &dyn MetricsCollector,
+) -> Result<(Vec<u64>, Vec<f32>, MaxscoreStats)> {
     let terms = unique_terms(tokens);
     let limit = params.limit.unwrap_or(usize::MAX);
     if terms.is_empty() || limit == 0 {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), MaxscoreStats::default()));
     }
 
     let mask = prefilter.mask();
@@ -111,7 +143,7 @@ pub async fn combined_fields_search(
         }
     }
     // Everything past the loads is uninterruptible CPU work: building and sorting
-    // a per-term `HashMap`, then the whole scoring loop with no await. Offload it
+    // a per-term `HashMap`, then the whole MAXSCORE loop with no await. Offload it
     // so a large query cannot hold a DataFusion
     // worker past a stream drop or task cancellation, matching how the
     // single-column `InvertedIndex::bm25_search` dispatches its per-partition
@@ -119,63 +151,43 @@ pub async fn combined_fields_search(
     // scoring loop. The `'static` closure clones the borrowed `scorer` (a handful
     // of per-term statistics) and moves everything else in.
     let scorer = Arc::new(scorer.clone());
-    let top = spawn_cpu(move || {
+    let (top, stats) = spawn_cpu(move || {
         let dl_prime = |row_id: u64| -> f32 {
             length_sources
                 .iter()
                 .map(|(weight, docs)| weight * docs.doc_length_at(row_id) as f32)
                 .sum()
         };
-        let terms: Vec<CombinedTermPostings> = terms
-            .iter()
-            .zip(loaded)
-            .map(|(term, sources)| build_term_postings(term, sources, &mask, scorer.as_ref()))
-            .collect();
-
-        // Score every candidate: the union of the terms' postings for `Or`, and the
-        // same union filtered to the documents holding every term for `And`. A row
-        // absent from a term contributes no `tf'`, so it is skipped rather than
-        // scored as zero.
-        //
-        // Ties are settled by [`RankedDoc`], not left to the heap: it orders on
-        // `(score, row_id)` as a whole, so both which rows survive the k-th score and
-        // the order they come back in are fixed by the data alone.
-        let candidates: BTreeSet<u64> = terms
-            .iter()
-            .flat_map(|term| term.postings.iter().map(|(row_id, _)| *row_id))
-            .collect();
-        let mut top: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
-        for row_id in candidates {
-            let dl = dl_prime(row_id);
-            let mut score = 0.0f32;
-            let mut missing_term = false;
-            for term in &terms {
-                let tf = term.tf_prime(row_id);
-                if tf <= 0.0 {
-                    missing_term = true;
-                    continue;
-                }
-                score += term.idf * scorer.doc_weight(tf, dl);
-            }
-            if require_all_terms && missing_term {
-                continue;
-            }
-            top.push(Reverse(RankedDoc::new(row_id, score)));
-            if top.len() > limit {
-                top.pop();
-            }
+        // Cursors that are all exhausted need no special case: `combined_maxscore`
+        // finds no candidate and returns an empty heap, which unzips to no hits.
+        let mut cursors: Vec<MaterializedTerm> = Vec::with_capacity(terms.len());
+        for (term, sources) in terms.iter().zip(loaded) {
+            cursors.push(build_materialized_term(
+                term,
+                sources,
+                &mask,
+                scorer.as_ref(),
+            ));
         }
-        Result::Ok(top)
+        let result = combined_maxscore(
+            &mut cursors,
+            dl_prime,
+            limit,
+            require_all_terms,
+            scorer.as_ref(),
+        );
+        Result::Ok(result)
     })
     .await?;
 
     // Ascending in `Reverse<RankedDoc>` is descending in `RankedDoc`, i.e. best
     // first: highest score, and within a score the lowest row id.
-    Ok(top
+    let (row_ids, scores) = top
         .into_sorted_vec()
         .into_iter()
         .map(|Reverse(doc)| (doc.row_id.0, doc.score.0))
-        .unzip())
+        .unzip();
+    Ok((row_ids, scores, stats))
 }
 
 #[cfg(test)]
@@ -359,6 +371,77 @@ mod tests {
         );
         assert_eq!(scores[0].to_bits(), idf(1, 19).to_bits());
         assert_eq!(scores[1].to_bits(), idf(10, 19).to_bits());
+    }
+
+    /// Discovery pruning through the real loading path, not just the
+    /// `combined_maxscore` unit fixtures: one rare term and one term in every
+    /// row, so the common term's ceiling drops below the k-th score at once and
+    /// candidate discovery walks the rare term's single posting alone.
+    ///
+    /// Also the coverage for [`combined_fields_search_with_stats`] and its
+    /// re-export: it is reached here through the gated crate path the bench uses,
+    /// and its top-k must be what plain [`combined_fields_search`] returns.
+    #[tokio::test]
+    async fn test_combined_fields_search_with_stats_prunes_discovery() {
+        use crate::scalar::inverted::{MaxscoreStats, combined_fields_search_with_stats};
+
+        const ROWS: usize = 40;
+        let vocab = ["rare", "common"];
+        let rows: ElementRows = (0..ROWS)
+            .map(|row| {
+                if row == 0 {
+                    vec![vec!["rare", "common"]]
+                } else {
+                    vec![vec!["common"]]
+                }
+            })
+            .collect();
+        let (index, _dir) =
+            element_document_index(InvertedListFormatVersion::V3, &vocab, &rows).await;
+        let columns = combined_columns(vec![index]);
+
+        let tokens = Tokens::new(vec!["rare".to_owned(), "common".to_owned()], DocType::Text);
+        let scorer =
+            build_combined_bm25_scorer(&columns, &tokens, CombinedCorpusStats::IndexOnly, None)
+                .await
+                .unwrap();
+        let params = FtsSearchParams::new().with_limit(Some(1));
+
+        let (row_ids, scores, stats): (Vec<u64>, Vec<f32>, MaxscoreStats) =
+            combined_fields_search_with_stats(
+                &columns,
+                &tokens,
+                &params,
+                Operator::Or,
+                &scorer,
+                Arc::new(NoFilter),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(row_ids, vec![0], "the only row holding `rare` must win");
+        // Every candidate discovered is either pruned or scored, so the counts
+        // account for the whole loop.
+        assert_eq!(stats.discovered, stats.pruned + stats.scored);
+        assert_eq!(
+            stats.discovered, 1,
+            "only `rare`'s single posting drives discovery, not the {ROWS} rows \
+             in the candidate union",
+        );
+
+        // The delegating entry point must return exactly this, stats aside.
+        let plain = combined_fields_search(
+            &columns,
+            &tokens,
+            &params,
+            Operator::Or,
+            &scorer,
+            Arc::new(NoFilter),
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plain, (row_ids, scores));
     }
 
     /// One legacy element-per-document column and one modern row-per-document

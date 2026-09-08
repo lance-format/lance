@@ -101,6 +101,10 @@ tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
 # Exposes `scalar::inverted::oracle`, the brute-force scoring reference, to
 # downstream test and bench targets. Enable it as a dev-dependency feature only.
 test-oracle = []
+# Exposes `scalar::inverted::combined_fields_search_with_stats` and the
+# `MaxscoreStats` it returns, so a bench can report how much candidate scoring
+# the MAXSCORE pruning saves. Enable it as a dev-dependency feature only.
+test-scan-stats = []
 
 [build-dependencies]
 prost-build.workspace = true

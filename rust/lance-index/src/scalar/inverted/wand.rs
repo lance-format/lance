@@ -233,7 +233,7 @@ static USE_MAXSCORE_SEARCH: LazyLock<bool> =
     LazyLock::new(|| std::env::var("LANCE_FTS_MAXSCORE").as_deref() != Ok("0"));
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum CompetitiveFloorMode {
+pub(super) enum CompetitiveFloorMode {
     #[default]
     Exclusive,
     Inclusive,
@@ -1812,7 +1812,7 @@ pub(super) fn score_sum_upper_bound_factor(num_values: usize) -> f64 {
 }
 
 #[inline]
-fn score_sum_cannot_compete(
+pub(super) fn score_sum_cannot_compete(
     partial_score: f32,
     remaining_upper_bound: f64,
     floor: f32,
