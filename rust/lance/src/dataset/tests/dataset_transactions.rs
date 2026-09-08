@@ -2825,7 +2825,7 @@ mod composite {
     use std::sync::Arc;
 
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
-    use crate::index::DatasetIndexExt;
+    use crate::index::load_all_indices;
     use crate::{Dataset, Error, Result};
     use arrow_array::{Int32Array, RecordBatch, StructArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -3981,7 +3981,7 @@ mod composite {
     }
 
     async fn index_coverage(dataset: &Dataset, name: &str) -> Vec<u32> {
-        let indices = dataset.load_indices().await.unwrap();
+        let indices = load_all_indices(dataset).await.unwrap();
         let segment = indices
             .iter()
             .find(|index| index.name == name)
@@ -4056,8 +4056,7 @@ mod composite {
         )
         .await;
 
-        let uuids = dataset
-            .load_indices()
+        let uuids = load_all_indices(&dataset)
             .await
             .unwrap()
             .iter()
@@ -4103,8 +4102,7 @@ mod composite {
         .await
         .expect("segments over disjoint fragments both belong to the index");
 
-        let mut coverage = dataset
-            .load_indices()
+        let mut coverage = load_all_indices(&dataset)
             .await
             .unwrap()
             .iter()
