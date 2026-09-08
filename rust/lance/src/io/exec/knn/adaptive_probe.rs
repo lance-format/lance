@@ -6,8 +6,14 @@
 //! Auto probing is an empirical heuristic, not a recall guarantee. The initial
 //! budget does not limit subsequent probing when filters leave fewer than k rows.
 //! `LANCE_AUTO_PROBE_MARGIN` overrides the nonnegative relative distance margin;
-//! `LANCE_AUTO_MAX_INITIAL_NPROBES` overrides the positive initial budget cap.
+//! `LANCE_AUTO_MIN_INITIAL_NPROBES` and `LANCE_AUTO_MAX_INITIAL_NPROBES` override
+//! the positive learned floor and cap. Each override replaces only that profile
+//! field; the resulting floor must not exceed the resulting cap. Override both
+//! bounds when an individual change would conflict with the other profile bound.
+//! The caller minimum takes precedence over the learned cap, while the caller
+//! maximum and available candidate count limit the final initial budget.
 //! Explicit fixed nprobes bypasses both the heuristic and these overrides.
+//! Hamming retains its existing probe heuristic and ignores these overrides.
 
 use std::env;
 
@@ -16,18 +22,33 @@ use lance_index::vector::Query;
 use lance_linalg::distance::DistanceType;
 
 const MARGIN_ENV: &str = "LANCE_AUTO_PROBE_MARGIN";
+const MIN_INITIAL_NPROBES_ENV: &str = "LANCE_AUTO_MIN_INITIAL_NPROBES";
 const MAX_INITIAL_NPROBES_ENV: &str = "LANCE_AUTO_MAX_INITIAL_NPROBES";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct AutoProbeConfig {
+    pub(super) min_initial_nprobes: usize,
     pub(super) margin: f32,
     pub(super) max_initial_nprobes: Option<usize>,
+}
+
+impl Default for AutoProbeConfig {
+    fn default() -> Self {
+        Self {
+            min_initial_nprobes: 1,
+            margin: 0.0,
+            max_initial_nprobes: None,
+        }
+    }
 }
 
 impl AutoProbeConfig {
     pub(super) fn from_env(query: &Query, metric: DistanceType) -> DataFusionResult<Option<Self>> {
         if query.maximum_nprobes == Some(query.minimum_nprobes) {
             return Ok(None);
+        }
+        if metric == DistanceType::Hamming {
+            return Ok(Some(Self::default()));
         }
         fn read_override(name: &str) -> DataFusionResult<Option<String>> {
             match env::var(name) {
@@ -39,40 +60,82 @@ impl AutoProbeConfig {
             }
         }
         let margin = read_override(MARGIN_ENV)?;
+        let minimum = read_override(MIN_INITIAL_NPROBES_ENV)?;
         let maximum = read_override(MAX_INITIAL_NPROBES_ENV)?;
-        Self::parse(query, metric, margin.as_deref(), maximum.as_deref())
+        Self::parse(
+            query,
+            metric,
+            margin.as_deref(),
+            minimum.as_deref(),
+            maximum.as_deref(),
+        )
     }
 
     fn parse(
         query: &Query,
         metric: DistanceType,
         margin: Option<&str>,
+        minimum: Option<&str>,
         maximum: Option<&str>,
     ) -> DataFusionResult<Option<Self>> {
         if query.maximum_nprobes == Some(query.minimum_nprobes) {
             return Ok(None);
+        }
+        if metric == DistanceType::Hamming {
+            return Ok(Some(Self::default()));
         }
         let bucket = match query.k {
             ..=1 => 0,
             2..=10 => 1,
             _ => 2,
         };
-        // TODO: Finalize these profiles with independent metric-specific calibration.
-        // Cosine starts from the measured LAION candidates; other metrics retain
-        // the previous coarse k buckets without an implicit initial cap.
-        let mut config = if metric == DistanceType::Cosine {
+        // Profiles are calibrated on DINO (L2), LAION (cosine), and
+        // MS MARCO Web Search (Dot).
+        let config = if metric == DistanceType::L2 {
             Self {
-                margin: [0.3, 1.0, 1.0][bucket],
-                max_initial_nprobes: Some([20, 25, 47][bucket]),
+                min_initial_nprobes: [8, 1, 16][bucket],
+                margin: [0.25, 0.4, 0.4][bucket],
+                max_initial_nprobes: Some([16, 22, 37][bucket]),
+            }
+        } else if metric == DistanceType::Cosine {
+            Self {
+                min_initial_nprobes: [4, 8, 8][bucket],
+                margin: [0.3, 0.4, 0.5][bucket],
+                max_initial_nprobes: Some([18, 28, 47][bucket]),
             }
         } else {
             Self {
-                margin: [0.0, 6.0, 80.0][bucket],
-                ..Self::default()
+                min_initial_nprobes: [417, 463, 508][bucket],
+                margin: 0.1,
+                max_initial_nprobes: Some([664, 698, 808][bucket]),
             }
         };
+        config.with_overrides(margin, minimum, maximum).map(Some)
+    }
+
+    fn with_overrides(
+        mut self,
+        margin: Option<&str>,
+        minimum: Option<&str>,
+        maximum: Option<&str>,
+    ) -> DataFusionResult<Self> {
+        fn positive_override(name: &str, value: Option<&str>) -> DataFusionResult<Option<usize>> {
+            value
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "invalid {name} value {value:?}: expected a positive integer"
+                            ))
+                        })
+                })
+                .transpose()
+        }
         if let Some(value) = margin {
-            config.margin = value
+            self.margin = value
                 .parse::<f32>()
                 .ok()
                 .filter(|margin| margin.is_finite() && *margin >= 0.0)
@@ -82,19 +145,21 @@ impl AutoProbeConfig {
                     ))
                 })?;
         }
-        if let Some(value) = maximum {
-            let maximum = value
-                .parse::<usize>()
-                .ok()
-                .filter(|maximum| *maximum > 0)
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "invalid {MAX_INITIAL_NPROBES_ENV} value {value:?}: expected a positive integer"
-                    ))
-                })?;
-            config.max_initial_nprobes = Some(maximum);
+        if let Some(minimum) = positive_override(MIN_INITIAL_NPROBES_ENV, minimum)? {
+            self.min_initial_nprobes = minimum;
         }
-        Ok(Some(config))
+        if let Some(maximum) = positive_override(MAX_INITIAL_NPROBES_ENV, maximum)? {
+            self.max_initial_nprobes = Some(maximum);
+        }
+        if let Some(maximum) = self.max_initial_nprobes
+            && self.min_initial_nprobes > maximum
+        {
+            return Err(DataFusionError::Execution(format!(
+                "invalid Auto probe interval: {MIN_INITIAL_NPROBES_ENV} effective minimum {} exceeds {MAX_INITIAL_NPROBES_ENV} effective maximum {maximum}",
+                self.min_initial_nprobes
+            )));
+        }
+        Ok(self)
     }
 
     /// Select an initial prefix of sorted centroid distances, honoring caller bounds.
@@ -102,10 +167,28 @@ impl AutoProbeConfig {
     /// L2 and normalized-cosine routing use squared L2 distances. Dot routing uses
     /// `1 - dot(query, centroid)`, so its scale is the magnitude of the best dot
     /// product, not the shifted distance. At zero scale only best-distance ties
-    /// qualify; the caller minimum still applies. f64 arithmetic avoids overflow
-    /// when subtracting finite f32 distances or applying a large finite margin.
+    /// qualify; the learned and caller minimums still apply. f64 arithmetic avoids
+    /// overflow when subtracting finite f32 distances or applying a large finite margin.
     pub(super) fn apply(self, query: &mut Query, distances: &[f32], metric: DistanceType) {
         if query.maximum_nprobes == Some(query.minimum_nprobes) {
+            return;
+        }
+        if metric == DistanceType::Hamming {
+            // Keep uncalibrated binary search behavior unchanged, including f32
+            // threshold rounding and the top-1 factor below one.
+            let selected = distances.first().map_or(0, |nearest| {
+                let factor = match query.k {
+                    ..=1 => 0.6,
+                    2..=10 => 7.0,
+                    _ => 81.0,
+                };
+                let threshold = *nearest * factor;
+                distances.partition_point(|distance| *distance <= threshold)
+            });
+            query.minimum_nprobes = query.minimum_nprobes.max(selected);
+            if let Some(maximum) = query.maximum_nprobes {
+                query.minimum_nprobes = query.minimum_nprobes.min(maximum);
+            }
             return;
         }
         let selected = match distances.first().copied() {
@@ -125,7 +208,9 @@ impl AutoProbeConfig {
             Some(_) => distances.len(),
             None => 0,
         };
-        let selected = selected.min(self.max_initial_nprobes.unwrap_or(distances.len()));
+        let selected = selected
+            .max(self.min_initial_nprobes)
+            .min(self.max_initial_nprobes.unwrap_or(distances.len()));
         query.minimum_nprobes = query
             .minimum_nprobes
             .max(selected)
@@ -163,6 +248,96 @@ mod tests {
     }
 
     #[rstest]
+    #[case::l2_top1(DistanceType::L2, 1, 0.25, 8, 16)]
+    #[case::l2_top10_lower_boundary(DistanceType::L2, 2, 0.4, 1, 22)]
+    #[case::l2_top10_upper_boundary(DistanceType::L2, 10, 0.4, 1, 22)]
+    #[case::l2_top100_lower_boundary(DistanceType::L2, 11, 0.4, 16, 37)]
+    #[case::l2_top100(DistanceType::L2, 100, 0.4, 16, 37)]
+    #[case::cosine_top1(DistanceType::Cosine, 1, 0.3, 4, 18)]
+    #[case::cosine_top10_lower_boundary(DistanceType::Cosine, 2, 0.4, 8, 28)]
+    #[case::cosine_top10_upper_boundary(DistanceType::Cosine, 10, 0.4, 8, 28)]
+    #[case::cosine_top100_lower_boundary(DistanceType::Cosine, 11, 0.5, 8, 47)]
+    #[case::cosine_top100(DistanceType::Cosine, 100, 0.5, 8, 47)]
+    #[case::dot_top1(DistanceType::Dot, 1, 0.1, 417, 664)]
+    #[case::dot_top10_lower_boundary(DistanceType::Dot, 2, 0.1, 463, 698)]
+    #[case::dot_top10_upper_boundary(DistanceType::Dot, 10, 0.1, 463, 698)]
+    #[case::dot_top100_lower_boundary(DistanceType::Dot, 11, 0.1, 508, 808)]
+    #[case::dot_top100(DistanceType::Dot, 100, 0.1, 508, 808)]
+    fn test_auto_probe_metric_profiles(
+        #[case] metric: DistanceType,
+        #[case] k: usize,
+        #[case] margin: f32,
+        #[case] minimum: usize,
+        #[case] maximum: usize,
+    ) {
+        let mut query = query();
+        query.k = k;
+        let config = AutoProbeConfig::parse(&query, metric, None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config,
+            AutoProbeConfig {
+                min_initial_nprobes: minimum,
+                margin,
+                max_initial_nprobes: Some(maximum),
+            }
+        );
+
+        let mut distances = vec![2.0; maximum + 1];
+        distances[0] = 1.0;
+        config.apply(&mut query, &distances, metric);
+        assert_eq!(query.minimum_nprobes, minimum);
+
+        distances.fill(1.0);
+        config.apply(&mut query, &distances, metric);
+        assert_eq!(query.minimum_nprobes, maximum);
+        assert_eq!(query.maximum_nprobes, None);
+    }
+
+    #[rstest]
+    #[case::top1_positive(1, &[4.0, 4.0, 5.0], 1, None, 1)]
+    #[case::top1_zero_ties(1, &[0.0, 0.0, 1.0], 1, None, 2)]
+    #[case::top10_positive(10, &[1.0, 7.0, 8.0], 1, None, 2)]
+    #[case::top10_zero_ties(10, &[0.0, 0.0, 1.0], 1, None, 2)]
+    #[case::top100_positive(100, &[1.0, 81.0, 82.0], 1, None, 2)]
+    #[case::above_learned_cap(10, &[1.0, 1.0, 1.0, 1.0, 1.0], 1, None, 5)]
+    #[case::maximum(10, &[1.0, 1.0, 1.0], 1, Some(2), 2)]
+    #[case::minimum(1, &[1.0, 1.0], 4, None, 4)]
+    fn test_hamming_preserves_probe_budget(
+        #[case] k: usize,
+        #[case] distances: &[f32],
+        #[case] minimum: usize,
+        #[case] maximum: Option<usize>,
+        #[case] expected: usize,
+    ) {
+        let mut query = query();
+        query.k = k;
+        query.minimum_nprobes = minimum;
+        query.maximum_nprobes = maximum;
+        // Real-valued Auto overrides must neither reject nor change Hamming.
+        assert_eq!(
+            AutoProbeConfig::parse(
+                &query,
+                DistanceType::Hamming,
+                Some("invalid"),
+                Some("0"),
+                Some("0")
+            )
+            .unwrap(),
+            Some(AutoProbeConfig::default()),
+        );
+        AutoProbeConfig {
+            min_initial_nprobes: 4,
+            margin: 80.0,
+            max_initial_nprobes: Some(4),
+        }
+        .apply(&mut query, distances, DistanceType::Hamming);
+        assert_eq!(query.minimum_nprobes, expected);
+        assert_eq!(query.maximum_nprobes, maximum);
+    }
+
+    #[rstest]
     #[case::l2(DistanceType::L2, &[4.0, 6.0, 6.25], 0.5, 2)]
     #[case::cosine(DistanceType::Cosine, &[0.25, 0.5, 0.75], 1.0, 2)]
     #[case::negative_dot(DistanceType::Dot, &[-3.0, -1.0, 0.0], 0.5, 2)]
@@ -185,6 +360,7 @@ mod tests {
     ) {
         let mut query = query();
         AutoProbeConfig {
+            min_initial_nprobes: 1,
             margin,
             max_initial_nprobes: None,
         }
@@ -194,12 +370,19 @@ mod tests {
     }
 
     #[rstest]
-    #[case::caller_minimum(4, None, Some(2), 4)]
-    #[case::caller_maximum(1, Some(3), None, 3)]
-    #[case::initial_cap(1, None, Some(2), 2)]
-    #[case::fixed(3, Some(3), Some(1), 3)]
-    #[case::minimum_exceeds_candidates(10, None, None, 5)]
+    #[case::caller_minimum(1, 10.0, 4, None, Some(2), 4)]
+    #[case::caller_maximum(1, 10.0, 1, Some(3), None, 3)]
+    #[case::initial_cap(1, 10.0, 1, None, Some(2), 2)]
+    #[case::fixed(4, 10.0, 3, Some(3), Some(4), 3)]
+    #[case::minimum_exceeds_candidates(1, 10.0, 10, None, None, 5)]
+    #[case::learned_floor(4, 0.0, 1, None, None, 4)]
+    #[case::learned_floor_limited_by_caller(4, 0.0, 1, Some(2), None, 2)]
+    #[case::learned_floor_exceeds_candidates(8, 0.0, 1, None, None, 5)]
+    #[case::selected_above_floor(2, 10.0, 1, None, Some(4), 4)]
+    #[case::learned_floor_equals_cap(3, 0.0, 1, None, Some(3), 3)]
     fn test_auto_probe_bounds(
+        #[case] learned_minimum: usize,
+        #[case] margin: f32,
         #[case] minimum: usize,
         #[case] maximum: Option<usize>,
         #[case] cap: Option<usize>,
@@ -209,7 +392,8 @@ mod tests {
         query.minimum_nprobes = minimum;
         query.maximum_nprobes = maximum;
         AutoProbeConfig {
-            margin: 10.0,
+            min_initial_nprobes: learned_minimum,
+            margin,
             max_initial_nprobes: cap,
         }
         .apply(&mut query, &[1.0, 2.0, 3.0, 4.0, 5.0], DistanceType::L2);
@@ -218,38 +402,120 @@ mod tests {
     }
 
     #[rstest]
-    #[case::invalid_margin(Some("no"), None, MARGIN_ENV)]
-    #[case::negative_margin(Some("-1"), None, MARGIN_ENV)]
-    #[case::nan_margin(Some("NaN"), None, MARGIN_ENV)]
-    #[case::infinite_margin(Some("inf"), None, MARGIN_ENV)]
-    #[case::zero_cap(None, Some("0"), MAX_INITIAL_NPROBES_ENV)]
-    #[case::negative_cap(None, Some("-1"), MAX_INITIAL_NPROBES_ENV)]
-    #[case::invalid_cap(None, Some("no"), MAX_INITIAL_NPROBES_ENV)]
+    fn test_auto_probe_learned_floor_matches_caller_floor(
+        #[values(4, 16, 32)] minimum: usize,
+        #[values(0.0, 5.0, 30.0)] margin: f32,
+    ) {
+        let distances = (1..=64).map(|distance| distance as f32).collect::<Vec<_>>();
+        let mut learned = query();
+        let mut explicit = query();
+        explicit.minimum_nprobes = minimum;
+        AutoProbeConfig {
+            min_initial_nprobes: minimum,
+            margin,
+            max_initial_nprobes: Some(48),
+        }
+        .apply(&mut learned, &distances, DistanceType::L2);
+        AutoProbeConfig {
+            min_initial_nprobes: 1,
+            margin,
+            max_initial_nprobes: Some(48),
+        }
+        .apply(&mut explicit, &distances, DistanceType::L2);
+        assert_eq!(learned.minimum_nprobes, explicit.minimum_nprobes);
+        assert!(learned.minimum_nprobes >= minimum);
+        assert_eq!(learned.maximum_nprobes, None);
+    }
+
+    #[rstest]
+    #[case::invalid_margin(Some("no"), None, None, MARGIN_ENV)]
+    #[case::negative_margin(Some("-1"), None, None, MARGIN_ENV)]
+    #[case::nan_margin(Some("NaN"), None, None, MARGIN_ENV)]
+    #[case::infinite_margin(Some("inf"), None, None, MARGIN_ENV)]
+    #[case::zero_floor(None, Some("0"), None, MIN_INITIAL_NPROBES_ENV)]
+    #[case::negative_floor(None, Some("-1"), None, MIN_INITIAL_NPROBES_ENV)]
+    #[case::invalid_floor(None, Some("no"), None, MIN_INITIAL_NPROBES_ENV)]
+    #[case::nan_floor(None, Some("NaN"), None, MIN_INITIAL_NPROBES_ENV)]
+    #[case::infinite_floor(None, Some("inf"), None, MIN_INITIAL_NPROBES_ENV)]
+    #[case::zero_cap(None, None, Some("0"), MAX_INITIAL_NPROBES_ENV)]
+    #[case::negative_cap(None, None, Some("-1"), MAX_INITIAL_NPROBES_ENV)]
+    #[case::invalid_cap(None, None, Some("no"), MAX_INITIAL_NPROBES_ENV)]
+    #[case::nan_cap(None, None, Some("NaN"), MAX_INITIAL_NPROBES_ENV)]
+    #[case::infinite_cap(None, None, Some("inf"), MAX_INITIAL_NPROBES_ENV)]
     fn test_auto_probe_invalid_overrides(
         #[case] margin: Option<&str>,
+        #[case] minimum: Option<&str>,
         #[case] maximum: Option<&str>,
         #[case] name: &str,
     ) {
-        let error =
-            AutoProbeConfig::parse(&query(), DistanceType::Dot, margin, maximum).unwrap_err();
+        let error = AutoProbeConfig::parse(&query(), DistanceType::Dot, margin, minimum, maximum)
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Execution(_)));
         assert!(error.to_string().contains(name));
         let mut fixed = query();
         fixed.maximum_nprobes = Some(fixed.minimum_nprobes);
         assert_eq!(
-            AutoProbeConfig::parse(&fixed, DistanceType::Dot, margin, maximum).unwrap(),
+            AutoProbeConfig::parse(&fixed, DistanceType::Dot, margin, minimum, maximum).unwrap(),
             None
         );
     }
 
+    #[rstest]
+    #[case::minimum_above_default_cap(Some("9"), None)]
+    #[case::maximum_below_default_floor(None, Some("2"))]
+    #[case::inverted_overrides(Some("8"), Some("4"))]
+    fn test_auto_probe_inverted_interval(
+        #[case] minimum: Option<&str>,
+        #[case] maximum: Option<&str>,
+    ) {
+        let config = AutoProbeConfig {
+            min_initial_nprobes: 4,
+            margin: 0.5,
+            max_initial_nprobes: Some(8),
+        };
+        let error = config.with_overrides(None, minimum, maximum).unwrap_err();
+        assert!(matches!(error, DataFusionError::Execution(_)));
+        let message = error.to_string();
+        assert!(message.contains(MIN_INITIAL_NPROBES_ENV));
+        assert!(message.contains(MAX_INITIAL_NPROBES_ENV));
+        assert!(message.contains("exceeds"));
+    }
+
+    #[test]
+    fn test_auto_probe_partial_overrides_preserve_profile_fields() {
+        let config = AutoProbeConfig {
+            min_initial_nprobes: 4,
+            margin: 0.5,
+            max_initial_nprobes: Some(8),
+        };
+        let floor_only = config.with_overrides(None, Some("6"), None).unwrap();
+        assert_eq!(floor_only.min_initial_nprobes, 6);
+        assert_eq!(floor_only.margin, config.margin);
+        assert_eq!(floor_only.max_initial_nprobes, config.max_initial_nprobes);
+        let cap_only = config.with_overrides(None, None, Some("6")).unwrap();
+        assert_eq!(cap_only.min_initial_nprobes, config.min_initial_nprobes);
+        assert_eq!(cap_only.margin, config.margin);
+        assert_eq!(cap_only.max_initial_nprobes, Some(6));
+        let both = config.with_overrides(None, Some("1"), Some("2")).unwrap();
+        assert_eq!(both.min_initial_nprobes, 1);
+        assert_eq!(both.max_initial_nprobes, Some(2));
+    }
+
     #[test]
     fn test_auto_probe_valid_overrides() {
-        let config = AutoProbeConfig::parse(&query(), DistanceType::Cosine, Some("0"), Some("7"))
-            .unwrap()
-            .unwrap();
+        let config = AutoProbeConfig::parse(
+            &query(),
+            DistanceType::Cosine,
+            Some("0"),
+            Some("4"),
+            Some("7"),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             config,
             AutoProbeConfig {
+                min_initial_nprobes: 4,
                 margin: 0.0,
                 max_initial_nprobes: Some(7)
             }
@@ -269,6 +535,7 @@ mod tests {
         for margin in [0.0, 0.25, 0.5, 1.0, 6.0, 80.0] {
             let mut query = query();
             AutoProbeConfig {
+                min_initial_nprobes: 1,
                 margin,
                 max_initial_nprobes: None,
             }
@@ -291,6 +558,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut query = query();
             AutoProbeConfig {
+                min_initial_nprobes: 1,
                 margin: 0.5,
                 max_initial_nprobes: None,
             }

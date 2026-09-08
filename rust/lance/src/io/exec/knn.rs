@@ -3340,6 +3340,7 @@ mod tests {
         query.maximum_nprobes = Some(3);
         if has_auto_cap {
             AutoProbeConfig {
+                min_initial_nprobes: 1,
                 margin: 80.0,
                 max_initial_nprobes: Some(1),
             }
@@ -4383,6 +4384,7 @@ mod tests {
         let fixture = NprobesTestFixture::new(100, num_deltas).await;
 
         let q = fixture.get_centroid(0);
+        let initial_nprobes = 20;
         let stats_holder = StatsHolder::default();
 
         let results = fixture
@@ -4390,7 +4392,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(10)
+            .minimum_nprobes(initial_nprobes)
             .prefilter(true)
             .scan_stats_callback(stats_holder.get_setter())
             .filter("label = 17 AND label = 18")
@@ -4409,7 +4411,7 @@ mod tests {
         // We skip the late search because by then we know there are no results
         assert_eq!(
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
-            &(10 * num_deltas)
+            &(initial_nprobes * num_deltas)
         );
         assert_find_partitions_elapsed_recorded(&stats);
     }
@@ -4461,13 +4463,33 @@ mod tests {
         let fixture = NprobesTestFixture::new(100, num_deltas).await;
 
         let q = fixture.get_centroid(0);
+        let initial_nprobes = 20;
+        // Use a fixed budget to identify which matching rows the initial search
+        // reaches, independently of centroid tie ordering and Auto calibration.
+        let initial_results = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 50)
+            .unwrap()
+            .minimum_nprobes(initial_nprobes)
+            .maximum_nprobes(initial_nprobes)
+            .prefilter(true)
+            .filter("userid < 20")
+            .unwrap()
+            .project(&Vec::<String>::new())
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(initial_results.num_rows() > 0 && initial_results.num_rows() < 20);
         let stats_holder = StatsHolder::default();
         let results = fixture
             .dataset
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(10)
+            .minimum_nprobes(initial_nprobes)
             .prefilter(true)
             .filter("userid < 20")
             .unwrap()
@@ -4485,21 +4507,35 @@ mod tests {
         // we can cheaply stop early.
         assert_eq!(
             stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap(),
-            &(10 * num_deltas)
+            &(initial_nprobes * num_deltas)
         );
         assert_find_partitions_elapsed_recorded(&stats);
         assert_eq!(results.num_rows(), 20);
 
-        // 15 of the results come from beyond the closest 10 partitions and these will have infinite
-        // distance.
-        let num_infinite_results = results
-            .column(0)
+        // Only the rows missing from the fixed-budget search should be emitted
+        // by the cheap prefilter shortcut with a placeholder distance.
+        let initial_ids = initial_results[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values();
+        for (row_id, distance) in results[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .zip(results[DIST_COL].as_primitive::<Float32Type>().values())
+        {
+            if initial_ids.contains(row_id) {
+                assert!(distance.is_finite());
+            } else {
+                assert_eq!(*distance, f32::INFINITY);
+            }
+        }
+        let num_infinite_results = results[DIST_COL]
             .as_primitive::<Float32Type>()
             .values()
             .iter()
-            .filter(|val| val.is_infinite())
+            .filter(|distance| distance.is_infinite())
             .count();
-        assert_eq!(num_infinite_results, 15);
+        assert_eq!(num_infinite_results, 20 - initial_results.num_rows());
 
         // If we set a refine factor then the distance should not be infinite.
         let results = fixture
@@ -4507,7 +4543,7 @@ mod tests {
             .scan()
             .nearest("vector", q.as_ref(), 50)
             .unwrap()
-            .minimum_nprobes(10)
+            .minimum_nprobes(initial_nprobes)
             .prefilter(true)
             .refine(1)
             .filter("userid < 20")
