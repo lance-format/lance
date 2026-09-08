@@ -2233,9 +2233,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
-                        let normalized_query =
-                            normalize_query_for_index(raw_index.as_ref(), query.clone())?;
-                        query = normalized_query;
+                        query = normalize_query_for_index(raw_index.as_ref(), query)?;
                         if let Some(config) = AutoProbeConfig::from_env(&query, raw_index.metric_type())? {
                             config.apply(&mut query, q_c_dists.values(), raw_index.metric_type());
                         }

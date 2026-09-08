@@ -62,7 +62,6 @@ rustc-hash = "2.1"
 # Compact FST term dictionary for the FTS mem-index partitions.
 fst.workspace = true
 itertools.workspace = true
-libm.workspace = true
 moka.workspace = true
 object_store = { workspace = true }
 pin-project.workspace = true

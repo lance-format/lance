@@ -89,25 +89,24 @@ impl AutoProbeConfig {
             2..=10 => 1,
             _ => 2,
         };
-        // Profiles are calibrated on DINO (L2), LAION (cosine), and
-        // MS MARCO Web Search (Dot).
+        // Profiles depend only on metric and k; every index uses the same values.
         let config = if metric == DistanceType::L2 {
             Self {
-                min_initial_nprobes: [8, 1, 16][bucket],
-                margin: [0.25, 0.4, 0.4][bucket],
-                max_initial_nprobes: Some([16, 22, 37][bucket]),
+                min_initial_nprobes: 6,
+                margin: [0.39, 0.42, 0.45][bucket],
+                max_initial_nprobes: Some([450, 432, 491][bucket]),
             }
         } else if metric == DistanceType::Cosine {
             Self {
-                min_initial_nprobes: [4, 8, 8][bucket],
-                margin: [0.3, 0.4, 0.5][bucket],
-                max_initial_nprobes: Some([18, 28, 47][bucket]),
+                min_initial_nprobes: 1,
+                margin: [0.35, 0.39, 0.41][bucket],
+                max_initial_nprobes: Some([482, 553, 588][bucket]),
             }
         } else {
             Self {
-                min_initial_nprobes: [417, 463, 508][bucket],
-                margin: 0.1,
-                max_initial_nprobes: Some([664, 698, 808][bucket]),
+                min_initial_nprobes: [1, 23, 1][bucket],
+                margin: [0.1275, 0.1325, 0.1375][bucket],
+                max_initial_nprobes: Some([628, 697, 756][bucket]),
             }
         };
         config.with_overrides(margin, minimum, maximum).map(Some)
@@ -248,21 +247,21 @@ mod tests {
     }
 
     #[rstest]
-    #[case::l2_top1(DistanceType::L2, 1, 0.25, 8, 16)]
-    #[case::l2_top10_lower_boundary(DistanceType::L2, 2, 0.4, 1, 22)]
-    #[case::l2_top10_upper_boundary(DistanceType::L2, 10, 0.4, 1, 22)]
-    #[case::l2_top100_lower_boundary(DistanceType::L2, 11, 0.4, 16, 37)]
-    #[case::l2_top100(DistanceType::L2, 100, 0.4, 16, 37)]
-    #[case::cosine_top1(DistanceType::Cosine, 1, 0.3, 4, 18)]
-    #[case::cosine_top10_lower_boundary(DistanceType::Cosine, 2, 0.4, 8, 28)]
-    #[case::cosine_top10_upper_boundary(DistanceType::Cosine, 10, 0.4, 8, 28)]
-    #[case::cosine_top100_lower_boundary(DistanceType::Cosine, 11, 0.5, 8, 47)]
-    #[case::cosine_top100(DistanceType::Cosine, 100, 0.5, 8, 47)]
-    #[case::dot_top1(DistanceType::Dot, 1, 0.1, 417, 664)]
-    #[case::dot_top10_lower_boundary(DistanceType::Dot, 2, 0.1, 463, 698)]
-    #[case::dot_top10_upper_boundary(DistanceType::Dot, 10, 0.1, 463, 698)]
-    #[case::dot_top100_lower_boundary(DistanceType::Dot, 11, 0.1, 508, 808)]
-    #[case::dot_top100(DistanceType::Dot, 100, 0.1, 508, 808)]
+    #[case::l2_top1(DistanceType::L2, 1, 0.39, 6, 450)]
+    #[case::l2_top10_lower_boundary(DistanceType::L2, 2, 0.42, 6, 432)]
+    #[case::l2_top10_upper_boundary(DistanceType::L2, 10, 0.42, 6, 432)]
+    #[case::l2_top100_lower_boundary(DistanceType::L2, 11, 0.45, 6, 491)]
+    #[case::l2_top100(DistanceType::L2, 100, 0.45, 6, 491)]
+    #[case::cosine_top1(DistanceType::Cosine, 1, 0.35, 1, 482)]
+    #[case::cosine_top10_lower_boundary(DistanceType::Cosine, 2, 0.39, 1, 553)]
+    #[case::cosine_top10_upper_boundary(DistanceType::Cosine, 10, 0.39, 1, 553)]
+    #[case::cosine_top100_lower_boundary(DistanceType::Cosine, 11, 0.41, 1, 588)]
+    #[case::cosine_top100(DistanceType::Cosine, 100, 0.41, 1, 588)]
+    #[case::dot_top1(DistanceType::Dot, 1, 0.1275, 1, 628)]
+    #[case::dot_top10_lower_boundary(DistanceType::Dot, 2, 0.1325, 23, 697)]
+    #[case::dot_top10_upper_boundary(DistanceType::Dot, 10, 0.1325, 23, 697)]
+    #[case::dot_top100_lower_boundary(DistanceType::Dot, 11, 0.1375, 1, 756)]
+    #[case::dot_top100(DistanceType::Dot, 100, 0.1375, 1, 756)]
     fn test_auto_probe_metric_profiles(
         #[case] metric: DistanceType,
         #[case] k: usize,

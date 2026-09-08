@@ -4472,7 +4472,6 @@ dependencies = [
  "lance-testing",
  "lance-tokenizer",
  "libc",
- "libm",
  "log",
  "lzma-sys",
  "mock_instant",
