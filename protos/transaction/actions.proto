@@ -181,8 +181,9 @@ message Action {
     ConfigUpdate config_update = 8;
     AddOverlays add_overlays = 9;
     RefreshRowVersionMetadata refresh_row_version_metadata = 10;
-    // Named `update_compacted_ss_tables` rather than `..._sstables` so the
-    // generated oneof variant matches the message name.
+    /* Named `update_compacted_ss_tables` rather than `..._sstables` so the
+     * generated oneof variant matches the message name.
+     */
     UpdateCompactedSsTables update_compacted_ss_tables = 11;
     // -- Schema (field-level; no wholesale SetSchema) --
     DropField drop_field = 12;
@@ -331,9 +332,10 @@ message RemoveFragment {
  * the read-version deletion file and are not serialized here.
  */
 message SetDeletionFile {
-  // The fragment, by committed id: unlike the sibling fragment actions this
-  // takes no Ref, because a fragment minted in the same operation has no rows
-  // to delete yet (see AddFragment).
+  /* The fragment, by committed id: unlike the sibling fragment actions this
+   * takes no Ref, because a fragment minted in the same operation has no rows
+   * to delete yet (see AddFragment).
+   */
   uint64 fragment = 1;
   lance.table.DeletionFile deletion_file = 2;
   // Data-change marker; see AddFragment.data_change.
@@ -446,8 +448,9 @@ message AddIndexSegment {
    * rewrites the segment). Empty when unavailable.
    */
   repeated lance.table.IndexFile files = 7;
-  // Data-change marker; see AddFragment.data_change. false marks a segment
-  // rebuild/compaction that does not reflect any change to the indexed data.
+  /* Data-change marker; see AddFragment.data_change. false marks a segment
+   * rebuild/compaction that does not reflect any change to the indexed data.
+   */
   optional bool data_change = 8;
   /*
    * The base path this segment's files live under, for a segment imported from
@@ -487,8 +490,9 @@ message FragmentCoverage {
  */
 message RemoveIndexSegment {
   lance.table.UUID uuid = 1;
-  // Data-change marker; see AddFragment.data_change. false marks removal of a
-  // segment superseded by compaction, not a change to the indexed data.
+  /* Data-change marker; see AddFragment.data_change. false marks removal of a
+   * segment superseded by compaction, not a change to the indexed data.
+   */
   optional bool data_change = 2;
   /*
    * The logical index the segment belongs to. Carried so apply can check the

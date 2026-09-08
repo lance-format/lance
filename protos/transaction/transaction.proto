@@ -388,8 +388,9 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
-    // Action-based transaction (Transaction V2). See actions.proto.
-    // DRAFT: currently rejected on load; no write path.
+    /* Action-based transaction (Transaction V2). See actions.proto.
+     * DRAFT: currently rejected on load; no write path.
+     */
     lance.transaction.CompositeOperation composite_operation = 116;
   }
 
