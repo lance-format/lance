@@ -164,6 +164,7 @@ class IndicesBuilder:
         *,
         sample_rate: int = 256,
         max_iters: int = 50,
+        num_bits: int = 8,
         fragment_ids: Optional[list[int]] = None,
     ) -> PqModel:
         """
@@ -195,6 +196,8 @@ class IndicesBuilder:
             This parameter is used in the same way as in the IVF model.
         max_iters: int
             This parameter is used in the same way as in the IVF model.
+        num_bits: int
+            The number of bits used to encode each PQ centroid.
         fragment_ids: list[int], optional
             If provided, train using only the specified fragments from the dataset.
         """
@@ -202,7 +205,7 @@ class IndicesBuilder:
 
         num_rows = self._count_rows(fragment_ids)
         num_subvectors = self._normalize_pq_params(num_subvectors, self.dimension)
-        self._verify_pq_sample_rate(num_rows, sample_rate)
+        self._verify_pq_sample_rate(num_rows, sample_rate, num_bits)
         distance_type = ivf_model.distance_type
         pq_codebook = indices.train_pq_model(
             self.dataset._ds,
@@ -214,8 +217,9 @@ class IndicesBuilder:
             max_iters,
             ivf_model.centroids,
             fragment_ids,
+            num_bits,
         )
-        return PqModel(num_subvectors, pq_codebook)
+        return PqModel(num_subvectors, pq_codebook, num_bits=num_bits)
 
     def prepare_global_ivf_pq(
         self,
@@ -226,6 +230,7 @@ class IndicesBuilder:
         accelerator: Optional[Union[str, "torch.Device"]] = None,
         sample_rate: int = 256,
         max_iters: int = 50,
+        num_bits: int = 8,
         fragment_ids: Optional[list[int]] = None,
     ) -> dict:
         """
@@ -267,6 +272,7 @@ class IndicesBuilder:
             num_subvectors,
             sample_rate=sample_rate,
             max_iters=max_iters,
+            num_bits=num_bits,
             fragment_ids=fragment_ids,
         )
 
@@ -381,6 +387,7 @@ class IndicesBuilder:
             dest_uri,
             fragments,
             partition_ds_uri,
+            pq.num_bits,
         )
 
     def shuffle_transformed_vectors(
@@ -471,6 +478,7 @@ class IndicesBuilder:
                 num_subvectors,
                 distance_type,
                 index_name,
+                pq.num_bits,
             )
         else:
             raise ValueError("filenames must be a list of strings")
@@ -526,13 +534,17 @@ class IndicesBuilder:
                 f"The sample_rate must be an int greater than 1, got {sample_rate}"
             )
 
-    def _verify_pq_sample_rate(self, num_rows: int, sample_rate: int):
+    def _verify_pq_sample_rate(
+        self, num_rows: int, sample_rate: int, num_bits: int = 8
+    ):
         self._verify_base_sample_rate(sample_rate)
-        if 256 * sample_rate > num_rows:
+        required_rows = (2**num_bits) * sample_rate
+        if required_rows > num_rows:
             raise ValueError(
                 "There are not enough rows in the dataset to create PQ"
-                f" codebook with a sample rate of {sample_rate}.  {sample_rate * 256}"
-                f" rows needed and there are {num_rows}"
+                f" codebook with a sample rate of {sample_rate} and num_bits"
+                f" of {num_bits}.  {required_rows} rows needed and there are"
+                f" {num_rows}"
             )
 
     def _verify_ivf_sample_rate(

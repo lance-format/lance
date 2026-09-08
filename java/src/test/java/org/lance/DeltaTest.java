@@ -188,6 +188,57 @@ public class DeltaTest {
     }
   }
 
+  @Test
+  public void testGetDeletedRowIds(@TempDir Path tempDir) throws IOException {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      String uri = tempDir.resolve("delta_demo_delete").toString();
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  Field.notNullable(
+                      "id", new org.apache.arrow.vector.types.pojo.ArrowType.Int(32, true)),
+                  Field.nullable(
+                      "val", org.apache.arrow.vector.types.pojo.ArrowType.Utf8.INSTANCE)));
+
+      // v1: create with three rows, keeping stable row ids so deletions are reportable.
+      byte[] batch1 =
+          writeBatch(allocator, schema, new int[] {1, 2, 3}, new String[] {"a", "b", "c"});
+      try (ArrowStreamReader reader1 =
+              new ArrowStreamReader(new ByteArrayReadableSeekableByteChannel(batch1), allocator);
+          ArrowArrayStream stream1 = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader1, stream1);
+        Dataset.write().stream(stream1)
+            .uri(uri)
+            .mode(WriteParams.WriteMode.CREATE)
+            .enableStableRowIds(true)
+            .execute()
+            .close();
+      }
+
+      // v2: delete one row.
+      try (Dataset ds = Dataset.open(uri, allocator)) {
+        ds.delete("id = 2");
+      }
+
+      try (Dataset ds2 = Dataset.open(uri, allocator)) {
+        DatasetDelta delta = ds2.delta(1L);
+        try (ArrowReader deleted = delta.getDeletedRowIds()) {
+          int total = 0;
+          while (deleted.loadNextBatch()) {
+            VectorSchemaRoot outRoot = deleted.getVectorSchemaRoot();
+            List<String> names =
+                outRoot.getSchema().getFields().stream()
+                    .map(Field::getName)
+                    .collect(Collectors.toList());
+            Assertions.assertEquals(Arrays.asList("_rowid"), names);
+            total += outRoot.getRowCount();
+          }
+          Assertions.assertEquals(1, total, "exactly one row was deleted");
+        }
+      }
+    }
+  }
+
   /** Helper: serialize a single Arrow batch with the given schema and (id, val) pairs. */
   private static byte[] writeBatch(RootAllocator allocator, Schema schema, int[] ids, String[] vals)
       throws IOException {

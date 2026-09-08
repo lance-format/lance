@@ -305,8 +305,6 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .get("size")
             .and_then(|attr| attr.as_n().ok().and_then(|v| v.parse().ok()));
 
-        let e_tag = item.get("e_tag").and_then(|attr| attr.as_s().ok().cloned());
-
         let naming_scheme = detect_naming_scheme_from_path(&path)?;
 
         Ok(ManifestLocation {
@@ -314,7 +312,12 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             path,
             size,
             naming_scheme,
-            e_tag,
+            // DynamoDB coordinates the logical version but does not own an
+            // object generation. Older rows may still contain `e_tag`; ignore
+            // it and let the commit handler obtain the current token from the
+            // authoritative object store when it validates the final path.
+            e_tag: None,
+            identity: None,
         })
     }
 
@@ -372,8 +375,6 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                     _ => None,
                 });
 
-                let e_tag = item.get("e_tag").and_then(|attr| attr.as_s().ok().cloned());
-
                 match (version_attribute, path_attribute) {
                     (AttributeValue::N(version), AttributeValue::S(path)) => {
                         let version = version.parse().map_err(|e| Error::invalid_input(format!("dynamodb error: could not parse the version number returned {}, error: {}", version, e)))?;
@@ -384,7 +385,11 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                             path,
                             size,
                             naming_scheme,
-                            e_tag,
+                            // See `get_manifest_location`: legacy DDB ETags
+                            // are physical-generation observations, not
+                            // version identity, and are intentionally ignored.
+                            e_tag: None,
+                            identity: None,
                         };
                         Ok(Some(location))
                     }
@@ -404,21 +409,20 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
         version: u64,
         path: &str,
         size: u64,
-        e_tag: Option<String>,
+        _e_tag: Option<String>,
     ) -> Result<()> {
-        let mut put_item = self
-            .ddb_put()
+        // Do not persist an object-store ETag. Staging paths are immutable and
+        // uniquely selected by this conditional write; finalized paths are
+        // validated against object storage. Persisting an ETag adds no DDB
+        // concurrency or content-integrity guarantee and can make the row stale
+        // after an identical copy. The commit handler returns the destination
+        // ETag separately as an ephemeral runtime cache discriminator.
+        self.ddb_put()
             .item(base_uri!(), AttributeValue::S(base_uri.into()))
             .item(version!(), AttributeValue::N(version.to_string()))
             .item(path!(), AttributeValue::S(path.to_string()))
             .item(committer!(), AttributeValue::S(self.committer_name.clone()))
-            .item("size", AttributeValue::N(size.to_string()));
-
-        if let Some(e_tag) = e_tag {
-            put_item = put_item.item("e_tag", AttributeValue::S(e_tag));
-        }
-
-        put_item
+            .item("size", AttributeValue::N(size.to_string()))
             .condition_expression(format!(
                 "attribute_not_exists({}) AND attribute_not_exists({})",
                 base_uri!(),
@@ -438,21 +442,17 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
         version: u64,
         path: &str,
         size: u64,
-        e_tag: Option<String>,
+        _e_tag: Option<String>,
     ) -> Result<()> {
-        let mut put_item = self
-            .ddb_put()
+        // Replacing the staging pointer with the canonical path publishes the
+        // same generation-independent `(path, size)` tuple from every helper.
+        // Each helper still returns the canonical ETag it observed to its caller.
+        self.ddb_put()
             .item(base_uri!(), AttributeValue::S(base_uri.into()))
             .item(version!(), AttributeValue::N(version.to_string()))
             .item(path!(), AttributeValue::S(path.to_string()))
             .item(committer!(), AttributeValue::S(self.committer_name.clone()))
-            .item("size", AttributeValue::N(size.to_string()));
-
-        if let Some(e_tag) = e_tag {
-            put_item = put_item.item("e_tag", AttributeValue::S(e_tag));
-        }
-
-        put_item
+            .item("size", AttributeValue::N(size.to_string()))
             .condition_expression(format!(
                 "attribute_exists({}) AND attribute_exists({})",
                 base_uri!(),

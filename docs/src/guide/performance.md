@@ -141,7 +141,7 @@ Keys are often a composite of multiple fields and all keys are scoped to the dat
 | Deletion Files    | Dataset URI, fragment_id, version, id, file_type | The deletion vector for a frag      |
 | Row Id Mask       | Dataset URI, version                             | The row id sequence for the dataset |
 | Row Id Index      | Dataset URI, version                             | The row id index for the dataset    |
-| Row Id Sequence   | Dataset URI, fragment_id                         | The row id sequence for a fragment  |
+| Row Id Sequence   | Dataset URI, fragment_id, row_id_meta            | The row id sequence for a fragment  |
 | Index Metadata    | Dataset URI, version                             | The index metadata for the dataset  |
 | Index Details¹    | Dataset URI, index uuid                          | The index details for an index      |
 | File Global Meta  | Dataset URI, file path                           | The global metadata for a file      |
@@ -189,6 +189,41 @@ working with 1024-dimensional vector embeddings (e.g. 32-bit floats) then 8192 r
 spread that across 16 CPU threads then you would need 512MB of compute memory per scan. You might find working
 with 1024 rows per batch is more appropriate.
 
+#### Tuning remote scans
+
+An ordered dataset scan still overlaps I/O from multiple fragments. `scan_in_order=True` controls the order in
+which batches are returned; it does not make fragment reads sequential. This is why a dataset scan can issue
+more concurrent requests than scanning one fragment directly. The following controls tune different parts of
+the scan:
+
+* `fragment_readahead` limits how many fragments may have reads scheduled concurrently. Set it to `1` to match
+  the fragment-level I/O pattern, then increase it if the storage connection has spare bandwidth.
+* `LANCE_IO_THREADS` limits concurrent storage requests for the process. Cloud stores default to 64, which is
+  intended for high-bandwidth, in-region access and can be too aggressive across regions or over the public
+  internet.
+* `io_buffer_size` limits buffered I/O bytes and applies backpressure when decoding falls behind.
+* `batch_readahead` limits concurrent batch decoding. It does not control the size of storage range requests.
+
+For a bandwidth-constrained remote connection, start with conservative settings and tune upward:
+
+```shell
+LANCE_IO_THREADS=8 python scan.py
+```
+
+```python
+scanner = dataset.scanner(
+    fragment_readahead=1,
+    batch_readahead=2,
+    io_buffer_size=64 * 1024 * 1024,
+)
+for batch in scanner.to_batches():
+    process(batch)
+```
+
+Lance reads encoded pages from storage, so reducing `batch_size` changes the returned and decoded batch sizes
+but may not reduce the initial range request. The first batch can require loading one encoded page for each
+selected column.
+
 In summary, scans could use up to `(2 * io_buffer_size) + (batch_size * num_compute_threads)` bytes of memory.
 Keep in mind that `io_buffer_size` is a soft limit (e.g. we cannot read less than one page at a time right now)
 and so it is not necessarily a bug if you see memory usage exceed this limit by a small margin.
@@ -218,6 +253,37 @@ These initial settings are balanced and should work for most
 use cases. For example, S3 can typically get up to 5000
 req/s and with these settings we should get there in about
 10 seconds.
+
+## Fragment Sizing
+
+A Lance table is a collection of fragments tracked by a manifest. How you size those fragments
+trades off two classes of work:
+
+- **Manifest-level operations** scale with the *number* of fragments. Every dataset mutation
+  (appends, metadata updates, schema changes, compactions, etc.) rewrites the manifest, so a
+  larger fragment list makes every write slower. Reads pay a similar cost up front: opening a
+  dataset, listing fragments, planning a scan, and resolving transaction conflicts at the
+  dataset level all walk the manifest.
+- **Fragment-level operations** scale with the *size* of a fragment. These include scans
+  against a matching fragment, compaction, updates, deletes, and `merge_insert`. Conflict
+  detection for these operations is also done at the fragment level.
+
+Fewer, larger fragments make manifest-level operations cheap but make each fragment-level
+operation heavier and increase the chance of conflicts when many writers target the same
+fragment. More, smaller fragments do the reverse.
+
+Practical guidance:
+
+- The default of 1M rows per fragment works well up to ~1B rows. Past that, bumping toward
+  ~100M rows per fragment is reasonable, though fragment-count limits are rarely the bottleneck
+  in practice.
+- Tens of thousands of fragments per table is generally fine.
+- Keep individual fragments well under object-store object-size limits (S3 caps at 5 TB, and
+  stores tend to misbehave well before that). 10 GB–100 GB per fragment is a reasonable upper
+  range; 1 TB is a hard ceiling.
+- If you run many concurrent updates, deletes, or `merge_insert` operations, err toward more
+  fragments — conflict detection is per-fragment, so too few fragments leads to excess
+  retries.
 
 ## Conflict Handling
 
@@ -414,11 +480,52 @@ exact size depends on the quantizer:
 100M * (768 + 8) = ~72.3 GiB
 ```
 
-**RQ (RaBitQ):** Vectors are currently quantized to 1-bit binary codes. Each row also stores per-row
-scale and offset factors (4 bytes each) used for distance correction. Each row requires
-`dimension / 8 + 16` bytes (8 bytes for the row ID plus 8 bytes for the factors). For example, 100M
-rows with 768 dimensions and 1 bit per dimension:
+**RQ (RaBitQ):** New indexes default to 5 bits per dimension. Every bit width stores a 1-bit sign
+code plus three 4-byte correction factors. Multi-bit indexes also store the remaining bits in
+64-dimension-padded blocks and two additional 4-byte correction factors. Including the 8-byte row
+ID, the approximate size per row is:
+
+- 1-bit: `dimension / 8 + 20` bytes
+- Multi-bit: `dimension / 8 + round_up(dimension, 64) * (num_bits - 1) / 8 + 28` bytes
+
+For example, the default 5-bit index for 100M rows with 768 dimensions requires:
 
 ```
-100M * (768 / 8 + 16) = ~10.8 GiB
+100M * (768 / 8 + 768 * 4 / 8 + 28) = ~47.3 GiB
 ```
+
+The 5-bit default retains more information for the higher-fidelity distance estimates used by
+`Normal` and `Accurate` search modes, at the cost of more quantization work and index I/O during
+the build and a larger index. `Fast` search mode uses only the 1-bit sign code even when the index
+stores additional bits. Set `num_bits=1` explicitly to minimize index size and build I/O; the same
+100M-row example uses about 10.8 GiB, but searches cannot use the multi-bit distance estimate and
+may have lower recall.
+
+#### AMX Acceleration
+
+On Linux x86_64 with an AMX-FP16 CPU (Intel Granite Rapids / Xeon 6 and newer), a `float16`
+vector column indexed with `dot` distance uses the AMX tile instructions, provided the build
+machine had clang >= 16 or gcc >= 13 to compile the kernel. There is nothing to enable —
+Lance checks the CPU at run time and falls back to the previous implementation everywhere else.
+
+The accelerated paths are also shape-gated, because below these sizes a tile pass costs more
+than it saves and the kernel declines the work:
+
+| Condition | Why |
+|---|---|
+| `float16` vectors, `dot` distance | The kernel is fp16-specific; other types and metrics keep their existing paths |
+| `dimension >= 32` | One tile pass covers 32 dimensions; a shorter vector would be all scalar cleanup |
+| `num_centroids >= 32` | The GEMM steps its centroid loop by 32 and has no partial-tile path |
+
+Anything outside them behaves exactly as it does today, so a small dataset or a low-dimensional
+column simply keeps the previous implementation rather than changing behaviour.
+
+Index build also changes algorithm where all of the above hold: comparing every vector against
+every centroid becomes affordable, so partition assignment is exact instead of approximated with
+a graph search over the centroids. Recall improves, and partition assignments differ from what an
+older build produced.
+
+Set `LANCE_DISABLE_AMX=1` to take the AMX paths out of service without rebuilding — for
+A/B measurement, or to get the previous behaviour back. Because it also moves partition
+assignment back to the approximate path, an index built with it set is not equivalent to one
+built without it; compare recall, not just build time.

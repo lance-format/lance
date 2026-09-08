@@ -15,19 +15,22 @@ use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
-    ExecutionSummaryCounts, Scanner,
+    ExecutionSummaryCounts, MaterializationStyle, Scanner,
 };
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::query::{
-    BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
-    MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
-    PhraseQuery as FtsPhraseQuery,
+use lance_index::scalar::inverted::{
+    DocumentGranularity,
+    query::{
+        BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
+        MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
+        PhraseQuery as FtsPhraseQuery,
+    },
 };
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 
 use crate::{
-    RT,
+    RT, block_on,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::IntoJava,
     utils::parse_approx_mode,
@@ -66,17 +69,17 @@ impl BlockingScanner {
 
     pub fn open_stream(&self) -> Result<DatasetRecordBatchStream> {
         self.reset_stats();
-        let res = RT.block_on(self.inner.try_into_stream())?;
+        let res = block_on(self.inner.try_into_stream())?;
         Ok(res)
     }
 
     pub fn schema(&self) -> Result<SchemaRef> {
-        let res = RT.block_on(self.inner.schema())?;
+        let res = block_on(self.inner.schema())?;
         Ok(res)
     }
 
     pub fn count_rows(&self) -> Result<u64> {
-        let res = RT.block_on(self.inner.count_rows())?;
+        let res = block_on(self.inner.count_rows())?;
         Ok(res)
     }
 
@@ -114,6 +117,7 @@ pub(crate) fn build_full_text_search_query<'a>(
             let max_expansions = env.get_int_as_usize_from_method(&java_obj, "getMaxExpansions")?;
             let operator = env.get_fts_operator_from_method(&java_obj)?;
             let prefix_length = env.get_u32_from_method(&java_obj, "getPrefixLength")?;
+            let document_granularity = get_document_granularity(env, &java_obj)?;
 
             let mut query = FtsMatchQuery::new(query_text);
             query = query.with_column(Some(column));
@@ -123,6 +127,9 @@ pub(crate) fn build_full_text_search_query<'a>(
                 .with_max_expansions(max_expansions)
                 .with_operator(operator)
                 .with_prefix_length(prefix_length);
+            if let Some(document_granularity) = document_granularity {
+                query = query.with_document_granularity(document_granularity);
+            }
 
             Ok(FtsQuery::Match(query))
         }
@@ -130,10 +137,14 @@ pub(crate) fn build_full_text_search_query<'a>(
             let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
             let column = env.get_string_from_method(&java_obj, "getColumn")?;
             let slop = env.get_u32_from_method(&java_obj, "getSlop")?;
+            let document_granularity = get_document_granularity(env, &java_obj)?;
 
             let mut query = FtsPhraseQuery::new(query_text);
             query = query.with_column(Some(column));
             query = query.with_slop(slop);
+            if let Some(document_granularity) = document_granularity {
+                query = query.with_document_granularity(document_granularity);
+            }
 
             Ok(FtsQuery::Phrase(query))
         }
@@ -229,6 +240,20 @@ pub(crate) fn build_full_text_search_query<'a>(
     }
 }
 
+fn get_document_granularity(
+    env: &mut JNIEnv<'_>,
+    java_obj: &JObject,
+) -> Result<Option<DocumentGranularity>> {
+    env.get_optional_from_method(
+        java_obj,
+        "getDocumentGranularity",
+        |env, granularity_obj| {
+            let value = env.get_string_from_method(&granularity_obj, "toRustString")?;
+            DocumentGranularity::try_from(value.as_str()).map_err(Error::from)
+        },
+    )
+}
+
 /// Scanner options passed from JNI - shared between blocking and async scanners
 pub(crate) struct ScannerOptions<'a> {
     pub fragment_ids_obj: JObject<'a>,
@@ -236,6 +261,8 @@ pub(crate) struct ScannerOptions<'a> {
     pub substrait_filter_obj: JObject<'a>,
     pub filter_obj: JObject<'a>,
     pub batch_size_obj: JObject<'a>,
+    pub batch_size_bytes_obj: JObject<'a>,
+    pub io_buffer_size_obj: JObject<'a>,
     pub limit_obj: JObject<'a>,
     pub offset_obj: JObject<'a>,
     pub query_obj: JObject<'a>,
@@ -244,6 +271,9 @@ pub(crate) struct ScannerOptions<'a> {
     pub with_row_id: jboolean,
     pub with_row_address: jboolean,
     pub batch_readahead: jint,
+    pub fragment_readahead_obj: JObject<'a>,
+    pub scan_in_order: jboolean,
+    pub late_materialization_obj: JObject<'a>,
     pub column_orderings: JObject<'a>,
     pub use_scalar_index: jboolean,
     pub fast_search: jboolean,
@@ -283,7 +313,7 @@ pub(crate) fn build_scanner_with_options<'a>(
 
     let substrait_opt = env.get_bytes_opt(&options.substrait_filter_obj)?;
     if let Some(substrait) = substrait_opt {
-        RT.block_on(async { scanner.filter_substrait(substrait) })?;
+        block_on(async { scanner.filter_substrait(substrait) })?;
     }
 
     let filter_opt = env.get_string_opt(&options.filter_obj)?;
@@ -294,6 +324,26 @@ pub(crate) fn build_scanner_with_options<'a>(
     let batch_size_opt = env.get_long_opt(&options.batch_size_obj)?;
     if let Some(batch_size) = batch_size_opt {
         scanner.batch_size(batch_size as usize);
+    }
+
+    let batch_size_bytes_opt = env.get_long_opt(&options.batch_size_bytes_obj)?;
+    if let Some(batch_size_bytes) = batch_size_bytes_opt {
+        let batch_size_bytes = u64::try_from(batch_size_bytes).map_err(|_| {
+            Error::input_error(format!(
+                "batchSizeBytes must be non-negative, got {batch_size_bytes}"
+            ))
+        })?;
+        scanner.batch_size_bytes(batch_size_bytes);
+    }
+
+    let io_buffer_size_opt = env.get_long_opt(&options.io_buffer_size_obj)?;
+    if let Some(io_buffer_size) = io_buffer_size_opt {
+        let io_buffer_size = u64::try_from(io_buffer_size).map_err(|_| {
+            Error::input_error(format!(
+                "ioBufferSize must be non-negative, got {io_buffer_size}"
+            ))
+        })?;
+        scanner.io_buffer_size(io_buffer_size);
     }
 
     let limit_opt = env.get_long_opt(&options.limit_obj)?;
@@ -377,6 +427,47 @@ pub(crate) fn build_scanner_with_options<'a>(
 
     scanner.batch_readahead(options.batch_readahead as usize);
 
+    let fragment_readahead_opt = env.get_int_opt(&options.fragment_readahead_obj)?;
+    if let Some(fragment_readahead) = fragment_readahead_opt {
+        let fragment_readahead = usize::try_from(fragment_readahead).map_err(|_| {
+            Error::input_error(format!(
+                "fragmentReadahead must be greater than 0, got {fragment_readahead}"
+            ))
+        })?;
+        if fragment_readahead == 0 {
+            return Err(Error::input_error(
+                "fragmentReadahead must be greater than 0, got 0".to_string(),
+            ));
+        }
+        scanner.fragment_readahead(fragment_readahead);
+    }
+
+    scanner.scan_in_order(options.scan_in_order == JNI_TRUE);
+
+    env.get_optional(&options.late_materialization_obj, |env, java_obj| {
+        let style_name = env.get_string_from_method(&java_obj, "toRustString")?;
+        let style = match style_name.as_str() {
+            "heuristic" => MaterializationStyle::Heuristic,
+            "all_late" => MaterializationStyle::AllLate,
+            "all_early" => MaterializationStyle::AllEarly,
+            "all_early_except" => {
+                let columns: Vec<String> =
+                    import_vec_from_method(env, &java_obj, "getColumns", |env, elem| {
+                        let jstr = JString::from(elem);
+                        Ok(env.get_string(&jstr)?.into())
+                    })?;
+                MaterializationStyle::all_early_except(&columns, dataset.schema())?
+            }
+            other => {
+                return Err(Error::input_error(format!(
+                    "Unsupported materialization style: {other}"
+                )));
+            }
+        };
+        scanner.materialization_style(style);
+        Ok(())
+    })?;
+
     env.get_optional(&options.column_orderings, |env, java_obj| {
         let list = env.get_list(&java_obj)?;
         let mut iter = list.iter(env)?;
@@ -427,6 +518,8 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     substrait_filter_obj: JObject<'local>, // Optional<ByteBuffer>
     filter_obj: JObject<'local>,       // Optional<String>
     batch_size_obj: JObject<'local>,   // Optional<Long>
+    batch_size_bytes_obj: JObject<'local>, // Optional<Long>
+    io_buffer_size_obj: JObject<'local>, // Optional<Long>
     limit_obj: JObject<'local>,        // Optional<Integer>
     offset_obj: JObject<'local>,       // Optional<Integer>
     query_obj: JObject<'local>,        // Optional<Query>
@@ -435,6 +528,9 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     with_row_id: jboolean,             // boolean
     with_row_address: jboolean,        // boolean
     batch_readahead: jint,             // int
+    fragment_readahead_obj: JObject<'local>, // Optional<Integer>
+    scan_in_order: jboolean,           // boolean
+    late_materialization_obj: JObject<'local>, // Optional<MaterializationStyle>
     column_orderings: JObject<'local>, // Optional<List<ColumnOrdering>>
     use_scalar_index: jboolean,        // boolean
     fast_search: jboolean,             // boolean
@@ -454,6 +550,8 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             substrait_filter_obj,
             filter_obj,
             batch_size_obj,
+            batch_size_bytes_obj,
+            io_buffer_size_obj,
             limit_obj,
             offset_obj,
             query_obj,
@@ -462,6 +560,9 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             with_row_id,
             with_row_address,
             batch_readahead,
+            fragment_readahead_obj,
+            scan_in_order,
+            late_materialization_obj,
             column_orderings,
             use_scalar_index,
             fast_search,
@@ -483,6 +584,8 @@ fn inner_create_scanner<'local>(
     substrait_filter_obj: JObject<'local>,
     filter_obj: JObject<'local>,
     batch_size_obj: JObject<'local>,
+    batch_size_bytes_obj: JObject<'local>,
+    io_buffer_size_obj: JObject<'local>,
     limit_obj: JObject<'local>,
     offset_obj: JObject<'local>,
     query_obj: JObject<'local>,
@@ -491,6 +594,9 @@ fn inner_create_scanner<'local>(
     with_row_id: jboolean,
     with_row_address: jboolean,
     batch_readahead: jint,
+    fragment_readahead_obj: JObject<'local>,
+    scan_in_order: jboolean,
+    late_materialization_obj: JObject<'local>,
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
     fast_search: jboolean,
@@ -511,6 +617,8 @@ fn inner_create_scanner<'local>(
         substrait_filter_obj,
         filter_obj,
         batch_size_obj,
+        batch_size_bytes_obj,
+        io_buffer_size_obj,
         limit_obj,
         offset_obj,
         query_obj,
@@ -519,6 +627,9 @@ fn inner_create_scanner<'local>(
         with_row_id,
         with_row_address,
         batch_readahead,
+        fragment_readahead_obj,
+        scan_in_order,
+        late_materialization_obj,
         column_orderings,
         use_scalar_index,
         fast_search,
@@ -589,6 +700,38 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_openStream(
 }
 
 fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -> Result<()> {
+    if stream_addr == 0 {
+        return Err(Error::input_error(
+            "ArrowArrayStream address must not be null".to_string(),
+        ));
+    }
+
+    // Reject a stream that already holds a producer. We write the C struct in place below with
+    // `ptr::write_unaligned`, which does not run any destructor on the previous contents. If the
+    // caller passed a stream whose `release` callback is already set (e.g. it was populated by an
+    // earlier export and not yet released), overwriting it would drop that callback and leak the
+    // first producer's resources. A freshly-allocated `ArrowArrayStream` has a null `release`, per
+    // the Arrow C Data Interface, so requiring `release == None` is the contract for "empty".
+    //
+    // The struct is allocated by Arrow Java inside an ArrowBuf and is not guaranteed to be aligned
+    // (hence `write_unaligned` below), so we must not form a reference to it. We read only the
+    // `release` field through an unaligned read: `addr_of!` computes the field address without
+    // creating an intermediate, possibly-unaligned reference, and the field is an `Option<fn>`
+    // which is `Copy` with no destructor, so reading a copy of it leaves the caller's stream
+    // untouched.
+    let release_is_set = unsafe {
+        let stream_ptr = stream_addr as *const FFI_ArrowArrayStream;
+        let release = std::ptr::read_unaligned(std::ptr::addr_of!((*stream_ptr).release));
+        release.is_some()
+    };
+    if release_is_set {
+        return Err(Error::input_error(
+            "ArrowArrayStream is already populated; exporting into it would leak the existing \
+             producer. Pass a freshly-allocated, empty stream."
+                .to_string(),
+        ));
+    }
+
     let record_batch_stream = {
         let scanner_guard =
             unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
@@ -637,7 +780,7 @@ fn inner_count_rows(env: &mut JNIEnv, j_scanner: JObject) -> Result<u64> {
 }
 
 const SCAN_STATS_CLASS: &str = "org/lance/ipc/ScanStats";
-const SCAN_STATS_CONSTRUCTOR_SIG: &str = "(JJJJJJLjava/util/Map;Ljava/util/Map;)V";
+const SCAN_STATS_CONSTRUCTOR_SIG: &str = "(JJJJJJJJLjava/util/Map;Ljava/util/Map;)V";
 
 fn export_usize_map<'a>(env: &mut JNIEnv<'a>, map: &HashMap<String, usize>) -> Result<JObject<'a>> {
     let hash_map = env.new_object("java/util/HashMap", "()V", &[])?;
@@ -669,6 +812,8 @@ impl IntoJava for &ExecutionSummaryCounts {
                 JValueGen::Long(self.indices_loaded as i64),
                 JValueGen::Long(self.parts_loaded as i64),
                 JValueGen::Long(self.index_comparisons as i64),
+                JValueGen::Long(self.index_cache_hits() as i64),
+                JValueGen::Long(self.index_cache_misses() as i64),
                 JValueGen::Object(&all_counts),
                 JValueGen::Object(&all_times),
             ],

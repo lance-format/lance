@@ -27,7 +27,7 @@ GitHub organization.
 | Integration | Description | Source |
 |---|---|---|
 | [PyTorch](pytorch.md) | Use `lance.torch.data.LanceDataset` as a `torch.utils.data.IterableDataset` for training and inference. | Built-in |
-| [TensorFlow](tensorflow.md) | Use `lance.tf.data.from_lance` to stream Lance data into `tf.data.Dataset` pipelines. | Built-in |
+| [TensorFlow](tensorflow.md) | Use `lance_tensorflow.from_lance` to stream Lance data into `tf.data.Dataset` pipelines. | [lance-format/lance-tensorflow](https://github.com/lance-format/lance-tensorflow) |
 | [Ray](ray) | Distributed read/write of Lance datasets with Ray Data. | [lance-format/lance-ray](https://github.com/lance-format/lance-ray) |
 | [Hugging Face](huggingface) | Convert and load Hugging Face datasets to and from Lance in a single call. | [lance-format/lance-huggingface](https://github.com/lance-format/lance-huggingface) |
 

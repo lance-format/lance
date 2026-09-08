@@ -7,7 +7,6 @@ pub mod batch_store;
 pub mod flush;
 pub mod scanner;
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,6 +21,7 @@ use uuid::Uuid;
 
 use super::index::IndexStore;
 use super::util::{WatchableOnceCell, WatchableOnceCellReader};
+use super::wal::WalFlushFailure;
 use super::write::{DurabilityResult, WalFlushResult};
 use crate::Dataset;
 use batch_store::BatchStore;
@@ -78,15 +78,12 @@ pub struct MemTable {
     /// Generation number (incremented on flush).
     generation: u64,
 
-    /// WAL batch mapping: batch_position -> (wal_entry_position, position within WAL entry).
-    wal_batch_mapping: HashMap<usize, (u64, usize)>,
-    /// Last WAL entry position that has been flushed.
-    last_flushed_wal_entry_position: u64,
-    /// Set of batch IDs that have been flushed to WAL.
-    flushed_batch_positions: HashSet<usize>,
-
     /// Primary key bloom filter for staleness detection.
     pk_bloom_filter: Sbbf,
+    /// Decoded size of the primary-key columns across every batch appended so
+    /// far. Accumulated here because [`Self::update_bloom_filter`] already has
+    /// the key columns in hand.
+    pk_bytes: usize,
     /// Primary key field IDs (for bloom filter updates).
     pk_field_ids: Vec<i32>,
 
@@ -103,9 +100,10 @@ pub struct MemTable {
     /// Set when the memtable is frozen and a WAL flush request is sent.
     /// The reader can be awaited to know when WAL flush is complete.
     /// Uses Mutex for interior mutability since the MemTable is wrapped in Arc when frozen.
-    /// Uses Result<WalFlushResult, String> since lance_core::Error doesn't implement Clone.
+    /// Uses `WalFlushFailure` (not `Error`) since `lance_core::Error` doesn't
+    /// implement Clone; the carrier preserves the fence reason for the waiter.
     wal_flush_completion: std::sync::Mutex<
-        Option<WatchableOnceCellReader<std::result::Result<WalFlushResult, String>>>,
+        Option<WatchableOnceCellReader<std::result::Result<WalFlushResult, WalFlushFailure>>>,
     >,
 
     /// Cell for memtable flush completion notification.
@@ -128,6 +126,24 @@ const PK_BLOOM_FILTER_EXPECTED_ITEMS: u64 = 8192;
 /// Default false positive probability for primary key bloom filter.
 /// Consistent with lance-index scalar bloomfilter defaults (≈ 1 in 1754).
 const PK_BLOOM_FILTER_FPP: f64 = 0.00057;
+
+/// Heap one memtable's PK bloom filter holds.
+///
+/// The same for every memtable, because it is sized from two constants rather
+/// than from the rows in it — so this is a property of the build, not a
+/// measurement, and a memory view need not carry it per memtable.
+///
+/// Counted as index memory rather than row data: it is an auxiliary lookup
+/// structure, and a fixed term in the `max_memtable_size` seal trigger would
+/// make every memtable seal a constant early.
+pub fn pk_bloom_filter_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        Sbbf::with_ndv_fpp(PK_BLOOM_FILTER_EXPECTED_ITEMS, PK_BLOOM_FILTER_FPP)
+            .map(|f| f.estimated_memory_size())
+            .unwrap_or(0)
+    })
+}
 
 impl MemTable {
     /// Create a new MemTable with default capacity.
@@ -186,6 +202,29 @@ impl MemTable {
         cache_config: CacheConfig,
         batch_capacity: usize,
     ) -> Result<Self> {
+        Self::with_capacity_at(
+            schema,
+            generation,
+            pk_field_ids,
+            cache_config,
+            batch_capacity,
+            0,
+        )
+    }
+
+    /// Create a memtable whose batch 0 sits at `global_offset` in the writer's
+    /// batch sequence. Every memtable after the writer's first is rotated in by
+    /// `freeze_memtable`, which stamps the outgoing memtable's `global_end()`
+    /// here so writer-global cursors stay mappable onto local batch positions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_capacity_at(
+        schema: Arc<ArrowSchema>,
+        generation: u64,
+        pk_field_ids: Vec<i32>,
+        cache_config: CacheConfig,
+        batch_capacity: usize,
+        global_offset: usize,
+    ) -> Result<Self> {
         let lance_schema = Schema::try_from(schema.as_ref())?;
 
         // Initialize bloom filter for primary key staleness detection.
@@ -203,7 +242,7 @@ impl MemTable {
         let dataset_uri = format!("memory://{}", Uuid::new_v4());
 
         // Create lock-free batch store
-        let batch_store = Arc::new(BatchStore::with_capacity(batch_capacity));
+        let batch_store = Arc::new(BatchStore::with_capacity_at(batch_capacity, global_offset));
 
         // Create memtable_flush_completion cell immediately so backpressure can
         // wait on it even before the memtable is frozen. Every memtable will
@@ -218,11 +257,9 @@ impl MemTable {
             cache_config,
             cached_dataset: RwLock::new(None),
             generation,
-            wal_batch_mapping: HashMap::new(),
-            last_flushed_wal_entry_position: 0,
-            flushed_batch_positions: HashSet::new(),
             pk_bloom_filter,
             pk_field_ids,
+            pk_bytes: 0,
             // Initialize with an empty IndexStore so the visibility cursor has
             // a stable Arc shared between the scanner (via `indexes_arc()`)
             // and the WAL flush handler. Replaced via `set_indexes_arc` if
@@ -266,7 +303,7 @@ impl MemTable {
     /// the WAL flush is complete.
     pub fn set_wal_flush_completion(
         &self,
-        reader: WatchableOnceCellReader<std::result::Result<WalFlushResult, String>>,
+        reader: WatchableOnceCellReader<std::result::Result<WalFlushResult, WalFlushFailure>>,
     ) {
         *self.wal_flush_completion.lock().unwrap() = Some(reader);
     }
@@ -278,7 +315,7 @@ impl MemTable {
     /// Thread-safe via interior mutability.
     pub fn take_wal_flush_completion(
         &self,
-    ) -> Option<WatchableOnceCellReader<std::result::Result<WalFlushResult, String>>> {
+    ) -> Option<WatchableOnceCellReader<std::result::Result<WalFlushResult, WalFlushFailure>>> {
         self.wal_flush_completion.lock().unwrap().take()
     }
 
@@ -476,56 +513,44 @@ impl MemTable {
     ///
     /// Returns true if the batch store is full or estimated size exceeds threshold.
     pub fn should_flush(&self, max_bytes: usize) -> bool {
-        self.batch_store.is_full() || self.batch_store.estimated_bytes() >= max_bytes
+        self.batch_store.is_full() || self.batch_store.row_bytes() >= max_bytes
     }
 
-    /// Get batches visible up to a specific batch position (inclusive).
+    /// Get the batches in the visible prefix.
     ///
-    /// A batch at position `i` is visible if `i <= max_visible_batch_position`.
+    /// A batch at position `i` is visible if `i < visible_count`.
     ///
     /// # Arguments
     ///
-    /// * `max_visible_batch_position` - The maximum batch position to include (inclusive)
+    /// * `visible_count` - Exclusive count of batch positions to include
     ///
     /// # Returns
     ///
     /// Vector of visible batches.
-    pub async fn get_visible_batches(&self, max_visible_batch_position: usize) -> Vec<RecordBatch> {
-        self.batch_store
-            .visible_record_batches(max_visible_batch_position)
+    pub async fn get_visible_batches(&self, visible_count: usize) -> Vec<RecordBatch> {
+        self.batch_store.visible_record_batches(visible_count)
     }
 
-    /// Get batch positions visible up to a specific batch position (inclusive).
+    /// Get the batch positions in the visible prefix.
     ///
     /// This is useful for filtering index results by visibility.
-    pub async fn get_max_visible_batch_positions(
-        &self,
-        max_visible_batch_position: usize,
-    ) -> Vec<usize> {
-        self.batch_store
-            .max_visible_batch_positions(max_visible_batch_position)
+    pub async fn get_visible_batch_positions(&self, visible_count: usize) -> Vec<usize> {
+        self.batch_store.visible_batch_positions(visible_count)
     }
 
     /// Check if a specific batch is visible at a given visibility position.
     ///
     /// Returns true if the batch is visible, false if not visible or doesn't exist.
-    pub async fn is_batch_visible(
-        &self,
-        batch_position: usize,
-        max_visible_batch_position: usize,
-    ) -> bool {
+    pub async fn is_batch_visible(&self, batch_position: usize, visible_count: usize) -> bool {
         self.batch_store
-            .is_batch_visible(batch_position, max_visible_batch_position)
+            .is_batch_visible(batch_position, visible_count)
     }
 
     /// Scan batches visible up to a specific batch position.
     ///
     /// This combines `get_visible_batches` with the scan interface.
-    pub async fn scan_batches_at_position(
-        &self,
-        max_visible_batch_position: usize,
-    ) -> Result<Vec<RecordBatch>> {
-        Ok(self.get_visible_batches(max_visible_batch_position).await)
+    pub async fn scan_batches_at_position(&self, visible_count: usize) -> Result<Vec<RecordBatch>> {
+        Ok(self.get_visible_batches(visible_count).await)
     }
 
     /// Update the bloom filter with primary keys from a batch.
@@ -556,31 +581,13 @@ impl MemTable {
             bloom.insert_hash(hash);
         }
 
+        // Per column, not per row: the loop above is what costs something here.
+        self.pk_bytes += pk_columns
+            .iter()
+            .map(|column| batch_store::StoredBatch::estimate_array_size(&column.to_data()))
+            .sum::<usize>();
+
         Ok(())
-    }
-
-    /// Mark batches as flushed to WAL.
-    ///
-    /// Updates the WAL batch mapping for use during MemTable flush.
-    /// Also updates the batch_store's watermark to the highest flushed batch_position.
-    pub fn mark_wal_flushed(
-        &mut self,
-        batch_positions: &[usize],
-        wal_entry_position: u64,
-        positions: &[usize],
-    ) {
-        for (idx, &batch_position) in batch_positions.iter().enumerate() {
-            self.wal_batch_mapping
-                .insert(batch_position, (wal_entry_position, positions[idx]));
-            self.flushed_batch_positions.insert(batch_position);
-        }
-        self.last_flushed_wal_entry_position = wal_entry_position;
-
-        // Update batch_store watermark to the highest batch_position flushed (inclusive)
-        if let Some(&max_batch_position) = batch_positions.iter().max() {
-            self.batch_store
-                .set_max_flushed_batch_position(max_batch_position);
-        }
     }
 
     /// Get or create a Dataset for reading.
@@ -652,7 +659,7 @@ impl MemTable {
     ///
     /// This is used when flushing MemTable to persistent storage to ensure
     /// the flushed data is ordered from newest to oldest. This enables more
-    /// efficient K-way merge during LSM scan because flushed generations
+    /// efficient K-way merge during LSM scan because SSTables
     /// will be pre-sorted in the order needed for deduplication.
     ///
     /// The total number of rows in the MemTable is also returned to allow
@@ -704,6 +711,11 @@ impl MemTable {
     }
 
     /// Get total row count.
+    /// Decoded size of the primary-key columns this memtable holds.
+    pub fn pk_bytes(&self) -> usize {
+        self.pk_bytes
+    }
+
     pub fn row_count(&self) -> usize {
         self.batch_store.total_rows()
     }
@@ -717,21 +729,6 @@ impl MemTable {
     #[allow(clippy::unused_async)]
     pub async fn batch_count_async(&self) -> usize {
         self.batch_count()
-    }
-
-    /// Get estimated size in bytes.
-    pub fn estimated_size(&self) -> usize {
-        self.batch_store.estimated_bytes() + self.pk_bloom_filter.estimated_memory_size()
-    }
-
-    /// Get the WAL batch mapping.
-    pub fn wal_batch_mapping(&self) -> &HashMap<usize, (u64, usize)> {
-        &self.wal_batch_mapping
-    }
-
-    /// Get the last flushed WAL entry position.
-    pub fn last_flushed_wal_entry_position(&self) -> u64 {
-        self.last_flushed_wal_entry_position
     }
 
     /// Get the bloom filter for serialization.
@@ -755,17 +752,15 @@ impl MemTable {
         self.indexes.take()
     }
 
-    /// Check if all batches have been flushed to WAL.
-    pub fn all_flushed_to_wal(&self) -> bool {
-        self.batch_store.pending_wal_flush_count() == 0
+    /// Whether every committed batch in this memtable is WAL-durable, given the
+    /// writer-global durability cursor. The L0 flush's precondition.
+    pub fn all_flushed_to_wal(&self, durable: usize) -> bool {
+        self.batch_store.pending_wal_flush_count(durable) == 0
     }
 
-    /// Get unflushed batch IDs.
-    pub fn unflushed_batch_positions(&self) -> Vec<usize> {
-        let batch_count = self.batch_count();
-        (0..batch_count)
-            .filter(|id| !self.flushed_batch_positions.contains(id))
-            .collect()
+    /// Writer-global coordinate one past this memtable's last committed batch.
+    pub fn global_end(&self) -> usize {
+        self.batch_store.global_end()
     }
 
     /// Get cache configuration.
@@ -783,18 +778,13 @@ impl MemTable {
         self.batch_store.remaining_capacity()
     }
 
-    /// Check if batch store is full.
-    pub fn is_batch_store_full(&self) -> bool {
-        self.batch_store.is_full()
-    }
-
     /// Create a scanner for querying this MemTable.
     ///
     /// # Arguments
     ///
-    /// * `max_visible_batch_position` - Maximum batch position visible (inclusive)
+    /// * `visible_count` - Maximum batch position visible (inclusive)
     ///
-    /// The scanner captures the current `max_visible_batch_position` from the
+    /// The scanner captures the current `visible_count` from the
     /// `IndexStore` at construction time to ensure consistent visibility.
     ///
     /// # Panics
@@ -929,29 +919,11 @@ mod tests {
         assert_eq!(total_rows, 15);
     }
 
+    /// `all_flushed_to_wal(durable)` is the L0 flush's precondition (`flush.rs:171`):
+    /// false while any committed batch is still un-appended, true once the
+    /// durability watermark covers every one of them.
     #[tokio::test]
-    async fn test_memtable_wal_mapping() {
-        let schema = create_test_schema();
-        let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
-
-        let batch_position = memtable
-            .insert(create_test_batch(&schema, 10))
-            .await
-            .unwrap();
-        assert!(!memtable.all_flushed_to_wal());
-
-        memtable.mark_wal_flushed(&[batch_position], 5, &[0]);
-
-        assert!(memtable.all_flushed_to_wal());
-        assert_eq!(
-            memtable.wal_batch_mapping().get(&batch_position),
-            Some(&(5, 0))
-        );
-        assert_eq!(memtable.last_flushed_wal_entry_position(), 5);
-    }
-
-    #[tokio::test]
-    async fn test_memtable_unflushed_batches() {
+    async fn test_all_flushed_to_wal_tracks_the_durability_watermark() {
         let schema = create_test_schema();
         let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
 
@@ -963,12 +935,16 @@ mod tests {
             .insert(create_test_batch(&schema, 5))
             .await
             .unwrap();
+        assert!(!memtable.all_flushed_to_wal(0), "nothing is durable yet");
 
-        assert_eq!(memtable.unflushed_batch_positions(), vec![batch1, batch2]);
+        let durable = batch1 + 1;
+        assert!(
+            !memtable.all_flushed_to_wal(durable),
+            "batch2 is still waiting on its WAL append"
+        );
 
-        memtable.mark_wal_flushed(&[batch1], 1, &[0]);
-
-        assert_eq!(memtable.unflushed_batch_positions(), vec![batch2]);
+        let durable = batch2 + 1;
+        assert!(memtable.all_flushed_to_wal(durable));
     }
 
     #[tokio::test]
@@ -990,23 +966,21 @@ mod tests {
             .await
             .unwrap();
 
-        // max_visible_batch_position=1 means positions 0 and 1 are visible
-        let visible = memtable.get_visible_batches(1).await;
+        // A count of N exposes the prefix [0, N).
+        let visible = memtable.get_visible_batches(2).await;
         assert_eq!(visible.len(), 2);
         let total_rows: usize = visible.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 15); // 10 + 5
 
-        // max_visible_batch_position=2 means all batches are visible
-        let visible = memtable.get_visible_batches(2).await;
+        let visible = memtable.get_visible_batches(3).await;
         assert_eq!(visible.len(), 3);
 
-        // max_visible_batch_position=0 means only position 0 is visible
-        let visible = memtable.get_visible_batches(0).await;
-        assert_eq!(visible.len(), 1);
+        // A count of 0 exposes nothing — not "batch 0".
+        assert!(memtable.get_visible_batches(0).await.is_empty());
     }
 
     #[tokio::test]
-    async fn test_memtable_get_max_visible_batch_positions() {
+    async fn test_memtable_get_visible_batch_positions() {
         let schema = create_test_schema();
         let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
 
@@ -1024,17 +998,15 @@ mod tests {
             .await
             .unwrap();
 
-        // max_visible_batch_position=1 means positions 0 and 1 visible
-        let visible_ids = memtable.get_max_visible_batch_positions(1).await;
+        // A count of N exposes the prefix [0, N).
+        let visible_ids = memtable.get_visible_batch_positions(2).await;
         assert_eq!(visible_ids, vec![0, 1]);
 
-        // max_visible_batch_position=2 means all positions visible
-        let visible_ids = memtable.get_max_visible_batch_positions(2).await;
+        let visible_ids = memtable.get_visible_batch_positions(3).await;
         assert_eq!(visible_ids, vec![0, 1, 2]);
 
-        // max_visible_batch_position=0 means only position 0 visible
-        let visible_ids = memtable.get_max_visible_batch_positions(0).await;
-        assert_eq!(visible_ids, vec![0]);
+        // A count of 0 exposes nothing.
+        assert!(memtable.get_visible_batch_positions(0).await.is_empty());
     }
 
     #[tokio::test]
@@ -1055,14 +1027,14 @@ mod tests {
             .await
             .unwrap(); // position 2
 
-        // batch_position 0 is visible when max_visible_batch_position >= 0
-        assert!(memtable.is_batch_visible(0, 0).await);
+        // A count of 0 means nothing is visible, batch 0 included.
+        assert!(!memtable.is_batch_visible(0, 0).await);
+
+        // Batch i is visible once the count exceeds i.
         assert!(memtable.is_batch_visible(0, 1).await);
         assert!(memtable.is_batch_visible(0, 2).await);
-
-        // batch_position 2 is only visible when max_visible_batch_position >= 2
         assert!(!memtable.is_batch_visible(2, 1).await);
-        assert!(memtable.is_batch_visible(2, 2).await);
+        assert!(!memtable.is_batch_visible(2, 2).await);
         assert!(memtable.is_batch_visible(2, 3).await);
 
         // Non-existent batch
@@ -1083,12 +1055,21 @@ mod tests {
             .await
             .unwrap(); // position 1
 
-        let batches = memtable.scan_batches_at_position(0).await.unwrap();
+        let batches = memtable.scan_batches_at_position(1).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 10);
 
-        let batches = memtable.scan_batches_at_position(1).await.unwrap();
+        let batches = memtable.scan_batches_at_position(2).await.unwrap();
         assert_eq!(batches.len(), 2);
+
+        // Nothing indexed yet => nothing scannable.
+        assert!(
+            memtable
+                .scan_batches_at_position(0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1099,7 +1080,7 @@ mod tests {
 
         assert_eq!(memtable.batch_capacity(), 3);
         assert_eq!(memtable.remaining_batch_capacity(), 3);
-        assert!(!memtable.is_batch_store_full());
+        assert!(!memtable.batch_store().is_full());
 
         // Fill up the store
         memtable
@@ -1115,7 +1096,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(memtable.is_batch_store_full());
+        assert!(memtable.batch_store().is_full());
         assert_eq!(memtable.remaining_batch_capacity(), 0);
 
         // Next insert should fail

@@ -42,7 +42,13 @@ pub fn build_distance_table_l2_impl<const NUM_BITS: u32, T: L2>(
     let sub_vector_length = dimension / num_sub_vectors;
     let num_centroids = 2_usize.pow(NUM_BITS);
     let mut result = Vec::with_capacity(num_sub_vectors * num_centroids);
-    for (i, sub_vec) in query.chunks_exact(sub_vector_length).enumerate() {
+    // Legacy writers allowed non-divisible dimensions and truncated the tail.
+    // Limit iteration to the sub-vectors that were persisted by those writers.
+    for (i, sub_vec) in query
+        .chunks_exact(sub_vector_length)
+        .take(num_sub_vectors)
+        .enumerate()
+    {
         let subvec_centroids =
             get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
         result.extend(l2_distance_batch(
@@ -63,8 +69,14 @@ pub fn build_distance_table_l2_prepared(l2_targets: &[L2Prepared], query: &[f32]
     let num_targets = l2_targets[0].num_targets();
 
     let mut result = vec![0.0f32; l2_targets.len() * num_targets];
-    for (i, sub_vec) in query.chunks_exact(sub_dim).enumerate() {
-        l2_targets[i].distances_into(sub_vec, &mut result[i * num_targets..][..num_targets]);
+    // The target count also bounds legacy codebooks whose writers truncated
+    // a non-divisible vector tail.
+    for (i, (target, sub_vec)) in l2_targets
+        .iter()
+        .zip(query.chunks_exact(sub_dim))
+        .enumerate()
+    {
+        target.distances_into(sub_vec, &mut result[i * num_targets..][..num_targets]);
     }
     result
 }
@@ -94,7 +106,13 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
     let sub_vector_length = dimension / num_sub_vectors;
     let num_centroids = 2_usize.pow(NUM_BITS);
     let mut result = Vec::with_capacity(num_sub_vectors * num_centroids);
-    for (i, sub_vec) in query.chunks_exact(sub_vector_length).enumerate() {
+    // Legacy writers allowed non-divisible dimensions and truncated the tail.
+    // Limit iteration to the sub-vectors that were persisted by those writers.
+    for (i, sub_vec) in query
+        .chunks_exact(sub_vector_length)
+        .take(num_sub_vectors)
+        .enumerate()
+    {
         let subvec_centroids =
             get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
         result.extend(dot_distance_batch(
@@ -376,5 +394,82 @@ mod tests {
             pq_codes.values(),
         );
         assert_eq!(distances, expected);
+    }
+
+    #[test]
+    fn test_compute_4bit_bulk_distance_preserves_flat_prefix_middle_and_tail() {
+        const NUM_VECTORS: usize = 227;
+        const NUM_SUB_VECTORS: usize = 4;
+        const NUM_PACKED_CODES: usize = NUM_SUB_VECTORS / 2;
+        const NUM_CENTROIDS: usize = 16;
+
+        let distance_table = (0..NUM_SUB_VECTORS * NUM_CENTROIDS)
+            .map(|value| (value * value + 1) as f32)
+            .collect::<Vec<_>>();
+        let packed_codes = (0..NUM_VECTORS * NUM_PACKED_CODES)
+            .map(|value| {
+                let low = (value % NUM_CENTROIDS) as u8;
+                let high = ((value * 7 + 3) % NUM_CENTROIDS) as u8;
+                low | (high << 4)
+            })
+            .collect::<Vec<_>>();
+        let packed_codes = UInt8Array::from(packed_codes);
+        let transposed = transpose(&packed_codes, NUM_VECTORS, NUM_PACKED_CODES);
+
+        let actual =
+            compute_pq_distance(&distance_table, 4, NUM_SUB_VECTORS, transposed.values(), 10);
+        let expected = packed_codes
+            .values()
+            .chunks_exact(NUM_PACKED_CODES)
+            .map(|codes| {
+                codes
+                    .iter()
+                    .enumerate()
+                    .map(|(byte_idx, code)| {
+                        distance_table[byte_idx * 2 * NUM_CENTROIDS + (code & 0x0f) as usize]
+                            + distance_table
+                                [(byte_idx * 2 + 1) * NUM_CENTROIDS + (code >> 4) as usize]
+                    })
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual.len(), NUM_VECTORS);
+        assert_eq!(&actual[..FLAT_NUM_4BIT_PQ], &expected[..FLAT_NUM_4BIT_PQ]);
+        let tail_start = NUM_VECTORS - NUM_VECTORS % NUM_CENTROIDS;
+        assert_eq!(&actual[tail_start..], &expected[tail_start..]);
+
+        let qmax = expected[..FLAT_NUM_4BIT_PQ]
+            .iter()
+            .copied()
+            .max_by(f32::total_cmp)
+            .unwrap();
+        let (qmin, quantized_table) = quantize_distance_table(&distance_table, qmax);
+        let range = (qmax - qmin) / 255.0;
+        for (vector_idx, actual_distance) in actual
+            .iter()
+            .enumerate()
+            .take(tail_start)
+            .skip(FLAT_NUM_4BIT_PQ)
+        {
+            let codes = &packed_codes.values()
+                [vector_idx * NUM_PACKED_CODES..(vector_idx + 1) * NUM_PACKED_CODES];
+            let quantized_sum = codes
+                .iter()
+                .enumerate()
+                .fold(0_u8, |sum, (byte_idx, code)| {
+                    sum.saturating_add(
+                        quantized_table[byte_idx * 2 * NUM_CENTROIDS + (code & 0x0f) as usize],
+                    )
+                    .saturating_add(
+                        quantized_table[(byte_idx * 2 + 1) * NUM_CENTROIDS + (code >> 4) as usize],
+                    )
+                });
+            let reference = quantized_sum as f32 * range + qmin;
+            assert!(
+                (*actual_distance - reference).abs() <= f32::EPSILON,
+                "4-bit bulk distance mismatch at vector {vector_idx}: actual={actual_distance}, reference={reference}"
+            );
+        }
     }
 }

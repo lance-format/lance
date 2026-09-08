@@ -10,8 +10,7 @@
 //!
 
 use core::f32;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::cmp::Reverse;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 use std::vec;
@@ -26,8 +25,12 @@ use arrow_array::{ArrowNumericType, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{ArrowError, DataType};
 use bitvec::prelude::*;
+use half::f16;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_linalg::distance::dot_f16::{
+    PackedCentroidsF16, amx_fp16_available, amx_fp16_supported, dot_f16_batch_16,
+};
 use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
 use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch};
 use lance_linalg::kernels::{argmin_value_float, argmin_value_float_with_bias};
@@ -45,16 +48,17 @@ use {
 };
 
 use crate::vector::utils::SimpleIndex;
-use crate::{Error, Result};
+use lance_core::{Error, Result};
 
 /// KMean initialization method.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum KMeanInit {
     Random,
     Incremental(Arc<FixedSizeListArray>),
 }
 
 /// KMean Training Parameters
+#[derive(Clone)]
 pub struct KMeansParams {
     /// Max number of iterations.
     pub max_iters: u32,
@@ -79,12 +83,27 @@ pub struct KMeansParams {
     /// which is the same as normal kmeans clustering.
     pub balance_factor: f32,
 
-    /// The number of clusters to train in each hierarchical level.
+    /// The number of sub-clusters each node of the hierarchy is split into.
     ///
-    /// Default is 16, which performs the best performance in our experiments.
-    /// Higher would split the clusters more aggressively, which would be more accurate but slower.
-    /// hierarchical kmeans is enabled only if hierarchical_k > 1 and k > 256.
+    /// Default is 16. A larger fan-out makes a shallower tree with fewer
+    /// sub-tree boundaries, which improves the clustering a little at a higher
+    /// training cost; a smaller one is faster but loses recall.
+    /// Hierarchical k-means is enabled only if hierarchical_k > 1 and k > 256.
     pub hierarchical_k: usize,
+
+    /// Number of global Lloyd iterations run over the whole training sample after
+    /// the hierarchical tree is built, with every centroid competing for every
+    /// vector. The tree fits each centroid only against its own sub-tree's
+    /// vectors, so this pass repairs the boundaries between sub-trees. Each
+    /// iteration costs about as much as assigning the training sample to the
+    /// centroids once. Off by default (`0`); two iterations typically recover
+    /// most of the gap to flat k-means in WCSS and recall. Non-hierarchical
+    /// training already iterates globally and ignores it.
+    pub refine_iters: u32,
+
+    /// Seed for centroid initialization. `None` draws a seed from the OS, so two
+    /// trainings of the same data may pick different initial centroids.
+    pub seed: Option<u64>,
 
     /// Optional sync callback for iteration progress: (current_iteration, max_iterations).
     pub on_progress: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
@@ -100,6 +119,8 @@ impl std::fmt::Debug for KMeansParams {
             .field("distance_type", &self.distance_type)
             .field("balance_factor", &self.balance_factor)
             .field("hierarchical_k", &self.hierarchical_k)
+            .field("refine_iters", &self.refine_iters)
+            .field("seed", &self.seed)
             .field("on_progress", &self.on_progress.as_ref().map(|_| "..."))
             .finish()
     }
@@ -115,6 +136,8 @@ impl Default for KMeansParams {
             distance_type: DistanceType::L2,
             balance_factor: 0.0,
             hierarchical_k: 16,
+            refine_iters: 0,
+            seed: None,
             on_progress: None,
         }
     }
@@ -155,13 +178,42 @@ impl KMeansParams {
         self
     }
 
-    /// Set the number of clusters to train in each hierarchical level.
-    ///
-    /// Higher would split the clusters more aggressively, which would be more accurate but slower.
-    /// hierarchical kmeans is enabled only if hierarchical_k > 1 and k > 256.
+    /// Set the number of sub-clusters each node of the hierarchy is split into.
+    /// See [`KMeansParams::hierarchical_k`].
     pub fn with_hierarchical_k(mut self, hierarchical_k: usize) -> Self {
         self.hierarchical_k = hierarchical_k;
         self
+    }
+
+    /// Set the number of global refinement iterations run after hierarchical
+    /// training. See [`KMeansParams::refine_iters`].
+    pub fn with_refine_iters(mut self, refine_iters: u32) -> Self {
+        self.refine_iters = refine_iters;
+        self
+    }
+
+    /// Seed centroid initialization, making training reproducible.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    fn rng(&self) -> SmallRng {
+        match self.seed {
+            Some(seed) => SmallRng::seed_from_u64(seed),
+            None => SmallRng::from_os_rng(),
+        }
+    }
+
+    /// The same parameters with a seed derived for one sub-problem, so sibling
+    /// sub-trees of a hierarchical training do not share initial centroids.
+    /// Unseeded parameters stay unseeded.
+    fn derive(&self, salt: u64) -> Self {
+        let mut params = self.clone();
+        params.seed = self
+            .seed
+            .map(|seed| seed ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17));
+        params
     }
 }
 
@@ -191,26 +243,21 @@ fn kmeans_random_init<T: ArrowPrimitiveType>(
     }
 }
 
-/// Split one big cluster into two smaller clusters. After split, each
-/// cluster has approximately half of the vectors.
-fn split_clusters<T: Float + MulAssign>(
-    n: usize,
-    cnts: &mut [usize],
-    centroids: &mut [T],
-    dim: usize,
-) {
+/// Give every empty cluster half of the currently largest cluster. After the
+/// split each of the two has approximately half of the vectors.
+///
+/// Draining the largest cluster first keeps the result independent of a random
+/// draw, so seeded trainings stay reproducible.
+fn split_clusters<T: Float + MulAssign>(cnts: &mut [usize], centroids: &mut [T], dim: usize) {
     let eps = T::from(1.0 / 1024.0).unwrap();
-    let mut rng = SmallRng::from_os_rng();
     for i in 0..cnts.len() {
         if cnts[i] == 0 {
-            let mut j = 0;
-            loop {
-                let p = (cnts[j] as f32 - 1.0) / (n - cnts.len()) as f32;
-                if rng.random::<f32>() < p {
-                    break;
-                }
-                j += 1;
-                j %= cnts.len();
+            let Some(j) = (0..cnts.len()).max_by_key(|&j| cnts[j]) else {
+                break;
+            };
+            if cnts[j] < 2 {
+                // Nothing left to split.
+                break;
             }
 
             cnts[i] = cnts[j] / 2;
@@ -324,6 +371,112 @@ pub trait KMeansAlgo<T: Num> {
     ) -> KMeans;
 }
 
+/// Reads a `T::Native` slice as `f16` when — and only when — that is what it is.
+///
+/// The default body answers `None`, so every element type opts out until it
+/// says otherwise, and [`Float16Type`] is the one that overrides it with the
+/// identity. That keeps "is this f16?" a compile-time property of `T` for the
+/// dot-distance kernel below, rather than a `DataType` comparison paired with a
+/// transmute whose correctness the compiler cannot check.
+pub(crate) trait MaybeF16: ArrowNumericType {
+    fn as_f16_slice(_values: &[Self::Native]) -> Option<&[f16]> {
+        None
+    }
+}
+
+impl MaybeF16 for Float16Type {
+    fn as_f16_slice(values: &[f16]) -> Option<&[f16]> {
+        Some(values)
+    }
+}
+impl MaybeF16 for Float32Type {}
+impl MaybeF16 for Float64Type {}
+
+/// Per-thread score-buffer budget for [`dot_membership_amx_f16`], in f32
+/// values: 256 KB, sized to stay within a typical private L2 alongside the
+/// vectors and packed centroids a block streams past.
+const AMX_DOT_SCRATCH_F32: usize = 64 * 1024;
+
+/// Assigns each row of `data` (row-major `[_, dimension]`) to its nearest
+/// centroid under dot distance using the AMX-FP16 GEMM, scoring 32 vectors
+/// against every centroid per tile pass instead of one vector at a time.
+///
+/// `None` — the kernel is unavailable on this build or host, or the shape does
+/// not suit it — means the caller must run its own per-vector path. The output
+/// is otherwise identical in content and order to that path: `(centroid,
+/// distance)` per row, `None` for a row whose distances are all NaN.
+///
+/// Answers only "can this shape run here": the `LANCE_DISABLE_AMX` kill switch
+/// is checked by the caller, so the accelerated path stays directly testable
+/// while production traffic honours an operator who turned it off.
+fn dot_membership_amx_f16(
+    centroids: &[f16],
+    data: &[f16],
+    dimension: usize,
+    balance_factor: f32,
+    cluster_sizes: Option<&[usize]>,
+) -> Option<Vec<Option<(u32, f32)>>> {
+    let k = centroids.len() / dimension;
+    // Under one full 32-wide k-pass the GEMM degenerates to the kernel's scalar
+    // cleanup, and under one full 32-centroid block most of its work would be
+    // the zero padding. Neither is worth leaving the per-vector path for.
+    if dimension < 32 || k < 32 {
+        return None;
+    }
+    let packed = PackedCentroidsF16::new(centroids, k, dimension)?;
+    let n_padded = packed.num_centroids_padded();
+    // Rows per block: as many as the scratch budget buys, rounded down to the
+    // kernel's 32-row granularity, and capped so a large input still splits
+    // into enough blocks to spread across threads. Very large `k` blows the
+    // budget on a single row, hence the lower clamp back to one tile pass.
+    let block_rows = ((AMX_DOT_SCRATCH_F32 / n_padded) & !31).clamp(32, 512);
+    // Precomputed once, not per row. The bias depends only on the centroid, so
+    // rebuilding it inside the loop would repeat `k` multiplications for every
+    // one of the `n` vectors -- `n * k` of them across the call, against `k` here.
+    let biases: Option<Vec<f32>> = cluster_sizes.map(|sizes| {
+        sizes
+            .iter()
+            .map(|size| balance_factor * *size as f32)
+            .collect()
+    });
+    let biases = || biases.as_deref().map(|b| b.iter().copied());
+
+    Some(
+        data.par_chunks(block_rows * dimension)
+            .map_init(
+                || vec![0f32; block_rows * n_padded],
+                |scores, block| {
+                    let rows = block.len() / dimension;
+                    let tiled = rows - rows % 32;
+                    let mut assignments = Vec::with_capacity(rows);
+
+                    packed.score(block, tiled, dimension, scores, n_padded);
+                    for row in 0..tiled {
+                        // Only the first `k` columns. The rest score the zero
+                        // centroids padding `n` up to the kernel's block size,
+                        // at distance exactly 1.0 — which beats every real
+                        // centroid whose dot product happens to be negative.
+                        let dots = &scores[row * n_padded..row * n_padded + k];
+                        assignments.push(argmin_value_float_with_bias(
+                            dots.iter().map(|dot| 1.0 - dot),
+                            biases(),
+                        ));
+                    }
+                    // Rows past the last whole tile pass keep the per-vector path.
+                    for vector in block[tiled * dimension..].chunks(dimension) {
+                        assignments.push(argmin_value_float_with_bias(
+                            dot_distance_batch(vector, centroids, dimension),
+                            biases(),
+                        ));
+                    }
+                    assignments
+                },
+            )
+            .flatten_iter()
+            .collect(),
+    )
+}
+
 pub struct KMeansAlgoFloat<T: ArrowNumericType>
 where
     T::Native: Float + Num,
@@ -331,7 +484,7 @@ where
     phantom_data: std::marker::PhantomData<T>,
 }
 
-impl<T: ArrowNumericType> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
+impl<T: ArrowNumericType + MaybeF16> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
 where
     T::Native: Float + Dot + L2 + MulAssign + DivAssign + AddAssign + FromPrimitive + Sync,
     PrimitiveArray<T>: From<Vec<T::Native>>,
@@ -368,16 +521,34 @@ where
                         )
                     })
                     .collect::<Vec<_>>(),
-                DistanceType::Dot => data
-                    .par_chunks(dimension)
-                    .map(|vec| {
-                        argmin_value_float_with_bias(
-                            dot_distance_batch(vec, centroids, dimension),
-                            cluster_sizes
-                                .map(|size| size.iter().map(|size| balance_factor * *size as f32)),
+                DistanceType::Dot => T::as_f16_slice(centroids)
+                    .zip(T::as_f16_slice(data))
+                    // The kill switch is enforced here rather than inside the
+                    // kernel wrapper: this is the one place production work is
+                    // routed onto the GEMM, and `prefers_flat_amx_assignment`
+                    // reads the same flag, so the two stay in lockstep.
+                    .filter(|_| amx_fp16_available())
+                    .and_then(|(centroids, data)| {
+                        dot_membership_amx_f16(
+                            centroids,
+                            data,
+                            dimension,
+                            balance_factor,
+                            cluster_sizes,
                         )
                     })
-                    .collect::<Vec<_>>(),
+                    .unwrap_or_else(|| {
+                        data.par_chunks(dimension)
+                            .map(|vec| {
+                                argmin_value_float_with_bias(
+                                    dot_distance_batch(vec, centroids, dimension),
+                                    cluster_sizes.map(|size| {
+                                        size.iter().map(|size| balance_factor * *size as f32)
+                                    }),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    }),
                 _ => {
                     panic!(
                         "KMeans::find_partitions: {} is not supported",
@@ -459,12 +630,7 @@ where
             }
         }
 
-        split_clusters(
-            data.len() / dimension,
-            cluster_sizes,
-            &mut centroids,
-            dimension,
-        );
+        split_clusters(cluster_sizes, &mut centroids, dimension);
 
         KMeans {
             centroids: Arc::new(PrimitiveArray::<T>::from(centroids)),
@@ -578,6 +744,60 @@ pub type KMeansMembershipAndLoss = (KMeansMembership, KMeansClusterRadii, KMeans
 
 /// Batch assignment results with per-vector distances.
 pub type KMeansMembershipAndDistances = (KMeansMembership, KMeansDistances);
+
+/// Rows gathered per centroid to train one node of the hierarchy; the same
+/// prefix `train_kmeans` keeps for itself.
+const TRAINING_ROWS_PER_CENTROID: usize = 512;
+/// Bytes of vectors gathered at a time when assigning a node's rows to its
+/// sub-clusters. One such chunk is held per worker thread, so this is sized in
+/// bytes rather than rows: a row-count budget would hold a multiple of it on
+/// high-dimensional data.
+const MEMBERSHIP_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+/// One leaf of the proportional hierarchy: a centroid and the training vectors
+/// it was fitted on.
+struct Leaf<N> {
+    centroid: Vec<N>,
+    indices: Vec<usize>,
+}
+
+/// Apportion `quota` centroids over sub-clusters of the given sizes so that each
+/// sub-cluster's share follows its share of the vectors (largest-remainder
+/// rounding). A sub-cluster never gets more centroids than it has vectors, and
+/// one whose share rounds to zero gets none.
+fn allocate_quotas(sizes: &[usize], quota: usize) -> Vec<usize> {
+    let total: usize = sizes.iter().sum();
+    debug_assert!(
+        total > 0,
+        "cannot apportion centroids over empty sub-clusters"
+    );
+    let mut quotas: Vec<usize> = sizes
+        .iter()
+        .map(|&size| (quota * size / total).min(size))
+        .collect();
+    let mut remaining = quota.saturating_sub(quotas.iter().sum::<usize>());
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by_key(|&i| (Reverse(quota * sizes[i] % total), Reverse(sizes[i])));
+    // Hand out the remainder by fractional share, going around again while some
+    // sub-cluster still has room for another centroid.
+    while remaining > 0 {
+        let mut handed = 0;
+        for &i in &order {
+            if remaining == 0 {
+                break;
+            }
+            if quotas[i] < sizes[i] {
+                quotas[i] += 1;
+                remaining -= 1;
+                handed += 1;
+            }
+        }
+        if handed == 0 {
+            break;
+        }
+    }
+    quotas
+}
 
 /// KMeans implementation for Apache Arrow Arrays.
 #[derive(Debug, Clone)]
@@ -799,8 +1019,7 @@ impl KMeans {
         let mut cluster_sizes = vec![0; k];
         let mut adjusted_balance_factor = f32::MAX;
 
-        // TODO: use seed for Rng.
-        let mut rng = SmallRng::from_os_rng();
+        let mut rng = params.rng();
         for redo in 1..=params.redos {
             let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
@@ -884,6 +1103,40 @@ impl KMeans {
     }
 
     /// Helper function to create a FixedSizeListArray from indices
+    /// Nearest centroid of every row in `indices`, computed over gathered chunks
+    /// so that no copy of the whole node is ever held.
+    fn membership_of_rows<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
+        centroids: &[T::Native],
+        data_values: &[T::Native],
+        dimension: usize,
+        indices: &[usize],
+        distance_type: DistanceType,
+    ) -> Vec<Option<u32>>
+    where
+        T::Native: Num,
+    {
+        let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<T::Native>())).max(1);
+        indices
+            .par_chunks(chunk_rows)
+            .flat_map_iter(|chunk| {
+                let mut rows = Vec::with_capacity(chunk.len() * dimension);
+                for &idx in chunk {
+                    rows.extend_from_slice(&data_values[idx * dimension..(idx + 1) * dimension]);
+                }
+                let (membership, _) = Algo::compute_membership_and_dist(
+                    centroids,
+                    &rows,
+                    dimension,
+                    distance_type,
+                    0.0,
+                    None,
+                    None,
+                );
+                membership
+            })
+            .collect()
+    }
+
     fn create_array_from_indices<T: ArrowNumericType>(
         indices: &[usize],
         data_values: &[T::Native],
@@ -903,11 +1156,11 @@ impl KMeans {
         FixedSizeListArray::try_new_from_values(array, dimension as i32)
     }
 
-    /// Train a hierarchical KMeans model when k > 256
+    /// Train a hierarchical KMeans model when k > 256.
     ///
-    /// This function implements a hierarchical clustering approach:
-    /// 1. Start with k'=256 initial clusters
-    /// 2. Iteratively split the largest cluster until we have k clusters
+    /// Grows the centroid tree with size-proportional quotas
+    /// ([`Self::train_hierarchical_proportional`]), then optionally refines every
+    /// centroid against the whole sample ([`KMeansParams::refine_iters`]).
     fn train_hierarchical_kmeans<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
         data: &FixedSizeListArray,
         target_k: usize,
@@ -917,46 +1170,46 @@ impl KMeans {
         T::Native: Num,
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
-        // Cluster structure for the heap
-        #[derive(Clone, Debug)]
-        struct Cluster<N> {
-            id: usize,
-            indices: Vec<usize>,
-            centroid: Vec<N>,
-            finalized: bool,
+        let tree = Self::train_hierarchical_proportional::<T, Algo>(data, target_k, params)?;
+        if params.refine_iters == 0 {
+            return Ok(tree);
         }
+        info!(
+            "Hierarchical clustering: refining {} centroids for {} iterations",
+            target_k, params.refine_iters
+        );
+        let centroids =
+            FixedSizeListArray::try_new_from_values(tree.centroids.clone(), tree.dimension as i32)?;
+        let refine_params = KMeansParams {
+            init: KMeanInit::Incremental(Arc::new(centroids)),
+            max_iters: params.refine_iters,
+            redos: 1,
+            ..params.clone()
+        };
+        Self::train_kmeans::<T, Algo>(data, target_k, &refine_params)
+    }
 
-        impl<N> Eq for Cluster<N> {}
-
-        impl<N> PartialEq for Cluster<N> {
-            fn eq(&self, other: &Self) -> bool {
-                self.indices.len() == other.indices.len()
-            }
-        }
-
-        impl<N> Ord for Cluster<N> {
-            fn cmp(&self, other: &Self) -> Ordering {
-                // Non-finalized clusters should always have higher priority than finalized ones
-                match (self.finalized, other.finalized) {
-                    (false, true) => Ordering::Greater,
-                    (true, false) => Ordering::Less,
-                    _ => {
-                        // Max heap: larger clusters first
-                        self.indices.len().cmp(&other.indices.len())
-                    }
-                }
-            }
-        }
-
-        impl<N> PartialOrd for Cluster<N> {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
+    /// Hierarchical training that gives every sub-cluster a centroid quota
+    /// proportional to its share of the vectors and grows the sub-trees in
+    /// parallel.
+    ///
+    /// Every node holds `n` vectors and owes `quota` centroids. It runs one small
+    /// k-means with `min(hierarchical_k, quota)` centroids over its vectors and
+    /// hands each sub-cluster `quota * n_i / n` of the quota, so a leaf ends up
+    /// with roughly `n / k` training vectors however skewed the data is. The
+    /// recursion bottoms out where a node's quota fits one k-means run; there the
+    /// sub-clusters become the leaves, each centroid the mean of its vectors.
+    fn train_hierarchical_proportional<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
+        data: &FixedSizeListArray,
+        target_k: usize,
+        params: &KMeansParams,
+    ) -> arrow::error::Result<Self>
+    where
+        T::Native: Num,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+    {
         let n = data.len();
         let dimension = data.value_length() as usize;
-
         let data_values = data
             .values()
             .as_primitive_opt::<T>()
@@ -966,213 +1219,305 @@ impl KMeans {
                 data.value_type()
             )))?
             .values();
-
-        // Initial clustering with k'=16
-        let initial_k = params.hierarchical_k.min(target_k).min(n);
         info!(
-            "Hierarchical clustering: initial k={}, target k={}",
-            initial_k, target_k
+            "Hierarchical clustering (proportional): branching {}, target k={}",
+            params.hierarchical_k.max(2),
+            target_k
         );
 
-        let initial_kmeans = Self::train_kmeans::<T, Algo>(data, initial_k, params)?;
-
-        // Get membership for all data points
-        let (membership, _, _) = Algo::compute_membership_and_loss(
-            initial_kmeans.centroids.as_primitive::<T>().values(),
+        let indices: Vec<usize> = (0..n).collect();
+        let mut leaves = Self::grow_proportional_subtree::<T, Algo>(
             data_values,
             dimension,
-            params.distance_type,
-            0.0, // No balance factor for membership computation
-            None,
-            None,
-        );
+            indices,
+            target_k,
+            params,
+            1,
+        )?;
+        Self::fill_missing_leaves::<T, Algo>(
+            data_values,
+            dimension,
+            &mut leaves,
+            target_k,
+            params,
+        )?;
 
-        // Build initial clusters and add to heap
-        let mut heap: BinaryHeap<Cluster<T::Native>> = BinaryHeap::new();
-        let mut next_cluster_id = 0;
-        let initial_centroids = initial_kmeans.centroids.as_primitive::<T>().values();
-
-        for i in 0..initial_k {
-            let mut cluster_indices = Vec::new();
-            for (idx, &cluster_id) in membership.iter().enumerate() {
-                if let Some(cid) = cluster_id
-                    && cid as usize == i
-                {
-                    cluster_indices.push(idx);
-                }
-            }
-
-            if !cluster_indices.is_empty() {
-                let centroid_start = i * dimension;
-                let centroid_end = centroid_start + dimension;
-                let centroid = initial_centroids[centroid_start..centroid_end].to_vec();
-
-                heap.push(Cluster {
-                    id: next_cluster_id,
-                    indices: cluster_indices,
-                    centroid,
-                    finalized: false,
-                });
-                next_cluster_id += 1;
-            }
-        }
-
-        // Iteratively split largest clusters until we have target_k clusters
-        while heap.len() < target_k {
-            // Get the largest cluster
-            let mut largest_cluster = heap.pop().ok_or(ArrowError::InvalidArgumentError(
-                "No cluster can be further split".to_string(),
-            ))?;
-
-            // If this cluster is already finalized, no further split is possible; stop splitting
-            if largest_cluster.finalized {
-                log::warn!(
-                    "Cluster {} is already finalized, no further split is possible, finish with {} clusters",
-                    largest_cluster.id,
-                    heap.len() + 1
-                );
-                heap.push(largest_cluster);
-                break;
-            }
-
-            // Because the clusters are sorted by size, if the cluster has only 1 point, no further split is possible; stop splitting
-            if largest_cluster.indices.len() <= 1 {
-                log::warn!(
-                    "Cluster {} has only 1 point, no further split is possible, finish with {} clusters",
-                    largest_cluster.id,
-                    heap.len() + 1
-                );
-                heap.push(largest_cluster);
-                break;
-            }
-
-            let cluster_size = largest_cluster.indices.len();
-            log::debug!(
-                "Splitting cluster {} with {} points (current total clusters: {})",
-                largest_cluster.id,
-                cluster_size,
-                heap.len() + 1 // +1 for the cluster we just popped
-            );
-
-            // Determine k' for this cluster based on its size
-            let remaining_k = target_k - heap.len(); // Spaces left to fill
-            let cluster_k = if cluster_size <= params.hierarchical_k {
-                2.min(remaining_k).min(cluster_size)
-            } else {
-                // For larger clusters, split more aggressively
-                let suggested_k = cluster_size / params.hierarchical_k;
-                suggested_k
-                    .min(remaining_k)
-                    .min(params.hierarchical_k)
-                    .max(2)
-            };
-
-            // Create sub-dataset for this cluster using indices
-            let sub_data = Self::create_array_from_indices::<T>(
-                &largest_cluster.indices,
-                data_values,
-                dimension,
-            )?;
-
-            // Run kmeans on this cluster
-            let sub_kmeans = Self::train_kmeans::<T, Algo>(&sub_data, cluster_k, params)?;
-
-            // Get membership for points in the sub-cluster
-            let sub_data = sub_data.values().as_primitive::<T>().values();
-            let (sub_membership, _, _) = Algo::compute_membership_and_loss(
-                sub_kmeans.centroids.as_primitive::<T>().values(),
-                sub_data,
-                dimension,
-                params.distance_type,
-                0.0,
-                None,
-                None,
-            );
-
-            // Build per-cluster membership while checking whether the split is effective
-            let approx_cluster_capacity = if cluster_k > 0 {
-                largest_cluster.indices.len().div_ceil(cluster_k)
-            } else {
-                0
-            };
-            let mut cluster_assignments: Vec<Vec<usize>> = (0..cluster_k)
-                .map(|_| Vec::with_capacity(approx_cluster_capacity))
-                .collect();
-
-            let mut first_sid: Option<u32> = None;
-            let mut all_same = true;
-            for (local_idx, &membership) in sub_membership.iter().enumerate() {
-                let Some(sub_cluster_id) = membership else {
-                    continue;
-                };
-
-                if let Some(first) = first_sid {
-                    if sub_cluster_id != first {
-                        all_same = false;
-                    }
-                } else {
-                    first_sid = Some(sub_cluster_id);
-                }
-
-                let sub_cluster_id = sub_cluster_id as usize;
-                if let Some(indices) = cluster_assignments.get_mut(sub_cluster_id) {
-                    indices.push(largest_cluster.indices[local_idx]);
-                } else {
-                    // Unexpected assignment outside [0, cluster_k); treat as ineffective split.
-                    all_same = false;
-                }
-            }
-
-            // If all memberships are identical, the split is ineffective; finalize the original cluster
-            if all_same {
-                largest_cluster.finalized = true;
-                heap.push(largest_cluster);
-                continue;
-            }
-
-            // Create new sub-clusters and add to heap
-            let sub_centroids = sub_kmeans.centroids.as_primitive::<T>().values();
-            for (i, new_cluster_indices) in cluster_assignments.into_iter().enumerate() {
-                if new_cluster_indices.is_empty() {
-                    continue;
-                }
-
-                let centroid_start = i * dimension;
-                let centroid_end = centroid_start + dimension;
-                let centroid = sub_centroids[centroid_start..centroid_end].to_vec();
-
-                heap.push(Cluster {
-                    id: next_cluster_id,
-                    indices: new_cluster_indices,
-                    centroid,
-                    finalized: false,
-                });
-                next_cluster_id += 1;
-            }
-
-            log::debug!(
-                "Split complete: now have {} clusters (target: {})",
-                heap.len(),
-                target_k
-            );
-        }
-        debug_assert_eq!(heap.len(), target_k);
-
-        // Construct final KMeans model with all centroids
-        let mut all_clusters: Vec<Cluster<T::Native>> = heap.into_vec();
-        // Sort by ID to ensure consistent ordering
-        all_clusters.sort_by_key(|c| c.id);
-
-        let flat_centroids: Vec<T::Native> =
-            all_clusters.into_iter().flat_map(|c| c.centroid).collect();
-        let centroids_array = PrimitiveArray::<T>::from(flat_centroids);
-
+        let centroids: Vec<T::Native> = leaves.into_iter().flat_map(|leaf| leaf.centroid).collect();
         Ok(Self {
-            centroids: Arc::new(centroids_array),
+            centroids: Arc::new(PrimitiveArray::<T>::from(centroids)),
             dimension,
             distance_type: params.distance_type,
             loss: 0.0, // Loss is not meaningful for hierarchical clustering
         })
+    }
+
+    /// Grow the sub-tree under one node of the proportional hierarchy.
+    ///
+    /// `indices` are the node's training vectors and `quota` the number of leaf
+    /// centroids it owes. `salt` derives per-node seeds from a seeded training,
+    /// so sibling sub-trees do not repeat each other's initialization.
+    fn grow_proportional_subtree<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
+        data_values: &[T::Native],
+        dimension: usize,
+        indices: Vec<usize>,
+        quota: usize,
+        params: &KMeansParams,
+        salt: u64,
+    ) -> arrow::error::Result<Vec<Leaf<T::Native>>>
+    where
+        T::Native: Num,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+    {
+        let n = indices.len();
+        if quota <= 1 || n <= 1 {
+            return Ok(vec![Self::leaf_from_indices::<T, Algo>(
+                data_values,
+                dimension,
+                indices,
+                params.distance_type,
+            )?]);
+        }
+
+        let branching = params.hierarchical_k.max(2);
+        let k = branching.min(quota).min(n);
+        // Train on a prefix of the node's rows, which is a uniform subsample
+        // because the sample is in random order (`train_kmeans` would take the
+        // same prefix itself). Gathering only the prefix, and assigning the rest
+        // in chunks, keeps memory at the sample plus one chunk instead of a copy
+        // of every level of the tree.
+        let training_rows = indices.len().min(k * TRAINING_ROWS_PER_CENTROID);
+        let training = Self::create_array_from_indices::<T>(
+            &indices[..training_rows],
+            data_values,
+            dimension,
+        )?;
+        let kmeans = Self::train_kmeans::<T, Algo>(&training, k, &params.derive(salt))?;
+        drop(training);
+        let membership = Self::membership_of_rows::<T, Algo>(
+            kmeans.centroids.as_primitive::<T>().values(),
+            data_values,
+            dimension,
+            &indices,
+            params.distance_type,
+        );
+        let mut children: Vec<(usize, Vec<usize>)> =
+            (0..k).map(|centroid| (centroid, Vec::new())).collect();
+        for (local, cluster) in membership.iter().enumerate() {
+            if let Some(cluster) = cluster {
+                children[*cluster as usize].1.push(indices[local]);
+            }
+        }
+        children.retain(|(_, child)| !child.is_empty());
+
+        if children.len() <= 1 {
+            // Every vector landed in the same sub-cluster (duplicates): the node
+            // cannot be split. It becomes one leaf; the centroids it still owes
+            // are filled from other leaves afterwards.
+            return Ok(vec![Self::leaf_from_indices::<T, Algo>(
+                data_values,
+                dimension,
+                indices,
+                params.distance_type,
+            )?]);
+        }
+
+        if quota <= k {
+            // Bottom of the tree: the sub-clusters are the leaves.
+            return children
+                .into_iter()
+                .map(|(_, child)| {
+                    Self::leaf_from_indices::<T, Algo>(
+                        data_values,
+                        dimension,
+                        child,
+                        params.distance_type,
+                    )
+                })
+                .collect();
+        }
+
+        let sizes: Vec<usize> = children.iter().map(|(_, child)| child.len()).collect();
+        let quotas = allocate_quotas(&sizes, quota);
+        let (children, quotas) = Self::merge_unfunded_children::<T, Algo>(
+            data_values,
+            dimension,
+            children,
+            quotas,
+            kmeans.centroids.as_primitive::<T>().values(),
+            params.distance_type,
+        )?;
+        if children.len() < 2 {
+            // The merge handed every vector to one sub-cluster (say 999 duplicates
+            // and one outlier with a quota of 300), which would be this very node
+            // again: recursing could never make progress. Stop here as a leaf;
+            // `fill_missing_leaves` tries the remaining splits with a bounded
+            // loop and reports the shortfall.
+            let indices = children.into_iter().flatten().collect();
+            return Ok(vec![Self::leaf_from_indices::<T, Algo>(
+                data_values,
+                dimension,
+                indices,
+                params.distance_type,
+            )?]);
+        }
+        debug_assert!(
+            children.iter().all(|child| child.len() < n),
+            "every sub-cluster must be smaller than its parent for the recursion to end"
+        );
+
+        let leaves = children
+            .into_par_iter()
+            .zip(quotas.into_par_iter())
+            .enumerate()
+            .map(|(child_id, (child, child_quota))| {
+                Self::grow_proportional_subtree::<T, Algo>(
+                    data_values,
+                    dimension,
+                    child,
+                    child_quota,
+                    params,
+                    salt.wrapping_mul(branching as u64 + 1)
+                        .wrapping_add(child_id as u64 + 1),
+                )
+            })
+            .collect::<arrow::error::Result<Vec<_>>>()?;
+        Ok(leaves.into_iter().flatten().collect())
+    }
+
+    /// Hand the vectors of sub-clusters whose quota rounded to zero to the
+    /// nearest sibling that did earn centroids, and drop those sub-clusters.
+    fn merge_unfunded_children<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
+        data_values: &[T::Native],
+        dimension: usize,
+        children: Vec<(usize, Vec<usize>)>,
+        quotas: Vec<usize>,
+        centroids: &[T::Native],
+        distance_type: DistanceType,
+    ) -> arrow::error::Result<(Vec<Vec<usize>>, Vec<usize>)>
+    where
+        T::Native: Num,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+    {
+        let (mut funded, unfunded): (Vec<_>, Vec<_>) = children
+            .into_iter()
+            .zip(quotas)
+            .partition(|(_, quota)| *quota > 0);
+        if !unfunded.is_empty() {
+            let funded_centroids: Vec<T::Native> = funded
+                .iter()
+                .flat_map(|((centroid, _), _)| {
+                    centroids[centroid * dimension..(centroid + 1) * dimension]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            let orphans: Vec<usize> = unfunded
+                .into_iter()
+                .flat_map(|((_, child), _)| child)
+                .collect();
+            let orphan_data =
+                Self::create_array_from_indices::<T>(&orphans, data_values, dimension)?;
+            let (membership, _) = Algo::compute_membership_and_dist(
+                &funded_centroids,
+                orphan_data.values().as_primitive::<T>().values(),
+                dimension,
+                distance_type,
+                0.0,
+                None,
+                None,
+            );
+            for (orphan, cluster) in orphans.into_iter().zip(membership) {
+                if let Some(cluster) = cluster {
+                    funded[cluster as usize].0.1.push(orphan);
+                }
+            }
+        }
+        Ok(funded
+            .into_iter()
+            .map(|((_, child), quota)| (child, quota))
+            .unzip())
+    }
+
+    /// One leaf from the given vectors: its centroid is their mean (or mode).
+    fn leaf_from_indices<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
+        data_values: &[T::Native],
+        dimension: usize,
+        indices: Vec<usize>,
+        distance_type: DistanceType,
+    ) -> arrow::error::Result<Leaf<T::Native>>
+    where
+        T::Native: Num,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+    {
+        let sub_data = Self::create_array_from_indices::<T>(&indices, data_values, dimension)?;
+        let membership = vec![Some(0); indices.len()];
+        let mut sizes = vec![indices.len()];
+        let kmeans = Algo::to_kmeans(
+            sub_data.values().as_primitive::<T>().values(),
+            dimension,
+            1,
+            &membership,
+            &mut sizes,
+            distance_type,
+            0.0,
+        );
+        Ok(Leaf {
+            centroid: kmeans.centroids.as_primitive::<T>().values().to_vec(),
+            indices,
+        })
+    }
+
+    /// Split the largest leaves in two until `target_k` leaves exist, for the
+    /// rare tree that came up short because nodes of duplicate vectors could not
+    /// be split.
+    fn fill_missing_leaves<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
+        data_values: &[T::Native],
+        dimension: usize,
+        leaves: &mut Vec<Leaf<T::Native>>,
+        target_k: usize,
+        params: &KMeansParams,
+    ) -> arrow::error::Result<()>
+    where
+        T::Native: Num,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+    {
+        let n = data_values.len() / dimension;
+        let mut unsplittable = vec![false; leaves.len()];
+        let mut salt = u64::MAX / 2;
+        while leaves.len() < target_k {
+            let largest = (0..leaves.len())
+                .filter(|&i| !unsplittable[i] && leaves[i].indices.len() >= 2)
+                .max_by_key(|&i| leaves[i].indices.len());
+            let Some(largest) = largest else {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "Cannot create {target_k} IVF partitions: k-means could only form {} non-empty \
+                     clusters from {n} training vectors. The dataset is likely too small or has too \
+                     many (near-)duplicate vectors for this many partitions. Reduce num_partitions to \
+                     <= {} or provide more diverse data.",
+                    leaves.len(),
+                    leaves.len()
+                )));
+            };
+            salt += 1;
+            let indices = std::mem::take(&mut leaves[largest].indices);
+            let mut halves = Self::grow_proportional_subtree::<T, Algo>(
+                data_values,
+                dimension,
+                indices.clone(),
+                2,
+                params,
+                salt,
+            )?;
+            if halves.len() < 2 {
+                leaves[largest].indices = indices;
+                unsplittable[largest] = true;
+                continue;
+            }
+            leaves[largest] = halves.pop().unwrap();
+            leaves.push(halves.pop().unwrap());
+            unsplittable.push(false);
+        }
+        Ok(())
     }
 
     /// Train a [`KMeans`] model with full parameters.
@@ -1259,12 +1604,22 @@ pub fn kmeans_find_partitions_arrow_array(
     }
 
     match (centroids.value_type(), query.data_type()) {
-        (DataType::Float16, DataType::Float16) => Ok(kmeans_find_partitions(
-            centroids.values().as_primitive::<Float16Type>().values(),
-            query.as_primitive::<Float16Type>().values(),
-            nprobes,
-            distance_type,
-        )?),
+        (DataType::Float16, DataType::Float16) => {
+            let centroids = centroids.values().as_primitive::<Float16Type>().values();
+            let query = query.as_primitive::<Float16Type>().values();
+            if distance_type == DistanceType::Dot
+                && amx_fp16_available()
+                && let Some(dists) = dot_f16_partitions_amx(centroids, query)
+            {
+                return smallest_nprobes(dists, nprobes);
+            }
+            Ok(kmeans_find_partitions(
+                centroids,
+                query,
+                nprobes,
+                distance_type,
+            )?)
+        }
         (DataType::Float32, DataType::Float32) => Ok(kmeans_find_partitions(
             centroids.values().as_primitive::<Float32Type>().values(),
             query.as_primitive::<Float32Type>().values(),
@@ -1294,6 +1649,69 @@ pub fn kmeans_find_partitions_arrow_array(
 /// KMeans finds N nearest partitions.
 ///
 /// Parameters:
+/// The `nprobes` smallest distances and the partitions they belong to.
+fn smallest_nprobes(
+    dists: Vec<f32>,
+    nprobes: usize,
+) -> arrow::error::Result<(UInt32Array, Float32Array)> {
+    // TODO: use heap to just keep nprobes smallest values.
+    let dists_arr = Float32Array::from(dists);
+    let indices = sort_to_indices(&dists_arr, None, Some(nprobes))?;
+    let dists = arrow::compute::take(&dists_arr, &indices, None)?
+        .as_primitive::<Float32Type>()
+        .clone();
+    Ok((indices, dists))
+}
+
+/// `Dot` distances from `query` to every centroid, through the AMX-FP16 kernel,
+/// or `None` when this build/CPU/shape cannot use it.
+///
+/// Partition selection is one query against every centroid, so on paper it needs
+/// well under 1% of this machine's arithmetic. It measured at 33% of a saturated
+/// IVF_HNSW_SQ query because `dot_f16_avx512` carries no vector instruction at
+/// all under GCC 13.4 -- disassembly shows 30 `vcvtsh2ss` / 15 `vmulss` /
+/// 14 `vaddss` and zero `zmm` operands, since GCC has no packed `_Float16` ->
+/// `float` widening pattern. The scalar loop, not the work, is the cost.
+///
+/// Sixteen centroids at a time rather than the `M x N` GEMM: the GEMM steps its
+/// centroid loop by 32 and would spend 31 of every 32 output columns on padding
+/// for a single query (16 MAC/cycle), while this shape wastes 15 of 16 and
+/// reaches 32 MAC/cycle. Those rates count tile work only; each call also pays
+/// one LDTILECFG plus one TILERELEASE, which at these shapes is the larger term.
+/// Beating either needs several queries scored together, which the per-query
+/// search API does not offer.
+fn dot_f16_partitions_amx(centroids: &[f16], query: &[f16]) -> Option<Vec<f32>> {
+    let dim = query.len();
+    // Below one full 32-wide k-pass the kernel is all scalar cleanup, so a dim
+    // that short would run at a loss. Support, not the `LANCE_DISABLE_AMX` kill
+    // switch: the caller has already decided to use AMX, and this only declines
+    // shapes the kernel cannot pay for.
+    if dim < 32 || !amx_fp16_supported() {
+        return None;
+    }
+    debug_assert_eq!(centroids.len() % dim, 0);
+
+    let mut dists = vec![0f32; centroids.len() / dim];
+    let row = |i: usize| &centroids[i * dim..(i + 1) * dim];
+    for (g, out) in dists.chunks_mut(16).enumerate() {
+        let base = g * 16;
+        // `dot_f16_batch_16` requires 16 slices of the query's length even when
+        // only `len` of them are scored, so the tail repeats a valid row; those
+        // lanes are computed and discarded.
+        let mut group: [&[f16]; 16] = [row(base); 16];
+        for (i, slot) in group.iter_mut().enumerate().take(out.len()) {
+            *slot = row(base + i);
+        }
+        // The kernel returns raw dot products; `Dot` distance is `1 - dot`, the
+        // same convention `dot_distance_batch` applies.
+        let dots = dot_f16_batch_16(query, &group, out.len());
+        for (d, dot) in out.iter_mut().zip(dots.iter()) {
+            *d = 1.0 - *dot;
+        }
+    }
+    Some(dists)
+}
+
 /// - *centroids*: a `k * dimension` floating array.
 /// - *query*: a `dimension` floating array.
 /// - *nprobes*: the number of partitions to find.
@@ -1319,13 +1737,7 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
         }
     };
 
-    // TODO: use heap to just keep nprobes smallest values.
-    let dists_arr = Float32Array::from(dists);
-    let indices = sort_to_indices(&dists_arr, None, Some(nprobes))?;
-    let dists = arrow::compute::take(&dists_arr, &indices, None)?
-        .as_primitive::<Float32Type>()
-        .clone();
-    Ok((indices, dists))
+    smallest_nprobes(dists, nprobes)
 }
 
 pub fn kmeans_find_partitions_binary(
@@ -1550,8 +1962,46 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
 
     use super::*;
+    use lance_linalg::distance::dot_f16::amx_fp16_supported;
     use lance_linalg::distance::l2;
     use lance_linalg::kernels::argmin;
+
+    /// The AMX partition path must pick the same partitions as the scalar one.
+    /// Exact equality on the distances is not required -- the kernel accumulates
+    /// in a different order -- but the chosen partition ids must match, since a
+    /// different choice silently changes which vectors a query can ever see.
+    #[test]
+    fn test_amx_find_partitions_matches_scalar() {
+        if !amx_fp16_supported() {
+            return;
+        }
+        // (dim, k): a production shape, one with a partial 16-group tail, and one
+        // whose dimension is not a multiple of the kernel's 32-wide k-pass.
+        for (dim, k) in [(768usize, 10_000usize), (768, 37), (133, 100)] {
+            let mut st = 0x9E37u64;
+            let mut next = || {
+                st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+                f16::from_f32(((st >> 33) as f32 / (1u64 << 31) as f32) - 0.5)
+            };
+            let centroids: Vec<f16> = (0..k * dim).map(|_| next()).collect();
+            let query: Vec<f16> = (0..dim).map(|_| next()).collect();
+
+            let amx = dot_f16_partitions_amx(&centroids, &query)
+                .expect("the AMX path declined a shape it should accept");
+            let scalar: Vec<f32> = dot_distance_batch(&query[..], &centroids[..], dim).collect();
+            assert_eq!(amx.len(), scalar.len(), "dim={dim} k={k}");
+
+            for nprobes in [1usize, 8, 32] {
+                let (amx_idx, _) = smallest_nprobes(amx.clone(), nprobes).unwrap();
+                let (scalar_idx, _) = smallest_nprobes(scalar.clone(), nprobes).unwrap();
+                assert_eq!(
+                    amx_idx.values(),
+                    scalar_idx.values(),
+                    "dim={dim} k={k} nprobes={nprobes} picked different partitions"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_train_with_small_dataset() {
@@ -1723,6 +2173,411 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_hierarchical_kmeans_too_few_distinct_vectors_errors() {
+        // Regression test for https://github.com/lance-format/lance/issues/7867
+        //
+        // With a small number of distinct vectors repeated many times (heavy
+        // near-duplication) and dot distance, hierarchical k-means cannot form
+        // `target_k` non-empty clusters no matter how it splits: every split of a
+        // cluster of identical vectors is either ineffective (`all_same`) or
+        // immediately hits the "<= 1 point" floor. This used to trip
+        // `debug_assert_eq!(heap.len(), target_k)` (panic in debug builds) or
+        // silently return a half-empty centroid set (release builds). It should
+        // now return a clear error instead.
+        const DIM: usize = 8;
+        const NUM_DISTINCT: usize = 5;
+        const REPEATS: usize = 200;
+        const TARGET_K: usize = 300; // > 256 to trigger hierarchical clustering
+
+        let base_vectors = generate_random_array(NUM_DISTINCT * DIM);
+        let mut values = Vec::with_capacity(NUM_DISTINCT * REPEATS * DIM);
+        for _ in 0..REPEATS {
+            values.extend_from_slice(base_vectors.values());
+        }
+        let values = Float32Array::from(values);
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let params = KMeansParams {
+            max_iters: 10,
+            hierarchical_k: 16,
+            distance_type: DistanceType::Dot,
+            ..Default::default()
+        };
+
+        let err = KMeans::new_with_params(&fsl, TARGET_K, &params)
+            .expect_err("training should fail rather than panic or silently under-produce");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Cannot create") && msg.contains(&TARGET_K.to_string()),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AMX-FP16 dot-distance assignment
+    // -----------------------------------------------------------------------
+
+    /// Relative tolerance between the AMX and per-vector distances. Both
+    /// accumulate f32-widened products and differ only in summation order, so
+    /// this is far looser than what they actually differ by (~1e-4) and far
+    /// tighter than fp16's own representational error.
+    const AMX_REL_TOL: f32 = 5e-3;
+
+    /// A vector this much nearer its best centroid than its runner-up cannot
+    /// change hands on summation order alone. Closer ties are allowed to
+    /// disagree — that is fp16 arithmetic, not a bug.
+    const AMX_TIE_GAP: f32 = 1e-2;
+
+    fn random_f16(count: usize, rng: &mut SmallRng) -> Vec<f16> {
+        (0..count)
+            .map(|_| f16::from_f32(rng.random_range(-1.0f32..1.0)))
+            .collect()
+    }
+
+    /// Assert the AMX dot path engages for this input and assigns every vector
+    /// where the per-vector path does.
+    fn assert_dot_paths_agree(
+        centroids: &[f16],
+        data: &[f16],
+        dimension: usize,
+        balance_factor: f32,
+        cluster_sizes: Option<&[usize]>,
+        ctx: &str,
+    ) {
+        let k = centroids.len() / dimension;
+        // The AMX path's own output, not `compute_membership_and_dist`'s: that
+        // entry point falls back to the per-vector path whenever this one
+        // declines, so going through it would silently degrade this into a
+        // scalar-against-scalar comparison on any host or build that lacks the
+        // kernel, and prove nothing about it.
+        let amx = dot_membership_amx_f16(centroids, data, dimension, balance_factor, cluster_sizes)
+            .unwrap_or_else(|| {
+                panic!("{ctx}: the AMX path declined this shape, so agreeing proves nothing")
+            });
+
+        for (i, vector) in data.chunks(dimension).enumerate() {
+            let row = dot_distance_batch(vector, centroids, dimension).collect::<Vec<_>>();
+            let want = argmin_value_float_with_bias(
+                row.iter().copied(),
+                cluster_sizes.map(|sizes| sizes.iter().map(|size| balance_factor * *size as f32)),
+            );
+            let got = amx[i];
+            let (Some((want_id, _)), Some((got_id, got_dist))) = (want, got) else {
+                assert_eq!(
+                    want.is_none(),
+                    got.is_none(),
+                    "{ctx}: row {i} is assigned by one path only: {want:?} vs {got:?}"
+                );
+                continue;
+            };
+
+            assert!(
+                (got_id as usize) < k,
+                "{ctx}: row {i} landed on centroid {got_id}, outside the {k} real ones"
+            );
+            // Check the reported distance against the reported centroid's own
+            // rather than against the winner's: on a near-tie the paths may
+            // pick different centroids, and then only this identity has to hold.
+            let want_dist = row[got_id as usize];
+            assert!(
+                (got_dist - want_dist).abs() <= AMX_REL_TOL * want_dist.abs() + 1e-3,
+                "{ctx}: row {i} centroid {got_id} distance {got_dist}, want {want_dist}"
+            );
+
+            let mut biased = row
+                .iter()
+                .enumerate()
+                .map(|(j, dist)| {
+                    dist + cluster_sizes.map_or(0.0, |sizes| balance_factor * sizes[j] as f32)
+                })
+                .collect::<Vec<_>>();
+            biased.sort_by(f32::total_cmp);
+            if biased[1] - biased[0] > AMX_TIE_GAP {
+                assert_eq!(
+                    got_id, want_id,
+                    "{ctx}: row {i} is not a tie ({} vs {}) but the paths disagree",
+                    biased[0], biased[1]
+                );
+            }
+        }
+    }
+
+    /// The two paths across the shapes that exercise each boundary: `k` on and
+    /// off the kernel's 32-centroid block (so with and without zero padding),
+    /// `dim` with and without the kernel's scalar tail, and row counts on and
+    /// off the 32-row tile pass (so with and without trailing fallback rows).
+    #[test]
+    fn test_dot_amx_matches_per_vector_path() {
+        if !amx_fp16_supported() {
+            return;
+        }
+        let mut rng = SmallRng::seed_from_u64(0xD07);
+        for k in [32usize, 64, 100] {
+            for dimension in [32usize, 64, 768] {
+                for n in [64usize, 100, 1000] {
+                    let centroids = random_f16(k * dimension, &mut rng);
+                    let data = random_f16(n * dimension, &mut rng);
+                    assert_dot_paths_agree(
+                        &centroids,
+                        &data,
+                        dimension,
+                        0.0,
+                        None,
+                        &format!("k={k} dim={dimension} n={n}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The padding columns must be unreachable by the argmin.
+    ///
+    /// `k` is not a multiple of 32, so the GEMM's `n` block is filled out with
+    /// zero centroids, which score a dot product of 0 — distance exactly 1.0.
+    /// Here every real dot product is negative, so every real distance exceeds
+    /// 1.0 and a reduction over the padded row width would hand *every* vector
+    /// a cluster id past the end of the centroid set.
+    #[test]
+    fn test_dot_amx_padding_columns_never_win() {
+        if !amx_fp16_supported() {
+            return;
+        }
+        const K: usize = 100;
+        const DIM: usize = 64;
+        const N: usize = 128;
+
+        let mut rng = SmallRng::seed_from_u64(0xBAD5);
+        let negate = |v: &f16| f16::from_f32(-v.to_f32().abs() - 0.1);
+        let centroids = random_f16(K * DIM, &mut rng)
+            .iter()
+            .map(negate)
+            .collect::<Vec<_>>();
+        let data = random_f16(N * DIM, &mut rng)
+            .iter()
+            .map(|v| f16::from_f32(v.to_f32().abs() + 0.1))
+            .collect::<Vec<_>>();
+
+        for vector in data.chunks(DIM) {
+            assert!(
+                dot_distance_batch(vector, &centroids, DIM).all(|dist| dist > 1.0),
+                "premise broken: a real centroid is nearer than the zero padding"
+            );
+        }
+        assert_dot_paths_agree(&centroids, &data, DIM, 0.0, None, "padding");
+    }
+
+    /// The bias path. `argmin_value_float_with_bias` minimizes `distance +
+    /// bias` but reports the unbiased distance, so both halves of that have to
+    /// survive the AMX path; the balance factor is sized to actually move
+    /// assignments, which the test asserts rather than assumes.
+    #[test]
+    fn test_dot_amx_with_balance_bias() {
+        if !amx_fp16_supported() {
+            return;
+        }
+        const K: usize = 64;
+        const DIM: usize = 128;
+        const N: usize = 256;
+        const BALANCE_FACTOR: f32 = 0.02;
+
+        let mut rng = SmallRng::seed_from_u64(0xB1A5);
+        let centroids = random_f16(K * DIM, &mut rng);
+        let data = random_f16(N * DIM, &mut rng);
+        let cluster_sizes = (0..K).map(|id| id * 4).collect::<Vec<_>>();
+
+        assert_dot_paths_agree(
+            &centroids,
+            &data,
+            DIM,
+            BALANCE_FACTOR,
+            Some(&cluster_sizes),
+            "bias",
+        );
+
+        let assign = |balance_factor, sizes| {
+            KMeansAlgoFloat::<Float16Type>::compute_membership_and_dist(
+                &centroids,
+                &data,
+                DIM,
+                DistanceType::Dot,
+                balance_factor,
+                sizes,
+                None,
+            )
+            .0
+        };
+        assert_ne!(
+            assign(BALANCE_FACTOR, Some(cluster_sizes.as_slice())),
+            assign(0.0, None),
+            "the balance factor is too small to move any assignment"
+        );
+    }
+
+    /// A row of NaNs has no nearest centroid — `distance + bias < min` is false
+    /// for every centroid — and the AMX path has to reach the same `None` as
+    /// the per-vector one instead of defaulting to cluster 0. Covered in both
+    /// the tiled rows and the trailing rows that fall back per vector.
+    #[test]
+    fn test_dot_amx_all_nan_row_is_unassigned() {
+        if !amx_fp16_supported() {
+            return;
+        }
+        const K: usize = 64;
+        const DIM: usize = 64;
+        const N: usize = 100; // 3 full tile passes, then 4 fallback rows
+        const NAN_ROWS: [usize; 2] = [7, 98];
+
+        let mut rng = SmallRng::seed_from_u64(0x4A4);
+        let centroids = random_f16(K * DIM, &mut rng);
+        let mut data = random_f16(N * DIM, &mut rng);
+        for row in NAN_ROWS {
+            data[row * DIM..(row + 1) * DIM].fill(f16::NAN);
+        }
+
+        assert_dot_paths_agree(&centroids, &data, DIM, 0.0, None, "nan");
+
+        let (membership, _) = KMeansAlgoFloat::<Float16Type>::compute_membership_and_dist(
+            &centroids,
+            &data,
+            DIM,
+            DistanceType::Dot,
+            0.0,
+            None,
+            None,
+        );
+        for (row, cluster_id) in membership.iter().enumerate() {
+            assert_eq!(
+                cluster_id.is_none(),
+                NAN_ROWS.contains(&row),
+                "row {row} membership {cluster_id:?}"
+            );
+        }
+    }
+
+    /// Wall-clock throughput of the dot-distance assignment the AMX path above
+    /// accelerates, swept over `(threads, dim, k)`.
+    ///
+    /// The path is picked inside `compute_membership_and_dist` from run-time
+    /// capability and the data's shape, so there is nothing to toggle per
+    /// iteration: run this same binary twice — once as-is for the AMX path, once
+    /// with `LANCE_DISABLE_AMX=1` for the per-vector path — and divide. The
+    /// header line reports which path the process took, so the two outputs
+    /// cannot be confused.
+    ///
+    /// Each point runs for a wall-clock budget rather than a fixed pass count, so
+    /// a 1-thread point and an all-core point take comparable time and every
+    /// point averages over enough work to be stable.
+    ///
+    /// `#[ignore]` -- run:
+    ///   cargo test -p lance-index --release \
+    ///     kmeans_dot_f16_membership_bench -- --ignored --nocapture
+    /// Tune with `BENCH_N`, `BENCH_DIMS` / `BENCH_KS` / `BENCH_THREADS`
+    /// (comma-separated; threads default `<ncpu>,32,1`) and `BENCH_SECONDS` (the
+    /// wall-clock budget each measured point gets).
+    #[test]
+    #[ignore]
+    #[allow(clippy::print_stderr)]
+    fn kmeans_dot_f16_membership_bench() {
+        use std::time::{Duration, Instant};
+
+        let env_usize = |key: &str, default: usize| -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(default)
+        };
+        let env_list = |key: &str, default: &[usize]| -> Vec<usize> {
+            std::env::var(key)
+                .ok()
+                .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+                .unwrap_or_else(|| default.to_vec())
+        };
+
+        let n = env_usize("BENCH_N", 65_536);
+        let dims = env_list("BENCH_DIMS", &[128, 768, 1536]);
+        let ks = env_list("BENCH_KS", &[32, 64, 128, 256, 1024, 4096]);
+        let ncpu = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        let thread_counts = env_list("BENCH_THREADS", &[ncpu, 32, 1]);
+        let budget = Duration::from_secs_f64(
+            std::env::var("BENCH_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3.0),
+        );
+
+        eprintln!(
+            "[kmeans_dot_f16_bench] n={n} ncpu={ncpu} budget={:.1}s amx_fp16_available={}",
+            budget.as_secs_f64(),
+            amx_fp16_available(),
+        );
+
+        let mut rng = SmallRng::seed_from_u64(0x9E37);
+        for &dimension in &dims {
+            // Random data *and* random centroids: with degenerate inputs every
+            // vector would reduce to the same centroid and the argmin's branches
+            // and the score buffer's access pattern would both be unrealistic.
+            let data = random_f16(n * dimension, &mut rng);
+            for &k in &ks {
+                if k >= n {
+                    eprintln!(
+                        "[kmeans_dot_f16_bench]   dim={dimension} k={k}: skipped, k must be < n={n}"
+                    );
+                    continue;
+                }
+                let centroids = random_f16(k * dimension, &mut rng);
+                for &nthreads in &thread_counts {
+                    if nthreads == 0 || nthreads > ncpu {
+                        eprintln!(
+                            "[kmeans_dot_f16_bench]   dim={dimension} k={k} threads={nthreads}: skipped, not in 1..={ncpu}"
+                        );
+                        continue;
+                    }
+                    // A private pool so the sweep sets the width exactly, without
+                    // reconfiguring (or being limited by) the global one.
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(nthreads)
+                        .build()
+                        .unwrap();
+                    let run_pass = || {
+                        pool.install(|| {
+                            KMeansAlgoFloat::<Float16Type>::compute_membership_and_dist(
+                                &centroids,
+                                &data,
+                                dimension,
+                                DistanceType::Dot,
+                                0.0,
+                                None,
+                                None,
+                            )
+                        })
+                    };
+                    let warm = run_pass(); // page-in and thread spin-up, untimed
+                    std::hint::black_box(&warm);
+                    drop(warm);
+
+                    let t0 = Instant::now();
+                    let mut passes = 0usize;
+                    while t0.elapsed() < budget {
+                        let assigned = run_pass();
+                        std::hint::black_box(&assigned);
+                        passes += 1;
+                    }
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let vectors = passes * n;
+                    let vec_per_s = vectors as f64 / elapsed;
+                    eprintln!(
+                        "[kmeans_dot_f16_bench]   dim={dimension:>5} k={k:>5} threads={nthreads:>4} passes={passes:>6} vec_per_s={vec_per_s:>12.0} us_per_vec={:>9.4} Gpair_per_s={:>8.2}",
+                        1e6 / vec_per_s,
+                        vec_per_s * k as f64 / 1e9,
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_float16_underflow_fix() {
         // This test verifies the fix for float16 division underflow
         // When training k-means on many float16 vectors with small k,
@@ -1758,5 +2613,158 @@ mod tests {
             assert!(!val.is_nan(), "Centroid should not contain NaN values");
             assert!(val != f16::ZERO);
         }
+    }
+
+    #[test]
+    fn test_hierarchical_kmeans_one_outlier_among_duplicates_errors() {
+        // 999 identical rows plus one outlier with a quota of 300: the outlier's
+        // sub-cluster earns no centroid and is merged back, which used to hand the
+        // whole node to itself again and recurse until the stack overflowed. It
+        // must end in the bounded "cannot create" error instead.
+        let mut values = vec![1.0_f32; 999];
+        values.push(100.0);
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(values), 1).unwrap();
+        let params = KMeansParams {
+            max_iters: 10,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let err = KMeans::new_with_params(&data, 300, &params)
+            .expect_err("duplicates cannot be split into 300 partitions");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Cannot create") && msg.contains("300"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_allocate_quotas_follows_sizes() {
+        // Exact shares.
+        assert_eq!(allocate_quotas(&[100, 100, 100, 100], 8), vec![2, 2, 2, 2]);
+        assert_eq!(allocate_quotas(&[700, 200, 100], 10), vec![7, 2, 1]);
+        // Equal fractional parts: the remainder still adds up to the quota.
+        let quotas = allocate_quotas(&[1000, 1000, 1000], 10);
+        assert_eq!(quotas.iter().sum::<usize>(), 10);
+        assert!(quotas.iter().all(|&q| (3..=4).contains(&q)));
+        // Sub-clusters whose share rounds to zero get nothing; the remainder
+        // goes to the largest fractional share.
+        assert_eq!(allocate_quotas(&[1, 1, 1000], 20), vec![0, 0, 20]);
+        assert_eq!(allocate_quotas(&[1, 10_000], 10), vec![0, 10]);
+        // A sub-cluster never gets more centroids than vectors.
+        assert_eq!(allocate_quotas(&[2, 2], 10), vec![2, 2]);
+    }
+
+    #[test]
+    fn test_split_clusters_takes_half_of_the_largest() {
+        let mut cnts = vec![0, 10, 4];
+        let mut centroids = vec![0.0f32, 0.0, 1.0, 2.0, 3.0, 4.0];
+        split_clusters(&mut cnts, &mut centroids, 2);
+        assert_eq!(cnts, vec![5, 5, 4]);
+        // The empty cluster's centroid is a perturbed copy of the largest one.
+        assert!((centroids[0] - 1.0).abs() < 0.01 && centroids[0] != centroids[2]);
+        assert!((centroids[1] - 2.0).abs() < 0.01 && centroids[1] != centroids[3]);
+    }
+
+    fn skewed_training_data(rows: usize, dim: usize) -> FixedSizeListArray {
+        // 80% of the vectors sit in one dense blob near the origin, the rest
+        // spread over the unit cube, so a fixed fan-out would starve the blob
+        // of centroids.
+        let mut values = generate_random_array(rows * dim).values().to_vec();
+        for value in values.iter_mut().take(rows * 8 / 10 * dim) {
+            *value *= 0.05;
+        }
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32).unwrap()
+    }
+
+    fn assigned_sizes(kmeans: &KMeans, data: &FixedSizeListArray) -> Vec<usize> {
+        let (membership, _) =
+            compute_partitions_with_dists::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                kmeans.centroids.as_primitive(),
+                data.values().as_primitive(),
+                kmeans.dimension,
+                kmeans.distance_type,
+            );
+        let mut sizes = vec![0; kmeans.centroids.len() / kmeans.dimension];
+        for cluster in membership.into_iter().flatten() {
+            sizes[cluster as usize] += 1;
+        }
+        sizes
+    }
+
+    #[test]
+    fn test_hierarchical_kmeans_is_seeded_and_balanced() {
+        const DIM: usize = 16;
+        const K: usize = 300;
+        let data = skewed_training_data(K * 32, DIM);
+        let params = KMeansParams {
+            max_iters: 10,
+            hierarchical_k: 16,
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let kmeans = KMeans::new_with_params(&data, K, &params).unwrap();
+        assert_eq!(kmeans.centroids.len(), K * DIM);
+        let again = KMeans::new_with_params(&data, K, &params).unwrap();
+        assert_eq!(
+            kmeans.centroids.as_primitive::<Float32Type>().values(),
+            again.centroids.as_primitive::<Float32Type>().values(),
+            "seeded training must be reproducible"
+        );
+
+        let sizes = assigned_sizes(&kmeans, &data);
+        let mean = data.len() as f64 / K as f64;
+        let max = *sizes.iter().max().unwrap() as f64;
+        assert_eq!(
+            sizes.iter().filter(|&&s| s == 0).count(),
+            0,
+            "no empty partition"
+        );
+        assert!(max <= 4.0 * mean, "largest partition {max} vs mean {mean}");
+    }
+
+    #[test]
+    fn test_hierarchical_refinement_lowers_loss() {
+        const DIM: usize = 16;
+        const K: usize = 300;
+        let data = skewed_training_data(K * 16, DIM);
+        let loss_of = |refine_iters: u32| {
+            let params = KMeansParams {
+                max_iters: 5,
+                hierarchical_k: 8,
+                refine_iters,
+                seed: Some(7),
+                ..Default::default()
+            };
+            KMeans::new_with_params(&data, K, &params)
+                .unwrap()
+                .compute_loss(&data)
+                .unwrap()
+        };
+        let unrefined = loss_of(0);
+        let refined = loss_of(3);
+        assert!(
+            refined <= unrefined * 1.001,
+            "refinement raised the loss from {unrefined} to {refined}"
+        );
+    }
+
+    #[test]
+    fn test_flat_kmeans_seed_is_reproducible() {
+        const DIM: usize = 8;
+        let data = generate_random_array(4096 * DIM);
+        let data = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
+        let params = KMeansParams {
+            max_iters: 5,
+            seed: Some(3),
+            ..Default::default()
+        };
+        let first = KMeans::new_with_params(&data, 16, &params).unwrap();
+        let second = KMeans::new_with_params(&data, 16, &params).unwrap();
+        assert_eq!(
+            first.centroids.as_primitive::<Float32Type>().values(),
+            second.centroids.as_primitive::<Float32Type>().values()
+        );
     }
 }

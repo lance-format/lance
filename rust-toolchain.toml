@@ -1,5 +1,5 @@
 # We keep this pinned to keep clippy and rustfmt in sync between local and CI.
 # Feel free to upgrade to bring in new lints.
 [toolchain]
-channel = "1.94.0"
+channel = "1.97.0"
 components = ["rustfmt", "clippy", "rust-analyzer"]

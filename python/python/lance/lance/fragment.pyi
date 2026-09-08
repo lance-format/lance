@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from typing import Literal, Optional
+from typing import Iterable, Iterator, Literal, Optional, Union
+
+import pyarrow as pa
 
 class DeletionFile:
     """
@@ -119,4 +121,87 @@ class RowIdMeta:
         """
         ...
 
+    def __reduce__(self) -> tuple: ...
+
+class RowIdSequence:
+    """
+    The stable row ids of the rows in a single fragment, in fragment order.
+
+    Use this to attach pre-existing row ids to a fragment when assembling a
+    transaction manually, so that rewritten rows keep their identity::
+
+        sequence = RowIdSequence([7, 12])
+        fragment = FragmentMetadata(..., row_id_meta=sequence.to_inline_metadata())
+
+    The sequence may be shorter than the fragment's ``physical_rows``. The ids
+    bind to the leading rows and the commit generates new ids for the remaining
+    ones, which is how a fragment holding both rewritten and newly inserted rows
+    is expressed: write the rewritten rows first and supply only their ids.
+    Passing more ids than the fragment has rows is rejected.
+
+    Warning
+    -------
+    Only duplicates within this sequence are rejected. Row ids must also be
+    unique across the dataset, and Lance does not re-check that when
+    committing, so the caller owns it. Supply only row ids that already exist
+    and are being relocated by the same transaction, which must also remove
+    every earlier occurrence of them. Do not generate ids for new rows yourself
+    -- they come from a counter in the manifest that a concurrent commit can
+    advance, so only the commit knows which values are free. Do not supply
+    unused row ids either: a sequence covering all of a fragment's rows leaves
+    the dataset's row id allocator untouched, so a later append will hand the
+    same id out again.
+
+    Parameters
+    ----------
+    row_ids : range | pa.Array | pa.ChunkedArray | Iterable[int]
+        The row ids, in the order the corresponding rows appear in the
+        fragment. A ``range`` with a step of one is stored compactly without
+        materializing its values.
+    """
+
+    def __init__(
+        self, row_ids: Union[range, pa.Array, pa.ChunkedArray, Iterable[int]]
+    ) -> None: ...
+    @staticmethod
+    def from_inline_metadata(metadata: RowIdMeta) -> RowIdSequence:
+        """
+        Read back a sequence stored inline in fragment row id metadata.
+
+        Parameters
+        ----------
+        metadata : RowIdMeta
+            Row id metadata holding an inline sequence. Metadata pointing at an
+            external file is not supported.
+
+        Returns
+        -------
+        RowIdSequence
+        """
+        ...
+
+    def to_inline_metadata(self) -> RowIdMeta:
+        """
+        Encode the sequence as row id metadata to store inline in the manifest.
+
+        Returns
+        -------
+        RowIdMeta
+            Suitable for the ``row_id_meta`` argument of
+            :class:`lance.fragment.FragmentMetadata`.
+        """
+        ...
+
+    def to_pyarrow(self) -> pa.UInt64Array:
+        """
+        Get the row ids as a ``uint64`` array, in sequence order.
+
+        Returns
+        -------
+        pa.UInt64Array
+        """
+        ...
+
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[int]: ...
     def __reduce__(self) -> tuple: ...

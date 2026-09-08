@@ -5,7 +5,6 @@
 //!
 //! Used in point lookup queries to stop searching after finding the first match.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -109,10 +108,6 @@ impl DisplayAs for CoalesceFirstExec {
 impl ExecutionPlan for CoalesceFirstExec {
     fn name(&self) -> &str {
         "CoalesceFirstExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

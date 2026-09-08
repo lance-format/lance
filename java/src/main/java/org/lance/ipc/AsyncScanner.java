@@ -14,6 +14,7 @@
 package org.lance.ipc;
 
 import org.lance.Dataset;
+import org.lance.LanceException;
 import org.lance.LockManager;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -61,29 +62,37 @@ public class AsyncScanner implements AutoCloseable {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(options);
     Preconditions.checkNotNull(allocator);
-    AsyncScanner scanner =
-        createAsyncScanner(
-            dataset,
-            options.getFragmentIds(),
-            options.getColumns(),
-            options.getSubstraitFilter(),
-            options.getFilter(),
-            options.getBatchSize(),
-            options.getLimit(),
-            options.getOffset(),
-            options.getNearest(),
-            options.getFullTextQuery(),
-            options.isPrefilter(),
-            options.isWithRowId(),
-            options.isWithRowAddress(),
-            options.getBatchReadahead(),
-            options.getColumnOrderings(),
-            options.isUseScalarIndex(),
-            options.isFastSearch(),
-            options.getSubstraitAggregate(),
-            options.isIncludeDeletedRows(),
-            options.isStrictBatchSize(),
-            options.isDisableScoringAutoprojection());
+    AsyncScanner scanner;
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      scanner =
+          createAsyncScanner(
+              dataset,
+              options.getFragmentIds(),
+              options.getColumns(),
+              options.getSubstraitFilter(),
+              options.getFilter(),
+              options.getBatchSize(),
+              options.getBatchSizeBytes(),
+              options.getIoBufferSize(),
+              options.getLimit(),
+              options.getOffset(),
+              options.getNearest(),
+              options.getFullTextQuery(),
+              options.isPrefilter(),
+              options.isWithRowId(),
+              options.isWithRowAddress(),
+              options.getBatchReadahead(),
+              options.getFragmentReadahead(),
+              options.isScanInOrder(),
+              options.getLateMaterialization(),
+              options.getColumnOrderings(),
+              options.isUseScalarIndex(),
+              options.isFastSearch(),
+              options.getSubstraitAggregate(),
+              options.isIncludeDeletedRows(),
+              options.isStrictBatchSize(),
+              options.isDisableScoringAutoprojection());
+    }
     scanner.allocator = allocator;
     return scanner;
   }
@@ -95,6 +104,8 @@ public class AsyncScanner implements AutoCloseable {
       Optional<ByteBuffer> substraitFilter,
       Optional<String> filter,
       Optional<Long> batchSize,
+      Optional<Long> batchSizeBytes,
+      Optional<Long> ioBufferSize,
       Optional<Long> limit,
       Optional<Long> offset,
       Optional<Query> query,
@@ -103,6 +114,9 @@ public class AsyncScanner implements AutoCloseable {
       boolean withRowId,
       boolean withRowAddress,
       int batchReadahead,
+      Optional<Integer> fragmentReadahead,
+      boolean scanInOrder,
+      Optional<MaterializationStyle> lateMaterialization,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
       boolean fastSearch,
@@ -137,18 +151,18 @@ public class AsyncScanner implements AutoCloseable {
             pendingTasks.remove(taskId);
 
             if (error != null) {
-              throw new RuntimeException("Scan failed", error);
+              throw new LanceException("Scan failed", error);
             }
 
             if (streamPtr < 0) {
-              throw new RuntimeException("Native scan error");
+              throw new LanceException("Native scan returned an invalid stream pointer");
             }
 
             try {
               ArrowArrayStream stream = ArrowArrayStream.wrap(streamPtr);
               return Data.importArrayStream(allocator, stream);
             } catch (Exception e) {
-              throw new RuntimeException(e);
+              throw new LanceException("Failed to import scan stream", e);
             }
           });
     }
@@ -166,7 +180,7 @@ public class AsyncScanner implements AutoCloseable {
   private void failTask(long taskId, String errorMessage) {
     CompletableFuture<Long> future = pendingTasks.get(taskId);
     if (future != null) {
-      future.completeExceptionally(new RuntimeException(errorMessage));
+      future.completeExceptionally(new LanceException(errorMessage));
     }
   }
 

@@ -420,12 +420,11 @@ enum InstructionSet {
     Scalar,
 }
 
-/// Internal 8-wide bitpacker implementation.
+/// 8-wide bitpacker implementation.
 ///
-/// One block contains 256 integers. This stays private to avoid exposing a new
-/// block-size choice through the public Lance bitpacking API.
+/// One block contains 256 integers.
 #[derive(Clone, Copy)]
-pub(crate) struct BitPacker8x(InstructionSet);
+pub struct BitPacker8x(InstructionSet);
 
 impl BitPacker8x {
     #[cfg(target_arch = "x86_64")]

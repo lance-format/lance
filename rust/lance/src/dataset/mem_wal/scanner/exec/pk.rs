@@ -4,7 +4,7 @@
 //! Shared primary-key helpers for the LSM scanner execution nodes.
 //!
 //! Centralizes PK column resolution and per-row hashing so that every
-//! consumer (e.g. [`super::PkBlockFilterExec`], [`super::NewestPkFilterExec`])
+//! consumer (e.g. [`super::PkBlockFilterExec`])
 //! resolves and hashes a primary key the same way. The row hash is kept
 //! consistent with the variants supported by [`super::compute_pk_hash_from_scalars`]
 //! so a single PK produces the same hash regardless of which exec consumes it.

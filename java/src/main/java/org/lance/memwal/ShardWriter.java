@@ -36,6 +36,7 @@ import java.util.List;
  * <pre>{@code
  * try (ShardWriter writer = dataset.memWalWriter(shardId)) {
  *   writer.put(reader);
+ *   writer.delete(keys);
  * }
  * }</pre>
  *
@@ -64,9 +65,11 @@ public class ShardWriter implements Closeable {
   public static ShardWriter create(Dataset dataset, String shardId, ShardWriterConfig config) {
     Preconditions.checkNotNull(dataset, "dataset must not be null");
     Preconditions.checkNotNull(shardId, "shardId must not be null");
-    ShardWriter writer = createNative(dataset, shardId, config);
-    writer.allocator = dataset.allocator();
-    return writer;
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      ShardWriter writer = createNative(dataset, shardId, config);
+      writer.allocator = dataset.allocator();
+      return writer;
+    }
   }
 
   static native ShardWriter createNative(Dataset dataset, String shardId, ShardWriterConfig config);
@@ -99,6 +102,34 @@ public class ShardWriter implements Closeable {
 
   private native void nativePut(long streamAddress);
 
+  /**
+   * Delete rows from the MemWAL by primary key.
+   *
+   * <p>Each batch in {@code reader} must carry this shard's primary key column(s); other columns
+   * are ignored. Lance builds a tombstone row per key — the primary key plus {@code _tombstone =
+   * true} and null in every other column — and appends it like an ordinary write. The tombstone is
+   * the newest value for its key: it wins newest-per-PK resolution (suppressing the older real row)
+   * and is then dropped from query results.
+   *
+   * <p>Only supported in memtable mode. Because a tombstone nulls every non-PK column, those
+   * columns must be nullable in the base schema; deleting against a schema with a non-nullable
+   * non-PK column errors. Deleting on a shard with no primary key columns also errors.
+   *
+   * @param reader the keys to delete; consumed fully by this call
+   */
+  public void delete(ArrowReader reader) {
+    Preconditions.checkNotNull(reader, "reader must not be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeShardWriterHandle != 0, "ShardWriter is closed");
+      try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, stream);
+        nativeDelete(stream.memoryAddress());
+      }
+    }
+  }
+
+  private native void nativeDelete(long streamAddress);
+
   /** Return a snapshot of cumulative write statistics. */
   public WriteStats stats() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -122,9 +153,8 @@ public class ShardWriter implements Closeable {
   /**
    * Create an LSM scanner that includes this writer's active MemTable.
    *
-   * <p>The scanner covers the base table, the given flushed generations, and the current active
-   * MemTable, providing read-your-writes consistency. This writer's own shard is included
-   * automatically.
+   * <p>The scanner covers the base table, the given SSTables, and the current active MemTable,
+   * providing read-your-writes consistency. This writer's own shard is included automatically.
    *
    * @param shardSnapshots snapshots of other shards to include
    * @return an LSM scanner

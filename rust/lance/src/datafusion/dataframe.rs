@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    any::Any,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
@@ -42,6 +39,9 @@ pub struct LanceTableProvider {
     row_id_idx: Option<usize>,
     row_addr_idx: Option<usize>,
     ordered: bool,
+    blob_handling: Option<lance_core::datatypes::BlobHandling>,
+    batch_size: Option<usize>,
+    batch_size_bytes: Option<u64>,
 }
 
 impl LanceTableProvider {
@@ -72,7 +72,46 @@ impl LanceTableProvider {
             row_id_idx,
             row_addr_idx,
             ordered,
+            blob_handling: None,
+            batch_size: None,
+            batch_size_bytes: None,
         }
+    }
+
+    /// Overrides how blob columns are read during [`TableProvider::scan`].
+    /// When unset, the underlying dataset scan uses its default
+    /// [`BlobHandling`](lance_core::datatypes::BlobHandling) policy.
+    pub fn with_blob_handling(mut self, handling: lance_core::datatypes::BlobHandling) -> Self {
+        let converted = self
+            .dataset
+            .full_projection()
+            .with_blob_handling(handling.clone())
+            .to_bare_schema();
+        let mut full_schema = Schema::from(&converted);
+        if self.row_id_idx.is_some() {
+            full_schema = full_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
+        }
+        if self.row_addr_idx.is_some() {
+            full_schema = full_schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
+        }
+        self.full_schema = Arc::new(full_schema);
+        self.blob_handling = Some(handling);
+        self
+    }
+
+    /// Overrides the maximum number of rows produced by each dataset scan batch.
+    ///
+    /// The batch size must be between 1 and [`u32::MAX`], inclusive. Invalid
+    /// values are rejected when DataFusion creates the scan plan.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Overrides the approximate maximum bytes produced by each dataset scan batch.
+    pub fn with_batch_size_bytes(mut self, batch_size_bytes: u64) -> Self {
+        self.batch_size_bytes = Some(batch_size_bytes);
+        self
     }
 
     pub fn dataset(&self) -> Arc<Dataset> {
@@ -82,10 +121,6 @@ impl LanceTableProvider {
 
 #[async_trait]
 impl TableProvider for LanceTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.full_schema.clone()
     }
@@ -96,32 +131,34 @@ impl TableProvider for LanceTableProvider {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let mut scan = self.dataset.scan();
-        match projection {
-            Some(projection) if projection.is_empty() => {
-                scan.empty_project()?;
-            }
-            Some(projection) => {
-                let mut columns = Vec::with_capacity(projection.len());
-                for field_idx in projection {
-                    if Some(*field_idx) == self.row_id_idx {
-                        scan.with_row_id();
-                    } else if Some(*field_idx) == self.row_addr_idx {
-                        scan.with_row_address();
-                    } else {
-                        columns.push(self.full_schema.field(*field_idx).name());
-                    }
+        if let Some(handling) = self.blob_handling.clone() {
+            scan.blob_handling(handling);
+        }
+        if let Some(batch_size) = self.batch_size {
+            scan.batch_size(batch_size);
+        }
+        if let Some(batch_size_bytes) = self.batch_size_bytes {
+            scan.batch_size_bytes(batch_size_bytes);
+        }
+
+        if let Some(projection) = projection {
+            let mut columns = Vec::with_capacity(projection.len());
+            for field_idx in projection {
+                if Some(*field_idx) == self.row_id_idx {
+                    scan.with_row_id();
+                } else if Some(*field_idx) == self.row_addr_idx {
+                    scan.with_row_address();
+                } else {
+                    columns.push(self.full_schema.field(*field_idx).name());
                 }
-                if !columns.is_empty() {
-                    scan.project(&columns)?;
-                }
             }
-            _ => {}
+            scan.project(&columns)?;
         }
 
         let combined_filter = match filters.len() {
@@ -141,7 +178,9 @@ impl TableProvider for LanceTableProvider {
         scan.limit(limit.map(|l| l as i64), None)?;
         scan.scan_in_order(self.ordered);
 
-        scan.create_plan().await.map_err(DataFusionError::from)
+        scan.create_plan_with_session(state)
+            .await
+            .map_err(DataFusionError::from)
     }
 
     // Since we are using datafusion itself to apply the filters it should
@@ -166,13 +205,7 @@ pub trait SessionContextExt {
         with_row_id: bool,
         with_row_addr: bool,
     ) -> datafusion::common::Result<DataFrame>;
-    /// Creates a DataFrame for reading a Lance dataset without ordering
-    fn read_lance_unordered(
-        &self,
-        dataset: Arc<Dataset>,
-        with_row_id: bool,
-        with_row_addr: bool,
-    ) -> datafusion::common::Result<DataFrame>;
+
     /// Creates a DataFrame for reading a stream of data
     ///
     /// This dataframe may only be queried once, future queries will fail
@@ -229,20 +262,6 @@ impl SessionContextExt for SessionContext {
             dataset,
             with_row_id,
             with_row_addr,
-        )))
-    }
-
-    fn read_lance_unordered(
-        &self,
-        dataset: Arc<Dataset>,
-        with_row_id: bool,
-        with_row_addr: bool,
-    ) -> datafusion::common::Result<DataFrame> {
-        self.read_table(Arc::new(LanceTableProvider::new_with_ordering(
-            dataset,
-            with_row_id,
-            with_row_addr,
-            false,
         )))
     }
 
@@ -308,5 +327,40 @@ mod tests {
         assert_eq!(results.num_rows(), 1);
         // SUM(0..100) - SUM(0..50) = 3675
         assert_eq!(results.column(0).as_primitive::<Int64Type>().value(0), 3675);
+    }
+
+    #[tokio::test]
+    async fn test_table_provider_rejects_invalid_batch_size() {
+        let data = Arc::new(
+            lance_datagen::gen_batch()
+                .col("x", array::step::<Int32Type>())
+                .into_dataset(
+                    "memory://test_table_provider_rejects_invalid_batch_size",
+                    FragmentCount::from(1),
+                    FragmentRowCount::from(3),
+                )
+                .await
+                .unwrap(),
+        );
+
+        for batch_size in [0, u32::MAX as usize + 1] {
+            let provider =
+                LanceTableProvider::new(data.clone(), false, false).with_batch_size(batch_size);
+            let ctx = SessionContext::new();
+            ctx.register_table("dataset", Arc::new(provider)).unwrap();
+
+            let error = ctx
+                .sql("SELECT x FROM dataset")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .expect_err("invalid batch size should be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("batch_size must be between 1 and {}", u32::MAX))
+            );
+        }
     }
 }

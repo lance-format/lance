@@ -196,6 +196,25 @@ impl ArrowFixedSizeListVectorStore {
         })
     }
 
+    /// Heap bytes of the store's own slabs, all sized from `capacity` and
+    /// `max_batches` at construction.
+    ///
+    /// Excludes the vectors themselves: batches are held by reference, so their
+    /// bytes belong to the MemTable's batch store and counting them here would
+    /// double-count. That also makes this independent of `dim`.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        Self::reserved_bytes(self.capacity, self.max_batches)
+    }
+
+    /// What [`Self::resident_bytes`] will report for a store of this shape,
+    /// answerable before one exists — the slabs are sized from these two
+    /// numbers alone, and `dim` never enters. Lets a memory ceiling charge for
+    /// the store ahead of the first insert that allocates it.
+    pub(crate) fn reserved_bytes(capacity: usize, max_batches: usize) -> usize {
+        max_batches * std::mem::size_of::<StoredArrowBatch>()
+            + capacity * (std::mem::size_of::<RowLookup>() + std::mem::size_of::<u64>())
+    }
+
     /// Number of committed vectors.
     pub fn committed_len(&self) -> usize {
         self.committed_len.load(Ordering::Acquire)
@@ -269,25 +288,30 @@ impl ArrowFixedSizeListVectorStore {
             )));
         };
 
+        // Exhaustion is a shard-construction bug (store sized below the memtable),
+        // not caller input — hence `internal`, not `invalid_input`.
         let start = self.committed_len.load(Ordering::Relaxed);
         let end = start.checked_add(num_rows).ok_or_else(|| {
-            Error::invalid_input(format!(
+            Error::internal(format!(
                 "vector count overflow: start={}, batch_len={}",
                 start, num_rows
             ))
         })?;
         if end > self.capacity {
-            return Err(Error::invalid_input(format!(
-                "capacity {} exhausted: inserting rows [{}..{})",
+            return Err(Error::internal(format!(
+                "HNSW vector store capacity {} exhausted: inserting rows [{}..{}); \
+                 the store is sized below the memtable's row capacity",
                 self.capacity, start, end
             )));
         }
 
         let batch_idx = self.committed_batches.load(Ordering::Relaxed);
         if batch_idx >= self.max_batches {
-            return Err(Error::invalid_input(format!(
-                "max_batches {} exhausted",
-                self.max_batches
+            return Err(Error::internal(format!(
+                "HNSW vector store max_batches {} exhausted at batch_idx {} \
+                 (inserting rows [{}..{})); the store is sized below the \
+                 memtable's batch capacity",
+                self.max_batches, batch_idx, start, end
             )));
         }
 
@@ -327,6 +351,19 @@ impl ArrowFixedSizeListVectorStore {
 
     /// Capture a stable visible prefix of the store.
     pub fn snapshot(self: &Arc<Self>) -> VectorStoreSnapshot {
+        self.snapshot_after_visible_len(|| {})
+    }
+
+    fn snapshot_after_visible_len(
+        self: &Arc<Self>,
+        after_visible_len: impl FnOnce(),
+    ) -> VectorStoreSnapshot {
+        // Read the length first. If it observes a newly committed batch, the
+        // Acquire load also makes the preceding committed_batches publication
+        // visible to the later load below. If it observes the old length, the
+        // snapshot remains a valid prefix even if a writer commits meanwhile.
+        let visible_len = self.committed_len();
+        after_visible_len();
         let committed_batches = self.committed_batches.load(Ordering::Acquire);
         let contiguous_values_addr = if committed_batches == 1 {
             // SAFETY: batch slot 0 is initialized before committed_batches is
@@ -337,7 +374,7 @@ impl ArrowFixedSizeListVectorStore {
         };
         VectorStoreSnapshot {
             store: self.clone(),
-            visible_len: self.committed_len(),
+            visible_len,
             contiguous_values_addr,
         }
     }
@@ -436,12 +473,22 @@ impl VectorSource for VectorStoreSnapshot {
     }
 
     fn row_id(&self, id: u32) -> u64 {
-        debug_assert!((id as usize) < self.visible_len);
+        // HNSW only requests ids from its own graph, which is built from this
+        // snapshot's visible prefix. Keep this as a debug-only contract check.
+        debug_assert!(
+            (id as usize) < self.visible_len,
+            "vector id {id} is outside snapshot length {}",
+            self.visible_len
+        );
         self.store.row_id_at(id)
     }
 
     fn vector(&self, id: u32) -> &[f32] {
-        debug_assert!((id as usize) < self.visible_len);
+        debug_assert!(
+            (id as usize) < self.visible_len,
+            "vector id {id} is outside snapshot length {}",
+            self.visible_len
+        );
         if self.contiguous_values_addr != 0 {
             // SAFETY: this snapshot holds the store Arc, which retains the
             // Arrow batch backing this pointer. The id was checked above.
@@ -465,6 +512,7 @@ fn uninit_boxed_slice<T>(len: usize) -> Box<[MaybeUninit<T>]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
 
     fn fsl(values: Vec<f32>, dim: usize) -> Arc<FixedSizeListArray> {
         let values = Arc::new(Float32Array::from(values)) as ArrayRef;
@@ -497,6 +545,36 @@ mod tests {
             compute_f32_distance(snapshot.vector(0), snapshot.vector(1), DistanceType::L2),
             8.0
         );
+    }
+
+    #[test]
+    fn test_snapshot_stays_with_visible_prefix_during_commit() {
+        let store =
+            Arc::new(ArrowFixedSizeListVectorStore::try_new(8, 2, 2, DistanceType::L2).unwrap());
+        store
+            .append_batch(fsl(vec![1.0, 2.0, 3.0, 4.0], 2), 10)
+            .unwrap();
+
+        let visible_len_loaded = Arc::new(Barrier::new(2));
+        let continue_snapshot = Arc::new(Barrier::new(2));
+        let snapshot_store = store.clone();
+        let snapshot_visible_len_loaded = visible_len_loaded.clone();
+        let snapshot_continue = continue_snapshot.clone();
+        let snapshot_thread = std::thread::spawn(move || {
+            snapshot_store.snapshot_after_visible_len(|| {
+                snapshot_visible_len_loaded.wait();
+                snapshot_continue.wait();
+            })
+        });
+
+        visible_len_loaded.wait();
+        store.append_batch(fsl(vec![5.0, 6.0], 2), 12).unwrap();
+        continue_snapshot.wait();
+
+        let snapshot = snapshot_thread.join().unwrap();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.row_id(1), 11);
+        assert_eq!(snapshot.vector(1), &[3.0, 4.0]);
     }
 
     /// Build a `FixedSizeList<Float32>` where `None` rows are null at the list

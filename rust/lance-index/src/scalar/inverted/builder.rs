@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::encoding::encode_group_starts;
 use super::{InvertedIndexParams, index::*};
 use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::json::JsonTextStream;
+use crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 #[cfg(test)]
 use crate::scalar::lance_format::LanceIndexStore;
@@ -13,37 +13,37 @@ use crate::vector::graph::OrderedFloat;
 use crate::{progress::IndexBuildProgress, progress::noop_progress};
 use arrow::array::AsArray;
 use arrow::datatypes;
-use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
+use arrow_array::{Array, BinaryArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use bytes::Bytes;
-use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
+use datafusion::execution::SendableRecordBatchStream;
 use fst::Streamer;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
 use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
-use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
+use lance_core::{Error, ROW_ID, Result};
 use lance_io::object_store::ObjectStore;
 use lance_select::RowSetOps;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use std::{fmt::Debug, sync::atomic::AtomicU64};
+use tokio::task::JoinSet;
 use tracing::instrument;
 
-// the number of elements in each block
-// each block contains 128 row ids and 128 frequencies
-// WARNING: changing this value will break the compatibility with existing indexes
+// The legacy bitpacking block size. Position streams still use this block size;
+// FTS posting blocks choose their physical bitpacker from the configured
+// InvertedIndexParams::block_size.
 pub const BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
 // The default number of workers to use for FTS builds.
@@ -74,91 +74,7 @@ static LANCE_FTS_POSTING_BATCH_ROWS: LazyLock<usize> = LazyLock::new(|| {
         .parse()
         .expect("failed to parse LANCE_FTS_POSTING_BATCH_ROWS")
 });
-// Target serialized byte size of a posting-list cache group. Consecutive
-// posting lists are grouped into a single cache entry until their combined
-// serialized size reaches this target, amortizing per-entry overhead across
-// small (Zipfian-rare) terms. See issue #7040.
-static LANCE_FTS_POSTING_GROUP_TARGET_BYTES: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("LANCE_FTS_POSTING_GROUP_TARGET_BYTES")
-        .unwrap_or_else(|_| "4096".to_string())
-        .parse()
-        .expect("failed to parse LANCE_FTS_POSTING_GROUP_TARGET_BYTES")
-});
-// Maximum number of posting lists in a single cache group, regardless of byte
-// size. Caps the work and memory of a single group read for corpora with many
-// tiny terms.
-static LANCE_FTS_POSTING_GROUP_MAX_TOKENS: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("LANCE_FTS_POSTING_GROUP_MAX_TOKENS")
-        .unwrap_or_else(|_| "256".to_string())
-        .parse()
-        .expect("failed to parse LANCE_FTS_POSTING_GROUP_MAX_TOKENS")
-});
 const MAX_RETAINED_TOKEN_IDS: usize = 8 * 1024;
-
-/// Write-time configuration controlling how consecutive posting lists are
-/// grouped into a single read-path cache entry (issue #7040). Defaults come
-/// from the `LANCE_FTS_POSTING_GROUP_*` environment variables.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PostingGroupConfig {
-    pub(crate) target_bytes: usize,
-    pub(crate) max_tokens: usize,
-}
-
-impl Default for PostingGroupConfig {
-    fn default() -> Self {
-        Self {
-            target_bytes: (*LANCE_FTS_POSTING_GROUP_TARGET_BYTES).max(1),
-            max_tokens: (*LANCE_FTS_POSTING_GROUP_MAX_TOKENS).max(1),
-        }
-    }
-}
-
-/// Accumulates posting-list group boundaries at write time. Tokens are pushed
-/// in row order; a group is cut once its serialized bytes reach
-/// `target_bytes` or it holds `max_tokens` posting lists. A posting list
-/// larger than the target that *starts* a group occupies that group alone (the
-/// clamp case); one encountered mid-group is absorbed and closes that group, so
-/// a single term is never split across groups.
-#[derive(Debug)]
-pub(crate) struct PostingGroupAccumulator {
-    config: PostingGroupConfig,
-    starts: Vec<u32>,
-    next_token: u32,
-    current_bytes: usize,
-    current_tokens: usize,
-}
-
-impl PostingGroupAccumulator {
-    pub(crate) fn new(config: PostingGroupConfig) -> Self {
-        Self {
-            config,
-            starts: Vec::new(),
-            next_token: 0,
-            current_bytes: 0,
-            current_tokens: 0,
-        }
-    }
-
-    /// Record the next posting list in row order, given its serialized byte size.
-    pub(crate) fn push(&mut self, posting_bytes: usize) {
-        if self.current_tokens == 0 {
-            self.starts.push(self.next_token);
-        }
-        self.current_bytes += posting_bytes;
-        self.current_tokens += 1;
-        self.next_token += 1;
-        if self.current_bytes >= self.config.target_bytes
-            || self.current_tokens >= self.config.max_tokens
-        {
-            self.current_bytes = 0;
-            self.current_tokens = 0;
-        }
-    }
-
-    pub(crate) fn into_starts(self) -> Vec<u32> {
-        self.starts
-    }
-}
 
 fn default_num_workers() -> usize {
     let total_cpus = get_num_compute_intensive_cpus() + *IO_CORE_RESERVATION;
@@ -181,25 +97,53 @@ fn resolve_worker_memory_limit_bytes(params: &InvertedIndexParams, num_workers: 
         .unwrap_or(default_worker_memory_limit_bytes)
 }
 
-fn merge_all_tail_partitions(tails: Vec<TailPartition>) -> Result<Option<InnerBuilder>> {
-    if tails.is_empty() {
-        return Ok(None);
+/// Merge the workers' leftover tail builders into as few partitions as the
+/// memory budget allows. Folding unconditionally would collapse every build
+/// whose workers never hit the flush threshold into a single partition, which
+/// destroys intra-query parallelism; splitting by the same per-partition
+/// budget as the flush path makes the final partition count converge to
+/// roughly total_builder_memory / memory_limit_bytes regardless of worker
+/// layout.
+fn merge_all_tail_partitions(
+    tails: Vec<TailPartition>,
+    memory_limit_bytes: u64,
+) -> Result<Vec<InnerBuilder>> {
+    let mut merged_builders: Vec<InnerBuilder> = Vec::new();
+    let mut merged: Option<InnerBuilder> = None;
+    let mut empty_coordinate_builder: Option<InnerBuilder> = None;
+    for tail in tails {
+        let builder = tail.builder;
+        if builder.is_empty() {
+            if builder.docs.coordinate_rank() > 0 && empty_coordinate_builder.is_none() {
+                empty_coordinate_builder = Some(builder);
+            }
+            continue;
+        }
+        match &mut merged {
+            Some(current) => {
+                let would_exceed_memory =
+                    current.memory_size().saturating_add(builder.memory_size())
+                        >= memory_limit_bytes;
+                let would_exceed_doc_ids =
+                    current.docs.len().saturating_add(builder.docs.len()) > u32::MAX as usize;
+                if would_exceed_memory || would_exceed_doc_ids {
+                    merged_builders.push(std::mem::replace(current, builder));
+                } else {
+                    current.merge_from(builder)?;
+                }
+            }
+            None => merged = Some(builder),
+        }
     }
-    merge_tail_partition_group(tails).map(Some)
-}
-
-fn merge_tail_partition_group(group: Vec<TailPartition>) -> Result<InnerBuilder> {
-    let mut group = group.into_iter();
-    let mut merged = group
-        .next()
-        .ok_or_else(|| {
-            Error::invalid_input("cannot merge an empty tail partition group".to_owned())
-        })?
-        .builder;
-    for tail in group {
-        merged.merge_from(tail.builder)?;
+    if let Some(builder) = merged {
+        merged_builders.push(builder);
     }
-    Ok(merged)
+    if merged_builders.is_empty()
+        && let Some(builder) = empty_coordinate_builder
+    {
+        merged_builders.push(builder);
+    }
+    Ok(merged_builders)
 }
 
 #[derive(Debug)]
@@ -246,6 +190,7 @@ impl InvertedIndexBuilder {
         fragment_mask: Option<u64>,
         deleted_fragments: RoaringBitmap,
     ) -> Self {
+        let format_version = params.resolved_format_version();
         Self {
             params,
             partitions,
@@ -253,16 +198,19 @@ impl InvertedIndexBuilder {
             src_store: store,
             token_set_format,
             fragment_mask,
-            format_version: current_fts_format_version(),
-            posting_tail_codec: current_fts_format_version().posting_tail_codec(),
+            format_version,
+            posting_tail_codec: format_version.posting_tail_codec(),
             progress: noop_progress(),
             deleted_fragments,
         }
     }
 
     pub fn with_posting_tail_codec(mut self, posting_tail_codec: PostingTailCodec) -> Self {
-        self.format_version =
-            InvertedListFormatVersion::from_posting_tail_codec(posting_tail_codec);
+        self.format_version = InvertedListFormatVersion::from_posting_tail_codec_and_block_size(
+            posting_tail_codec,
+            self.params.block_size,
+        )
+        .expect("invalid posting tail codec for posting block size");
         self.posting_tail_codec = posting_tail_codec;
         self
     }
@@ -289,6 +237,7 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<Vec<IndexFile>> {
+        validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
 
@@ -323,6 +272,7 @@ impl InvertedIndexBuilder {
         old_segments: &[Arc<InvertedIndex>],
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<Vec<IndexFile>> {
+        validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
 
@@ -371,22 +321,36 @@ impl InvertedIndexBuilder {
                 if partition_builder.is_empty() {
                     continue;
                 }
-                match &mut merged {
-                    Some(merged) => {
-                        let would_exceed_memory = merged
+                match merged.take() {
+                    Some(mut accumulated) => {
+                        let would_exceed_memory = accumulated
                             .memory_size()
                             .saturating_add(partition_builder.memory_size())
                             >= memory_limit_bytes;
-                        let would_exceed_doc_ids = merged
+                        let would_exceed_doc_ids = accumulated
                             .docs
                             .len()
                             .saturating_add(partition_builder.docs.len())
                             > u32::MAX as usize;
                         if would_exceed_memory || would_exceed_doc_ids {
-                            let builder = std::mem::replace(merged, partition_builder);
-                            files.extend(self.write_new_partition(dest_store, builder).await?);
+                            merged = Some(partition_builder);
+                            files.extend(self.write_new_partition(dest_store, accumulated).await?);
                         } else {
-                            merged.merge_from(partition_builder)?;
+                            // `merge_from` remaps token ids into a unified
+                            // dictionary and concatenates posting lists across
+                            // builders holding up to LANCE_FTS_PARTITION_SIZE of
+                            // state, so it runs for seconds at a time. Inline it
+                            // would occupy a runtime worker for that whole span,
+                            // starving the tasks driving in-flight uploads; the
+                            // upload's whole-request timeout keeps running while
+                            // its task waits to be polled. The builder is moved
+                            // in and handed back so ownership survives the hop.
+                            accumulated = spawn_cpu(move || {
+                                accumulated.merge_from(partition_builder)?;
+                                Result::Ok(accumulated)
+                            })
+                            .await?;
+                            merged = Some(accumulated);
                         }
                     }
                     None => merged = Some(partition_builder),
@@ -448,13 +412,15 @@ impl InvertedIndexBuilder {
             fragment_mask: self.fragment_mask,
             token_set_format: self.token_set_format,
             worker_memory_limit_bytes,
+            block_size: self.params.block_size,
+            coordinate_rank: document_coordinate_rank(&stream.schema()),
         };
         let next_id = self.next_partition_id();
         let id_alloc = Arc::new(AtomicU64::new(next_id));
         let tokenized_count = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = async_channel::bounded(num_workers);
         let dest_store = dest_store.clone_arc();
-        let mut index_tasks = Vec::with_capacity(num_workers);
+        let mut index_tasks = JoinSet::new();
         for _ in 0..num_workers {
             let tokenizer = tokenizer.clone();
             let receiver: async_channel::Receiver<RecordBatch> = receiver.clone();
@@ -462,7 +428,7 @@ impl InvertedIndexBuilder {
             let id_alloc = id_alloc.clone();
             let progress = self.progress.clone();
             let tokenized_count = tokenized_count.clone();
-            index_tasks.push(tokio::task::spawn(async move {
+            index_tasks.spawn(async move {
                 let mut worker =
                     IndexWorker::new(tokenizer, dest_store, id_alloc, worker_config).await?;
                 while let Ok(batch) = receiver.recv().await {
@@ -476,7 +442,7 @@ impl InvertedIndexBuilder {
                         .await?;
                 }
                 worker.finish().await
-            }));
+            });
         }
 
         let index_build = async {
@@ -490,7 +456,17 @@ impl InvertedIndexBuilder {
             let mut last_num_rows = 0;
             let mut total_num_rows = 0;
             let start = std::time::Instant::now();
-            while let Some(batch) = stream.try_next().await? {
+            loop {
+                let batch = match stream.try_next().await {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => break,
+                    Err(err) => {
+                        drop(stream);
+                        drop(sender);
+                        index_tasks.shutdown().await;
+                        return Err(err.into());
+                    }
+                };
                 let num_rows = batch.num_rows();
 
                 if sender.send(batch).await.is_err() {
@@ -520,24 +496,46 @@ impl InvertedIndexBuilder {
             let start = std::time::Instant::now();
             let mut tail_partitions = Vec::new();
             let mut files = Vec::new();
-            for index_task in index_tasks {
-                let output = index_task.await??;
+            while let Some(index_task) = index_tasks.join_next().await {
+                let output = match index_task {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(err)) => {
+                        index_tasks.shutdown().await;
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        index_tasks.shutdown().await;
+                        return Err(err.into());
+                    }
+                };
                 self.new_partitions.extend(output.partitions);
                 files.extend(output.files);
                 if let Some(tail_partition) = output.tail_partition {
                     tail_partitions.push(tail_partition);
                 }
             }
-            let merged_tail_partitions =
-                spawn_cpu(move || merge_all_tail_partitions(tail_partitions)).await?;
-            if let Some(builder) = merged_tail_partitions {
-                self.new_partitions.push(builder.id());
-                let mut builder = builder;
-                files.extend(
-                    builder
-                        .write_to(dest_store.as_ref(), self.partition_write_target())
-                        .await?,
-                );
+            let merged_tail_partitions = spawn_cpu(move || {
+                merge_all_tail_partitions(tail_partitions, worker_memory_limit_bytes)
+            })
+            .await?;
+            // Tail partitions hold most of the data when workers rarely hit the
+            // flush threshold; writing them one at a time serializes the
+            // posting-list compression of nearly the whole index behind a
+            // single producer thread. Compress and write them concurrently.
+            let write_target = self.partition_write_target();
+            let mut tail_writes =
+                futures::stream::iter(merged_tail_partitions.into_iter().map(|mut builder| {
+                    let dest_store = dest_store.clone();
+                    async move {
+                        let partition_id = builder.id();
+                        let files = builder.write_to(dest_store.as_ref(), write_target).await?;
+                        Result::Ok((partition_id, files))
+                    }
+                }))
+                .buffer_unordered(get_num_compute_intensive_cpus().clamp(1, 16));
+            while let Some((partition_id, partition_files)) = tail_writes.try_next().await? {
+                self.new_partitions.push(partition_id);
+                files.extend(partition_files);
             }
             log::info!("wait workers indexing elapsed: {:?}", start.elapsed());
             Result::Ok(files)
@@ -548,7 +546,7 @@ impl InvertedIndexBuilder {
 
     pub async fn remap(
         &mut self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         src_store: Arc<dyn IndexStore>,
         dest_store: &dyn IndexStore,
     ) -> Result<Vec<IndexFile>> {
@@ -586,6 +584,7 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         partitions: &[u64],
     ) -> Result<IndexFile> {
+        validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let mut serialized_deleted_fragments =
             Vec::with_capacity(self.deleted_fragments.serialized_size());
         self.deleted_fragments
@@ -601,6 +600,14 @@ impl InvertedIndexBuilder {
             (
                 POSTING_TAIL_CODEC_KEY.to_owned(),
                 self.posting_tail_codec.as_str().to_owned(),
+            ),
+            (
+                FTS_FORMAT_VERSION_KEY.to_owned(),
+                self.format_version.index_version().to_string(),
+            ),
+            (
+                POSTING_BLOCK_SIZE_KEY.to_owned(),
+                self.params.block_size.to_string(),
             ),
         ]);
 
@@ -644,9 +651,19 @@ impl InvertedIndexBuilder {
     pub(crate) async fn write_part_metadata(
         &self,
         dest_store: &dyn IndexStore,
-        partition: u64, // Modify parameter type
+        partition: u64,
     ) -> Result<IndexFile> {
-        let partitions = vec![partition];
+        self.write_staged_metadata(dest_store, part_metadata_file_path(partition), &[partition])
+            .await
+    }
+
+    async fn write_staged_metadata(
+        &self,
+        dest_store: &dyn IndexStore,
+        file_name: String,
+        partitions: &[u64],
+    ) -> Result<IndexFile> {
+        validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let mut metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
             ("params".to_owned(), serde_json::to_string(&self.params)?),
@@ -657,6 +674,14 @@ impl InvertedIndexBuilder {
             (
                 POSTING_TAIL_CODEC_KEY.to_owned(),
                 self.posting_tail_codec.as_str().to_owned(),
+            ),
+            (
+                FTS_FORMAT_VERSION_KEY.to_owned(),
+                self.format_version.index_version().to_string(),
+            ),
+            (
+                POSTING_BLOCK_SIZE_KEY.to_owned(),
+                self.params.block_size.to_string(),
             ),
         ]);
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
@@ -673,8 +698,6 @@ impl InvertedIndexBuilder {
                     .to_owned(),
             );
         }
-        // Use partition ID to generate a unique temporary filename
-        let file_name = part_metadata_file_path(partition);
         let mut writer = dest_store
             .new_index_file(&file_name, Arc::new(Schema::empty()))
             .await?;
@@ -686,26 +709,39 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         partitions: &[u64],
     ) -> Result<Vec<IndexFile>> {
-        let total = if self.fragment_mask.is_none() {
-            Some(1)
-        } else {
-            Some(partitions.len() as u64)
-        };
+        let total = Some(partitions.len().max(1) as u64);
         let mut files = Vec::new();
         self.progress
             .stage_start("write_metadata", total, "files")
             .await?;
-        if self.fragment_mask.is_none() {
-            files.push(self.write_metadata(dest_store, partitions).await?);
-            self.progress.stage_progress("write_metadata", 1).await?;
-        } else {
-            let mut completed = 0;
-            for &partition_id in partitions {
-                files.push(self.write_part_metadata(dest_store, partition_id).await?);
-                completed += 1;
-                self.progress
-                    .stage_progress("write_metadata", completed)
-                    .await?;
+        match self.fragment_mask {
+            None => {
+                files.push(self.write_metadata(dest_store, partitions).await?);
+                self.progress.stage_progress("write_metadata", 1).await?;
+            }
+            Some(fragment_mask) if partitions.is_empty() => {
+                // Root metadata is the finalization marker for the shared index directory. An
+                // empty shard must publish only staged metadata so sibling partitions are still
+                // finalized.
+                files.push(
+                    self.write_staged_metadata(
+                        dest_store,
+                        empty_part_metadata_file_path(fragment_mask),
+                        partitions,
+                    )
+                    .await?,
+                );
+                self.progress.stage_progress("write_metadata", 1).await?;
+            }
+            Some(_) => {
+                let mut completed = 0;
+                for &partition_id in partitions {
+                    files.push(self.write_part_metadata(dest_store, partition_id).await?);
+                    completed += 1;
+                    self.progress
+                        .stage_progress("write_metadata", completed)
+                        .await?;
+                }
             }
         }
         self.progress.stage_complete("write_metadata").await?;
@@ -794,10 +830,10 @@ pub struct InnerBuilder {
     token_set_format: TokenSetFormat,
     format_version: InvertedListFormatVersion,
     posting_tail_codec: PostingTailCodec,
+    block_size: usize,
     pub(crate) tokens: TokenSet,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
-    pub(crate) group_config: PostingGroupConfig,
 }
 
 impl InnerBuilder {
@@ -816,16 +852,51 @@ impl InnerBuilder {
         token_set_format: TokenSetFormat,
         format_version: InvertedListFormatVersion,
     ) -> Self {
+        Self::new_with_format_version_and_block_size(
+            id,
+            with_position,
+            token_set_format,
+            format_version,
+            LEGACY_BLOCK_SIZE,
+        )
+    }
+
+    pub fn new_with_block_size(
+        id: u64,
+        with_position: bool,
+        token_set_format: TokenSetFormat,
+        block_size: usize,
+    ) -> Self {
+        let format_version = default_fts_format_version_for_block_size(block_size)
+            .expect("invalid posting list block size");
+        Self::new_with_format_version_and_block_size(
+            id,
+            with_position,
+            token_set_format,
+            format_version,
+            block_size,
+        )
+    }
+
+    pub fn new_with_format_version_and_block_size(
+        id: u64,
+        with_position: bool,
+        token_set_format: TokenSetFormat,
+        format_version: InvertedListFormatVersion,
+        block_size: usize,
+    ) -> Self {
+        validate_format_version_block_size(format_version, block_size)
+            .expect("invalid FTS format version for posting block size");
         Self {
             id,
             with_position,
             token_set_format,
             format_version,
             posting_tail_codec: format_version.posting_tail_codec(),
+            block_size,
             tokens: TokenSet::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
-            group_config: PostingGroupConfig::default(),
         }
     }
 
@@ -835,13 +906,34 @@ impl InnerBuilder {
         token_set_format: TokenSetFormat,
         posting_tail_codec: PostingTailCodec,
     ) -> Self {
-        let format_version = if posting_tail_codec == PostingTailCodec::Fixed32 {
-            InvertedListFormatVersion::V1
-        } else {
-            InvertedListFormatVersion::V2
-        };
-        let mut builder =
-            Self::new_with_format_version(id, with_position, token_set_format, format_version);
+        Self::new_with_posting_tail_codec_and_block_size(
+            id,
+            with_position,
+            token_set_format,
+            posting_tail_codec,
+            LEGACY_BLOCK_SIZE,
+        )
+    }
+
+    pub fn new_with_posting_tail_codec_and_block_size(
+        id: u64,
+        with_position: bool,
+        token_set_format: TokenSetFormat,
+        posting_tail_codec: PostingTailCodec,
+        block_size: usize,
+    ) -> Self {
+        let format_version = InvertedListFormatVersion::from_posting_tail_codec_and_block_size(
+            posting_tail_codec,
+            block_size,
+        )
+        .expect("invalid posting tail codec for posting block size");
+        let mut builder = Self::new_with_format_version_and_block_size(
+            id,
+            with_position,
+            token_set_format,
+            format_version,
+            block_size,
+        );
         builder.posting_tail_codec = posting_tail_codec;
         builder
     }
@@ -873,7 +965,7 @@ impl InnerBuilder {
         self.posting_lists = posting_lists;
     }
 
-    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {
         // for the docs, we need to remove the rows that are removed from the doc set,
         // and update the row ids of the rows that are updated
         let removed = self.docs.remap(mapping);
@@ -912,7 +1004,7 @@ impl InnerBuilder {
                 mapping.insert(*row_id, None);
             }
         }
-        self.remap(&mapping).await
+        self.remap(&RowAddrRemap::direct(mapping)).await
     }
 
     pub fn merge_from(&mut self, other: Self) -> Result<()> {
@@ -922,10 +1014,10 @@ impl InnerBuilder {
             token_set_format,
             format_version,
             posting_tail_codec,
+            block_size,
             tokens,
             posting_lists,
             docs,
-            group_config: _,
         } = other;
 
         if self.with_position != with_position {
@@ -952,6 +1044,12 @@ impl InnerBuilder {
                 self.posting_tail_codec, posting_tail_codec
             )));
         }
+        if self.block_size != block_size {
+            return Err(Error::index(format!(
+                "cannot merge partitions with mismatched FTS block sizes: {} vs {}",
+                self.block_size, block_size
+            )));
+        }
 
         let mut token_id_map = vec![u32::MAX; posting_lists.len()];
         match tokens.tokens {
@@ -973,11 +1071,23 @@ impl InnerBuilder {
         }
 
         let doc_id_offset = self.docs.len() as u32;
-        for (row_id, num_tokens) in docs.iter() {
-            self.docs.append(*row_id, *num_tokens);
+        for doc_id in 0..docs.len() as u32 {
+            let row_id = docs.row_id(doc_id);
+            let num_tokens = docs.num_tokens(doc_id);
+            let doc_index = docs.doc_index(doc_id);
+            if doc_index.is_empty() {
+                self.docs.append(row_id, num_tokens);
+            } else {
+                self.docs
+                    .append_with_doc_index(row_id, num_tokens, &doc_index)?;
+            }
         }
         self.posting_lists.resize_with(self.tokens.len(), || {
-            PostingListBuilder::new_with_posting_tail_codec(with_position, self.posting_tail_codec)
+            PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                with_position,
+                self.posting_tail_codec,
+                self.block_size,
+            )
         });
 
         for (token_id, posting_list) in posting_lists.into_iter().enumerate() {
@@ -1044,7 +1154,11 @@ impl InnerBuilder {
         let mut writer = store
             .new_index_file(
                 path,
-                inverted_list_schema_for_version(self.with_position, self.format_version),
+                inverted_list_schema_for_version_with_block_size(
+                    self.with_position,
+                    self.format_version,
+                    self.block_size,
+                ),
             )
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
@@ -1057,52 +1171,84 @@ impl InnerBuilder {
         );
         let with_position = self.with_position;
         let format_version = self.format_version;
-        let group_config = self.group_config;
-        let schema = inverted_list_schema_for_version(self.with_position, self.format_version);
+        let schema = inverted_list_schema_for_version_with_block_size(
+            self.with_position,
+            self.format_version,
+            self.block_size,
+        );
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
         let batch_rows = *LANCE_FTS_POSTING_BATCH_ROWS;
         let (tx, rx) = async_channel::bounded(*LANCE_FTS_WRITE_QUEUE_SIZE);
-        let producer = spawn_cpu(move || {
+        // The producer builds posting-list batches on the CPU pool and hands them
+        // to the writer through a bounded channel. Each batch is built inside its
+        // own `spawn_cpu` call and dispatched with an async `send().await` instead
+        // of a blocking send: when the channel is full the producer *yields* its
+        // task rather than parking the pool thread it is running on. Parking would
+        // deadlock on hosts whose CPU pool has a single thread: once the consumer
+        // accumulates enough data to flush an encoded column, the flush also needs
+        // that pool. The parked producer and the starved consumer would then wait
+        // on each other forever.
+        let producer = tokio::spawn(async move {
             let mut batch_builder = PostingListBatchBuilder::new(
-                schema_for_batches.clone(),
+                schema_for_batches,
                 with_position,
                 format_version,
                 batch_rows,
-                group_config,
             );
-            for posting_list in posting_lists {
-                posting_list.append_to_batch_with_docs(
-                    &docs_for_batches,
-                    &mut batch_builder,
-                    format_version,
-                )?;
-                if batch_builder.len() < batch_rows {
-                    continue;
-                }
+            let mut posting_lists = posting_lists.into_iter();
+            let mut encode_elapsed = Duration::ZERO;
+            loop {
+                let docs_for_batches = docs_for_batches.clone();
+                let encode_started = Instant::now();
+                // Build the next batch on the CPU pool. The builder and the
+                // remaining posting lists are moved in and handed back so state
+                // persists across batches.
+                let (next_builder, next_posting_lists, batch) = spawn_cpu(move || {
+                    let mut batch_builder = batch_builder;
+                    let mut posting_lists = posting_lists;
+                    let mut batch = None;
+                    for posting_list in posting_lists.by_ref() {
+                        posting_list.append_to_batch_with_docs(
+                            &docs_for_batches,
+                            &mut batch_builder,
+                            format_version,
+                        )?;
+                        if batch_builder.len() >= batch_rows {
+                            batch = Some(batch_builder.finish()?);
+                            break;
+                        }
+                    }
+                    if batch.is_none() && !batch_builder.is_empty() {
+                        batch = Some(batch_builder.finish()?);
+                    }
+                    Result::Ok((batch_builder, posting_lists, batch))
+                })
+                .await?;
+                encode_elapsed += encode_started.elapsed();
+                batch_builder = next_builder;
+                posting_lists = next_posting_lists;
 
-                let batch = batch_builder.finish()?;
-                if let Err(err) = tx.send_blocking(batch) {
-                    return Err(Error::execution(format!(
-                        "failed to send posting list batch to writer: {err}"
-                    )));
+                let Some(batch) = batch else {
+                    // No more batches: the posting lists are exhausted.
+                    break;
+                };
+                if tx.send(batch).await.is_err() {
+                    // The receiver is gone, which only happens when the writer
+                    // failed; stop producing and let that error surface there.
+                    break;
                 }
             }
 
-            if !batch_builder.is_empty() {
-                let batch = batch_builder.finish()?;
-                if let Err(err) = tx.send_blocking(batch) {
-                    return Err(Error::execution(format!(
-                        "failed to send posting list batch to writer: {err}"
-                    )));
-                }
-            }
-
-            Result::Ok(batch_builder.into_group_starts())
+            Result::Ok(encode_elapsed)
         });
 
+        let mut write_elapsed = Duration::ZERO;
         while let Ok(batch) = rx.recv().await {
-            if let Err(err) = writer.write_record_batch(batch).await {
+            let write_started = Instant::now();
+            let result = writer.write_record_batch(batch).await;
+            write_elapsed += write_started.elapsed();
+            if let Err(err) = result {
                 drop(rx);
                 // Wait for producer to stop; preserve the write error as the primary failure.
                 let _ = producer.await;
@@ -1110,22 +1256,21 @@ impl InnerBuilder {
             }
         }
         drop(rx);
-        let group_starts = producer.await?;
+        let encode_elapsed = producer.await??;
+        let finish_started = Instant::now();
+        let file = writer.finish().await?;
+        write_elapsed += finish_started.elapsed();
 
-        // Persist the posting-list cache-group boundaries as a global buffer,
-        // recording its 1-indexed id in schema metadata so the reader can group
-        // small posting lists into a single cache entry (issue #7040). Empty
-        // partitions skip this entirely and fall back to the per-token path.
-        let mut extra_metadata = HashMap::new();
-        if !group_starts.is_empty() {
-            let encoded = encode_group_starts(&group_starts);
-            let buffer_id = writer.add_global_buffer(Bytes::from(encoded)).await?;
-            extra_metadata.insert(
-                POSTING_GROUP_OFFSETS_BUF_KEY.to_owned(),
-                buffer_id.to_string(),
-            );
-        }
-        writer.finish_with_metadata(extra_metadata).await
+        // Splits the cost of a partition write into the two halves that are
+        // otherwise indistinguishable from the outside, so a build that fails on
+        // an upload timeout shows whether encoding or the upload dominated.
+        log::info!(
+            "wrote posting lists of partition {}: {:.1?} encoding, {:.1?} writing",
+            id,
+            encode_elapsed,
+            write_elapsed
+        );
+        Ok(file)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1149,7 +1294,12 @@ impl InnerBuilder {
         let batch = docs.to_batch()?;
         let mut writer = store.new_index_file(path, batch.schema()).await?;
         writer.write_record_batch(batch).await?;
-        writer.finish().await
+        writer
+            .finish_with_metadata(HashMap::from([(
+                super::documents::TOTAL_TOKENS_KEY.to_owned(),
+                docs.total_tokens_num().to_string(),
+            )]))
+            .await
     }
 }
 
@@ -1195,6 +1345,7 @@ struct IndexWorker {
     token_set_format: TokenSetFormat,
     token_ids: Vec<u32>,
     last_token_count: usize,
+    coordinate_rank: usize,
 }
 
 struct TailPartition {
@@ -1207,6 +1358,11 @@ struct WorkerOutput {
     tail_partition: Option<TailPartition>,
 }
 
+enum DocumentSource<'a> {
+    Text(&'a str),
+    StringList(&'a dyn Array),
+}
+
 #[derive(Debug, Clone, Copy)]
 struct IndexWorkerConfig {
     with_position: bool,
@@ -1214,6 +1370,8 @@ struct IndexWorkerConfig {
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
     worker_memory_limit_bytes: u64,
+    block_size: usize,
+    coordinate_rank: usize,
 }
 
 impl IndexWorker {
@@ -1257,18 +1415,26 @@ impl IndexWorker {
         id_alloc: Arc<AtomicU64>,
         config: IndexWorkerConfig,
     ) -> Result<Self> {
-        let schema = inverted_list_schema_for_version(config.with_position, config.format_version);
+        let schema = inverted_list_schema_for_version_with_block_size(
+            config.with_position,
+            config.format_version,
+            config.block_size,
+        );
+
+        let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+            id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                | config.fragment_mask.unwrap_or(0),
+            config.with_position,
+            config.token_set_format,
+            config.format_version,
+            config.block_size,
+        );
+        builder.docs = DocSet::with_coordinate_rank(config.coordinate_rank);
 
         Ok(Self {
             tokenizer,
             dest_store,
-            builder: InnerBuilder::new_with_format_version(
-                id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    | config.fragment_mask.unwrap_or(0),
-                config.with_position,
-                config.token_set_format,
-                config.format_version,
-            ),
+            builder,
             partitions: Vec::new(),
             files: Vec::new(),
             id_alloc,
@@ -1280,6 +1446,7 @@ impl IndexWorker {
             token_set_format: config.token_set_format,
             token_ids: Vec::new(),
             last_token_count: 0,
+            coordinate_rank: config.coordinate_rank,
         })
     }
 
@@ -1292,147 +1459,301 @@ impl IndexWorker {
 
     async fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
         let doc_col = batch.column(0);
-        let doc_iter = iter_str_array(doc_col);
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-        let docs = doc_iter
-            .zip(row_id_col.values().iter())
-            .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
+        let doc_index_columns = (0..self.coordinate_rank)
+            .map(|rank| {
+                let column_name = doc_index_storage_column(rank);
+                batch
+                    .column_by_name(&column_name)
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "FTS document input is missing coordinate column {column_name}"
+                        ))
+                    })
+                    .map(|column| column.as_primitive::<datatypes::UInt32Type>())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        match doc_col.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                for (row_index, (doc, row_id)) in iter_str_array(doc_col.as_ref())
+                    .zip(row_id_col.values().iter())
+                    .enumerate()
+                {
+                    let doc = match doc {
+                        Some(doc) => doc,
+                        None if self.coordinate_rank > 0 => "",
+                        None => continue,
+                    };
+                    let doc_index = doc_index_columns
+                        .iter()
+                        .map(|column| column.value(row_index))
+                        .collect::<Vec<_>>();
+                    self.process_document(*row_id, DocumentSource::Text(doc), &doc_index)
+                        .await?;
+                }
+            }
+            DataType::List(_) => {
+                if self.coordinate_rank > 0 {
+                    return Err(Error::index(
+                        "ListElement FTS input must be expanded to string documents before indexing"
+                            .to_string(),
+                    ));
+                }
+                self.process_string_list_batch::<i32>(doc_col, row_id_col)
+                    .await?;
+            }
+            DataType::LargeList(_) => {
+                if self.coordinate_rank > 0 {
+                    return Err(Error::index(
+                        "ListElement FTS input must be expanded to string documents before indexing"
+                            .to_string(),
+                    ));
+                }
+                self.process_string_list_batch::<i64>(doc_col, row_id_col)
+                    .await?;
+            }
+            data_type => {
+                return Err(Error::index(format!(
+                    "expect data type String, LargeString, List(String), or LargeList(String) but got {}",
+                    data_type
+                )));
+            }
+        }
 
+        Ok(())
+    }
+
+    async fn process_string_list_batch<Offset: arrow::array::OffsetSizeTrait>(
+        &mut self,
+        doc_col: &Arc<dyn Array>,
+        row_id_col: &arrow_array::PrimitiveArray<datatypes::UInt64Type>,
+    ) -> Result<()> {
+        let docs = doc_col.as_list::<Offset>();
+        match docs.value_type() {
+            datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => {}
+            data_type => {
+                return Err(Error::index(format!(
+                    "expect list item data type String or LargeString but got {}",
+                    data_type
+                )));
+            }
+        }
+
+        for (doc, row_id) in docs.iter().zip(row_id_col.values().iter()) {
+            let Some(doc) = doc else {
+                continue;
+            };
+
+            self.process_document(*row_id, DocumentSource::StringList(doc.as_ref()), &[])
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    fn checked_token_position(row_id: u64, token_position: usize) -> Result<u32> {
+        u32::try_from(token_position).map_err(|_| {
+            Error::invalid_input(format!(
+                "token position overflow for row_id={row_id}: token_position={token_position}"
+            ))
+        })
+    }
+
+    fn materialize_string_list(elements: &dyn Array) -> String {
+        let mut doc = String::new();
+        for element in iter_str_array(elements).flatten() {
+            if !doc.is_empty() {
+                doc.push(' ');
+            }
+            doc.push_str(element);
+        }
+        doc
+    }
+
+    async fn process_document(
+        &mut self,
+        row_id: u64,
+        document: DocumentSource<'_>,
+        doc_index: &[u32],
+    ) -> Result<()> {
         let with_position = self.has_position();
-        for (doc, row_id) in docs {
-            let builder_was_empty = self.builder.docs.is_empty();
-            let old_temporary_memory_size = self.temporary_memory_size();
-            let old_token_memory_size = self.builder.tokens.memory_size() as u64;
-            let doc_id = self.builder.docs.len() as u32;
-            let mut token_num: u32 = 0;
-            let mut posting_memory_delta = 0i64;
-            if with_position {
+        let builder_was_empty = self.builder.docs.is_empty();
+        let old_temporary_memory_size = self.temporary_memory_size();
+        let old_token_memory_size = self.builder.tokens.memory_size() as u64;
+        let doc_id = self.builder.docs.len() as u32;
+        let mut token_num: u32 = 0;
+        let mut doc_length_bytes = 0usize;
+        let mut posting_memory_delta = 0i64;
+        if with_position {
+            {
                 if self.token_ids.capacity() < self.last_token_count {
                     self.token_ids
                         .reserve(self.last_token_count - self.token_ids.capacity());
                 }
                 self.token_ids.clear();
+                let tokenizer = &mut self.tokenizer;
                 let builder = &mut self.builder;
                 let token_ids = &mut self.token_ids;
                 let memory_size = &mut self.memory_size;
                 let posting_tail_codec = builder.posting_tail_codec;
 
-                let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
-                while token_stream.advance() {
-                    let token = token_stream.token();
-                    let token_id = builder.tokens.get_or_add(&token.text);
-                    if token_id as usize == builder.posting_lists.len() {
-                        let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
-                            * std::mem::size_of::<PostingListBuilder>())
-                            as u64;
-                        builder.posting_lists.push(
-                            PostingListBuilder::new_with_posting_tail_codec(
-                                true,
-                                posting_tail_codec,
-                            ),
-                        );
-                        let new_posting_lists_overhead_size = (builder.posting_lists.capacity()
-                            * std::mem::size_of::<PostingListBuilder>())
-                            as u64;
-                        Self::adjust_tracked_value(
-                            memory_size,
-                            old_posting_lists_overhead_size,
-                            new_posting_lists_overhead_size,
-                        );
+                let block_size = builder.block_size;
+                let mut process_text = |text: &str| -> Result<()> {
+                    doc_length_bytes += text.len();
+                    let mut token_stream = tokenizer.token_stream_for_doc(text);
+                    while token_stream.advance() {
+                        let token = token_stream.token();
+                        let position = Self::checked_token_position(row_id, token.position)?;
+                        let token_id = builder.tokens.get_or_add(&token.text);
+                        if token_id as usize == builder.posting_lists.len() {
+                            let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
+                                * std::mem::size_of::<PostingListBuilder>())
+                                as u64;
+                            builder.posting_lists.push(
+                                PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                                    true,
+                                    posting_tail_codec,
+                                    block_size,
+                                ),
+                            );
+                            let new_posting_lists_overhead_size = (builder.posting_lists.capacity()
+                                * std::mem::size_of::<PostingListBuilder>())
+                                as u64;
+                            Self::adjust_tracked_value(
+                                memory_size,
+                                old_posting_lists_overhead_size,
+                                new_posting_lists_overhead_size,
+                            );
+                        }
+                        let posting_list = &mut builder.posting_lists[token_id as usize];
+                        let old_posting_memory_size = posting_list.size();
+                        if posting_list.add_occurrence(doc_id, position)? {
+                            token_ids.push(token_id);
+                        }
+                        let new_posting_memory_size = posting_list.size();
+                        posting_memory_delta +=
+                            new_posting_memory_size as i64 - old_posting_memory_size as i64;
+                        token_num += 1;
                     }
-                    let posting_list = &mut builder.posting_lists[token_id as usize];
-                    let old_posting_memory_size = posting_list.size();
-                    if posting_list.add_occurrence(doc_id, token.position as u32)? {
-                        token_ids.push(token_id);
+                    Ok(())
+                };
+
+                match document {
+                    DocumentSource::Text(doc) => {
+                        process_text(doc)?;
                     }
-                    let new_posting_memory_size = posting_list.size();
-                    posting_memory_delta +=
-                        new_posting_memory_size as i64 - old_posting_memory_size as i64;
-                    token_num += 1;
+                    DocumentSource::StringList(elements) => {
+                        let doc = Self::materialize_string_list(elements);
+                        process_text(&doc)?;
+                    }
                 }
-            } else {
+            }
+        } else {
+            {
                 if self.token_ids.capacity() < self.last_token_count {
                     self.token_ids
                         .reserve(self.last_token_count - self.token_ids.capacity());
                 }
                 self.token_ids.clear();
 
-                let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
-                while token_stream.advance() {
-                    let token_id = self.builder.tokens.get_or_add(&token_stream.token().text);
-                    self.token_ids.push(token_id);
-                    token_num += 1;
-                }
-            }
-            self.adjust_tracked_memory_size(
-                old_token_memory_size,
-                self.builder.tokens.memory_size() as u64,
-            );
-
-            if !with_position {
-                let old_posting_lists_overhead_size = self.posting_lists_overhead_size();
-                self.builder
-                    .posting_lists
-                    .resize_with(self.builder.tokens.len(), || {
-                        PostingListBuilder::new_with_posting_tail_codec(
-                            false,
-                            self.builder.posting_tail_codec,
-                        )
-                    });
-                let new_posting_lists_overhead_size = self.posting_lists_overhead_size();
-                Self::adjust_tracked_value(
-                    &mut self.memory_size,
-                    old_posting_lists_overhead_size,
-                    new_posting_lists_overhead_size,
-                );
-            }
-
-            let old_doc_memory_size = self.builder.docs.memory_size() as u64;
-            let appended_doc_id = self.builder.docs.append(row_id, token_num);
-            debug_assert_eq!(appended_doc_id, doc_id);
-            self.adjust_tracked_memory_size(
-                old_doc_memory_size,
-                self.builder.docs.memory_size() as u64,
-            );
-            self.total_doc_length += doc.len();
-
-            if with_position {
-                for &token_id in &self.token_ids {
-                    let (old_posting_memory_size, new_posting_memory_size) = {
-                        let posting_list = &mut self.builder.posting_lists[token_id as usize];
-                        let old_posting_memory_size = posting_list.size();
-                        posting_list.finish_open_doc(doc_id)?;
-                        let new_posting_memory_size = posting_list.size();
-                        (old_posting_memory_size, new_posting_memory_size)
-                    };
-                    posting_memory_delta +=
-                        new_posting_memory_size as i64 - old_posting_memory_size as i64;
-                }
-                Self::apply_delta(&mut self.memory_size, posting_memory_delta);
-            } else if token_num > 0 {
-                self.token_ids.sort_unstable();
-                let mut iter = self.token_ids.iter();
-                let mut current = *iter.next().unwrap();
-                let mut count = 1u32;
-                for &token_id in iter {
-                    if token_id == current {
-                        count += 1;
-                        continue;
+                let tokenizer = &mut self.tokenizer;
+                let builder = &mut self.builder;
+                let token_ids = &mut self.token_ids;
+                let mut process_text = |text: &str| {
+                    doc_length_bytes += text.len();
+                    let mut token_stream = tokenizer.token_stream_for_doc(text);
+                    while token_stream.advance() {
+                        let token_id = builder.tokens.get_or_add(&token_stream.token().text);
+                        token_ids.push(token_id);
+                        token_num += 1;
                     }
+                };
 
-                    let (old_posting_memory_size, new_posting_memory_size) = {
-                        let posting_list = &mut self.builder.posting_lists[current as usize];
-                        let old_posting_memory_size = posting_list.size();
-                        posting_list.add(doc_id, PositionRecorder::Count(count));
-                        let new_posting_memory_size = posting_list.size();
-                        (old_posting_memory_size, new_posting_memory_size)
-                    };
-                    posting_memory_delta +=
-                        new_posting_memory_size as i64 - old_posting_memory_size as i64;
-
-                    current = token_id;
-                    count = 1;
+                match document {
+                    DocumentSource::Text(doc) => process_text(doc),
+                    DocumentSource::StringList(elements) => {
+                        let doc = Self::materialize_string_list(elements);
+                        process_text(&doc);
+                    }
                 }
+            }
+        }
+        self.adjust_tracked_memory_size(
+            old_token_memory_size,
+            self.builder.tokens.memory_size() as u64,
+        );
+
+        // Row indexes omit zero-token documents from corpus statistics.
+        // ListElement indexes retain them so their physical coordinates remain
+        // part of the document corpus even when they cannot match a term.
+        if token_num == 0 && self.coordinate_rank == 0 {
+            self.last_token_count = 0;
+            self.trim_temporary_buffers();
+            self.adjust_tracked_memory_size(
+                old_temporary_memory_size,
+                self.temporary_memory_size(),
+            );
+            return Ok(());
+        }
+
+        if !with_position {
+            let old_posting_lists_overhead_size = self.posting_lists_overhead_size();
+            self.builder
+                .posting_lists
+                .resize_with(self.builder.tokens.len(), || {
+                    PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                        false,
+                        self.builder.posting_tail_codec,
+                        self.builder.block_size,
+                    )
+                });
+            let new_posting_lists_overhead_size = self.posting_lists_overhead_size();
+            Self::adjust_tracked_value(
+                &mut self.memory_size,
+                old_posting_lists_overhead_size,
+                new_posting_lists_overhead_size,
+            );
+        }
+
+        let old_doc_memory_size = self.builder.docs.memory_size() as u64;
+        let appended_doc_id = if doc_index.is_empty() {
+            self.builder.docs.append(row_id, token_num)
+        } else {
+            self.builder
+                .docs
+                .append_with_doc_index(row_id, token_num, doc_index)?
+        };
+        debug_assert_eq!(appended_doc_id, doc_id);
+        self.adjust_tracked_memory_size(
+            old_doc_memory_size,
+            self.builder.docs.memory_size() as u64,
+        );
+        self.total_doc_length += doc_length_bytes;
+
+        if with_position {
+            for &token_id in &self.token_ids {
+                let (old_posting_memory_size, new_posting_memory_size) = {
+                    let posting_list = &mut self.builder.posting_lists[token_id as usize];
+                    let old_posting_memory_size = posting_list.size();
+                    posting_list.finish_open_doc(doc_id)?;
+                    let new_posting_memory_size = posting_list.size();
+                    (old_posting_memory_size, new_posting_memory_size)
+                };
+                posting_memory_delta +=
+                    new_posting_memory_size as i64 - old_posting_memory_size as i64;
+            }
+            Self::apply_delta(&mut self.memory_size, posting_memory_delta);
+        } else if token_num > 0 {
+            self.token_ids.sort_unstable();
+            let mut iter = self.token_ids.iter();
+            let mut current = *iter.next().unwrap();
+            let mut count = 1u32;
+            for &token_id in iter {
+                if token_id == current {
+                    count += 1;
+                    continue;
+                }
+
                 let (old_posting_memory_size, new_posting_memory_size) = {
                     let posting_list = &mut self.builder.posting_lists[current as usize];
                     let old_posting_memory_size = posting_list.size();
@@ -1442,27 +1763,35 @@ impl IndexWorker {
                 };
                 posting_memory_delta +=
                     new_posting_memory_size as i64 - old_posting_memory_size as i64;
-                Self::apply_delta(&mut self.memory_size, posting_memory_delta);
-            }
-            self.last_token_count = self.token_ids.len();
-            self.trim_temporary_buffers();
-            self.adjust_tracked_memory_size(
-                old_temporary_memory_size,
-                self.temporary_memory_size(),
-            );
 
-            if self.builder.docs.len() == 1 && self.memory_size > self.worker_memory_limit_bytes {
-                return Err(Error::invalid_input(format!(
-                    "single document row_id={} exceeds worker memory limit: {} > {} bytes",
-                    row_id, self.memory_size, self.worker_memory_limit_bytes
-                )));
+                current = token_id;
+                count = 1;
             }
+            let (old_posting_memory_size, new_posting_memory_size) = {
+                let posting_list = &mut self.builder.posting_lists[current as usize];
+                let old_posting_memory_size = posting_list.size();
+                posting_list.add(doc_id, PositionRecorder::Count(count));
+                let new_posting_memory_size = posting_list.size();
+                (old_posting_memory_size, new_posting_memory_size)
+            };
+            posting_memory_delta += new_posting_memory_size as i64 - old_posting_memory_size as i64;
+            Self::apply_delta(&mut self.memory_size, posting_memory_delta);
+        }
+        self.last_token_count = self.token_ids.len();
+        self.trim_temporary_buffers();
+        self.adjust_tracked_memory_size(old_temporary_memory_size, self.temporary_memory_size());
 
-            if self.builder.docs.len() as u32 == u32::MAX
-                || (!builder_was_empty && self.memory_size >= self.worker_memory_limit_bytes)
-            {
-                self.flush().await?;
-            }
+        if self.builder.docs.len() == 1 && self.memory_size > self.worker_memory_limit_bytes {
+            return Err(Error::invalid_input(format!(
+                "single document row_id={} exceeds worker memory limit: {} > {} bytes",
+                row_id, self.memory_size, self.worker_memory_limit_bytes
+            )));
+        }
+
+        if self.builder.docs.len() as u32 == u32::MAX
+            || (!builder_was_empty && self.memory_size >= self.worker_memory_limit_bytes)
+        {
+            self.flush().await?;
         }
 
         Ok(())
@@ -1470,7 +1799,7 @@ impl IndexWorker {
 
     #[instrument(level = "debug", skip_all)]
     async fn flush(&mut self) -> Result<()> {
-        if self.builder.tokens.is_empty() {
+        if self.builder.docs.is_empty() {
             return Ok(());
         }
 
@@ -1481,17 +1810,18 @@ impl IndexWorker {
         self.memory_size = self.temporary_memory_size();
         let with_position = self.has_position();
         let format_version = self.builder.format_version;
-        let builder = std::mem::replace(
-            &mut self.builder,
-            InnerBuilder::new_with_format_version(
-                self.id_alloc
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    | self.fragment_mask.unwrap_or(0),
-                with_position,
-                self.token_set_format,
-                format_version,
-            ),
+        let block_size = self.builder.block_size;
+        let mut replacement = InnerBuilder::new_with_format_version_and_block_size(
+            self.id_alloc
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                | self.fragment_mask.unwrap_or(0),
+            with_position,
+            self.token_set_format,
+            format_version,
+            block_size,
         );
+        replacement.docs = DocSet::with_coordinate_rank(self.coordinate_rank);
+        let builder = std::mem::replace(&mut self.builder, replacement);
         let written_partition_id = builder.id();
         let mut builder = builder;
         let target = if self.fragment_mask.is_some() {
@@ -1514,7 +1844,7 @@ impl IndexWorker {
     }
 
     async fn finish(self) -> Result<WorkerOutput> {
-        let tail_partition = if self.builder.tokens.is_empty() {
+        let tail_partition = if self.builder.docs.is_empty() && self.coordinate_rank == 0 {
             None
         } else {
             Some(TailPartition {
@@ -1558,6 +1888,7 @@ impl PositionRecorder {
 #[derive(Debug, Eq, PartialEq, Clone, DeepSizeOf)]
 pub struct ScoredDoc {
     pub row_id: u64,
+    pub doc_index: Vec<u32>,
     pub score: OrderedFloat,
 }
 
@@ -1565,6 +1896,15 @@ impl ScoredDoc {
     pub fn new(row_id: u64, score: f32) -> Self {
         Self {
             row_id,
+            doc_index: Vec::new(),
+            score: OrderedFloat(score),
+        }
+    }
+
+    pub fn with_doc_index(row_id: u64, doc_index: Vec<u32>, score: f32) -> Self {
+        Self {
+            row_id,
+            doc_index,
             score: OrderedFloat(score),
         }
     }
@@ -1609,17 +1949,56 @@ pub fn inverted_list_schema_for_version(
     with_position: bool,
     format_version: InvertedListFormatVersion,
 ) -> SchemaRef {
+    inverted_list_schema_for_version_with_block_size(
+        with_position,
+        format_version,
+        LEGACY_BLOCK_SIZE,
+    )
+}
+
+pub fn inverted_list_schema_for_version_with_block_size(
+    with_position: bool,
+    format_version: InvertedListFormatVersion,
+    block_size: usize,
+) -> SchemaRef {
+    inverted_list_schema_for_version_with_block_size_and_impacts(
+        with_position,
+        format_version,
+        block_size,
+        true,
+    )
+}
+
+pub(crate) fn inverted_list_schema_for_version_with_block_size_and_impacts(
+    with_position: bool,
+    format_version: InvertedListFormatVersion,
+    block_size: usize,
+    with_impacts: bool,
+) -> SchemaRef {
+    validate_format_version_block_size(format_version, block_size)
+        .expect("invalid FTS format version for posting block size");
     match format_version {
-        InvertedListFormatVersion::V1 => inverted_list_schema_v1(with_position),
-        InvertedListFormatVersion::V2 => inverted_list_schema_with_tail_codec_and_position_codec(
-            with_position,
-            PostingTailCodec::VarintDelta,
-            Some(PositionStreamCodec::PackedDelta),
-        ),
+        InvertedListFormatVersion::V1 => {
+            inverted_list_schema_v1(with_position, block_size, with_impacts)
+        }
+        InvertedListFormatVersion::V2 | InvertedListFormatVersion::V3 => {
+            inverted_list_schema_with_tail_codec_and_position_codec(
+                with_position,
+                format_version,
+                PostingTailCodec::VarintDelta,
+                Some(PositionStreamCodec::PackedDelta),
+                block_size,
+                with_impacts,
+            )
+        }
     }
 }
 
-fn inverted_list_schema_v1(with_position: bool) -> SchemaRef {
+fn inverted_list_schema_v1(
+    with_position: bool,
+    block_size: usize,
+    with_impacts: bool,
+) -> SchemaRef {
     let mut fields = vec![
         arrow_schema::Field::new(
             POSTING_COL,
@@ -1633,6 +2012,17 @@ fn inverted_list_schema_v1(with_position: bool) -> SchemaRef {
         arrow_schema::Field::new(MAX_SCORE_COL, datatypes::DataType::Float32, false),
         arrow_schema::Field::new(LENGTH_COL, datatypes::DataType::UInt32, false),
     ];
+    if with_impacts {
+        fields.push(arrow_schema::Field::new(
+            IMPACT_COL,
+            datatypes::DataType::List(Arc::new(Field::new(
+                "item",
+                datatypes::DataType::LargeBinary,
+                true,
+            ))),
+            false,
+        ));
+    }
     if with_position {
         fields.push(arrow_schema::Field::new(
             POSITION_COL,
@@ -1648,24 +2038,44 @@ fn inverted_list_schema_v1(with_position: bool) -> SchemaRef {
             false,
         ));
     }
-    Arc::new(arrow_schema::Schema::new(fields))
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        HashMap::from([
+            (POSTING_BLOCK_SIZE_KEY.to_owned(), block_size.to_string()),
+            (
+                FTS_FORMAT_VERSION_KEY.to_owned(),
+                InvertedListFormatVersion::V1.index_version().to_string(),
+            ),
+        ]),
+    ))
 }
 
 pub fn inverted_list_schema_with_tail_codec(
     with_position: bool,
     posting_tail_codec: PostingTailCodec,
 ) -> SchemaRef {
+    let format_version = InvertedListFormatVersion::from_posting_tail_codec_and_block_size(
+        posting_tail_codec,
+        LEGACY_BLOCK_SIZE,
+    )
+    .expect("invalid posting tail codec for posting block size");
     inverted_list_schema_with_tail_codec_and_position_codec(
         with_position,
+        format_version,
         posting_tail_codec,
         Some(PositionStreamCodec::PackedDelta),
+        LEGACY_BLOCK_SIZE,
+        false,
     )
 }
 
 fn inverted_list_schema_with_tail_codec_and_position_codec(
     with_position: bool,
+    format_version: InvertedListFormatVersion,
     posting_tail_codec: PostingTailCodec,
     position_codec: Option<PositionStreamCodec>,
+    block_size: usize,
+    with_impacts: bool,
 ) -> SchemaRef {
     let mut fields = vec![
         // we compress the posting lists (including row ids and frequencies),
@@ -1682,6 +2092,17 @@ fn inverted_list_schema_with_tail_codec_and_position_codec(
         arrow_schema::Field::new(MAX_SCORE_COL, datatypes::DataType::Float32, false),
         arrow_schema::Field::new(LENGTH_COL, datatypes::DataType::UInt32, false),
     ];
+    if with_impacts {
+        fields.push(arrow_schema::Field::new(
+            IMPACT_COL,
+            datatypes::DataType::List(Arc::new(Field::new(
+                "item",
+                datatypes::DataType::LargeBinary,
+                true,
+            ))),
+            false,
+        ));
+    }
     if with_position {
         fields.push(arrow_schema::Field::new(
             COMPRESSED_POSITION_COL,
@@ -1702,6 +2123,11 @@ fn inverted_list_schema_with_tail_codec_and_position_codec(
         POSTING_TAIL_CODEC_KEY.to_owned(),
         posting_tail_codec.as_str().to_owned(),
     )]);
+    metadata.insert(
+        FTS_FORMAT_VERSION_KEY.to_owned(),
+        format_version.index_version().to_string(),
+    );
+    metadata.insert(POSTING_BLOCK_SIZE_KEY.to_owned(), block_size.to_string());
     if let Some(position_codec) = position_codec.filter(|_| with_position) {
         metadata.insert(
             POSITIONS_LAYOUT_KEY.to_owned(),
@@ -1713,129 +2139,6 @@ fn inverted_list_schema_with_tail_codec_and_position_codec(
         );
     }
     Arc::new(arrow_schema::Schema::new_with_metadata(fields, metadata))
-}
-
-/// Flatten the string list stream into a string stream
-pub struct FlattenStream {
-    /// Inner record batch stream with 2 columns:
-    /// 1. doc_col: List(Utf8) or List(LargeUtf8)
-    /// 2. row_id_col: UInt64
-    inner: SendableRecordBatchStream,
-    field_type: DataType,
-    data_type: DataType,
-}
-
-impl FlattenStream {
-    pub fn new(input: SendableRecordBatchStream) -> Self {
-        let schema = input.schema();
-        let field = schema.field(0);
-        let data_type = match field.data_type() {
-            DataType::List(f) if matches!(f.data_type(), DataType::Utf8) => DataType::Utf8,
-            DataType::List(f) if matches!(f.data_type(), DataType::LargeUtf8) => {
-                DataType::LargeUtf8
-            }
-            DataType::LargeList(f) if matches!(f.data_type(), DataType::Utf8) => DataType::Utf8,
-            DataType::LargeList(f) if matches!(f.data_type(), DataType::LargeUtf8) => {
-                DataType::LargeUtf8
-            }
-            _ => panic!(
-                "expect data type List(Utf8) or List(LargeUtf8) but got {:?}",
-                field.data_type()
-            ),
-        };
-        Self {
-            inner: input,
-            field_type: field.data_type().clone(),
-            data_type,
-        }
-    }
-}
-
-impl Stream for FlattenStream {
-    type Item = datafusion_common::Result<RecordBatch>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(batch))) => {
-                let doc_col = batch.column(0);
-                let batch = match self.field_type {
-                    DataType::List(_) => flatten_string_list::<i32>(&batch, doc_col).map_err(|e| {
-                        datafusion_common::error::DataFusionError::Execution(format!(
-                            "flatten string list error: {}",
-                            e
-                        ))
-                    }),
-                    DataType::LargeList(_) => {
-                        flatten_string_list::<i64>(&batch, doc_col).map_err(|e| {
-                            datafusion_common::error::DataFusionError::Execution(format!(
-                                "flatten string list error: {}",
-                                e
-                            ))
-                        })
-                    }
-                    _ => unreachable!(
-                        "expect data type List or LargeList but got {:?}",
-                        self.field_type
-                    ),
-                };
-                Poll::Ready(Some(batch))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl RecordBatchStream for FlattenStream {
-    fn schema(&self) -> SchemaRef {
-        let schema = Schema::new(vec![
-            Field::new(
-                self.inner.schema().field(0).name(),
-                self.data_type.clone(),
-                true,
-            ),
-            ROW_ID_FIELD.clone(),
-        ]);
-
-        Arc::new(schema)
-    }
-}
-
-fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
-    batch: &RecordBatch,
-    doc_col: &Arc<dyn Array>,
-) -> Result<RecordBatch> {
-    let docs = doc_col.as_list::<Offset>();
-    let row_ids = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-
-    let row_ids = row_ids
-        .values()
-        .iter()
-        .zip(docs.iter())
-        .flat_map(|(row_id, doc)| std::iter::repeat_n(*row_id, doc.map(|d| d.len()).unwrap_or(0)));
-
-    let row_ids = Arc::new(UInt64Array::from_iter_values(row_ids));
-    let docs = match docs.value_type() {
-        datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => docs.values().clone(),
-        _ => {
-            return Err(Error::index(format!(
-                "expect data type String or LargeString but got {}",
-                docs.value_type()
-            )));
-        }
-    };
-
-    let schema = Schema::new(vec![
-        Field::new(
-            batch.schema().field(0).name(),
-            docs.data_type().clone(),
-            true,
-        ),
-        ROW_ID_FIELD.clone(),
-    ]);
-    let batch = RecordBatch::try_new(Arc::new(schema), vec![docs, row_ids])?;
-    Ok(batch)
 }
 
 pub(crate) fn token_file_path(partition_id: u64) -> String {
@@ -1852,6 +2155,10 @@ pub(crate) fn doc_file_path(partition_id: u64) -> String {
 
 pub(crate) fn part_metadata_file_path(partition_id: u64) -> String {
     staged_partition_file_path(partition_id, METADATA_FILE)
+}
+
+fn empty_part_metadata_file_path(fragment_mask: u64) -> String {
+    format!("{STAGED_PARTITION_DIR}/part_empty_{fragment_mask}_{METADATA_FILE}")
 }
 
 const PARTITION_FILE_SUFFIXES: [&str; 3] = [TOKENS_FILE, INVERT_LIST_FILE, DOCS_FILE];
@@ -1958,7 +2265,6 @@ async fn merge_metadata_files(
     let mut params = None;
     let mut token_set_format = None;
     let mut format_version = None;
-    let mut posting_tail_codec = None;
     let mut deleted_fragments = RoaringBitmap::new();
     progress
         .stage_start(
@@ -1999,9 +2305,6 @@ async fn merge_metadata_files(
         }
         if format_version.is_none() {
             format_version = Some(parse_format_version_from_metadata(metadata)?);
-        }
-        if posting_tail_codec.is_none() {
-            posting_tail_codec = Some(parse_posting_tail_codec(metadata)?);
         }
 
         if reader.num_rows() > 0 {
@@ -2068,8 +2371,7 @@ async fn merge_metadata_files(
         None,
         deleted_fragments,
     )
-    .with_format_version(format_version.unwrap_or(InvertedListFormatVersion::V1))
-    .with_posting_tail_codec(posting_tail_codec.unwrap_or(PostingTailCodec::Fixed32));
+    .with_format_version(format_version.unwrap_or(InvertedListFormatVersion::V1));
     progress
         .stage_start("write_merged_metadata", Some(1), "files")
         .await?;
@@ -2107,11 +2409,11 @@ pub fn document_input(
     let schema = input.schema();
     let field = schema.column_with_name(column).expect_ok()?.1;
     match field.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 => Ok(input),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(input),
         DataType::List(field) | DataType::LargeList(field)
             if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
         {
-            Ok(Box::pin(FlattenStream::new(input)))
+            Ok(input)
         }
         DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
             Some(name) if name.as_str() == JSON_EXT_NAME => {
@@ -2135,10 +2437,12 @@ pub fn document_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Index;
     use crate::metrics::NoOpMetricsCollector;
     use crate::progress::IndexBuildProgress;
+    use crate::scalar::inverted::{MemBM25Scorer, Scorer};
     use crate::scalar::{IndexFile, IndexReader, IndexWriter, ScalarIndex};
-    use arrow_array::{RecordBatch, StringArray, UInt64Array};
+    use arrow_array::{RecordBatch, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -2156,8 +2460,9 @@ mod tests {
     use std::any::Any;
     use std::fmt::{Display, Formatter};
     use std::ops::Range;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     fn make_doc_batch(doc: &str, row_id: u64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -2166,6 +2471,17 @@ mod tests {
         ]));
         let docs = Arc::new(StringArray::from(vec![Some(doc)]));
         let row_ids = Arc::new(UInt64Array::from(vec![row_id]));
+        RecordBatch::try_new(schema, vec![docs, row_ids]).unwrap()
+    }
+
+    fn make_doc_batch_from_docs(docs: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let num_rows = docs.len();
+        let docs = Arc::new(StringArray::from(docs));
+        let row_ids = Arc::new(UInt64Array::from_iter_values(0..num_rows as u64));
         RecordBatch::try_new(schema, vec![docs, row_ids]).unwrap()
     }
 
@@ -2249,6 +2565,77 @@ mod tests {
 
         async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
             self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct CopyFailingObjectStore {
+        inner: InMemory,
+        copy_count: Arc<AtomicUsize>,
+    }
+
+    impl Display for CopyFailingObjectStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CopyFailingObjectStore")
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for CopyFailingObjectStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, _from: &Path, _to: &Path, _opts: CopyOptions) -> OSResult<()> {
+            self.copy_count.fetch_add(1, Ordering::SeqCst);
+            Err(object_store::Error::Generic {
+                store: "CopyFailingObjectStore",
+                source: "native copy disabled in test".into(),
+            })
         }
     }
 
@@ -2556,8 +2943,7 @@ mod tests {
         }
 
         async fn add_global_buffer(&mut self, _data: Bytes) -> Result<u32> {
-            // The posting-list writer stores the group offsets as a global
-            // buffer; mirror the real writer's 1-indexed return value.
+            // Mirror the real writer's 1-indexed return value.
             Ok(1)
         }
 
@@ -2640,63 +3026,6 @@ mod tests {
         async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
             Ok(vec![])
         }
-    }
-
-    fn collect_group_starts(config: PostingGroupConfig, sizes: &[usize]) -> Vec<u32> {
-        let mut acc = PostingGroupAccumulator::new(config);
-        for &size in sizes {
-            acc.push(size);
-        }
-        acc.into_starts()
-    }
-
-    #[test]
-    fn test_group_accumulator_cuts_on_target_bytes() {
-        let config = PostingGroupConfig {
-            target_bytes: 100,
-            max_tokens: 1000,
-        };
-        // 40+40 -> cut at 80? no, 80 < 100; third 40 reaches 120 >= 100 -> cut.
-        // So group 0 = tokens [0,3), then a new group starts at token 3.
-        let starts = collect_group_starts(config, &[40, 40, 40, 10, 10]);
-        assert_eq!(starts, vec![0, 3]);
-    }
-
-    #[test]
-    fn test_group_accumulator_cuts_on_max_tokens() {
-        let config = PostingGroupConfig {
-            target_bytes: 1_000_000,
-            max_tokens: 2,
-        };
-        // Byte target never reached; cap of 2 forces a cut every 2 tokens.
-        let starts = collect_group_starts(config, &[1, 1, 1, 1, 1]);
-        assert_eq!(starts, vec![0, 2, 4]);
-    }
-
-    #[test]
-    fn test_group_accumulator_clamps_oversized_term() {
-        let config = PostingGroupConfig {
-            target_bytes: 100,
-            max_tokens: 64,
-        };
-        // A term larger than the target that *starts* a group occupies that
-        // group alone ([1, 2) here), so a single huge posting list is never
-        // forced to share a cache entry. Token 0 (==100) closes its own group
-        // first; the trailing small terms regroup after the big one.
-        let starts = collect_group_starts(config, &[100, 5000, 10, 10]);
-        assert_eq!(starts, vec![0, 1, 2]);
-
-        // A huge term encountered mid-group is absorbed and closes that group;
-        // we never split one term across groups.
-        let starts = collect_group_starts(config, &[10, 10, 5000, 10, 10]);
-        assert_eq!(starts, vec![0, 3]);
-    }
-
-    #[test]
-    fn test_group_accumulator_empty_and_single() {
-        let config = PostingGroupConfig::default();
-        assert_eq!(collect_group_starts(config, &[]), Vec::<u32>::new());
-        assert_eq!(collect_group_starts(config, &[10]), vec![0]);
     }
 
     #[tokio::test]
@@ -2833,6 +3162,10 @@ mod tests {
         expected_partitions.dedup();
         let remapped_partitions = (0..expected_partitions.len() as u64).collect::<Vec<_>>();
         assert_eq!(written_partitions, remapped_partitions);
+        assert_eq!(
+            parse_format_version_from_metadata(metadata)?,
+            InvertedListFormatVersion::V2
+        );
 
         for (new_id, old_id) in expected_partitions.iter().enumerate() {
             assert_partition_file_markers(base_store.as_ref(), new_id as u64, *old_id).await?;
@@ -2853,6 +3186,99 @@ mod tests {
                 );
             }
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fts_remap_streams_files_when_native_copy_fails() -> Result<()> {
+        let copy_count = Arc::new(AtomicUsize::new(0));
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = Arc::new(CopyFailingObjectStore {
+            inner: InMemory::new(),
+            copy_count: copy_count.clone(),
+        });
+        let object_store = Arc::new(object_store);
+        let index_path = Path::from("index");
+        let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_path.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let store = Arc::new(NoRenameStore::new(base_store.clone()));
+        let partitions = vec![5_u64, 1_u64];
+        let metadata_builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default(),
+            None,
+            Vec::new(),
+            TokenSetFormat::default(),
+            None,
+            RoaringBitmap::new(),
+        );
+
+        for partition_id in &partitions {
+            write_partition_files(
+                base_store.as_ref(),
+                *partition_id,
+                PartitionWriteTarget::Staged,
+            )
+            .await?;
+            metadata_builder
+                .write_part_metadata(base_store.as_ref(), *partition_id)
+                .await?;
+        }
+
+        let probe_source = staged_partition_file_path(partitions[0], TOKENS_FILE);
+        let probe_source_size = base_store
+            .open_index_file(&probe_source)
+            .await?
+            .file_size_bytes()
+            .expect("written index file should report its size");
+        let copied = base_store
+            .copy_index_file_to(&probe_source, "probe.lance", base_store.as_ref())
+            .await?;
+        assert_eq!(copied.path, "probe.lance");
+        assert_eq!(copied.size_bytes, probe_source_size);
+        assert_eq!(
+            read_partition_file_marker(base_store.as_ref(), "probe.lance").await?,
+            partitions[0]
+        );
+
+        let renamed = base_store
+            .rename_index_file("probe.lance", "renamed-probe.lance")
+            .await?;
+        assert_eq!(renamed.path, "renamed-probe.lance");
+        assert_eq!(renamed.size_bytes, probe_source_size);
+        assert!(base_store.open_index_file("probe.lance").await.is_err());
+        assert_eq!(
+            read_partition_file_marker(base_store.as_ref(), "renamed-probe.lance").await?,
+            partitions[0]
+        );
+
+        let progress = Arc::new(RecordingProgress::default());
+        merge_index_files(object_store.as_ref(), &index_path, store, progress.clone()).await?;
+
+        let mut expected_partitions = partitions;
+        expected_partitions.sort_unstable();
+        for (new_id, old_id) in expected_partitions.iter().enumerate() {
+            assert_partition_file_markers(base_store.as_ref(), new_id as u64, *old_id).await?;
+        }
+        let remap_progress = progress
+            .recorded_events()
+            .into_iter()
+            .filter_map(|(kind, stage, completed)| {
+                (kind == "progress" && stage == "remap_partition_files").then_some(completed)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            remap_progress.last().copied(),
+            Some((expected_partitions.len() * PARTITION_FILE_SUFFIXES.len()) as u64)
+        );
+        assert_eq!(
+            copy_count.load(Ordering::SeqCst),
+            0,
+            "bulk index movement must not invoke native object-store copy"
+        );
 
         Ok(())
     }
@@ -3123,6 +3549,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_distributed_empty_build_does_not_finalize_shared_directory() -> Result<()> {
+        let index_dir = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let empty_fragment_mask = 7_u64 << 32;
+        let batch = make_doc_batch_from_docs(vec![None, None]);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let params = InvertedIndexParams {
+            lance_tokenizer: Some("text".to_string()),
+            with_position: true,
+            ..Default::default()
+        };
+        let mut builder =
+            InvertedIndexBuilder::new_with_fragment_mask(params.clone(), Some(empty_fragment_mask));
+
+        let files = builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        assert_eq!(files.len(), 1);
+        let empty_metadata_path = empty_part_metadata_file_path(empty_fragment_mask);
+        assert_eq!(files[0].path, empty_metadata_path);
+        assert!(
+            store.open_index_file(METADATA_FILE).await.is_err(),
+            "an empty shard must not finalize the shared directory"
+        );
+        let reader = store.open_index_file(&empty_metadata_path).await?;
+        let metadata = &reader.schema().metadata;
+        let partitions: Vec<u64> = serde_json::from_str(
+            metadata
+                .get("partitions")
+                .expect("partitions missing from metadata"),
+        )?;
+        assert!(partitions.is_empty());
+        let written_params: InvertedIndexParams = serde_json::from_str(
+            metadata
+                .get("params")
+                .expect("params missing from metadata"),
+        )?;
+        assert_eq!(written_params, params);
+
+        let non_empty_fragment_mask = 8_u64 << 32;
+        let batch = make_doc_batch("searchable text", non_empty_fragment_mask);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let mut builder =
+            InvertedIndexBuilder::new_with_fragment_mask(params, Some(non_empty_fragment_mask));
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        let staged_metadata =
+            list_metadata_files(object_store.as_ref(), &index_dir.obj_path()).await?;
+        assert_eq!(staged_metadata.len(), 2);
+
+        merge_index_files(
+            object_store.as_ref(),
+            &index_dir.obj_path(),
+            store.clone(),
+            noop_progress(),
+        )
+        .await?;
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(index.partition_count(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_merge_index_files_is_noop_when_metadata_exists() -> Result<()> {
         let index_dir = TempDir::default();
         let object_store = Arc::new(ObjectStore::local());
@@ -3184,6 +3684,8 @@ mod tests {
                 fragment_mask: None,
                 token_set_format,
                 worker_memory_limit_bytes: u64::MAX,
+                block_size: params.block_size,
+                coordinate_rank: 0,
             },
         )
         .await?;
@@ -3207,6 +3709,8 @@ mod tests {
                 fragment_mask: None,
                 token_set_format,
                 worker_memory_limit_bytes: u64::MAX,
+                block_size: params.block_size,
+                coordinate_rank: 0,
             },
         )
         .await?;
@@ -3230,7 +3734,8 @@ mod tests {
             token_set_format,
             None,
             RoaringBitmap::new(),
-        );
+        )
+        .with_format_version(InvertedListFormatVersion::V1);
         builder.write(dest_store.as_ref()).await?;
 
         let metadata_reader = dest_store.open_index_file(METADATA_FILE).await?;
@@ -3294,6 +3799,14 @@ mod tests {
             .await?;
 
         let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
+        let derived_params = index.derive_index_params()?;
+        let derived_params: InvertedIndexParams =
+            serde_json::from_str(derived_params.params.as_deref().unwrap())?;
+        assert_eq!(
+            derived_params.format_version,
+            Some(InvertedListFormatVersion::V1)
+        );
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("doc", DataType::Utf8, true),
             Field::new(ROW_ID, DataType::UInt64, false),
@@ -3345,6 +3858,39 @@ mod tests {
         assert_eq!(builder.posting_tail_codec, PostingTailCodec::VarintDelta);
     }
 
+    #[test]
+    fn test_v3_128_reuses_v2_physical_layout() {
+        for with_position in [false, true] {
+            for with_impacts in [false, true] {
+                let v2 = inverted_list_schema_for_version_with_block_size_and_impacts(
+                    with_position,
+                    InvertedListFormatVersion::V2,
+                    LEGACY_BLOCK_SIZE,
+                    with_impacts,
+                );
+                let v3 = inverted_list_schema_for_version_with_block_size_and_impacts(
+                    with_position,
+                    InvertedListFormatVersion::V3,
+                    LEGACY_BLOCK_SIZE,
+                    with_impacts,
+                );
+
+                assert_eq!(v2.fields(), v3.fields());
+                let mut v2_metadata = v2.metadata.clone();
+                let mut v3_metadata = v3.metadata.clone();
+                assert_eq!(
+                    v2_metadata.remove(FTS_FORMAT_VERSION_KEY).as_deref(),
+                    Some("2")
+                );
+                assert_eq!(
+                    v3_metadata.remove(FTS_FORMAT_VERSION_KEY).as_deref(),
+                    Some("3")
+                );
+                assert_eq!(v2_metadata, v3_metadata);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_inverted_index_without_positions_tracks_frequency() -> Result<()> {
         let index_dir = TempDir::default();
@@ -3393,6 +3939,177 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats() -> Result<()> {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch = make_doc_batch_from_docs(vec![
+            Some(""),
+            Some("   "),
+            Some("the"),
+            Some("overlength"),
+            None,
+            Some("hello"),
+        ]);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .with_position(false)
+                .remove_stop_words(true)
+                .stem(false)
+                .max_token_length(Some(6))
+                .num_workers(1);
+
+        let mut builder = InvertedIndexBuilder::new(params);
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        let (total_tokens, num_docs, token_docs) = index
+            .bm25_stats_for_terms(&["hello".to_string()], None)
+            .await?;
+        assert_eq!(total_tokens, 1);
+        assert_eq!(num_docs, 1);
+        assert_eq!(token_docs, vec![1]);
+
+        let actual_scorer = MemBM25Scorer::new(
+            total_tokens,
+            num_docs,
+            HashMap::from([("hello".to_string(), token_docs[0])]),
+        );
+        let expected_scorer = MemBM25Scorer::new(1, 1, HashMap::from([("hello".to_string(), 1)]));
+        assert_eq!(
+            actual_scorer.avg_doc_length(),
+            expected_scorer.avg_doc_length()
+        );
+        assert_eq!(
+            actual_scorer.query_weight("hello"),
+            expected_scorer.query_weight("hello")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_all_empty_string_documents_build_empty_index() -> Result<()> {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch = make_doc_batch_from_docs(vec![Some(""), Some("   "), None]);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .with_position(false)
+                .remove_stop_words(false)
+                .stem(false)
+                .max_token_length(None)
+                .num_workers(1);
+
+        let mut builder = InvertedIndexBuilder::new(params);
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        assert!(index.partitions.is_empty());
+        let statistics = index.statistics()?;
+        assert_eq!(statistics["num_tokens"], 0);
+        assert_eq!(statistics["num_docs"], 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_zero_token_coordinate_documents_are_preserved_in_corpus_stats() -> Result<()> {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(doc_index_storage_column(0), DataType::UInt32, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    None,
+                    Some(""),
+                    Some("   "),
+                    Some("the"),
+                    Some("overlength"),
+                ])),
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3, 4])),
+                Arc::new(UInt64Array::from(vec![7, 7, 7, 7, 7])),
+            ],
+        )?;
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .with_position(false)
+                .remove_stop_words(true)
+                .stem(false)
+                .max_token_length(Some(6))
+                .num_workers(1);
+
+        let mut builder = InvertedIndexBuilder::new(params);
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        let statistics = index.statistics()?;
+        assert_eq!(statistics["num_tokens"], 0);
+        assert_eq!(statistics["num_docs"], 5);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_all_empty_string_documents_do_not_create_tail_partition() -> Result<()> {
+        let tokenizer = InvertedIndexParams::default().build()?;
+        let store = Arc::new(CountingStore::new());
+        let id_alloc = Arc::new(AtomicU64::new(0));
+        let mut worker = IndexWorker::new(
+            tokenizer,
+            store,
+            id_alloc,
+            IndexWorkerConfig {
+                with_position: false,
+                format_version: InvertedListFormatVersion::V1,
+                fragment_mask: None,
+                token_set_format: TokenSetFormat::default(),
+                worker_memory_limit_bytes: u64::MAX,
+                block_size: InvertedIndexParams::default().block_size,
+                coordinate_rank: 0,
+            },
+        )
+        .await?;
+
+        worker
+            .process_batch(make_doc_batch_from_docs(vec![Some(""), Some("   "), None]))
+            .await?;
+        let output = worker.finish().await?;
+
+        assert!(output.partitions.is_empty());
+        assert!(output.tail_partition.is_none());
+
+        Ok(())
+    }
+
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
     #[derive(Debug, Default)]
@@ -3406,6 +4123,38 @@ mod tests {
 
         async fn stage_progress(&self, _stage: &str, _completed: u64) -> Result<()> {
             Err(Error::io("injected progress failure"))
+        }
+
+        async fn stage_complete(&self, _stage: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct LateCallbackDetectingProgress {
+        calls: AtomicUsize,
+        first_callback_started: Arc<Notify>,
+        release_first_callback: Arc<Notify>,
+        update_returned: Arc<AtomicBool>,
+        callback_after_return: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl IndexBuildProgress for LateCallbackDetectingProgress {
+        async fn stage_start(&self, _stage: &str, _total: Option<u64>, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stage_progress(&self, _stage: &str, _completed: u64) -> Result<()> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.update_returned.load(Ordering::SeqCst) {
+                self.callback_after_return.notify_one();
+            }
+            if call == 0 {
+                self.first_callback_started.notify_one();
+                self.release_first_callback.notified().await;
+            }
+            Ok(())
         }
 
         async fn stage_complete(&self, _stage: &str) -> Result<()> {
@@ -3680,6 +4429,8 @@ mod tests {
                 fragment_mask: None,
                 token_set_format: TokenSetFormat::default(),
                 worker_memory_limit_bytes: u64::MAX,
+                block_size: InvertedIndexParams::default().block_size,
+                coordinate_rank: 0,
             },
         )
         .await?;
@@ -3711,6 +4462,8 @@ mod tests {
                 fragment_mask: None,
                 token_set_format: TokenSetFormat::default(),
                 worker_memory_limit_bytes: u64::MAX,
+                block_size: InvertedIndexParams::default().block_size,
+                coordinate_rank: 0,
             },
         )
         .await?;
@@ -3749,6 +4502,8 @@ mod tests {
                 fragment_mask: None,
                 token_set_format: TokenSetFormat::default(),
                 worker_memory_limit_bytes: u64::MAX,
+                block_size: InvertedIndexParams::default().block_size,
+                coordinate_rank: 0,
             },
         )
         .await?;
@@ -3797,27 +4552,208 @@ mod tests {
         assert_eq!(resolve_worker_memory_limit_bytes(&params, 16), 256 << 20);
     }
 
-    #[test]
-    fn test_merge_all_tail_partitions_combines_everything() -> Result<()> {
-        let merged = merge_all_tail_partitions(vec![
-            TailPartition {
-                builder: InnerBuilder::new(0, false, TokenSetFormat::default()),
-            },
-            TailPartition {
-                builder: InnerBuilder::new(1, false, TokenSetFormat::default()),
-            },
-            TailPartition {
-                builder: InnerBuilder::new(2, false, TokenSetFormat::default()),
-            },
-        ])?;
+    fn tail_with_docs(id: u64, num_docs: u64) -> TailPartition {
+        let mut builder = InnerBuilder::new(id, false, TokenSetFormat::default());
+        let token = builder.tokens.add(format!("token{}", id));
+        builder
+            .posting_lists
+            .resize_with(builder.tokens.len(), || PostingListBuilder::new(false));
+        for row in 0..num_docs {
+            let doc = builder.docs.append(row, 1);
+            builder.posting_lists[token as usize].add(doc, PositionRecorder::Count(1));
+        }
+        TailPartition { builder }
+    }
 
-        assert_eq!(merged.expect("merged builder should exist").id(), 0);
+    #[test]
+    fn test_merge_all_tail_partitions_combines_under_budget() -> Result<()> {
+        let merged = merge_all_tail_partitions(
+            vec![
+                tail_with_docs(0, 4),
+                tail_with_docs(1, 4),
+                tail_with_docs(2, 4),
+            ],
+            u64::MAX,
+        )?;
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id(), 0);
+        assert_eq!(merged[0].docs.len(), 12);
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_all_tail_partitions_splits_on_memory_budget() -> Result<()> {
+        let tails = vec![
+            tail_with_docs(0, 64),
+            tail_with_docs(1, 64),
+            tail_with_docs(2, 64),
+            tail_with_docs(3, 64),
+        ];
+        let single = tails[0].builder.memory_size();
+        // A budget below two builders' footprint must keep them separate.
+        let merged = merge_all_tail_partitions(tails, single + 1)?;
+        assert_eq!(merged.len(), 4);
+        assert!(merged.iter().all(|builder| builder.docs.len() == 64));
         Ok(())
     }
 
     #[test]
     fn test_merge_all_tail_partitions_returns_none_for_empty_input() -> Result<()> {
-        assert!(merge_all_tail_partitions(Vec::new())?.is_none());
+        assert!(merge_all_tail_partitions(Vec::new(), u64::MAX)?.is_empty());
+        Ok(())
+    }
+
+    /// Build an inverted index over `batches` with an explicit worker/memory
+    /// layout and return it loaded, so tests can compare query behavior
+    /// across partition shapes of the same corpus.
+    async fn build_fuzzy_corpus_index(
+        batches: Vec<RecordBatch>,
+        num_workers: usize,
+        memory_limit_mb: u64,
+    ) -> Result<(TempDir, Arc<InvertedIndex>)> {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = batches[0].schema();
+        let stream =
+            RecordBatchStreamAdapter::new(schema, stream::iter(batches.into_iter().map(Ok)));
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .with_position(false)
+                .remove_stop_words(false)
+                .stem(false)
+                .max_token_length(None)
+                .num_workers(num_workers)
+                .memory_limit_mb(memory_limit_mb);
+        let mut builder = InvertedIndexBuilder::new(params);
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        // The caller keeps the TempDir alive for as long as it queries the
+        // loaded index.
+        Ok((index_dir, index))
+    }
+
+    /// Regression test for tail-partition splitting vs fuzzy queries
+    /// (https://github.com/lance-format/lance/pull/7601#pullrequestreview):
+    /// splitting the leftover tails into budget-sized partitions must not
+    /// change fuzzy results while `max_expansions` is not the binding
+    /// constraint. Every doc carries one member of two dense fuzzy families
+    /// plus unique filler tokens, so a small worker memory budget forces
+    /// flushes and a tail split, while a fuzzy query matches every doc.
+    #[tokio::test]
+    async fn test_tail_partition_split_preserves_fuzzy_results() -> Result<()> {
+        use std::collections::HashMap;
+
+        use crate::prefilter::NoFilter;
+        use crate::scalar::inverted::document_tokenizer::DocType;
+        use crate::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
+
+        const NUM_DOCS: usize = 4000;
+        const DOCS_PER_BATCH: usize = 20;
+        let alpha_variants = ["alpha", "alphb", "alphc", "alphd", "alphe"];
+        let beta_variants = ["beta", "betb", "betc", "betd", "bete"];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batches = (0..NUM_DOCS / DOCS_PER_BATCH)
+            .map(|batch_idx| {
+                let mut docs = Vec::with_capacity(DOCS_PER_BATCH);
+                let mut row_ids = Vec::with_capacity(DOCS_PER_BATCH);
+                for row in 0..DOCS_PER_BATCH {
+                    let i = batch_idx * DOCS_PER_BATCH + row;
+                    // 8 unique filler tokens per doc grow the vocabulary so
+                    // the corpus comfortably exceeds the small worker budget.
+                    docs.push(format!(
+                        "{} {} f{i}a f{i}b f{i}c f{i}d f{i}e f{i}f f{i}g f{i}h",
+                        alpha_variants[i % alpha_variants.len()],
+                        beta_variants[i % beta_variants.len()],
+                    ));
+                    row_ids.push(i as u64);
+                }
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(docs)),
+                        Arc::new(UInt64Array::from(row_ids)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        // Reference shape: everything in one partition.
+        let (_ref_dir, ref_index) = build_fuzzy_corpus_index(batches.clone(), 1, 1024).await?;
+        assert_eq!(
+            ref_index.partitions.len(),
+            1,
+            "reference build should stay in a single partition"
+        );
+
+        // Tail-heavy shape: a 1MB budget across 2 workers forces flushes and
+        // splits the leftover tails by the same budget.
+        let (_split_dir, split_index) = build_fuzzy_corpus_index(batches, 2, 1).await?;
+        assert!(
+            split_index.partitions.len() > 1,
+            "small worker budget should produce multiple partitions, got {}",
+            split_index.partitions.len()
+        );
+
+        async fn fuzzy_search(
+            index: &InvertedIndex,
+            tokens: &[&str],
+            operator: Operator,
+        ) -> HashMap<u64, f32> {
+            let tokens = Arc::new(Tokens::new(
+                tokens.iter().map(|t| t.to_string()).collect(),
+                DocType::Text,
+            ));
+            // max_expansions=50 is far above the 10 family variants, so the
+            // per-partition vs global cap distinction cannot bind here.
+            let params = Arc::new(
+                FtsSearchParams::new()
+                    .with_limit(Some(NUM_DOCS))
+                    .with_fuzziness(Some(1))
+                    .with_max_expansions(50),
+            );
+            let (row_ids, scores) = index
+                .bm25_search(
+                    tokens,
+                    params,
+                    operator,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                    None,
+                )
+                .await
+                .unwrap();
+            row_ids.into_iter().zip(scores).collect()
+        }
+
+        for (tokens, operator) in [
+            (vec!["alphx"], Operator::Or),
+            (vec!["alphx", "betx"], Operator::Or),
+            (vec!["alphx", "betx"], Operator::And),
+        ] {
+            let reference = fuzzy_search(&ref_index, &tokens, operator).await;
+            let split = fuzzy_search(&split_index, &tokens, operator).await;
+            assert_eq!(
+                reference.len(),
+                NUM_DOCS,
+                "every doc carries a family variant, {tokens:?} {operator:?} should match all"
+            );
+            assert_eq!(
+                reference, split,
+                "fuzzy {operator:?} results must not depend on the tail partition shape for {tokens:?}"
+            );
+        }
+
         Ok(())
     }
 
@@ -3839,10 +4775,15 @@ mod tests {
         let second_doc = second.docs.append(20, 2);
         second.posting_lists[world as usize].add(second_doc, PositionRecorder::Count(2));
 
-        let merged = merge_tail_partition_group(vec![
-            TailPartition { builder: first },
-            TailPartition { builder: second },
-        ])?;
+        let merged = merge_all_tail_partitions(
+            vec![
+                TailPartition { builder: first },
+                TailPartition { builder: second },
+            ],
+            u64::MAX,
+        )?;
+        assert_eq!(merged.len(), 1);
+        let merged = &merged[0];
 
         assert_eq!(merged.id(), 0);
         assert_eq!(merged.docs.len(), 2);
@@ -3878,6 +4819,11 @@ mod tests {
         first.tokens.remap(&[1]);
         first.posting_lists.remove(1);
         assert_eq!(first.tokens.len(), first.posting_lists.len());
+
+        // Mimic a token set persisted by a writer from before #7115. Converting the
+        // loaded set for mutation must restore the dense token-id invariant.
+        first.tokens.next_id = 9;
+        first.tokens = std::mem::take(&mut first.tokens).into_mutable();
 
         // `second` contributes a brand-new token absent from `first`. Before the fix,
         // get_or_add returned the stale next_id, indexing past posting_lists.
@@ -4005,6 +4951,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_index_joins_workers_before_returning_stream_error() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let first_callback_started = Arc::new(Notify::new());
+        let release_first_callback = Arc::new(Notify::new());
+        let update_returned = Arc::new(AtomicBool::new(false));
+        let callback_after_return = Arc::new(Notify::new());
+        let progress = Arc::new(LateCallbackDetectingProgress {
+            calls: AtomicUsize::new(0),
+            first_callback_started: first_callback_started.clone(),
+            release_first_callback: release_first_callback.clone(),
+            update_returned: update_returned.clone(),
+            callback_after_return: callback_after_return.clone(),
+        });
+
+        let first_batch = make_doc_batch("hello world", 0);
+        let second_batch = make_doc_batch("goodbye world", 1);
+        let schema = first_batch.schema();
+        let source = stream::iter(vec![Ok(first_batch), Ok(second_batch)]).chain(stream::once({
+            let first_callback_started = first_callback_started.clone();
+            async move {
+                first_callback_started.notified().await;
+                Err(datafusion::error::DataFusionError::Execution(
+                    "injected stream failure".to_owned(),
+                ))
+            }
+        }));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, source));
+        let params = InvertedIndexParams::default().num_workers(1);
+        let mut builder = InvertedIndexBuilder::new(params).with_progress(progress);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            builder.update_index(stream, store.as_ref()),
+        )
+        .await
+        .expect("update_index should not hang")
+        .expect_err("stream failure should be returned");
+        assert!(
+            result.to_string().contains("injected stream failure"),
+            "unexpected error: {result}"
+        );
+
+        update_returned.store(true, Ordering::SeqCst);
+        release_first_callback.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), callback_after_return.notified())
+                .await
+                .is_err(),
+            "detached worker invoked progress after update_index returned"
+        );
+    }
+
+    #[tokio::test]
     async fn test_new_index_has_empty_deleted_fragments() {
         let index_dir = TempDir::default();
         let store = Arc::new(LanceIndexStore::new(
@@ -4073,7 +5077,10 @@ mod tests {
         // Remap the index via the ScalarIndex trait method
         use crate::scalar::ScalarIndex;
         let mapping = HashMap::from([(0u64, Some(50 << 32))]);
-        index.remap(&mapping, dest_store.as_ref()).await.unwrap();
+        index
+            .remap(&RowAddrRemap::direct(mapping), dest_store.as_ref())
+            .await
+            .unwrap();
 
         // Reload from dest and verify deleted fragments are preserved
         let remapped_index = InvertedIndex::load(dest_store.clone(), None, &LanceCache::no_cache())

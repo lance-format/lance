@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -51,10 +50,6 @@ impl LanceSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for LanceSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.tables
             .iter()

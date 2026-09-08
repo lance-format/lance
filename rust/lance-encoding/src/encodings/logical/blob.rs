@@ -13,7 +13,9 @@ use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field as ArrowField, Fields};
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::{
-    Error, Result, datatypes::BLOB_V2_DESC_FIELDS, datatypes::Field, error::LanceOptionExt,
+    Error, Result,
+    datatypes::{BLOB_V2_DESC_FIELDS, BlobV2Layout, Field},
+    error::LanceOptionExt,
 };
 
 use crate::{
@@ -21,7 +23,6 @@ use crate::{
     constants::PACKED_STRUCT_META_KEY,
     decoder::PageEncoding,
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
-    encodings::logical::primitive::PrimitiveStructuralEncoder,
     format::ProtobufUtils21,
     repdef::{DefinitionInterpretation, RepDefBuilder},
 };
@@ -42,9 +43,7 @@ pub struct BlobStructuralEncoder {
 impl BlobStructuralEncoder {
     pub fn new(
         field: &Field,
-        column_index: u32,
-        options: &crate::encoder::EncodingOptions,
-        compression_strategy: Arc<dyn crate::compression::CompressionStrategy>,
+        make_descriptor_encoder: impl FnOnce(Field) -> Result<Box<dyn FieldEncoder>>,
     ) -> Result<Self> {
         // Create descriptor field: struct<position: u64, size: u64>
         // Preserve the original field's metadata for packed struct
@@ -63,13 +62,7 @@ impl BlobStructuralEncoder {
         )?;
 
         // Use PrimitiveStructuralEncoder to handle the descriptor
-        let descriptor_encoder = Box::new(PrimitiveStructuralEncoder::try_new(
-            options,
-            compression_strategy,
-            column_index,
-            descriptor_field,
-            Arc::new(HashMap::new()),
-        )?);
+        let descriptor_encoder = make_descriptor_encoder(descriptor_field)?;
 
         Ok(Self {
             descriptor_encoder,
@@ -137,14 +130,18 @@ impl FieldEncoder for BlobStructuralEncoder {
         let def = repdef.definition_levels.as_ref();
         let def_meaning: Arc<[DefinitionInterpretation]> = repdef.def_meaning.into();
 
-        match self.def_meaning.as_ref() {
-            None => {
-                self.def_meaning = Some(def_meaning.clone());
+        // A blob page stores one definition interpretation for all of its rows.
+        // The descriptor encoder can buffer multiple input arrays, so finish the
+        // pending page before a later array changes from all-valid to nullable (or
+        // vice versa).
+        let mut encode_tasks = match self.def_meaning.as_ref() {
+            Some(existing) if existing != &def_meaning => {
+                let existing = existing.clone();
+                Self::wrap_tasks(self.descriptor_encoder.flush(external_buffers)?, existing)
             }
-            Some(existing) => {
-                debug_assert_eq!(existing, &def_meaning);
-            }
-        }
+            _ => Vec::new(),
+        };
+        self.def_meaning = Some(def_meaning.clone());
 
         // Collect positions and sizes
         let mut positions = Vec::with_capacity(binary_array.len());
@@ -192,15 +189,16 @@ impl FieldEncoder for BlobStructuralEncoder {
         ));
 
         // Delegate to descriptor encoder
-        let encode_tasks = self.descriptor_encoder.maybe_encode(
+        let descriptor_tasks = self.descriptor_encoder.maybe_encode(
             descriptor_array,
             external_buffers,
             RepDefBuilder::default(),
             row_number,
             num_rows,
         )?;
+        encode_tasks.extend(Self::wrap_tasks(descriptor_tasks, def_meaning));
 
-        Ok(Self::wrap_tasks(encode_tasks, def_meaning))
+        Ok(encode_tasks)
     }
 
     fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
@@ -236,9 +234,7 @@ pub struct BlobV2StructuralEncoder {
 impl BlobV2StructuralEncoder {
     pub fn new(
         field: &Field,
-        column_index: u32,
-        options: &crate::encoder::EncodingOptions,
-        compression_strategy: Arc<dyn crate::compression::CompressionStrategy>,
+        make_descriptor_encoder: impl FnOnce(Field) -> Result<Box<dyn FieldEncoder>>,
     ) -> Result<Self> {
         let mut descriptor_metadata = HashMap::with_capacity(1);
         descriptor_metadata.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
@@ -250,13 +246,7 @@ impl BlobV2StructuralEncoder {
                 .with_metadata(descriptor_metadata),
         )?;
 
-        let descriptor_encoder = Box::new(PrimitiveStructuralEncoder::try_new(
-            options,
-            compression_strategy,
-            column_index,
-            descriptor_field,
-            Arc::new(HashMap::new()),
-        )?);
+        let descriptor_encoder = make_descriptor_encoder(descriptor_field)?;
 
         Ok(Self { descriptor_encoder })
     }
@@ -267,15 +257,30 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
-        mut repdef: RepDefBuilder,
+        repdef: RepDefBuilder,
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        let struct_arr = array.as_struct();
-        if let Some(validity) = struct_arr.nulls() {
-            repdef.add_validity_bitmap(validity.clone());
-        } else {
-            repdef.add_no_null(struct_arr.len());
+        let struct_arr = array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!(
+                        "Blob v2 encoder expected StructArray, got {}",
+                        array.data_type()
+                    )
+                    .into(),
+                )
+            })?;
+        if BlobV2Layout::classify(struct_arr.fields()) != Some(BlobV2Layout::Prepared) {
+            let actual = BlobV2Layout::classify(struct_arr.fields())
+                .map(|layout| layout.to_string())
+                .unwrap_or_else(|| format!("unrecognized ({:?})", struct_arr.fields()));
+            return Err(Error::invalid_input_source(
+                format!("Blob v2 encoder expected prepared array layout, got {actual} layout")
+                    .into(),
+            ));
         }
 
         let kind_col = struct_arr
@@ -403,7 +408,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         let descriptor_array = Arc::new(StructArray::try_new(
             BLOB_V2_DESC_FIELDS.clone(),
             children,
-            None,
+            struct_arr.nulls().cloned(),
         )?) as ArrayRef;
 
         self.descriptor_encoder.maybe_encode(
@@ -435,31 +440,80 @@ impl FieldEncoder for BlobV2StructuralEncoder {
 mod tests {
     use super::*;
     use crate::{
-        compression::DefaultCompressionStrategy,
         encoder::{ColumnIndexSequence, EncodingOptions},
         testing::{
-            TestCases, check_round_trip_encoding_of_data,
-            check_round_trip_encoding_of_data_with_expected,
+            TestCases, TestEncoding, check_round_trip_encoding_of_data,
+            check_round_trip_encoding_of_data_with_expected, create_test_field_encoder,
+            test_encoding_strategy,
         },
-        version::LanceFileVersion,
     };
     use arrow_array::{
         ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, Field as ArrowField};
+    use lance_core::datatypes::BLOB_V2_LOGICAL_MINIMAL_FIELDS;
 
     #[test]
     fn test_blob_encoder_creation() {
-        let field =
-            Field::try_from(ArrowField::new("blob_field", DataType::LargeBinary, true)).unwrap();
+        let field = Field::try_from(
+            ArrowField::new("blob_field", DataType::LargeBinary, true).with_metadata(
+                HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]),
+            ),
+        )
+        .unwrap();
         let mut column_index = ColumnIndexSequence::default();
-        let column_idx = column_index.next_column_index(0);
         let options = EncodingOptions::default();
-        let compression = Arc::new(DefaultCompressionStrategy::new());
+        let strategy = test_encoding_strategy(TestEncoding::StructuralU16);
 
-        let encoder = BlobStructuralEncoder::new(&field, column_idx, &options, compression);
+        let encoder =
+            create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options);
 
         assert!(encoder.is_ok());
+    }
+
+    #[test]
+    fn test_blob_v2_encoder_rejects_logical_array_layout() {
+        let field = Field::try_from(
+            ArrowField::new(
+                "blob_field",
+                DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone()),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+            )])),
+        )
+        .unwrap();
+        let mut column_index = ColumnIndexSequence::default();
+        let options = EncodingOptions::default();
+        let strategy = test_encoding_strategy(TestEncoding::StructuralU32);
+        let mut encoder =
+            create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options)
+                .unwrap();
+        let array = Arc::new(
+            StructArray::try_new(
+                BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone(),
+                vec![
+                    Arc::new(LargeBinaryArray::from(vec![Some(b"payload".as_ref())])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+                ],
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let mut external_buffers = OutOfLineBuffers::new(0, 8);
+        let Err(error) =
+            encoder.maybe_encode(array, &mut external_buffers, RepDefBuilder::default(), 0, 1)
+        else {
+            panic!("logical array layout unexpectedly reached the descriptor encoder");
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("expected prepared array layout, got logical layout")
+        );
     }
 
     #[tokio::test]
@@ -471,12 +525,12 @@ mod tests {
         )
         .unwrap();
         let mut column_index = ColumnIndexSequence::default();
-        let column_idx = column_index.next_column_index(0);
         let options = EncodingOptions::default();
-        let compression = Arc::new(DefaultCompressionStrategy::new());
+        let strategy = test_encoding_strategy(TestEncoding::StructuralU16);
 
         let mut encoder =
-            BlobStructuralEncoder::new(&field, column_idx, &options, compression).unwrap();
+            create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options)
+                .unwrap();
 
         // Create test data with larger blobs
         let large_data = vec![0u8; 1024 * 100]; // 100KB blob
@@ -529,7 +583,53 @@ mod tests {
         // Use the standard test harness
         check_round_trip_encoding_of_data(
             vec![array],
-            &TestCases::default().with_max_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_array_and_u16_encodings(),
+            blob_metadata,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_blob_round_trip_empty_values() {
+        // Empty values share size == 0 with nulls in the descriptor layout
+        // and schedule no read; each must decode to zero-length bytes without
+        // consuming the read result of a following non-empty blob. Empties
+        // are placed before payloads so a misassignment corrupts the output
+        // instead of only exhausting the read iterator.
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+
+        let val1: &[u8] = &vec![1u8; 1024];
+        let val2: &[u8] = &vec![2u8; 10240];
+        let empty: &[u8] = &[];
+        let array = Arc::new(LargeBinaryArray::from(vec![
+            Some(empty),
+            Some(val1),
+            None,
+            Some(empty),
+            Some(val2),
+            None,
+            Some(empty),
+        ]));
+
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_blob_round_trip_varying_chunk_nullability() {
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let all_valid = Arc::new(LargeBinaryArray::from(vec![Some(b"first".as_ref())]));
+        let with_null = Arc::new(LargeBinaryArray::from(vec![
+            Some(b"second".as_ref()),
+            None,
+            Some(b"".as_ref()),
+        ]));
+        let all_valid_again = Arc::new(LargeBinaryArray::from(vec![Some(b"last".as_ref())]));
+
+        check_round_trip_encoding_of_data(
+            vec![all_valid, with_null, all_valid_again],
+            &TestCases::default().with_encoding(TestEncoding::StructuralU16),
             blob_metadata,
         )
         .await;
@@ -607,7 +707,7 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default().with_u32_structural_encodings(),
             blob_metadata,
         )
         .await;
@@ -672,7 +772,7 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default().with_u32_structural_encodings(),
             blob_metadata,
         )
         .await;
@@ -734,7 +834,7 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default().with_u32_structural_encodings(),
             blob_metadata,
         )
         .await;
@@ -796,7 +896,7 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default().with_u32_structural_encodings(),
             blob_metadata,
         )
         .await;

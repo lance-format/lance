@@ -38,6 +38,10 @@ impl Dialect for LanceDialect {
     fn is_delimited_identifier_start(&self, ch: char) -> bool {
         ch == '`'
     }
+
+    fn supports_bitwise_shift_operators(&self) -> bool {
+        self.0.supports_bitwise_shift_operators()
+    }
 }
 
 /// Parse sql filter to Expression.
@@ -45,18 +49,16 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
     let sql = format!("SELECT 1 FROM t WHERE {filter}");
     let statement = parse_statement(&sql)?;
 
-    let selection = if let Statement::Query(query) = &statement {
-        if let SetExpr::Select(s) = query.body.as_ref() {
-            s.selection.as_ref()
-        } else {
-            None
-        }
+    if let Statement::Query(query) = statement
+        && let SetExpr::Select(select) = *query.body
+        && let Some(expr) = select.selection
+    {
+        Ok(expr)
     } else {
-        None
-    };
-    let expr =
-        selection.ok_or_else(|| Error::invalid_input(format!("Filter is not valid: {filter}")))?;
-    Ok(expr.clone())
+        Err(Error::invalid_input(format!(
+            "Filter is not valid: {filter}"
+        )))
+    }
 }
 
 /// Parse a SQL expression to Expression. This is more lenient than parse_sql_filter
@@ -65,22 +67,16 @@ pub(crate) fn parse_sql_expr(expr: &str) -> Result<Expr> {
     let sql = format!("SELECT {expr} FROM t");
     let statement = parse_statement(&sql)?;
 
-    let selection = if let Statement::Query(query) = &statement {
-        if let SetExpr::Select(s) = query.body.as_ref() {
-            if let SelectItem::UnnamedExpr(expr) = &s.projection[0] {
-                Some(expr)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+    if let Statement::Query(query) = statement
+        && let SetExpr::Select(select) = *query.body
+        && let Some(SelectItem::UnnamedExpr(expr)) = select.projection.into_iter().next()
+    {
+        Ok(expr)
     } else {
-        None
-    };
-    let expr = selection
-        .ok_or_else(|| Error::invalid_input(format!("Expression is not valid: {expr}")))?;
-    Ok(expr.clone())
+        Err(Error::invalid_input(format!(
+            "Expression is not valid: {expr}"
+        )))
+    }
 }
 
 fn parse_statement(statement: &str) -> Result<Statement> {

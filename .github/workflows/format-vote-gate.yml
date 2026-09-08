@@ -1,0 +1,86 @@
+name: Format spec vote gate
+
+# Structurally enforces the PMC vote required for Lance format-specification
+# changes (see https://lance.org/community/voting/). The path labeler
+# (.github/labeler-area.yml) applies the `format-change` label to PRs that touch
+# the persisted format protos or `docs/src/format/**`; execution-only wire
+# schemas are excluded. This gate reads that label and blocks merging until the
+# PR has 3 binding +1 votes from PMC members (PR approvals, excluding the
+# author), has no outstanding veto (a PMC "Request changes" review), and the
+# 72-hour voting period has elapsed. That period starts once the PR is labeled
+# and ready for review, and pauses over weekends.
+#
+# The gate publishes its verdict as the `format-spec-vote` commit status on the
+# PR head. To make it a merge blocker, an org admin must add `format-spec-vote`
+# as a required status check in the branch protection rules for `main` (and any
+# release branches). The status is posted on *every* PR — success immediately
+# for non-format PRs — so a required check is never left pending forever.
+#
+# A PMC member may waive a trivial edit (typo, wording, formatting) by applying
+# the `format-waived` label.
+#
+# Uses pull_request_target so the token can post statuses/comments on fork-based
+# PRs. It never checks out or executes PR code: it reads the trusted base
+# checkout (for the PMC roster and this script) and queries the API only.
+#
+# There is deliberately no `pull_request_review` trigger. A run triggered by a
+# fork PR's review event gets a read-only GITHUB_TOKEN no matter what the
+# `permissions` block below asks for, so it cannot post the status — and format
+# proposals from non-committers are exactly the fork-PR case. Approvals are
+# therefore picked up by the `schedule` sweep instead, or by a manual
+# `workflow_dispatch` run for a voter who does not want to wait for it. The
+# gate's PR comment links to that dispatch page.
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+      # The voting clock starts when a PR leaves draft, so both draft
+      # transitions have to re-evaluate the gate.
+      - ready_for_review
+      - converted_to_draft
+  schedule:
+    # Re-evaluate open format-change PRs so votes and the voting-period clock are
+    # re-checked when no PR event fires: reviews land without one (see the note
+    # above), and the period routinely elapses days after the third approval.
+    # Every 15 minutes, because this is the only path that observes a vote.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to re-check (blank = every open format-change PR)"
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  statuses: write
+
+jobs:
+  gate:
+    name: Evaluate format spec vote
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install PyGithub PyYAML
+      - name: Evaluate vote
+        run: python ci/format_vote_gate.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GATE_PR: ${{ inputs.pr }}

@@ -44,7 +44,17 @@ impl std::fmt::Debug for f64x4 {
 }
 
 impl From<&[f64]> for f64x4 {
+    /// Loads the first 4 values from `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` contains fewer than 4 values.
     fn from(value: &[f64]) -> Self {
+        assert!(
+            value.len() >= 4,
+            "f64x4 requires at least 4 values, got {}",
+            value.len()
+        );
         unsafe { Self::load_unaligned(value.as_ptr()) }
     }
 }
@@ -355,14 +365,15 @@ impl Mul for f64x4 {
 // f64x8: 8 × f64 values (512-bit SIMD or 2 × 256-bit)
 // ---------------------------------------------------------------------------
 
-/// 8 of 64-bit `f64` values. Uses 512-bit SIMD if possible.
+/// 8 of 64-bit `f64` values. Stored as a pair of 256-bit AVX vectors on
+/// x86_64. Originally there was a sibling AVX-512 variant gated on
+/// `target_feature = "avx512f"`, but no project CI configuration enables
+/// `+avx512f` globally, so the variant was dead code. Removed in the
+/// runtime-SIMD-dispatch retrofit; per-tier dispatch happens in the kernel
+/// functions in `crate::distance::*` via `match *SIMD_SUPPORT` + per-tier
+/// `#[target_feature(enable = "...")]` inner functions.
 #[allow(non_camel_case_types)]
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[derive(Clone, Copy)]
-pub struct f64x8(__m512d);
-
-#[allow(non_camel_case_types)]
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 pub struct f64x8(__m256d, __m256d);
 
@@ -387,7 +398,17 @@ impl std::fmt::Debug for f64x8 {
 }
 
 impl From<&[f64]> for f64x8 {
+    /// Loads the first 8 values from `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` contains fewer than 8 values.
     fn from(value: &[f64]) -> Self {
+        assert!(
+            value.len() >= 8,
+            "f64x8 requires at least 8 values, got {}",
+            value.len()
+        );
         unsafe { Self::load_unaligned(value.as_ptr()) }
     }
 }
@@ -401,11 +422,7 @@ impl<'a> From<&'a [f64; 8]> for f64x8 {
 impl SIMD<f64, 8> for f64x8 {
     #[inline]
     fn splat(val: f64) -> Self {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_set1_pd(val))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_set1_pd(val), _mm256_set1_pd(val))
         }
@@ -423,11 +440,7 @@ impl SIMD<f64, 8> for f64x8 {
 
     #[inline]
     fn zeros() -> Self {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_setzero_pd())
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_setzero_pd(), _mm256_setzero_pd())
         }
@@ -443,11 +456,7 @@ impl SIMD<f64, 8> for f64x8 {
 
     #[inline]
     unsafe fn load(ptr: *const f64) -> Self {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_load_pd(ptr))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_load_pd(ptr), _mm256_load_pd(ptr.add(4)))
         }
@@ -466,11 +475,7 @@ impl SIMD<f64, 8> for f64x8 {
 
     #[inline]
     unsafe fn load_unaligned(ptr: *const f64) -> Self {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_loadu_pd(ptr))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_loadu_pd(ptr), _mm256_loadu_pd(ptr.add(4)))
         }
@@ -489,11 +494,7 @@ impl SIMD<f64, 8> for f64x8 {
 
     #[inline]
     unsafe fn store(&self, ptr: *mut f64) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            _mm512_store_pd(ptr, self.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             _mm256_store_pd(ptr, self.0);
             _mm256_store_pd(ptr.add(4), self.1);
@@ -512,11 +513,7 @@ impl SIMD<f64, 8> for f64x8 {
 
     #[inline]
     unsafe fn store_unaligned(&self, ptr: *mut f64) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            _mm512_storeu_pd(ptr, self.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             _mm256_storeu_pd(ptr, self.0);
             _mm256_storeu_pd(ptr.add(4), self.1);
@@ -533,12 +530,9 @@ impl SIMD<f64, 8> for f64x8 {
         }
     }
 
+    #[inline]
     fn reduce_sum(&self) -> f64 {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            _mm512_mask_reduce_add_pd(0xFF, self.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             let sum = _mm256_add_pd(self.0, self.1);
             let hi = _mm256_permute2f128_pd(sum, sum, 1);
@@ -561,11 +555,7 @@ impl SIMD<f64, 8> for f64x8 {
 
     #[inline]
     fn reduce_min(&self) -> f64 {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            _mm512_mask_reduce_min_pd(0xFF, self.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             let m = _mm256_min_pd(self.0, self.1);
             let hi = _mm256_permute2f128_pd(m, m, 1);
@@ -592,11 +582,7 @@ impl SIMD<f64, 8> for f64x8 {
 
     #[inline]
     fn min(&self, rhs: &Self) -> Self {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_min_pd(self.0, rhs.0))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_min_pd(self.0, rhs.0), _mm256_min_pd(self.1, rhs.1))
         }
@@ -613,6 +599,7 @@ impl SIMD<f64, 8> for f64x8 {
         }
     }
 
+    #[inline]
     fn find(&self, val: f64) -> Option<i32> {
         unsafe {
             for i in 0..8 {
@@ -628,11 +615,7 @@ impl SIMD<f64, 8> for f64x8 {
 impl FloatSimd<f64, 8> for f64x8 {
     #[inline]
     fn multiply_add(&mut self, a: Self, b: Self) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            self.0 = _mm512_fmadd_pd(a.0, b.0, self.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             self.0 = _mm256_fmadd_pd(a.0, b.0, self.0);
             self.1 = _mm256_fmadd_pd(a.1, b.1, self.1);
@@ -657,11 +640,7 @@ impl Add for f64x8 {
 
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_add_pd(self.0, rhs.0))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_add_pd(self.0, rhs.0), _mm256_add_pd(self.1, rhs.1))
         }
@@ -682,11 +661,7 @@ impl Add for f64x8 {
 impl AddAssign for f64x8 {
     #[inline]
     fn add_assign(&mut self, rhs: Self) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            self.0 = _mm512_add_pd(self.0, rhs.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             self.0 = _mm256_add_pd(self.0, rhs.0);
             self.1 = _mm256_add_pd(self.1, rhs.1);
@@ -711,11 +686,7 @@ impl Mul for f64x8 {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self::Output {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_mul_pd(self.0, rhs.0))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_mul_pd(self.0, rhs.0), _mm256_mul_pd(self.1, rhs.1))
         }
@@ -738,11 +709,7 @@ impl Sub for f64x8 {
 
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            Self(_mm512_sub_pd(self.0, rhs.0))
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             Self(_mm256_sub_pd(self.0, rhs.0), _mm256_sub_pd(self.1, rhs.1))
         }
@@ -763,11 +730,7 @@ impl Sub for f64x8 {
 impl SubAssign for f64x8 {
     #[inline]
     fn sub_assign(&mut self, rhs: Self) {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-        unsafe {
-            self.0 = _mm512_sub_pd(self.0, rhs.0)
-        }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             self.0 = _mm256_sub_pd(self.0, rhs.0);
             self.1 = _mm256_sub_pd(self.1, rhs.1);
@@ -792,7 +755,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_slice_conversion_rejects_short_input() {
+        assert!(std::panic::catch_unwind(|| f64x4::from(&[0.0; 3][..])).is_err());
+        assert!(std::panic::catch_unwind(|| f64x8::from(&[0.0; 7][..])).is_err());
+    }
+
+    #[test]
     fn test_f64x4_basic_ops() {
+        // The `f64x4` constructor / load / store / arithmetic paths all lower
+        // to AVX intrinsics on x86_64; none of them need AVX2.
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
         let a = [1.0_f64, 2.0, 3.0, 4.0];
         let b = [5.0_f64, 6.0, 7.0, 8.0];
 
@@ -814,6 +789,11 @@ mod tests {
 
     #[test]
     fn test_f64x4_fma() {
+        // `multiply_add` lowers to `_mm256_fmadd_pd`, which needs FMA.
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
         let a = [1.0_f64, 2.0, 3.0, 4.0];
         let b = [2.0_f64, 3.0, 4.0, 5.0];
 
@@ -826,6 +806,11 @@ mod tests {
 
     #[test]
     fn test_f64x4_min() {
+        // `min` / `reduce_min` are AVX intrinsics.
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
         let a = [1.0_f64, 5.0, 2.0, 8.0];
         let b = [3.0_f64, 2.0, 4.0, 1.0];
         let simd_a: f64x4 = (&a).into();
@@ -838,6 +823,11 @@ mod tests {
 
     #[test]
     fn test_f64x8_basic_ops() {
+        // `f64x8` is a pair of `__m256d`; add / reduce are AVX intrinsics.
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
         let a: [f64; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let b: [f64; 8] = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
 
@@ -856,6 +846,11 @@ mod tests {
 
     #[test]
     fn test_f64x8_fma() {
+        // `multiply_add` lowers to `_mm256_fmadd_pd`, which needs FMA.
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
         let a: [f64; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let b: [f64; 8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 
@@ -869,6 +864,11 @@ mod tests {
 
     #[test]
     fn test_f64x8_min() {
+        // `min` / `reduce_min` are AVX intrinsics.
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
         let a: [f64; 8] = [5.0, 1.0, 8.0, 3.0, 9.0, 2.0, 7.0, 4.0];
         let b: [f64; 8] = [2.0, 6.0, 3.0, 7.0, 1.0, 8.0, 4.0, 9.0];
         let simd_a: f64x8 = (&a).into();

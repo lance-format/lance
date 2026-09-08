@@ -87,7 +87,30 @@ def test_multiple_close(tmp_path):
     writer = LanceFileWriter(str(path), schema)
     writer.write_batch(pa.table({"a": [1, 2, 3]}))
     writer.close()
+    size_bytes = writer.size_bytes
+    # The second close is a no-op and must not clear the recorded size
     writer.close()
+    assert writer.size_bytes == size_bytes
+
+
+@pytest.mark.parametrize("num_rows", [0, 3])
+def test_size_bytes(tmp_path, num_rows):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    writer = LanceFileWriter(str(path), schema)
+    assert writer.size_bytes is None
+    writer.write_batch(pa.table({"a": list(range(num_rows))}))
+    assert writer.close() == num_rows
+    # Even an empty file has a footer, so the size is always positive
+    assert writer.size_bytes > 0
+    assert writer.size_bytes == os.path.getsize(path)
+
+
+def test_size_bytes_with_session(tmp_path):
+    session = LanceFileSession(tmp_path)
+    with session.open_writer("foo.lance") as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    assert writer.size_bytes == os.path.getsize(tmp_path / "foo.lance")
 
 
 def test_version(tmp_path):
@@ -459,18 +482,27 @@ def test_write_read_additional_schema_metadata(tmp_path):
 
 
 def test_writer_maintains_order(tmp_path):
-    # 100Ki strings, each string is a couple of KiBs
-    big_strings = [f"{i}" * 1024 for i in range(100 * 1024)]
-    table = pa.table({"big_strings": big_strings})
+    row_ids = list(range(8))
+    payloads = ["0123456789abcdef" * (64 * 1024)] + [
+        f"page-{row_id}" for row_id in row_ids[1:]
+    ]
+    table = pa.table({"payload": payloads, "row_id": row_ids})
+    path = tmp_path / "ordered-pages.lance"
 
-    for i in range(4):
-        path = tmp_path / f"foo-{i}.lance"
-        with LanceFileWriter(str(path)) as writer:
-            writer.write_batch(table)
+    # Before #2836, the seven cheap pages could finish encoding before the
+    # expensive first page and be written out of order.
+    with LanceFileWriter(
+        str(path),
+        table.schema,
+        version="2.0",
+        data_cache_bytes=1,
+        max_page_bytes=64 * 1024,
+    ) as writer:
+        writer.write_batch(table)
 
-        reader = LanceFileReader(str(path))
-        result = reader.read_all().to_table()
-        assert result == table
+    reader = LanceFileReader(str(path))
+    assert [len(column.pages) for column in reader.metadata().columns] == [8, 1]
+    assert reader.read_all().to_table() == table
 
 
 def test_compression(tmp_path):

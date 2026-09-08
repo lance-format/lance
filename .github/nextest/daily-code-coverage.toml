@@ -1,0 +1,3 @@
+[profile.daily-code-coverage]
+slow-timeout = { period = "60s", terminate-after = 30, grace-period = "10s" }
+global-timeout = "5h30m"

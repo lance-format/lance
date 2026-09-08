@@ -1,29 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-/// A macro that combines debug_assert and std::hint::assert_unchecked for optimized assertions
+/// Assert an invariant that should also be visible to the optimizer.
 ///
-/// In debug builds, this will perform a normal assertion check.
-/// In release builds, this will use hint::assert_unchecked which tells the compiler to assume
-/// the condition is true without actually checking it.
-///
-/// # Safety
-///
-/// This macro is unsafe in release builds since it uses hint::assert_unchecked.
-/// The caller must ensure the condition will always be true.
+/// Unlike [`debug_assert!`], this remains checked in release builds. This is
+/// required because the macro can be invoked from safe Rust and an invalid
+/// assumption must not become undefined behavior.
 #[macro_export]
 macro_rules! assume {
     ($cond:expr) => {
-        debug_assert!($cond);
-        // SAFETY: The debug_assert ensures this is true in debug builds.
-        // In release builds, caller must ensure the condition holds.
-        unsafe { std::hint::assert_unchecked($cond); }
+        assert!($cond)
     };
     ($cond:expr, $($arg:tt)+) => {
-        debug_assert!($cond, $($arg)+);
-        // SAFETY: The debug_assert ensures this is true in debug builds.
-        // In release builds, caller must ensure the condition holds.
-        unsafe { std::hint::assert_unchecked($cond); }
+        assert!($cond, $($arg)+)
     };
 }
 
@@ -31,11 +20,24 @@ macro_rules! assume {
 #[macro_export]
 macro_rules! assume_eq {
     ($left:expr, $right:expr) => {
-        debug_assert_eq!($left, $right);
-        unsafe { std::hint::assert_unchecked($left == $right); }
+        assert_eq!($left, $right)
     };
     ($left:expr, $right:expr, $($arg:tt)+) => {
-        debug_assert_eq!($left, $right, $($arg)+);
-        unsafe { std::hint::assert_unchecked($left == $right); }
+        assert_eq!($left, $right, $($arg)+)
     };
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn assume_rejects_false_conditions() {
+        assert!(std::panic::catch_unwind(|| assume!(false)).is_err());
+        assert!(std::panic::catch_unwind(|| assume!(false, "invalid condition")).is_err());
+    }
+
+    #[test]
+    fn assume_eq_rejects_unequal_values() {
+        assert!(std::panic::catch_unwind(|| assume_eq!(1, 2)).is_err());
+        assert!(std::panic::catch_unwind(|| assume_eq!(1, 2, "invalid equality")).is_err());
+    }
 }

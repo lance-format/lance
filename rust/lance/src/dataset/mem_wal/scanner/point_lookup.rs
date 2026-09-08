@@ -27,19 +27,20 @@ use lance_core::{Result, is_system_column};
 use lance_datafusion::exec::OneShotExec;
 use tracing::instrument;
 
-use crate::dataset::mem_wal::TOMBSTONE;
-use crate::dataset::mem_wal::index::IndexStore;
+use crate::dataset::mem_wal::index::{IndexStore, MemTableVisibility};
 use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
+use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
-use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
-    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
-    project_to_canonical, wants_row_address, wants_row_id,
+    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, force_schema, null_columns,
+    project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
 };
+use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
+use lance_io::object_store::ObjectStoreParams;
 
 /// Plans point lookup queries over LSM data.
 ///
@@ -87,12 +88,14 @@ pub struct LsmPointLookupPlanner {
     /// Bloom filters for each memtable generation.
     /// Map: generation -> bloom filter
     bloom_filters: std::collections::HashMap<u64, Arc<Sbbf>>,
-    /// Session threaded into flushed-generation opens (shared caches).
+    /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
-    /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<dyn DatasetCache>>,
-    /// Optional warmer fired on first open of a flushed generation.
-    warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// Store params for opening SSTables, reusing the base dataset's store.
+    store_params: Option<ObjectStoreParams>,
+    /// Cache of opened SSTable datasets.
+    sstable_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of an SSTable.
+    warmer: Option<Arc<dyn SsTableWarmer>>,
     /// Precomputed canonical output schema for the no-projection case, so the
     /// hot `lookup(.., None)` path clones an `Arc` instead of rebuilding the
     /// schema on every call.
@@ -102,6 +105,9 @@ pub struct LsmPointLookupPlanner {
     /// on the plan fallback path (the part of point-lookup latency that doesn't
     /// scale with generation count).
     task_ctx: Arc<TaskContext>,
+    /// Prefix of the in-memory memtables this planner reads. Applies to the fast
+    /// BTree probe and the plan fallback alike, so both resolve a key the same.
+    visibility: MemTableVisibility,
 }
 
 impl LsmPointLookupPlanner {
@@ -124,32 +130,46 @@ impl LsmPointLookupPlanner {
             base_schema,
             bloom_filters: std::collections::HashMap::new(),
             session: None,
-            flushed_cache: None,
+            store_params: None,
+            sstable_cache: None,
             warmer: None,
             none_target,
             task_ctx: SessionContext::new().task_ctx(),
+            visibility: MemTableVisibility::Published,
         }
     }
 
-    /// Thread a session into flushed-generation opens so the first open
-    /// populates the shared index / file-metadata caches.
+    /// Read the in-memory memtables at `visibility`. See
+    /// [`MemTableVisibility::Indexed`] for when a wider bound is sound.
+    pub fn with_visibility(mut self, visibility: MemTableVisibility) -> Self {
+        self.visibility = visibility;
+        self
+    }
+
+    /// Set the session used to open SSTables.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
     }
 
-    /// Inject a cache of opened flushed-generation datasets, making repeated
+    /// Set the store params used to open SSTables.
+    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+        self.store_params = Some(store_params);
+        self
+    }
+
+    /// Inject a cache of opened SSTable datasets, making repeated
     /// lookups against the same generation a pure `Arc::clone`. Populate it up
     /// front during scan setup via
     /// [`DatasetMemWalExt::prewarm_mem_wal`](crate::dataset::mem_wal::DatasetMemWalExt::prewarm_mem_wal)
     /// so the first gen-key lookup does not pay the dataset open.
-    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
-        self.flushed_cache = Some(cache);
+    pub fn with_sstable_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
+        self.sstable_cache = Some(cache);
         self
     }
 
-    /// Inject the warmer fired on first open of a flushed generation.
-    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+    /// Inject the warmer fired on first open of an SSTable.
+    pub fn with_warmer(mut self, warmer: Arc<dyn SsTableWarmer>) -> Self {
         self.warmer = Some(warmer);
         self
     }
@@ -216,6 +236,7 @@ impl LsmPointLookupPlanner {
         pk_values: &[ScalarValue],
         projection: Option<&[String]>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        validate_projection_names(projection, &self.base_schema, &[])?;
         if pk_values.len() != self.pk_columns.len() {
             return Err(lance_core::Error::invalid_input(format!(
                 "Expected {} primary key values, got {}",
@@ -311,7 +332,7 @@ impl LsmPointLookupPlanner {
     ) -> Result<RecordBatch> {
         let canonical =
             canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
-        let target = carry_schema(&canonical);
+        let target = carry_schema(&canonical, &self.pk_columns);
         let mut out: Vec<RecordBatch> = Vec::with_capacity(keys.len());
         for key in keys {
             if let Some(b) = self.lookup_keep_tombstone(key, projection).await? {
@@ -331,7 +352,7 @@ impl LsmPointLookupPlanner {
     /// For a single-column primary key this probes the in-memory memtables'
     /// BTree index directly — no DataFusion plan — newest generation first, and
     /// returns on the first hit. Only when the lookup must consult an on-disk
-    /// source (a flushed generation or the base table), a memtable lacks a
+    /// source (an SSTable or the base table), a memtable lacks a
     /// BTree on the key, the key is multi-column, or the projection requests
     /// system columns does it fall back to [`Self::plan_lookup`]. The result is
     /// identical to executing `plan_lookup` and taking the first row; the fast
@@ -389,6 +410,7 @@ impl LsmPointLookupPlanner {
                             &self.pk_columns[0],
                             &pk_values[0],
                             target,
+                            self.visibility,
                         )? {
                             Probe::Hit(batch) => Ok(Some(FastOutcome::Hit(batch))),
                             Probe::Deleted => Ok(Some(FastOutcome::Deleted)),
@@ -406,7 +428,7 @@ impl LsmPointLookupPlanner {
                     None => {
                         // Every in-memory memtable missed. If there is no
                         // on-disk source, the key does not exist; otherwise the
-                        // plan path consults the base table / flushed gens.
+                        // plan path consults the base table / SSTables.
                         if !self.collector.has_on_disk_sources() {
                             return Ok(None);
                         }
@@ -497,7 +519,8 @@ impl LsmPointLookupPlanner {
         for key in keys {
             let mut resolved = false;
             for (ri, m) in refs.iter().enumerate() {
-                match probe_position(&m.batch_store, &m.index_store, pk_col, key)? {
+                match probe_position(&m.batch_store, &m.index_store, pk_col, key, self.visibility)?
+                {
                     ProbePos::Found { batch_idx, row } => {
                         // Newest version is a tombstone → the key is deleted:
                         // resolve it as a miss (emit nothing) and do not fall
@@ -644,13 +667,18 @@ impl LsmPointLookupPlanner {
                     scanner.with_row_address();
                 }
                 scanner.filter_expr(filter.clone());
-                scanner.create_plan().await?
+                // Box at the call site: `create_plan`'s inlined async layout exceeds
+                // rustc's depth limit up this point-lookup chain, and boxing inside
+                // `create_plan` instead triggers a `Box<Future>: Send` solver overflow
+                // (E0275 downstream). Same for the other arms below.
+                Box::pin(scanner.create_plan()).await?
             }
-            LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = open_flushed_dataset(
+            LsmDataSource::SsTable { path, .. } => {
+                let dataset = open_sstable(
                     path,
                     self.session.as_ref(),
-                    self.flushed_cache.as_ref(),
+                    self.store_params.as_ref(),
+                    self.sstable_cache.as_ref(),
                     self.warmer.as_ref(),
                 )
                 .await?;
@@ -661,7 +689,7 @@ impl LsmPointLookupPlanner {
                 let cols = cols_with_tombstone(&cols, dataset.schema().field(TOMBSTONE).is_some());
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());
-                scanner.create_plan().await?
+                Box::pin(scanner.create_plan()).await?
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -671,12 +699,16 @@ impl LsmPointLookupPlanner {
             } => {
                 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 
-                let mut scanner =
-                    MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                let mut scanner = MemTableScanner::new_at_visibility(
+                    batch_store.clone(),
+                    index_store.clone(),
+                    schema.clone(),
+                    self.visibility,
+                );
                 // Carry `_tombstone` through so the post-coalesce filter can drop
                 // a deleted key; it survives the sort below.
                 let cols = cols_with_tombstone(&cols, schema.column_with_name(TOMBSTONE).is_some());
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());
                 // Expose `_rowid` (the BatchStore row offset, monotonic with
                 // insert order) so we can pick the most recently inserted
@@ -684,7 +716,7 @@ impl LsmPointLookupPlanner {
                 // over insert-ordered scan would return the *oldest* of
                 // multiple rows sharing the target primary key.
                 scanner.with_row_id();
-                let raw = scanner.create_plan().await?;
+                let raw = Box::pin(scanner.create_plan()).await?;
                 // The filter already restricts to the exact PK value, so the
                 // scan yields that key's insert history. Within the active
                 // memtable larger `_rowid` = newer insert, so sorting `_rowid`
@@ -713,7 +745,7 @@ impl LsmPointLookupPlanner {
         // Output carries `_tombstone` (canonical + the marker) so it survives
         // the union/coalesce to the post-coalesce filter; base / legacy sources
         // that lack the column get a synthesized `false`.
-        project_to_carry(scan, &target)
+        project_to_carry(scan, &target, &self.pk_columns)
     }
 
     /// Create an empty execution plan with the canonical output schema.
@@ -741,11 +773,18 @@ fn cols_with_tombstone(cols: &[String], present: bool) -> Vec<String> {
     out
 }
 
-/// Carry schema = canonical output + a trailing non-nullable `_tombstone`
-/// Boolean. Non-nullable so the base arm's synthesized `Literal(false)` matches
-/// the WAL arms' real column under `CoalesceFirstExec`'s exact-schema check.
-fn carry_schema(canonical: &SchemaRef) -> SchemaRef {
-    let mut fields: Vec<Arc<Field>> = canonical.fields().iter().cloned().collect();
+/// Carry schema = canonical output widened to the storage schema's
+/// nullability, plus a trailing non-nullable `_tombstone` Boolean.
+///
+/// Widened because tombstone rows — null in every non-PK column — are still in
+/// flight; [`filter_tombstones_after_coalesce`] drops them past
+/// `CoalesceFirstExec`, and only then does the plan narrow back to the logical
+/// schema. `_tombstone` stays non-nullable so the base arm's synthesized
+/// `Literal(false)` matches the WAL arms' real column under
+/// `CoalesceFirstExec`'s exact-schema check.
+fn carry_schema(canonical: &SchemaRef, pk_columns: &[String]) -> SchemaRef {
+    let widened = relax_non_pk_nullability(canonical, pk_columns);
+    let mut fields: Vec<Arc<Field>> = widened.fields().iter().cloned().collect();
     fields.push(Arc::new(Field::new(TOMBSTONE, DataType::Boolean, false)));
     Arc::new(Schema::new(fields))
 }
@@ -757,9 +796,10 @@ fn carry_schema(canonical: &SchemaRef) -> SchemaRef {
 fn project_to_carry(
     plan: Arc<dyn ExecutionPlan>,
     canonical: &SchemaRef,
+    pk_columns: &[String],
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let input = plan.schema();
-    let carry = carry_schema(canonical);
+    let carry = carry_schema(canonical, pk_columns);
     let mut project_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
         Vec::with_capacity(carry.fields().len());
     for field in carry.fields() {
@@ -783,11 +823,11 @@ fn project_to_carry(
         };
         project_exprs.push((expr, name.clone()));
     }
-    Ok(Arc::new(
-        ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
-            lance_core::Error::internal(format!("Failed to build carry ProjectionExec: {}", e))
-        })?,
-    ))
+    let projected = Arc::new(ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
+        lance_core::Error::internal(format!("Failed to build carry ProjectionExec: {}", e))
+    })?);
+    // `CoalesceFirstExec` panics unless every arm lands on exactly `carry`.
+    Ok(force_schema(projected, &carry))
 }
 
 /// Drop tombstone rows after `CoalesceFirstExec` has already picked the newest
@@ -872,6 +912,7 @@ fn probe_position(
     index_store: &IndexStore,
     pk_column: &str,
     pk_value: &ScalarValue,
+    visibility: MemTableVisibility,
 ) -> Result<ProbePos> {
     // Visible batches are the committed prefix [0, last_visible_idx]; each
     // `StoredBatch` carries its cumulative `row_offset`, so visibility and the
@@ -880,7 +921,12 @@ fn probe_position(
     if len == 0 {
         return Ok(ProbePos::Miss);
     }
-    let last_visible_idx = index_store.max_visible_batch_position().min(len - 1);
+    // The cursor is an exclusive count, so the last readable batch sits at
+    // `count - 1`. A count of 0 means nothing is readable yet — not "batch 0".
+    let readable_count = index_store.prefix_count(visibility).min(len);
+    let Some(last_visible_idx) = readable_count.checked_sub(1) else {
+        return Ok(ProbePos::Miss);
+    };
     let last = batch_store.get(last_visible_idx).ok_or_else(|| {
         lance_core::Error::internal("point-lookup: visible batch index out of range")
     })?;
@@ -980,8 +1026,9 @@ fn probe_memtable(
     pk_column: &str,
     pk_value: &ScalarValue,
     target: &SchemaRef,
+    visibility: MemTableVisibility,
 ) -> Result<Probe> {
-    match probe_position(batch_store, index_store, pk_column, pk_value)? {
+    match probe_position(batch_store, index_store, pk_column, pk_value, visibility)? {
         ProbePos::NoIndex => Ok(Probe::NoIndex),
         ProbePos::Miss => Ok(Probe::Miss),
         ProbePos::Found { batch_idx, row } => {
@@ -1007,6 +1054,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::physical_plan::displayable;
+    use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -1099,7 +1147,7 @@ mod tests {
 
         let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(2)
-            .with_flushed_generation(1, "gen_1".to_string());
+            .with_sstable(1, "gen_1".to_string());
 
         // Create collector
         let collector = LsmDataSourceCollector::new(base_dataset, vec![shard_snapshot]);
@@ -1180,10 +1228,10 @@ mod tests {
         let base_path = temp_dir.path().to_str().unwrap();
 
         // No base dataset is created. We still need a base URI so the collector
-        // can resolve flushed-generation paths.
+        // can resolve SSTable paths.
         let base_uri = format!("{}/base", base_path);
 
-        // Create a flushed generation under {base_uri}/_mem_wal/{shard}/gen_1
+        // Create an SSTable under {base_uri}/_mem_wal/{shard}/gen_1
         let shard_id = Uuid::new_v4();
         let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
         let gen1_batch = create_test_batch(&schema, &[2, 3], "gen1");
@@ -1191,12 +1239,12 @@ mod tests {
 
         let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(2)
-            .with_flushed_generation(1, "gen_1".to_string());
+            .with_sstable(1, "gen_1".to_string());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
         let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
 
-        // id=3 lives in the flushed generation
+        // id=3 lives in the SSTable
         let pk_values = vec![ScalarValue::Int32(Some(3))];
         let plan = planner.plan_lookup(&pk_values, None).await.unwrap();
 
@@ -1340,6 +1388,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_point_lookup_rejects_missing_projection_column() {
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let projection = vec!["missing".to_string()];
+        let pk_values = vec![ScalarValue::Int32(Some(2))];
+        let err = planner
+            .plan_lookup(&pk_values, Some(&projection))
+            .await
+            .expect_err("unknown projection column should fail planning");
+        assert!(
+            err.to_string().contains("missing"),
+            "unexpected missing-column projection error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_point_lookup_active_memtable_returns_newest_duplicate() {
         // Regression: same primary key inserted twice into one active
         // memtable must return the *newest* row. The bug was that
@@ -1356,8 +1425,9 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        // BTree on the PK so that `max_visible_batch_position` advances as
-        // we insert, otherwise the scanner sees no batches at all.
+        // BTree on the PK: the point lookup resolves keys through the indexed PK
+        // path, which this exercises. (`indexed_count`/`visible_count` advance
+        // from the batch position regardless of whether any index is configured.)
         index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
 
         // Two writes to pk=1, then an unrelated pk=2. The "new" row goes
@@ -1497,11 +1567,94 @@ mod tests {
         );
     }
 
+    /// The writer's own read at [`MemTableVisibility::Indexed`] resolves a row
+    /// whose WAL append is still outstanding, while the default `Published`
+    /// bound does not. The projection selects which read path runs: the fast
+    /// BTree probe, or the `MemTableScanner` plan fallback (a system column in
+    /// the output disqualifies the probe). Both must resolve the key alike.
+    #[rstest]
+    #[case::fast_btree_probe(None)]
+    #[case::scanner_fallback(Some(vec![
+        "id".to_string(),
+        "name".to_string(),
+        "_rowid".to_string(),
+    ]))]
     #[tokio::test]
-    async fn test_point_lookup_flushed_memtable_returns_newest_duplicate() {
-        // Regression / invariant pin: when a flushed memtable contains two
+    async fn test_indexed_visibility_reads_the_undurable_prefix(
+        #[case] projection: Option<Vec<String>>,
+    ) {
+        use crate::dataset::mem_wal::index::MemTableVisibility;
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::wal::WriterCursors;
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        // A writer whose durability cursor never advances: the batch indexes,
+        // but its append stays outstanding, so it never publishes.
+        index_store.set_durability(Arc::new(WriterCursors::new(true)), 0);
+
+        let batch = create_test_batch(&schema, &[1], "pending");
+        let (bp, off, _) = batch_store.append(batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&batch, off, Some(bp))
+            .unwrap();
+        assert_eq!(index_store.indexed_count(), 1);
+        assert_eq!(index_store.visible_count(), 0, "the append is outstanding");
+        let index_store = Arc::new(index_store);
+
+        let shard_id = Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+        let key = [ScalarValue::Int32(Some(1))];
+
+        assert!(
+            planner
+                .lookup(&key, projection.as_deref())
+                .await
+                .unwrap()
+                .is_none(),
+            "a row whose append is outstanding must stay invisible at Published"
+        );
+
+        let planner = planner.with_visibility(MemTableVisibility::Indexed);
+        let hit = planner
+            .lookup(&key, projection.as_deref())
+            .await
+            .unwrap()
+            .expect("the writer must read its own indexed prefix");
+        assert_eq!(hit.num_rows(), 1);
+        let name = hit
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name.value(0), "pending_1");
+    }
+
+    #[tokio::test]
+    async fn test_point_lookup_sstable_returns_newest_duplicate() {
+        // Regression / invariant pin: when an SSTable contains two
         // rows for the same PK, the lookup must return the newer one. The
-        // flushed dataset is reverse-written (newest at the smallest
+        // SSTable dataset is reverse-written (newest at the smallest
         // physical position), so we simulate that here by writing the
         // dataset with the new row first. The point-lookup plan today
         // returns the first match (smallest `_rowid`) under reverse-write,
@@ -1522,7 +1675,7 @@ mod tests {
 
         let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(2)
-            .with_flushed_generation(1, "gen_1".to_string());
+            .with_sstable(1, "gen_1".to_string());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
         let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
@@ -1542,7 +1695,7 @@ mod tests {
         assert_eq!(
             name_arr.value(0),
             "new_1",
-            "flushed-arm lookup must return the row at the smallest _rowid (newest under reverse-write)"
+            "SSTable-arm lookup must return the row at the smallest _rowid (newest under reverse-write)"
         );
     }
 

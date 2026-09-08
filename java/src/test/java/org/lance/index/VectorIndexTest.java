@@ -25,17 +25,106 @@ import org.lance.index.vector.VectorTrainer;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class VectorIndexTest {
+
+  @ParameterizedTest
+  @EnumSource(
+      value = IndexType.class,
+      names = {"IVF_FLAT", "IVF_PQ"})
+  @SuppressWarnings("deprecation")
+  public void testCreateIndexWithConcreteVectorType(IndexType indexType, @TempDir Path tempDir)
+      throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve(indexType.name()))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        VectorIndexParams vectorIndexParams =
+            indexType == IndexType.IVF_FLAT
+                ? VectorIndexParams.ivfFlat(2, DistanceType.L2)
+                : VectorIndexParams.ivfPq(2, 8, 2, DistanceType.L2, 2);
+        IndexParams indexParams =
+            IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
+
+        Index index =
+            dataset.createIndex(
+                Collections.singletonList(TestVectorDataset.vectorColumnName),
+                indexType,
+                Optional.empty(),
+                indexParams,
+                false);
+
+        assertNotNull(index);
+        assertTrue(dataset.listIndexes().contains(index.name()));
+      }
+    }
+  }
+
+  @Test
+  public void testCreateIvfFlatIndexPropagatesProgressFailure(@TempDir Path tempDir)
+      throws Exception {
+    String indexName = "ivf_progress_failure_idx";
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("ivf_progress_failure"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        long initialVersion = dataset.version();
+        IndexParams indexParams =
+            IndexParams.builder()
+                .setVectorIndexParams(VectorIndexParams.ivfFlat(2, DistanceType.L2))
+                .build();
+        IndexOptions options =
+            IndexOptions.builder(
+                    Collections.singletonList(TestVectorDataset.vectorColumnName),
+                    IndexType.IVF_FLAT,
+                    indexParams)
+                .withIndexName(indexName)
+                .build();
+        IndexBuildProgress progress =
+            new IndexBuildProgress() {
+              @Override
+              public void stageStart(String stage, Optional<Long> total, String unit) {}
+
+              @Override
+              public void stageProgress(String stage, long completed) {
+                if (stage.equals("train_ivf")) {
+                  throw new IllegalStateException("vector progress callback failure");
+                }
+              }
+
+              @Override
+              public void stageComplete(String stage) {}
+            };
+
+        RuntimeException failure =
+            assertThrows(RuntimeException.class, () -> dataset.createIndex(options, progress));
+
+        assertFalse(
+            failure instanceof IllegalArgumentException,
+            "Progress callback failures should not be reported as invalid input: " + failure);
+        assertTrue(
+            causeChainContains(failure, "stageProgress")
+                && causeChainContains(failure, "train_ivf")
+                && causeChainContains(failure, "java.lang.IllegalStateException")
+                && causeChainContains(failure, "vector progress callback failure"),
+            "Expected callback context and original Java exception details, got: " + failure);
+        assertEquals(initialVersion, dataset.version(), "Failed index build must not commit");
+        assertFalse(
+            dataset.listIndexes().contains(indexName), "Failed index build must not publish index");
+      }
+    }
+  }
 
   @Test
   public void testCreateIvfFlatIndexDistributively(@TempDir Path tempDir) throws Exception {
@@ -394,5 +483,14 @@ public class VectorIndexTest {
       }
     }
     return true;
+  }
+
+  private static boolean causeChainContains(Throwable failure, String expected) {
+    for (Throwable current = failure; current != null; current = current.getCause()) {
+      if (current.getMessage() != null && current.getMessage().contains(expected)) {
+        return true;
+      }
+    }
+    return false;
   }
 }

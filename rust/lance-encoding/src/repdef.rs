@@ -118,13 +118,16 @@ use arrow_buffer::{
 };
 use lance_core::{Error, Result, utils::bit::log_2_ceil};
 
-use crate::buffer::LanceBuffer;
+use crate::{
+    buffer::LanceBuffer,
+    encodings::logical::primitive::sparse::{SparseStructuralPlan, SparseStructuralUnraveler},
+};
 
 pub type LevelBuffer = Vec<u16>;
 
-/// A contiguous top-level-row range that can be encoded as one structural page.
+/// A top-level-row range whose dense rep/def stream fits one mini-block page.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StructuralPageSplit {
+pub(crate) struct MiniBlockRepDefSplit {
     /// Top-level row offset, relative to the original unsplit page.
     pub(crate) row_start: u64,
     /// Number of top-level rows in this split.
@@ -137,15 +140,15 @@ pub(crate) struct StructuralPageSplit {
     pub(crate) num_values: u64,
 }
 
-/// Planner result for structural page budget handling.
+/// Dense mini-block rep/def budget result for one accumulated page.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StructuralPagePlan {
-    /// The original page can be encoded as-is.
-    Fits,
-    /// The original page should be split on top-level row boundaries.
-    Split(Vec<StructuralPageSplit>),
-    /// One top-level row is larger than the requested structural page budget.
-    UnsplittableOverBudget(u64),
+pub(crate) enum MiniBlockRepDefBudget {
+    /// The dense rep/def stream fits one mini-block structural page.
+    WithinBudget,
+    /// The dense rep/def stream fits after splitting on top-level row boundaries.
+    RequiresPageSplit(Vec<MiniBlockRepDefSplit>),
+    /// A single top-level row has this many rep/def levels and exceeds the budget.
+    SingleRowOverBudget(u64),
 }
 
 // As we build def levels we add this to special values to indicate that they
@@ -197,6 +200,143 @@ enum RawRepDef {
     Offsets(OffsetDesc),
     Validity(ValidityDesc),
     Fsl(FslDesc),
+}
+
+/// A normalized Arrow structural layer shared by dense and sparse serializers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NormalizedStructuralLayer<'a> {
+    List {
+        offsets: &'a [i64],
+        validity: Option<&'a BooleanBuffer>,
+        num_slots: usize,
+    },
+    Validity {
+        validity: Option<&'a BooleanBuffer>,
+        num_slots: usize,
+    },
+    FixedSizeList {
+        validity: Option<&'a BooleanBuffer>,
+        dimension: usize,
+        num_slots: usize,
+    },
+}
+
+/// Structural layers concatenated across input batches exactly once.
+///
+/// Dense rep/def serialization and sparse metadata planning both consume this
+/// representation so the Arrow nesting is not independently reconstructed.
+#[derive(Debug)]
+pub(crate) struct NormalizedStructuralPlan {
+    layers: Vec<RawRepDef>,
+    dense_all_valid: bool,
+}
+
+impl NormalizedStructuralPlan {
+    pub(crate) fn layers(&self) -> impl ExactSizeIterator<Item = NormalizedStructuralLayer<'_>> {
+        self.layers.iter().map(|layer| match layer {
+            RawRepDef::Offsets(OffsetDesc {
+                offsets,
+                validity,
+                num_values,
+                ..
+            }) => NormalizedStructuralLayer::List {
+                offsets,
+                validity: validity.as_ref(),
+                num_slots: *num_values,
+            },
+            RawRepDef::Validity(ValidityDesc {
+                validity,
+                num_values,
+            }) => NormalizedStructuralLayer::Validity {
+                validity: validity.as_ref(),
+                num_slots: *num_values,
+            },
+            RawRepDef::Fsl(FslDesc {
+                validity,
+                dimension,
+                num_values,
+            }) => NormalizedStructuralLayer::FixedSizeList {
+                validity: validity.as_ref(),
+                dimension: *dimension,
+                num_slots: *num_values,
+            },
+        })
+    }
+
+    fn to_serializer(&self) -> (SerializerContext, Option<u64>) {
+        if self.dense_all_valid {
+            let def_meaning = self
+                .layers
+                .iter()
+                .map(|_| DefinitionInterpretation::AllValidItem)
+                .collect::<Vec<_>>();
+            return (
+                SerializerContext {
+                    def_meaning,
+                    rep_levels: LevelBuffer::default(),
+                    spare_rep: LevelBuffer::default(),
+                    def_levels: LevelBuffer::default(),
+                    spare_def: LevelBuffer::default(),
+                    current_rep: 0,
+                    current_def: 0,
+                    current_len: 0,
+                    current_num_specials: 0,
+                    has_fsl: false,
+                },
+                None,
+            );
+        }
+
+        let total_len = self.layers.last().map_or(0, RawRepDef::num_values)
+            + self
+                .layers
+                .iter()
+                .map(RawRepDef::num_specials)
+                .sum::<usize>();
+        let max_rep = self.layers.iter().map(RawRepDef::max_rep).sum::<u16>();
+        let max_def = self.layers.iter().map(RawRepDef::max_def).sum::<u16>();
+        let bits_per_rep = if max_rep > 0 {
+            u64::from(u16::BITS - max_rep.leading_zeros())
+        } else {
+            0
+        };
+        let bits_per_def = if max_def > 0 {
+            u64::from(u16::BITS - max_def.leading_zeros())
+        } else {
+            0
+        };
+        let bits_per_level =
+            (bits_per_rep + bits_per_def > 0).then_some(bits_per_rep + bits_per_def);
+
+        let num_layers = self.layers.len();
+        let mut context = SerializerContext::new(total_len, num_layers, max_rep, max_def);
+        for layer in &self.layers {
+            match layer {
+                RawRepDef::Validity(def) => context.record_validity(def),
+                RawRepDef::Offsets(rep) => context.record_offsets(rep),
+                RawRepDef::Fsl(fsl) => context.record_fsl(fsl),
+            }
+        }
+        (context, bits_per_level)
+    }
+
+    pub(crate) fn serialize(&self) -> SerializedRepDefs {
+        self.to_serializer().0.build()
+    }
+
+    pub(crate) fn serialize_with_miniblock_repdef_budget(
+        &self,
+        max_levels_for_bits: impl FnOnce(u64) -> u64,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Result<(SerializedRepDefs, MiniBlockRepDefBudget)> {
+        let (context, bits_per_level) = self.to_serializer();
+        context.build_with_miniblock_repdef_budget(
+            bits_per_level.map(max_levels_for_bits),
+            num_rows,
+            num_values,
+        )
+    }
 }
 
 impl RawRepDef {
@@ -806,21 +946,20 @@ impl SerializerContext {
         max_levels_per_page: Option<u64>,
         num_rows: u64,
         num_values: u64,
-    ) -> Result<StructuralPagePlan> {
+    ) -> Result<MiniBlockRepDefBudget> {
         // Extremely sparse lists can have many rep/def levels for very few
         // visible leaf values.  If this ratio becomes too skewed then a
-        // miniblock structural chunk can exceed its packed rep/def metadata
-        // budget even though the value buffers are small.  We detect that case
-        // while normalizing special def levels and split the structural page on
-        // top-level row boundaries so each emitted page stays within the
-        // miniblock structural budget.
+        // mini-block rep/def chunk can exceed its packed metadata budget even
+        // though the value buffers are small.  We detect that case while
+        // normalizing special def levels and split on top-level row boundaries
+        // so each emitted dense mini-block page stays within the budget.
         if self.def_levels.is_empty() {
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         }
 
         if self.rep_levels.is_empty() {
             self.normalize_specials();
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         }
 
         if self.rep_levels.len() != self.def_levels.len() {
@@ -833,12 +972,12 @@ impl SerializerContext {
 
         let Some(max_levels_per_page) = max_levels_per_page else {
             self.normalize_specials();
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         };
 
         if num_values == 0 {
             self.normalize_specials();
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         }
 
         let max_schema_rep = def_meaning.iter().filter(|level| level.is_list()).count() as u16;
@@ -847,7 +986,7 @@ impl SerializerContext {
 
         if !should_plan {
             self.normalize_specials();
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         }
 
         let max_visible_level = max_visible_level.unwrap();
@@ -855,7 +994,7 @@ impl SerializerContext {
         let mut counted_rows = 0u64;
         let mut counted_values = 0u64;
         let mut saw_structural_overhead = false;
-        let mut unsplittable_over_budget = None;
+        let mut single_row_over_budget_levels = None;
 
         let mut current_row_level_start = None;
         let mut current_row_num_values = 0u64;
@@ -876,14 +1015,14 @@ impl SerializerContext {
                 saw_structural_overhead |= row_has_structural_overhead;
 
                 if row_has_structural_overhead && row_num_levels > max_levels_per_page {
-                    unsplittable_over_budget = Some(row_num_levels);
+                    single_row_over_budget_levels = Some(row_num_levels);
                 }
 
                 if current_page_num_rows > 0
                     && (current_page_has_structural_overhead || row_has_structural_overhead)
                     && current_page_num_levels + row_num_levels > max_levels_per_page
                 {
-                    splits.push(StructuralPageSplit {
+                    splits.push(MiniBlockRepDefSplit {
                         row_start: current_page_row_start,
                         num_rows: current_page_num_rows,
                         level_range: current_page_level_start..current_page_level_end,
@@ -966,14 +1105,14 @@ impl SerializerContext {
             )));
         }
         if !saw_structural_overhead {
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         }
-        if let Some(row_num_levels) = unsplittable_over_budget {
-            return Ok(StructuralPagePlan::UnsplittableOverBudget(row_num_levels));
+        if let Some(row_num_levels) = single_row_over_budget_levels {
+            return Ok(MiniBlockRepDefBudget::SingleRowOverBudget(row_num_levels));
         }
 
         if current_page_num_rows > 0 {
-            splits.push(StructuralPageSplit {
+            splits.push(MiniBlockRepDefSplit {
                 row_start: current_page_row_start,
                 num_rows: current_page_num_rows,
                 level_range: current_page_level_start..current_page_level_end,
@@ -983,9 +1122,9 @@ impl SerializerContext {
         }
 
         if splits.len() > 1 {
-            Ok(StructuralPagePlan::Split(splits))
+            Ok(MiniBlockRepDefBudget::RequiresPageSplit(splits))
         } else {
-            Ok(StructuralPagePlan::Fits)
+            Ok(MiniBlockRepDefBudget::WithinBudget)
         }
     }
 
@@ -1023,12 +1162,12 @@ impl SerializerContext {
         )
     }
 
-    fn build_with_structural_plan(
+    fn build_with_miniblock_repdef_budget(
         mut self,
         max_levels_per_page: Option<u64>,
         num_rows: u64,
         num_values: u64,
-    ) -> Result<(SerializedRepDefs, StructuralPagePlan)> {
+    ) -> Result<(SerializedRepDefs, MiniBlockRepDefBudget)> {
         if self.current_len == 0 {
             return Ok((
                 SerializedRepDefs::new_with_fixed_size_list_levels(
@@ -1037,7 +1176,7 @@ impl SerializerContext {
                     self.def_meaning,
                     self.has_fsl,
                 ),
-                StructuralPagePlan::Fits,
+                MiniBlockRepDefBudget::WithinBudget,
             ));
         }
 
@@ -1046,7 +1185,7 @@ impl SerializerContext {
             .into_iter()
             .rev()
             .collect::<Vec<_>>();
-        let plan = self.normalize_specials_and_plan_splits(
+        let budget = self.normalize_specials_and_plan_splits(
             &def_meaning,
             max_levels_per_page,
             num_rows,
@@ -1071,7 +1210,7 @@ impl SerializerContext {
                 def_meaning,
                 self.has_fsl,
             ),
-            plan,
+            budget,
         ))
     }
 }
@@ -1409,54 +1548,18 @@ impl RepDefBuilder {
     /// Converts the validity / offsets buffers that have been gathered so far
     /// into repetition and definition levels
     pub fn serialize(builders: Vec<Self>) -> SerializedRepDefs {
-        Self::serialize_builders(builders).0.build()
+        Self::normalize(builders).serialize()
     }
 
-    /// Converts gathered structural buffers into rep/def levels and an encode-time plan.
-    pub(crate) fn serialize_with_structural_plan(
-        builders: Vec<Self>,
-        max_levels_for_bits: impl FnOnce(u64) -> u64,
-        num_rows: u64,
-        num_values: u64,
-    ) -> Result<(SerializedRepDefs, StructuralPagePlan)> {
-        let (context, bits_per_level) = Self::serialize_builders(builders);
-        context.build_with_structural_plan(
-            bits_per_level.map(max_levels_for_bits),
-            num_rows,
-            num_values,
-        )
-    }
-
-    fn serialize_builders(builders: Vec<Self>) -> (SerializerContext, Option<u64>) {
+    pub(crate) fn normalize(builders: Vec<Self>) -> NormalizedStructuralPlan {
         assert!(!builders.is_empty());
-        if builders.iter().all(|b| b.is_empty()) {
-            // No repetition, all-valid
-            let def_meaning = builders
-                .first()
-                .unwrap()
-                .repdefs
-                .iter()
-                .map(|_| DefinitionInterpretation::AllValidItem)
-                .collect::<Vec<_>>();
-            return (
-                SerializerContext {
-                    def_meaning,
-                    rep_levels: LevelBuffer::default(),
-                    spare_rep: LevelBuffer::default(),
-                    def_levels: LevelBuffer::default(),
-                    spare_def: LevelBuffer::default(),
-                    current_rep: 0,
-                    current_def: 0,
-                    current_len: 0,
-                    current_num_specials: 0,
-                    has_fsl: false,
-                },
-                None,
-            );
-        }
-
         let num_layers = builders[0].num_layers();
-        let combined_layers = (0..num_layers)
+        debug_assert!(
+            builders
+                .iter()
+                .all(|builder| builder.num_layers() == num_layers)
+        );
+        let layers = (0..num_layers)
             .map(|layer_index| {
                 Self::concat_layers(
                     builders.iter().map(|b| &b.repdefs[layer_index]),
@@ -1464,47 +1567,10 @@ impl RepDefBuilder {
                 )
             })
             .collect::<Vec<_>>();
-        debug_assert!(
-            builders
-                .iter()
-                .all(|b| b.num_layers() == builders[0].num_layers())
-        );
-
-        let total_len = combined_layers.last().unwrap().num_values()
-            + combined_layers
-                .iter()
-                .map(|l| l.num_specials())
-                .sum::<usize>();
-        let max_rep = combined_layers.iter().map(|l| l.max_rep()).sum::<u16>();
-        let max_def = combined_layers.iter().map(|l| l.max_def()).sum::<u16>();
-        let bits_per_rep = if max_rep > 0 {
-            u64::from(u16::BITS - max_rep.leading_zeros())
-        } else {
-            0
-        };
-        let bits_per_def = if max_def > 0 {
-            u64::from(u16::BITS - max_def.leading_zeros())
-        } else {
-            0
-        };
-        let bits_per_level =
-            (bits_per_rep + bits_per_def > 0).then_some(bits_per_rep + bits_per_def);
-
-        let mut context = SerializerContext::new(total_len, num_layers, max_rep, max_def);
-        for layer in combined_layers.into_iter() {
-            match layer {
-                RawRepDef::Validity(def) => {
-                    context.record_validity(&def);
-                }
-                RawRepDef::Offsets(rep) => {
-                    context.record_offsets(&rep);
-                }
-                RawRepDef::Fsl(fsl) => {
-                    context.record_fsl(&fsl);
-                }
-            }
+        NormalizedStructuralPlan {
+            layers,
+            dense_all_valid: builders.iter().all(Self::is_empty),
         }
-        (context, bits_per_level)
     }
 }
 
@@ -1514,6 +1580,7 @@ impl RepDefBuilder {
 /// This is used during decoding to create the necessary arrow structures
 #[derive(Debug)]
 pub struct RepDefUnraveler {
+    sparse: Option<SparseStructuralUnraveler>,
     rep_levels: Option<LevelBuffer>,
     def_levels: Option<LevelBuffer>,
     // Maps from definition level to the rep level at which that definition level is visible
@@ -1567,6 +1634,7 @@ impl RepDefUnraveler {
             }
         }
         Self {
+            sparse: None,
             rep_levels,
             def_levels,
             current_def_cmp: 0,
@@ -1578,7 +1646,35 @@ impl RepDefUnraveler {
         }
     }
 
+    pub(crate) fn new_sparse(plan: SparseStructuralPlan) -> Self {
+        Self {
+            sparse: Some(SparseStructuralUnraveler::new(plan)),
+            rep_levels: None,
+            def_levels: None,
+            levels_to_rep: Vec::new(),
+            def_meaning: Arc::new([]),
+            current_def_cmp: 0,
+            current_rep_cmp: 0,
+            current_layer: 0,
+            num_items: 0,
+        }
+    }
+
+    fn ensure_exhausted(&self) -> Result<()> {
+        if let Some(sparse) = &self.sparse {
+            sparse.ensure_exhausted()?;
+        }
+        Ok(())
+    }
+
+    fn is_sparse(&self) -> bool {
+        self.sparse.is_some()
+    }
+
     pub fn is_all_valid(&self) -> bool {
+        if let Some(sparse) = &self.sparse {
+            return sparse.is_all_valid();
+        }
         self.def_levels.is_none() || self.def_meaning[self.current_layer].is_all_valid()
     }
 
@@ -1587,15 +1683,19 @@ impl RepDefUnraveler {
     ///
     /// This is not valid to call when the current level is a struct/primitive layer because
     /// in some cases there may be no rep or def information to know this.
-    pub fn max_lists(&self) -> usize {
+    pub fn max_lists(&self) -> Result<usize> {
+        if let Some(sparse) = &self.sparse {
+            return sparse.max_lists();
+        }
         debug_assert!(
             self.def_meaning[self.current_layer] != DefinitionInterpretation::NullableItem
         );
-        self.rep_levels
+        Ok(self
+            .rep_levels
             .as_ref()
             // Worst case every rep item is max_rep and a new list
             .map(|levels| levels.len())
-            .unwrap_or(0)
+            .unwrap_or(0))
     }
 
     /// Unravels a layer of offsets from the unraveler into the given offset width
@@ -1607,6 +1707,9 @@ impl RepDefUnraveler {
         offsets: &mut Vec<T>,
         validity: Option<&mut BooleanBufferBuilder>,
     ) -> Result<()> {
+        if let Some(sparse) = self.sparse.as_mut() {
+            return sparse.unravel_offsets(offsets, validity);
+        }
         let rep_levels = self
             .rep_levels
             .as_mut()
@@ -1743,7 +1846,11 @@ impl RepDefUnraveler {
             }
             let num_new_lists = offsets.len() - old_offsets_len;
             offsets.push(to_offset(curlen)?);
-            rep_levels.truncate(offsets.len() - 1);
+            // Truncate to the number of lists THIS unraveler produced (write_idx),
+            // not `offsets.len() - 1` — the latter includes offsets contributed by
+            // earlier unravelers in a multi-page read, which would leave too many
+            // rep levels for the next (outer) layer and over-count its lists.
+            rep_levels.truncate(write_idx);
             if let Some(validity) = validity {
                 // Even though we don't have validity it is possible another unraveler did and so we need
                 // to push all valids
@@ -1753,18 +1860,25 @@ impl RepDefUnraveler {
         }
     }
 
-    pub fn skip_validity(&mut self) {
+    pub fn skip_validity(&mut self) -> Result<()> {
+        if let Some(sparse) = self.sparse.as_mut() {
+            return sparse.skip_validity();
+        }
         debug_assert!(self.is_all_valid());
         self.current_layer += 1;
+        Ok(())
     }
 
     /// Unravels a layer of validity from the definition levels
-    pub fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) {
+    pub fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) -> Result<()> {
+        if let Some(sparse) = self.sparse.as_mut() {
+            return sparse.unravel_validity(validity);
+        }
         let meaning = self.def_meaning[self.current_layer];
         if meaning == DefinitionInterpretation::AllValidItem || self.def_levels.is_none() {
             self.current_layer += 1;
             validity.append_n(self.num_items as usize, true);
-            return;
+            return Ok(());
         }
 
         self.current_layer += 1;
@@ -1782,9 +1896,28 @@ impl RepDefUnraveler {
         }) {
             validity.append(is_valid);
         }
+        Ok(())
     }
 
-    pub fn decimate(&mut self, dimension: usize) {
+    /// Removes all but the first definition level of each fixed-size-list slot
+    ///
+    /// The definition levels arrive with one entry per item.  A fixed-size-list
+    /// layer has a single definition level per slot (all `dimension` items in a
+    /// slot share it) so we keep every `dimension`-th level and drop the rest.
+    ///
+    /// `dimension` must be non-zero.  A zero dimension can only come from a
+    /// malformed schema (writers reject it, see
+    /// [`lance_core::datatypes::validate_fixed_size_list_dimensions`]) and is
+    /// rejected here rather than allowed to run off the end of the buffer.
+    pub fn decimate(&mut self, dimension: usize) -> Result<()> {
+        if dimension == 0 {
+            return Err(Error::invalid_input(
+                "Cannot decimate repetition/definition levels with a fixed-size-list dimension of 0; dimension must be a positive integer",
+            ));
+        }
+        if let Some(sparse) = self.sparse.as_mut() {
+            return sparse.decimate(dimension);
+        }
         if self.rep_levels.is_some() {
             // If we need to support this then I think we need to walk through the rep def levels to find
             // the spots at which we keep.  E.g. if we have:
@@ -1800,11 +1933,14 @@ impl RepDefUnraveler {
             todo!("Not yet supported FSL<...List<...>>");
         }
         let Some(def_levels) = self.def_levels.as_mut() else {
-            return;
+            return Ok(());
         };
         let mut read_idx = 0;
         let mut write_idx = 0;
         while read_idx < def_levels.len() {
+            // SAFETY: `read_idx` is checked against the length by the loop condition and
+            // `dimension >= 1` (checked above) means `write_idx <= read_idx`, so both
+            // indices are in bounds.
             unsafe {
                 *def_levels.get_unchecked_mut(write_idx) = *def_levels.get_unchecked(read_idx);
             }
@@ -1812,6 +1948,7 @@ impl RepDefUnraveler {
             read_idx += dimension;
         }
         def_levels.truncate(write_idx);
+        Ok(())
     }
 }
 
@@ -1831,44 +1968,104 @@ impl RepDefUnraveler {
 #[derive(Debug)]
 pub struct CompositeRepDefUnraveler {
     unravelers: Vec<RepDefUnraveler>,
+    comparisons: Vec<Self>,
 }
 
 impl CompositeRepDefUnraveler {
     pub fn new(unravelers: Vec<RepDefUnraveler>) -> Self {
-        Self { unravelers }
+        Self {
+            unravelers,
+            comparisons: Vec::new(),
+        }
+    }
+
+    pub(crate) fn add_compatibility_check(&mut self, other: Self) {
+        self.comparisons.push(other);
+    }
+
+    pub(crate) fn has_sparse(&self) -> bool {
+        self.unravelers.iter().any(RepDefUnraveler::is_sparse)
+            || self.comparisons.iter().any(Self::has_sparse)
+    }
+
+    pub(crate) fn ensure_exhausted(&self) -> Result<()> {
+        for unraveler in &self.unravelers {
+            unraveler.ensure_exhausted()?;
+        }
+        for comparison in &self.comparisons {
+            comparison.ensure_exhausted()?;
+        }
+        Ok(())
+    }
+
+    fn null_buffers_equal(
+        left: &Option<NullBuffer>,
+        right: &Option<NullBuffer>,
+        expected_len: usize,
+    ) -> bool {
+        match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                left.len() == expected_len
+                    && right.len() == expected_len
+                    && left.iter().eq(right.iter())
+            }
+            (None, Some(right)) => right.len() == expected_len && right.null_count() == 0,
+            (Some(left), None) => left.len() == expected_len && left.null_count() == 0,
+        }
+    }
+
+    fn decimate(&mut self, dimension: usize) -> Result<()> {
+        for unraveler in &mut self.unravelers {
+            unraveler.decimate(dimension)?;
+        }
+        for comparison in &mut self.comparisons {
+            comparison.decimate(dimension)?;
+        }
+        Ok(())
     }
 
     /// Unravels a layer of validity
     ///
     /// Returns None if there are no null items in this layer
-    pub fn unravel_validity(&mut self, num_values: usize) -> Option<NullBuffer> {
+    pub fn unravel_validity(&mut self, num_values: usize) -> Result<Option<NullBuffer>> {
         let is_all_valid = self
             .unravelers
             .iter()
             .all(|unraveler| unraveler.is_all_valid());
 
-        if is_all_valid {
+        let validity = if is_all_valid {
             for unraveler in self.unravelers.iter_mut() {
-                unraveler.skip_validity();
+                unraveler.skip_validity()?;
             }
             None
         } else {
             let mut validity = BooleanBufferBuilder::new(num_values);
             for unraveler in self.unravelers.iter_mut() {
-                unraveler.unravel_validity(&mut validity);
+                unraveler.unravel_validity(&mut validity)?;
             }
             Some(NullBuffer::new(validity.finish()))
+        };
+        for comparison in &mut self.comparisons {
+            let other = comparison.unravel_validity(num_values)?;
+            if !Self::null_buffers_equal(&validity, &other, num_values) {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Structural sibling fields have incompatible validity metadata for {num_values} values"
+                    )
+                    .into(),
+                ));
+            }
         }
+        Ok(validity)
     }
 
     pub fn unravel_fsl_validity(
         &mut self,
         num_values: usize,
         dimension: usize,
-    ) -> Option<NullBuffer> {
-        for unraveler in self.unravelers.iter_mut() {
-            unraveler.decimate(dimension);
-        }
+    ) -> Result<Option<NullBuffer>> {
+        self.decimate(dimension)?;
         self.unravel_validity(num_values)
     }
 
@@ -1877,10 +2074,16 @@ impl CompositeRepDefUnraveler {
         &mut self,
     ) -> Result<(OffsetBuffer<T>, Option<NullBuffer>)> {
         let mut is_all_valid = true;
-        let mut max_num_lists = 0;
+        let mut max_num_lists: usize = 0;
         for unraveler in self.unravelers.iter() {
             is_all_valid &= unraveler.is_all_valid();
-            max_num_lists += unraveler.max_lists();
+            max_num_lists = max_num_lists
+                .checked_add(unraveler.max_lists()?)
+                .ok_or_else(|| {
+                    Error::invalid_input_source(
+                        "Combined repetition/definition list count exceeds usize::MAX".into(),
+                    )
+                })?;
         }
 
         let mut validity = if is_all_valid {
@@ -1897,10 +2100,28 @@ impl CompositeRepDefUnraveler {
             unraveler.unravel_offsets(&mut offsets, validity.as_mut())?;
         }
 
-        Ok((
-            OffsetBuffer::new(ScalarBuffer::from(offsets)),
-            validity.map(|mut v| NullBuffer::new(v.finish())),
-        ))
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+        let validity = validity.map(|mut v| NullBuffer::new(v.finish()));
+        for comparison in &mut self.comparisons {
+            let (other_offsets, other_validity) = comparison.unravel_offsets::<T>()?;
+            if offsets.as_ref() != other_offsets.as_ref()
+                || !Self::null_buffers_equal(
+                    &validity,
+                    &other_validity,
+                    offsets.len().saturating_sub(1),
+                )
+            {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Structural sibling fields have incompatible list metadata for {} slots",
+                        offsets.len().saturating_sub(1)
+                    )
+                    .into(),
+                ));
+            }
+        }
+
+        Ok((offsets, validity))
     }
 }
 
@@ -2599,6 +2820,10 @@ impl ControlWordParser {
 mod tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 
+    use crate::encodings::logical::primitive::sparse::{
+        SparsePositionSet, SparseStructuralLayerPlan, SparseStructuralPlan, SparseValidityMeaning,
+        SparseValiditySet,
+    };
     use crate::repdef::{
         CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler, SerializedRepDefs,
     };
@@ -2615,6 +2840,31 @@ mod tests {
 
     fn offsets_64(values: &[i64]) -> OffsetBuffer<i64> {
         OffsetBuffer::<i64>::new(ScalarBuffer::from_iter(values.iter().copied()))
+    }
+
+    #[test]
+    fn sparse_sibling_validity_mismatch_is_invalid_input() {
+        let sparse = |positions| {
+            RepDefUnraveler::new_sparse(SparseStructuralPlan {
+                layers: vec![SparseStructuralLayerPlan::Validity {
+                    num_slots: 2,
+                    validity: SparseValiditySet {
+                        meaning: SparseValidityMeaning::NullPositions,
+                        positions,
+                    },
+                }],
+                num_items: 2,
+                num_visible_items: 2,
+            })
+        };
+        let mut repdef = CompositeRepDefUnraveler::new(vec![sparse(SparsePositionSet::Empty)]);
+        repdef.add_compatibility_check(CompositeRepDefUnraveler::new(vec![sparse(
+            SparsePositionSet::Explicit(vec![0]),
+        )]));
+
+        let err = repdef.unravel_validity(2).unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("incompatible validity metadata"));
     }
 
     #[test]
@@ -2662,7 +2912,7 @@ mod tests {
         // Note: validity doesn't exactly round-trip because repdef normalizes some of the
         // redundant validity values
         assert_eq!(
-            unraveler.unravel_validity(9),
+            unraveler.unravel_validity(9).unwrap(),
             Some(validity(&[
                 true, true, true, false, false, false, true, true, false
             ]))
@@ -2800,15 +3050,45 @@ mod tests {
         )]);
 
         assert_eq!(
-            unraveler.unravel_validity(8),
+            unraveler.unravel_validity(8).unwrap(),
             Some(validity(&[
                 true, false, true, false, false, false, false, false
             ]))
         );
-        assert_eq!(unraveler.unravel_fsl_validity(4, 2), None);
+        assert_eq!(unraveler.unravel_fsl_validity(4, 2).unwrap(), None);
         assert_eq!(
-            unraveler.unravel_fsl_validity(2, 2),
+            unraveler.unravel_fsl_validity(2, 2).unwrap(),
             Some(validity(&[true, false]))
+        );
+    }
+
+    #[test]
+    fn test_repdef_fsl_zero_dimension_is_invalid_input() {
+        // A zero dimension can only reach us from a malformed schema.  Decimating with it
+        // used to loop forever, writing past the end of the definition levels buffer.
+        let mut builder = RepDefBuilder::default();
+        builder.add_fsl(Some(validity(&[true, false])), 2, 2);
+        builder.add_validity_bitmap(validity(&[true, false, true, false]));
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+        let def = repdefs.definition_levels.unwrap();
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            None,
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+            4,
+        )]);
+        // Consume the item layer so the fixed-size-list layer is next
+        unraveler.unravel_validity(4).unwrap();
+
+        let err = unraveler.unravel_fsl_validity(2, 0).unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
         );
     }
 
@@ -2843,10 +3123,10 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(8), None);
-        assert_eq!(unraveler.unravel_fsl_validity(4, 2), None);
+        assert_eq!(unraveler.unravel_validity(8).unwrap(), None);
+        assert_eq!(unraveler.unravel_fsl_validity(4, 2).unwrap(), None);
         assert_eq!(
-            unraveler.unravel_fsl_validity(2, 2),
+            unraveler.unravel_fsl_validity(2, 2).unwrap(),
             Some(validity(&[true, false]))
         );
     }
@@ -2924,7 +3204,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, None);
@@ -2950,13 +3230,47 @@ mod tests {
             9,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(9), None);
+        assert_eq!(unraveler.unravel_validity(9).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 1, 3, 5, 7, 9]).inner());
         assert_eq!(val, None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 2, 3, 5]).inner());
         assert_eq!(val, None);
+    }
+
+    #[test]
+    fn test_repdef_nested_list_multibatch_matches_single() {
+        // Single builder: List<List<i32>>, 3 rows.
+        //   outer [0,2,3,5] -> rows have 2,1,2 inner lists
+        //   inner [0,1,3,5,7,9] -> 5 inner lists, lengths 1,2,2,2,2 (9 leaf)
+        let mut single = RepDefBuilder::default();
+        single.add_offsets(offsets_64(&[0, 2, 3, 5]), None);
+        single.add_offsets(offsets_64(&[0, 1, 3, 5, 7, 9]), None);
+        single.add_no_null(9);
+        let single_rep = RepDefBuilder::serialize(vec![single])
+            .repetition_levels
+            .unwrap();
+
+        // Same logical data split into two batches:
+        //   batch0 = rows 0,1 : outer [0,2,3], inner [0,1,3,5] (3 inner, 5 leaf)
+        //   batch1 = row 2    : outer [0,2],   inner [0,2,4]   (2 inner, 4 leaf)
+        let mut b0 = RepDefBuilder::default();
+        b0.add_offsets(offsets_64(&[0, 2, 3]), None);
+        b0.add_offsets(offsets_64(&[0, 1, 3, 5]), None);
+        b0.add_no_null(5);
+        let mut b1 = RepDefBuilder::default();
+        b1.add_offsets(offsets_64(&[0, 2]), None);
+        b1.add_offsets(offsets_64(&[0, 2, 4]), None);
+        b1.add_no_null(4);
+        let multi_rep = RepDefBuilder::serialize(vec![b0, b1])
+            .repetition_levels
+            .unwrap();
+
+        assert_eq!(
+            *single_rep, *multi_rep,
+            "multi-batch nested-list rep levels must equal single-batch"
+        );
     }
 
     #[test]
@@ -2980,7 +3294,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, None);
@@ -3010,7 +3324,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, Some(validity(&[true, false, false, true])));
@@ -3040,7 +3354,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, Some(validity(&[true, false, true, true])));
@@ -3068,11 +3382,11 @@ mod tests {
         )]);
 
         assert_eq!(
-            unraveler.unravel_validity(4),
+            unraveler.unravel_validity(4).unwrap(),
             Some(validity(&[false, true, false, false]))
         );
         assert_eq!(
-            unraveler.unravel_validity(4),
+            unraveler.unravel_validity(4).unwrap(),
             Some(validity(&[false, true, false, false]))
         );
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
@@ -3101,14 +3415,14 @@ mod tests {
         )]);
 
         assert_eq!(
-            unraveler.unravel_validity(5),
+            unraveler.unravel_validity(5).unwrap(),
             Some(validity(&[false, false, true, true, false]))
         );
         assert_eq!(
-            unraveler.unravel_validity(5),
+            unraveler.unravel_validity(5).unwrap(),
             Some(validity(&[false, false, true, true, true]))
         );
-        assert_eq!(unraveler.unravel_validity(5), None);
+        assert_eq!(unraveler.unravel_validity(5).unwrap(), None);
     }
 
     #[test]
@@ -3150,7 +3464,7 @@ mod tests {
 
         let mut unraveler = CompositeRepDefUnraveler::new(vec![unravel1, unravel2]);
 
-        assert!(unraveler.unravel_validity(9).is_none());
+        assert!(unraveler.unravel_validity(9).unwrap().is_none());
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(
             off.inner(),
@@ -3446,11 +3760,11 @@ mod tests {
             0,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(0), None);
+        assert_eq!(unraveler.unravel_validity(0).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 0, 0, 0]).inner());
         assert_eq!(val, Some(validity(&[false, false, false])));
-        let val = unraveler.unravel_validity(3).unwrap();
+        let val = unraveler.unravel_validity(3).unwrap().unwrap();
         assert_eq!(val.inner(), validity(&[true, false, true]).inner());
     }
 
@@ -3478,7 +3792,7 @@ mod tests {
             1,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(1), None);
+        assert_eq!(unraveler.unravel_validity(1).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 1, 1]).inner());
         assert_eq!(val, Some(validity(&[true, false])));
@@ -3509,7 +3823,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            unraveler.unravel_validity(8),
+            unraveler.unravel_validity(8).unwrap(),
             Some(validity(&[
                 true, false, true, false, true, true, true, true
             ]))
@@ -3546,7 +3860,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            unraveler.unravel_validity(4),
+            unraveler.unravel_validity(4).unwrap(),
             Some(validity(&[true, false, true, true]))
         );
         assert_eq!(
@@ -3578,7 +3892,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            unraveler.unravel_validity(8),
+            unraveler.unravel_validity(8).unwrap(),
             Some(validity(&[
                 true, false, true, false, true, true, true, true
             ]))

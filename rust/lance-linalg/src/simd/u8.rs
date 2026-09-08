@@ -84,7 +84,17 @@ impl std::fmt::Debug for u8x16 {
 }
 
 impl From<&[u8]> for u8x16 {
+    /// Loads the first 16 values from `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` contains fewer than 16 values.
     fn from(value: &[u8]) -> Self {
+        assert!(
+            value.len() >= 16,
+            "u8x16 requires at least 16 values, got {}",
+            value.len()
+        );
         unsafe { Self::load_unaligned(value.as_ptr()) }
     }
 }
@@ -402,6 +412,11 @@ impl SubAssign for u8x16 {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn test_slice_conversion_rejects_short_input() {
+        assert!(std::panic::catch_unwind(|| u8x16::from(&[0; 15][..])).is_err());
+    }
 
     #[test]
     fn test_basic_u8x16_ops() {

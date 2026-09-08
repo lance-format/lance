@@ -4,7 +4,7 @@ Machine learning users can use `lance.torch.data.LanceDataset`, a
 subclass of `torch.utils.data.IterableDataset`, that to use
 Lance data directly PyTorch training and inference loops.
 
-It starts with creating a ML dataset for training. With the [HuggingFace integration](huggingface.md),
+It starts with creating a ML dataset for training. With the [HuggingFace integration](huggingface),
 it takes just one line of Python to convert a HuggingFace dataset to a Lance dataset.
 
 ```python

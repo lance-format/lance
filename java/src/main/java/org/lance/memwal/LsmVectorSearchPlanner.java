@@ -44,17 +44,17 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
 
   /**
    * @param dataset the base dataset
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    * @param vectorColumn name of the {@code FixedSizeList<float32>} vector column
    */
   public LsmVectorSearchPlanner(
       Dataset dataset, List<ShardSnapshot> shardSnapshots, String vectorColumn) {
-    this(dataset, shardSnapshots, vectorColumn, null, null);
+    this(dataset, shardSnapshots, vectorColumn, null, null, null);
   }
 
   /**
    * @param dataset the base dataset
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    * @param vectorColumn name of the {@code FixedSizeList<float32>} vector column
    * @param pkColumns primary key column names; inferred from schema metadata when {@code null}
    * @param distanceType distance metric, one of {@code "l2"}, {@code "cosine"}, {@code "dot"},
@@ -66,16 +66,39 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
       String vectorColumn,
       List<String> pkColumns,
       String distanceType) {
+    this(dataset, shardSnapshots, vectorColumn, pkColumns, distanceType, null);
+  }
+
+  /**
+   * @param dataset the base dataset
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
+   * @param vectorColumn name of the {@code FixedSizeList<float32>} vector column
+   * @param pkColumns primary key column names; inferred from schema metadata when {@code null}
+   * @param distanceType distance metric, one of {@code "l2"}, {@code "cosine"}, {@code "dot"},
+   *     {@code "hamming"}; defaults to {@code "l2"} when {@code null}
+   * @param filter SQL predicate applied as a prefilter to every LSM source before vector candidate
+   *     selection; pass {@code null} for no predicate
+   */
+  public LsmVectorSearchPlanner(
+      Dataset dataset,
+      List<ShardSnapshot> shardSnapshots,
+      String vectorColumn,
+      List<String> pkColumns,
+      String distanceType,
+      String filter) {
     Preconditions.checkNotNull(dataset, "dataset must not be null");
     Preconditions.checkNotNull(shardSnapshots, "shardSnapshots must not be null");
     Preconditions.checkNotNull(vectorColumn, "vectorColumn must not be null");
     this.allocator = dataset.allocator();
-    nativeCreate(
-        dataset,
-        shardSnapshots,
-        vectorColumn,
-        Optional.ofNullable(pkColumns),
-        Optional.ofNullable(distanceType));
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      nativeCreate(
+          dataset,
+          shardSnapshots,
+          vectorColumn,
+          Optional.ofNullable(pkColumns),
+          Optional.ofNullable(distanceType),
+          Optional.ofNullable(filter));
+    }
   }
 
   private native void nativeCreate(
@@ -83,7 +106,8 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
       List<ShardSnapshot> shardSnapshots,
       String vectorColumn,
       Optional<List<String>> pkColumns,
-      Optional<String> distanceType);
+      Optional<String> distanceType,
+      Optional<String> filter);
 
   /**
    * Plan a KNN vector search.
@@ -96,17 +120,17 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
    * @param refineBaseTable when true, the base-table arm re-ranks candidates with exact distances
    *     (refine factor 1). Useful when the base table uses an approximate index (IVF-PQ).
    *     Auto-enabled whenever stale filtering is on (see {@code overfetchFactor}).
-   * @param overfetchFactor single knob controlling both stale-read filtering and over-fetch:
+   * @param overfetchFactor over-fetch multiple for sources with rows superseded by newer
+   *     generations. Must be at least {@code 1.0}:
    *     <ul>
-   *       <li>{@code < 1.0} (e.g. {@code 0.0}): stale filtering off — rows superseded by a newer
-   *           generation may surface (the global primary-key dedup still runs).
-   *       <li>{@code == 1.0}: filtering on, no over-fetch — a source with superseded rows fetches
-   *           exactly {@code k} candidates and may return fewer than {@code k} live rows.
-   *       <li>{@code > 1.0}: filtering on, with over-fetch — such a source fetches {@code ceil(k *
-   *           overfetchFactor)} candidates so dropping the stale ones still leaves {@code k} live
-   *           rows.
+   *       <li>{@code == 1.0}: no over-fetch — an affected source fetches exactly {@code k}
+   *           candidates and may return fewer than {@code k} live rows after stale rows are
+   *           dropped.
+   *       <li>{@code > 1.0}: with over-fetch — such a source fetches {@code ceil(k *
+   *           overfetchFactor)} candidates so dropping stale rows is less likely to under-fill the
+   *           result.
    *     </ul>
-   *     There is no separate on/off flag: over-fetch is only meaningful while filtering.
+   *
    * @return an executable plan
    */
   public ExecutionPlan planSearch(
@@ -119,6 +143,10 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
     Preconditions.checkNotNull(query, "query must not be null");
     Preconditions.checkArgument(k > 0, "k must be positive, got %s", k);
     Preconditions.checkArgument(nprobes > 0, "nprobes must be positive, got %s", nprobes);
+    Preconditions.checkArgument(
+        Double.isFinite(overfetchFactor) && overfetchFactor >= 1.0,
+        "overfetchFactor must be finite and >= 1.0, got %s",
+        overfetchFactor);
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(
           nativeVectorPlannerHandle != 0, "LsmVectorSearchPlanner is closed");

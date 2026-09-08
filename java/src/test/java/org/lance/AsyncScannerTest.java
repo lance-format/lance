@@ -18,6 +18,7 @@ import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.AsyncScanner;
+import org.lance.ipc.MaterializationStyle;
 import org.lance.ipc.ScanOptions;
 
 import org.apache.arrow.memory.BufferAllocator;
@@ -32,6 +33,9 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
@@ -40,6 +44,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -47,6 +53,7 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -66,6 +73,29 @@ public class AsyncScannerTest {
     if (dataset != null) {
       dataset.close();
     }
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void testNativeScanFailureUsesLanceException() throws Exception {
+    Constructor<AsyncScanner> constructor = AsyncScanner.class.getDeclaredConstructor();
+    constructor.setAccessible(true);
+    AsyncScanner scanner = constructor.newInstance();
+
+    Field pendingTasksField = AsyncScanner.class.getDeclaredField("pendingTasks");
+    pendingTasksField.setAccessible(true);
+    ConcurrentHashMap<Long, CompletableFuture<Long>> pendingTasks =
+        (ConcurrentHashMap<Long, CompletableFuture<Long>>) pendingTasksField.get(scanner);
+    CompletableFuture<Long> pendingTask = new CompletableFuture<>();
+    pendingTasks.put(1L, pendingTask);
+
+    Method failTask = AsyncScanner.class.getDeclaredMethod("failTask", long.class, String.class);
+    failTask.setAccessible(true);
+    failTask.invoke(scanner, 1L, "scan I/O failed");
+
+    CompletionException failure = assertThrows(CompletionException.class, pendingTask::join);
+    assertEquals(LanceException.class, failure.getCause().getClass());
+    assertEquals("scan I/O failed", failure.getCause().getMessage());
   }
 
   /**
@@ -137,6 +167,35 @@ public class AsyncScannerTest {
 
           assertEquals(20, rowCount, "Should read only filtered rows");
           reader.close();
+        }
+      }
+    }
+  }
+
+  @Test
+  void testAsyncScanWithPerformanceOptions(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("async_scanner_performance_options").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      try (Dataset dataset = testDataset.write(1, 40)) {
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .filter("id < 20")
+                .batchSize(10)
+                .batchSizeBytes(1024)
+                .ioBufferSize(1024 * 1024)
+                .batchReadahead(2)
+                .fragmentReadahead(2)
+                .scanInOrder(false)
+                .lateMaterialization(MaterializationStyle.allEarly())
+                .build();
+
+        try (AsyncScanner scanner = AsyncScanner.create(dataset, options, allocator);
+            ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
+          assertEquals(20, countRows(reader));
         }
       }
     }

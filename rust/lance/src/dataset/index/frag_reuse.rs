@@ -16,15 +16,34 @@ use roaring::RoaringBitmap;
 /// If all the indices currently available are already caught up to as a specific reuse version,
 /// all older reuse versions (inclusive) can be cleaned up.
 ///
-/// An index is considered caught up against a specific reuse version if
-/// 1. the index is created after or at the same dataset version as the reuse version
-/// 2. there is no old fragment in the version that is covered by the index and can be remapped.
-///    If an index's fragment bitmap is missing, we will consider it as caught up.
-///    Otherwise, we will never be able to clean up the reuse version.
+/// An index is considered caught up against a specific reuse version if either:
+/// 1. its coverage is disjoint from the fragments the reuse chain touches, so it
+///    holds nothing the FRI would remap (the common multi-index case: a
+///    compaction rewrote a sibling index's fragments, not this one); or
+/// 2. it is at or past the reuse version's dataset version and no old fragment
+///    in the version is still in its bitmap. A missing bitmap counts as caught
+///    up, else the version could never be cleaned up.
 ///
 /// Note that there could be a race condition that an index is being added during the cleanup,
 /// This will make that specific index not efficient until the next reindex,
 /// but it will not cause any correctness problem.
+///
+/// Typically run after [`compact_files`] with deferred remap and per-index
+/// [`remap_column_index`] have caught the indexes up.
+///
+/// # Example
+///
+/// ```no_run
+/// # use lance::dataset::index::frag_reuse::cleanup_frag_reuse_index;
+/// # async fn example(dataset: &mut lance::Dataset) -> lance::Result<()> {
+/// // Trim the fragment-reuse index to the versions still needed by some index.
+/// cleanup_frag_reuse_index(dataset).await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`compact_files`]: crate::dataset::optimize::compact_files
+/// [`remap_column_index`]: crate::dataset::optimize::remapping::remap_column_index
 pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
     // check against index metadata before auto-remap
     let indices = read_manifest_indexes(
@@ -42,12 +61,14 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         .await
         .unwrap();
 
+    let chain_frag_bitmap = reuse_chain_frag_bitmap(&frag_reuse_details.versions);
+
     let mut retained_versions = Vec::new();
     let mut fragment_bitmaps = RoaringBitmap::new();
     for version in frag_reuse_details.versions.iter() {
         let check_results = indices
             .iter()
-            .map(|idx| is_index_remap_caught_up(version, idx))
+            .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
             .collect::<Vec<_>>();
 
         if check_results
@@ -97,11 +118,35 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     Ok(())
 }
 
+/// Every fragment the reuse chain touches (old + new) across all versions. An
+/// index disjoint from this set holds no row address the FRI remaps, so trimming
+/// can never strand it (fragment ids are never reused).
+fn reuse_chain_frag_bitmap(versions: &[FragReuseVersion]) -> RoaringBitmap {
+    let mut bitmap = RoaringBitmap::new();
+    for version in versions {
+        bitmap.extend(version.old_frag_ids().iter().map(|&id| id as u32));
+        bitmap.extend(version.new_frag_ids().iter().map(|&id| id as u32));
+    }
+    bitmap
+}
+
 fn is_index_remap_caught_up(
     frag_reuse_version: &FragReuseVersion,
     index_meta: &IndexMetadata,
+    chain_frag_bitmap: &RoaringBitmap,
 ) -> lance_core::Result<bool> {
     if is_system_index(index_meta) {
+        return Ok(true);
+    }
+
+    // Disjoint coverage => caught up regardless of dataset_version, bypassing the
+    // stale-version gate below (see fn docs). The chain includes NEW fragments
+    // deliberately: a deferred-remap commit advances a covering index's bitmap
+    // onto them before its data is remapped, so an old-frag-only check would
+    // clear a still-stale index and trim a version it needs.
+    if let Some(index_frag_bitmap) = &index_meta.fragment_bitmap
+        && index_frag_bitmap.is_disjoint(chain_frag_bitmap)
+    {
         return Ok(true);
     }
 
@@ -157,6 +202,106 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
 
+    fn frag_digest(id: u64) -> lance_index::frag_reuse::FragDigest {
+        lance_index::frag_reuse::FragDigest {
+            id,
+            physical_rows: 100,
+            num_deleted_rows: 0,
+        }
+    }
+
+    fn reuse_version(dataset_version: u64, old: &[u64], new: &[u64]) -> FragReuseVersion {
+        FragReuseVersion {
+            dataset_version,
+            groups: vec![lance_index::frag_reuse::FragReuseGroup {
+                changed_row_addrs: Vec::new(),
+                old_frags: old.iter().copied().map(frag_digest).collect(),
+                new_frags: new.iter().copied().map(frag_digest).collect(),
+            }],
+        }
+    }
+
+    fn index_covering(dataset_version: u64, covered: &[u32]) -> IndexMetadata {
+        IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![0],
+            covering_fields: vec![],
+            name: "test_idx".into(),
+            dataset_version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter(covered.iter().copied())),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
+
+    /// The catch-up determination must not pin the FRI on an index that is
+    /// simply unrelated to the compaction, while still retaining versions that a
+    /// covering-but-not-yet-remapped index needs.
+    #[test]
+    fn test_caught_up_uses_fragment_coverage_not_only_version() {
+        // A reuse version at dataset_version 10 rewrote fragments [4, 5] -> [6].
+        let version = reuse_version(10, &[4, 5], &[6]);
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+
+        // Non-covering, stale version: touches none of the rewritten frags, so
+        // caught up despite version 5 < 10 (the case the old gate got wrong).
+        assert_true!(
+            is_index_remap_caught_up(&version, &index_covering(5, &[1, 2, 3]), &chain).unwrap()
+        );
+
+        // Still holds an old fragment: not caught up.
+        assert_false!(
+            is_index_remap_caught_up(&version, &index_covering(5, &[1, 4, 5]), &chain).unwrap()
+        );
+
+        // Bitmap advanced onto the new fragment but data not yet remapped: not
+        // caught up (why the chain must include new frags).
+        assert_false!(
+            is_index_remap_caught_up(&version, &index_covering(5, &[1, 6]), &chain).unwrap()
+        );
+
+        // Once remapped (version advanced): caught up.
+        assert_true!(
+            is_index_remap_caught_up(&version, &index_covering(11, &[1, 6]), &chain).unwrap()
+        );
+    }
+
+    /// The chain spans every reuse version, not just the one being checked: a
+    /// stale index touching only a *later* version's fragment must still fall to
+    /// the version gate (a per-version chain would wrongly clear it).
+    #[test]
+    fn test_caught_up_uses_whole_reuse_chain() {
+        let v1 = reuse_version(10, &[4, 5], &[6]); // 4,5 -> 6
+        let v2 = reuse_version(11, &[6], &[7]); // 6 -> 7
+        let chain = reuse_chain_frag_bitmap(&[v1.clone(), v2]);
+
+        // Stale index (version 5) covering only v2's new fragment [7]: not
+        // disjoint from the chain, so not caught up on v1.
+        assert_false!(is_index_remap_caught_up(&v1, &index_covering(5, &[1, 7]), &chain).unwrap());
+    }
+
+    /// Whole-fragment removal (every row deleted, no replacement): an index
+    /// emptied by the deletion has an empty bitmap and must count as caught up --
+    /// it holds only dead rows -- else its stale version pins the removed-fragment
+    /// version forever (remap hits the drop-everything path, never advancing it).
+    #[test]
+    fn test_caught_up_handles_fragment_removal() {
+        // Reuse version 20 removed fragment [7] outright (no replacement).
+        let version = reuse_version(20, &[7], &[]);
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+
+        // Index emptied by the deletion (empty bitmap): caught up.
+        assert_true!(is_index_remap_caught_up(&version, &index_covering(5, &[]), &chain).unwrap());
+
+        // Bitmap still lists the removed fragment (not yet updated): retained.
+        assert_false!(
+            is_index_remap_caught_up(&version, &index_covering(5, &[7]), &chain).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn test_cleanup_frag_reuse_index() {
         let mut dataset = lance_datagen::gen_batch()
@@ -209,7 +354,12 @@ mod tests {
         let scalar_index = indices.iter().find(|idx| idx.name == "scalar").unwrap();
         // Should not be considered caught up because index was created at an old dataset version
         assert_false!(
-            is_index_remap_caught_up(&frag_reuse_details.versions[0], scalar_index).unwrap()
+            is_index_remap_caught_up(
+                &frag_reuse_details.versions[0],
+                scalar_index,
+                &reuse_chain_frag_bitmap(&frag_reuse_details.versions),
+            )
+            .unwrap()
         );
 
         // Remap and check index is caught up
@@ -219,7 +369,12 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         let scalar_index = indices.iter().find(|idx| idx.name == "scalar").unwrap();
         assert_true!(
-            is_index_remap_caught_up(&frag_reuse_details.versions[0], scalar_index).unwrap()
+            is_index_remap_caught_up(
+                &frag_reuse_details.versions[0],
+                scalar_index,
+                &reuse_chain_frag_bitmap(&frag_reuse_details.versions),
+            )
+            .unwrap()
         );
 
         // Cleanup frag reuse index and check there is no reuse version
@@ -313,7 +468,12 @@ mod tests {
                 .find(|idx| idx.name == format!("{col}_idx"))
                 .unwrap();
             assert!(
-                is_index_remap_caught_up(&frag_reuse_details.versions[0], index).unwrap(),
+                is_index_remap_caught_up(
+                    &frag_reuse_details.versions[0],
+                    index,
+                    &reuse_chain_frag_bitmap(&frag_reuse_details.versions),
+                )
+                .unwrap(),
                 "index {col}_idx was not caught up after remap"
             );
         }

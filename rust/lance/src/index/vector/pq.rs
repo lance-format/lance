@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::any::Any;
 use std::sync::Arc;
-use std::{any::Any, collections::HashMap};
 
-use arrow::compute::concat;
+use arrow::{
+    array::{ArrayData, make_array},
+    compute::concat,
+};
 use arrow_array::types::UInt64Type;
 use arrow_array::{
     Array, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
     cast::{AsArray, as_primitive_array},
+    new_empty_array,
 };
 use arrow_array::{ArrayRef, Float32Array, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
@@ -17,12 +22,12 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{BufferExt, DataTypeExt, FixedSizeListArrayExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::{ProductQuantizationStorage, transpose};
@@ -32,7 +37,7 @@ use lance_index::{
     Index, IndexType,
     vector::{Query, pq::ProductQuantizer},
 };
-use lance_io::{traits::Reader, utils::read_fixed_stride_array};
+use lance_io::traits::Reader;
 use lance_linalg::distance::{DistanceType, MetricType};
 use log::{info, warn};
 use roaring::RoaringBitmap;
@@ -67,7 +72,37 @@ pub struct PQIndex {
     /// Metric type.
     metric_type: MetricType,
 
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+}
+
+async fn read_legacy_index_values(
+    reader: &dyn Reader,
+    data_type: &DataType,
+    offset: usize,
+    length: usize,
+) -> Result<ArrayRef> {
+    if length == 0 {
+        return Ok(new_empty_array(data_type));
+    }
+
+    let byte_length = length
+        .checked_mul(data_type.byte_width())
+        .ok_or_else(|| Error::index("legacy IVF page byte length overflow".to_string()))?;
+    let end = offset
+        .checked_add(byte_length)
+        .ok_or_else(|| Error::index("legacy IVF page offset overflow".to_string()))?;
+    let bytes = reader.get_range(offset..end).await?;
+    let buffer = if bytes.len() < byte_length {
+        arrow_buffer::Buffer::copy_bytes_bytes(bytes, byte_length)
+    } else {
+        arrow_buffer::Buffer::from_bytes_bytes(bytes, data_type.byte_width() as u64)
+    };
+    let data = ArrayData::builder(data_type.clone())
+        .len(length)
+        .null_count(0)
+        .add_buffer(buffer)
+        .build()?;
+    Ok(make_array(data))
 }
 
 impl DeepSizeOf for PQIndex {
@@ -115,7 +150,7 @@ impl PQIndex {
     pub(crate) fn new(
         pq: ProductQuantizer,
         metric_type: MetricType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> Self {
         Self {
             code: None,
@@ -330,24 +365,14 @@ impl VectorIndex for PQIndex {
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
         let pq_code_length = self.pq.code_dim() * length;
-        let pq_codes = read_fixed_stride_array(
-            reader.as_ref(),
-            &DataType::UInt8,
-            offset,
-            pq_code_length,
-            ..,
-        )
-        .await?;
+        let pq_codes =
+            read_legacy_index_values(reader.as_ref(), &DataType::UInt8, offset, pq_code_length)
+                .await?;
 
         let row_id_offset = offset + pq_code_length /* *1 */;
-        let row_ids = read_fixed_stride_array(
-            reader.as_ref(),
-            &DataType::UInt64,
-            row_id_offset,
-            length,
-            ..,
-        )
-        .await?;
+        let row_ids =
+            read_legacy_index_values(reader.as_ref(), &DataType::UInt64, row_id_offset, length)
+                .await?;
 
         let pq_codes = transpose(
             pq_codes.as_primitive(),
@@ -434,18 +459,21 @@ impl VectorIndex for PQIndex {
             .map_or(0, |row_ids| row_ids.len() as u64)
     }
 
-    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
-        todo!("this method is for only IVF_HNSW_* index");
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64> + '_> {
+        match self.row_ids.as_ref() {
+            Some(row_ids) => Box::new(row_ids.values().iter()),
+            None => Box::new(std::iter::empty()),
+        }
     }
 
-    async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {
         let num_vectors = self.row_ids.as_ref().unwrap().len();
         let row_ids = self.row_ids.as_ref().unwrap().values().iter();
         let transposed_codes = self.code.as_ref().unwrap();
         let remapped = row_ids
             .enumerate()
             .filter_map(|(vec_idx, old_row_id)| {
-                let new_row_id = mapping.get(old_row_id).cloned();
+                let new_row_id = mapping.get(*old_row_id);
                 // If the row id is not in the mapping then this row is not remapped and we keep as is
                 let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
                 new_row_id.map(|new_row_id| {
@@ -644,13 +672,18 @@ pub(crate) fn build_pq_storage(
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
     use std::{ops::Range, sync::Mutex};
 
     use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::tempfile::{TempObjFile, TempStrDir};
+    use lance_io::object_store::ObjectStore;
+    use lance_io::traits::Writer;
     use lance_linalg::kernels::normalize_fsl;
+    use object_store::path::Path;
+    use tokio::io::AsyncWriteExt;
 
     use crate::index::vector::ivf::build_ivf_model;
     use lance_index::metrics::NoOpMetricsCollector;
@@ -662,6 +695,47 @@ mod tests {
     };
 
     const DIM: usize = 128;
+
+    #[tokio::test]
+    async fn empty_legacy_ivf_pq_partition_does_not_read_object_store() {
+        let object_store = ObjectStore::memory();
+        let reader = object_store
+            .open(&Path::from("missing-index"))
+            .await
+            .unwrap();
+        let codebook_values = Float32Array::from_iter_values((0..256).map(|value| value as f32));
+        let codebook = FixedSizeListArray::try_new_from_values(codebook_values, 1).unwrap();
+        let index = PQIndex::new(
+            ProductQuantizer::new(1, 8, 1, codebook, DistanceType::L2),
+            MetricType::L2,
+            None,
+        );
+
+        let loaded = index.load(reader.into(), 1, 0).await.unwrap();
+
+        assert_eq!(loaded.num_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_index_values_are_read_from_the_requested_offset() {
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = object_store.create(&path).await.unwrap();
+        writer.write_all(&[0xFF]).await.unwrap();
+        writer.write_all(&11_u64.to_le_bytes()).await.unwrap();
+        writer.write_all(&12_u64.to_le_bytes()).await.unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        let reader = object_store.open(&path).await.unwrap();
+        let values = read_legacy_index_values(reader.as_ref(), &DataType::UInt64, 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            values.as_primitive::<UInt64Type>(),
+            &UInt64Array::from_iter_values([11, 12])
+        );
+    }
+
     async fn generate_dataset(
         test_uri: &str,
         range: Range<f32>,
@@ -699,7 +773,11 @@ mod tests {
         let centroids = generate_random_array_with_range::<Float32Type>(4 * DIM, -1.0..1.0);
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
         let ivf = IvfModel::new(fsl, None);
-        let params = PQBuildParams::new(16, 8);
+        let params = PQBuildParams {
+            max_iters: 2,
+            sample_rate: 4,
+            ..PQBuildParams::new(16, 8)
+        };
         let pq = build_pq_model(&dataset, "vector", DIM, MetricType::L2, &params, Some(&ivf))
             .await
             .unwrap();
@@ -739,7 +817,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let params = PQBuildParams::new(16, 8);
+        let params = PQBuildParams {
+            max_iters: 2,
+            sample_rate: 4,
+            ..PQBuildParams::new(16, 8)
+        };
         let pq = build_pq_model(
             &dataset,
             "vector",

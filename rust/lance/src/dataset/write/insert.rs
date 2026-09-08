@@ -7,11 +7,12 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
-use lance_core::datatypes::{NullabilityComparison, Schema, SchemaCompareOptions};
+use lance_core::datatypes::{NullabilityComparison, Schema};
+use lance_core::is_system_column;
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
-use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::Fragment;
@@ -19,10 +20,13 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 
 use crate::Dataset;
+use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-use crate::dataset::write::{validate_and_resolve_target_bases, write_fragments_internal};
+use crate::dataset::write::{
+    validate_and_resolve_target_bases_with_primary, write_fragments_internal,
+};
 use crate::{Error, Result};
 use tracing::info;
 
@@ -133,7 +137,7 @@ impl<'a> InsertBuilder<'a> {
     async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_stable_row_ids(context.params.enable_stable_row_ids)
-            .with_storage_format(context.storage_version)
+            .with_exact_storage_format(context.storage_version)
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
             .with_object_store(context.object_store.clone())
@@ -201,10 +205,17 @@ impl<'a> InsertBuilder<'a> {
         self.validate_write(&mut context, &schema)?;
 
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
-        let target_base_info =
-            validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
+        let target_base_info = validate_and_resolve_target_bases_with_primary(
+            &mut context.params,
+            existing_base_paths,
+            &context.object_store,
+            &context.base_path,
+            &context.dest.uri(),
+        )
+        .await?;
 
         let (written_fragments, written_schema) = write_fragments_internal(
+            context.storage_version,
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,
@@ -307,20 +318,18 @@ impl<'a> InsertBuilder<'a> {
                 context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
             }
 
-            let schema_cmp_opts = SchemaCompareOptions {
-                compare_dictionary: dataset.manifest.should_use_legacy_format(),
-                compare_nullability: NullabilityComparison::Ignore,
-                allow_missing_if_nullable: true,
-                ignore_field_order: true,
-                ..Default::default()
-            };
+            let version = dataset.manifest.data_storage_format.lance_file_format();
+            let mut schema_cmp_opts = crate::dataset::versions::schema_compare_options(version);
+            schema_cmp_opts.compare_nullability = NullabilityComparison::Ignore;
+            schema_cmp_opts.allow_missing_if_nullable = true;
+            schema_cmp_opts.ignore_field_order = true;
 
-            data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
+            let normalized_data_schema = prepared_to_logical_blob_schema(data_schema)?;
+            normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
         }
 
-        // Make sure we aren't using any reserved column names
         for field in data_schema.fields.iter() {
-            if field.name == ROW_ID || field.name == ROW_ADDR || field.name == ROW_OFFSET {
+            if is_system_column(&field.name) {
                 return Err(Error::invalid_input_source(
                     format!(
                         "The column {} is a reserved name and cannot be used in a Lance dataset",
@@ -355,7 +364,10 @@ impl<'a> InsertBuilder<'a> {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
                 dataset.base.clone(),
-                dataset.commit_handler.clone(),
+                params
+                    .commit_handler
+                    .clone()
+                    .unwrap_or_else(|| dataset.commit_handler.clone()),
             ),
             WriteDestination::Uri(uri) => {
                 let registry = params
@@ -403,15 +415,15 @@ impl<'a> InsertBuilder<'a> {
             (WriteMode::Overwrite, WriteDestination::Dataset(dataset)) => {
                 // If overwriting an existing dataset, allow the user to specify but use
                 // the existing version if they don't
-                params.data_storage_version.map(Ok).unwrap_or_else(|| {
-                    let m = dataset.manifest.as_ref();
-                    m.data_storage_format.lance_file_version()
-                })?
+                params
+                    .data_storage_version
+                    .map(LanceFileVersion::resolve)
+                    .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
             }
             (_, WriteDestination::Dataset(dataset)) => {
                 // If appending to an existing dataset, always use the dataset version
                 let m = dataset.manifest.as_ref();
-                m.data_storage_format.lance_file_version()?
+                m.data_storage_format.lance_file_format()
             }
             // Otherwise (no existing dataset) fallback to the default if the user didn't specify
             (_, WriteDestination::Uri(_)) => params.storage_version_or_default(),
@@ -435,7 +447,7 @@ struct WriteContext<'a> {
     object_store: Arc<ObjectStore>,
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
-    storage_version: LanceFileVersion,
+    storage_version: ConcreteFileVersion,
 }
 
 #[cfg(test)]
@@ -445,6 +457,7 @@ mod test {
     use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use lance_arrow::BLOB_META_KEY;
+    use lance_table::io::commit::{RenameCommitHandler, commit_handler_from_url};
 
     use crate::session::Session;
 
@@ -493,6 +506,74 @@ mod test {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn dataset_destination_honors_explicit_commit_handler() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let initial_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(initial_batch)],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+        dataset.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
+            .await
+            .unwrap();
+
+        let append_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2]))])
+                .unwrap();
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            commit_handler: Some(Arc::new(RenameCommitHandler)),
+            ..Default::default()
+        };
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(append_batch)], schema),
+            Arc::new(dataset),
+            Some(params),
+        )
+        .await
+        .expect("the explicit per-write commit handler should override the dataset handler");
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+    }
+
+    #[rstest::rstest]
+    #[case::row_id("_rowid")]
+    #[case::row_addr("_rowaddr")]
+    #[case::row_offset("_rowoffset")]
+    #[case::row_created_at_version("_row_created_at_version")]
+    #[case::row_last_updated_at_version("_row_last_updated_at_version")]
+    #[tokio::test]
+    async fn rejects_reserved_system_column_names(#[case] reserved_name: &str) {
+        // Every system column name must be rejected on write. The row-version
+        // columns (`_row_created_at_version`, `_row_last_updated_at_version`) are
+        // computed at read time and appended by `Projection::to_schema`; a user
+        // data column sharing one of those names would otherwise pass ingest and
+        // later collide with the appended field.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            reserved_name,
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+
+        let result = InsertBuilder::new("memory://")
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await;
+
+        let err = result.expect_err("writing a reserved system column name should fail");
+        assert!(
+            err.to_string().contains("reserved name"),
+            "unexpected error for {reserved_name}: {err}"
         );
     }
 

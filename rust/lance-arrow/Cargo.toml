@@ -21,6 +21,7 @@ arrow-ipc = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
+bytemuck = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 half = { workspace = true }

@@ -19,9 +19,10 @@ from .dependencies import (
 )
 from .dependencies import numpy as np
 from .log import LOGGER
-from .util import MetricType, _normalize_metric_type
+from .util import MetricType, _normalize_index_segment_ids, _normalize_metric_type
 
 if TYPE_CHECKING:
+    import uuid
     from pathlib import Path
 
     from . import LanceDataset
@@ -197,6 +198,33 @@ def train_pq_codebook_on_accelerator(
     return pq_codebook, kmeans_list
 
 
+def _sample_init_centroids(
+    ds: Iterable["torch.Tensor"], k: int, filter_nan: bool
+) -> "torch.Tensor":
+    """Take up to k vectors from ds to seed kmeans, skipping non-finite ones."""
+    # `column is not null` does not exclude NaN vectors, so they can still be
+    # sampled here.  Training drops them (distance returns id -1), but a NaN
+    # centroid never recovers and leaves every partition NaN.
+    sampled = []
+    num_sampled = 0
+    for batch in ds:
+        if filter_nan:
+            batch = batch[batch.isfinite().flatten(1).all(dim=1)]
+        if batch.shape[0] == 0:
+            continue
+        sampled.append(batch)
+        num_sampled += batch.shape[0]
+        if num_sampled >= k:
+            break
+
+    if num_sampled == 0:
+        raise ValueError(
+            "Cannot initialize centroids: the sampled vectors are all null or "
+            "non-finite"
+        )
+    return torch.cat(sampled)[:k]
+
+
 def train_ivf_centroids_on_accelerator(
     dataset: LanceDataset,
     column: str,
@@ -244,7 +272,7 @@ def train_ivf_centroids_on_accelerator(
         filter=filt,
     )
 
-    init_centroids = next(iter(ds))
+    init_centroids = _sample_init_centroids(ds, k, filter_nan)
     LOGGER.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(
@@ -288,12 +316,12 @@ def compute_pq_codes(
         Dataset to compute pq codes for.
     kmeans_list: List[lance.torch.kmeans.KMeans]
         KMeans models to use to compute pq (one per subspace)
-    batch_size: int, default 10240
+    batch_size: int, default 40960
         The batch size used to read the dataset.
     dst_dataset_uri: Union[str, Path], optional
         The path to store the partitions.  If not specified a random
         directory is used instead
-    allow_tf32: bool, default True
+    allow_cuda_tf32: bool, default True
         Whether to allow tf32 for matmul on CUDA.
 
     Returns
@@ -417,12 +445,12 @@ def compute_partitions(
         Column name of the vector column.
     kmeans: lance.torch.kmeans.KMeans
         KMeans model to use to compute partitions.
-    batch_size: int, default 10240
+    batch_size: int, default 40960
         The batch size used to read the dataset.
     dst_dataset_uri: Union[str, Path], optional
         The path to store the partitions.  If not specified a random
         directory is used instead
-    allow_tf32: bool, default True
+    allow_cuda_tf32: bool, default True
         Whether to allow tf32 for matmul on CUDA.
 
     Returns
@@ -761,13 +789,17 @@ def hamming_clustering_for_ivf_partition(
     index_name: str,
     partition_id: int,
     hamming_threshold: int,
+    *,
+    index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
 ) -> pa.RecordBatchReader:
     """
     Perform hamming clustering on a partition of an IVF_FLAT index.
 
-    Loads a partition from an IVF_FLAT index on a hash column, computes
-    pairwise hamming distances between all hashes in the partition,
-    filters by threshold, and clusters the results using union-find.
+    Loads a partition from every segment of an IVF_FLAT index on a hash
+    column, computes pairwise hamming distances between all hashes in the
+    combined partition, filters by threshold, and clusters the results using
+    union-find. All segments of the logical index must share the same global
+    IVF centroids; an error is raised if they do not.
 
     Parameters
     ----------
@@ -779,6 +811,11 @@ def hamming_clustering_for_ivf_partition(
         The partition ID within the IVF_FLAT index
     hamming_threshold : int
         Maximum hamming distance to consider as similar
+    index_segments : iterable of str or uuid.UUID, optional
+        If specified, only these physical index segment UUIDs of the named
+        logical index contribute rows. Use
+        :meth:`LanceDataset.describe_indices` to obtain segment UUIDs from
+        ``IndexDescription.segments``. Defaults to all segments.
 
     Returns
     -------
@@ -789,16 +826,24 @@ def hamming_clustering_for_ivf_partition(
         - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
     """
     return dataset._ds.hamming_clustering_for_ivf_partition(
-        index_name, partition_id, hamming_threshold
+        index_name,
+        partition_id,
+        hamming_threshold,
+        _normalize_index_segment_ids(index_segments),
     )
 
 
 def get_ivf_partition_info(
     dataset: "LanceDataset",
     index_name: str,
+    *,
+    index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
 ) -> List[dict]:
     """
     Get partition information for an IVF_FLAT index.
+
+    Partition sizes are aggregated across all segments of the logical index
+    unless a subset is selected via ``index_segments``.
 
     Parameters
     ----------
@@ -806,13 +851,18 @@ def get_ivf_partition_info(
         The Lance dataset containing the hash column with an IVF_FLAT index.
     index_name : str
         Name of the IVF_FLAT index
+    index_segments : iterable of str or uuid.UUID, optional
+        If specified, only these physical index segment UUIDs of the named
+        logical index contribute to the sizes. Defaults to all segments.
 
     Returns
     -------
     list[dict]
         List of partition info dicts with 'partition_id' and 'size'
     """
-    return dataset._ds.get_ivf_partition_info(index_name)
+    return dataset._ds.get_ivf_partition_info(
+        index_name, _normalize_index_segment_ids(index_segments)
+    )
 
 
 def hamming_clustering_for_sample(
@@ -833,7 +883,8 @@ def hamming_clustering_for_sample(
     dataset : LanceDataset
         The Lance dataset containing the hash column.
     column : str
-        Name of the hash column (must be FixedSizeList<UInt8, 8>)
+        Name of the hash column (must be FixedSizeList<UInt8, N> where N is a
+        positive multiple of 8 bytes)
     sample_size : int, optional
         Number of rows to sample. If None, uses all rows.
     hamming_threshold : int, default 10
@@ -875,7 +926,8 @@ def hamming_clustering_for_range(
     dataset : LanceDataset
         The Lance dataset containing the hash column.
     column : str
-        Name of the hash column (must be FixedSizeList<UInt8, 8>)
+        Name of the hash column (must be FixedSizeList<UInt8, N> where N is a
+        positive multiple of 8 bytes)
     fragment_id : int
         The fragment ID to read from
     start_row : int

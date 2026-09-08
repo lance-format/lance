@@ -55,6 +55,31 @@ public class CleanupTest {
   }
 
   @Test
+  public void testCleanupSpecificVersions(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("test_dataset_for_cleanup").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      testDataset.createEmptyDataset().close();
+
+      testDataset.write(1, 10).close();
+      testDataset.write(2, 10).close();
+
+      try (Dataset dataset = testDataset.write(3, 10)) {
+        assertEquals(4, dataset.listVersions().size());
+
+        RemovalStats stats =
+            dataset.cleanupWithPolicy(CleanupPolicy.builder().withVersions(List.of(2L)).build());
+
+        assertEquals(1L, stats.getOldVersions());
+        assertEquals(3, dataset.listVersions().size());
+        assertTrue(dataset.listVersions().stream().noneMatch(version -> version.getId() == 2L));
+      }
+    }
+  }
+
+  @Test
   public void testExplainCleanupBeforeVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("test_dataset_for_cleanup").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {

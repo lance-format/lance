@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use lance_index::{IndexParams, IndexType, PrewarmOptions, optimize::OptimizeOptions};
+use lance_index::{
+    FtsPrewarmResult, IndexParams, IndexType, PrewarmOptions, optimize::OptimizeOptions,
+};
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
@@ -15,37 +17,52 @@ use crate::{Error, Result};
 /// A single physical segment of a logical index.
 ///
 /// Each segment is stored independently and will become one manifest entry when committed.
-/// The logical index identity (name / target column / dataset version) is provided separately
-/// by the commit API.
+/// The logical index name is provided separately by the commit API, while physical field and
+/// dataset-version provenance travel with the segment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexSegment {
     /// Unique ID of the physical segment.
     uuid: Uuid,
     /// The fragments covered by this segment.
     fragment_bitmap: RoaringBitmap,
+    /// Field IDs whose physical values are encoded in this segment.
+    fields: Vec<i32>,
+    /// Field IDs whose values this segment carries but is not keyed on.
+    ///
+    /// Always the trailing entries of `fields`.
+    covering_fields: Vec<i32>,
     /// Metadata specific to the index type.
     index_details: Arc<prost_types::Any>,
     /// The on-disk index version for this segment.
     index_version: i32,
+    /// Dataset version at which this segment's physical contents were built.
+    dataset_version: u64,
 }
 
 impl IndexSegment {
-    /// Create a fully described segment with the given UUID, fragment coverage, and index
-    /// metadata.
-    pub fn new<I>(
+    /// Create a fully described segment with its physical build provenance.
+    pub fn new<I, F, C>(
         uuid: Uuid,
         fragment_bitmap: I,
+        fields: F,
         index_details: Arc<prost_types::Any>,
         index_version: i32,
+        dataset_version: u64,
+        covering_fields: C,
     ) -> Self
     where
         I: IntoIterator<Item = u32>,
+        F: IntoIterator<Item = i32>,
+        C: IntoIterator<Item = i32>,
     {
         Self {
             uuid,
             fragment_bitmap: fragment_bitmap.into_iter().collect(),
+            fields: fields.into_iter().collect(),
+            covering_fields: covering_fields.into_iter().collect(),
             index_details,
             index_version,
+            dataset_version,
         }
     }
 
@@ -59,6 +76,37 @@ impl IndexSegment {
         &self.fragment_bitmap
     }
 
+    pub(crate) fn fragment_bitmap_mut(&mut self) -> &mut RoaringBitmap {
+        &mut self.fragment_bitmap
+    }
+
+    /// Return the field IDs whose values are encoded in this segment.
+    pub fn fields(&self) -> &[i32] {
+        &self.fields
+    }
+
+    /// Return the fields whose values this segment carries but is not keyed on.
+    ///
+    /// Always the trailing entries of [`Self::fields`].
+    pub fn covering_fields(&self) -> &[i32] {
+        &self.covering_fields
+    }
+
+    /// Return the single column this segment is keyed on, or `None` when it is
+    /// keyed on several -- a genuinely composite index -- or on none at all.
+    ///
+    /// Mirrors [`IndexMetadata::keyed_field`], including its fail-closed
+    /// behavior on a declaration longer than [`Self::fields`]: a segment comes
+    /// from a caller (a distributed build's output, say) that this build never
+    /// validated.
+    pub fn keyed_field(&self) -> Option<i32> {
+        let keyed = self.fields.len().saturating_sub(self.covering_fields.len());
+        match &self.fields[..keyed] {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
     /// Return the serialized index details for this segment.
     pub fn index_details(&self) -> &Arc<prost_types::Any> {
         &self.index_details
@@ -69,13 +117,31 @@ impl IndexSegment {
         self.index_version
     }
 
+    /// Return the source dataset version for this segment.
+    pub fn dataset_version(&self) -> u64 {
+        self.dataset_version
+    }
+
     /// Consume the segment and return its component parts.
-    pub fn into_parts(self) -> (Uuid, RoaringBitmap, Arc<prost_types::Any>, i32) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Uuid,
+        RoaringBitmap,
+        Vec<i32>,
+        Vec<i32>,
+        Arc<prost_types::Any>,
+        i32,
+        u64,
+    ) {
         (
             self.uuid,
             self.fragment_bitmap,
+            self.fields,
+            self.covering_fields,
             self.index_details,
             self.index_version,
+            self.dataset_version,
         )
     }
 }
@@ -110,8 +176,11 @@ impl IntoIndexSegment for IndexMetadata {
         Ok(IndexSegment::new(
             self.uuid,
             fragment_bitmap.iter(),
+            self.fields,
             index_details,
             self.index_version,
+            self.dataset_version,
+            self.covering_fields,
         ))
     }
 }
@@ -167,7 +236,55 @@ pub trait DatasetIndexExt {
         ))
     }
 
-    /// Read all indices of this Dataset version.
+    /// Prewarm an index by name with additional options and return the structured outcome.
+    async fn prewarm_index_with_options_result(
+        &self,
+        _name: &str,
+        _options: &PrewarmOptions,
+    ) -> Result<FtsPrewarmResult> {
+        Err(Error::not_supported(
+            "prewarm result reports are not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
+    /// Prewarm selected physical segments of an index by name.
+    async fn prewarm_index_segments(&self, _name: &str, _segment_ids: &[Uuid]) -> Result<()> {
+        Err(Error::not_supported(
+            "segment-level prewarm is not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
+    /// Prewarm selected physical segments of an index by name with additional options.
+    async fn prewarm_index_segments_with_options(
+        &self,
+        _name: &str,
+        _segment_ids: &[Uuid],
+        _options: &PrewarmOptions,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "prewarm options are not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
+    /// Prewarm selected physical segments with options and return the structured outcome.
+    async fn prewarm_index_segments_with_options_result(
+        &self,
+        _name: &str,
+        _segment_ids: &[Uuid],
+        _options: &PrewarmOptions,
+    ) -> Result<FtsPrewarmResult> {
+        Err(Error::not_supported(
+            "prewarm result reports are not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
+    /// Read the indices of this Dataset version that this build can use.
+    ///
+    /// An index whose declared type has no reader in this build, or whose format
+    /// version is newer than this build supports, is omitted: it is still in the
+    /// manifest and still belongs to the dataset, but nothing here can decode
+    /// it. Code deciding what the *next* manifest should say must not use this
+    /// list - it would drop what it omits.
     ///
     /// The indices are lazy loaded and cached in memory within the `Dataset` instance.
     /// The cache is invalidated when the dataset version (Manifest) is changed.
@@ -253,4 +370,89 @@ pub trait DatasetIndexExt {
         partition_id: usize,
         with_vector: bool,
     ) -> Result<SendableRecordBatchStream>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[test]
+    fn test_index_metadata_conversion_preserves_provenance() {
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![3, 7],
+            covering_fields: vec![],
+            dataset_version: 42,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([1, 2])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "example.IndexDetails".to_string(),
+                value: vec![1, 2, 3],
+            })),
+            index_version: 5,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        let segment = metadata.into_index_segment().unwrap();
+        assert_eq!(segment.fields(), [3, 7]);
+        assert_eq!(segment.dataset_version(), 42);
+    }
+
+    /// Segments arrive from callers this build never validated, so the keyed
+    /// prefix must fail closed on a declaration longer than `fields` rather than
+    /// underflow, exactly as [`IndexMetadata::keyed_field`] does.
+    #[rstest]
+    #[case::not_covered(vec![7], vec![], Some(7))]
+    #[case::covered(vec![7, 11], vec![11], Some(7))]
+    #[case::composite(vec![7, 11], vec![], None)]
+    #[case::malformed_longer_than_fields(vec![7], vec![11, 13], None)]
+    fn test_index_segment_keyed_field(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected: Option<i32>,
+    ) {
+        let segment = IndexSegment::new(
+            Uuid::new_v4(),
+            [0u32],
+            fields,
+            Arc::new(prost_types::Any {
+                type_url: "test".to_string(),
+                value: vec![],
+            }),
+            0,
+            1,
+            covering_fields,
+        );
+
+        assert_eq!(segment.keyed_field(), expected);
+    }
+
+    /// A covering declaration must survive the metadata -> segment -> metadata
+    /// round trip. `IndexSegment` is the hop where it was previously dropped.
+    #[test]
+    fn test_index_segment_preserves_covering_fields() {
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "covered".to_string(),
+            fields: vec![7, 11],
+            covering_fields: vec![11],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "test".to_string(),
+                value: vec![],
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        let segment = metadata.into_index_segment().unwrap();
+        assert_eq!(segment.fields(), &[7, 11]);
+        assert_eq!(segment.covering_fields(), &[11]);
+    }
 }

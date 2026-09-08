@@ -104,10 +104,14 @@ public class MergeTest extends OperationTestBase {
                       Merge.builder()
                           .fragments(Collections.singletonList(evolvedFragment))
                           .schema(evolvedSchema)
+                          .preservesNullability(true)
                           .build())
                   .build()) {
             try (Dataset evolvedDataset = new CommitBuilder(initialDataset).execute(mergeTxn)) {
               Assertions.assertEquals(3, evolvedDataset.version());
+              // The explicit non-default assertion must survive the JNI round trip.
+              Transaction readBack = evolvedDataset.readTransaction().orElseThrow();
+              Assertions.assertTrue(((Merge) readBack.operation()).preservesNullability());
               Assertions.assertEquals(rowCount, evolvedDataset.countRows());
               Assertions.assertEquals(evolvedSchema, evolvedDataset.getSchema());
               Assertions.assertEquals(3, evolvedDataset.getSchema().getFields().size());
@@ -134,6 +138,27 @@ public class MergeTest extends OperationTestBase {
         }
       }
     }
+  }
+
+  @Test
+  void testPreservesNullabilityEquality() {
+    Schema schema =
+        new Schema(
+            Collections.singletonList(Field.nullable("id", new ArrowType.Int(32, true))), null);
+    // No assertion by default, and the assertion is part of the operation's identity.
+    Assertions.assertFalse(
+        Merge.builder()
+            .fragments(Collections.emptyList())
+            .schema(schema)
+            .build()
+            .preservesNullability());
+    Assertions.assertNotEquals(
+        Merge.builder().fragments(Collections.emptyList()).schema(schema).build(),
+        Merge.builder()
+            .fragments(Collections.emptyList())
+            .schema(schema)
+            .preservesNullability(true)
+            .build());
   }
 
   @Test

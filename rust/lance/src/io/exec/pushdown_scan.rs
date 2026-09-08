@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt64Type};
@@ -25,7 +25,8 @@ use datafusion::{
 };
 use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
@@ -40,13 +41,14 @@ use crate::{
     Dataset,
     dataset::{
         ROW_ID,
-        fragment::{FileFragment, FragmentReader},
+        fragment::{FileFragment, V1FragmentReader},
+        versions,
     },
     datatypes::Schema,
 };
 
 use super::Planner;
-use super::utils::InstrumentedRecordBatchStreamAdapter;
+use super::utils::{InstrumentedRecordBatchStreamAdapter, buffered_fragment_opens};
 
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
@@ -158,10 +160,6 @@ impl ExecutionPlan for LancePushdownScanExec {
         "LancePushdownScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -207,23 +205,24 @@ impl ExecutionPlan for LancePushdownScanExec {
             }
         });
 
-        let batch_stream = fragment_stream.map(|(exec, fragment)| async move {
-            let frag_scanner = FragmentScanner::open(
-                fragment,
-                exec.dataset,
-                exec.projection,
-                exec.predicate_projection,
-                exec.predicate,
-                exec.config.clone(),
-            )
-            .await?;
+        let batch_stream = buffered_fragment_opens(
+            fragment_stream,
+            self.config.fragment_readahead,
+            |(exec, fragment)| async move {
+                let frag_scanner = FragmentScanner::open(
+                    fragment,
+                    exec.dataset,
+                    exec.projection,
+                    exec.predicate_projection,
+                    exec.predicate,
+                    exec.config.clone(),
+                )
+                .await?;
 
-            frag_scanner.scan().await
-        });
-
-        let batch_stream = batch_stream
-            .buffered(self.config.fragment_readahead)
-            .try_flatten();
+                frag_scanner.scan()
+            },
+        )
+        .try_flatten();
 
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
@@ -283,7 +282,7 @@ struct FragmentScanner {
     predicate_projection: Arc<Schema>,
     predicate: Expr,
     config: ScanConfig,
-    reader: FragmentReader,
+    reader: V1FragmentReader,
     stats: Option<RecordBatch>,
 }
 
@@ -304,15 +303,14 @@ impl FragmentScanner {
         if let Some(file_reader_options) = config.file_reader_options.clone() {
             frag_config = frag_config.with_file_reader_options(file_reader_options);
         }
-        let mut reader = fragment.open(dataset.schema(), frag_config).await?;
+        let mut reader =
+            versions::open_v1_fragment_reader(&fragment, dataset.schema(), &frag_config).await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }
 
         // We only need the statistics for the predicate projection.
-        let stats = reader
-            .legacy_read_page_stats(Some(&predicate_projection))
-            .await?;
+        let stats = reader.read_page_stats(Some(&predicate_projection)).await?;
 
         Ok(Self {
             fragment,
@@ -325,7 +323,7 @@ impl FragmentScanner {
         })
     }
 
-    pub async fn scan(self) -> Result<impl Stream<Item = Result<RecordBatch>> + 'static + Send> {
+    pub fn scan(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let batch_readahead = self.config.batch_readahead;
         let simplified_predicates = self.simplified_predicates()?;
         let ordered_output = self.config.ordered_output;
@@ -381,7 +379,7 @@ impl FragmentScanner {
                     projection_reader.with_row_address();
                 }
                 let batch = projection_reader
-                    .legacy_read_batch_projected(batch_id, .., &self.projection)
+                    .read_batch_projected(batch_id, .., &self.projection)
                     .await?;
                 let batch = self.final_projection(batch)?;
                 Ok(Some(batch))
@@ -414,7 +412,7 @@ impl FragmentScanner {
                 reader.with_row_address();
 
                 let batch = reader
-                    .legacy_read_batch_projected(batch_id, .., &predicate_projection)
+                    .read_batch_projected(batch_id, .., &predicate_projection)
                     .await?;
 
                 // 2. Evaluate predicate
@@ -488,7 +486,7 @@ impl FragmentScanner {
                         self.projection.project_by_ids(&remaining_fields, true);
                     Some(
                         self.reader
-                            .legacy_read_batch_projected(
+                            .read_batch_projected(
                                 batch_id,
                                 selection.clone(),
                                 &remaining_projection,
@@ -658,20 +656,20 @@ impl FragmentScanner {
     }
 
     fn simplified_predicates(&self) -> Result<Vec<Expr>> {
-        let num_batches = self.reader.legacy_num_batches();
+        let num_batches = self.reader.num_batches();
 
         if let Some(stats) = &self.stats {
             let batch_sizes: Vec<usize> = (0..num_batches as u32)
                 .map(|batch_id| {
                     self.reader
-                        .legacy_num_rows_in_batch(batch_id)
+                        .num_rows_in_batch(batch_id)
                         .expect("Operation does not yet support v2 fragments")
                         as usize
                 })
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);
-            let context = SimplifyContext::default().with_schema(schema);
+            let context = SimplifyContext::builder().with_schema(schema).build();
             let mut simplifier = ExprSimplifier::new(context);
 
             let mut predicates = Vec::with_capacity(num_batches);
@@ -700,6 +698,11 @@ impl FragmentScanner {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashSet;
+    use std::fmt::Display;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
     use arrow_array::{
         ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int32Array,
         RecordBatchIterator, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array,
@@ -708,16 +711,274 @@ mod test {
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{Field, TimeUnit};
     use arrow_select::concat::concat_batches;
+    use async_trait::async_trait;
     use datafusion::prelude::{Column, SessionContext, lit};
+    use futures::stream::BoxStream;
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_datagen::{array, gen_batch};
     use lance_file::version::LanceFileVersion;
+    use lance_io::object_store::WrappingObjectStore;
+    use object_store::list::PaginatedListStore;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+        Result as ObjectStoreResult, path::Path,
+    };
     use pretty_assertions::assert_eq;
+    use tokio::sync::{Semaphore, mpsc};
 
     use crate::dataset::WriteParams;
+    use crate::io::exec::{LanceScanConfig, LanceScanExec};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use lance_datafusion::logical_expr::ExprExt;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct BlockingDataFileReads {
+        release: Semaphore,
+        started_paths: Mutex<HashSet<Path>>,
+        started_tx: mpsc::UnboundedSender<()>,
+        completed_tx: mpsc::UnboundedSender<()>,
+    }
+
+    impl BlockingDataFileReads {
+        async fn wait_for_release(&self, location: &Path) -> bool {
+            let is_first_data_file_read = location.as_ref().ends_with(".lance")
+                && self.started_paths.lock().unwrap().insert(location.clone());
+            if !is_first_data_file_read {
+                return false;
+            }
+
+            self.started_tx.send(()).unwrap();
+            self.release
+                .acquire()
+                .await
+                .expect("release semaphore was closed")
+                .forget();
+            true
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct BlockingDataFileStoreWrapper {
+        reads: Arc<BlockingDataFileReads>,
+    }
+
+    impl WrappingObjectStore for BlockingDataFileStoreWrapper {
+        fn wrap(&self, _prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            Arc::new(BlockingDataFileStore {
+                target,
+                reads: self.reads.clone(),
+            })
+        }
+
+        // Only data file reads are blocked, so a listing can keep the pushdown.
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            Some(original)
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingDataFileStore {
+        target: Arc<dyn ObjectStore>,
+        reads: Arc<BlockingDataFileReads>,
+    }
+
+    impl Display for BlockingDataFileStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "BlockingDataFileStore({})", self.target)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for BlockingDataFileStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.target.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            let is_tracked_read = self.reads.wait_for_release(location).await;
+            let result = self.target.get_opts(location, options).await;
+            if is_tracked_read {
+                self.reads.completed_tx.send(()).unwrap();
+            }
+            result
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.target.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.target.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: RenameOptions,
+        ) -> ObjectStoreResult<()> {
+            self.target.rename_opts(from, to, options).await
+        }
+    }
+
+    #[derive(Debug)]
+    enum LegacyScanPath {
+        Regular,
+        Pushdown,
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    #[case::regular(LegacyScanPath::Regular)]
+    #[case::pushdown(LegacyScanPath::Pushdown)]
+    async fn test_fragment_opens_progress_with_bounded_cancellation(
+        #[case] scan_path: LegacyScanPath,
+    ) {
+        const FRAGMENT_READAHEAD: usize = 2;
+        const ROWS_PER_FRAGMENT: u32 = 8;
+
+        let dataset = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(4),
+                FragmentRowCount::from(ROWS_PER_FRAGMENT),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::Legacy),
+                    max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+                    max_rows_per_group: ROWS_PER_FRAGMENT as usize,
+                    ..WriteParams::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset.session().file_metadata_cache().clear().await;
+
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+        let reads = Arc::new(BlockingDataFileReads {
+            release: Semaphore::new(0),
+            started_paths: Mutex::new(HashSet::new()),
+            started_tx,
+            completed_tx,
+        });
+        let dataset = Arc::new(dataset.with_object_store_wrappers([Arc::new(
+            BlockingDataFileStoreWrapper {
+                reads: reads.clone(),
+            },
+        )
+            as Arc<dyn WrappingObjectStore>]));
+        let fragments = dataset.fragments().clone();
+        let projection = Arc::new(dataset.schema().clone());
+
+        let exec: Arc<dyn ExecutionPlan> = match scan_path {
+            LegacyScanPath::Regular => Arc::new(LanceScanExec::new(
+                dataset,
+                fragments,
+                None,
+                projection,
+                LanceScanConfig {
+                    fragment_readahead: Some(FRAGMENT_READAHEAD),
+                    ordered_output: true,
+                    ..LanceScanConfig::default()
+                },
+            )),
+            LegacyScanPath::Pushdown => Arc::new(
+                LancePushdownScanExec::try_new(
+                    dataset,
+                    fragments,
+                    projection,
+                    col("x").gt(lit(-1)),
+                    ScanConfig {
+                        fragment_readahead: FRAGMENT_READAHEAD,
+                        ..ScanConfig::default()
+                    },
+                )
+                .unwrap(),
+            ),
+        };
+        let context = SessionContext::new();
+        let mut output = exec.execute(0, context.task_ctx()).unwrap();
+
+        assert!(futures::poll!(output.next()).is_pending());
+        for _ in 0..FRAGMENT_READAHEAD {
+            tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                .await
+                .expect("fragment open did not start")
+                .expect("fragment open start channel closed");
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(started_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "fragment opens exceeded fragment_readahead"
+        );
+
+        // The child task must finish this request even though the output stream
+        // is not polled again.
+        reads.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), completed_rx.recv())
+            .await
+            .expect("fragment open did not progress independently")
+            .expect("fragment open completion channel closed");
+        assert!(
+            matches!(started_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "fragment opens exceeded fragment_readahead"
+        );
+
+        // Dropping the scan must abort the other in-flight open instead of
+        // detaching it from the cancelled query.
+        drop(output);
+        reads.release.add_permits(FRAGMENT_READAHEAD);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), completed_rx.recv())
+                .await
+                .is_err(),
+            "fragment open completed after scan cancellation"
+        );
+    }
 
     // TODO: test pushdown with nested column once https://github.com/apache/arrow-datafusion/pull/8256
     // is released.

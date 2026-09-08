@@ -51,10 +51,12 @@ mod file_reader;
 mod file_writer;
 mod fragment;
 mod index;
+mod index_progress;
 mod mem_wal;
 mod merge_insert;
 mod namespace;
 mod optimize;
+mod otel;
 mod schema;
 mod session;
 mod sql;
@@ -84,6 +86,22 @@ pub static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .build()
         .expect("Failed to create tokio runtime")
 });
+
+/// Drive a future on the shared JNI runtime, including nested calls.
+///
+/// Progress callbacks (and similar JNI re-entry) may invoke Dataset methods while
+/// already inside `RT.block_on`. Calling `Runtime::block_on` again panics with
+/// "Cannot start a runtime from within a runtime". When a Tokio handle is already
+/// available, use `block_in_place` + `Handle::block_on` instead.
+///
+/// JNI entry points should use this helper instead of calling `RT.block_on`
+/// directly so they remain safe when invoked from a callback.
+pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => RT.block_on(future),
+    }
+}
 
 fn set_timestamp_precision(builder: &mut env_logger::Builder) {
     if let Ok(timestamp_precision) = env::var("LANCE_LOG_TS_PRECISION") {

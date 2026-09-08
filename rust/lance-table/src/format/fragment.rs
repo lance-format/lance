@@ -7,12 +7,13 @@ use std::sync::Arc;
 
 use lance_core::Error;
 use lance_core::deepsize::DeepSizeOf;
-use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
-use lance_file::version::LanceFileVersion;
+use lance_file::version::ConcreteFileVersion;
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::overlay::{DataOverlayFile, TOMBSTONE_FIELD_ID, sort_overlays_newest_last};
+use super::row_ids::{ExternalFile, RowIdMeta};
 use crate::format::pb;
 
 use crate::rowids::version::{
@@ -36,7 +37,7 @@ pub struct DataFile {
     pub fields: Arc<[i32]>,
     /// The offsets of the fields listed in `fields`, empty in v1 files
     ///
-    /// Note that -1 is a possibility and it indices that the field has
+    /// Note that -1 is a possibility and it indicates that the field has
     /// no top-level column in the file.
     ///
     /// Columns that lack a field id may still exist as extra entries in
@@ -103,15 +104,16 @@ impl<'de> Deserialize<'de> for DataFile {
 }
 
 impl DataFile {
+    /// Create a `DataFile` and encode its exact format version for manifest storage.
     pub fn new(
         path: impl Into<String>,
         fields: Vec<i32>,
         column_indices: Vec<i32>,
-        file_major_version: u32,
-        file_minor_version: u32,
+        file_version: ConcreteFileVersion,
         file_size_bytes: Option<NonZero<u64>>,
         base_id: Option<u32>,
     ) -> Self {
+        let (file_major_version, file_minor_version) = file_version.to_data_file_numbers();
         Self {
             path: path.into(),
             fields: Arc::from(fields),
@@ -123,12 +125,9 @@ impl DataFile {
         }
     }
 
-    /// Create a new `DataFile` with the expectation that fields and column_indices will be set later
-    pub fn new_unstarted(
-        path: impl Into<String>,
-        file_major_version: u32,
-        file_minor_version: u32,
-    ) -> Self {
+    /// Create a new `DataFile` whose fields and column indices will be set later.
+    pub fn new_unstarted(path: impl Into<String>, file_version: ConcreteFileVersion) -> Self {
+        let (file_major_version, file_minor_version) = file_version.to_data_file_numbers();
         Self {
             path: path.into(),
             fields: Arc::from([]),
@@ -145,15 +144,7 @@ impl DataFile {
         fields: Vec<i32>,
         base_id: Option<u32>,
     ) -> Self {
-        Self::new(
-            path,
-            fields,
-            vec![],
-            MAJOR_VERSION as u32,
-            MINOR_VERSION as u32,
-            None,
-            base_id,
-        )
+        Self::new(path, fields, vec![], ConcreteFileVersion::V1, None, base_id)
     }
 
     pub fn new_legacy(
@@ -168,8 +159,7 @@ impl DataFile {
             path,
             field_ids,
             vec![],
-            MAJOR_VERSION as u32,
-            MINOR_VERSION as u32,
+            ConcreteFileVersion::V1,
             file_size_bytes,
             base_id,
         )
@@ -179,13 +169,30 @@ impl DataFile {
         full_schema.project_by_ids(&self.fields, false)
     }
 
-    pub fn is_legacy_file(&self) -> bool {
+    fn uses_v1_data_file_encoding(&self) -> bool {
         self.file_major_version == 0 && self.file_minor_version < 3
     }
 
+    /// Decode the exact file version stored in this `DataFile` metadata.
+    pub fn file_version(&self) -> Result<ConcreteFileVersion> {
+        ConcreteFileVersion::from_data_file_numbers(
+            self.file_major_version,
+            self.file_minor_version,
+        )
+    }
+
     pub fn validate(&self, base_path: &Path) -> Result<()> {
-        if self.is_legacy_file() {
-            if !self.fields.windows(2).all(|w| w[0] < w[1]) {
+        if self.uses_v1_data_file_encoding() {
+            // A tombstone marks a field superseded by a later data file. It is
+            // not a field id, so it carries no ordering; the live ids around it
+            // must still be sorted and distinct.
+            let live: Vec<i32> = self
+                .fields
+                .iter()
+                .copied()
+                .filter(|field| *field != TOMBSTONE_FIELD_ID)
+                .collect();
+            if !live.windows(2).all(|w| w[0] < w[1]) {
                 return Err(Error::corrupt_file(
                     base_path.clone().join(self.path.clone()),
                     "contained unsorted or duplicate field ids",
@@ -375,6 +382,15 @@ impl DataFileFieldInterner {
                 .into_iter()
                 .map(|f| self.intern_data_file(f))
                 .collect::<Result<_>>()?,
+            overlays: {
+                let mut overlays = p
+                    .overlays
+                    .into_iter()
+                    .map(DataOverlayFile::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+                sort_overlays_newest_last(&mut overlays);
+                overlays
+            },
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
@@ -439,38 +455,6 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
     }
 }
 
-/// A reference to a part of a file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct ExternalFile {
-    pub path: String,
-    pub offset: u64,
-    pub size: u64,
-}
-
-/// Metadata about location of the row id sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub enum RowIdMeta {
-    Inline(Vec<u8>),
-    External(ExternalFile),
-}
-
-impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
-    type Error = Error;
-
-    fn try_from(value: pb::data_fragment::RowIdSequence) -> Result<Self> {
-        match value {
-            pb::data_fragment::RowIdSequence::InlineRowIds(data) => Ok(Self::Inline(data)),
-            pb::data_fragment::RowIdSequence::ExternalRowIds(file) => {
-                Ok(Self::External(ExternalFile {
-                    path: file.path.clone(),
-                    offset: file.offset,
-                    size: file.size,
-                }))
-            }
-        }
-    }
-}
-
 /// Data fragment.
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
@@ -482,6 +466,12 @@ pub struct Fragment {
 
     /// Files within the fragment.
     pub files: Vec<DataFile>,
+
+    /// Overlay files supplying new values for a subset of cells without
+    /// rewriting the base data files. Order is significant: a later entry is
+    /// newer than an earlier one. See [`DataOverlayFile`] for resolution rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlays: Vec<DataOverlayFile>,
 
     /// Optional file with deleted local row offsets.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -510,6 +500,7 @@ impl Fragment {
         Self {
             id,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: None,
@@ -534,6 +525,52 @@ impl Fragment {
         }
     }
 
+    /// Every Lance-format file this fragment references: the base data files
+    /// plus the data file of each overlay. The fragment's other referenced
+    /// files are not in this format: a deletion file is `.arrow` or `.bin`, and
+    /// external row-id or row-version metadata is a raw byte range.
+    ///
+    /// Prefer this over `files`, which is the base data files only and so omits
+    /// overlays.
+    pub fn referenced_lance_files(&self) -> impl Iterator<Item = &DataFile> + '_ {
+        // Destructured on purpose: a new field here fails to compile until
+        // someone decides whether it references files.
+        let Self {
+            id: _,
+            files,
+            overlays,
+            deletion_file: _,
+            row_id_meta: _,
+            physical_rows: _,
+            last_updated_at_version_meta: _,
+            created_at_version_meta: _,
+        } = self;
+        files
+            .iter()
+            .chain(overlays.iter().map(|overlay| &overlay.data_file))
+    }
+
+    /// Mutable counterpart of [`Self::referenced_lance_files`], for rewriting
+    /// the fields a clone has to normalize (`base_id`) across base and overlay
+    /// files alike.
+    pub fn referenced_lance_files_mut(&mut self) -> impl Iterator<Item = &mut DataFile> + '_ {
+        // Destructured for the same reason as `referenced_lance_files`, and so
+        // the two disjoint field borrows are visible to the borrow checker.
+        let Self {
+            id: _,
+            files,
+            overlays,
+            deletion_file: _,
+            row_id_meta: _,
+            physical_rows: _,
+            last_updated_at_version_meta: _,
+            created_at_version_meta: _,
+        } = self;
+        files
+            .iter_mut()
+            .chain(overlays.iter_mut().map(|overlay| &mut overlay.data_file))
+    }
+
     pub fn from_json(json: &str) -> Result<Self> {
         let fragment: Self = serde_json::from_str(json)?;
         Ok(fragment)
@@ -549,6 +586,7 @@ impl Fragment {
         Self {
             id,
             files: vec![DataFile::new_legacy(path, schema, None, None)],
+            overlays: vec![],
             deletion_file: None,
             physical_rows,
             row_id_meta: None,
@@ -562,16 +600,14 @@ impl Fragment {
         path: impl Into<String>,
         field_ids: Vec<i32>,
         column_indices: Vec<i32>,
-        version: &LanceFileVersion,
+        version: ConcreteFileVersion,
         file_size_bytes: Option<NonZero<u64>>,
     ) -> Self {
-        let (major, minor) = version.to_numbers();
         let data_file = DataFile::new(
             path,
             field_ids,
             column_indices,
-            major,
-            minor,
+            version,
             file_size_bytes,
             None,
         );
@@ -589,16 +625,14 @@ impl Fragment {
         path: impl Into<String>,
         field_ids: Vec<i32>,
         column_indices: Vec<i32>,
-        version: &LanceFileVersion,
+        version: ConcreteFileVersion,
         file_size_bytes: Option<NonZero<u64>>,
     ) {
-        let (major, minor) = version.to_numbers();
         self.files.push(DataFile::new(
             path,
             field_ids,
             column_indices,
-            major,
-            minor,
+            version,
             file_size_bytes,
             None,
         ));
@@ -610,17 +644,11 @@ impl Fragment {
             .push(DataFile::new_legacy(path, schema, None, None));
     }
 
-    // True if this fragment is made up of legacy v1 files, false otherwise
-    pub fn has_legacy_files(&self) -> bool {
-        // If any file in a fragment is legacy then all files in the fragment must be
-        self.files[0].is_legacy_file()
-    }
-
     // Helper method to infer the Lance version from a set of fragments
     //
     // Returns None if there are no data files
     // Returns an error if the data files have different versions
-    pub fn try_infer_version(fragments: &[Self]) -> Result<Option<LanceFileVersion>> {
+    pub fn try_infer_version(fragments: &[Self]) -> Result<Option<ConcreteFileVersion>> {
         // Otherwise we need to check the actual file versions
         // Determine version from first file
         let Some(sample_file) = fragments
@@ -630,17 +658,11 @@ impl Fragment {
         else {
             return Ok(None);
         };
-        let file_version = LanceFileVersion::try_from_major_minor(
-            sample_file.file_major_version,
-            sample_file.file_minor_version,
-        )?;
+        let file_version = sample_file.file_version()?;
         // Ensure all files match
         for frag in fragments {
             for file in &frag.files {
-                let this_file_version = LanceFileVersion::try_from_major_minor(
-                    file.file_major_version,
-                    file.file_minor_version,
-                )?;
+                let this_file_version = file.file_version()?;
                 if file_version != this_file_version {
                     return Err(Error::invalid_input(format!(
                         "All data files must have the same version.  Detected both {} and {}",
@@ -669,6 +691,15 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .into_iter()
                 .map(DataFile::try_from)
                 .collect::<Result<_>>()?,
+            overlays: {
+                let mut overlays = p
+                    .overlays
+                    .into_iter()
+                    .map(DataOverlayFile::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+                sort_overlays_newest_last(&mut overlays);
+                overlays
+            },
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
@@ -701,7 +732,9 @@ impl From<&Fragment> for pb::DataFragment {
         });
 
         let row_id_sequence = f.row_id_meta.as_ref().map(|m| match m {
-            RowIdMeta::Inline(data) => pb::data_fragment::RowIdSequence::InlineRowIds(data.clone()),
+            RowIdMeta::Inline(data) => {
+                pb::data_fragment::RowIdSequence::InlineRowIds(data.to_vec())
+            }
             RowIdMeta::External(file) => {
                 pb::data_fragment::RowIdSequence::ExternalRowIds(pb::ExternalFile {
                     path: file.path.clone(),
@@ -716,6 +749,7 @@ impl From<&Fragment> for pb::DataFragment {
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
+            overlays: f.overlays.iter().map(pb::DataOverlayFile::from).collect(),
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
@@ -728,11 +762,108 @@ impl From<&Fragment> for pb::DataFragment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::overlay::OverlayCoverage;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
+    use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
     use object_store::path::Path;
+    use roaring::RoaringBitmap;
     use serde_json::{Value, json};
+
+    #[test]
+    fn test_data_overlay_roundtrip() {
+        // A fragment carrying a dense overlay round-trips through protobuf and
+        // back, and the parsed coverage bitmap is recovered per field.
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(1);
+        bitmap.insert(3);
+
+        let overlay = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("overlay-0.lance", vec![3], None),
+            coverage: OverlayCoverage::dense(bitmap.clone()),
+            committed_version: 7,
+        };
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![DataFile::new_legacy_from_fields(
+            "base.lance",
+            vec![1, 3],
+            None,
+        )];
+        fragment.overlays = vec![overlay];
+
+        let proto = pb::DataFragment::from(&fragment);
+        assert_eq!(proto.overlays.len(), 1);
+        let round_tripped = Fragment::try_from(proto).unwrap();
+        assert_eq!(round_tripped, fragment);
+
+        // Dense coverage applies to every field.
+        let recovered = round_tripped.overlays[0].coverage_for_field(0).unwrap();
+        assert_eq!(*recovered, bitmap);
+        assert_eq!(
+            *round_tripped.overlays[0].coverage_for_field(5).unwrap(),
+            bitmap
+        );
+    }
+
+    #[test]
+    fn test_data_overlay_sparse_per_field_coverage() {
+        // A sparse overlay carries one bitmap per field, recovered by position.
+        let name_coverage = RoaringBitmap::from_iter([2u32, 3]);
+        let embedding_coverage = RoaringBitmap::from_iter([1u32]);
+        let overlay = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("overlay-1.lance", vec![2, 4], None),
+            coverage: OverlayCoverage::sparse(vec![
+                name_coverage.clone(),
+                embedding_coverage.clone(),
+            ]),
+            committed_version: 3,
+        };
+        let mut fragment = Fragment::new(1);
+        fragment.overlays = vec![overlay];
+
+        let round_tripped = Fragment::try_from(pb::DataFragment::from(&fragment)).unwrap();
+        assert_eq!(
+            *round_tripped.overlays[0].coverage_for_field(0).unwrap(),
+            name_coverage
+        );
+        assert_eq!(
+            *round_tripped.overlays[0].coverage_for_field(1).unwrap(),
+            embedding_coverage
+        );
+    }
+
+    #[test]
+    fn test_overlays_sorted_newest_last_on_load() {
+        // Overlays load stable-sorted by committed_version (newest last), with
+        // list position preserved as the tiebreak for equal versions.
+        let mk = |version: u64, field: i32| DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("o.lance", vec![field], None),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+            committed_version: version,
+        };
+        let mut fragment = Fragment::new(0);
+        // Written out of order: v5, v2, v2 (second), v3.
+        fragment.overlays = vec![mk(5, 1), mk(2, 2), mk(2, 3), mk(3, 4)];
+
+        let loaded = Fragment::try_from(pb::DataFragment::from(&fragment)).unwrap();
+        let versions: Vec<u64> = loaded
+            .overlays
+            .iter()
+            .map(|o| o.committed_version)
+            .collect();
+        assert_eq!(versions, vec![2, 2, 3, 5]);
+        // Stable: the two v2 overlays keep their original relative order (field 2
+        // before field 3).
+        assert_eq!(
+            loaded.overlays[0].data_file.fields.as_ref(),
+            [2i32].as_slice()
+        );
+        assert_eq!(
+            loaded.overlays[1].data_file.fields.as_ref(),
+            [3i32].as_slice()
+        );
+    }
 
     #[test]
     fn test_new_fragment() {
@@ -784,6 +915,56 @@ mod tests {
         let proto = pb::DataFragment::from(&fragment);
         let fragment2 = Fragment::try_from(proto).unwrap();
         assert_eq!(fragment, fragment2);
+    }
+
+    #[test]
+    fn infer_exact_file_version_and_reject_mixed_fragments() {
+        assert_eq!(Fragment::try_infer_version(&[]).unwrap(), None);
+
+        let v2_0 = Fragment::new(0).with_file(
+            "v2_0.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+        );
+        assert_eq!(
+            (
+                v2_0.files[0].file_major_version,
+                v2_0.files[0].file_minor_version
+            ),
+            (2, 0)
+        );
+        let unstarted = DataFile::new_unstarted("unstarted.lance", ConcreteFileVersion::V2_0);
+        assert_eq!(
+            (unstarted.file_major_version, unstarted.file_minor_version),
+            (2, 0)
+        );
+        let v2_0_second = Fragment::new(1).with_file(
+            "v2_0_second.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+        );
+        assert_eq!(
+            Fragment::try_infer_version(&[v2_0.clone(), v2_0_second]).unwrap(),
+            Some(ConcreteFileVersion::V2_0)
+        );
+
+        let v2_1 = Fragment::new(2).with_file(
+            "v2_1.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_1,
+            None,
+        );
+        let error = Fragment::try_infer_version(&[v2_0, v2_1]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("All data files must have the same version"));
+        assert!(message.contains("2.0"));
+        assert!(message.contains("2.1"));
     }
 
     #[test]

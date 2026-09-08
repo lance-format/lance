@@ -51,14 +51,10 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
                 field_path.push(c.name.as_str());
                 break;
             }
-            Expr::ScalarFunction(udf) => {
-                if udf.name() == GetFieldFunc::default().name() {
-                    let name = get_as_string_scalar_opt(&udf.args[1])?;
-                    field_path.push(name);
-                    current_expr = &udf.args[0];
-                } else {
-                    return None;
-                }
+            Expr::ScalarFunction(udf) if udf.name() == GetFieldFunc::default().name() => {
+                let name = get_as_string_scalar_opt(&udf.args[1])?;
+                field_path.push(name);
+                current_expr = &udf.args[0];
             }
             _ => return None,
         }
@@ -285,8 +281,10 @@ pub fn field_path_to_expr(field_path: &str) -> Result<Expr> {
         )));
     }
 
-    // Build the column expression, handling nested fields
-    let mut expr = col(&parts[0]);
+    // Build the column expression, handling nested fields.
+    let mut expr = Expr::Column(datafusion::common::Column::new_unqualified(
+        parts[0].clone(),
+    ));
     for part in &parts[1..] {
         expr = expr.field_newstyle(part);
     }
@@ -301,7 +299,25 @@ mod tests {
     use super::*;
 
     use arrow_schema::{Field, Schema as ArrowSchema};
+    use datafusion::common::Column;
     use datafusion_functions::core::expr_ext::FieldAccessor;
+
+    #[test]
+    fn test_field_path_to_expr_preserves_case_sensitive_root_column() {
+        let expr = field_path_to_expr("VECTOR").unwrap();
+
+        assert_eq!(expr, Expr::Column(Column::new_unqualified("VECTOR")));
+    }
+
+    #[test]
+    fn test_field_path_to_expr_preserves_case_sensitive_escaped_nested_path() {
+        let expr = field_path_to_expr("Parent.`Child.With.Dot`").unwrap();
+
+        assert_eq!(
+            expr,
+            Expr::Column(Column::new_unqualified("Parent")).field_newstyle("Child.With.Dot")
+        );
+    }
 
     #[test]
     fn test_resolve_large_utf8() {

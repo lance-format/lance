@@ -117,18 +117,23 @@ impl CapturedRowIds {
         }
     }
 
-    pub fn row_addrs(&self, index: Option<&RowIdIndex>) -> Cow<'_, RoaringTreemap> {
+    pub fn row_addrs(&self, index: Option<&RowIdIndex>) -> Result<Cow<'_, RoaringTreemap>> {
         match self {
-            Self::AddressStyle(addrs) => Cow::Borrowed(addrs),
+            Self::AddressStyle(addrs) => Ok(Cow::Borrowed(addrs)),
             Self::SequenceStyle(sequence) => {
                 let mut treemap = RoaringTreemap::new();
                 let Some(index) = index else {
                     panic!("RowIdIndex required for sequence style row ids")
                 };
                 for row_id in sequence.iter() {
-                    treemap.insert(index.get(row_id).expect("row id missing from index").into());
+                    treemap.insert(
+                        index
+                            .get(row_id)?
+                            .expect("row id missing from index")
+                            .into(),
+                    );
                 }
-                Cow::Owned(treemap)
+                Ok(Cow::Owned(treemap))
             }
         }
     }

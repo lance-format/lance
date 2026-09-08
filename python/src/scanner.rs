@@ -66,6 +66,10 @@ pub struct ScanStatistics {
     pub parts_loaded: usize,
     /// Number of index comparisons performed
     pub index_comparisons: usize,
+    /// Number of index cache page lookups that were served from memory
+    pub index_cache_hits: usize,
+    /// Number of index cache page lookups that had to load from storage
+    pub index_cache_misses: usize,
     /// Additional metrics for more detailed statistics. These are subject to change in the future
     /// and should only be used for debugging purposes.
     pub all_counts: HashMap<String, usize>,
@@ -80,6 +84,8 @@ impl ScanStatistics {
             indices_loaded: stats.indices_loaded,
             parts_loaded: stats.parts_loaded,
             index_comparisons: stats.index_comparisons,
+            index_cache_hits: stats.index_cache_hits(),
+            index_cache_misses: stats.index_cache_misses(),
             all_counts: stats.all_counts.clone(),
         }
     }
@@ -89,13 +95,15 @@ impl ScanStatistics {
 impl ScanStatistics {
     fn __repr__(&self) -> String {
         format!(
-            "ScanStatistics(iops={}, requests={}, bytes_read={}, indices_loaded={}, parts_loaded={}, index_comparisons={}, all_counts={:?})",
+            "ScanStatistics(iops={}, requests={}, bytes_read={}, indices_loaded={}, parts_loaded={}, index_comparisons={}, index_cache_hits={}, index_cache_misses={}, all_counts={:?})",
             self.iops,
             self.requests,
             self.bytes_read,
             self.indices_loaded,
             self.parts_loaded,
             self.index_comparisons,
+            self.index_cache_hits,
+            self.index_cache_misses,
             self.all_counts
         )
     }

@@ -192,7 +192,7 @@ async fn test_add_bases() {
     use std::sync::Arc;
 
     // Create a test dataset
-    let test_uri = "memory://add_bases_test";
+    let test_uri = "shared-memory://add_bases_test/primary";
     let mut data_gen =
         BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
@@ -213,13 +213,13 @@ async fn test_add_bases() {
     let new_bases = vec![
         BasePath::new(
             0,
-            "memory://bucket1".to_string(),
+            "shared-memory://add_bases_test/bucket1".to_string(),
             Some("bucket1".to_string()),
             false,
         ),
         BasePath::new(
             0,
-            "memory://bucket2".to_string(),
+            "shared-memory://add_bases_test/bucket2".to_string(),
             Some("bucket2".to_string()),
             true,
         ),
@@ -243,9 +243,9 @@ async fn test_add_bases() {
         .find(|bp| bp.name == Some("bucket2".to_string()))
         .expect("bucket2 not found");
 
-    assert_eq!(bucket1.path, "memory://bucket1");
+    assert_eq!(bucket1.path, "shared-memory://add_bases_test/bucket1");
     assert!(!bucket1.is_dataset_root);
-    assert_eq!(bucket2.path, "memory://bucket2");
+    assert_eq!(bucket2.path, "shared-memory://add_bases_test/bucket2");
     assert!(bucket2.is_dataset_root);
 
     let updated_dataset = Arc::new(updated_dataset);
@@ -253,7 +253,7 @@ async fn test_add_bases() {
     // Test conflict detection - try to add a base with the same name
     let conflicting_bases = vec![BasePath::new(
         0,
-        "memory://bucket3".to_string(),
+        "shared-memory://add_bases_test/bucket3".to_string(),
         Some("bucket1".to_string()),
         false,
     )];
@@ -270,7 +270,7 @@ async fn test_add_bases() {
     // Test conflict detection - try to add a base with the same path
     let conflicting_bases = vec![BasePath::new(
         0,
-        "memory://bucket1".to_string(),
+        "shared-memory://add_bases_test/bucket1".to_string(),
         Some("bucket3".to_string()),
         false,
     )];
@@ -292,7 +292,7 @@ async fn test_concurrent_add_bases_conflict() {
     use std::sync::Arc;
 
     // Create a test dataset
-    let test_uri = "memory://concurrent_add_bases_test";
+    let test_uri = "shared-memory://concurrent_add_bases_test/primary";
     let mut data_gen =
         BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
@@ -314,7 +314,7 @@ async fn test_concurrent_add_bases_conflict() {
     // First transaction adds base1
     let new_bases1 = vec![BasePath::new(
         0,
-        "memory://bucket1".to_string(),
+        "shared-memory://concurrent_add_bases_test/bucket1".to_string(),
         Some("base1".to_string()),
         false,
     )];
@@ -325,7 +325,7 @@ async fn test_concurrent_add_bases_conflict() {
     // This should succeed as there's no conflict
     let new_bases2 = vec![BasePath::new(
         0,
-        "memory://bucket2".to_string(),
+        "shared-memory://concurrent_add_bases_test/bucket2".to_string(),
         Some("base2".to_string()),
         false,
     )];
@@ -360,7 +360,7 @@ async fn test_concurrent_add_bases_name_conflict() {
     use std::sync::Arc;
 
     // Create a test dataset
-    let test_uri = "memory://concurrent_name_conflict_test";
+    let test_uri = "shared-memory://concurrent_name_conflict_test/primary";
     let mut data_gen =
         BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
@@ -383,7 +383,7 @@ async fn test_concurrent_add_bases_name_conflict() {
     // First transaction adds base with name "shared_base"
     let new_bases1 = vec![BasePath::new(
         0,
-        "memory://bucket1".to_string(),
+        "shared-memory://concurrent_name_conflict_test/bucket1".to_string(),
         Some("shared_base".to_string()),
         false,
     )];
@@ -394,7 +394,7 @@ async fn test_concurrent_add_bases_name_conflict() {
     // This should fail due to name conflict
     let new_bases2 = vec![BasePath::new(
         0,
-        "memory://bucket2".to_string(),
+        "shared-memory://concurrent_name_conflict_test/bucket2".to_string(),
         Some("shared_base".to_string()),
         false,
     )];
@@ -416,7 +416,7 @@ async fn test_concurrent_add_bases_path_conflict() {
     use std::sync::Arc;
 
     // Create a test dataset
-    let test_uri = "memory://concurrent_path_conflict_test";
+    let test_uri = "shared-memory://concurrent_path_conflict_test/primary";
     let mut data_gen =
         BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
@@ -436,10 +436,10 @@ async fn test_concurrent_add_bases_path_conflict() {
     let dataset = Arc::new(dataset);
     let dataset_clone = Arc::new(dataset_clone);
 
-    // First transaction adds base with path "memory://shared_path"
+    // First transaction adds a base at the shared path
     let new_bases1 = vec![BasePath::new(
         0,
-        "memory://shared_path".to_string(),
+        "shared-memory://concurrent_path_conflict_test/shared_path".to_string(),
         Some("base1".to_string()),
         false,
     )];
@@ -450,7 +450,7 @@ async fn test_concurrent_add_bases_path_conflict() {
     // This should fail due to path conflict
     let new_bases2 = vec![BasePath::new(
         0,
-        "memory://shared_path".to_string(),
+        "shared-memory://concurrent_path_conflict_test/shared_path".to_string(),
         Some("base2".to_string()),
         false,
     )];
@@ -472,7 +472,7 @@ async fn test_concurrent_add_bases_with_data_write() {
     use std::sync::Arc;
 
     // Create a test dataset
-    let test_uri = "memory://concurrent_write_test";
+    let test_uri = "shared-memory://concurrent_write_test/primary";
     let mut data_gen =
         BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
 
@@ -494,7 +494,7 @@ async fn test_concurrent_add_bases_with_data_write() {
     // First transaction adds a new base
     let new_bases = vec![BasePath::new(
         0,
-        "memory://bucket1".to_string(),
+        "shared-memory://concurrent_write_test/bucket1".to_string(),
         Some("base1".to_string()),
         false,
     )];

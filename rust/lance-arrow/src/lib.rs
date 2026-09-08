@@ -5,12 +5,22 @@
 //!
 //! To improve Arrow-RS ergonomic
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+
+// lance-arrow reinterprets value bytes as native numeric types in
+// `FloatArray::as_slice` for `bf16` (rust/lance-arrow/src/bfloat16.rs), which
+// requires the host byte order to match the on-disk byte order Lance writes.
+// Lance writes little-endian; building on a big-endian target would silently
+// produce wrong numeric values.
+#[cfg(not(target_endian = "little"))]
+compile_error!("lance-arrow only supports little-endian targets");
+
 use std::sync::Arc;
 use std::{collections::HashMap, ptr::NonNull};
 
 use arrow_array::{
     Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray, GenericListArray,
-    LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
+    LargeListArray, ListArray, MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
     UInt8Array, UInt32Array, cast::AsArray,
 };
 use arrow_array::{
@@ -54,6 +64,9 @@ pub const BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY: &str =
     "lance-encoding:blob-dedicated-size-threshold";
 /// Metadata key for overriding the inline blob size threshold (in bytes)
 pub const BLOB_INLINE_SIZE_THRESHOLD_META_KEY: &str = "lance-encoding:blob-inline-size-threshold";
+/// Metadata key for overriding the maximum size (in bytes) of a packed blob sidecar file
+pub const BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY: &str =
+    "lance-encoding:blob-pack-file-size-threshold";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 
@@ -291,7 +304,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float32Array::from_iter_values(
+                    Arc::new(Float32Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<Int8Array>()
@@ -299,7 +312,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to Int8Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f32)),
+                            .map(|x| x.map(|y| y as f32)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -310,7 +323,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float32Array::from_iter_values(
+                    Arc::new(Float32Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<Int16Array>()
@@ -318,7 +331,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to Int16Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f32)),
+                            .map(|x| x.map(|y| y as f32)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -329,7 +342,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float32Array::from_iter_values(
+                    Arc::new(Float32Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<Int32Array>()
@@ -337,7 +350,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to Int32Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f32)),
+                            .map(|x| x.map(|y| y as f32)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -348,7 +361,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float64Array::from_iter_values(
+                    Arc::new(Float64Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<Int64Array>()
@@ -356,7 +369,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to Int64Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f64)),
+                            .map(|x| x.map(|y| y as f64)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -367,7 +380,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float64Array::from_iter_values(
+                    Arc::new(Float64Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<UInt8Array>()
@@ -375,7 +388,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to UInt8Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f64)),
+                            .map(|x| x.map(|y| y as f64)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -386,7 +399,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float64Array::from_iter_values(
+                    Arc::new(Float64Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<UInt32Array>()
@@ -394,7 +407,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to UInt32Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f64)),
+                            .map(|x| x.map(|y| y as f64)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -459,6 +472,20 @@ pub fn iter_str_array(arr: &dyn Array) -> Box<dyn Iterator<Item = Option<&str>> 
         DataType::Utf8 => Box::new(arr.as_string::<i32>().iter()),
         DataType::LargeUtf8 => Box::new(arr.as_string::<i64>().iter()),
         _ => panic!("Expecting Utf8 or LargeUtf8, found {:?}", arr.data_type()),
+    }
+}
+
+pub fn iter_binary_array(
+    arr: &dyn Array,
+) -> Result<Box<dyn Iterator<Item = Option<&[u8]>> + Send + '_>> {
+    match arr.data_type() {
+        DataType::Binary => Ok(Box::new(arr.as_binary::<i32>().iter())),
+        DataType::LargeBinary => Ok(Box::new(arr.as_binary::<i64>().iter())),
+        DataType::BinaryView => Ok(Box::new(arr.as_binary_view().iter())),
+        DataType::FixedSizeBinary(_) => Ok(Box::new(arr.as_fixed_size_binary().iter())),
+        data_type => Err(ArrowError::InvalidArgumentError(format!(
+            "Expecting a binary type, found {data_type}"
+        ))),
     }
 }
 
@@ -833,6 +860,30 @@ fn project_array(array: &ArrayRef, target_field: &Field) -> Result<ArrayRef> {
                 list_arr.nulls().cloned(),
             )))
         }
+        // A nullable entries field fails MapArray::try_new unconditionally,
+        // so a (schema-invalid) map declared that way keeps the clone
+        // fallthrough it always had rather than gaining a new error.
+        DataType::Map(entries_field, sorted) if !entries_field.is_nullable() => {
+            let map_arr = array.as_map();
+            let DataType::Struct(entry_fields) = entries_field.data_type() else {
+                return Err(ArrowError::SchemaError(format!(
+                    "Map entries field must be a struct, got {}",
+                    entries_field.data_type()
+                )));
+            };
+            let projected_entries = project(map_arr.entries(), entry_fields)?;
+            // try_new re-checks the entries invariants (a non-null entries
+            // struct, two entry columns, offset bounds); null keys are ruled
+            // out one level down, by the struct rebuild against the
+            // non-nullable key field.
+            Ok(Arc::new(MapArray::try_new(
+                entries_field.clone(),
+                map_arr.offsets().clone(),
+                projected_entries,
+                map_arr.nulls().cloned(),
+                *sorted,
+            )?))
+        }
         _ => Ok(array.clone()),
     }
 }
@@ -1004,40 +1055,25 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
     }
 }
 
-/// Helper function to normalize validity buffers
-/// Returns None for all-null validity (placeholder structs)
-fn normalize_validity(
-    validity: Option<&arrow_buffer::NullBuffer>,
-) -> Option<&arrow_buffer::NullBuffer> {
-    validity.and_then(|v| {
-        if v.null_count() == v.len() {
-            None
-        } else {
-            Some(v)
-        }
-    })
-}
-
-/// Helper function to merge validity buffers from two struct arrays
-/// Returns None only if both arrays are null at the same position
+/// Helper function to merge validity buffers from two struct arrays.
 ///
-/// Special handling for placeholder structs (all-null validity)
+/// A row is valid if it is valid in either input.
+/// An absent validity buffer means all rows are valid, an all-null buffer acts as the identity for this merge.
 fn merge_struct_validity(
     left_validity: Option<&arrow_buffer::NullBuffer>,
     right_validity: Option<&arrow_buffer::NullBuffer>,
 ) -> Option<arrow_buffer::NullBuffer> {
-    // Normalize both validity buffers (convert all-null to None)
-    let left_normalized = normalize_validity(left_validity);
-    let right_normalized = normalize_validity(right_validity);
-
-    match (left_normalized, right_normalized) {
+    match (left_validity, right_validity) {
         // Fast paths: no computation needed
-        (None, None) => None,
-        (Some(left), None) => Some(left.clone()),
-        (None, Some(right)) => Some(right.clone()),
+        (None, _) | (_, None) => None,
         (Some(left), Some(right)) => {
-            // Fast path: if both have no nulls, can return either one
-            if left.null_count() == 0 && right.null_count() == 0 {
+            if left.null_count() == 0 || right.null_count() == 0 {
+                return None;
+            }
+            if left.null_count() == left.len() {
+                return Some(right.clone());
+            }
+            if right.null_count() == right.len() {
                 return Some(left.clone());
             }
 
@@ -1232,22 +1268,23 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> S
                         if left_list.data_type().is_struct()
                             && right_list.data_type().is_struct() =>
                     {
-                        // If there is nothing to merge just use the left field
+                        // Identical inner types: nothing to merge, keep the left column.
                         if left_list.data_type() == right_list.data_type() {
                             fields.push(left_field.as_ref().clone());
                             columns.push(left_column.clone());
-                        }
-                        // If we have two List<Struct> and they have different sets of fields then
-                        // we can merge them if the offsets arrays are the same.  Otherwise, we
-                        // have to consider it an error.
-                        let merged_sub_array = merge_list_struct(&left_column, &right_column);
+                        } else {
+                            // The struct fields differ, so merge them structurally. merge_list_struct
+                            // only succeeds when both lists share offsets or one side is all-null;
+                            // it panics otherwise.
+                            let merged_sub_array = merge_list_struct(&left_column, &right_column);
 
-                        fields.push(Field::new(
-                            left_field.name(),
-                            merged_sub_array.data_type().clone(),
-                            left_field.is_nullable(),
-                        ));
-                        columns.push(merged_sub_array);
+                            fields.push(Field::new(
+                                left_field.name(),
+                                merged_sub_array.data_type().clone(),
+                                left_field.is_nullable(),
+                            ));
+                            columns.push(merged_sub_array);
+                        }
                     }
                     // otherwise, just use the field on the left hand side
                     _ => {
@@ -1372,9 +1409,12 @@ fn merge_with_schema(
                         );
                         let merged_validity =
                             merge_struct_validity(left_list.nulls(), right_list.nulls());
+                        // `trimmed_values` starts at the first used value, so offsets
+                        // must be shifted to match or `ListArray::new` panics when the
+                        // input list was sliced (e.g. from a filtered batch).
                         let merged_list = ListArray::new(
                             child_field.clone(),
-                            left_list.offsets().clone(),
+                            left_list.trimmed_offsets(),
                             merged_values,
                             merged_validity,
                         );
@@ -1399,7 +1439,7 @@ fn merge_with_schema(
                             merge_struct_validity(left_list.nulls(), right_list.nulls());
                         let merged_list = LargeListArray::new(
                             child_field.clone(),
-                            left_list.offsets().clone(),
+                            left_list.trimmed_offsets(),
                             merged_values,
                             merged_validity,
                         );
@@ -1559,9 +1599,69 @@ impl BufferExt for arrow_buffer::Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Float32Array, Int32Array, NullArray, StructArray};
-    use arrow_array::{ListArray, StringArray, new_empty_array, new_null_array};
+    use arrow_array::{
+        BinaryArray, BinaryViewArray, FixedSizeBinaryArray, Float32Array, Int32Array,
+        LargeBinaryArray, ListArray, NullArray, StringArray, StructArray, new_empty_array,
+        new_null_array,
+    };
     use arrow_buffer::OffsetBuffer;
+
+    #[test]
+    fn test_convert_to_floating_point_preserves_inner_nulls() {
+        // A FixedSizeList<Int8> with a null inner element must convert to a
+        // FixedSizeList<Float32> with the null kept in place. Dropping it would
+        // shorten the values array and shift every later element (and, when the
+        // remaining count is not a multiple of the list size, panic).
+        let values = Int8Array::from(vec![Some(1), None, Some(3), Some(4)]);
+        let fsl = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Int8, true)),
+            2,
+            Arc::new(values),
+            None,
+        );
+
+        let converted = fsl.convert_to_floating_point().unwrap();
+
+        assert_eq!(converted.len(), 2);
+        let conv_values = converted
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(conv_values.len(), 4);
+        assert_eq!(conv_values.value(0), 1.0);
+        assert!(conv_values.is_null(1));
+        assert_eq!(conv_values.value(2), 3.0);
+        assert_eq!(conv_values.value(3), 4.0);
+    }
+
+    #[test]
+    fn test_convert_to_floating_point_preserves_inner_nulls_f64_arm() {
+        // The Float64-producing arms (Int64/UInt8/UInt32) share the same fix as the
+        // Float32 arms; cover one representative (UInt8 -> Float64) so both branch
+        // families are exercised.
+        let values = UInt8Array::from(vec![Some(10u8), None, Some(30), Some(40)]);
+        let fsl = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::UInt8, true)),
+            2,
+            Arc::new(values),
+            None,
+        );
+
+        let converted = fsl.convert_to_floating_point().unwrap();
+
+        assert_eq!(converted.len(), 2);
+        let conv_values = converted
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(conv_values.len(), 4);
+        assert_eq!(conv_values.value(0), 10.0);
+        assert!(conv_values.is_null(1));
+        assert_eq!(conv_values.value(2), 30.0);
+        assert_eq!(conv_values.value(3), 40.0);
+    }
 
     #[test]
     fn test_merge_recursive() {
@@ -1781,6 +1881,105 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_list_struct_identical_schema() {
+        // Merging two batches whose `List<Struct>` columns have identical types
+        // should yield a single column equal to the input (there is nothing to
+        // merge), not a struct with the field pushed twice.
+        let x_field = Arc::new(Field::new("x", DataType::Int32, true));
+        let item_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![x_field.clone()])),
+            true,
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "list_struct",
+            DataType::List(item_field.clone()),
+            true,
+        )]));
+
+        let build_list = |values: Vec<i32>| {
+            let len = values.len();
+            let item_struct = Arc::new(StructArray::new(
+                Fields::from(vec![x_field.clone()]),
+                vec![Arc::new(Int32Array::from(values))],
+                None,
+            ));
+            ListArray::new(
+                item_field.clone(),
+                OffsetBuffer::from_lengths([len]),
+                item_struct,
+                None,
+            )
+        };
+
+        // Distinct values so the equality assertion proves the left column is kept,
+        // not that some column with the same values happens to be present.
+        let left =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(build_list(vec![1, 2]))]).unwrap();
+        let right = RecordBatch::try_new(schema, vec![Arc::new(build_list(vec![3, 4]))]).unwrap();
+
+        let merged = left.merge(&right).unwrap();
+
+        // Exactly one column, equal to the left input: the field must not be duplicated.
+        assert_eq!(merged.num_columns(), 1);
+        assert_eq!(merged, left);
+    }
+
+    #[test]
+    fn test_merge_nested_list_struct_identical_schema() {
+        // A `List<Struct>` nested inside a struct reaches the identical-type
+        // short-circuit through the recursive `merge` call. The recursion must
+        // keep the field exactly once, equal to the left input.
+        let x_field = Arc::new(Field::new("x", DataType::Int32, true));
+        let item_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![x_field.clone()])),
+            true,
+        ));
+        let companies_field = Arc::new(Field::new(
+            "companies",
+            DataType::List(item_field.clone()),
+            true,
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![companies_field.clone()])),
+            true,
+        )]));
+
+        let build_outer = |x: i32| {
+            // One list row: [{x}].
+            let item_struct = Arc::new(StructArray::new(
+                Fields::from(vec![x_field.clone()]),
+                vec![Arc::new(Int32Array::from(vec![x]))],
+                None,
+            ));
+            let companies = Arc::new(ListArray::new(
+                item_field.clone(),
+                OffsetBuffer::from_lengths([1]),
+                item_struct,
+                None,
+            ));
+            StructArray::new(
+                Fields::from(vec![companies_field.clone()]),
+                vec![companies],
+                None,
+            )
+        };
+
+        // Distinct values so equality proves the left column is kept.
+        let left = RecordBatch::try_new(schema.clone(), vec![Arc::new(build_outer(10))]).unwrap();
+        let right = RecordBatch::try_new(schema, vec![Arc::new(build_outer(20))]).unwrap();
+
+        let merged = left.merge(&right).unwrap();
+
+        // The recursive identical-type merge keeps exactly one `companies` field,
+        // with no double-push inside the nested struct.
+        assert_eq!(merged.column(0).as_struct().num_columns(), 1);
+        assert_eq!(merged, left);
+    }
+
+    #[test]
     fn test_byte_width_opt() {
         assert_eq!(DataType::Int32.byte_width_opt(), Some(4));
         assert_eq!(DataType::Int64.byte_width_opt(), Some(8));
@@ -1907,6 +2106,60 @@ mod tests {
     }
 
     #[test]
+    fn test_project_rebuilds_sliced_map() {
+        // A sliced MapArray keeps its full entries array behind sliced
+        // offsets and validity; the Map projection arm must rebuild it
+        // without renormalizing either.
+        let entry_fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+        ]);
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(entry_fields.clone()),
+            false,
+        ));
+        let entries = StructArray::new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(vec!["k0", "k1", "k2"])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+            None,
+        );
+        let map = MapArray::new(
+            entries_field.clone(),
+            OffsetBuffer::new(vec![0, 1, 1, 3].into()),
+            entries,
+            Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "m",
+            DataType::Map(entries_field, false),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(map) as ArrayRef]).unwrap();
+
+        // Rows 1..3: a null slot and a two-entry slot, offsets not zero-based.
+        let projected = batch
+            .slice(1, 2)
+            .project_by_schema(schema.as_ref())
+            .unwrap();
+        let map = projected.column(0).as_map();
+        assert!(map.is_null(0));
+        assert!(map.is_valid(1));
+        assert_eq!(map.value_length(1), 2);
+        assert_eq!(
+            map.value(1)
+                .column(1)
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values(),
+            &[2, 3]
+        );
+    }
+
+    #[test]
     fn test_project_preserves_struct_validity() {
         // Test that projecting a struct array preserves its validity (fix for issue #4385)
         let fields = Fields::from(vec![
@@ -1984,6 +2237,47 @@ mod tests {
         assert_eq!(width_values.value(0), 300);
         assert_eq!(width_values.value(1), 200);
         assert!(width_values.is_null(2)); // width is null when right struct was null
+
+        // An all-null validity buffer is data, not a placeholder meaning "this side has no
+        // validity": merging two of them keeps the rows null.
+        let all_null_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![None, None])) as ArrayRef],
+            Some(vec![false, false].into()),
+        );
+        let all_null_right = StructArray::new(
+            Fields::from(vec![Field::new("width", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![None, None])) as ArrayRef],
+            Some(vec![false, false].into()),
+        );
+
+        let merged = merge(&all_null_left, &all_null_right);
+        assert_eq!(merged.null_count(), 2);
+
+        // An all-null side is the identity of the merge, so the other side decides each row.
+        let partial_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef],
+            Some(vec![true, false].into()),
+        );
+        let merged = merge(&partial_left, &all_null_right);
+        assert!(!merged.is_null(0));
+        assert!(merged.is_null(1));
+
+        // A missing validity buffer means all rows are valid, which absorbs an all-null side.
+        let all_valid_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+            None,
+        );
+        let merged = merge(&all_valid_left, &all_null_right);
+        assert_eq!(merged.null_count(), 0);
+
+        // An explicit all-valid buffer has the same semantics as a missing buffer.
+        let all_valid: arrow_buffer::NullBuffer = vec![true, true].into();
+        let partial: arrow_buffer::NullBuffer = vec![true, false].into();
+        assert!(merge_struct_validity(Some(&all_valid), Some(&partial)).is_none());
+        assert!(merge_struct_validity(Some(&partial), Some(&all_valid)).is_none());
     }
 
     #[test]
@@ -2311,6 +2605,118 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_with_schema_sliced_list_struct() {
+        test_merge_with_schema_sliced_list_struct_generic::<i32>();
+    }
+
+    #[test]
+    fn test_merge_with_schema_sliced_large_list_struct() {
+        test_merge_with_schema_sliced_list_struct_generic::<i64>();
+    }
+
+    // Regression for #6580: merge_with_schema panicked when the left list was a
+    // sliced view whose offsets did not start at zero (common after a filtered
+    // scan). Cloning those offsets alongside `trimmed_values` produced offsets
+    // larger than the trimmed child, panicking in `(Large)ListArray::new`.
+    fn test_merge_with_schema_sliced_list_struct_generic<O: OffsetSizeTrait>() {
+        let make_list_dtype = |item_field: Arc<Field>| {
+            if O::IS_LARGE {
+                DataType::LargeList(item_field)
+            } else {
+                DataType::List(item_field)
+            }
+        };
+
+        // Build a List<Struct> with two rows of 5 items each, then slice away
+        // the first row so the remaining list's offsets start at 5, not 0.
+        let struct_fields_a = Fields::from(vec![Field::new("a", DataType::Int32, true)]);
+        let left_values = Arc::new(StructArray::new(
+            struct_fields_a.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef],
+            None,
+        ));
+        let full_list = GenericListArray::<O>::new(
+            Arc::new(Field::new("item", DataType::Struct(struct_fields_a), true)),
+            OffsetBuffer::<O>::from_lengths([5, 5]),
+            left_values,
+            None,
+        );
+        let sliced_left = full_list.slice(1, 1);
+        assert_eq!(sliced_left.offsets()[0].as_usize(), 5);
+        assert_eq!(sliced_left.offsets()[1].as_usize(), 10);
+
+        let struct_fields_b = Fields::from(vec![Field::new("b", DataType::Int32, true)]);
+        let right_values = Arc::new(StructArray::new(
+            struct_fields_b.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(100..105)) as ArrayRef],
+            None,
+        ));
+        let right_list = GenericListArray::<O>::new(
+            Arc::new(Field::new("item", DataType::Struct(struct_fields_b), true)),
+            OffsetBuffer::<O>::from_lengths([5]),
+            right_values,
+            None,
+        );
+
+        let target_item_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Int32, true),
+            ])),
+            true,
+        ));
+        let target_fields = Fields::from(vec![Field::new(
+            "items",
+            make_list_dtype(target_item_field),
+            true,
+        )]);
+
+        let left_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "items",
+                sliced_left.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(sliced_left) as ArrayRef],
+        )
+        .unwrap();
+        let right_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "items",
+                right_list.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(right_list) as ArrayRef],
+        )
+        .unwrap();
+
+        let merged = left_batch
+            .merge_with_schema(&right_batch, &Schema::new(target_fields.to_vec()))
+            .unwrap();
+
+        let merged_list = merged
+            .column_by_name("items")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<GenericListArray<O>>()
+            .unwrap();
+        assert_eq!(merged_list.len(), 1);
+        assert_eq!(merged_list.value_length(0).as_usize(), 5);
+        let merged_struct = merged_list.values().as_struct();
+        assert_eq!(merged_struct.num_columns(), 2);
+        let a = merged_struct
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        // After shifting offsets to zero, values 5..10 should be first.
+        let a_vals: Vec<i32> = a.iter().map(|v| v.unwrap()).collect();
+        assert_eq!(a_vals, vec![5, 6, 7, 8, 9]);
+    }
+
+    #[test]
     fn test_project_by_schema_list_struct_reorder() {
         // Test that project_by_schema correctly reorders fields inside List<Struct>
         // This is a regression test for issue #5702
@@ -2549,5 +2955,43 @@ mod tests {
             innermost_struct.column(1).as_ref(),
             &Int32Array::from(vec![1, 2]) as &dyn Array
         );
+    }
+
+    #[test]
+    fn test_iter_binary_array_accepts_binary_variants() {
+        let binary = BinaryArray::from(vec![b"a".as_slice(), b"bc"]);
+        assert_eq!(
+            iter_binary_array(&binary).unwrap().collect::<Vec<_>>(),
+            vec![Some(b"a".as_slice()), Some(b"bc".as_slice())]
+        );
+
+        let large_binary = LargeBinaryArray::from(vec![b"x".as_slice(), b"yz"]);
+        assert_eq!(
+            iter_binary_array(&large_binary)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![Some(b"x".as_slice()), Some(b"yz".as_slice())]
+        );
+
+        let binary_view = BinaryViewArray::from(vec![b"1".as_slice(), b"23"]);
+        assert_eq!(
+            iter_binary_array(&binary_view).unwrap().collect::<Vec<_>>(),
+            vec![Some(b"1".as_slice()), Some(b"23".as_slice())]
+        );
+
+        let fixed_size = FixedSizeBinaryArray::from(vec![b"abcd", b"efgh"]);
+        assert_eq!(
+            iter_binary_array(&fixed_size).unwrap().collect::<Vec<_>>(),
+            vec![Some(b"abcd".as_slice()), Some(b"efgh".as_slice())]
+        );
+    }
+
+    #[test]
+    fn test_iter_binary_array_rejects_non_binary() {
+        let int_array = Int32Array::from(vec![1, 2, 3]);
+        let Err(error) = iter_binary_array(&int_array) else {
+            panic!("expected an error for non-binary array");
+        };
+        assert!(error.to_string().contains("Expecting a binary type"));
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{any::Any, borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc};
 
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
@@ -19,10 +19,6 @@ use crate::Dataset;
 
 #[async_trait]
 impl TableProvider for Dataset {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> Arc<ArrowSchema> {
         Arc::new(self.schema().into())
     }
@@ -167,17 +163,11 @@ mod tests {
 
         // DataFusion will create a cooperative execution plan, so we need to get its inner plan
         let physical_plan = physical_plan
-            .as_any()
             .downcast_ref::<CooperativeExec>()
             .unwrap()
             .children()[0];
 
-        assert!(
-            physical_plan
-                .as_any()
-                .downcast_ref::<LanceScanExec>()
-                .is_some()
-        );
+        assert!(physical_plan.downcast_ref::<LanceScanExec>().is_some());
 
         let expected_fields = schema
             .fields()

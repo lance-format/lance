@@ -44,6 +44,9 @@ impl IoRequest {
     /// Used when a request cannot be submitted (e.g. SQ full).
     pub(super) fn fail(&self, err: io::Error) {
         let mut state = self.state.lock().unwrap();
+        if state.completed {
+            return;
+        }
         state.err = Some(err);
         state.completed = true;
         if let Some(waker) = state.waker.take() {

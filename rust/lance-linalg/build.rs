@@ -17,12 +17,14 @@ fn main() -> Result<(), String> {
 
     // Let clippy know about our custom cfg attribute
     println!(
-        "cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512_f16\", \"avx512_bf16\", \"avx512_dist_table\"))"
+        "cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512_f16\", \"avx512_bf16\", \"avx512_dist_table\", \"amx_fp16\"))"
     );
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
     println!("cargo:rerun-if-changed=src/simd/bf16.c");
     println!("cargo:rerun-if-changed=src/simd/dist_table.c");
+    println!("cargo:rerun-if-changed=src/simd/amx_fp16.c");
+    println!("cargo:rerun-if-env-changed=LANCE_AMX_FP16_CC");
 
     // Important: we don't use `cfg!(target_arch)` here because that is the target_arch
     // for the build script, not the target_arch for the library. Similar story for
@@ -84,6 +86,28 @@ fn main() -> Result<(), String> {
         } else {
             println!("cargo:rustc-cfg=kernel_support=\"avx512_dist_table\"");
         };
+        // Build the AMX-FP16 batched f16 dot-product kernel (Granite Rapids+).
+        //
+        // No cargo feature of its own: whether it can be built is a property of
+        // the toolchain, not a choice the user makes. `-mamx-fp16` needs clang
+        // >= 16 or gcc >= 13, so a capable compiler is probed for below; if none
+        // is found we warn, skip the kernel, and leave `kernel_support` unset.
+        //
+        // Linux only: every Rust-side cfg gate on this kernel also demands
+        // `target_os = "linux"`, and entering it needs XTILEDATA from
+        // `arch_prctl(ARCH_REQ_XCOMP_PERM)`, which is Linux-specific.
+        if target_os == "linux" {
+            if let Err(err) =
+                build_amx_fp16_with_flags(&["-march=sapphirerapids", "-mamx-fp16", "-mamx-tile"])
+            {
+                println!(
+                    "cargo:warning=Skipping build of AMX-FP16 kernels. Error: {}",
+                    err
+                );
+            } else {
+                println!("cargo:rustc-cfg=kernel_support=\"amx_fp16\"");
+            };
+        }
         // Build a version with AVX
         // While GCC doesn't have support for _Float16 until GCC 12, clang
         // has support for __fp16 going back to at least clang 6.
@@ -195,4 +219,97 @@ fn build_dist_table_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::E
         builder.flag(flag);
     }
     builder.try_compile(&format!("dist_table_{}", suffix))
+}
+
+/// Compile the AMX-FP16 kernel. Unlike the other kernels this may need a
+/// different C compiler: `_tile_dpfp16ps` / `-mamx-fp16` require clang >= 16 or
+/// gcc >= 13, which is often newer than the platform default `cc`. We probe for
+/// a capable compiler (respecting a `LANCE_AMX_FP16_CC` override) and use it
+/// only for this one file; everything else keeps using the default toolchain.
+fn build_amx_fp16_with_flags(flags: &[&str]) -> Result<(), String> {
+    let compiler = find_amx_fp16_compiler(flags).ok_or_else(|| {
+        "no C compiler supporting -mamx-fp16 found (need clang>=16 or gcc>=13; \
+         set LANCE_AMX_FP16_CC to override)"
+            .to_string()
+    })?;
+    let mut builder = cc::Build::new();
+    builder
+        .compiler(&compiler)
+        .std("c17")
+        .file("src/simd/amx_fp16.c")
+        .flag("-funroll-loops")
+        .flag("-O3")
+        .flag("-Wall")
+        .flag("-Wextra");
+    for flag in flags {
+        builder.flag(flag);
+    }
+    builder.try_compile("amx_fp16").map_err(|e| e.to_string())
+}
+
+/// Find a C compiler that can build the AMX-FP16 kernel with `flags`, in order:
+/// the `LANCE_AMX_FP16_CC` override, the default toolchain `cc`, then common
+/// modern clang names. Returns the first that compiles a `_tile_dpfp16ps` probe.
+fn find_amx_fp16_compiler(flags: &[&str]) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(cc) = env::var("LANCE_AMX_FP16_CC") {
+        candidates.push(cc);
+    }
+    if let Ok(default_cc) = cc::Build::new()
+        .get_compiler()
+        .path()
+        .to_str()
+        .ok_or(())
+        .map(str::to_string)
+    {
+        candidates.push(default_cc);
+    }
+    for c in ["clang-18", "clang-17", "clang-16", "clang"] {
+        candidates.push(c.to_string());
+    }
+    candidates
+        .into_iter()
+        .find(|cc| cc_supports_amx_fp16(cc, flags))
+}
+
+/// True iff invoking `cc` with `flags` can compile a translation unit that uses
+/// `_tile_dpfp16ps`. `-Werror=implicit-function-declaration` turns gcc's
+/// "intrinsic not declared" *warning* (which otherwise still exits 0 on the
+/// too-old gcc that lacks amx-fp16) into a hard failure.
+fn cc_supports_amx_fp16(cc: &str, flags: &[&str]) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let src = b"#include <immintrin.h>\n\
+        void t(const void* a, const void* b) {\n\
+        _tile_loadd(1, a, 64); _tile_loadd(2, b, 4);\n\
+        _tile_dpfp16ps(0, 1, 2); _tile_release(); }\n";
+    let out = env::var("OUT_DIR")
+        .map(|d| format!("{d}/amx_fp16_probe.o"))
+        .unwrap_or_else(|_| "/dev/null".to_string());
+
+    let mut cmd = Command::new(cc);
+    cmd.args(flags)
+        .args([
+            "-Werror=implicit-function-declaration",
+            "-x",
+            "c",
+            "-c",
+            "-",
+            "-o",
+        ])
+        .arg(&out)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take()
+        && stdin.write_all(src).is_err()
+    {
+        return false;
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
 }

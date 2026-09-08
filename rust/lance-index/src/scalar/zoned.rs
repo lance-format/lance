@@ -92,13 +92,14 @@ where
     pub async fn train(
         mut self,
         stream: SendableRecordBatchStream,
-    ) -> Result<Vec<P::ZoneStatistics>> {
+    ) -> Result<(Vec<P::ZoneStatistics>, RowAddrTreeMap)> {
         let zone_size = usize::try_from(self.zone_capacity).map_err(|_| {
             Error::invalid_input("zone capacity does not fit into usize on this platform")
         })?;
 
         let mut batches = chunk_concat_stream(stream, zone_size);
         let mut zones = Vec::new();
+        let mut null_rows = RowAddrTreeMap::new();
         let mut current_fragment_id: Option<u64> = None;
         let mut current_zone_len: usize = 0;
         let mut zone_start_offset: Option<u64> = None;
@@ -155,6 +156,16 @@ where
                 self.processor
                     .process_chunk(&values.slice(batch_offset, take))?;
 
+                // Record exact row addresses for null values in this chunk.
+                let chunk = values.slice(batch_offset, take);
+                if chunk.null_count() > 0 {
+                    for i in 0..take {
+                        if values.is_null(batch_offset + i) {
+                            null_rows.insert(row_addr_col.value(batch_offset + i));
+                        }
+                    }
+                }
+
                 // Track the first and last row offsets to handle non-contiguous offsets
                 // after deletions. Zone length (offset span) is computed as (last - first + 1),
                 // not the actual row count.
@@ -200,7 +211,7 @@ where
             }
         }
 
-        Ok(zones)
+        Ok((zones, null_rows))
     }
 
     /// Flushes a non-empty zone and resets the processor state.
@@ -266,21 +277,21 @@ where
 }
 
 /// Helper that retrains zones from `stream` and appends them to the existing
-/// statistics. Useful for index update paths that need to merge new fragments
-/// into an existing zone list.
+/// statistics. Returns the combined zone list and the null-row bitmap for the
+/// new data only — callers are responsible for merging with any existing bitmap.
 pub async fn rebuild_zones<P>(
     existing: &[P::ZoneStatistics],
     trainer: ZoneTrainer<P>,
     stream: SendableRecordBatchStream,
-) -> Result<Vec<P::ZoneStatistics>>
+) -> Result<(Vec<P::ZoneStatistics>, RowAddrTreeMap)>
 where
     P: ZoneProcessor,
     P::ZoneStatistics: Clone,
 {
     let mut combined = existing.to_vec();
-    let mut new_zones = trainer.train(stream).await?;
+    let (mut new_zones, null_rows) = trainer.train(stream).await?;
     combined.append(&mut new_zones);
-    Ok(combined)
+    Ok((combined, null_rows))
 }
 
 #[cfg(test)]
@@ -362,7 +373,7 @@ mod tests {
 
         let processor = MockProcessor::new();
         let trainer = ZoneTrainer::new(processor, 4).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Three zones: offsets [0..=3], [4..=7], [8..=9]
         assert_eq!(stats.len(), 3);
@@ -393,7 +404,7 @@ mod tests {
 
         let processor = MockProcessor::new();
         let trainer = ZoneTrainer::new(processor, 10).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Two zones, one per fragment (capacity=10 is large enough)
         assert_eq!(stats.len(), 2);
@@ -447,7 +458,7 @@ mod tests {
 
         let processor = MockProcessor::new();
         let trainer = ZoneTrainer::new(processor, 10).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let (stats, _) = trainer.train(stream).await.unwrap();
 
         // One zone containing the 3 valid rows (empty batches skipped)
         assert_eq!(stats.len(), 1);
@@ -469,7 +480,7 @@ mod tests {
 
         let processor = MockProcessor::new();
         let trainer = ZoneTrainer::new(processor, 1).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Three zones, one per row (capacity=1)
         assert_eq!(stats.len(), 3);
@@ -494,7 +505,7 @@ mod tests {
 
         let processor = MockProcessor::new();
         let trainer = ZoneTrainer::new(processor, 10000).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let (stats, _) = trainer.train(stream).await.unwrap();
 
         // One zone containing all 100 rows (capacity is large enough)
         assert_eq!(stats.len(), 1);
@@ -530,7 +541,7 @@ mod tests {
 
         let processor = MockProcessor::new();
         let trainer = ZoneTrainer::new(processor, 4).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Two zones: first 4 rows, then remaining 2 rows
         assert_eq!(stats.len(), 2);
@@ -561,7 +572,7 @@ mod tests {
 
         let processor = MockProcessor::new();
         let trainer = ZoneTrainer::new(processor, 3).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Three zones: frag 0 full zone, frag 0 partial (flushed at boundary), frag 1
         assert_eq!(stats.len(), 3);
@@ -602,7 +613,7 @@ mod tests {
 
         let processor = MockProcessor::new();
         let trainer = ZoneTrainer::new(processor, 4).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Should create 2 zones (capacity=4):
         // Zone 0: rows at offsets [0, 1, 5, 7] (4 rows)
@@ -637,7 +648,7 @@ mod tests {
 
         let processor = MockProcessor::new();
         let trainer = ZoneTrainer::new(processor, 10).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let (stats, _) = trainer.train(stream).await.unwrap();
 
         // One zone with 3 rows, but offset span [0..=200] so length=201 due to large gaps
         assert_eq!(stats.len(), 1);
@@ -663,7 +674,7 @@ mod tests {
 
         let processor = MockProcessor::new();
         let trainer = ZoneTrainer::new(processor, 10).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let (stats, _) = trainer.train(stream).await.unwrap();
 
         // Should create 3 zones (one per fragment)
         assert_eq!(stats.len(), 3);
@@ -810,7 +821,7 @@ mod tests {
         ));
 
         let trainer = ZoneTrainer::new(MockProcessor::new(), 2).unwrap();
-        let rebuilt = rebuild_zones(&existing, trainer, stream).await.unwrap();
+        let (rebuilt, _) = rebuild_zones(&existing, trainer, stream).await.unwrap();
         // Existing zone should remain unchanged and new stats appended afterwards
         assert_eq!(rebuilt.len(), 2);
         assert_eq!(rebuilt[0].sum, 50);
@@ -840,7 +851,7 @@ mod tests {
         ));
 
         let trainer = ZoneTrainer::new(MockProcessor::new(), 2).unwrap();
-        let rebuilt = rebuild_zones(&existing, trainer, stream).await.unwrap();
+        let (rebuilt, _) = rebuild_zones(&existing, trainer, stream).await.unwrap();
         // Existing zone plus two new fragments should yield three total zones
         assert_eq!(rebuilt.len(), 3);
         assert_eq!(rebuilt[0].bound.fragment_id, 0);

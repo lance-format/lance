@@ -23,6 +23,16 @@ pub trait ListArrayExt {
     /// behaves similarly to `values()` except it slices the array so that it starts at
     /// the first list offset and ends at the last list offset.
     fn trimmed_values(&self) -> Arc<dyn Array>;
+    /// The offset type of the underlying list array.
+    type Offset: OffsetSizeTrait;
+    /// Returns offsets shifted so the first offset is zero, matching
+    /// [`Self::trimmed_values`].
+    ///
+    /// Sliced list arrays (e.g. a filtered batch) keep offsets that reference the
+    /// original values buffer, so combining them with trimmed values produces
+    /// offsets that exceed the values length. Use this together with
+    /// `trimmed_values` when constructing a new list array.
+    fn trimmed_offsets(&self) -> OffsetBuffer<Self::Offset>;
 }
 
 impl<OffsetSize: OffsetSizeTrait> ListArrayExt for GenericListArray<OffsetSize> {
@@ -89,6 +99,20 @@ impl<OffsetSize: OffsetSizeTrait> ListArrayExt for GenericListArray<OffsetSize> 
             .map(|v| v.to_usize().unwrap())
             .unwrap_or(0);
         self.values().slice(first_value, last_value - first_value)
+    }
+
+    type Offset = OffsetSize;
+
+    fn trimmed_offsets(&self) -> OffsetBuffer<OffsetSize> {
+        let offsets = self.offsets();
+        let Some(&first) = offsets.first() else {
+            return offsets.clone();
+        };
+        if first == OffsetSize::zero() {
+            return offsets.clone();
+        }
+        let shifted: Vec<OffsetSize> = offsets.iter().map(|&o| o - first).collect();
+        OffsetBuffer::new(ScalarBuffer::from(shifted))
     }
 }
 

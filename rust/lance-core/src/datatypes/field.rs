@@ -30,7 +30,8 @@ use super::{
 };
 use crate::{
     Error, Result,
-    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD, BlobV2Layout},
+    utils::parse::str_is_truthy,
 };
 
 /// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
@@ -57,6 +58,8 @@ pub const LANCE_UNENFORCED_CLUSTERING_KEY_POSITION: &str =
 /// Use this config key in Arrow field metadata to specify the field id of the lance field.
 /// The value should be non-negative i32 value. Any negative value will be seen as -1.
 pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
+
+const PACKED_KEYS: [&str; 2] = ["packed", "lance-encoding:packed"];
 
 fn has_blob_v2_extension(field: &ArrowField) -> bool {
     field
@@ -269,24 +272,15 @@ impl Field {
     }
 
     pub fn apply_projection(&self, projection: &Projection) -> Option<Self> {
-        // Map fields encode their physical layout as a single child entries
-        // struct (`Struct<key, value>`) whose presence is required for the
-        // parent to be readable — we never want to filter into that subtree.
-        // But the parent field itself is still subject to selection: if the
-        // caller didn't ask for this Map column, drop it like any other
-        // non-selected leaf. Without this early return the unconditional
-        // children clone would keep `children.is_empty() == false` forever
-        // and every Map column in the schema would survive every projection,
-        // pulling tens-of-bytes-per-row of unrelated data through downstream
-        // operators (notably `SortExec` in scalar-index training, where it
-        // was responsible for >100 GiB external-sort spills on real-world
-        // tables).
-        if self.logical_type.is_map() && !projection.contains_field_id(self.id) {
+        // Maps and blob descriptors are atomic physical layouts. Map children
+        // must remain together, while projected blob descriptor children may
+        // have synthetic IDs that cannot be selected independently.
+        let is_atomic_layout = self.logical_type.is_map() || self.is_blob();
+        if is_atomic_layout && !projection.contains_field_id(self.id) {
             return None;
         }
 
-        let children = if self.logical_type.is_map() {
-            // Map field is selected: keep all children intact.
+        let children = if is_atomic_layout {
             self.children.clone()
         } else {
             self.children
@@ -374,12 +368,22 @@ impl Field {
                 self_name
             ));
         }
-        let children_differences = explain_fields_difference(
-            &self.children,
-            &expected.children,
-            options,
-            Some(&self_name),
-        );
+        let children_differences =
+            if let Some(shared_child_count) = self.blob_v2_logical_shared_child_count(expected) {
+                explain_fields_difference(
+                    &self.children[..shared_child_count],
+                    &expected.children[..shared_child_count],
+                    options,
+                    Some(&self_name),
+                )
+            } else {
+                explain_fields_difference(
+                    &self.children,
+                    &expected.children,
+                    options,
+                    Some(&self_name),
+                )
+            };
         if !children_differences.is_empty() {
             let children_differences = format!(
                 "`{}` had mismatched children: {}",
@@ -417,10 +421,20 @@ impl Field {
     }
 
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
+        let children_match = self
+            .blob_v2_logical_shared_child_count(expected)
+            .map(|shared_child_count| {
+                compare_fields(
+                    &self.children[..shared_child_count],
+                    &expected.children[..shared_child_count],
+                    options,
+                )
+            })
+            .unwrap_or_else(|| compare_fields(&self.children, &expected.children, options));
         self.name == expected.name
             && self.logical_type == expected.logical_type
             && Self::compare_nullability(expected.nullable, self.nullable, options)
-            && compare_fields(&self.children, &expected.children, options)
+            && children_match
             && (!options.compare_field_ids || self.id == expected.id)
             && (!options.compare_dictionary || self.dictionary == expected.dictionary)
             && (!options.compare_metadata || self.metadata == expected.metadata)
@@ -549,6 +563,40 @@ impl Field {
             .get(ARROW_EXT_NAME_KEY)
             .map(|name| name == BLOB_V2_EXT_NAME)
             .unwrap_or(false)
+            || self.is_blob_v2_descriptor()
+    }
+
+    fn blob_v2_layout(&self) -> Option<BlobV2Layout> {
+        if self.extension_name() != Some(BLOB_V2_EXT_NAME) {
+            return None;
+        }
+        let DataType::Struct(fields) = self.data_type() else {
+            return None;
+        };
+        BlobV2Layout::classify(&fields)
+    }
+
+    fn blob_v2_logical_shared_child_count(&self, other: &Self) -> Option<usize> {
+        if self.blob_v2_layout() == Some(BlobV2Layout::Logical)
+            && other.blob_v2_layout() == Some(BlobV2Layout::Logical)
+        {
+            Some(self.children.len().min(other.children.len()))
+        } else {
+            None
+        }
+    }
+
+    fn is_blob_v2_descriptor(&self) -> bool {
+        self.metadata.contains_key(BLOB_META_KEY)
+            && self.logical_type == BLOB_V2_DESC_LANCE_FIELD.logical_type
+            && self.children.len() == BLOB_V2_DESC_LANCE_FIELD.children.len()
+            && self
+                .children
+                .iter()
+                .zip(BLOB_V2_DESC_LANCE_FIELD.children.iter())
+                .all(|(child, expected)| {
+                    child.name == expected.name && child.data_type() == expected.data_type()
+                })
     }
 
     // Blob columns intentionally have two schema representations:
@@ -572,6 +620,31 @@ impl Field {
             self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
             self.children = BLOB_DESC_LANCE_FIELD.children.clone();
             self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
+        }
+    }
+
+    /// Convert a blob field to the materialized binary payload view.
+    ///
+    /// The field keeps its name and id but uses `LargeBinary` with no children.
+    /// Blob v2 fields retain their extension marker internally so scan planning
+    /// can recognize the binary view before exposing a plain Arrow binary field.
+    pub fn binary_blob_mut(&mut self) {
+        if !self.is_blob() {
+            return;
+        }
+        let is_blob_v2 = self.is_blob_v2();
+
+        self.logical_type = LogicalType::try_from(&DataType::LargeBinary)
+            .expect("LargeBinary is always a valid logical type");
+        self.children.clear();
+        self.encoding = Some(Encoding::VarBinary);
+        if is_blob_v2 {
+            self.metadata.remove(BLOB_META_KEY);
+            for key in PACKED_KEYS {
+                self.metadata.remove(key);
+            }
+            self.metadata
+                .insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
         }
     }
 
@@ -812,6 +885,13 @@ impl Field {
         }
 
         if self.is_blob() != other.is_blob() {
+            if ignore_types {
+                return Ok(if self.id >= 0 {
+                    self.clone()
+                } else {
+                    other.clone()
+                });
+            }
             return Err(Error::arrow(format!(
                 "Attempt to intersect blob and non-blob field: {}",
                 self.name
@@ -847,7 +927,7 @@ impl Field {
                 .iter()
                 .filter_map(|c| {
                     if let Some(other_child) = other.child(&c.name) {
-                        let intersection = c.intersection(other_child).ok()?;
+                        let intersection = c.do_intersection(other_child, ignore_types).ok()?;
                         Some(intersection)
                     } else {
                         None
@@ -1038,11 +1118,10 @@ impl Field {
 
     // Check if field has metadata `packed` set to true, this check is case insensitive.
     pub fn is_packed_struct(&self) -> bool {
-        const PACKED_KEYS: [&str; 2] = ["packed", "lance-encoding:packed"];
         PACKED_KEYS.iter().any(|key| {
             self.metadata
                 .get(*key)
-                .map(|value| value.eq_ignore_ascii_case("true"))
+                .map(|value| str_is_truthy(value))
                 .unwrap_or(false)
         })
     }
@@ -1149,7 +1228,7 @@ impl TryFrom<&ArrowField> for Field {
                 // Backward compatibility: use 0 for legacy boolean flag
                 metadata
                     .get(LANCE_UNENFORCED_PRIMARY_KEY)
-                    .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
+                    .filter(|s| str_is_truthy(s))
                     .map(|_| 0)
             });
         let unenforced_clustering_key_position = metadata
@@ -1236,6 +1315,101 @@ mod tests {
     use arrow_schema::{Fields, TimeUnit};
     use lance_arrow::BLOB_META_KEY;
     use std::collections::HashMap;
+
+    use crate::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_MINIMAL_FIELDS};
+
+    fn blob_v2_logical_field(children: Fields) -> Field {
+        ArrowField::new("blob", DataType::Struct(children), true)
+            .with_metadata(HashMap::from([(
+                ARROW_EXT_NAME_KEY.to_string(),
+                BLOB_V2_EXT_NAME.to_string(),
+            )]))
+            .try_into()
+            .unwrap()
+    }
+
+    #[test]
+    fn blob_v2_logical_shapes_are_compatible() {
+        let minimal = blob_v2_logical_field(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone());
+        let complete = blob_v2_logical_field(BLOB_V2_LOGICAL_FIELDS.clone());
+        let complete_required_range = blob_v2_logical_field(Fields::from(
+            BLOB_V2_LOGICAL_FIELDS
+                .iter()
+                .enumerate()
+                .map(|(index, field)| Arc::new(field.as_ref().clone().with_nullable(index < 2)))
+                .collect::<Vec<_>>(),
+        ));
+        let options = SchemaCompareOptions::default();
+
+        for complete_shape in [&complete, &complete_required_range] {
+            assert!(minimal.compare_with_options(complete_shape, &options));
+            assert!(complete_shape.compare_with_options(&minimal, &options));
+            assert_eq!(minimal.explain_difference(complete_shape, &options), None);
+            assert_eq!(complete_shape.explain_difference(&minimal, &options), None);
+        }
+
+        assert!(!complete.compare_with_options(&complete_required_range, &options));
+        let ignore_nullability = SchemaCompareOptions {
+            compare_nullability: NullabilityComparison::Ignore,
+            ..Default::default()
+        };
+        assert!(complete.compare_with_options(&complete_required_range, &ignore_nullability));
+
+        let complete_with_child_metadata = blob_v2_logical_field(Fields::from(
+            BLOB_V2_LOGICAL_FIELDS
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let field = if index == 0 {
+                        field.as_ref().clone().with_metadata(HashMap::from([(
+                            "source".to_string(),
+                            "test".to_string(),
+                        )]))
+                    } else {
+                        field.as_ref().clone()
+                    };
+                    Arc::new(field)
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let compare_metadata = SchemaCompareOptions {
+            compare_metadata: true,
+            ..Default::default()
+        };
+        assert!(!complete.compare_with_options(&complete_with_child_metadata, &compare_metadata));
+
+        let nested_minimal: Field = ArrowField::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![ArrowField::from(&minimal)])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        let nested_complete: Field = ArrowField::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![ArrowField::from(&complete)])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        assert!(nested_minimal.compare_with_options(&nested_complete, &options));
+        assert!(nested_complete.compare_with_options(&nested_minimal, &options));
+    }
+
+    #[test]
+    fn malformed_blob_v2_logical_shapes_remain_incompatible() {
+        let minimal = blob_v2_logical_field(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone());
+        let malformed = blob_v2_logical_field(Fields::from(vec![
+            ArrowField::new("data", DataType::LargeBinary, true),
+            ArrowField::new("uri", DataType::LargeUtf8, true),
+        ]));
+        let options = SchemaCompareOptions::default();
+
+        assert!(!minimal.compare_with_options(&malformed, &options));
+        assert!(!malformed.compare_with_options(&minimal, &options));
+        assert!(minimal.explain_difference(&malformed, &options).is_some());
+        assert!(malformed.explain_difference(&minimal, &options).is_some());
+    }
 
     #[test]
     fn arrow_field_to_field_metadata() {
@@ -1847,6 +2021,14 @@ mod tests {
     #[test]
     fn blob_unloaded_mut_selects_layout_from_metadata() {
         let metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let mut binary_field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+            .with_metadata(metadata.clone())
+            .try_into()
+            .unwrap();
+        binary_field.binary_blob_mut();
+        assert!(binary_field.metadata.contains_key(BLOB_META_KEY));
+        assert!(!binary_field.is_blob_v2());
+
         let mut field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
             .with_metadata(metadata)
             .try_into()
@@ -1854,6 +2036,12 @@ mod tests {
         field.unloaded_mut();
         assert_eq!(field.children.len(), 2);
         assert_eq!(field.logical_type, BLOB_DESC_LANCE_FIELD.logical_type);
+        assert!(field.is_blob());
+        assert!(!field.is_blob_v2());
+        field.unloaded_mut();
+        assert_eq!(field.children.len(), 2);
+        assert_eq!(field.logical_type, BLOB_DESC_LANCE_FIELD.logical_type);
+        assert!(!field.is_blob_v2());
 
         let metadata =
             HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]);
@@ -1874,6 +2062,12 @@ mod tests {
         field.unloaded_mut();
         assert_eq!(field.children.len(), 5);
         assert_eq!(field.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+        assert!(!field.metadata.contains_key(ARROW_EXT_NAME_KEY));
+        assert!(field.is_blob_v2());
+        field.unloaded_mut();
+        assert_eq!(field.children.len(), 5);
+        assert_eq!(field.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+        assert!(!field.metadata.contains_key(ARROW_EXT_NAME_KEY));
     }
 
     #[test]
@@ -1943,5 +2137,44 @@ mod tests {
             .project_by_field(&field, OnTypeMismatch::Error)
             .unwrap();
         assert_eq!(unloaded_projected, unloaded);
+    }
+
+    #[test]
+    fn blob_descriptor_projection_preserves_synthetic_children() {
+        let metadata =
+            HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]);
+        let mut blob: Field = ArrowField::new(
+            "blob",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("data", DataType::LargeBinary, true),
+                    ArrowField::new("uri", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        )
+        .with_metadata(metadata)
+        .try_into()
+        .unwrap();
+        let mut next_id = 0;
+        blob.set_id(-1, &mut next_id);
+
+        let schema = Arc::new(crate::datatypes::Schema {
+            fields: vec![blob],
+            metadata: HashMap::new(),
+        });
+        let descriptor_schema = Projection::full(schema)
+            .with_blob_handling(crate::datatypes::BlobHandling::BlobsDescriptions)
+            .to_bare_schema();
+        assert!(
+            descriptor_schema.fields[0]
+                .children
+                .iter()
+                .all(|child| child.id == -1)
+        );
+
+        let projected = Projection::full(Arc::new(descriptor_schema)).to_bare_schema();
+        assert_eq!(projected.fields[0].children.len(), 5);
     }
 }

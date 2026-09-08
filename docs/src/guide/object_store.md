@@ -30,16 +30,65 @@ These options apply to all object stores.
 | Key                          | Description                                                                                                                                                                                                                                                                                             |
 |------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `allow_http`                 | Allow non-TLS, i.e. non-HTTPS connections. Default, `False`.                                                                                                                                                                                                                                            |
-| `download_retry_count`       | Number of times to retry a download. Default, `3`. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of `request_timeout`.                                                                                                    |
+| `download_retry_count`       | Number of times to retry a download. Default, `3`. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of `timeout`.                                                                                                            |
 | `allow_invalid_certificates` | Skip certificate validation on https connections. Default, `False`. Warning: This is insecure and should only be used for testing.                                                                                                                                                                      |
 | `connect_timeout`            | Timeout for only the connect phase of a Client. Default, `5s`.                                                                                                                                                                                                                                          |
-| `request_timeout`            | Timeout for the entire request, from connection until the response body has finished. Default, `30s`.                                                                                                                                                                                                   |
+| `timeout`                    | Timeout for the entire request, from connection until the response body has finished. Default, `30s`. This applies to each individual request, so on a large write it must cover one complete multipart part upload; raise it alongside `LANCE_INITIAL_UPLOAD_SIZE`.                                    |
 | `user_agent`                 | User agent string to use in requests.                                                                                                                                                                                                                                                                   |
 | `proxy_url`                  | URL of a proxy server to use for requests. Default, `None`.                                                                                                                                                                                                                                             |
 | `proxy_ca_certificate`       | PEM-formatted CA certificate for proxy connections                                                                                                                                                                                                                                                      |
 | `proxy_excludes`             | List of hosts that bypass proxy. This is a comma separated list of domains and IP masks. Any subdomain of the provided domain will be bypassed. For example, `example.com, 192.168.1.0/24` would bypass `https://api.example.com`, `https://www.example.com`, and any IP in the range `192.168.1.0/24`. |
 | `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
+
+### Bulk copy strategy
+
+Lance streams bulk index-file movement and dataset deep-clone files through
+read and write APIs by default. This avoids requiring a provider-native copy
+operation and works across different object stores.
+
+Set `LANCE_IO_SERVER_SIDE_COPY_ENABLED` to a truthy value (`1`, `true`, `on`,
+`yes`, or `y`, case-insensitive) to opt cloud copies whose source and destination
+share the same object-store client into the provider-native server-side copy
+operation. Cross-client, cross-store, and local copies do not use this setting.
+Native copy can reduce client bandwidth and transfer cost, but it requires copy
+support from the object-store integration and is subject to the provider
+request's timeout and retry behavior.
+
+Deep clone bounds non-local file movement to four concurrent files by default.
+Set `LANCE_DEEP_CLONE_STREAM_CONCURRENCY` to a positive integer to override this
+operation-specific limit. The bound also applies when server-side copy is
+enabled because S3 and GCS copies above the provider's single-copy size limit
+fall back to streaming through Lance.
+
+## Per-Base Configuration
+
+A dataset can register additional base paths that store part of its data, and each
+base may live in a different bucket, account, or storage provider. A storage option
+key of the form `base_<id>.<key>` applies `<key>` only to the base path with that
+manifest id. Every base inherits the unscoped options; base-scoped entries add to or
+override them for that base only.
+
+```python
+import lance
+ds = lance.dataset(
+    "az://account-a/path",
+    storage_options={
+        # Shared defaults, used by the primary dataset and inherited by bases
+        "account_name": "account-a",
+        "account_key": "key-a",
+        # Overrides for the base path with id 1
+        "base_1.account_name": "account-b",
+        "base_1.account_key": "key-b",
+    },
+)
+```
+
+Base ids are assigned when bases are registered (`initial_bases` ids are assigned
+sequentially starting at 1, in order) and can be inspected through the manifest base
+paths. Keys that do not match `base_<id>.<key>` exactly (e.g. `base_url`) are treated
+as regular storage options. Exact per-base parameter maps (`base_store_params`,
+keyed by base path URI) take precedence over base-scoped keys for that base.
 
 ## S3 Configuration
 
@@ -80,6 +129,38 @@ The following keys can be used as both environment variables or keys in the
 | `aws_server_side_encryption`                                        | The server-side encryption algorithm to use. Must be one of `"AES256"`, `"aws:kms"`, or `"aws:kms:dsse"`. Default, `None`.                       |
 | `aws_sse_kms_key_id`                                                | The KMS key ID to use for server-side encryption. If set, `aws_server_side_encryption` must be `"aws:kms"` or `"aws:kms:dsse"`.                  |
 | `aws_sse_bucket_key_enabled`                                        | Whether to use bucket keys for server-side encryption.                                                                                           |
+
+### Credential provider selection
+
+By default, Lance uses the standard AWS credential provider chain (environment
+variables, shared config file, web identity tokens, ECS, EC2 instance metadata).
+
+The `aws_provider_scheme` storage option pins a dataset to a specific credential
+provider, which is useful when two datasets in the same process need different
+AWS auth (for example, one bucket using IRSA and another using ECS container
+credentials).
+
+| Value | Behavior |
+|-------|----------|
+| `token` | Use static access-key credentials. Returns an error if `aws_access_key_id` and `aws_secret_access_key` are not set. |
+| `ecs` | Use the ECS/Pod Identity container credential endpoint. Reads `AWS_CONTAINER_CREDENTIALS_FULL_URI` or `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` from the environment. |
+| `irsa` | Use IRSA (IAM Roles for Service Accounts) web identity token credentials. Reads `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN` from the environment. |
+
+```python
+import lance
+
+# Bucket A — use IRSA (web identity token from the environment)
+ds_a = lance.dataset(
+    "s3://bucket-a/path",
+    storage_options={"aws_provider_scheme": "irsa"},
+)
+
+# Bucket B — use ECS container credentials
+ds_b = lance.dataset(
+    "s3://bucket-b/path",
+    storage_options={"aws_provider_scheme": "ecs"},
+)
+```
 
 ### S3-compatible stores
 
@@ -297,6 +378,15 @@ parameter; explicit `storage_options` override environment variables:
 | `cos_secret_key` | Secret key used for COS authentication. Optional if credentials are provided by environment. |
 | `cos_enable_versioning` | Whether to enable object versioning on the bucket. Optional. |
 
+!!! warning
+
+    Tencent COS does not reliably enforce put-if-not-exists on buckets that have
+    ever had versioning enabled, even if versioning is now suspended. To prevent
+    silent manifest overwrites, Lance requires a custom distributed commit lock
+    for COS writes. Pass the same `commit_lock` implementation to every Python
+    writer, or provide a custom `CommitHandler` in Rust. Reads do not require a
+    commit lock.
+
 !!! note
 
     The OpenDAL `CosConfig` currently exposes a limited set of options. Additional
@@ -310,6 +400,31 @@ filesystem. Lance accesses GooseFS through its Master gRPC service. The URL form
 is `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
 (default port: `9200`, may be omitted, e.g. `goosefs://10.0.0.1/path`) and
 `/path` is the filesystem path within GooseFS.
+
+Manifest commits on `goosefs://` use `ConditionalPutCommitHandler`
+(`PutMode::Create` / if-not-exists), backed by GooseFS master's atomic
+no-replace rename so concurrent writers cannot clobber each other's
+versioned manifests.
+
+!!! warning "Mixed-version writers are NOT safe"
+
+    The `if-not-exists` guarantee only holds when **every** writer for a
+    dataset routes through this new handler. A writer running an older
+    Lance release still selects `UnsafeCommitHandler` for `goosefs://`
+    and writes the version path unconditionally, which can overwrite a
+    manifest that an upgraded writer has already won. Safe concurrent
+    commits therefore require:
+
+    - all writers for the dataset run a Lance release that includes this
+      routing change, **or**
+    - writers share an external coordination boundary (e.g. a single-writer
+      queue, table-level lock, or a gateway that serializes commits) that
+      prevents the old code path from racing the new one.
+
+    When upgrading in place, quiesce all writers (drain jobs, scale
+    clients to zero, or route traffic through a writer coordinator) before
+    rolling out the new Lance version, then bring writers back on the new
+    version together.
 
 !!! note "About the dataset path"
 
@@ -429,17 +544,19 @@ The Master address can be resolved from (in priority order):
 2. The `GOOSEFS_MASTER_ADDR` environment variable.
 3. The host and port from the URL authority.
 
-The following keys can be used as both environment variables or keys in the
-`storage_options` parameter:
+`storage_options` keys **must be lowercase**. Uppercase or mixed-case spellings
+such as `GOOSEFS_MASTER_ADDR` are rejected with an explicit error — they are
+not ignored, and they are not treated as the matching environment variable.
+Environment variables keep the `GOOSEFS_*` form.
 
-| Key | Description |
-|-----|-------------|
-| `goosefs_master_addr` / `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL. |
-| `goosefs_write_type` / `GOOSEFS_WRITE_TYPE` | Write type, e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`. Optional. |
-| `goosefs_block_size` / `GOOSEFS_BLOCK_SIZE` | GooseFS block size in bytes (this is the GooseFS-side block size, not Lance's I/O block size). Optional. |
-| `goosefs_chunk_size` / `GOOSEFS_CHUNK_SIZE` | Chunk size in bytes used when reading or writing files. Optional. |
-| `goosefs_auth_type` / `GOOSEFS_AUTH_TYPE` | Authentication type. Either `nosasl` or `simple` (case-insensitive; the value is passed through to OpenDAL). Optional. |
-| `goosefs_auth_username` / `GOOSEFS_AUTH_USERNAME` | Username used in `simple` authentication mode. Optional. |
+| storage_options key | env var | Description |
+|---------------------|---------|-------------|
+| `goosefs_master_addr` | `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL. |
+| `goosefs_write_type` | `GOOSEFS_WRITE_TYPE` | Write type, e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`. Optional. |
+| `goosefs_block_size` | `GOOSEFS_BLOCK_SIZE` | GooseFS block size (this is the GooseFS-side block size, not Lance's I/O block size). Accepts a raw byte count or GooseFS suffixes such as `64MB` (binary units: `1KB = 1024`). Optional. |
+| `goosefs_chunk_size` | `GOOSEFS_CHUNK_SIZE` | Chunk size used when reading or writing files. Accepts a raw byte count or GooseFS suffixes such as `4MB` (binary units: `1KB = 1024`). Optional. |
+| `goosefs_auth_type` | `GOOSEFS_AUTH_TYPE` | Authentication type. Either `nosasl` or `simple` (case-insensitive; the value is passed through to OpenDAL). Optional. |
+| `goosefs_auth_username` | `GOOSEFS_AUTH_USERNAME` | Username used in `simple` authentication mode. Optional. |
 
 !!! note "Running the GooseFS integration tests"
 

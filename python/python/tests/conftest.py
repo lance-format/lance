@@ -102,8 +102,41 @@ def pytest_configure(config):
         "compat: mark tests that run upgrade/downgrade compatibility checks",
     )
 
+    workerinput = getattr(config, "workerinput", None)
+    if workerinput is not None:
+        from compat.compat_decorator import use_version_snapshot
 
+        use_version_snapshot(workerinput["lance_compat_versions"])
+
+
+def pytest_configure_node(node):
+    """Resolve the compat version list once, on the xdist controller.
+
+    The compat tests are parametrized over the pylance releases published to
+    PyPI and fury.io, and collecting `python/tests` imports them whether or not
+    --run-compat was passed. Left to itself every worker queries for that list
+    while collecting, so a request that times out or a release that lands
+    mid-run gives one worker a different parameter set, and xdist aborts the
+    whole run with "Different tests were collected".
+    """
+    from compat.compat_decorator import version_snapshot
+
+    node.workerinput["lance_compat_versions"] = version_snapshot()
+
+
+# tryfirst because xdist reads xdist_group off each item to build its scheduling
+# groups before ordinary pytest_collection_modifyitems hooks run; a mark added
+# later is silently ignored rather than rejected.
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
+    # The lindera fixture unzips a dictionary into the checked-out models tree and
+    # removes it again on teardown, and the tokenizer configs name that path
+    # relative to the repo, so it cannot be relocated per worker. Pinning these
+    # tests to one xdist worker keeps a teardown in one worker from deleting the
+    # dictionary another is still reading. Without -n it changes nothing.
+    for item in items:
+        if "lindera_ipadic" in getattr(item, "fixturenames", ()):
+            item.add_marker(pytest.mark.xdist_group("lindera"))
     if not config.getoption("--run-integration"):
         disable_items_with_mark(items, "integration", "--run-integration not specified")
     if not config.getoption("--run-slow"):

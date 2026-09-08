@@ -1,59 +1,110 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+//! MemWAL index data structures and metadata helpers.
+//!
+//! The MemWAL Index stores:
+//! - Configuration (sharding_specs, maintained_indexes)
+//! - SSTable compaction progress
+//! - Shard state snapshots (eventually consistent)
+//!
+//! Writers no longer update the index on every write. Instead, they update
+//! shard manifests directly. This module provides functions to:
+//! - Load the MemWAL index
+//! - Update compacted SSTables (called during merge-insert commits)
 
-use lance_core::Error;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::format::pb;
+use crate::format::{IndexMetadata, pb};
 
 pub const MEM_WAL_INDEX_NAME: &str = "__lance_mem_wal";
 
 /// Type alias for shard identifier (UUID v4).
 pub type ShardId = Uuid;
 
-/// A flushed MemTable generation and its storage location.
+/// An SSTable: the immutable result of flushing a MemTable, stored as a Lance dataset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct FlushedGeneration {
+pub struct SsTable {
     pub generation: u64,
     pub path: String,
+    /// Payload size of the rows, as the writer's MemTable accounted for them.
+    ///
+    /// An estimate of the payload, not a bound on what reading the SSTable
+    /// costs: it excludes the per-array structure a reader materializes, so a
+    /// consumer budgeting memory from it must add its own headroom.
+    ///
+    /// `None` on an SSTable written before these fields existed, which a reader
+    /// must carry as unmeasured rather than as zero. The same applies to the two
+    /// below.
+    pub in_memory_bytes: Option<u64>,
+    /// Rows held, counting the older duplicates of a primary key that the
+    /// generation's deletion vector masks.
+    pub physical_rows: Option<u64>,
+    /// Total payload size of the primary-key columns over every row in
+    /// [`Self::physical_rows`] -- not a per-row size, which varies for a
+    /// variable-length key. Carries the same estimate caveat as
+    /// [`Self::in_memory_bytes`], and is also `None` on a table with no primary
+    /// key.
+    pub primary_key_bytes: Option<u64>,
 }
 
-impl From<&FlushedGeneration> for pb::FlushedGeneration {
-    fn from(fg: &FlushedGeneration) -> Self {
+impl SsTable {
+    /// An SSTable whose contents were not measured at flush.
+    pub fn unmeasured(generation: u64, path: String) -> Self {
         Self {
-            generation: fg.generation,
-            path: fg.path.clone(),
+            generation,
+            path,
+            in_memory_bytes: None,
+            physical_rows: None,
+            primary_key_bytes: None,
         }
     }
 }
 
-impl From<pb::FlushedGeneration> for FlushedGeneration {
-    fn from(fg: pb::FlushedGeneration) -> Self {
+impl From<&SsTable> for pb::SsTable {
+    fn from(sstable: &SsTable) -> Self {
         Self {
-            generation: fg.generation,
-            path: fg.path,
+            generation: sstable.generation,
+            path: sstable.path.clone(),
+            in_memory_bytes: sstable.in_memory_bytes,
+            physical_rows: sstable.physical_rows,
+            primary_key_bytes: sstable.primary_key_bytes,
         }
     }
 }
 
-/// A shard's merged generation, used in MemWalIndexDetails.
+impl From<pb::SsTable> for SsTable {
+    fn from(sstable: pb::SsTable) -> Self {
+        Self {
+            generation: sstable.generation,
+            path: sstable.path,
+            in_memory_bytes: sstable.in_memory_bytes,
+            physical_rows: sstable.physical_rows,
+            primary_key_bytes: sstable.primary_key_bytes,
+        }
+    }
+}
+
+/// A pointer to the latest SSTable compacted for a shard.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct MergedGeneration {
+pub struct CompactedSsTable {
     pub shard_id: Uuid,
     pub generation: u64,
 }
 
-impl DeepSizeOf for MergedGeneration {
+impl DeepSizeOf for CompactedSsTable {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         0 // UUID is 16 bytes fixed size, no heap allocations
     }
 }
 
-impl MergedGeneration {
+impl CompactedSsTable {
     pub fn new(shard_id: Uuid, generation: u64) -> Self {
         Self {
             shard_id,
@@ -62,41 +113,41 @@ impl MergedGeneration {
     }
 }
 
-impl From<&MergedGeneration> for pb::MergedGeneration {
-    fn from(mg: &MergedGeneration) -> Self {
+impl From<&CompactedSsTable> for pb::CompactedSsTable {
+    fn from(sstable: &CompactedSsTable) -> Self {
         Self {
-            shard_id: Some((&mg.shard_id).into()),
-            generation: mg.generation,
+            shard_id: Some((&sstable.shard_id).into()),
+            generation: sstable.generation,
         }
     }
 }
 
-impl TryFrom<pb::MergedGeneration> for MergedGeneration {
+impl TryFrom<pb::CompactedSsTable> for CompactedSsTable {
     type Error = Error;
 
-    fn try_from(mg: pb::MergedGeneration) -> lance_core::Result<Self> {
-        let shard_id = mg
+    fn try_from(sstable: pb::CompactedSsTable) -> lance_core::Result<Self> {
+        let shard_id = sstable
             .shard_id
             .as_ref()
             .map(Uuid::try_from)
-            .ok_or_else(|| Error::invalid_input("Missing shard_id in MergedGeneration"))??;
+            .ok_or_else(|| Error::invalid_input("Missing shard_id in CompactedSsTable"))??;
         Ok(Self {
             shard_id,
-            generation: mg.generation,
+            generation: sstable.generation,
         })
     }
 }
 
-/// Tracks which merged generation a base table index has been rebuilt to cover.
-/// Used to determine whether to read from flushed MemTable indexes or base table.
+/// Tracks which compacted SSTable generation a base table index covers.
+/// Used to determine whether to read from SSTable indexes or base table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct IndexCatchupProgress {
     pub index_name: String,
-    pub caught_up_generations: Vec<MergedGeneration>,
+    pub caught_up_generations: Vec<CompactedSsTable>,
 }
 
 impl IndexCatchupProgress {
-    pub fn new(index_name: String, caught_up_generations: Vec<MergedGeneration>) -> Self {
+    pub fn new(index_name: String, caught_up_generations: Vec<CompactedSsTable>) -> Self {
         Self {
             index_name,
             caught_up_generations,
@@ -108,8 +159,8 @@ impl IndexCatchupProgress {
     pub fn caught_up_generation_for_shard(&self, shard_id: &Uuid) -> Option<u64> {
         self.caught_up_generations
             .iter()
-            .find(|mg| &mg.shard_id == shard_id)
-            .map(|mg| mg.generation)
+            .find(|sstable| &sstable.shard_id == shard_id)
+            .map(|sstable| sstable.generation)
     }
 }
 
@@ -120,7 +171,7 @@ impl From<&IndexCatchupProgress> for pb::IndexCatchupProgress {
             caught_up_generations: icp
                 .caught_up_generations
                 .iter()
-                .map(|mg| mg.into())
+                .map(|sstable| sstable.into())
                 .collect(),
         }
     }
@@ -135,7 +186,7 @@ impl TryFrom<pb::IndexCatchupProgress> for IndexCatchupProgress {
             caught_up_generations: icp
                 .caught_up_generations
                 .into_iter()
-                .map(MergedGeneration::try_from)
+                .map(CompactedSsTable::try_from)
                 .collect::<lance_core::Result<_>>()?,
         })
     }
@@ -198,16 +249,27 @@ pub struct ShardManifest {
     /// 1-based.
     pub wal_entry_position_last_seen: u64,
     pub current_generation: u64,
-    pub flushed_generations: Vec<FlushedGeneration>,
+    pub sstables: Vec<SsTable>,
     /// Lifecycle status (drop-table 2PC). Defaults to `Active`; preserved
     /// across claims via `..base` so only fresh constructions set it.
     pub status: ShardStatus,
 }
 
+impl ShardManifest {
+    /// The version a manifest built on this one must carry.
+    ///
+    /// Manifest versions are CAS-allocated and must stay gap-free: a reader
+    /// scans forward and stops at the first version it cannot find, so a gap
+    /// hides everything past it.
+    pub fn next_version(&self) -> u64 {
+        self.version + 1
+    }
+}
+
 impl DeepSizeOf for ShardManifest {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.shard_field_values.deep_size_of_children(context)
-            + self.flushed_generations.deep_size_of_children(context)
+            + self.sstables.deep_size_of_children(context)
     }
 }
 
@@ -229,7 +291,7 @@ impl From<&ShardManifest> for pb::ShardManifest {
             replay_after_wal_entry_position: rm.replay_after_wal_entry_position,
             wal_entry_position_last_seen: rm.wal_entry_position_last_seen,
             current_generation: rm.current_generation,
-            flushed_generations: rm.flushed_generations.iter().map(|fg| fg.into()).collect(),
+            sstables: rm.sstables.iter().map(|sstable| sstable.into()).collect(),
             status: rm.status.to_i32(),
         }
     }
@@ -258,11 +320,7 @@ impl TryFrom<pb::ShardManifest> for ShardManifest {
             replay_after_wal_entry_position: rm.replay_after_wal_entry_position,
             wal_entry_position_last_seen: rm.wal_entry_position_last_seen,
             current_generation: rm.current_generation,
-            flushed_generations: rm
-                .flushed_generations
-                .into_iter()
-                .map(FlushedGeneration::from)
-                .collect(),
+            sstables: rm.sstables.into_iter().map(SsTable::from).collect(),
             status: ShardStatus::from_i32(rm.status),
         })
     }
@@ -338,7 +396,7 @@ pub struct MemWalIndexDetails {
     pub inline_snapshots: Option<Vec<u8>>,
     pub sharding_specs: Vec<ShardingSpec>,
     pub maintained_indexes: Vec<String>,
-    pub merged_generations: Vec<MergedGeneration>,
+    pub compacted_sstables: Vec<CompactedSsTable>,
     pub index_catchup: Vec<IndexCatchupProgress>,
     /// Default `ShardWriter` configuration values for this MemWAL index.
     ///
@@ -357,10 +415,10 @@ impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
             inline_snapshots: details.inline_snapshots.clone(),
             sharding_specs: details.sharding_specs.iter().map(|rs| rs.into()).collect(),
             maintained_indexes: details.maintained_indexes.clone(),
-            merged_generations: details
-                .merged_generations
+            compacted_sstables: details
+                .compacted_sstables
                 .iter()
-                .map(|mg| mg.into())
+                .map(|sstable| sstable.into())
                 .collect(),
             index_catchup: details.index_catchup.iter().map(|icp| icp.into()).collect(),
             writer_config_defaults: details.writer_config_defaults.clone(),
@@ -382,10 +440,10 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
                 .map(ShardingSpec::from)
                 .collect(),
             maintained_indexes: details.maintained_indexes,
-            merged_generations: details
-                .merged_generations
+            compacted_sstables: details
+                .compacted_sstables
                 .into_iter()
-                .map(MergedGeneration::try_from)
+                .map(CompactedSsTable::try_from)
                 .collect::<lance_core::Result<_>>()?,
             index_catchup: details
                 .index_catchup
@@ -408,12 +466,12 @@ impl MemWalIndex {
         Self { details }
     }
 
-    pub fn merged_generation_for_shard(&self, shard_id: &Uuid) -> Option<u64> {
+    pub fn compacted_generation_for_shard(&self, shard_id: &Uuid) -> Option<u64> {
         self.details
-            .merged_generations
+            .compacted_sstables
             .iter()
-            .find(|mg| &mg.shard_id == shard_id)
-            .map(|mg| mg.generation)
+            .find(|sstable| &sstable.shard_id == shard_id)
+            .map(|sstable| sstable.generation)
     }
 
     /// Get the caught up generation for a specific index and shard.
@@ -425,14 +483,175 @@ impl MemWalIndex {
             .find(|icp| icp.index_name == index_name)
             .and_then(|icp| icp.caught_up_generation_for_shard(shard_id))
     }
+}
 
-    /// Check if an index is fully caught up for a shard.
-    /// Returns true if the index covers all merged data for the shard.
-    pub fn is_index_caught_up(&self, index_name: &str, shard_id: &Uuid) -> bool {
-        let merged_gen = self.merged_generation_for_shard(shard_id).unwrap_or(0);
-        let caught_up_gen = self.index_caught_up_generation(index_name, shard_id);
+// Reading and updating the `IndexMetadata` entry that carries the details above.
 
-        // If not tracked in index_catchup, assumed fully caught up
-        caught_up_gen.is_none_or(|generation| generation >= merged_gen)
+/// Load MemWalIndexDetails from an IndexMetadata.
+pub fn load_mem_wal_index_details(index: IndexMetadata) -> Result<MemWalIndexDetails> {
+    if let Some(details_any) = index.index_details.as_ref() {
+        if !details_any.type_url.ends_with("MemWalIndexDetails") {
+            return Err(Error::index(format!(
+                "Index details is not for the MemWAL index, but {}",
+                details_any.type_url
+            )));
+        }
+
+        Ok(MemWalIndexDetails::try_from(
+            details_any.to_msg::<pb::MemWalIndexDetails>()?,
+        )?)
+    } else {
+        Err(Error::index("Index details not found for the MemWAL index"))
+    }
+}
+
+/// Open the MemWAL index from its metadata.
+pub fn open_mem_wal_index(index: IndexMetadata) -> Result<Arc<MemWalIndex>> {
+    Ok(Arc::new(MemWalIndex::new(load_mem_wal_index_details(
+        index,
+    )?)))
+}
+
+/// Update `compacted_sstables` in the MemWAL index.
+///
+/// Called from the final data-changing merge-insert commit for a compaction
+/// target, so the rows and the generation that describes them publish
+/// together.
+///
+/// A proposed generation must be **strictly greater** than the one the latest
+/// state records for that shard, and a stale one fails the whole transaction.
+/// Accepting it while keeping the larger marker would publish that worker's row
+/// mutations under a generation it did not produce, and anything reading only
+/// the marker could then stop serving SSTables whose rows were never inserted.
+///
+/// Every other `MemWalIndexDetails` field is carried through untouched.
+pub fn update_mem_wal_index_compacted_sstables(
+    indices: &mut [IndexMetadata],
+    dataset_version: u64,
+    new_compacted_sstables: Vec<CompactedSsTable>,
+) -> Result<()> {
+    if new_compacted_sstables.is_empty() {
+        return Ok(());
+    }
+
+    let mut seen_shards = HashSet::with_capacity(new_compacted_sstables.len());
+    for sstable in &new_compacted_sstables {
+        if !seen_shards.insert(sstable.shard_id) {
+            return Err(Error::invalid_input(format!(
+                "Duplicate shard {} in one SSTable compaction update; each shard \
+                 may advance at most once per transaction",
+                sstable.shard_id
+            )));
+        }
+    }
+
+    // Default details would describe a table with no MemWAL shards at all, so
+    // the recorded generation would name a shard nothing can corroborate.
+    // Refuse instead of inventing metadata.
+    let pos = indices
+        .iter()
+        .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Cannot record SSTable compaction progress: the {} system index \
+                 does not exist on this table",
+                MEM_WAL_INDEX_NAME
+            ))
+        })?;
+
+    // Validated against a copy so a rejected update leaves `indices` exactly as
+    // the caller passed it.
+    let mut details = load_mem_wal_index_details(indices[pos].clone())?;
+
+    for new_sstable in new_compacted_sstables {
+        match details
+            .compacted_sstables
+            .iter_mut()
+            .find(|sstable| sstable.shard_id == new_sstable.shard_id)
+        {
+            Some(existing) if new_sstable.generation <= existing.generation => {
+                return Err(Error::invalid_input(format!(
+                    "Stale SSTable compaction for shard {}: proposed generation {} \
+                     is not greater than the recorded generation {}",
+                    new_sstable.shard_id, new_sstable.generation, existing.generation
+                )));
+            }
+            Some(existing) => existing.generation = new_sstable.generation,
+            None => details.compacted_sstables.push(new_sstable),
+        }
+    }
+
+    // Replaced in place so the index list keeps its order.
+    indices[pos] = new_mem_wal_index_meta(dataset_version, details)?;
+    Ok(())
+}
+
+/// Create a new MemWAL index metadata entry.
+///
+/// A fresh UUID is minted on every rewrite, including metadata-only updates.
+/// The decoded-details cache is keyed on that UUID, so the change of identity
+/// is what invalidates it; holding the UUID steady would leave a warmed reader
+/// answering with the state from before the update.
+pub fn new_mem_wal_index_meta(
+    dataset_version: u64,
+    details: MemWalIndexDetails,
+) -> Result<IndexMetadata> {
+    Ok(IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: MEM_WAL_INDEX_NAME.to_string(),
+        fields: vec![],
+        covering_fields: vec![],
+        dataset_version,
+        fragment_bitmap: None,
+        index_details: Some(Arc::new(prost_types::Any::from_msg(
+            &pb::MemWalIndexDetails::from(&details),
+        )?)),
+        index_version: 0,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        // Memory WAL index is inline (no files)
+        files: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An SSTable written before the size fields existed decodes as
+    /// unmeasured, not as zero. A reader that saw zero would treat a full
+    /// generation as costing nothing.
+    #[test]
+    fn an_sstable_without_the_size_fields_decodes_as_unmeasured() {
+        let legacy = pb::SsTable {
+            generation: 7,
+            path: "aaa_gen_7".to_string(),
+            in_memory_bytes: None,
+            physical_rows: None,
+            primary_key_bytes: None,
+        };
+        let decoded = SsTable::from(legacy);
+        assert_eq!(decoded.generation, 7);
+        assert_eq!(decoded.in_memory_bytes, None);
+        assert_eq!(decoded.physical_rows, None);
+        assert_eq!(decoded.primary_key_bytes, None);
+    }
+
+    /// All three survive the round trip, so a reader sees what the flush
+    /// measured rather than a default.
+    #[test]
+    fn the_recorded_size_survives_the_round_trip() {
+        let recorded = SsTable {
+            generation: 7,
+            path: "aaa_gen_7".to_string(),
+            in_memory_bytes: Some(4_096),
+            physical_rows: Some(10),
+            primary_key_bytes: Some(80),
+        };
+        let encoded = pb::SsTable::from(&recorded);
+        assert_eq!(encoded.in_memory_bytes, Some(4_096));
+        assert_eq!(encoded.physical_rows, Some(10));
+        assert_eq!(encoded.primary_key_bytes, Some(80));
+        assert_eq!(SsTable::from(encoded), recorded);
     }
 }

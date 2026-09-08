@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow::compute::cast;
+use arrow::{
+    array::{ArrayData, make_array},
+    buffer::Buffer,
+    compute::cast,
+};
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, cast::AsArray};
 use arrow_schema::{DataType, Field};
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{BufferExt, DataTypeExt, FixedSizeListArrayExt};
 use lance_core::{Error, Result};
-use lance_io::encodings::plain::bytes_to_array;
 use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::dot_f16::amx_fp16_available;
 use prost::bytes;
 use std::sync::LazyLock;
 use std::{ops::Range, sync::Arc};
@@ -40,6 +44,49 @@ static USE_HNSW_SPEEDUP_INDEXING: LazyLock<SimpleIndexStatus> = LazyLock::new(||
         SimpleIndexStatus::Auto
     }
 });
+
+/// Whether partition assignment is better served by the exact flat path than by
+/// an approximate lookup through this index.
+///
+/// The index turns one `M x N` problem -- every vector against every centroid --
+/// into `M` independent top-1 graph searches. Each search walks its own path, so
+/// no two vectors share a candidate set and the AMX-FP16 kernel behind them can
+/// only ever score one query against a handful of neighbors: 32 MAC/cycle, one
+/// of the tile's 16 output columns. Keeping the problem in its matrix shape lets
+/// [`crate::vector::kmeans::compute_partitions`] reach the AMX-FP16 GEMM, which
+/// fills all four accumulator tiles at 512 MAC/cycle.
+///
+/// Measured on 100M x 768 fp16 (dot, node-local, m=20, ef_construction=150), the
+/// flat path won on both build time and recall at every `k` tried:
+///
+/// | k     | flat        | indexed     |
+/// |-------|-------------|-------------|
+/// | 10000 | 1965s / .980 | 2011s / .976 |
+/// | 20000 | 2494s / .964 | 2588s / .832 |
+/// | 40000 | 3730s / .970 | 3976s / .940 |
+///
+/// The recall gap is the larger effect: the graph lookup runs at `ef = 15`, so
+/// some vectors land in a partition that is not their nearest and no `nprobes`
+/// setting recovers them. Flat assignment is exact.
+///
+/// The conditions below must stay in lockstep with the AMX gate in
+/// `compute_membership_and_dist`; without the GEMM the flat path is ~2.7x slower
+/// than the index (5361s vs 2011s at k=10000), so a mismatch here is expensive.
+/// That includes the `LANCE_DISABLE_AMX` kill switch, which both consult through
+/// [`amx_fp16_available`]: an operator turning AMX off has to move this decision
+/// too, or the build would take the exact-assignment path with no GEMM under it.
+fn prefers_flat_amx_assignment(
+    centroid_type: &DataType,
+    num_centroids: usize,
+    dimension: usize,
+    distance_type: DistanceType,
+) -> bool {
+    centroid_type == &DataType::Float16
+        && distance_type == DistanceType::Dot
+        && dimension >= 32
+        && num_centroids >= 32
+        && amx_fp16_available()
+}
 
 #[derive(Debug)]
 pub struct SimpleIndex {
@@ -74,6 +121,7 @@ impl SimpleIndex {
     //  - `num_centroids * dimension >= 1_000_000`
     //      we benchmarked that it's 2x faster in the case of 1024 centroids and 1024 dimensions,
     //      so set the threshold to 1_000_000.
+    //  - the exact flat assignment is not already faster, see `prefers_flat_amx_assignment`
     pub fn may_train_index(
         centroids: ArrayRef,
         dimension: usize,
@@ -82,6 +130,14 @@ impl SimpleIndex {
         match *USE_HNSW_SPEEDUP_INDEXING {
             SimpleIndexStatus::Auto => {
                 if centroids.len() < 1_000_000 {
+                    return Ok(None);
+                }
+                if prefers_flat_amx_assignment(
+                    centroids.data_type(),
+                    centroids.len() / dimension,
+                    dimension,
+                    distance_type,
+                ) {
                     return Ok(None);
                 }
             }
@@ -109,6 +165,7 @@ impl SimpleIndex {
             lower_bound: None,
             upper_bound: None,
             dist_q_c: 0.0,
+            use_acorn: false,
         };
         let res = match &self.store {
             SimpleStore::Float(store) => self.index.search_basic(query, 1, &params, None, store)?,
@@ -212,23 +269,40 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
         }
         let dim = tensor.shape[1] as usize;
         let num_rows = tensor.shape[0] as usize;
-
-        let data = bytes::Bytes::from(tensor.data.clone());
-        let flat_array = bytes_to_array(
-            &DataType::from(pb::tensor::DataType::try_from(tensor.data_type).unwrap()),
-            data,
-            dim * num_rows,
-            0,
-        )?;
-
-        if flat_array.len() != dim * num_rows {
+        let num_values = dim.checked_mul(num_rows).ok_or_else(|| {
+            Error::index(format!(
+                "Tensor shape {:?} exceeds the supported size",
+                tensor.shape
+            ))
+        })?;
+        let data_type = DataType::from(pb::tensor::DataType::try_from(tensor.data_type).unwrap());
+        let expected_data_len =
+            num_values
+                .checked_mul(data_type.byte_width())
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "Tensor shape {:?} exceeds the supported byte length",
+                        tensor.shape
+                    ))
+                })?;
+        if tensor.data.len() != expected_data_len {
             return Err(Error::index(format!(
-                "Tensor shape {:?} does not match to data len: {}",
+                "Tensor shape {:?} with data type {data_type} requires {expected_data_len} bytes, got {}",
                 tensor.shape,
-                flat_array.len()
+                tensor.data.len()
             )));
         }
 
+        let buffer = Buffer::from_bytes_bytes(
+            bytes::Bytes::from(tensor.data.clone()),
+            data_type.byte_width() as u64,
+        );
+        let data = ArrayData::builder(data_type)
+            .len(num_values)
+            .null_count(0)
+            .add_buffer(buffer)
+            .build()?;
+        let flat_array = make_array(data);
         let field = Field::new("item", flat_array.data_type().clone(), true);
         Ok(Self::try_new(
             Arc::new(field),
@@ -277,6 +351,7 @@ mod tests {
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::identities::Zero;
+    use rayon::ThreadPoolBuilder;
 
     use arrow::compute::cast;
     use rstest::rstest;
@@ -307,7 +382,8 @@ mod tests {
         (0..100).flat_map(|i| std::iter::repeat_n(i as f32, 16)).collect::<Vec<_>>(),
     )) as ArrayRef, 42.0f32)]
     fn test_simple_index_nearest_centroid(#[case] centroids: ArrayRef, #[case] query_val: f32) {
-        let index = build_index(centroids, 16);
+        let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let index = thread_pool.install(|| build_index(centroids, 16));
         let query: ArrayRef = Arc::new(Float32Array::from(vec![query_val; 16]));
         let (id, dist) = index.search(query).unwrap();
         assert_eq!(id, 42);
@@ -351,6 +427,8 @@ mod tests {
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float16 as i32);
         assert_eq!(tensor.shape, vec![4, 5]);
         assert_eq!(tensor.data.len(), 20 * 2);
+        let decoded = FixedSizeListArray::try_from(&tensor).unwrap();
+        assert_eq!(decoded.values().to_data(), fsl.values().to_data());
 
         let fsl =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 20]), 5).unwrap();
@@ -358,6 +436,8 @@ mod tests {
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float32 as i32);
         assert_eq!(tensor.shape, vec![4, 5]);
         assert_eq!(tensor.data.len(), 20 * 4);
+        let decoded = FixedSizeListArray::try_from(&tensor).unwrap();
+        assert_eq!(decoded.values().to_data(), fsl.values().to_data());
 
         let fsl =
             FixedSizeListArray::try_new_from_values(Float64Array::from(vec![0.0; 20]), 5).unwrap();
@@ -365,5 +445,57 @@ mod tests {
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float64 as i32);
         assert_eq!(tensor.shape, vec![4, 5]);
         assert_eq!(tensor.data.len(), 20 * 8);
+        let decoded = FixedSizeListArray::try_from(&tensor).unwrap();
+        assert_eq!(decoded.values().to_data(), fsl.values().to_data());
+    }
+
+    #[rstest]
+    #[case::too_short(vec![0; 7])]
+    #[case::too_long(vec![0; 9])]
+    fn test_tensor_to_fsl_rejects_invalid_data_length(#[case] data: Vec<u8>) {
+        let tensor = pb::Tensor {
+            data_type: pb::tensor::DataType::Uint32 as i32,
+            shape: vec![1, 2],
+            data,
+        };
+
+        let error = FixedSizeListArray::try_from(&tensor).unwrap_err();
+        assert!(error.to_string().contains("requires 8 bytes"));
+    }
+
+    /// Every shape the AMX-FP16 GEMM cannot serve must keep the centroid index,
+    /// because without the GEMM the flat path it would fall back to is ~2.7x
+    /// slower than the index. These four are the exact complement of the gate in
+    /// `compute_membership_and_dist`.
+    #[rstest]
+    #[case::not_f16(&DataType::Float32, 10_000, 768, DistanceType::Dot)]
+    #[case::not_dot(&DataType::Float16, 10_000, 768, DistanceType::L2)]
+    #[case::dim_below_one_k_pass(&DataType::Float16, 10_000, 31, DistanceType::Dot)]
+    #[case::k_below_one_b_block(&DataType::Float16, 31, 768, DistanceType::Dot)]
+    fn test_flat_amx_assignment_declines_unsupported_shapes(
+        #[case] centroid_type: &DataType,
+        #[case] num_centroids: usize,
+        #[case] dimension: usize,
+        #[case] distance_type: DistanceType,
+    ) {
+        assert!(!prefers_flat_amx_assignment(
+            centroid_type,
+            num_centroids,
+            dimension,
+            distance_type
+        ));
+    }
+
+    /// On a supported shape the decision is exactly "is AMX-FP16 usable here",
+    /// which is a property of the build, the CPU and the `LANCE_DISABLE_AMX`
+    /// kill switch, so the expectation is derived rather than hardcoded -- the
+    /// same assertion has to hold with the switch set, on a machine without AMX,
+    /// and in a build whose toolchain could not compile the kernel.
+    #[test]
+    fn test_flat_amx_assignment_follows_amx_availability() {
+        assert_eq!(
+            prefers_flat_amx_assignment(&DataType::Float16, 10_000, 768, DistanceType::Dot),
+            amx_fp16_available()
+        );
     }
 }

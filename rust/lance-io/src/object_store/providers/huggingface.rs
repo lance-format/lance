@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use object_store::ObjectStore as OSObjectStore;
 use object_store::path::Path;
-use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Huggingface};
 use url::Url;
 
 use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
+use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::parse_hf_repo_id;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
@@ -160,11 +160,9 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
         builder = builder.download_mode(download_mode);
     }
 
-    let operator = Operator::new(builder)
-        .map_err(|e| {
-            Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
-        })?
-        .finish();
+    let operator = Operator::new(builder).map_err(|e| {
+        Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
+    })?;
 
     Ok(OpendalStore::new(operator))
 }
@@ -209,6 +207,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         Ok(ObjectStore {
             scheme: "hf".to_string(),
             inner,
+            local_dir_operations: None,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
@@ -218,6 +217,8 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            // Listed in full: no paginated lister covers OpenDAL yet.
+            paginated_lister: None,
         })
     }
 
