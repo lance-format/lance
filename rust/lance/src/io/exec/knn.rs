@@ -77,11 +77,7 @@ use super::utils::{
 
 mod adaptive_probe;
 
-use adaptive_probe::{
-    ExperimentalProbePolicy, QuakeOptions, QuakePartitionSearchControl, experimental_probe_policy,
-    quake_candidate_count, spann_nprobes, validate_experimental_probe_index,
-    validate_experimental_probe_plan,
-};
+use adaptive_probe::AutoProbeConfig;
 
 pub const QUERY_INDEX_COL: &str = "query_index";
 
@@ -1303,25 +1299,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
                         .await?;
                     // Normalize cosine queries once before partition ranking.
-                    let mut query = normalize_query_for_index(index.as_ref(), query.clone())?;
-
-                    if let ExperimentalProbePolicy::Quake {
-                        initial_fraction, ..
-                    } = experimental_probe_policy(&query)?
-                    {
-                        let candidate_count = quake_candidate_count(
-                            &query,
-                            index.total_partitions(),
-                            initial_fraction,
-                        );
-                        if candidate_count == 0 {
-                            return Err(DataFusionError::Execution(
-                                "Quake probing requires at least one candidate partition"
-                                    .to_string(),
-                            ));
-                        }
-                        query.maximum_nprobes = Some(candidate_count);
-                    }
+                    let query = normalize_query_for_index(index.as_ref(), query.clone())?;
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
@@ -2055,81 +2033,6 @@ impl ANNIvfSubIndexExec {
             .buffered(query_parallelism)
             .boxed()
     }
-
-    #[allow(clippy::too_many_arguments)]
-    fn quake_search(
-        index: Arc<dyn VectorIndex>,
-        query: Query,
-        partitions: Arc<UInt32Array>,
-        q_c_dists: Arc<Float32Array>,
-        prefilter: Arc<dyn PreFilter>,
-        metrics: Arc<AnnIndexMetrics>,
-        recall_target: f32,
-        options: QuakeOptions,
-    ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-        stream::once(async move {
-            let mut query = query;
-            options.limits.apply(&mut query, partitions.len())?;
-            let maximum_nprobes = query
-                .maximum_nprobes
-                .unwrap_or(partitions.len())
-                .min(partitions.len());
-            let minimum_nprobes = query.minimum_nprobes.min(maximum_nprobes);
-            let control = Arc::new(QuakePartitionSearchControl::try_new(
-                &query,
-                index.as_ref(),
-                &partitions,
-                minimum_nprobes,
-                recall_target,
-                options,
-            )?);
-            let index_metrics: Arc<dyn MetricsCollector> = Arc::new(metrics.index_metrics.clone());
-            let stream = index
-                .search_partitions(
-                    query,
-                    partitions,
-                    q_c_dists,
-                    0,
-                    maximum_nprobes,
-                    prefilter,
-                    Some(control.clone()),
-                    index_metrics,
-                )
-                .await
-                .map_err(|error| {
-                    DataFusionError::Execution(format!(
-                        "Failed to search partitions with Quake probing: {error}"
-                    ))
-                })?;
-            let output_control = control.clone();
-            Ok::<_, DataFusionError>(
-                stream
-                    .map(move |batch| {
-                        let batch = batch?;
-                        if output_control.callback_failed() {
-                            return Err(DataFusionError::Execution(
-                                "Quake probing callback state was unexpectedly concurrent"
-                                    .to_string(),
-                            ));
-                        }
-                        metrics.partitions_searched.add(1);
-                        metrics.baseline_metrics.record_output(batch.num_rows());
-                        Ok(batch)
-                    })
-                    // Wait for the producer to finish before reading callback state.
-                    // Emitting between batches could race the next CPU callback.
-                    .chain(
-                        stream::once(async move {
-                            control.emit_trace();
-                            None
-                        })
-                        .filter_map(futures::future::ready),
-                    )
-                    .boxed(),
-            )
-        })
-        .try_flatten()
-    }
 }
 
 impl ExecutionPlan for ANNIvfSubIndexExec {
@@ -2201,15 +2104,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
-        let probe_policy = experimental_probe_policy(&self.query)?;
-        validate_experimental_probe_plan(
-            probe_policy,
-            &self.query,
-            self.indices.len(),
-            !matches!(&self.prefilter_source, PreFilterSource::None),
-            self.overlay_block.is_some(),
-            self.external_mask.is_some(),
-        )?;
         let input_stream = self.input.execute(partition, context.clone())?;
         let schema = self.schema();
         let target_partitions = context.session_config().target_partitions();
@@ -2342,27 +2236,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         let normalized_query =
                             normalize_query_for_index(raw_index.as_ref(), query.clone())?;
                         query = normalized_query;
-                        validate_experimental_probe_index(
-                            probe_policy,
-                            &query,
-                            raw_index.as_ref(),
-                        )?;
-
-                        match probe_policy {
-                            ExperimentalProbePolicy::Legacy => {
-                                let pruned_nprobes =
-                                    early_pruning(q_c_dists.values(), query.k);
-                                adjust_probes(&mut query, pruned_nprobes);
-                            }
-                            ExperimentalProbePolicy::Spann { ratio, limits } => {
-                                // IVF centroid distances are squared L2 for both L2 and
-                                // normalized-cosine partition ranking. Apply SPANN's
-                                // d <= ratio * d0 comparison in that same squared-L2 unit.
-                                let pruned_nprobes = spann_nprobes(q_c_dists.values(), ratio);
-                                limits.apply(&mut query, part_ids.len())?;
-                                adjust_probes(&mut query, pruned_nprobes.max(1));
-                            }
-                            ExperimentalProbePolicy::Quake { .. } => {}
+                        if let Some(config) = AutoProbeConfig::from_env(&query, raw_index.metric_type())? {
+                            config.apply(&mut query, q_c_dists.values(), raw_index.metric_type());
                         }
 
                         // A segment's index file may still physically contain rows for
@@ -2386,28 +2261,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             }
                             None => None,
                         };
-
-                        if let ExperimentalProbePolicy::Quake { recall_target, options, .. } = probe_policy {
-                            if seg_mask.is_some() {
-                                return Err(DataFusionError::Execution(
-                                    "Quake probing does not support per-segment row masks"
-                                        .to_string(),
-                                ));
-                            }
-                            return DataFusionResult::Ok(
-                                Self::quake_search(
-                                    raw_index,
-                                    query,
-                                    part_ids,
-                                    q_c_dists,
-                                    segment_pre_filter,
-                                    metrics,
-                                    recall_target,
-                                    options,
-                                )
-                                .boxed(),
-                            );
-                        }
 
                         let early_search = Self::initial_search(
                             raw_index.clone(),
@@ -2483,30 +2336,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     fn supports_limit_pushdown(&self) -> bool {
         false
     }
-}
-
-fn adjust_probes(query: &mut Query, pruned_nprobes: usize) {
-    query.minimum_nprobes = query.minimum_nprobes.max(pruned_nprobes);
-    if let Some(maximum) = query.maximum_nprobes
-        && query.minimum_nprobes > maximum
-    {
-        query.minimum_nprobes = maximum;
-    }
-}
-
-fn early_pruning(dists: &[f32], k: usize) -> usize {
-    if dists.is_empty() {
-        return 0;
-    }
-
-    const PRUNING_FACTORS: [f32; 3] = [0.6, 7.0, 81.0];
-    let factor = match k {
-        ..=1 => PRUNING_FACTORS[0],
-        2..=10 => PRUNING_FACTORS[1],
-        11.. => PRUNING_FACTORS[2],
-    };
-    let dist_threshold = dists[0] * factor;
-    dists.partition_point(|dist| *dist <= dist_threshold)
 }
 
 #[derive(Debug)]
@@ -3383,39 +3212,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_adjust_probes_rules() {
-        let mut query = base_query();
-        adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, 10);
-        assert_eq!(query.maximum_nprobes, None);
-
-        let mut query = base_query();
-        query.minimum_nprobes = 20;
-        adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, 20);
-        assert_eq!(query.maximum_nprobes, None);
-
-        let mut query = base_query();
-        query.maximum_nprobes = Some(25);
-        adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, 10);
-        assert_eq!(query.maximum_nprobes, Some(25));
-
-        let mut query = base_query();
-        query.maximum_nprobes = Some(5);
-        adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, 5);
-        assert_eq!(query.maximum_nprobes, Some(5));
-
-        let mut query = base_query();
-        query.minimum_nprobes = 30;
-        query.maximum_nprobes = Some(50);
-        adjust_probes(&mut query, 10);
-        assert_eq!(query.minimum_nprobes, 30);
-        assert_eq!(query.maximum_nprobes, Some(50));
-    }
-
     #[tokio::test]
     async fn test_find_partitions_runs_on_cpu_runtime() {
         let thread_name = Arc::new(Mutex::new(None));
@@ -3529,14 +3325,28 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::uncapped(false)]
+    #[case::auto_initial_cap(true)]
     #[tokio::test]
-    async fn test_sequential_late_search_prepares_all_then_stops_search_early() {
+    async fn test_sequential_late_search_prepares_all_then_stops_search_early(
+        #[case] has_auto_cap: bool,
+    ) {
         let (index, prepared_partitions, searched_partitions, _search_threads) =
             prepared_index(vec![21, 22, 23]);
         let mut query = base_query();
         query.k = 2;
         query.minimum_nprobes = 0;
         query.maximum_nprobes = Some(3);
+        if has_auto_cap {
+            AutoProbeConfig {
+                margin: 80.0,
+                max_initial_nprobes: Some(1),
+            }
+            .apply(&mut query, &[0.1, 0.2, 0.3], DistanceType::L2);
+            assert_eq!(query.minimum_nprobes, 1);
+            assert_eq!(query.maximum_nprobes, Some(3));
+        }
         let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
         state.record_batch(
             &RecordBatch::try_new(
@@ -3567,8 +3377,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(batches.len(), 1);
-        assert_eq!(*prepared_partitions.lock().unwrap(), vec![0, 1, 2]);
-        assert_eq!(*searched_partitions.lock().unwrap(), vec![0]);
+        let first_late_partition = usize::from(has_auto_cap);
+        assert_eq!(
+            *prepared_partitions.lock().unwrap(),
+            (first_late_partition..3).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            *searched_partitions.lock().unwrap(),
+            vec![first_late_partition]
+        );
         assert_eq!(state.num_results_found.load(Ordering::Relaxed), 2);
     }
 
