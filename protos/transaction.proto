@@ -132,10 +132,6 @@ message Transaction {
     repeated RewriteGroup groups = 3;
     // Indices that have been rewritten
     repeated RewrittenIndex rewritten_indices = 4;
-    // Semantic mapping delta, published atomically with the rewritten fragments.
-    // Rebase appends to the latest ledger after validating disjoint source changes;
-    // it must not replace a ledger snapshot prepared before concurrent commits.
-    repeated FragmentReuseIndexDetails.Transition append_fri_transitions = 5;
   }
 
   // An operation that merges in a new column, altering the schema.
@@ -372,6 +368,12 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
+  // TODO: compose with Rewrite atomically when Transaction V2 supports composite operations.
+  message AppendFragmentReuseTransitions {
+    // Transitions to append to the latest FRI history.
+    repeated FragmentReuseIndexDetails.Transition transitions = 1;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -390,6 +392,7 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
+    AppendFragmentReuseTransitions append_fri_transitions = 117;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

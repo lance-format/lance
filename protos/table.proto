@@ -595,43 +595,42 @@ message FragmentReuseIndexDetails {
   }
 
   message InlineContent {
-    // Existing compaction history; field 1 retains its original wire meaning.
+    // Existing compaction records, with the original field number and contents.
     repeated Version legacy_versions = 1;
-    // Tagged mappings in the index_version=1 unified lineage ledger.
+    // New mappings; requires index_version = 1.
     repeated Transition transitions = 2;
   }
 
-  // A value-preserving rewrite. Order follows fragment lineage, not list order.
+  // Replaces whole source fragments without changing surviving row values.
   message Transition {
-    // Source and commit versions are not stored in this record.
     reserved 1, 2;
-    // Physical source fragments in scan order, including deleted positions.
+    // Source fragments in scan order; counts include deleted rows.
     repeated FragmentDigest sources = 3;
-    // Destination fragments in mapping-label order, with creation-time counts.
+    // Destination fragments in label order; counts are recorded at creation.
     repeated FragmentDigest destinations = 4;
-    // Exactly one mapping is required. Fields >= 5 are mapping alternatives;
-    // inspect unknown wire fields before treating an absent known branch as invalid.
+    // Exactly one mapping is required. Fields >= 5 identify mapping types,
+    // including types this reader does not recognize.
     oneof mapping {
-      // Concatenated surviving source rows, resliced into destinations.
+      // Concatenate surviving rows in source fragment order, preserving row order
+      // within each fragment, then split into destination fragments.
       OrderedCompaction ordered_compaction = 5;
-      // Source order is preserved within each destination.
+      // Assign surviving rows to destinations by label, preserving source fragment
+      // order and row order within each source for rows sent to the same destination.
       StablePartition stable_partition = 6;
     }
   }
 
-  // The existing compact representation, available as a tagged mapping.
   message OrderedCompaction {
-    // Serialized RoaringTreemap of surviving physical source addresses.
+    // RoaringTreemap of surviving source row addresses; missing rows are deleted.
     bytes changed_row_addrs = 1;
   }
 
-  // Immutable mapping identity, independent of the FRI history's index UUID.
   message StablePartition {
-    // UUID directory under _fri/ containing row_map.lance.
+    // UUID in _fri/<map_id>/stable_partition.lance; unchanged when the FRI UUID changes.
     string map_id = 1;
-    // Complete row_map.lance byte length.
+    // Size of stable_partition.lance in bytes.
     uint64 map_size_bytes = 2;
-    // Absent: this dataset's base; present: an ID in Manifest.base_paths.
+    // Unset: use the dataset base. Set: look up this ID in Manifest.base_paths.
     optional uint32 base_id = 3;
   }
 
@@ -654,7 +653,6 @@ message FragmentReuseIndexDetails {
     repeated FragmentDigest old_fragments = 2;
 
     repeated FragmentDigest new_fragments = 3;
-
   }
 
   message Version {

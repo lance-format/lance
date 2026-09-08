@@ -31,10 +31,10 @@ they should return an "unsupported" error on any read or write operation.
 | 32       | `FLAG_DISABLE_TRANSACTION_FILE` | No              | Yes             | Transactions are recorded in the manifest rather than in a separate transaction file.                       |
 | 64       | `FLAG_UNSTABLE_DATA_OVERLAY_FILES` | Yes          | Yes             | Fragments may carry data overlay files. Unstable: release builds reject it unless explicitly opted in.      |
 | 128      | `FLAG_COVERED_INDEX_METADATA`   | Yes             | Yes             | Some index declares covering columns (`IndexMetadata.covering_fields`), so `fields` means keyed columns followed by carried ones. An implementation without this flag selects an index by membership of `fields` and would answer a query on a merely-carried column with an index keyed on a different one. |
-| 512      | `FLAG_FRAGMENT_REUSE_INDEX` | Yes | Yes | Extensible fragment reuse history, including stable partition and preservation of unknown encodings. |
+| 512      | `FLAG_FRAGMENT_REUSE_INDEX` | Yes | Yes | Support for the new FRI format, which can be extended with new encodings, including stable partition. |
 
 </div>
 
-Bit value 256 is reserved for mixed data-file versions. Unrecognized bits cause an "unsupported" error.
+Flags with bit values 256 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error.
 
-`FLAG_FRAGMENT_REUSE_INDEX` is set in both flag words in the atomic commit that first publishes a tagged FRI transition. Subsequent versions retain both bits. V1-only compaction does not set them. Advertising support requires the unknown-encoding behavior in the [FRI specification](../index/system/frag_reuse.md); the flag does not advertise support for every future encoding.
+Legacy compaction FRI does not require any flags. Set `FLAG_FRAGMENT_REUSE_INDEX` in both reader and writer flags when stable partition or another new FRI encoding is first written. This prevents readers and writers that only understand legacy compaction FRI from misinterpreting the new transitions. Subsequent versions retain both flags.
