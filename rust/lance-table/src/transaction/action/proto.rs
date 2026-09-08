@@ -236,6 +236,7 @@ mod tests {
                 uuid: Uuid::from_u128(7),
                 name: "by_a".into(),
                 fields: vec![Ref::Committed(1), Ref::Local(3)],
+                covering_fields: vec![Ref::Local(3)],
                 index_details: Some(Arc::new(prost_types::Any {
                     type_url: "type.googleapis.com/lance.table.MemWalIndexDetails".into(),
                     value: vec![1, 2, 3],
