@@ -2550,6 +2550,7 @@ mod composite {
             uuid: Uuid::new_v4(),
             name: name.into(),
             fields: vec![Ref::Committed(0)],
+            covering_fields: Vec::new(),
             index_details: None,
             index_version: 1,
             covered_fragments: Some(covered),

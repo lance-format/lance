@@ -181,6 +181,9 @@ struct IndexClaim {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct IndexIdentity {
     pub fields: Vec<Ref>,
+    /// Which of `fields` are merely carried: two writers that disagree about
+    /// this disagree about what the index answers for, not just what it holds.
+    pub covering_fields: Vec<Ref>,
     pub details: Option<Arc<prost_types::Any>>,
     pub index_version: i32,
 }

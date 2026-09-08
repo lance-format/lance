@@ -32,8 +32,22 @@ pub struct AddIndexSegment {
     pub uuid: Uuid,
     /// The logical index this segment belongs to.
     pub name: String,
-    /// The indexed fields.
+    /// The fields the segment is keyed on -- the columns it can be searched
+    /// by. Empty only for a system index keyed on no column at all, such as
+    /// `mem_wal` or `frag_reuse`.
+    ///
+    /// Keys only, unlike [`IndexMetadata::fields`] under the legacy contract,
+    /// where it means keyed columns followed by carried ones. `apply` derives
+    /// that representation.
     pub fields: Vec<Ref>,
+    /// The fields whose values the segment carries but is not necessarily
+    /// keyed on, independent of [`Self::fields`] rather than a subset of it.
+    /// Empty for a segment that carries no extra column.
+    ///
+    /// A field in both lists is one the segment is keyed on *and* carries.
+    /// That needs `FLAG_INDEPENDENT_COVERING_FIELDS`, which no release
+    /// implements, so `apply` rejects it for now.
+    pub covering_fields: Vec<Ref>,
     /// Index-type-specific metadata, opaque to the transaction layer.
     pub index_details: Option<Arc<prost_types::Any>>,
     pub index_version: i32,
@@ -76,10 +90,18 @@ impl AddIndexSegment {
             .transpose()?;
         let base_id = self.base.map(|base| state.resolve_base(base)).transpose()?;
 
-        state.add_index_segment(IndexMetadata {
+        let covering_fields = self
+            .covering_fields
+            .iter()
+            .map(|field| state.resolve_field(*field))
+            .collect::<Result<Vec<_>>>()?;
+        let (fields, covering_fields) = Self::lower_covering(&self.name, fields, covering_fields)?;
+
+        let metadata = IndexMetadata {
             uuid: self.uuid,
             name: self.name.clone(),
             fields,
+            covering_fields,
             dataset_version: self.reflected_version(state.read_version())?,
             fragment_bitmap,
             index_details: self.index_details.clone(),
@@ -87,7 +109,53 @@ impl AddIndexSegment {
             created_at: self.created_at,
             base_id,
             files: (!self.files.is_empty()).then(|| self.files.clone()),
-        })
+        };
+        // Belt and braces: `lower_covering` builds the legacy form by
+        // construction, so a failure here means the two have drifted apart.
+        metadata.validate_covering_fields()?;
+
+        state.add_index_segment(metadata)
+    }
+
+    /// Render the action's independent key/covering declaration as the
+    /// `IndexMetadata` form a manifest can carry today.
+    ///
+    /// The action names keys and carried columns separately (the contract in
+    /// lance-format/lance#9159), while a manifest without
+    /// `FLAG_INDEPENDENT_COVERING_FIELDS` carries the legacy form: one
+    /// `fields` list of keyed columns followed by carried ones, with
+    /// `covering_fields` naming that trailing subset.
+    ///
+    /// A disjoint declaration converts exactly. An overlapping one -- a column
+    /// both keyed and carried -- has no legacy representation and is rejected
+    /// rather than silently flattened, which would drop the fact that the
+    /// column is carried. Both this lowering and the rejection come out when a
+    /// release implements the flag; the action's own shape does not change.
+    fn lower_covering(
+        name: &str,
+        keys: Vec<i32>,
+        covering: Vec<i32>,
+    ) -> Result<(Vec<i32>, Vec<i32>)> {
+        if covering.is_empty() {
+            return Ok((keys, covering));
+        }
+
+        let overlapping: Vec<i32> = covering
+            .iter()
+            .copied()
+            .filter(|field| keys.contains(field))
+            .collect();
+        if !overlapping.is_empty() {
+            return Err(Error::not_supported(format!(
+                "index '{name}' declares fields {overlapping:?} as both keyed and \
+                 covering; that requires FLAG_INDEPENDENT_COVERING_FIELDS, which no \
+                 release implements yet (keys {keys:?}, covering {covering:?})"
+            )));
+        }
+
+        let mut lowered = keys;
+        lowered.extend_from_slice(&covering);
+        Ok((lowered, covering))
     }
 
     /// The version this segment reflects, defaulting to the one the operation
@@ -145,6 +213,7 @@ impl AddIndexSegment {
             self.name.clone(),
             IndexIdentity {
                 fields: self.fields.clone(),
+                covering_fields: self.covering_fields.clone(),
                 details: self.index_details.clone(),
                 index_version: self.index_version,
             },
@@ -165,6 +234,7 @@ impl DeepSizeOf for AddIndexSegment {
         self.uuid.as_bytes().deep_size_of_children(context)
             + self.name.deep_size_of_children(context)
             + self.fields.deep_size_of_children(context)
+            + self.covering_fields.deep_size_of_children(context)
             + index_details
             + self.covered_fragments.deep_size_of_children(context)
             + self.files.deep_size_of_children(context)
@@ -177,6 +247,11 @@ impl From<&AddIndexSegment> for pb::AddIndexSegment {
             uuid: Some((&value.uuid).into()),
             name: value.name.clone(),
             fields: value.fields.iter().map(|field| (*field).into()).collect(),
+            covering_fields: value
+                .covering_fields
+                .iter()
+                .map(|field| (*field).into())
+                .collect(),
             index_details: value
                 .index_details
                 .as_ref()
@@ -229,6 +304,11 @@ impl TryFrom<pb::AddIndexSegment> for AddIndexSegment {
                 .into_iter()
                 .map(Ref::try_from)
                 .collect::<Result<Vec<_>>>()?,
+            covering_fields: message
+                .covering_fields
+                .into_iter()
+                .map(Ref::try_from)
+                .collect::<Result<Vec<_>>>()?,
             index_details: message.index_details.map(Arc::new),
             index_version: message.index_version.unwrap_or_default(),
             covered_fragments: message
@@ -274,6 +354,7 @@ mod tests {
             uuid: Uuid::new_v4(),
             name: name.into(),
             fields,
+            covering_fields: Vec::new(),
             index_details: None,
             index_version: 1,
             covered_fragments: Some(vec![Ref::Committed(0)]),
@@ -348,6 +429,59 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(
             error.to_string().contains("could not have seen"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The action names keys and carried columns independently, but a manifest
+    /// can only carry the legacy form -- one `fields` list with the carried
+    /// columns as its tail -- until a release implements
+    /// `FLAG_INDEPENDENT_COVERING_FIELDS`. Apply converts between the two.
+    #[test]
+    fn test_a_disjoint_covering_declaration_lowers_to_the_legacy_form() {
+        let (next, indices) = apply_with_indices(
+            &backed_manifest(),
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: added_field("carried"),
+                }),
+                Action::AddIndexSegment(AddIndexSegment {
+                    covering_fields: vec![Ref::Local(0)],
+                    ..segment("by_a", vec![Ref::Committed(0)])
+                }),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let carried = next.schema.field("carried").unwrap().id;
+        assert_eq!(indices[0].fields, vec![0, carried]);
+        assert_eq!(indices[0].covering_fields, vec![carried]);
+    }
+
+    /// A column both keyed and carried has no legacy representation: dropping
+    /// it from `covering_fields` would leave the manifest claiming only that
+    /// the index is keyed on the column, losing the fact that it also serves
+    /// the column's values. Reject rather than publish the weaker claim.
+    #[test]
+    fn test_a_covering_field_that_is_also_a_key_is_rejected_for_now() {
+        let error = apply_with_indices(
+            &backed_manifest(),
+            vec![Action::AddIndexSegment(AddIndexSegment {
+                covering_fields: vec![Ref::Committed(0)],
+                ..segment("by_a", vec![Ref::Committed(0)])
+            })],
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("FLAG_INDEPENDENT_COVERING_FIELDS"),
             "unexpected error: {error}"
         );
     }
