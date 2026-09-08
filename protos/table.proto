@@ -595,7 +595,44 @@ message FragmentReuseIndexDetails {
   }
 
   message InlineContent {
-    repeated Version versions = 1;
+    // Existing compaction history; field 1 retains its original wire meaning.
+    repeated Version legacy_versions = 1;
+    // Tagged mappings in the index_version=1 unified lineage ledger.
+    repeated Transition transitions = 2;
+  }
+
+  // A value-preserving rewrite. Order follows fragment lineage, not list order.
+  message Transition {
+    // Source and commit versions are not stored in this record.
+    reserved 1, 2;
+    // Physical source fragments in scan order, including deleted positions.
+    repeated FragmentDigest sources = 3;
+    // Destination fragments in mapping-label order, with creation-time counts.
+    repeated FragmentDigest destinations = 4;
+    // Exactly one mapping is required. Fields >= 5 are mapping alternatives;
+    // inspect unknown wire fields before treating an absent known branch as invalid.
+    oneof mapping {
+      // Concatenated surviving source rows, resliced into destinations.
+      OrderedCompaction ordered_compaction = 5;
+      // Source order is preserved within each destination.
+      StablePartition stable_partition = 6;
+    }
+  }
+
+  // The existing compact representation, available as a tagged mapping.
+  message OrderedCompaction {
+    // Serialized RoaringTreemap of surviving physical source addresses.
+    bytes changed_row_addrs = 1;
+  }
+
+  // Immutable mapping identity, independent of the FRI history's index UUID.
+  message StablePartition {
+    // UUID directory under _fri/ containing row_map.lance.
+    string map_id = 1;
+    // Complete row_map.lance byte length.
+    uint64 map_size_bytes = 2;
+    // Absent: this dataset's base; present: an ID in Manifest.base_paths.
+    optional uint32 base_id = 3;
   }
 
   message FragmentDigest {
@@ -617,6 +654,7 @@ message FragmentReuseIndexDetails {
     repeated FragmentDigest old_fragments = 2;
 
     repeated FragmentDigest new_fragments = 3;
+
   }
 
   message Version {

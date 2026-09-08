@@ -153,6 +153,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 new_fragments,
                 groups,
                 rewritten_indices,
+                append_fri_transitions: _,
             })) => {
                 let groups = if !groups.is_empty() {
                     groups
