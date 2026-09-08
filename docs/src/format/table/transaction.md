@@ -766,10 +766,6 @@ This protocol ensures that datasets using external manifest stores remain portab
 
 ## Appending FRI transitions
 
-`append_fri_transitions` (field 117) is an independent transaction operation.
+`append_fri_transitions` (field 116) is an independent transaction operation.
 Its `AppendFragmentReuseTransitions.transitions` field lists new mappings to
 append to the latest FRI history; it does not contain the existing history.
-
-TODO: combine this operation with `Rewrite` through Transaction V2 composite
-operations. The fragments and mappings must appear in the same manifest commit.
-This proposal defines the operation but does not enable its execution.

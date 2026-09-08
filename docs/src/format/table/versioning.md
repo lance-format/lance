@@ -31,7 +31,7 @@ they should return an "unsupported" error on any read or write operation.
 | 32       | `FLAG_DISABLE_TRANSACTION_FILE` | No              | Yes             | Transactions are recorded in the manifest rather than in a separate transaction file.                       |
 | 64       | `FLAG_UNSTABLE_DATA_OVERLAY_FILES` | Yes          | Yes             | Fragments may carry data overlay files. Unstable: release builds reject it unless explicitly opted in.      |
 | 128      | `FLAG_COVERED_INDEX_METADATA`   | Yes             | Yes             | Some index declares covering columns (`IndexMetadata.covering_fields`), so `fields` means keyed columns followed by carried ones. An implementation without this flag selects an index by membership of `fields` and would answer a query on a merely-carried column with an index keyed on a different one. |
-| 512      | `FLAG_FRAGMENT_REUSE_INDEX` | Yes | Yes | Support for the new FRI format, which can be extended with new encodings, including stable partition. |
+| 512      | `FLAG_FRAGMENT_REUSE_INDEX` | Yes | Yes | Support for the new FRI format, which can be extended with new encodings, including stable partition encoding. |
 
 </div>
 

@@ -392,7 +392,7 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
-    AppendFragmentReuseTransitions append_fri_transitions = 117;
+    AppendFragmentReuseTransitions append_fri_transitions = 116;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

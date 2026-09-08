@@ -603,19 +603,18 @@ message FragmentReuseIndexDetails {
 
   // Replaces whole source fragments without changing surviving row values.
   message Transition {
-    reserved 1, 2;
     // Source fragments in scan order; counts include deleted rows.
     repeated FragmentDigest sources = 3;
     // Destination fragments in label order; counts are recorded at creation.
     repeated FragmentDigest destinations = 4;
-    // Exactly one mapping is required. Fields >= 5 identify mapping types,
-    // including types this reader does not recognize.
-    oneof mapping {
-      // Concatenate surviving rows in source fragment order, preserving row order
-      // within each fragment, then split into destination fragments.
+    oneof encoding {
+      /* Concatenate surviving rows in source fragment order, preserving row order
+       * within each fragment, then split into destination fragments.
+       */
       OrderedCompaction ordered_compaction = 5;
-      // Assign surviving rows to destinations by label, preserving source fragment
-      // order and row order within each source for rows sent to the same destination.
+      /* Process source fragments sequentially, distributing their rows across
+       * destination fragments by label in source row order.
+       */
       StablePartition stable_partition = 6;
     }
   }
