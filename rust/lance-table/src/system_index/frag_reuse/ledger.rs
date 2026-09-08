@@ -109,7 +109,7 @@ impl FragReuseLedger {
                             pb::Transition {
                                 sources: group.old_fragments,
                                 destinations: group.new_fragments,
-                                mapping: Some(transition::Mapping::OrderedCompaction(
+                                encoding: Some(transition::Encoding::OrderedCompaction(
                                     pb::OrderedCompaction {
                                         changed_row_addrs: group.changed_row_addrs,
                                     },
@@ -256,8 +256,8 @@ fn decode_transition(
             "transition row counts differ: {source_rows} source rows, {destination_rows} destination rows"
         )));
     }
-    let mapping = match value.mapping {
-        Some(transition::Mapping::OrderedCompaction(ordered)) => {
+    let mapping = match value.encoding {
+        Some(transition::Encoding::OrderedCompaction(ordered)) => {
             let mut cursor = Cursor::new(&ordered.changed_row_addrs);
             let bitmap = RoaringTreemap::deserialize_from(&mut cursor)
                 .map_err(|e| corrupt(e.to_string()))?;
@@ -288,7 +288,7 @@ fn decode_transition(
             .map_err(|e| corrupt(e.to_string()))?;
             Mapping::OrderedCompaction(remap)
         }
-        Some(transition::Mapping::StablePartition(partition)) => {
+        Some(transition::Encoding::StablePartition(partition)) => {
             Uuid::parse_str(&partition.map_id).map_err(|e| {
                 corrupt(format!(
                     "invalid stable partition map_id {:?}: {e}",
@@ -394,7 +394,7 @@ mod tests {
         pb::Transition {
             sources: vec![digest(source, 2, 0)],
             destinations: vec![digest(destination, 2, 0)],
-            mapping: Some(transition::Mapping::StablePartition(pb::StablePartition {
+            encoding: Some(transition::Encoding::StablePartition(pb::StablePartition {
                 map_id: Uuid::nil().to_string(),
                 map_size_bytes: 100,
                 base_id: Some(7),
@@ -428,7 +428,7 @@ mod tests {
         pb::Transition {
             sources,
             destinations,
-            mapping: Some(transition::Mapping::OrderedCompaction(
+            encoding: Some(transition::Encoding::OrderedCompaction(
                 pb::OrderedCompaction { changed_row_addrs },
             )),
         }
@@ -451,7 +451,7 @@ mod tests {
             vec![digest(3, 3, 0)],
             &[address(2, 0), address(2, 2), address(1, 0)],
         );
-        let Some(transition::Mapping::OrderedCompaction(mapping)) = old.mapping else {
+        let Some(transition::Encoding::OrderedCompaction(mapping)) = old.encoding else {
             unreachable!()
         };
         let mut next = partition(3, 4);
@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn unknown_mapping_is_preserved_and_taints_only_dependent_lineage() {
         let mut unknown = partition(1, 2);
-        unknown.mapping = None;
+        unknown.encoding = None;
         let mut raw = unknown.encode_to_vec();
         message_field(17, b"future external mapping", &mut raw);
         let mut content = history(vec![partition(2, 3), partition(10, 11)]).to_vec();
@@ -559,7 +559,7 @@ mod tests {
     #[case::duplicate_unknown(vec![9, 9], "multiple mapping")]
     fn rejects_ambiguous_mapping(#[case] tags: Vec<u32>, #[case] message: &str) {
         let mut transition = partition(1, 2);
-        transition.mapping = None;
+        transition.encoding = None;
         let mut raw = transition.encode_to_vec();
         for tag in tags {
             message_field(tag, &[], &mut raw);
@@ -623,7 +623,8 @@ mod tests {
             "survivors",
         );
         let mut transition = partition(1, 2);
-        let Some(transition::Mapping::StablePartition(reference)) = &mut transition.mapping else {
+        let Some(transition::Encoding::StablePartition(reference)) = &mut transition.encoding
+        else {
             unreachable!()
         };
         reference.map_id = "../escape".into();
