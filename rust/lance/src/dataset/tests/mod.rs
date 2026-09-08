@@ -17,5 +17,6 @@ mod dataset_scanner;
 mod dataset_schema_evolution;
 mod dataset_transactions;
 mod dataset_versioning;
+mod dataset_wide_table;
 mod fragment_validate_tombstones;
 mod fragment_write_columns;
