@@ -13,7 +13,10 @@
 //! The caller minimum takes precedence over the learned cap, while the caller
 //! maximum and available candidate count limit the final initial budget.
 //! Explicit fixed nprobes bypasses both the heuristic and these overrides.
-//! Hamming retains its existing probe heuristic and ignores these overrides.
+//! Only ordinary Float32 FLAT vectors with complete norm statistics use the
+//! learned profile and completion. Other capabilities, old indexes without
+//! statistics, and explicitly bounded Auto queries retain the pre-experiment
+//! f32 heuristic and ignore these overrides. Hamming is included in this fallback.
 
 use std::env;
 
@@ -28,6 +31,105 @@ use lance_linalg::distance::DistanceType;
 const MARGIN_ENV: &str = "LANCE_AUTO_PROBE_MARGIN";
 const MIN_INITIAL_NPROBES_ENV: &str = "LANCE_AUTO_MIN_INITIAL_NPROBES";
 const MAX_INITIAL_NPROBES_ENV: &str = "LANCE_AUTO_MAX_INITIAL_NPROBES";
+
+/// Select the probing behavior once, before interpreting experimental overrides.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum AutoProbePolicy {
+    Fixed,
+    Legacy,
+    NormAware(AutoProbeConfig),
+}
+
+impl AutoProbePolicy {
+    pub(super) fn from_env(
+        query: &Query,
+        index: &dyn VectorIndex,
+        vector_type: &DataType,
+    ) -> DataFusionResult<Self> {
+        Self::select_with_config(query, index, vector_type, AutoProbeConfig::from_env)
+    }
+
+    pub(super) fn select_with_config(
+        query: &Query,
+        index: &dyn VectorIndex,
+        vector_type: &DataType,
+        read_config: impl FnOnce(&Query, DistanceType) -> DataFusionResult<Option<AutoProbeConfig>>,
+    ) -> DataFusionResult<Self> {
+        if query.maximum_nprobes == Some(query.minimum_nprobes) {
+            return Ok(Self::Fixed);
+        }
+        if query.maximum_nprobes.is_some()
+            || query.key.data_type() != &DataType::Float32
+            || query.key.null_count() != 0
+            || !matches!(vector_type, DataType::FixedSizeList(item, dimension)
+                if item.data_type() == &DataType::Float32 && *dimension as usize == query.key.len())
+            || !matches!(
+                index.sub_index_type(),
+                (SubIndexType::Flat, QuantizationType::Flat)
+            )
+            || index.metric_type() == DistanceType::Hamming
+            || !query
+                .key
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .values()
+                .iter()
+                .all(|x| x.is_finite())
+        {
+            return Ok(Self::Legacy);
+        }
+        let mut has_vectors = false;
+        for part in 0..index.total_partitions() {
+            if index.partition_size(part) == 0 {
+                continue;
+            }
+            has_vectors = true;
+            let Some(range) = index.partition_norm_range(part) else {
+                return Ok(Self::Legacy);
+            };
+            if !range.min.is_finite()
+                || !range.max.is_finite()
+                || range.min < 0.0
+                || range.min > range.max
+            {
+                return Ok(Self::Legacy);
+            }
+        }
+        if !has_vectors {
+            return Ok(Self::Legacy);
+        }
+        Ok(read_config(query, index.metric_type())?.map_or(Self::Fixed, Self::NormAware))
+    }
+
+    pub(super) fn apply(self, query: &mut Query, distances: &[f32], metric: DistanceType) {
+        match self {
+            Self::Fixed => {}
+            Self::Legacy => apply_legacy_probes(query, distances),
+            Self::NormAware(config) => config.apply(query, distances, metric),
+        }
+    }
+
+    pub(super) fn allows_completion(self) -> bool {
+        matches!(self, Self::NormAware(_))
+    }
+}
+
+/// Preserve the pre-experiment f32 heuristic, including signed distances and
+/// overflow behavior. Available partitions are clipped by the search operators.
+fn apply_legacy_probes(query: &mut Query, distances: &[f32]) {
+    let selected = distances.first().map_or(0, |nearest| {
+        let factor = match query.k {
+            ..=1 => 0.6,
+            2..=10 => 7.0,
+            _ => 81.0,
+        };
+        let threshold = *nearest * factor;
+        distances.partition_point(|distance| *distance <= threshold)
+    });
+    query.minimum_nprobes = query.minimum_nprobes.max(selected);
+    if let Some(maximum) = query.maximum_nprobes {
+        query.minimum_nprobes = query.minimum_nprobes.min(maximum);
+    }
+}
 
 #[derive(Debug)]
 struct NormCompletionCandidate {
@@ -269,8 +371,8 @@ impl AutoProbeConfig {
         } else {
             Self {
                 min_initial_nprobes: [1, 23, 1][bucket],
-                margin: [0.1275, 0.1325, 0.1375][bucket],
-                max_initial_nprobes: Some([628, 697, 756][bucket]),
+                margin: [0.13, 0.1375, 0.1425][bucket],
+                max_initial_nprobes: Some([615, 683, 740][bucket]),
             }
         };
         config.with_overrides(margin, minimum, maximum).map(Some)
@@ -337,21 +439,7 @@ impl AutoProbeConfig {
             return;
         }
         if metric == DistanceType::Hamming {
-            // Keep uncalibrated binary search behavior unchanged, including f32
-            // threshold rounding and the top-1 factor below one.
-            let selected = distances.first().map_or(0, |nearest| {
-                let factor = match query.k {
-                    ..=1 => 0.6,
-                    2..=10 => 7.0,
-                    _ => 81.0,
-                };
-                let threshold = *nearest * factor;
-                distances.partition_point(|distance| *distance <= threshold)
-            });
-            query.minimum_nprobes = query.minimum_nprobes.max(selected);
-            if let Some(maximum) = query.maximum_nprobes {
-                query.minimum_nprobes = query.minimum_nprobes.min(maximum);
-            }
+            apply_legacy_probes(query, distances);
             return;
         }
         let selected = match distances.first().copied() {
@@ -390,6 +478,33 @@ mod tests {
     use arrow_array::Float32Array;
     use rstest::rstest;
     use std::sync::Arc;
+
+    #[rstest]
+    #[case::top1_positive_ties(1, vec![10.0, 10.0, 11.0], 1, None, 1)]
+    #[case::top10_boundary(10, vec![1.0, 7.0, 8.0], 1, None, 2)]
+    #[case::top100_boundary(100, vec![1.0, 81.0, 82.0], 1, None, 2)]
+    #[case::zero_ties(1, vec![0.0, 0.0, 1.0], 1, None, 2)]
+    #[case::negative_top1(1, vec![-10.0, -7.0, -6.0, -5.0], 1, None, 3)]
+    #[case::negative_top10(10, vec![-2.0, -1.0, 0.0], 1, None, 1)]
+    #[case::overflow(10, vec![f32::MAX, f32::INFINITY], 1, None, 2)]
+    #[case::empty_preserves_min(1, vec![], 4, None, 4)]
+    #[case::available_clipped_by_operator(1, vec![1.0, 2.0], 8, None, 8)]
+    #[case::caller_max(100, vec![1.0, 2.0, 3.0], 1, Some(2), 2)]
+    fn test_legacy_auto_matches_pre_experiment_arithmetic(
+        #[case] k: usize,
+        #[case] distances: Vec<f32>,
+        #[case] minimum: usize,
+        #[case] maximum: Option<usize>,
+        #[case] expected: usize,
+    ) {
+        let mut query = query();
+        query.k = k;
+        query.minimum_nprobes = minimum;
+        query.maximum_nprobes = maximum;
+        AutoProbePolicy::Legacy.apply(&mut query, &distances, DistanceType::Dot);
+        assert_eq!(query.minimum_nprobes, expected);
+        assert_eq!(query.maximum_nprobes, maximum);
+    }
 
     #[rstest]
     #[case::l2(DistanceType::L2, 4.0, 10.0)]
@@ -528,11 +643,11 @@ mod tests {
     #[case::cosine_top10_upper_boundary(DistanceType::Cosine, 10, 0.39, 1, 553)]
     #[case::cosine_top100_lower_boundary(DistanceType::Cosine, 11, 0.41, 1, 588)]
     #[case::cosine_top100(DistanceType::Cosine, 100, 0.41, 1, 588)]
-    #[case::dot_top1(DistanceType::Dot, 1, 0.1275, 1, 628)]
-    #[case::dot_top10_lower_boundary(DistanceType::Dot, 2, 0.1325, 23, 697)]
-    #[case::dot_top10_upper_boundary(DistanceType::Dot, 10, 0.1325, 23, 697)]
-    #[case::dot_top100_lower_boundary(DistanceType::Dot, 11, 0.1375, 1, 756)]
-    #[case::dot_top100(DistanceType::Dot, 100, 0.1375, 1, 756)]
+    #[case::dot_top1(DistanceType::Dot, 1, 0.13, 1, 615)]
+    #[case::dot_top10_lower_boundary(DistanceType::Dot, 2, 0.1375, 23, 683)]
+    #[case::dot_top10_upper_boundary(DistanceType::Dot, 10, 0.1375, 23, 683)]
+    #[case::dot_top100_lower_boundary(DistanceType::Dot, 11, 0.1425, 1, 740)]
+    #[case::dot_top100(DistanceType::Dot, 100, 0.1425, 1, 740)]
     fn test_auto_probe_metric_profiles(
         #[case] metric: DistanceType,
         #[case] k: usize,
