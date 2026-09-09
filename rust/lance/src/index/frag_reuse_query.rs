@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::{Buf, Bytes};
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::address::RowAddress;
@@ -15,10 +14,8 @@ use lance_core::{Error, Result};
 use lance_index::frag_reuse::row_map::RowMapReader;
 use lance_index::scalar::IndexStore;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_table::format::{IndexMetadata, pb};
+use lance_table::format::IndexMetadata;
 use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
-use prost::Message;
-use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 
@@ -208,8 +205,7 @@ impl QueryFragReuseIndex {
                     union |= bitmap;
                     union
                 });
-            let complete = sources.is_subset(&union)
-                && !matches!(transition.mapping(), Mapping::Unknown { .. });
+            let complete = sources.is_subset(&union);
             let direct = &union & &destinations;
             for bitmap in &mut coverage {
                 let contributes = !bitmap.is_disjoint(&sources);
@@ -252,7 +248,6 @@ impl QueryFragReuseIndex {
                             });
                         }
                     }
-                    Mapping::Unknown { .. } => rows.fill(None),
                     Mapping::StablePartition(_) => {
                         self.translate_partition(index, transition, &mut rows)
                             .await?
@@ -398,44 +393,11 @@ fn corrupt(message: impl Into<String>) -> Error {
 }
 
 async fn load_ledger(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReuseLedger> {
-    if index.index_version != 1 {
-        return Err(Error::not_supported(format!(
-            "unsupported tagged FRI index_version {}",
-            index.index_version
-        )));
-    }
     let details = index
         .index_details
         .as_ref()
-        .filter(|d| {
-            d.type_url
-                .ends_with("/lance.table.FragmentReuseIndexDetails")
-        })
-        .ok_or_else(|| corrupt("unexpected FRI details type"))?;
-    // Extract InlineContent before prost drops future transition alternatives.
-    let mut wire = Bytes::copy_from_slice(&details.value);
-    let mut content = None;
-    while wire.has_remaining() {
-        let (tag, kind) = decode_key(&mut wire).map_err(|e| corrupt(e.to_string()))?;
-        if tag == 1 || tag == 2 {
-            if kind != WireType::LengthDelimited || content.is_some() {
-                return Err(corrupt("invalid or repeated FRI content"));
-            }
-            let size = decode_varint(&mut wire).map_err(|e| corrupt(e.to_string()))?;
-            if size > wire.remaining() as u64 {
-                return Err(corrupt("truncated FRI content"));
-            }
-            content = Some((tag, wire.split_to(size as usize)));
-        } else {
-            skip_field(kind, tag, &mut wire, DecodeContext::default())
-                .map_err(|e| corrupt(e.to_string()))?;
-        }
-    }
-    let (tag, content) = content.ok_or_else(|| corrupt("missing FRI content"))?;
-    let content = if tag == 1 {
-        content
-    } else {
-        let file = pb::ExternalFile::decode(content).map_err(|e| corrupt(e.to_string()))?;
+        .ok_or_else(|| corrupt("missing FRI details"))?;
+    FragReuseLedger::decode_details(index.index_version, details, |file| async move {
         let end = file
             .offset
             .checked_add(file.size)
@@ -451,9 +413,10 @@ async fn load_ledger(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReu
             .open(&path)
             .await?
             .get_range(file.offset as usize..end)
-            .await?
-    };
-    FragReuseLedger::decode(index.index_version, content)
+            .await
+            .map_err(Error::from)
+    })
+    .await
 }
 
 /// Applies the shared FRI history and limits translated rows to this segment's coverage.
@@ -502,21 +465,30 @@ impl lance_index::scalar::BatchRowIdRemapper for QueryRowIdRemapper {
 mod tests {
     use super::*;
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
-    use crate::index::DatasetIndexExt;
+    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
     use crate::session::index_caches::IndexMetadataKey;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::Int32Type;
     use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array, cast::AsArray};
+    #[cfg(feature = "geo")]
+    use geo_types::line_string;
+    #[cfg(feature = "geo")]
+    use geoarrow_array::{GeoArrowArray, builder::LineStringBuilder};
+    #[cfg(feature = "geo")]
+    use geoarrow_schema::{Dimension, LineStringType};
     use lance_core::cache::LanceCache;
     use lance_index::IndexType;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::frag_reuse::row_map::{RowMapWriter, SourceRows};
+    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::scalar::ScalarIndexParams;
-    use lance_table::format::Fragment;
     use lance_table::format::pb::fragment_reuse_index_details::{
         FragmentDigest, InlineContent, StablePartition, Transition, transition,
     };
+    use lance_table::format::{Fragment, pb};
     use lance_table::transaction::{Operation, Transaction};
+    use prost::Message;
+    use prost::encoding::WireType;
     use tokio::io::AsyncWriteExt;
     use uuid::Uuid;
 
@@ -665,7 +637,7 @@ mod tests {
                     num_deleted_rows: 0,
                 })
                 .collect(),
-            encoding: Some(transition::Encoding::StablePartition(StablePartition {
+            mapping: Some(transition::Mapping::StablePartition(StablePartition {
                 map_id: id.to_string(),
                 map_size_bytes: file.size_bytes,
                 base_id: None,
@@ -753,6 +725,30 @@ mod tests {
         fri
     }
 
+    // Maintenance and clone reopen the manifest instead of using the query cache.
+    // Persist the assembled fixture without requiring the future rewrite writer.
+    async fn persist_fixture(dataset: &mut Dataset, indices: Vec<IndexMetadata>) {
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest.version += 1;
+        manifest.update_max_fragment_id();
+        manifest.transaction_file = None;
+        manifest.transaction_section = None;
+        let location = crate::dataset::write_manifest_file(
+            &dataset.object_store,
+            dataset.commit_handler.as_ref(),
+            &dataset.base,
+            &mut manifest,
+            Some(indices),
+            &crate::dataset::ManifestWriteConfig::default(),
+            dataset.manifest_location.naming_scheme,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        *dataset = dataset.checkout_version(location.version).await.unwrap();
+    }
+
     #[tokio::test]
     async fn projected_coverage_does_not_skip_address_translation() {
         let mut dataset = fixture().await;
@@ -824,7 +820,7 @@ mod tests {
                 physical_rows: 1,
                 num_deleted_rows: 0,
             }],
-            encoding: Some(transition::Encoding::StablePartition(StablePartition {
+            mapping: Some(transition::Mapping::StablePartition(StablePartition {
                 map_id: Uuid::new_v4().to_string(),
                 map_size_bytes: 100,
                 base_id: None,
@@ -1154,6 +1150,299 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "geo")]
+    #[tokio::test]
+    async fn rtree_queries_translate_partition_addresses() {
+        let geometry_type = LineStringType::new(Dimension::XY, Default::default());
+        let mut geometry = LineStringBuilder::new(geometry_type.clone());
+        for i in 0..8 {
+            let line = line_string![(x: i as f64, y: 0.0), (x: i as f64, y: 1.0)];
+            geometry
+                .push_line_string((i != 7).then_some(&line))
+                .unwrap();
+        }
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("i", arrow_schema::DataType::Int32, false),
+                geometry_type.to_field("geometry", true),
+            ])),
+            vec![
+                Arc::new(arrow_array::Int32Array::from_iter_values(0..8)),
+                geometry.finish().to_array_ref(),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["geometry"],
+                IndexType::RTree,
+                Some("geometry_idx".into()),
+                &ScalarIndexParams::new("RTree".into()),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset.delete("i = 1").await.unwrap();
+        let (transition, destinations) = prepare(&dataset).await;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        install(&mut dataset, content, destinations, false).await;
+        let sql = "SELECT i FROM dataset WHERE ST_Intersects(geometry, ST_GeomFromText('LINESTRING (0 0.5, 6 0.5)')) ORDER BY i";
+        let batches = dataset
+            .sql(sql)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let ids: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch["i"]
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(ids, vec![0, 2, 3, 4, 5, 6]);
+        let plan = dataset
+            .sql(&format!("EXPLAIN {sql}"))
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let plan = arrow::util::pretty::pretty_format_batches(&plan)
+            .unwrap()
+            .to_string();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        assert_eq!(
+            dataset
+                .count_rows(Some("geometry IS NULL".into()))
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_only_writer_stays_on_version_zero() {
+        let mut dataset = fixture().await;
+        for round in 0..2 {
+            if round == 1 {
+                let batch = dataset
+                    .scan()
+                    .limit(Some(1), None)
+                    .unwrap()
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+                dataset
+                    .append(
+                        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                dataset.delete("i = 1").await.unwrap();
+            }
+            crate::dataset::optimize::compact_files(
+                &mut dataset,
+                crate::dataset::optimize::CompactionOptions {
+                    target_rows_per_fragment: 100,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let indices = crate::index::load_all_indices(&dataset).await.unwrap();
+            let fri = indices
+                .iter()
+                .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+                .unwrap();
+            assert_eq!(fri.index_version, 0);
+            let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+            assert_eq!(dataset.manifest.reader_feature_flags & flag, 0);
+            assert_eq!(dataset.manifest.writer_feature_flags & flag, 0);
+            let ledger = load_ledger(&dataset, fri).await.unwrap();
+            assert!(
+                ledger.transitions().iter().all(|transition| matches!(
+                    transition.mapping(),
+                    Mapping::OrderedCompaction(_)
+                ))
+            );
+            let user_index = indices.iter().find(|index| index.name == "i_idx").unwrap();
+            let remapper = super::super::frag_reuse::open_row_id_remapping(
+                &dataset,
+                user_index,
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(
+                remapper.1,
+                lance_index::scalar::RowIdRemapping::InMemory(_)
+            ));
+            assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn released_legacy_fri_keeps_version_zero_on_append() {
+        let dir =
+            crate::utils::test::copy_test_data_to_tmp("fri_straddle_pre_6610/fri_straddle_dataset")
+                .unwrap();
+        let uri = dir.std_path().to_str().unwrap();
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        let indices = crate::index::load_all_indices(&dataset).await.unwrap();
+        let fri = indices
+            .iter()
+            .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+            .unwrap();
+        assert_eq!(fri.index_version, 0);
+        // Decode the released writer's actual Any, not a reserialized modern protobuf.
+        let ledger = load_ledger(&dataset, fri).await.unwrap();
+        assert!(!ledger.transitions().is_empty());
+        let legacy = dataset
+            .open_frag_reuse_index(&NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .unwrap();
+        for transition in ledger.transitions() {
+            for source in transition.sources() {
+                for offset in 0..source.physical_rows {
+                    let original = RowAddress::new_from_parts(source.id as u32, offset as u32);
+                    let mut translated = Some(u64::from(original));
+                    while let Some(current) = translated {
+                        let Some(index) = ledger.consumer(RowAddress::from(current).fragment_id())
+                        else {
+                            break;
+                        };
+                        let Mapping::OrderedCompaction(remap) =
+                            ledger.transitions()[index].mapping()
+                        else {
+                            unreachable!()
+                        };
+                        translated = remap.get(current).unwrap();
+                    }
+                    assert_eq!(translated, legacy.remap_row_id(original.into()));
+                }
+            }
+        }
+        let original_rows = dataset.count_rows(None).await.unwrap();
+        let batch = dataset
+            .scan()
+            .limit(Some(1), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), original_rows + 1);
+        let indices = crate::index::load_all_indices(&reopened).await.unwrap();
+        let fri = indices
+            .iter()
+            .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+            .unwrap();
+        assert_eq!(fri.index_version, 0);
+        let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        assert_eq!(reopened.manifest.reader_feature_flags & flag, 0);
+        assert_eq!(reopened.manifest.writer_feature_flags & flag, 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_vector_format_is_excluded_from_rewritten_coverage() {
+        let dir = crate::utils::test::copy_test_data_to_tmp("v0.10.15/non_divisible_pq").unwrap();
+        let mut dataset = Dataset::open(dir.std_path().to_str().unwrap())
+            .await
+            .unwrap();
+        let indices = crate::index::load_all_indices(&dataset).await.unwrap();
+        let vector = indices
+            .iter()
+            .find(|index| !index.fields.is_empty())
+            .unwrap()
+            .clone();
+        assert!(
+            !vector_supports_batch_remapping(&dataset, &vector)
+                .await
+                .unwrap()
+        );
+        let mut destinations = dataset.fragments().to_vec();
+        let sources = destinations
+            .iter()
+            .map(|fragment| FragmentDigest {
+                id: fragment.id,
+                physical_rows: 1,
+                num_deleted_rows: 0,
+            })
+            .collect();
+        for fragment in &mut destinations {
+            fragment.id += 10;
+        }
+        let transition = Transition {
+            sources,
+            destinations: destinations
+                .iter()
+                .map(|fragment| FragmentDigest {
+                    id: fragment.id,
+                    physical_rows: 1,
+                    num_deleted_rows: 0,
+                })
+                .collect(),
+            mapping: Some(transition::Mapping::StablePartition(StablePartition {
+                map_id: Uuid::new_v4().to_string(),
+                map_size_bytes: 1,
+                base_id: None,
+            })),
+        };
+        // No row-map file is written: the unsupported vector segment must fall back.
+        install(
+            &mut dataset,
+            InlineContent {
+                legacy_versions: vec![],
+                transitions: vec![transition],
+            }
+            .encode_to_vec(),
+            destinations,
+            false,
+        )
+        .await;
+        assert!(
+            dataset
+                .load_index_by_name(&vector.name)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(dataset.count_rows(Some("id = 0".into())).await.unwrap(), 1);
+    }
+
     #[tokio::test]
     async fn vector_partition_uses_shared_remapping_and_cached_reconstruction() {
         let mut dataset = lance_datagen::gen_batch()
@@ -1232,33 +1521,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_encoding_falls_back_to_scan_without_opening_payload() {
+    async fn future_index_version_rejects_filtered_reads_with_upgrade() {
         let mut dataset = fixture().await;
-        let (mut transition, destinations) = prepare(&dataset).await;
-        transition.encoding = None;
-        let mut raw = transition.encode_to_vec();
-        raw.extend(field(17, b"unknown-file-reference"));
-        let fri = install(&mut dataset, field(2, &raw), destinations, false).await;
-        let mapping = QueryFragReuseIndex::open(&dataset, &fri).await.unwrap();
-        assert!(mapping.partitions.is_empty());
-        let index = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
-        assert!(index.fragment_bitmap.as_ref().unwrap().is_empty());
-        let plan = dataset
-            .scan()
-            .filter("i = 2")
-            .unwrap()
-            .explain_plan(false)
+        let (transition, destinations) = prepare(&dataset).await;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        let mut fri = install(&mut dataset, content, destinations, false).await;
+        fri.index_version = 2;
+        let indices = crate::index::load_all_indices(&dataset)
             .await
-            .unwrap();
-        assert!(!plan.contains("ScalarIndexQuery"), "{plan}");
-        assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
-        assert_eq!(
-            mapping.segment_coverage(&[
-                RoaringBitmap::from_iter([0, 1]),
-                RoaringBitmap::from_iter([10])
-            ]),
-            vec![RoaringBitmap::new(), RoaringBitmap::from_iter([10])]
+            .unwrap()
+            .iter()
+            .map(|index| {
+                if index.uuid == fri.uuid {
+                    fri.clone()
+                } else {
+                    index.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        persist_fixture(&mut dataset, indices).await;
+        let error = dataset.count_rows(Some("i = 2".into())).await.unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("Please upgrade"));
+    }
+
+    #[rstest::rstest]
+    #[case::eager_compaction("eager")]
+    #[case::deferred_compaction("deferred")]
+    #[case::statistics("statistics")]
+    #[case::cleanup("cleanup")]
+    #[case::shallow_clone("shallow")]
+    #[case::deep_clone("deep")]
+    #[tokio::test]
+    async fn unsupported_maintenance_preserves_snapshot(#[case] operation: &str) {
+        let mut dataset = fixture().await;
+        let (transition, destinations) = prepare(&dataset).await;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        let fri = install(&mut dataset, content, destinations, false).await;
+        let indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        persist_fixture(&mut dataset, indices).await;
+        let version = dataset.manifest.version;
+        let error = match operation {
+            "eager" | "deferred" => crate::dataset::optimize::compact_files(
+                &mut dataset,
+                crate::dataset::optimize::CompactionOptions {
+                    target_rows_per_fragment: 100,
+                    defer_index_remap: operation == "deferred",
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_err(),
+            "statistics" => dataset
+                .index_statistics(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap_err(),
+            "cleanup" => crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+                .await
+                .unwrap_err(),
+            "shallow" => dataset
+                .shallow_clone("memory://fri-shallow", version, None)
+                .await
+                .unwrap_err(),
+            "deep" => dataset
+                .deep_clone("memory://fri-deep", version, None)
+                .await
+                .unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(
+            error.to_string().to_lowercase().contains("upgrade"),
+            "{error}"
         );
+        assert_eq!(dataset.manifest.version, version);
+        let indices = crate::index::load_all_indices(&dataset).await.unwrap();
+        assert_eq!(
+            indices.iter().find(|index| index.uuid == fri.uuid),
+            Some(&fri)
+        );
+        assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -1357,27 +1712,27 @@ mod tests {
             Transition {
                 sources: vec![digest(u64::from(source))],
                 destinations: vec![digest(destination)],
-                encoding: Some(transition::Encoding::OrderedCompaction(
+                mapping: Some(transition::Mapping::OrderedCompaction(
                     pb::fragment_reuse_index_details::OrderedCompaction { changed_row_addrs },
                 )),
             }
         };
-        let mut opaque = Transition {
-            sources: vec![digest(1)],
-            destinations: vec![digest(2)],
-            encoding: None,
-        }
-        .encode_to_vec();
-        opaque.extend(field(17, b"future encoding"));
-        let mut content = InlineContent {
+        let content = InlineContent {
             legacy_versions: vec![],
-            transitions: vec![ordered(2, 3), ordered(0, 1)],
+            transitions: vec![ordered(2, 3), ordered(0, 1), ordered(1, 2)],
         }
         .encode_to_vec();
-        content.extend(field(2, &opaque));
+        let details = prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: field(1, &content),
+        };
+        let ledger =
+            FragReuseLedger::decode_details(1, &details, |_| async { panic!("inline content") })
+                .await
+                .unwrap();
         let mapping = Arc::new(QueryFragReuseIndex {
             live_fragments: RoaringBitmap::from_iter([3, 9]),
-            ledger: FragReuseLedger::decode(1, content.into()).unwrap(),
+            ledger,
             partitions: HashMap::new(),
             cache: WeakLanceCache::from(&LanceCache::with_capacity(0)),
             key: QueryKey("test".into()),
@@ -1386,8 +1741,8 @@ mod tests {
         assert_eq!(
             mapping.translate(&inputs).await.unwrap(),
             vec![
-                None,
-                None,
+                Some(RowAddress::new_from_parts(3, 1)),
+                Some(RowAddress::new_from_parts(3, 1)),
                 Some(RowAddress::new_from_parts(3, 1)),
                 Some(inputs[3]),
                 Some(inputs[4])
@@ -1403,7 +1758,7 @@ mod tests {
     #[case::inline(false)]
     #[case::external(true)]
     #[tokio::test]
-    async fn append_carries_unknown_fri_without_interpreting_it(#[case] external: bool) {
+    async fn append_carries_future_fri_without_interpreting_it(#[case] external: bool) {
         let mut dataset = fixture().await;
         let batch = dataset.scan().try_into_batch().await.unwrap();
         let mut transition = Transition {
@@ -1417,7 +1772,7 @@ mod tests {
                 physical_rows: 1,
                 num_deleted_rows: 0,
             }],
-            encoding: None,
+            mapping: None,
         }
         .encode_to_vec();
         transition.extend(field(17, b"opaque future mapping reference"));
@@ -1454,7 +1809,7 @@ mod tests {
                 type_url: "/lance.table.FragmentReuseIndexDetails".into(),
                 value: details,
             })),
-            index_version: 1,
+            index_version: 2,
             created_at: None,
             base_id: None,
             files: None,

@@ -3328,7 +3328,7 @@ impl Dataset {
             index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME && index.index_version != 0
         }) {
             return Err(Error::not_supported(
-                "Cloning tagged FRI requires row-map reference relocation, which is not implemented",
+                "Cloning tagged FRI requires row-map reference relocation. Please upgrade to a version supporting FRI clone",
             ));
         }
         let src_paths = src_ds.collect_paths().await?;
