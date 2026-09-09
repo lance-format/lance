@@ -1362,6 +1362,9 @@ mod tests {
         };
         assert!(content.transitions.is_empty());
         let bytes = content.encode_to_vec();
+        // A fresh identity prevents a previously opened inline history from
+        // satisfying this test through the shared session cache.
+        fri.uuid = Uuid::new_v4();
         let name = "legacy-external.binpb";
         let path = dataset.indices_dir().join(fri.uuid.to_string()).join(name);
         let mut writer = dataset.object_store.create(&path).await.unwrap();
