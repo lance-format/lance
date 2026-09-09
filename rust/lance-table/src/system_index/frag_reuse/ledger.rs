@@ -56,12 +56,19 @@ pub enum Mapping {
 /// One whole-fragment rewrite, with fragment lists in mapping order.
 #[derive(Debug)]
 pub struct Transition {
+    fingerprint: [u8; 32],
     sources: Vec<pb::FragmentDigest>,
     destinations: Vec<pb::FragmentDigest>,
     mapping: Mapping,
 }
 
 impl Transition {
+    /// Content identity for sharing an unchanged mapping across FRI histories.
+    /// Derived in memory from the canonical protobuf; it is not a persisted field.
+    pub fn fingerprint(&self) -> &[u8; 32] {
+        &self.fingerprint
+    }
+
     /// Source digests at rewrite time, including deleted physical positions.
     pub fn sources(&self) -> &[pb::FragmentDigest] {
         &self.sources
@@ -362,6 +369,7 @@ fn decode_transition(value: pb::Transition) -> Result<Transition> {
             "transition row counts differ: {source_rows} source rows, {destination_rows} destination rows"
         )));
     }
+    let fingerprint = *blake3::hash(&value.encode_to_vec()).as_bytes();
     let mapping = match value.mapping {
         Some(transition::Mapping::OrderedCompaction(ordered)) => {
             let mut cursor = Cursor::new(&ordered.changed_row_addrs);
@@ -409,6 +417,7 @@ fn decode_transition(value: pb::Transition) -> Result<Transition> {
         None => return Err(corrupt("transition has no mapping")),
     };
     Ok(Transition {
+        fingerprint,
         sources: value.sources,
         destinations: value.destinations,
         mapping,
@@ -549,6 +558,49 @@ mod tests {
         let error = result.unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
         assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[test]
+    fn mapping_identity_survives_legacy_lifting_and_tracks_content() {
+        let mapping = ordered(
+            vec![digest(1, 3, 1)],
+            vec![digest(2, 2, 0)],
+            &[address(1, 0), address(1, 2)],
+        );
+        let Some(transition::Mapping::OrderedCompaction(ordered_mapping)) = &mapping.mapping else {
+            unreachable!()
+        };
+        let legacy = pb::InlineContent {
+            legacy_versions: vec![pb::Version {
+                dataset_version: 7,
+                groups: vec![pb::Group {
+                    changed_row_addrs: ordered_mapping.changed_row_addrs.clone(),
+                    old_fragments: mapping.sources.clone(),
+                    new_fragments: mapping.destinations.clone(),
+                }],
+            }],
+            transitions: vec![],
+        }
+        .encode_to_vec();
+        let legacy = FragReuseLedger::decode_content(0, legacy.into()).unwrap();
+        let tagged = FragReuseLedger::decode_content(1, history(vec![mapping])).unwrap();
+        assert_eq!(
+            legacy.transitions()[0].fingerprint(),
+            tagged.transitions()[0].fingerprint()
+        );
+        let different = FragReuseLedger::decode_content(
+            1,
+            history(vec![ordered(
+                vec![digest(1, 3, 1)],
+                vec![digest(2, 2, 0)],
+                &[address(1, 0), address(1, 1)],
+            )]),
+        )
+        .unwrap();
+        assert_ne!(
+            tagged.transitions()[0].fingerprint(),
+            different.transitions()[0].fingerprint()
+        );
     }
 
     #[test]
