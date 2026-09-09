@@ -190,11 +190,8 @@ type Result<T> = std::result::Result<T, WriteOverlayError>;
 /// Open it with [`FileFragment::write_overlay`], feed it batches keyed by
 /// `_rowaddr`, and [`finish`](Self::finish) it into a [`DataOverlayGroup`] ready
 /// for `Operation::DataOverlay`. On an error of the caller's own,
-/// [`abort`](Self::abort) discards the staged file; `finish` cleans up after its
-/// own failures.
-///
-/// The writer owns everything it needs, so it is `Send + 'static` and several
-/// can be open at once — one per fragment when a single scan spans a range.
+/// [`abort`](Self::abort) discards the staged file. If an error occurs during
+/// the call to [`finish`](Self::finish), the staged file is cleaned up automatically.
 pub struct OverlayWriter {
     dataset: Arc<Dataset>,
     fragment_id: u64,
@@ -278,14 +275,6 @@ impl OverlayWriter {
     ///
     /// Passing a NULL value covers that cell *with* NULL, overriding the base
     /// value. To leave a cell alone, omit its row.
-    ///
-    /// The batch is checked in full before anything is written, so a batch
-    /// rejected by any of the rules above contributes nothing to the staged
-    /// file and the writer can be used again. An error from underneath —
-    /// [`Other`](WriteOverlayError::Other), an I/O or encoding failure — can
-    /// arrive with part of the batch already written, so the writer must be
-    /// discarded rather than reused: call [`abort`](Self::abort), or drop it
-    /// and let cleanup reclaim the staged file.
     pub async fn write_batch(&mut self, data: &RecordBatch) -> Result<()> {
         let offsets_in_frag = self.validated_offsets(data)?;
         let positions = self.validated_columns(data)?;
@@ -408,9 +397,10 @@ impl OverlayWriter {
 
     /// Discard the staged file without committing anything.
     ///
-    /// For the caller's own error paths — [`finish`](Self::finish) already
-    /// cleans up after its own failures. Best effort: a file left behind is
-    /// unreferenced either way, and cleanup reclaims it.
+    /// Best effort: a file left behind is unreferenced either way, and cleanup reclaims it.
+    ///
+    /// This is not callable after calling [`finish`](Self::finish). That method
+    /// will invoke the cleanup in the case of errors automatically.
     pub async fn abort(self) {
         self.discard().await
     }
