@@ -58,6 +58,11 @@ impl AutoProbePolicy {
         if query.maximum_nprobes == Some(query.minimum_nprobes) {
             return Ok(Self::Fixed);
         }
+        // Legacy IVF indices do not expose sub-index metadata. Keep their
+        // original probing without calling those unsupported methods.
+        if !index.supports_prepared_partition_search() {
+            return Ok(Self::Legacy);
+        }
         if query.maximum_nprobes.is_some()
             || query.key.data_type() != &DataType::Float32
             || query.key.null_count() != 0

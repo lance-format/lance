@@ -2647,6 +2647,7 @@ mod tests {
         Flat,
         Product,
         Hnsw,
+        Legacy,
     }
 
     #[derive(Debug, DeepSizeOf)]
@@ -2882,7 +2883,7 @@ mod tests {
         }
 
         fn supports_prepared_partition_search(&self) -> bool {
-            true
+            !matches!(self.kind, PreparedIndexKind::Legacy)
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -3032,6 +3033,7 @@ mod tests {
                 PreparedIndexKind::Flat => (SubIndexType::Flat, QuantizationType::Flat),
                 PreparedIndexKind::Product => (SubIndexType::Flat, QuantizationType::Product),
                 PreparedIndexKind::Hnsw => (SubIndexType::Hnsw, QuantizationType::Flat),
+                PreparedIndexKind::Legacy => panic!("legacy sub-index metadata is unavailable"),
             }
         }
 
@@ -3235,6 +3237,7 @@ mod tests {
     #[case::multivector("multi", false)]
     #[case::product("product", false)]
     #[case::hnsw("hnsw", false)]
+    #[case::legacy("legacy", false)]
     #[case::bounded("bounded", false)]
     #[case::fixed("fixed", false)]
     #[case::large_k("large_k", false)]
@@ -3279,6 +3282,7 @@ mod tests {
             kind: match scenario {
                 "product" => PreparedIndexKind::Product,
                 "hnsw" => PreparedIndexKind::Hnsw,
+                "legacy" => PreparedIndexKind::Legacy,
                 _ => PreparedIndexKind::Flat,
             },
             prepared_partitions: Arc::default(),
