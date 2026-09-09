@@ -80,6 +80,7 @@ mod api;
 pub(crate) mod append;
 mod create;
 pub mod frag_reuse;
+pub(crate) mod frag_reuse_query;
 pub mod mem_wal;
 pub mod prefilter;
 pub mod scalar;
@@ -1873,6 +1874,43 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indices = load_all_indices(self).await?;
+        if let Some(fri) = indices
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version != 0)
+        {
+            let mapping = frag_reuse_query::QueryFragReuseIndex::open(self, fri).await?;
+            let mut indices: Vec<_> = indices
+                .iter()
+                .filter(|idx| {
+                    index_is_usable(idx)
+                        && (idx.name == FRAG_REUSE_INDEX_NAME
+                            || (segment_has_btree_details(idx) && idx.fragment_bitmap.is_some())
+                            || !mapping.needs_translation(idx.fragment_bitmap.as_ref()))
+                })
+                .cloned()
+                .collect();
+            let mut groups: HashMap<String, Vec<(usize, RoaringBitmap)>> = HashMap::new();
+            for (position, index) in indices.iter().enumerate() {
+                if index.name != FRAG_REUSE_INDEX_NAME
+                    && let Some(bitmap) = &index.fragment_bitmap
+                {
+                    groups
+                        .entry(index.name.clone())
+                        .or_default()
+                        .push((position, bitmap.clone()));
+                }
+            }
+            for members in groups.into_values() {
+                let (positions, provenance): (Vec<_>, Vec<_>) = members.into_iter().unzip();
+                for (position, coverage) in positions
+                    .into_iter()
+                    .zip(mapping.segment_coverage(&provenance))
+                {
+                    indices[position].fragment_bitmap = Some(coverage);
+                }
+            }
+            return Ok(Arc::new(indices));
+        }
         if indices.iter().all(index_is_usable) {
             return Ok(indices);
         }
@@ -2808,6 +2846,24 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
         }
     }
 
+    if let Some(fri) = indices
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version != 0)
+    {
+        if indices
+            .iter()
+            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .count()
+            != 1
+        {
+            return Err(Error::corrupt_file_named(
+                "FRI metadata",
+                "tagged history requires a single FRI entry",
+            ));
+        }
+        frag_reuse_query::QueryFragReuseIndex::open(dataset, fri).await?;
+        return Ok(indices);
+    }
     if let Some(frag_reuse_index_meta) =
         indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
     {
@@ -3350,6 +3406,9 @@ impl DatasetIndexInternalExt for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
         if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
+            if frag_reuse_index_meta.index_version != 0 {
+                return Ok(None);
+            }
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
             let frag_reuse_key = FragReuseIndexKey {
                 uuid: &frag_reuse_uuid,

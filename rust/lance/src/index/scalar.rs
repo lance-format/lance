@@ -527,7 +527,7 @@ async fn validate_label_list_index_compatibility(
     dataset: &Dataset,
     column: &str,
     index: &IndexMetadata,
-    index_store: &Arc<LanceIndexStore>,
+    index_store: &dyn IndexStore,
 ) -> Result<()> {
     let Some(field) = dataset.schema().field(column) else {
         return Ok(());
@@ -572,14 +572,44 @@ pub async fn open_scalar_index(
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
-
+    let metadata = dataset.load_indices().await?;
+    let tagged = metadata.iter().find(|idx| {
+        idx.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME && idx.index_version != 0
+    });
+    let legacy = dataset.open_frag_reuse_index(metrics).await?;
+    let cache_id = tagged
+        .map(|idx| idx.uuid)
+        .or_else(|| legacy.as_ref().map(|f| f.uuid));
     let index_cache = dataset
         .index_cache
-        .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
-
-    let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> = frag_reuse_index
-        .map(|f| Arc::new(CompactFragReuseIndexHandle(f)) as Arc<dyn RowIdRemapper>);
+        .for_index(&index.uuid, cache_id.as_ref());
+    let index_cache = if tagged.is_some() {
+        index_cache.with_key_prefix(dataset.manifest_location.path.as_ref())
+    } else {
+        index_cache
+    };
+    let frag_reuse_index =
+        legacy.map(|f| Arc::new(CompactFragReuseIndexHandle(f)) as Arc<dyn RowIdRemapper>);
+    let index_store: Arc<dyn IndexStore> = if let Some(fri) = tagged {
+        let mapping = super::frag_reuse_query::QueryFragReuseIndex::open(dataset, fri).await?;
+        if index_details.type_url.ends_with("BTreeIndexDetails") {
+            let coverage = metadata
+                .iter()
+                .find(|idx| idx.uuid == index.uuid)
+                .and_then(|idx| idx.fragment_bitmap.clone())
+                .unwrap_or_default()
+                & dataset.fragment_bitmap.as_ref();
+            Arc::new(super::frag_reuse_query::TranslatedIndexStore::new(
+                index_store,
+                mapping,
+                coverage,
+            ))
+        } else {
+            index_store
+        }
+    } else {
+        index_store
+    };
 
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
@@ -590,8 +620,13 @@ pub async fn open_scalar_index(
         let index_cache = index_cache.clone();
         async move {
             if index_details.type_url.ends_with("LabelListIndexDetails") {
-                validate_label_list_index_compatibility(dataset, column, index, &index_store)
-                    .await?;
+                validate_label_list_index_compatibility(
+                    dataset,
+                    column,
+                    index,
+                    index_store.as_ref(),
+                )
+                .await?;
             }
 
             let index = plugin
@@ -613,10 +648,18 @@ pub(crate) async fn cached_scalar_index_container(
     dataset: &Dataset,
     uuid: &Uuid,
 ) -> Option<Arc<dyn ScalarIndex>> {
-    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let metadata = dataset.load_indices().await.ok()?;
+    let fri = metadata
+        .iter()
+        .find(|idx| idx.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
     let index_cache = dataset
         .index_cache
-        .for_index(uuid, frag_reuse_uuid.as_ref());
+        .for_index(uuid, fri.map(|idx| &idx.uuid));
+    let index_cache = if fri.is_some_and(|idx| idx.index_version != 0) {
+        index_cache.with_key_prefix(dataset.manifest_location.path.as_ref())
+    } else {
+        index_cache
+    };
     index_cache.get_unsized_with_key(&ScalarIndexCacheKey).await
 }
 
