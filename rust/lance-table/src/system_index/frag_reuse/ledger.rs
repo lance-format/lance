@@ -3,20 +3,32 @@
 
 //! Metadata-only reader for the unified fragment reuse history.
 //!
-//! Decoding validates lineage without opening mapping files. Unknown alternatives
-//! retain only their common fragment metadata for conservative query coverage.
+//! Decoding validates lineage without opening row-map files. Unsupported index
+//! versions are rejected before interpreting their content.
 //! Operations that carry an index forward keep its original `Any` separately.
 //!
 //! ```
-//! use bytes::Bytes;
 //! use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
+//! use prost::Message;
+//! use lance_table::format::pb;
 //!
-//! let ledger = FragReuseLedger::decode(1, Bytes::new())?;
+//! # async fn example() -> lance_core::Result<()> {
+//! let details = prost_types::Any {
+//!     type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+//!     value: pb::FragmentReuseIndexDetails {
+//!         content: Some(pb::fragment_reuse_index_details::Content::Inline(Default::default())),
+//!     }.encode_to_vec(),
+//! };
+//! let ledger = FragReuseLedger::decode_details(1, &details, |_| async {
+//!     Err(lance_core::Error::not_supported("external content is unavailable"))
+//! }).await?;
 //! assert!(ledger.transitions().is_empty());
-//! # Ok::<(), lance_core::Error>(())
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io::Cursor;
 
 use bytes::{Buf, Bytes};
@@ -38,11 +50,6 @@ pub enum Mapping {
     OrderedCompaction(RowAddrRemap),
     /// Immutable row-map reference, with the base selected by its optional base ID.
     StablePartition(pb::StablePartition),
-    /// An unrecognized alternative; it cannot provide address translation.
-    Unknown {
-        /// Protobuf field number identifying the future mapping alternative.
-        field_number: u32,
-    },
 }
 
 /// One whole-fragment rewrite, with fragment lists in mapping order.
@@ -64,7 +71,7 @@ impl Transition {
         &self.destinations
     }
 
-    /// Mapping semantics, or an opaque future alternative.
+    /// Mapping semantics for a supported index version.
     pub fn mapping(&self) -> &Mapping {
         &self.mapping
     }
@@ -79,15 +86,64 @@ pub struct FragReuseLedger {
 }
 
 impl FragReuseLedger {
-    /// Decode serialized `InlineContent`, after resolving the outer inline/external
-    /// wrapper. Versions 0 (legacy only) and 1 (mixed history) are supported.
-    /// Unsupported versions and malformed or ambiguous lineage are rejected.
-    pub fn decode(index_version: i32, content: Bytes) -> Result<Self> {
-        if !matches!(index_version, 0 | 1) {
-            return Err(Error::not_supported(format!(
-                "FRI index_version {index_version}; supported versions are 0 and 1"
+    /// Decode FRI details, resolving external history through `read_external`.
+    /// The callback reads the exact byte range described by the external reference;
+    /// it is never used for inline history or stable-partition row maps.
+    /// Index versions 0 and 1 are supported. Unsupported versions require an upgrade.
+    pub async fn decode_details<F, Fut>(
+        index_version: i32,
+        details: &prost_types::Any,
+        read_external: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(crate::format::pb::ExternalFile) -> Fut,
+        Fut: Future<Output = Result<Bytes>>,
+    {
+        validate_index_version(index_version)?;
+        if details.type_url.rsplit('/').next() != Some("lance.table.FragmentReuseIndexDetails") {
+            return Err(corrupt(format!(
+                "unexpected FRI details type {:?}",
+                details.type_url
             )));
         }
+        let mut wire = Bytes::copy_from_slice(&details.value);
+        let mut content = None;
+        while wire.has_remaining() {
+            let (tag, payload) = next_field(&mut wire)?;
+            if matches!(tag, 1 | 2) {
+                let payload = require_message(tag, payload)?;
+                if content.replace((tag, payload)).is_some() {
+                    return Err(corrupt("multiple FRI content fields"));
+                }
+            }
+        }
+        let (tag, content) = content.ok_or_else(|| corrupt("missing FRI content"))?;
+        let content = if tag == 1 {
+            content
+        } else {
+            let file = crate::format::pb::ExternalFile::decode(content)
+                .map_err(|e| corrupt(e.to_string()))?;
+            file.offset
+                .checked_add(file.size)
+                .and_then(|end| usize::try_from(end).ok())
+                .ok_or_else(|| corrupt("external FRI range overflow"))?;
+            let expected = file.size;
+            let bytes = read_external(file).await?;
+            if bytes.len() as u64 != expected {
+                return Err(corrupt(format!(
+                    "external FRI size mismatch: expected {expected}, received {}",
+                    bytes.len()
+                )));
+            }
+            bytes
+        };
+        Self::decode(index_version, content)
+    }
+
+    // Each legacy group owns a compaction remap. Address resolution follows its
+    // fragment lineage, rather than searching every group in a legacy version.
+    fn decode(index_version: i32, content: Bytes) -> Result<Self> {
+        validate_index_version(index_version)?;
         let mut remaining = content;
         let mut transitions = Vec::new();
         while remaining.has_remaining() {
@@ -97,18 +153,15 @@ impl FragReuseLedger {
                     let version = pb::Version::decode(require_message(tag, payload)?)
                         .map_err(|e| corrupt(e.to_string()))?;
                     for group in version.groups {
-                        transitions.push(decode_transition(
-                            pb::Transition {
-                                sources: group.old_fragments,
-                                destinations: group.new_fragments,
-                                encoding: Some(transition::Encoding::OrderedCompaction(
-                                    pb::OrderedCompaction {
-                                        changed_row_addrs: group.changed_row_addrs,
-                                    },
-                                )),
-                            },
-                            5,
-                        )?);
+                        transitions.push(decode_transition(pb::Transition {
+                            sources: group.old_fragments,
+                            destinations: group.new_fragments,
+                            mapping: Some(transition::Mapping::OrderedCompaction(
+                                pb::OrderedCompaction {
+                                    changed_row_addrs: group.changed_row_addrs,
+                                },
+                            )),
+                        })?);
                     }
                 }
                 2 => {
@@ -117,23 +170,25 @@ impl FragReuseLedger {
                     }
                     let raw = require_message(tag, payload)?;
                     let mut fields = raw.clone();
-                    let mut mapping_tag = None;
+                    let mut has_mapping = false;
                     while fields.has_remaining() {
                         let (tag, payload) = next_field(&mut fields)?;
-                        if tag >= 5 {
+                        if matches!(tag, ORDERED_COMPACTION_FIELD | STABLE_PARTITION_FIELD) {
                             require_message(tag, payload)?;
-                            if mapping_tag.replace(tag).is_some() {
+                            if has_mapping {
                                 return Err(corrupt(
                                     "transition contains multiple mapping alternatives",
                                 ));
                             }
+                            has_mapping = true;
                         }
                     }
-                    let mapping_tag =
-                        mapping_tag.ok_or_else(|| corrupt("transition has no mapping"))?;
+                    if !has_mapping {
+                        return Err(corrupt("transition has no mapping"));
+                    }
                     let decoded =
                         pb::Transition::decode(raw).map_err(|e| corrupt(e.to_string()))?;
-                    transitions.push(decode_transition(decoded, mapping_tag)?);
+                    transitions.push(decode_transition(decoded)?);
                 }
                 _ => {} // Unknown envelope fields do not participate in address resolution.
             }
@@ -200,11 +255,23 @@ impl DeepSizeOf for FragReuseLedger {
                                 remap.deep_size_of_children(context)
                             }
                             Mapping::StablePartition(reference) => reference.map_id.capacity(),
-                            Mapping::Unknown { .. } => 0,
                         }
                 })
                 .sum::<usize>()
     }
+}
+
+// Exact protobuf alternatives, not the start of a reserved field-number range.
+const ORDERED_COMPACTION_FIELD: u32 = 3;
+const STABLE_PARTITION_FIELD: u32 = 4;
+
+fn validate_index_version(index_version: i32) -> Result<()> {
+    if !matches!(index_version, 0 | 1) {
+        return Err(Error::not_supported(format!(
+            "Unsupported FRI index_version {index_version}; supported versions are 0 and 1. Please upgrade to a newer version of Lance."
+        )));
+    }
+    Ok(())
 }
 
 fn corrupt(message: impl Into<String>) -> Error {
@@ -264,7 +331,7 @@ fn validate_digests(digests: &[pb::FragmentDigest], is_destination: bool) -> Res
     Ok(live_rows)
 }
 
-fn decode_transition(value: pb::Transition, mapping_tag: u32) -> Result<Transition> {
+fn decode_transition(value: pb::Transition) -> Result<Transition> {
     if value.sources.is_empty() {
         return Err(corrupt("transition has no source fragments"));
     }
@@ -275,8 +342,8 @@ fn decode_transition(value: pb::Transition, mapping_tag: u32) -> Result<Transiti
             "transition row counts differ: {source_rows} source rows, {destination_rows} destination rows"
         )));
     }
-    let mapping = match value.encoding {
-        Some(transition::Encoding::OrderedCompaction(ordered)) => {
+    let mapping = match value.mapping {
+        Some(transition::Mapping::OrderedCompaction(ordered)) => {
             let mut cursor = Cursor::new(&ordered.changed_row_addrs);
             let bitmap = RoaringTreemap::deserialize_from(&mut cursor)
                 .map_err(|e| corrupt(e.to_string()))?;
@@ -307,7 +374,7 @@ fn decode_transition(value: pb::Transition, mapping_tag: u32) -> Result<Transiti
             .map_err(|e| corrupt(e.to_string()))?;
             Mapping::OrderedCompaction(remap)
         }
-        Some(transition::Encoding::StablePartition(partition)) => {
+        Some(transition::Mapping::StablePartition(partition)) => {
             Uuid::parse_str(&partition.map_id).map_err(|e| {
                 corrupt(format!(
                     "invalid stable partition map_id {:?}: {e}",
@@ -319,9 +386,7 @@ fn decode_transition(value: pb::Transition, mapping_tag: u32) -> Result<Transiti
             }
             Mapping::StablePartition(partition)
         }
-        None => Mapping::Unknown {
-            field_number: mapping_tag,
-        },
+        None => return Err(corrupt("transition has no mapping")),
     };
     Ok(Transition {
         sources: value.sources,
@@ -378,6 +443,7 @@ fn order_lineage(transitions: Vec<Transition>) -> Result<Vec<Transition>> {
     let mut ordered = Vec::with_capacity(transitions.len());
     let mut transitions: Vec<_> = transitions.into_iter().map(Some).collect();
     while let Some(index) = ready.pop_front() {
+        // Each transition is queued once, when its incoming count reaches zero.
         let transition = transitions[index]
             .take()
             .ok_or_else(|| corrupt("lineage visited a transition twice"))?;
@@ -412,7 +478,7 @@ mod tests {
         pb::Transition {
             sources: vec![digest(source, 2, 0)],
             destinations: vec![digest(destination, 2, 0)],
-            encoding: Some(transition::Encoding::StablePartition(pb::StablePartition {
+            mapping: Some(transition::Mapping::StablePartition(pb::StablePartition {
                 map_id: Uuid::nil().to_string(),
                 map_size_bytes: 100,
                 base_id: Some(7),
@@ -446,7 +512,7 @@ mod tests {
         pb::Transition {
             sources,
             destinations,
-            encoding: Some(transition::Encoding::OrderedCompaction(
+            mapping: Some(transition::Mapping::OrderedCompaction(
                 pb::OrderedCompaction { changed_row_addrs },
             )),
         }
@@ -469,7 +535,7 @@ mod tests {
             vec![digest(3, 3, 0)],
             &[address(2, 0), address(2, 2), address(1, 0)],
         );
-        let Some(transition::Encoding::OrderedCompaction(mapping)) = old.encoding else {
+        let Some(transition::Mapping::OrderedCompaction(mapping)) = old.mapping else {
             unreachable!()
         };
         let mut next = partition(3, 4);
@@ -519,25 +585,18 @@ mod tests {
     }
 
     #[test]
-    fn unknown_mapping_retains_common_metadata_and_lineage() {
-        let mut unknown = partition(1, 2);
-        unknown.encoding = None;
-        let mut raw = unknown.encode_to_vec();
-        message_field(17, b"future external mapping", &mut raw);
-        let mut content = history(vec![partition(2, 3), partition(10, 11)]).to_vec();
+    fn ordinary_metadata_is_not_a_mapping() {
+        let mut raw = partition(1, 2).encode_to_vec();
+        message_field(17, b"future metadata", &mut raw);
+        prost::encoding::encode_key(7, WireType::Varint, &mut raw);
+        prost::encoding::encode_varint(100, &mut raw);
+        let mut content = Vec::new();
         message_field(2, &raw, &mut content);
-        message_field(19, b"future envelope metadata", &mut content);
-        let content = Bytes::from(content);
-        let ledger = FragReuseLedger::decode(1, content).unwrap();
-        let nodes = ledger.transitions();
-        let unknown_index = nodes
-            .iter()
-            .position(|t| matches!(t.mapping(), Mapping::Unknown { field_number: 17 }))
-            .unwrap();
-        let dependent_index = nodes.iter().position(|t| t.sources()[0].id == 2).unwrap();
-        assert!(unknown_index < dependent_index);
-        assert_eq!(nodes[unknown_index].sources()[0].id, 1);
-        assert_eq!(nodes[unknown_index].destinations()[0].id, 2);
+        let ledger = FragReuseLedger::decode(1, content.into()).unwrap();
+        assert!(matches!(
+            ledger.transitions()[0].mapping(),
+            Mapping::StablePartition(_)
+        ));
     }
 
     #[rstest]
@@ -562,17 +621,22 @@ mod tests {
         let ledger = FragReuseLedger::decode(1, history(vec![second, first])).unwrap();
         assert_eq!(ledger.transitions()[0].sources()[0].id, 1);
         assert_eq!(ledger.transitions()[1].sources()[0].id, 3);
+        let Mapping::OrderedCompaction(remap) = ledger.transitions()[1].mapping() else {
+            unreachable!()
+        };
+        assert_eq!(remap.get(address(3, 0)), Some(None));
+        for (source, destination) in [(address(3, 1), 0), (address(2, 0), 1), (address(2, 1), 2)] {
+            assert_eq!(remap.get(source), Some(Some(address(4, destination))));
+        }
     }
 
     #[rstest]
     #[case::missing(vec![], "no mapping")]
-    #[case::duplicate_known(vec![6, 6], "multiple mapping")]
-    #[case::conflicting_known(vec![5, 6], "multiple mapping")]
-    #[case::known_unknown(vec![6, 9], "multiple mapping")]
-    #[case::duplicate_unknown(vec![9, 9], "multiple mapping")]
+    #[case::duplicate_known(vec![4, 4], "multiple mapping")]
+    #[case::conflicting_known(vec![3, 4], "multiple mapping")]
     fn rejects_ambiguous_mapping(#[case] tags: Vec<u32>, #[case] message: &str) {
         let mut transition = partition(1, 2);
-        transition.encoding = None;
+        transition.mapping = None;
         let mut raw = transition.encode_to_vec();
         for tag in tags {
             message_field(tag, &[], &mut raw);
@@ -585,7 +649,7 @@ mod tests {
     #[rstest]
     #[case::truncated(vec![0x12, 10, 0], "exceeds remaining")]
     #[case::wrong_transition_wire(vec![0x10, 0], "length-delimited")]
-    #[case::wrong_mapping_wire(vec![0x12, 2, 0x48, 0], "length-delimited")]
+    #[case::wrong_mapping_wire(vec![0x12, 2, 0x20, 0], "length-delimited")]
     #[case::invalid_key(vec![0], "invalid tag")]
     fn rejects_malformed_wire(#[case] content: Vec<u8>, #[case] message: &str) {
         assert_corrupt(FragReuseLedger::decode(1, content.into()), message);
@@ -636,8 +700,7 @@ mod tests {
             "survivors",
         );
         let mut transition = partition(1, 2);
-        let Some(transition::Encoding::StablePartition(reference)) = &mut transition.encoding
-        else {
+        let Some(transition::Mapping::StablePartition(reference)) = &mut transition.mapping else {
             unreachable!()
         };
         reference.map_id = "../escape".into();
@@ -672,5 +735,159 @@ mod tests {
             FragReuseLedger::decode(0, history(vec![partition(1, 2)])),
             "index_version 1",
         );
+    }
+    #[rstest]
+    #[case::inline(false)]
+    #[case::external(true)]
+    #[tokio::test]
+    async fn legacy_writer_round_trip_and_remap_equivalence(#[case] external: bool) {
+        use crate::system_index::frag_reuse::{
+            CompactFragReuseIndex, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
+        };
+        let group = |sources, destinations, addresses: &[u64]| {
+            let transition = ordered(sources, destinations, addresses);
+            let Some(transition::Mapping::OrderedCompaction(mapping)) = transition.mapping else {
+                unreachable!()
+            };
+            FragReuseGroup::try_from(pb::Group {
+                old_fragments: transition.sources,
+                new_fragments: transition.destinations,
+                changed_row_addrs: mapping.changed_row_addrs,
+            })
+            .unwrap()
+        };
+        let details = FragReuseIndexDetails {
+            versions: vec![
+                FragReuseVersion {
+                    dataset_version: 10,
+                    groups: vec![
+                        group(
+                            vec![digest(2, 3, 1), digest(1, 1, 0)],
+                            vec![digest(3, 3, 0)],
+                            &[address(2, 0), address(2, 2), address(1, 0)],
+                        ),
+                        group(
+                            vec![digest(10, 1, 0)],
+                            vec![digest(11, 1, 0)],
+                            &[address(10, 0)],
+                        ),
+                    ],
+                },
+                FragReuseVersion {
+                    dataset_version: 11,
+                    groups: vec![group(
+                        vec![digest(3, 3, 1)],
+                        vec![digest(4, 2, 0)],
+                        &[address(3, 0), address(3, 2)],
+                    )],
+                },
+            ],
+        };
+        // Use the same serializer as the index-version-0 writer.
+        let content = pb::InlineContent::from(&details).encode_to_vec();
+        let old = CompactFragReuseIndex::try_new(Uuid::nil(), details).unwrap();
+        let file = crate::format::pb::ExternalFile {
+            path: "details.binpb".into(),
+            offset: 7,
+            size: content.len() as u64,
+        };
+        let mut envelope = Vec::new();
+        if external {
+            message_field(2, &file.encode_to_vec(), &mut envelope);
+        } else {
+            message_field(1, &content, &mut envelope);
+        }
+        let any = prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: envelope,
+        };
+        let ledger = FragReuseLedger::decode_details(1, &any, |actual| async move {
+            assert!(external);
+            assert_eq!(actual, file);
+            Ok(content.into())
+        })
+        .await
+        .unwrap();
+        assert_eq!(ledger.transitions().len(), 3);
+        for source in [
+            address(2, 0),
+            address(2, 1),
+            address(2, 2),
+            address(1, 0),
+            address(10, 0),
+            address(99, 0),
+        ] {
+            let mut translated = Some(source);
+            while let Some(current) = translated {
+                let fragment = RowAddress::from(current).fragment_id();
+                let Some(index) = ledger.consumer(fragment) else {
+                    break;
+                };
+                let Mapping::OrderedCompaction(remap) = ledger.transitions()[index].mapping()
+                else {
+                    unreachable!()
+                };
+                translated = remap.get(current).unwrap();
+            }
+            assert_eq!(translated, old.remap_row_id(source), "address {source}");
+        }
+    }
+
+    #[test]
+    fn independent_transitions_keep_serialized_order() {
+        let ledger =
+            FragReuseLedger::decode(1, history(vec![partition(10, 11), partition(1, 2)])).unwrap();
+        assert_eq!(
+            ledger
+                .transitions()
+                .iter()
+                .map(|t| t.sources()[0].id)
+                .collect::<Vec<_>>(),
+            vec![10, 1]
+        );
+    }
+
+    #[rstest]
+    #[case::missing(vec![], "missing FRI content")]
+    #[case::duplicate(vec![0x0a, 0, 0x0a, 0], "multiple FRI content")]
+    #[case::conflicting(vec![0x0a, 0, 0x12, 0], "multiple FRI content")]
+    #[case::truncated(vec![0x0a, 10, 0], "exceeds remaining")]
+    #[tokio::test]
+    async fn rejects_invalid_envelope(#[case] value: Vec<u8>, #[case] message: &str) {
+        let any = prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value,
+        };
+        let result = FragReuseLedger::decode_details(1, &any, |_| async {
+            panic!("invalid envelope must not read external content")
+        })
+        .await;
+        assert_corrupt(result, message);
+    }
+
+    #[tokio::test]
+    async fn version_gate_precedes_envelope_and_io() {
+        let error = FragReuseLedger::decode_details(2, &prost_types::Any::default(), |_| async {
+            panic!("unsupported version must not read external content")
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("Please upgrade"));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn arbitrary_inline_bytes_do_not_panic(raw in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
+            let _ = FragReuseLedger::decode(1, raw.into());
+        }
+
+        #[test]
+        fn arbitrary_envelopes_do_not_panic(raw in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
+            let any = prost_types::Any { type_url: "/lance.table.FragmentReuseIndexDetails".into(), value: raw };
+            let _ = futures::executor::block_on(FragReuseLedger::decode_details(1, &any, |_| async {
+                Err(Error::not_supported("no external data in parser property test"))
+            }));
+        }
     }
 }
