@@ -35,7 +35,10 @@ use uuid::Uuid;
 #[case::all_segments("all")]
 #[case::partial_selection("partial")]
 #[tokio::test]
-async fn vector_fragment_search_requires_every_contributor(#[case] selection: &str) {
+async fn vector_fragment_search_requires_every_contributor(
+    #[case] selection: &str,
+    #[values(false, true)] filtered_destination: bool,
+) {
     let mut dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
         .col(
@@ -88,7 +91,13 @@ async fn vector_fragment_search_requires_every_contributor(#[case] selection: &s
     install(&mut dataset, content, destinations, false).await;
     let mut scan = dataset.scan();
     scan.nearest("vector", query, 1).unwrap();
-    scan.with_fragments(dataset.fragments().iter().cloned().collect());
+    if filtered_destination {
+        scan.with_fragments(vec![dataset.fragments()[0].clone()]);
+        scan.filter("i = 6").unwrap();
+        scan.prefilter(true);
+    } else {
+        scan.with_fragments(dataset.fragments().iter().cloned().collect());
+    }
     match selection {
         "all" => {
             scan.with_index_segments(ids).unwrap();
@@ -209,6 +218,84 @@ async fn destination_coverage_requires_every_contributing_segment(#[case] scenar
     }
 }
 
+#[rstest::rstest]
+#[case::only_c(false)]
+#[case::both_destinations(true)]
+#[tokio::test]
+async fn direct_destination_coverage_preserves_partial_index_queries(#[case] both: bool) {
+    let mut dataset = fixture().await;
+    let params = ScalarIndexParams::default();
+    let sources: Vec<_> = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let mut segments = Vec::new();
+    for source in sources {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+                .name("i_idx".into())
+                .replace(true)
+                .fragments(vec![source])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments("i_idx", "i", segments)
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let covered: Vec<_> = dataset
+        .fragments()
+        .iter()
+        .take(if both { 2 } else { 1 })
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let direct = CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+        .name("i_idx".into())
+        .replace(true)
+        .fragments(covered.clone())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let mut indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    if !both {
+        // No index path reaches D, but direct coverage of C must remain usable.
+        indices.retain(|index| index.name == FRAG_REUSE_INDEX_NAME);
+    }
+    indices.push(direct.clone());
+    persist_fixture(&mut dataset, indices).await;
+    let usable = crate::index::scalar_logical::load_named_scalar_segments(&dataset, "i", "i_idx")
+        .await
+        .unwrap();
+    assert_eq!(usable.len(), 1);
+    assert_eq!(usable[0].uuid, direct.uuid);
+    assert_eq!(
+        usable[0].fragment_bitmap,
+        Some(RoaringBitmap::from_iter(covered))
+    );
+    let mut scan = dataset.scan();
+    scan.filter("i >= 0").unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut values = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+    values.sort_unstable();
+    assert_eq!(values, (0..8).collect::<Vec<_>>(), "{plan}");
+}
+
 #[tokio::test]
 async fn projected_coverage_does_not_skip_address_translation() {
     let mut dataset = fixture().await;
@@ -321,17 +408,17 @@ async fn scalar_queries_translate_deleted_sources_and_lazy_blocks(
         1
     );
     let inputs = [
-        RowAddress::new_from_parts(1, 3),
-        RowAddress::new_from_parts(0, 2),
-        RowAddress::new_from_parts(0, 2),
-        RowAddress::new_from_parts(0, 3),
+        u64::from(RowAddress::new_from_parts(1, 3)),
+        u64::from(RowAddress::new_from_parts(0, 2)),
+        u64::from(RowAddress::new_from_parts(0, 2)),
+        u64::from(RowAddress::new_from_parts(0, 3)),
     ];
     assert_eq!(
-        mapping.translate(&inputs).await.unwrap(),
+        mapping.remap_row_ids(&inputs).await.unwrap(),
         vec![
-            Some(RowAddress::new_from_parts(11, 2)),
-            Some(RowAddress::new_from_parts(10, 1)),
-            Some(RowAddress::new_from_parts(10, 1)),
+            Some(u64::from(RowAddress::new_from_parts(11, 2))),
+            Some(u64::from(RowAddress::new_from_parts(10, 1))),
+            Some(u64::from(RowAddress::new_from_parts(10, 1))),
             None
         ]
     );

@@ -83,20 +83,16 @@ impl QueryRowIdRemapper {
 #[async_trait]
 impl lance_index::scalar::BatchRowIdRemapper for QueryRowIdRemapper {
     async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
-        let addresses = row_ids
-            .iter()
-            .copied()
-            .map(RowAddress::from)
-            .collect::<Vec<_>>();
         Ok(self
             .mapping
-            .translate(&addresses)
+            .remap_row_ids(row_ids)
             .await?
             .into_iter()
             .map(|address| {
-                address
-                    .filter(|address| self.coverage.contains(address.fragment_id()))
-                    .map(u64::from)
+                address.filter(|row_id| {
+                    self.coverage
+                        .contains(RowAddress::from(*row_id).fragment_id())
+                })
             })
             .collect())
     }
