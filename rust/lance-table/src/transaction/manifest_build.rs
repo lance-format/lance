@@ -25,7 +25,7 @@ use crate::io::{
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
-use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use crate::system_index::frag_reuse::metadata::{is_tagged, validate_flags};
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -111,9 +111,19 @@ impl Transaction {
         // republish the referenced files as legacy-compatible.
         ensure_can_read_manifest(&manifest)?;
         ensure_can_write_manifest(&manifest)?;
+        // Restore bypasses build_manifest, so it needs the same maintenance boundary.
+        if (current_manifest.writer_feature_flags | manifest.writer_feature_flags)
+            & FLAG_FRAGMENT_REUSE_INDEX
+            != 0
+        {
+            return Err(Error::not_supported(
+                "Restoring tagged FRI history is not implemented. Please upgrade to a writer supporting tagged histories",
+            ));
+        }
         manifest.set_timestamp(config.timestamp_nanos);
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
+        validate_flags(&manifest, &indices)?;
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
@@ -412,9 +422,7 @@ impl Transaction {
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
-        if current_indices
-            .iter()
-            .any(|index| index.name == FRAG_REUSE_INDEX_NAME && index.index_version != 0)
+        if current_indices.iter().any(is_tagged)
             && !matches!(
                 self.operation,
                 Operation::Append { .. } | Operation::ReserveFragments { .. }
@@ -1533,10 +1541,7 @@ impl Transaction {
             manifest.next_row_id = next_row_id;
         }
 
-        if final_indices
-            .iter()
-            .any(|index| index.name == FRAG_REUSE_INDEX_NAME && index.index_version != 0)
-        {
+        if final_indices.iter().any(is_tagged) {
             manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
             manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
         }
@@ -1584,6 +1589,51 @@ mod tests {
     use lance_io::utils::CachedFileSize;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[rstest::rstest]
+    #[case::delete("delete")]
+    #[case::update("update")]
+    #[case::create_index("create_index")]
+    #[case::config("config")]
+    #[case::memwal("memwal")]
+    fn tagged_history_rejects_unsupported_transactions(#[case] kind: &str) {
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        let mut fri = sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        fri.fields.clear();
+        let operation = match kind {
+            "delete" => Operation::Delete {
+                updated_fragments: vec![],
+                deleted_fragment_ids: vec![0],
+                predicate: "true".into(),
+            },
+            "update" => crate::transaction::test_support::update_txn(vec![]).operation,
+            "create_index" => Operation::CreateIndex {
+                new_indices: vec![sample_index_metadata("id_idx")],
+                removed_indices: vec![],
+            },
+            "config" => Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            "memwal" => Operation::UpdateMemWalState {
+                compacted_sstables: vec![],
+            },
+            _ => unreachable!(),
+        };
+        let transaction = Transaction::new(manifest.version, operation, None);
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![fri], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(
+            error.to_string().contains("Tagged FRI history maintenance"),
+            "{error}"
+        );
+    }
 
     fn sample_manifest_with_fragments(ids: std::ops::Range<u64>) -> Manifest {
         let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);

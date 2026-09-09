@@ -1877,6 +1877,8 @@ impl DatasetIndexExt for Dataset {
         let indices = load_all_indices(self).await?;
         if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
             match fri.index_version {
+                // Legacy FRI index version 0 already had its fragment coverage
+                // remapped in load_all_indices().
                 0 => {}
                 1 => return frag_reuse_reader::load_indices(self, fri, &indices).await,
                 version => {
@@ -2828,9 +2830,12 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
         }
     }
 
+    // Legacy FRI index version 0 is handled below by directly remapping fragment coverage.
+    // For version 1 and above, load_indices handles version checks and filters index
+    // segments for query use; keep their metadata unchanged here.
     if indices
         .iter()
-        .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version != 0)
+        .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
     {
         if indices
             .iter()

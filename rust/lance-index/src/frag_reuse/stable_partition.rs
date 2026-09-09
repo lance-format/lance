@@ -10,6 +10,7 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::fragment_reuse::MappingReader;
 use lance_core::{Error, Result};
+use lance_table::format::pb::fragment_reuse_index_details::FragmentDigest;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,21 +19,12 @@ use tokio::sync::OnceCell;
 /// Immutable file name within the mapping's independently owned directory.
 pub const MAPPING_FILE: &str = "stable_partition.lance";
 
-/// Physical fragment layout, including deleted rows in source fragments.
-#[derive(Debug, Clone, Copy)]
-pub struct FragmentLayout {
-    /// Dataset fragment identifier.
-    pub id: u32,
-    /// Physical row count recorded when the mapping was created.
-    pub physical_rows: u64,
-}
-
 /// A mapping reader that opens labels only when addresses need translation.
 pub struct StablePartitionMapping {
     store: Arc<dyn IndexStore>,
     reader: OnceCell<RowMapReader>,
     sources: HashMap<u32, (u64, u64)>,
-    destinations: Vec<FragmentLayout>,
+    destinations: Vec<FragmentDigest>,
     total_rows: u64,
 }
 
@@ -50,15 +42,17 @@ impl StablePartitionMapping {
     /// The store resolves the dataset base; this reader does not interpret manifests.
     pub fn try_new(
         store: Arc<dyn IndexStore>,
-        sources: Vec<FragmentLayout>,
-        destinations: Vec<FragmentLayout>,
+        sources: Vec<FragmentDigest>,
+        destinations: Vec<FragmentDigest>,
     ) -> Result<Self> {
         let mut total_rows = 0_u64;
         let mut offsets = HashMap::with_capacity(sources.len());
         for source in sources {
-            if source.physical_rows > u32::MAX as u64
+            if source.id >= u64::from(RowAddress::TOMBSTONE_FRAG)
+                || source.num_deleted_rows > source.physical_rows
+                || source.physical_rows > u32::MAX as u64
                 || offsets
-                    .insert(source.id, (total_rows, source.physical_rows))
+                    .insert(source.id as u32, (total_rows, source.physical_rows))
                     .is_some()
             {
                 return Err(Error::invalid_input(format!(
@@ -70,12 +64,15 @@ impl StablePartitionMapping {
                 .checked_add(source.physical_rows)
                 .ok_or_else(|| Error::invalid_input("source physical row count overflow"))?;
         }
-        let destination_fragments: RoaringBitmap = destinations.iter().map(|f| f.id).collect();
+        let destination_fragments: RoaringBitmap =
+            destinations.iter().map(|f| f.id as u32).collect();
         if destinations.len() > u16::MAX as usize
             || destination_fragments.len() != destinations.len() as u64
-            || destinations
-                .iter()
-                .any(|f| f.physical_rows > u32::MAX as u64)
+            || destinations.iter().any(|f| {
+                f.id >= u64::from(RowAddress::TOMBSTONE_FRAG)
+                    || f.physical_rows > u32::MAX as u64
+                    || f.num_deleted_rows != 0
+            })
         {
             return Err(Error::invalid_input(
                 "invalid stable-partition destination layout",
@@ -94,7 +91,7 @@ impl StablePartitionMapping {
 impl DeepSizeOf for StablePartitionMapping {
     fn deep_size_of_children(&self, _: &mut Context) -> usize {
         self.sources.capacity() * (std::mem::size_of::<(u32, (u64, u64))>() + 1)
-            + self.destinations.capacity() * std::mem::size_of::<FragmentLayout>()
+            + self.destinations.capacity() * std::mem::size_of::<FragmentDigest>()
             + self
                 .reader
                 .get()
@@ -105,6 +102,15 @@ impl DeepSizeOf for StablePartitionMapping {
 
 #[async_trait]
 impl MappingReader for StablePartitionMapping {
+    async fn remap_row_id(&self, row_id: u64) -> Result<Option<u64>> {
+        // Reuse the block reader for a single address too.
+        let mapped = self.remap_row_ids(&[row_id]).await?;
+        mapped
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::internal("stable-partition mapping omitted the requested row"))
+    }
+
     async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
         let mut output = vec![None; row_ids.len()];
         let mut requests = Vec::with_capacity(row_ids.len());
@@ -176,7 +182,7 @@ impl MappingReader for StablePartitionMapping {
                         .ok_or_else(|| corrupt("row-map count overflow"))?;
                     Some(
                         RowAddress::new_from_parts(
-                            self.destinations[label as usize].id,
+                            self.destinations[label as usize].id as u32,
                             destination_offset,
                         )
                         .into(),
@@ -229,18 +235,21 @@ mod tests {
             path,
             Arc::new(LanceCache::with_capacity(1024 * 1024)),
         ));
-        let source = FragmentLayout {
+        let source = FragmentDigest {
             id: 1,
             physical_rows: 5,
+            num_deleted_rows: 1,
         };
         let destinations = vec![
-            FragmentLayout {
+            FragmentDigest {
                 id: 2,
                 physical_rows: 2,
+                num_deleted_rows: 0,
             },
-            FragmentLayout {
+            FragmentDigest {
                 id: 3,
                 physical_rows: 2,
+                num_deleted_rows: 0,
             },
         ];
         let mapping =
