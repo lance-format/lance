@@ -110,9 +110,9 @@ mod tests {
         let remap = Arc::new(
             RowAddrRemap::compact_with_layout([GroupInputWithLayout {
                 rewritten_old_row_addrs: RoaringTreemap::from_iter([
-                    address(1, 0).into(),
-                    address(1, 2).into(),
-                    address(2, 0).into(),
+                    u64::from(address(1, 0)),
+                    u64::from(address(1, 2)),
+                    u64::from(address(2, 0)),
                 ]),
                 old_frags: vec![(1, 3), (2, 1)],
                 new_frags: vec![(3, 2), (4, 1)],
