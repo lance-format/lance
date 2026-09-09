@@ -593,6 +593,7 @@ pub async fn open_scalar_index(
     let load: ScalarIndexLoad = Box::pin({
         let index_store = index_store.clone();
         let remapping = remapping.clone();
+        let frag_reuse_index = frag_reuse_index.clone();
         let index_cache = index_cache.clone();
         async move {
             if index_details.type_url.ends_with("LabelListIndexDetails") {
@@ -605,9 +606,23 @@ pub async fn open_scalar_index(
                 .await?;
             }
 
-            let index = plugin
-                .load_index_with_remapping(index_store, &index_details, remapping, &index_cache)
-                .await?;
+            let index = match remapping {
+                Some(remapping @ RowIdRemapping::External(_)) => {
+                    plugin
+                        .load_index_with_remapping(
+                            index_store,
+                            &index_details,
+                            Some(remapping),
+                            &index_cache,
+                        )
+                        .await?
+                }
+                _ => {
+                    plugin
+                        .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
+                        .await?
+                }
+            };
 
             tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
             metrics.record_index_load();

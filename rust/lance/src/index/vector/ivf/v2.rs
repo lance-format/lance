@@ -1434,9 +1434,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             FileReaderOptions::default(),
         )
         .await?;
+        let (legacy, external) = match frag_reuse_index {
+            Some(RowIdRemapping::InMemory(remapper)) => (Some(remapper), None),
+            Some(remapping @ RowIdRemapping::External(_)) => (None, Some(remapping)),
+            None => (None, None),
+        };
         let mut storage =
-            IvfQuantizationStorage::try_new_with_remapper(storage_reader, None).await?;
-        if let Some(remapping) = frag_reuse_index {
+            IvfQuantizationStorage::try_new_with_remapper(storage_reader, legacy).await?;
+        if let Some(remapping) = external {
             storage = storage.with_row_id_remapping(remapping);
         }
 
@@ -2525,14 +2530,19 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     )
     .await?;
 
+    let (legacy, external) = match frag_reuse_index {
+        Some(RowIdRemapping::InMemory(remapper)) => (Some(remapper), None),
+        Some(remapping @ RowIdRemapping::External(_)) => (None, Some(remapping)),
+        None => (None, None),
+    };
     let mut storage = IvfQuantizationStorage::from_cached_with_remapper(
         aux_reader,
         state.aux_ivf.clone(),
         state.metadata.clone(),
         state.distance_type,
-        None,
+        legacy,
     );
-    if let Some(remapping) = frag_reuse_index {
+    if let Some(remapping) = external {
         storage = storage.with_row_id_remapping(remapping);
     }
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
