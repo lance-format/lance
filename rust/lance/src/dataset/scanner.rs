@@ -1369,6 +1369,11 @@ impl TakeOperation {
                 _ => {}
             }
         } else if let Expr::InList(in_expr) = expr
+            // A negated InList (`_rowid NOT IN (...)`) is the complement of
+            // the listed ids, not a take of them. Small lists are expanded
+            // into `!=` conjunctions by the expression simplifier before they
+            // get here, but larger ones arrive as `negated: true`.
+            && !in_expr.negated
             && let Expr::Column(col) = in_expr.expr.as_ref()
             && let Some(u64s) = Self::extract_u64_list(&in_expr.list)
         {
@@ -15546,6 +15551,34 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await;
     }
 
+    // Unit-level companion to the NOT IN case in
+    // test_filter_to_take_with_stable_row_ids: exercises the lowering directly,
+    // independent of the expression simplifier's InList expansion threshold
+    // (which the end-to-end test depends on to keep the list unexpanded).
+    #[test]
+    fn take_operation_rejects_negated_in_list() {
+        // All three virtual columns share the one InList arm, so the guard has
+        // to hold for each of them.
+        for column in [ROW_ID, ROW_ADDR, ROW_OFFSET] {
+            let positive = col(column).in_list(vec![lit(0u64), lit(1u64)], false);
+            let lowered = TakeOperation::try_from_expr(&positive);
+            let ids = match lowered {
+                Some((TakeOperation::RowIds(ids), None))
+                | Some((TakeOperation::RowAddrs(ids), None))
+                | Some((TakeOperation::RowOffsets(ids), None)) => ids,
+                other => panic!("{column} IN (0, 1) must lower into a take, got {other:?}"),
+            };
+            assert_eq!(ids, vec![0, 1], "wrong ids lowered for {column}");
+
+            let negated = col(column).in_list(vec![lit(0u64), lit(1u64)], true);
+            assert!(
+                TakeOperation::try_from_expr(&negated).is_none(),
+                "a negated InList on {column} is the complement of the listed ids \
+                 and must not lower into a take of them"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_filter_to_take_with_stable_row_ids() {
         let ds = lance_datagen::gen_batch()
@@ -15610,6 +15643,45 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .await
             .unwrap();
         assert_eq!(batch["idx"].as_primitive::<Int32Type>().values(), &[5, 9]);
+
+        // NOT IN is the complement of IN and must not be lowered into a take
+        // of the listed ids. The list must be large enough that DataFusion's
+        // expression simplifier does not expand it into a conjunction of
+        // `!=` comparisons first (it only expands small lists) — with the
+        // pre-fix code the negated InList reached the lowering and returned
+        // exactly the listed rows.
+        let not_in_list = (0..10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let batch = ds
+            .scan()
+            .filter(&format!("{ROW_ID} NOT IN ({not_in_list})"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch["idx"].as_primitive::<Int32Type>().values(), &[10, 11]);
+
+        // `_rowoffset` shares the arm, and the contract that matters is that a
+        // negated list never turns into a take of the listed values. It cannot
+        // be answered as a scan filter either: `_rowoffset` is only reachable
+        // through this lowering, so it is absent from the filterable read
+        // schema and any predicate that survives to the planner is rejected.
+        // Pin that it fails rather than returning the complement. Plain
+        // comparisons such as `_rowoffset > 2` fail the same way, so this is
+        // the column's existing limit, not something the guard introduced.
+        let err = ds
+            .scan()
+            .filter(&format!("{ROW_OFFSET} NOT IN (0, 1, 2, 4)"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .expect_err("a negated _rowoffset list must not be answered from a take");
+        assert!(
+            err.to_string().contains(ROW_OFFSET),
+            "the error should name the column, got: {err}"
+        );
     }
 
     #[tokio::test]
