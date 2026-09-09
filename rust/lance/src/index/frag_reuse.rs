@@ -52,7 +52,7 @@ pub(super) async fn open_row_id_remapping(
                 index.uuid
             ))
         })?;
-    if !mapping.needs_translation(source.fragment_bitmap.as_ref()) {
+    if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
         let identity =
             CompactFragReuseIndex::try_new(fri.uuid, FragReuseIndexDetails { versions: vec![] })?;
         return Ok(Some((

@@ -180,13 +180,14 @@ impl QueryFragReuseIndex {
             .await
     }
 
-    /// Whether stored addresses cross any retained transition. Unsupported index
-    /// readers can still serve directly covered fragments without translation.
-    pub(crate) fn needs_translation(&self, provenance: Option<&RoaringBitmap>) -> bool {
+    /// Whether segment metadata could require translation. V1 may have projected
+    /// coverage to destinations without changing addresses stored in the index.
+    /// Only metadata disjoint from the whole lineage proves independence.
+    pub(crate) fn may_need_translation(&self, provenance: Option<&RoaringBitmap>) -> bool {
         provenance.is_none_or(|bitmap| {
             bitmap
                 .iter()
-                .any(|fragment| self.ledger.consumer(fragment).is_some())
+                .any(|fragment| self.ledger.contains_fragment(fragment))
         })
     }
 
@@ -750,6 +751,46 @@ mod tests {
             .insert_with_key(&key, Arc::new(indices))
             .await;
         fri
+    }
+
+    #[tokio::test]
+    async fn projected_coverage_does_not_skip_address_translation() {
+        let mut dataset = fixture().await;
+        let (transition, destinations) = prepare(&dataset).await;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        install(&mut dataset, content, destinations, false).await;
+        let mut indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        let index = indices
+            .iter_mut()
+            .find(|index| index.name == "i_idx")
+            .unwrap();
+        index.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+        let key = IndexMetadataKey {
+            version: dataset.manifest.version,
+            store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&key, Arc::new(indices))
+            .await;
+        for value in 0..8 {
+            assert_eq!(
+                dataset
+                    .count_rows(Some(format!("i = {value}")))
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
     }
 
     #[tokio::test]

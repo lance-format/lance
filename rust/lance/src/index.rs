@@ -1885,7 +1885,7 @@ impl DatasetIndexExt for Dataset {
                     continue;
                 }
                 if index.name != FRAG_REUSE_INDEX_NAME
-                    && mapping.needs_translation(index.fragment_bitmap.as_ref())
+                    && mapping.may_need_translation(index.fragment_bitmap.as_ref())
                 {
                     let can_remap = if segment_has_vector_details(index) {
                         frag_reuse_query::vector_supports_batch_remapping(self, index).await?
