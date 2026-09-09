@@ -3,9 +3,9 @@
 
 //! Metadata-only reader for the unified fragment reuse history.
 //!
-//! Decoding validates lineage without opening mapping files. Keep the serialized
-//! content when maintaining a history: generated protobuf messages discard unknown
-//! fields, including future mapping alternatives.
+//! Decoding validates lineage without opening mapping files. Unknown alternatives
+//! retain only their common fragment metadata for conservative query coverage.
+//! Operations that carry an index forward keep its original `Any` separately.
 //!
 //! ```
 //! use bytes::Bytes;
@@ -13,7 +13,6 @@
 //!
 //! let ledger = FragReuseLedger::decode(1, Bytes::new())?;
 //! assert!(ledger.transitions().is_empty());
-//! assert!(ledger.raw_content().is_empty());
 //! # Ok::<(), lance_core::Error>(())
 //! ```
 
@@ -21,6 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 
 use bytes::{Buf, Bytes};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::{GroupInputWithLayout, RowAddrRemap};
 use lance_core::{Error, Result};
@@ -38,7 +38,7 @@ pub enum Mapping {
     OrderedCompaction(RowAddrRemap),
     /// Immutable row-map reference, with the base selected by its optional base ID.
     StablePartition(pb::StablePartition),
-    /// An unrecognized alternative. Its original bytes live in the transition.
+    /// An unrecognized alternative; it cannot provide address translation.
     Unknown {
         /// Protobuf field number identifying the future mapping alternative.
         field_number: u32,
@@ -51,7 +51,6 @@ pub struct Transition {
     sources: Vec<pb::FragmentDigest>,
     destinations: Vec<pb::FragmentDigest>,
     mapping: Mapping,
-    raw: Option<Bytes>,
 }
 
 impl Transition {
@@ -69,21 +68,12 @@ impl Transition {
     pub fn mapping(&self) -> &Mapping {
         &self.mapping
     }
-
-    /// Original serialized tagged transition, including unknown fields.
-    /// Returns `None` for a group lifted from legacy history; its bytes remain in
-    /// [`FragReuseLedger::raw_content`].
-    pub fn raw_transition(&self) -> Option<&Bytes> {
-        self.raw.as_ref()
-    }
 }
 
 /// Validated history in fragment-lineage order, independent of serialization order.
 #[derive(Debug)]
 pub struct FragReuseLedger {
-    raw: Bytes,
     transitions: Vec<Transition>,
-    unknown_destinations: RoaringBitmap,
 }
 
 impl FragReuseLedger {
@@ -96,7 +86,7 @@ impl FragReuseLedger {
                 "FRI index_version {index_version}; supported versions are 0 and 1"
             )));
         }
-        let mut remaining = content.clone();
+        let mut remaining = content;
         let mut transitions = Vec::new();
         while remaining.has_remaining() {
             let (tag, payload) = next_field(&mut remaining)?;
@@ -115,7 +105,6 @@ impl FragReuseLedger {
                                     },
                                 )),
                             },
-                            None,
                             5,
                         )?);
                     }
@@ -141,46 +130,40 @@ impl FragReuseLedger {
                     let mapping_tag =
                         mapping_tag.ok_or_else(|| corrupt("transition has no mapping"))?;
                     let decoded =
-                        pb::Transition::decode(raw.clone()).map_err(|e| corrupt(e.to_string()))?;
-                    transitions.push(decode_transition(decoded, Some(raw), mapping_tag)?);
+                        pb::Transition::decode(raw).map_err(|e| corrupt(e.to_string()))?;
+                    transitions.push(decode_transition(decoded, mapping_tag)?);
                 }
-                _ => {} // Preserve future envelope fields in the original content.
+                _ => {} // Unknown envelope fields do not participate in address resolution.
             }
         }
         let transitions = order_lineage(transitions)?;
-        let mut unknown_destinations = RoaringBitmap::new();
-        for transition in &transitions {
-            if matches!(transition.mapping, Mapping::Unknown { .. })
-                || transition
-                    .sources
-                    .iter()
-                    .any(|s| unknown_destinations.contains(s.id as u32))
-            {
-                unknown_destinations.extend(transition.destinations.iter().map(|d| d.id as u32));
-            }
-        }
-        Ok(Self {
-            raw: content,
-            transitions,
-            unknown_destinations,
-        })
-    }
-
-    /// Exact original `InlineContent` bytes, suitable for lossless retention.
-    pub fn raw_content(&self) -> &Bytes {
-        &self.raw
+        Ok(Self { transitions })
     }
 
     /// Rewrites ordered so every producer precedes its consumers.
     pub fn transitions(&self) -> &[Transition] {
         &self.transitions
     }
+}
 
-    /// Destinations whose lineage crosses an unknown mapping, including downstream
-    /// rewrites. These mappings cannot establish index coverage. Independent direct
-    /// index coverage must be assessed separately by the query planner.
-    pub fn unknown_destinations(&self) -> &RoaringBitmap {
-        &self.unknown_destinations
+impl DeepSizeOf for FragReuseLedger {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.transitions.capacity() * std::mem::size_of::<Transition>()
+            + self
+                .transitions
+                .iter()
+                .map(|transition| {
+                    (transition.sources.capacity() + transition.destinations.capacity())
+                        * std::mem::size_of::<pb::FragmentDigest>()
+                        + match &transition.mapping {
+                            Mapping::OrderedCompaction(remap) => {
+                                remap.deep_size_of_children(context)
+                            }
+                            Mapping::StablePartition(reference) => reference.map_id.capacity(),
+                            Mapping::Unknown { .. } => 0,
+                        }
+                })
+                .sum::<usize>()
     }
 }
 
@@ -241,11 +224,7 @@ fn validate_digests(digests: &[pb::FragmentDigest], is_destination: bool) -> Res
     Ok(live_rows)
 }
 
-fn decode_transition(
-    value: pb::Transition,
-    raw: Option<Bytes>,
-    mapping_tag: u32,
-) -> Result<Transition> {
+fn decode_transition(value: pb::Transition, mapping_tag: u32) -> Result<Transition> {
     if value.sources.is_empty() {
         return Err(corrupt("transition has no source fragments"));
     }
@@ -308,7 +287,6 @@ fn decode_transition(
         sources: value.sources,
         destinations: value.destinations,
         mapping,
-        raw,
     })
 }
 
@@ -470,8 +448,7 @@ mod tests {
         }
         .encode_to_vec()
         .into();
-        let ledger = FragReuseLedger::decode(1, content.clone()).unwrap();
-        assert_eq!(ledger.raw_content(), &content);
+        let ledger = FragReuseLedger::decode(1, content).unwrap();
         assert_eq!(ledger.transitions().len(), 2);
         let Mapping::OrderedCompaction(remap) = ledger.transitions()[0].mapping() else {
             unreachable!()
@@ -481,7 +458,6 @@ mod tests {
         assert_eq!(remap.get(address(2, 2)), Some(Some(address(3, 1))));
         assert_eq!(remap.get(address(1, 0)), Some(Some(address(3, 2))));
         assert_eq!(remap.get(address(9, 0)), None);
-        assert!(ledger.transitions()[0].raw_transition().is_none());
         let Mapping::StablePartition(reference) = ledger.transitions()[1].mapping() else {
             unreachable!()
         };
@@ -490,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_mapping_is_preserved_and_taints_only_dependent_lineage() {
+    fn unknown_mapping_retains_common_metadata_and_lineage() {
         let mut unknown = partition(1, 2);
         unknown.encoding = None;
         let mut raw = unknown.encode_to_vec();
@@ -499,12 +475,7 @@ mod tests {
         message_field(2, &raw, &mut content);
         message_field(19, b"future envelope metadata", &mut content);
         let content = Bytes::from(content);
-        let ledger = FragReuseLedger::decode(1, content.clone()).unwrap();
-        assert_eq!(ledger.raw_content(), &content);
-        assert_eq!(
-            ledger.unknown_destinations(),
-            &RoaringBitmap::from_iter([2, 3])
-        );
+        let ledger = FragReuseLedger::decode(1, content).unwrap();
         let nodes = ledger.transitions();
         let unknown_index = nodes
             .iter()
@@ -512,19 +483,8 @@ mod tests {
             .unwrap();
         let dependent_index = nodes.iter().position(|t| t.sources()[0].id == 2).unwrap();
         assert!(unknown_index < dependent_index);
-        assert_eq!(nodes[unknown_index].raw_transition().unwrap().as_ref(), raw);
-        // Re-emitting the opaque transition preserves bytes prost does not know.
-        let mut retained = Vec::new();
-        message_field(
-            2,
-            nodes[unknown_index].raw_transition().unwrap(),
-            &mut retained,
-        );
-        let retained = FragReuseLedger::decode(1, retained.into()).unwrap();
-        assert!(matches!(
-            retained.transitions()[0].mapping(),
-            Mapping::Unknown { field_number: 17 }
-        ));
+        assert_eq!(nodes[unknown_index].sources()[0].id, 1);
+        assert_eq!(nodes[unknown_index].destinations()[0].id, 2);
     }
 
     #[rstest]
