@@ -35,6 +35,88 @@ use uuid::Uuid;
 #[case::missing_segment("missing")]
 #[case::unsupported_version("version")]
 #[case::unsupported_async_plugin("plugin")]
+#[rstest::rstest]
+#[case::default_search("default")]
+#[case::all_segments("all")]
+#[case::partial_selection("partial")]
+#[tokio::test]
+async fn vector_fragment_search_requires_every_contributor(#[case] selection: &str) {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    let params = crate::index::vector::VectorIndexParams::ivf_flat(
+        1,
+        lance_linalg::distance::DistanceType::L2,
+    );
+    let fragments: Vec<_> = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let mut segments = Vec::new();
+    for fragment in fragments {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name("vector_idx".into())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    let ids: Vec<_> = segments.iter().map(|segment| segment.uuid).collect();
+    dataset
+        .commit_existing_index_segments("vector_idx", "vector", segments)
+        .await
+        .unwrap();
+    let original = dataset
+        .scan()
+        .filter("i = 6")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let query = original["vector"].as_fixed_size_list().value(0);
+    let query = query.as_primitive::<arrow_array::types::Float32Type>();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let mut scan = dataset.scan();
+    scan.nearest("vector", query, 1).unwrap();
+    scan.with_fragments(dataset.fragments().iter().cloned().collect());
+    match selection {
+        "all" => {
+            scan.with_index_segments(ids).unwrap();
+        }
+        "partial" => {
+            scan.with_index_segments(vec![ids[0]]).unwrap();
+        }
+        "default" => {}
+        _ => unreachable!(),
+    }
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert_eq!(plan.contains("ANN"), selection != "partial", "{plan}");
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), 1);
+    // IVF_FLAT with one partition is exact: the nearest row must come from Y,
+    // including when explicit selection of X requires a flat fallback.
+    assert_eq!(
+        result["i"].as_primitive::<Int32Type>().value(0),
+        6,
+        "{plan}"
+    );
+}
+
 #[tokio::test]
 async fn destination_coverage_requires_every_contributing_segment(#[case] scenario: &str) {
     let mut dataset = fixture().await;

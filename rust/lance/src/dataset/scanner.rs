@@ -5277,7 +5277,7 @@ impl Scanner {
         } else {
             Arc::new(vec![])
         };
-        let index_and_segments = if use_index {
+        let mut index_and_segments = if use_index {
             if let Some(requested_segments) = self.index_segments.as_ref() {
                 let requested_segment_set =
                     requested_segments.iter().copied().collect::<HashSet<_>>();
@@ -5414,6 +5414,31 @@ impl Scanner {
         } else {
             None
         };
+
+        // Explicit segment selection may remove a contributor to FRI-derived coverage.
+        // When fragments are requested, they must still be searched completely.
+        // Segment-only search intentionally permits partial results and is unchanged.
+        if self.index_segments.is_some()
+            && self.fragments.is_some()
+            && indices
+                .iter()
+                .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
+            && let Some((name, segments, _)) = &index_and_segments
+        {
+            let selected: HashSet<_> = segments.iter().map(|segment| segment.uuid).collect();
+            let covered = self.get_indexed_frags(segments);
+            let missing_contributor = indices.iter().any(|index| {
+                index.name == *name
+                    && !selected.contains(&index.uuid)
+                    && index
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| !bitmap.is_disjoint(&covered))
+            });
+            if missing_contributor {
+                index_and_segments = None;
+            }
+        }
 
         if let Some((index_name, index_segments, index_metric)) = index_and_segments {
             if self.is_batch_nearest {
