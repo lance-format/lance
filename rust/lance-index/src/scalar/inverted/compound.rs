@@ -16,13 +16,14 @@ use lance_select::RowAddrMask;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 
 use super::{
-    InvertedIndex, build_global_bm25_scorer,
+    InvertedIndex, PreparedBm25Query,
     document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer},
     documents::{
         CachedRowAddressOrder, DocId, DocLengths, DocVisibility, OrderedRowAddressProjection,
         PartitionDocuments, ResidentAddressProjection, RowAddressProjectionOrderError,
     },
     index::{DocSet, InvertedPartition},
+    prepare_bm25_query,
     query::{
         FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens, collect_query_tokens,
     },
@@ -272,6 +273,16 @@ pub(super) trait ComposableScorer: Send {
         None
     }
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()>;
+
+    /// Conservative score upper bound for the current approximation without
+    /// running two-phase confirmation. `None` disables doc-local pruning.
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        Ok(None)
+    }
+
+    fn supports_doc_local_confirmation_pruning(&self) -> bool {
+        false
+    }
 
     fn matches(&mut self) -> Result<bool> {
         Ok(true)
@@ -678,11 +689,7 @@ impl CompoundScorerPlan {
         }
     }
 
-    pub(super) fn build<'a>(
-        &self,
-        leaves: &mut [Option<BoxScorer<'a>>],
-        metrics: &'a dyn MetricsCollector,
-    ) -> Result<BoxScorer<'a>> {
+    pub(super) fn build<'a>(&self, leaves: &mut [Option<BoxScorer<'a>>]) -> Result<BoxScorer<'a>> {
         match self {
             Self::Leaf { index, boost } => {
                 let leaf = leaves
@@ -700,14 +707,14 @@ impl CompoundScorerPlan {
                 negative,
                 negative_boost,
             } => Ok(Box::new(BoostScorer::try_new(
-                positive.build(leaves, metrics)?,
-                negative.build(leaves, metrics)?,
+                positive.build(leaves)?,
+                negative.build(leaves)?,
                 *negative_boost,
             )?)),
             Self::MultiMatch(children) => Ok(Box::new(DisjunctionScorer::try_new(
                 children
                     .iter()
-                    .map(|child| child.build(leaves, metrics))
+                    .map(|child| child.build(leaves))
                     .collect::<Result<Vec<_>>>()?,
                 DisjunctionScore::Max,
             )?)),
@@ -715,19 +722,18 @@ impl CompoundScorerPlan {
                 should,
                 must,
                 must_not,
-            } => Ok(Box::new(BooleanScorer::try_new_with_metrics(
+            } => Ok(Box::new(BooleanScorer::try_new(
                 should
                     .iter()
-                    .map(|child| child.build(leaves, metrics))
+                    .map(|child| child.build(leaves))
                     .collect::<Result<Vec<_>>>()?,
                 must.iter()
-                    .map(|child| child.build(leaves, metrics))
+                    .map(|child| child.build(leaves))
                     .collect::<Result<Vec<_>>>()?,
                 must_not
                     .iter()
-                    .map(|child| child.build(leaves, metrics))
+                    .map(|child| child.build(leaves))
                     .collect::<Result<Vec<_>>>()?,
-                Some(metrics),
             )?)),
         }
     }
@@ -775,6 +781,14 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
         self.set_min_competitive_score(min_score)
+    }
+
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        self.current_score().map(Some)
+    }
+
+    fn supports_doc_local_confirmation_pruning(&self) -> bool {
+        self.match_cost().is_some()
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -1020,6 +1034,10 @@ impl ComposableScorer for MaterializedScorer {
         Ok(())
     }
 
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        self.score().map(Some)
+    }
+
     fn scores_non_negative(&self) -> bool {
         self.scores_non_negative
     }
@@ -1243,6 +1261,15 @@ impl ComposableScorer for RowAddressScorer<'_> {
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
         self.source.set_min_competitive_score(min_score)
+    }
+
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        self.ensure_positioned()?;
+        self.source.current_score_upper_bound()
+    }
+
+    fn supports_doc_local_confirmation_pruning(&self) -> bool {
+        self.source.supports_doc_local_confirmation_pruning()
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -1788,6 +1815,16 @@ impl ComposableScorer for RowAddressMergeScorer<'_> {
         Ok(())
     }
 
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        self.current_source_mut()?.current_score_upper_bound()
+    }
+
+    fn supports_doc_local_confirmation_pruning(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| source.supports_doc_local_confirmation_pruning())
+    }
+
     fn matches(&mut self) -> Result<bool> {
         self.current_source_mut()?.matches()
     }
@@ -1905,7 +1942,6 @@ pub(super) struct TopKCollector<K = u64> {
     heap: BinaryHeap<HeapRow<K>>,
     competitive_score: Arc<CompetitiveScore>,
     tie_handling: TieHandling,
-    peak_buffered: usize,
 }
 
 impl<K: Copy + Ord> TopKCollector<K> {
@@ -1943,7 +1979,6 @@ impl<K: Copy + Ord> TopKCollector<K> {
             heap: BinaryHeap::with_capacity(limit.min(DEFAULT_BLOCK_SIZE)),
             competitive_score,
             tie_handling,
-            peak_buffered: 0,
         }
     }
 
@@ -1994,7 +2029,6 @@ impl<K: Copy + Ord> TopKCollector<K> {
                 }
             }
         }
-        self.peak_buffered = self.peak_buffered.max(self.heap.len());
         self.raise_competitive_score();
         CollectionStatus::Complete
     }
@@ -2060,6 +2094,21 @@ impl<K: Copy + Ord> TopKCollector<K> {
                 continue;
             }
 
+            // Phrase leaves expose their score from posting frequencies before
+            // positions are decoded. Composite scorers combine those doc-local
+            // uppers with sibling residuals, so a strict miss can bypass every
+            // pending position confirmation. Equality remains live because row
+            // id is the final top-k tie breaker.
+            if min_score.is_finite()
+                && scorer.supports_doc_local_confirmation_pruning()
+                && scorer
+                    .current_score_upper_bound()?
+                    .is_some_and(|upper| upper < min_score)
+            {
+                doc = scorer.next()?;
+                continue;
+            }
+
             if let Some(match_cost) = scorer.match_cost()
                 && (!match_cost.is_finite() || match_cost < 0.0)
             {
@@ -2113,6 +2162,40 @@ impl TopKCollector<u64> {
     }
 }
 
+/// Evaluate a compound query over exact, materialized leaf result sets.
+///
+/// This is the bridge used by query-local residual postings: it keeps Boolean,
+/// Boost, and MultiMatch semantics in the same scorer tree as the on-disk
+/// compound path while allowing a different posting source.
+#[doc(hidden)]
+pub fn materialized_compound_top_k(
+    query: &FtsQuery,
+    leaves: Vec<Vec<(u64, f32)>>,
+    limit: usize,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    let mut leaf_count = 0;
+    let plan = CompoundScorerPlan::from_query(query, &mut leaf_count)?;
+    if leaf_count != leaves.len() {
+        return Err(Error::internal(format!(
+            "compound FTS planned {leaf_count} leaves but received {} materialized leaves",
+            leaves.len()
+        )));
+    }
+    let mut scorers = leaves
+        .into_iter()
+        .map(|rows| {
+            let rows = rows
+                .into_iter()
+                .map(|(row_id, score)| ScoredRow { row_id, score })
+                .collect();
+            MaterializedScorer::try_new(rows).map(|scorer| Some(Box::new(scorer) as BoxScorer<'_>))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut scorer = plan.build(&mut scorers)?;
+    let rows = TopKCollector::new(limit).collect(scorer.as_mut())?;
+    Ok(rows.into_iter().map(|row| (row.row_id, row.score)).unzip())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) enum DisjunctionScore {
     Sum,
@@ -2158,6 +2241,10 @@ impl ComposableScorer for EmptyScorer {
 
     fn set_min_competitive_score(&mut self, _min_score: f32) -> Result<()> {
         Ok(())
+    }
+
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        Ok(Some(0.0))
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -2255,6 +2342,18 @@ impl ComposableScorer for ScaleScorer<'_> {
         }
         self.last_parent_score_floor = min_score;
         Ok(())
+    }
+
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        Ok(self.child.current_score_upper_bound()?.map(|upper| {
+            ScoreBounds { lower: 0.0, upper }
+                .scale_non_negative(self.factor)
+                .upper
+        }))
+    }
+
+    fn supports_doc_local_confirmation_pruning(&self) -> bool {
+        self.child.supports_doc_local_confirmation_pruning()
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -2464,6 +2563,42 @@ impl ComposableScorer for DisjunctionScorer<'_> {
             }
         }
         Ok(())
+    }
+
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        let Some(current) = self.current else {
+            return Ok(None);
+        };
+        let mut upper = 0.0_f32;
+        for child in &mut self.children {
+            if child.doc() != Some(current) {
+                continue;
+            }
+            let Some(child_upper) = child.current_score_upper_bound()? else {
+                return Ok(None);
+            };
+            if !child_upper.is_finite() {
+                return Ok(None);
+            }
+            upper = match self.mode {
+                DisjunctionScore::Sum => {
+                    ScoreBounds { lower: 0.0, upper }
+                        .add(ScoreBounds {
+                            lower: 0.0,
+                            upper: child_upper.max(0.0),
+                        })
+                        .upper
+                }
+                DisjunctionScore::Max => upper.max(child_upper),
+            };
+        }
+        Ok(upper.is_finite().then_some(upper))
+    }
+
+    fn supports_doc_local_confirmation_pruning(&self) -> bool {
+        self.children
+            .iter()
+            .any(|child| child.supports_doc_local_confirmation_pruning())
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -2710,6 +2845,35 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
         Ok(())
     }
 
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        let Some(current) = self.current else {
+            return Ok(None);
+        };
+        let mut bounds = ScoreBounds::ZERO;
+        for child in &mut self.children {
+            if child.doc() != Some(current) {
+                return Ok(None);
+            }
+            let Some(upper) = child.current_score_upper_bound()? else {
+                return Ok(None);
+            };
+            if !upper.is_finite() {
+                return Ok(None);
+            }
+            bounds = bounds.add(ScoreBounds {
+                lower: 0.0,
+                upper: upper.max(0.0),
+            });
+        }
+        Ok(bounds.upper.is_finite().then_some(bounds.upper))
+    }
+
+    fn supports_doc_local_confirmation_pruning(&self) -> bool {
+        self.children
+            .iter()
+            .any(|child| child.supports_doc_local_confirmation_pruning())
+    }
+
     fn matches(&mut self) -> Result<bool> {
         self.ensure_confirmed()
     }
@@ -2837,6 +3001,18 @@ impl ComposableScorer for BoostScorer<'_> {
             self.positive.set_min_competitive_score(min_score)?;
         }
         Ok(())
+    }
+
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        if self.negative.scores_non_negative() {
+            self.positive.current_score_upper_bound()
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn supports_doc_local_confirmation_pruning(&self) -> bool {
+        self.positive.supports_doc_local_confirmation_pruning()
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -3165,6 +3341,50 @@ impl ComposableScorer for ReqOptScorer<'_> {
         Ok(())
     }
 
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        let Some(current) = self.current else {
+            return Ok(None);
+        };
+        let Some(required_upper) = self.required.current_score_upper_bound()? else {
+            return Ok(None);
+        };
+        if !required_upper.is_finite() {
+            return Ok(None);
+        }
+        if required_upper >= self.min_competitive_score {
+            // The required side alone keeps this document competitive. Keep
+            // the optional iterator lazy; scoring will align it only for a
+            // surviving candidate.
+            return Ok(Some(f32::INFINITY));
+        }
+        let optional_upper = if self.ensure_optional_at_or_after(current)? == Some(current) {
+            let Some(optional_upper) = self.optional.current_score_upper_bound()? else {
+                return Ok(None);
+            };
+            if !optional_upper.is_finite() {
+                return Ok(None);
+            }
+            optional_upper.max(0.0)
+        } else {
+            0.0
+        };
+        let upper = ScoreBounds {
+            lower: 0.0,
+            upper: required_upper.max(0.0),
+        }
+        .add(ScoreBounds {
+            lower: 0.0,
+            upper: optional_upper,
+        })
+        .upper;
+        Ok(upper.is_finite().then_some(upper))
+    }
+
+    fn supports_doc_local_confirmation_pruning(&self) -> bool {
+        self.required.supports_doc_local_confirmation_pruning()
+            || self.optional.supports_doc_local_confirmation_pruning()
+    }
+
     fn matches(&mut self) -> Result<bool> {
         self.ensure_confirmed()
     }
@@ -3188,24 +3408,17 @@ pub(super) struct BooleanScorer<'a> {
     optional: Option<BoxScorer<'a>>,
     prohibited: Option<BoxScorer<'a>>,
     current: Option<u64>,
+    confirmed_doc: Option<u64>,
+    confirmed: bool,
     optional_matches: bool,
+    defer_confirmation: bool,
 }
 
 impl<'a> BooleanScorer<'a> {
-    #[cfg(test)]
     pub(super) fn try_new(
         should: Vec<BoxScorer<'a>>,
         must: Vec<BoxScorer<'a>>,
         must_not: Vec<BoxScorer<'a>>,
-    ) -> Result<Self> {
-        Self::try_new_with_metrics(should, must, must_not, None)
-    }
-
-    fn try_new_with_metrics(
-        should: Vec<BoxScorer<'a>>,
-        must: Vec<BoxScorer<'a>>,
-        must_not: Vec<BoxScorer<'a>>,
-        metrics: Option<&'a dyn MetricsCollector>,
     ) -> Result<Self> {
         let (driver, optional) = if must.is_empty() {
             if should.is_empty() {
@@ -3214,7 +3427,7 @@ impl<'a> BooleanScorer<'a> {
                 ));
             }
             let driver = if let Some(global_bounds) = ShouldMaxScoreScorer::global_bounds(&should) {
-                Box::new(ShouldMaxScoreScorer::new(should, global_bounds, metrics)) as BoxScorer<'a>
+                Box::new(ShouldMaxScoreScorer::new(should, global_bounds)) as BoxScorer<'a>
             } else {
                 Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
                     as BoxScorer<'a>
@@ -3254,26 +3467,57 @@ impl<'a> BooleanScorer<'a> {
                     as BoxScorer<'a>,
             )
         };
+        let scores_non_negative = driver.scores_non_negative()
+            && optional
+                .as_ref()
+                .is_none_or(|optional| optional.scores_non_negative());
+        let has_doc_local_confirmation = driver.supports_doc_local_confirmation_pruning()
+            || optional
+                .as_ref()
+                .is_some_and(|optional| optional.supports_doc_local_confirmation_pruning())
+            || prohibited
+                .as_ref()
+                .is_some_and(|prohibited| prohibited.supports_doc_local_confirmation_pruning());
         Ok(Self {
             driver,
             optional,
             prohibited,
             current: None,
+            confirmed_doc: None,
+            confirmed: false,
             optional_matches: false,
+            defer_confirmation: scores_non_negative && has_doc_local_confirmation,
         })
     }
 
-    fn accept_driver_doc(&mut self) -> Result<bool> {
-        let Some(current) = self.driver.doc() else {
+    fn set_current(&mut self, current: Option<u64>) -> Option<u64> {
+        if self.current != current {
+            self.confirmed_doc = None;
+            self.confirmed = false;
+            self.optional_matches = false;
+        }
+        self.current = current;
+        current
+    }
+
+    fn ensure_confirmed(&mut self) -> Result<bool> {
+        let Some(current) = self.current else {
             return Ok(false);
         };
+        if self.confirmed_doc == Some(current) {
+            return Ok(self.confirmed);
+        }
         if !self.driver.matches()? {
+            self.confirmed_doc = Some(current);
+            self.confirmed = false;
             return Ok(false);
         }
         if let Some(prohibited) = &mut self.prohibited
             && prohibited.advance(current)? == Some(current)
             && prohibited.matches()?
         {
+            self.confirmed_doc = Some(current);
+            self.confirmed = false;
             return Ok(false);
         }
         self.optional_matches = if let Some(optional) = &mut self.optional {
@@ -3281,24 +3525,23 @@ impl<'a> BooleanScorer<'a> {
         } else {
             false
         };
-        self.current = Some(current);
+        self.confirmed_doc = Some(current);
+        self.confirmed = true;
         Ok(true)
     }
 
-    fn next_accepted(&mut self, target: Option<u64>) -> Result<Option<u64>> {
-        let mut doc = match target {
+    fn next_candidate(&mut self, target: Option<u64>) -> Result<Option<u64>> {
+        let mut candidate = match target {
             Some(target) => self.driver.advance(target)?,
             None => self.driver.next()?,
         };
-        while doc.is_some() {
-            if self.accept_driver_doc()? {
+        loop {
+            self.set_current(candidate);
+            if self.defer_confirmation || candidate.is_none() || self.ensure_confirmed()? {
                 return Ok(self.current);
             }
-            doc = self.driver.next()?;
+            candidate = self.driver.next()?;
         }
-        self.current = None;
-        self.optional_matches = false;
-        Ok(None)
     }
 }
 
@@ -3312,14 +3555,14 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn next(&mut self) -> Result<Option<u64>> {
-        self.next_accepted(None)
+        self.next_candidate(None)
     }
 
     fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.current.is_some_and(|current| current >= target) {
             return Ok(self.current);
         }
-        self.next_accepted(Some(target))
+        self.next_candidate(Some(target))
     }
 
     fn cost(&self) -> usize {
@@ -3327,9 +3570,9 @@ impl ComposableScorer for BooleanScorer<'_> {
     }
 
     fn score(&mut self) -> Result<f32> {
-        if self.current.is_none() {
+        if !self.ensure_confirmed()? {
             return Err(Error::internal(
-                "Boolean FTS scorer is not positioned on a document",
+                "Boolean FTS score requested for an unconfirmed document",
             ));
         }
         let mut score = self.driver.score()?;
@@ -3393,8 +3636,69 @@ impl ComposableScorer for BooleanScorer<'_> {
         Ok(())
     }
 
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        let Some(current) = self.current else {
+            return Ok(None);
+        };
+        if !self.scores_non_negative() {
+            return Ok(None);
+        }
+        let Some(driver_upper) = self.driver.current_score_upper_bound()? else {
+            return Ok(None);
+        };
+        if !driver_upper.is_finite() {
+            return Ok(None);
+        }
+        let optional_upper = if let Some(optional) = &mut self.optional {
+            if optional.advance(current)? == Some(current) {
+                let Some(optional_upper) = optional.current_score_upper_bound()? else {
+                    return Ok(None);
+                };
+                if !optional_upper.is_finite() {
+                    return Ok(None);
+                }
+                optional_upper.max(0.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        let upper = ScoreBounds {
+            lower: 0.0,
+            upper: driver_upper,
+        }
+        .add(ScoreBounds {
+            lower: 0.0,
+            upper: optional_upper,
+        })
+        .upper;
+        Ok(upper.is_finite().then_some(upper))
+    }
+
+    fn supports_doc_local_confirmation_pruning(&self) -> bool {
+        self.defer_confirmation
+    }
+
     fn matches(&mut self) -> Result<bool> {
-        Ok(self.current.is_some())
+        self.ensure_confirmed()
+    }
+
+    fn match_cost(&self) -> Option<f32> {
+        self.driver
+            .match_cost()
+            .into_iter()
+            .chain(
+                self.optional
+                    .as_ref()
+                    .and_then(|optional| optional.match_cost()),
+            )
+            .chain(
+                self.prohibited
+                    .as_ref()
+                    .and_then(|prohibited| prohibited.match_cost()),
+            )
+            .reduce(|left, right| left + right)
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -3470,10 +3774,9 @@ pub(super) fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>
 }
 
 struct PreparedLeaf {
-    tokens_by_segment: Vec<Arc<Tokens>>,
+    query: Arc<PreparedBm25Query>,
     params: Arc<FtsSearchParams>,
     operator: Operator,
-    scorer: Arc<MemBM25Scorer>,
 }
 
 pub(super) fn tokenize_leaf(
@@ -3481,9 +3784,12 @@ pub(super) fn tokenize_leaf(
     leaf: &LeafQuery,
     params: &FtsSearchParams,
 ) -> Tokens {
-    let is_fuzzy_match = matches!(leaf, LeafQuery::Match(_))
-        && matches!(params.fuzziness, Some(distance) if distance != 0);
-    let mut tokenizer = if is_fuzzy_match {
+    // Keep the legacy explicit-fuzzy rewrite independent of index analysis.
+    // AUTO fuzziness still expands later, but its source terms must first use
+    // the same normalization and filtering as the indexed vocabulary.
+    let is_explicit_fuzzy_match = matches!(leaf, LeafQuery::Match(_))
+        && matches!(params.fuzziness, Some(distance) if distance > 0);
+    let mut tokenizer = if is_explicit_fuzzy_match {
         let analyzer = TextAnalyzer::from(SimpleTokenizer::default());
         match index.tokenizer().doc_type() {
             DocType::Text => Box::new(TextTokenizer::new(analyzer)) as Box<dyn LanceTokenizer>,
@@ -3495,48 +3801,13 @@ pub(super) fn tokenize_leaf(
     collect_query_tokens(leaf.terms(), &mut tokenizer)
 }
 
-pub(super) fn expanded_leaf_tokens(
-    index: &InvertedIndex,
-    tokens: &Tokens,
-    params: &FtsSearchParams,
-    operator: Operator,
-) -> Result<Tokens> {
-    if !matches!(params.fuzziness, Some(distance) if distance != 0) {
-        return Ok(tokens.clone());
-    }
-    let expanded = index.expand_fuzzy_tokens(tokens, params)?;
-    if operator == Operator::And || params.phrase_slop.is_some() {
-        let surviving = (0..expanded.len())
-            .map(|index| expanded.position(index))
-            .collect::<HashSet<_>>();
-        if (0..tokens.len()).any(|index| !surviving.contains(&tokens.position(index))) {
-            return Ok(Tokens::with_positions(
-                Vec::new(),
-                Vec::new(),
-                tokens.token_type().clone(),
-            ));
-        }
-    }
-    Ok(expanded)
-}
-
-fn validate_injected_scorer_tokens(scorer: &MemBM25Scorer, tokens: &Tokens) -> Result<()> {
-    for token in tokens {
-        if !scorer.token_docs.contains_key(token) {
-            return Err(Error::invalid_input(format!(
-                "injected BM25 scorer is missing compound FTS token '{token}'"
-            )));
-        }
-    }
-    Ok(())
-}
-
 async fn prepare_compound_query(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,
     params: &FtsSearchParams,
     metrics: &dyn MetricsCollector,
     base_scorer: Option<Arc<MemBM25Scorer>>,
+    prepared_match: Option<Arc<PreparedBm25Query>>,
 ) -> Result<(CompoundScorerPlan, Vec<PreparedLeaf>)> {
     let first_index = indices
         .first()
@@ -3553,30 +3824,31 @@ async fn prepare_compound_query(
     }
 
     let mut leaves = Vec::with_capacity(leaf_queries.len());
+    if prepared_match.is_some() && leaf_queries.len() != 1 {
+        return Err(Error::internal(
+            "prepared Match replay requires exactly one compound FTS leaf",
+        ));
+    }
     for leaf in leaf_queries {
         let effective_params = leaf.effective_params(params);
         let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
-        let scorer = match &base_scorer {
-            Some(scorer) => scorer.clone(),
+        let prepared = match &prepared_match {
+            Some(prepared) => prepared.clone(),
             None => Arc::new(
-                build_global_bm25_scorer(indices, &tokens, &effective_params, Some(metrics))
-                    .await?,
+                prepare_bm25_query(
+                    indices,
+                    tokens,
+                    &effective_params,
+                    Some(metrics),
+                    base_scorer.clone(),
+                )
+                .await?,
             ),
         };
-        let mut tokens_by_segment = Vec::with_capacity(indices.len());
-        for index in indices {
-            let expanded_tokens =
-                expanded_leaf_tokens(index, &tokens, &effective_params, leaf.operator())?;
-            if base_scorer.is_some() {
-                validate_injected_scorer_tokens(&scorer, &expanded_tokens)?;
-            }
-            tokens_by_segment.push(Arc::new(expanded_tokens));
-        }
         leaves.push(PreparedLeaf {
-            tokens_by_segment,
+            query: prepared,
             params: Arc::new(effective_params),
             operator: leaf.operator(),
-            scorer,
         });
     }
     Ok((plan, leaves))
@@ -3617,13 +3889,17 @@ async fn load_compound_partition(
 ) -> Result<Option<LoadedPartition>> {
     let leaf_loads = leaves.iter().map(|leaf| {
         let partition = partition.clone();
-        let tokens = leaf.tokens_by_segment[segment_ordinal].clone();
+        let tokens = leaf.query.tokens().clone();
         let params = leaf.params.clone();
-        let scorer = leaf.scorer.clone();
+        let scorer = leaf.query.scorer().clone();
         let metrics = metrics.clone();
         let operator = leaf.operator;
+        let has_all_query_positions = leaf.query.has_all_query_positions();
         async move {
-            let postings = if tokens.is_empty() {
+            let postings = if tokens.is_empty()
+                || ((operator == Operator::And || params.phrase_slop.is_some())
+                    && !has_all_query_positions)
+            {
                 Vec::new()
             } else {
                 partition
@@ -3745,7 +4021,7 @@ where
             Some(scorer)
         })
         .collect::<Vec<_>>();
-    let mut scorer = plan.build(&mut leaf_scorers, metrics)?;
+    let mut scorer = plan.build(&mut leaf_scorers)?;
     if leaf_scorers.iter().any(Option::is_some) {
         return Err(Error::internal(
             "compound FTS scorer did not consume every prepared leaf",
@@ -3791,7 +4067,6 @@ fn collect_loaded_partitions(
             } => {
                 let documents = ModernWandDocuments::filtered(lengths.as_ref(), &visibility);
                 if let Some(projection) = projection {
-                    let mut addresses_resolved = 0;
                     let status = collect_partition_with_documents(
                         &documents,
                         leaves,
@@ -3810,12 +4085,10 @@ fn collect_loaded_partitions(
                                     doc_id.get()
                                 ))
                             })?;
-                            addresses_resolved += 1;
                             Ok(row_id)
                         },
                     )?;
                     debug_assert_eq!(status, CollectionStatus::Complete);
-                    metrics.record_compound_addresses_resolved(addresses_resolved);
                 } else {
                     let max_buffered = collector
                         .limit
@@ -3839,7 +4112,6 @@ fn collect_loaded_partitions(
                             })?))
                         },
                     )?;
-                    metrics.record_compound_peak_buffered_candidates(local_collector.peak_buffered);
                     let boundary = match status {
                         CollectionStatus::Complete => {
                             PartitionCollectionBoundary::Deferred(DeferredCompoundRows {
@@ -3848,7 +4120,6 @@ fn collect_loaded_partitions(
                             })
                         }
                         CollectionStatus::ScoreFloorOverflow => {
-                            metrics.record_compound_score_floor_overflows(1);
                             PartitionCollectionBoundary::Overflow(OverflowedCompoundPartition {
                                 segment_ordinal,
                                 partition_ordinal,
@@ -3857,7 +4128,6 @@ fn collect_loaded_partitions(
                             })
                         }
                     };
-                    metrics.record_compound_peak_buffered_candidates(collector.peak_buffered);
                     return Ok(CollectedPartitions {
                         collector,
                         remaining: partitions.collect(),
@@ -3867,7 +4137,6 @@ fn collect_loaded_partitions(
             }
         }
     }
-    metrics.record_compound_peak_buffered_candidates(collector.peak_buffered);
     Ok(CollectedPartitions {
         collector,
         remaining: Vec::new(),
@@ -3878,7 +4147,6 @@ fn collect_loaded_partitions(
 async fn merge_resolved_compound_rows(
     collector: &mut TopKCollector<u64>,
     deferred: DeferredCompoundRows,
-    metrics: &dyn MetricsCollector,
 ) -> Result<()> {
     for rows in deferred.rows.chunks(SCORE_FLOOR_RESOLUTION_BATCH_SIZE) {
         let doc_ids = rows.iter().map(|row| row.row_id).collect::<Vec<_>>();
@@ -3890,9 +4158,6 @@ async fn merge_resolved_compound_rows(
                 rows.len()
             )));
         }
-        metrics.record_compound_address_resolution_batches(1);
-        metrics.record_compound_peak_address_resolution_batch_size(rows.len());
-        metrics.record_compound_addresses_resolved(addresses.len());
         for (row, row_id) in rows.iter().zip(addresses) {
             let status = collector.insert(ScoredRow {
                 row_id,
@@ -3901,7 +4166,6 @@ async fn merge_resolved_compound_rows(
             debug_assert_eq!(status, CollectionStatus::Complete);
         }
     }
-    metrics.record_compound_peak_buffered_candidates(collector.peak_buffered);
     Ok(())
 }
 
@@ -3956,7 +4220,7 @@ pub async fn compound_search(
     prefilter: Arc<dyn PreFilter>,
     metrics: Arc<dyn MetricsCollector>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
-    compound_search_impl(indices, query, params, prefilter, metrics, None, None).await
+    compound_search_impl(indices, query, params, prefilter, metrics, None, None, None).await
 }
 
 /// Search one-column compound FTS with caller-supplied corpus-wide BM25 statistics.
@@ -3979,6 +4243,7 @@ pub async fn compound_search_with_base_scorer(
         prefilter,
         metrics,
         Some(base_scorer),
+        None,
         None,
     )
     .await
@@ -4006,10 +4271,74 @@ pub async fn compound_search_with_base_scorer_and_score_floor(
         metrics,
         Some(base_scorer),
         Some(score_floor),
+        None,
     )
     .await
 }
 
+/// Replay one root Match query with the exact vocabulary/scorer pair used by
+/// an earlier bounded WAND probe.
+#[doc(hidden)]
+pub async fn compound_search_prepared_match(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+    prepared_match: Arc<PreparedBm25Query>,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    if !matches!(query, FtsQuery::Match(_)) {
+        return Err(Error::invalid_input(
+            "prepared Match replay requires a root Match query",
+        ));
+    }
+    compound_search_impl(
+        indices,
+        query,
+        params,
+        prefilter,
+        metrics,
+        None,
+        None,
+        Some(prepared_match),
+    )
+    .await
+}
+
+/// Replay one root Match query with a prepared vocabulary/scorer pair and an
+/// inclusive initial score floor.
+#[doc(hidden)]
+pub async fn compound_search_prepared_match_with_score_floor(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+    prepared_match: Arc<PreparedBm25Query>,
+    score_floor: f32,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    if !matches!(query, FtsQuery::Match(_)) {
+        return Err(Error::invalid_input(
+            "prepared Match replay requires a root Match query",
+        ));
+    }
+    compound_search_impl(
+        indices,
+        query,
+        params,
+        prefilter,
+        metrics,
+        None,
+        Some(score_floor),
+        Some(prepared_match),
+    )
+    .await
+}
+
+// These arguments keep the public entry points explicit while centralizing the
+// shared search loop; bundling them would only move the same independent inputs
+// into an internal forwarding struct.
+#[allow(clippy::too_many_arguments)]
 async fn compound_search_impl(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,
@@ -4018,13 +4347,21 @@ async fn compound_search_impl(
     metrics: Arc<dyn MetricsCollector>,
     base_scorer: Option<Arc<MemBM25Scorer>>,
     initial_score_floor: Option<f32>,
+    prepared_match: Option<Arc<PreparedBm25Query>>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
     let limit = params.limit.unwrap_or(usize::MAX);
     if limit == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
-    let (plan, leaves) =
-        prepare_compound_query(indices, query, params, metrics.as_ref(), base_scorer).await?;
+    let (plan, leaves) = prepare_compound_query(
+        indices,
+        query,
+        params,
+        metrics.as_ref(),
+        base_scorer,
+        prepared_match,
+    )
+    .await?;
     prefilter.wait_for_ready().await?;
     let mask = prefilter.mask();
     let competitive_score = Arc::new(CompetitiveScore::default());
@@ -4075,8 +4412,7 @@ async fn compound_search_impl(
             partitions = collected.remaining;
             match collected.boundary {
                 Some(PartitionCollectionBoundary::Deferred(deferred)) => {
-                    merge_resolved_compound_rows(&mut collector, deferred, metrics.as_ref())
-                        .await?;
+                    merge_resolved_compound_rows(&mut collector, deferred).await?;
                 }
                 Some(PartitionCollectionBoundary::Overflow(overflow)) => {
                     let retry = reload_compound_partition_with_projection(
@@ -4112,6 +4448,7 @@ mod tests {
     use super::super::scorer::Scorer;
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::inverted::query::MultiMatchQuery;
 
     fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
         values
@@ -4122,6 +4459,25 @@ mod tests {
 
     fn materialized(values: &[(u64, f32)]) -> Box<dyn ComposableScorer> {
         Box::new(MaterializedScorer::try_new(rows(values)).unwrap())
+    }
+
+    #[test]
+    fn materialized_compound_top_k_preserves_multimatch_and_tie_order() {
+        let query = FtsQuery::MultiMatch(MultiMatchQuery {
+            match_queries: vec![
+                MatchQuery::new("alpha".to_string()).with_column(Some("text".to_string())),
+                MatchQuery::new("alpha".to_string()).with_column(Some("text".to_string())),
+            ],
+        });
+        let (row_ids, scores) = materialized_compound_top_k(
+            &query,
+            vec![vec![(7, 1.0), (3, 2.0)], vec![(7, 3.0), (5, 3.0)]],
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(row_ids, vec![5, 7]);
+        assert_eq!(scores, vec![3.0, 3.0]);
     }
 
     fn zero_weight_wand<'a>(
@@ -4162,53 +4518,9 @@ mod tests {
         }
     }
 
-    fn should_maxscore<'a>(
-        children: Vec<BoxScorer<'a>>,
-        metrics: Option<&'a dyn MetricsCollector>,
-    ) -> ShouldMaxScoreScorer<'a> {
+    fn should_maxscore<'a>(children: Vec<BoxScorer<'a>>) -> ShouldMaxScoreScorer<'a> {
         let global_bounds = ShouldMaxScoreScorer::global_bounds(&children).unwrap();
-        ShouldMaxScoreScorer::new(children, global_bounds, metrics)
-    }
-
-    #[derive(Default)]
-    struct ShouldMetrics {
-        reports: AtomicUsize,
-        skipped_windows: AtomicUsize,
-        bound_recomputations: AtomicUsize,
-        essential_evaluations: AtomicUsize,
-        non_essential_evaluations: AtomicUsize,
-    }
-
-    impl MetricsCollector for ShouldMetrics {
-        fn record_parts_loaded(&self, _num_parts: usize) {}
-
-        fn record_index_loads(&self, _num_loads: usize) {}
-
-        fn record_comparisons(&self, _num_comparisons: usize) {}
-
-        fn record_compound_should_skipped_windows(&self, num_windows: usize) {
-            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
-            self.skipped_windows
-                .fetch_add(num_windows, AtomicOrdering::Relaxed);
-        }
-
-        fn record_compound_should_bound_recomputations(&self, num_recomputations: usize) {
-            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
-            self.bound_recomputations
-                .fetch_add(num_recomputations, AtomicOrdering::Relaxed);
-        }
-
-        fn record_compound_should_essential_evaluations(&self, num_evaluations: usize) {
-            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
-            self.essential_evaluations
-                .fetch_add(num_evaluations, AtomicOrdering::Relaxed);
-        }
-
-        fn record_compound_should_non_essential_evaluations(&self, num_evaluations: usize) {
-            self.reports.fetch_add(1, AtomicOrdering::Relaxed);
-            self.non_essential_evaluations
-                .fetch_add(num_evaluations, AtomicOrdering::Relaxed);
-        }
+        ShouldMaxScoreScorer::new(children, global_bounds)
     }
 
     #[test]
@@ -4446,6 +4758,7 @@ mod tests {
         inner: MaterializedScorer,
         accepted: Vec<u64>,
         match_cost: Option<f32>,
+        has_doc_upper: bool,
         approximations: Arc<AtomicUsize>,
         confirmations: Arc<AtomicUsize>,
     }
@@ -4495,6 +4808,18 @@ mod tests {
             self.inner.set_min_competitive_score(min_score)
         }
 
+        fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+            if self.has_doc_upper {
+                self.inner.score().map(Some)
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn supports_doc_local_confirmation_pruning(&self) -> bool {
+            true
+        }
+
         fn matches(&mut self) -> Result<bool> {
             self.confirmations.fetch_add(1, AtomicOrdering::Relaxed);
             Ok(self
@@ -4526,6 +4851,28 @@ mod tests {
             inner: MaterializedScorer::try_new(rows(values)).unwrap(),
             accepted,
             match_cost,
+            has_doc_upper: true,
+            approximations: approximations.clone(),
+            confirmations: confirmations.clone(),
+        };
+        (Box::new(scorer), approximations, confirmations)
+    }
+
+    fn two_phase_without_doc_upper(
+        values: &[(u64, f32)],
+        accepted: Vec<u64>,
+    ) -> (
+        Box<dyn ComposableScorer>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let approximations = Arc::new(AtomicUsize::new(0));
+        let confirmations = Arc::new(AtomicUsize::new(0));
+        let scorer = TwoPhaseScorer {
+            inner: MaterializedScorer::try_new(rows(values)).unwrap(),
+            accepted,
+            match_cost: Some(1.0),
+            has_doc_upper: false,
             approximations: approximations.clone(),
             confirmations: confirmations.clone(),
         };
@@ -4598,6 +4945,14 @@ mod tests {
         fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
             self.work.floors.fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.set_min_competitive_score(min_score)
+        }
+
+        fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+            self.inner.current_score_upper_bound()
+        }
+
+        fn supports_doc_local_confirmation_pruning(&self) -> bool {
+            self.inner.supports_doc_local_confirmation_pruning()
         }
 
         fn matches(&mut self) -> Result<bool> {
@@ -5383,6 +5738,191 @@ mod tests {
     }
 
     #[test]
+    fn phrase_doc_bound_records_exact_and_sloppy_confirmation_avoidance() {
+        let mut token_docs = HashMap::new();
+        token_docs.insert("common".to_owned(), 10_000_000);
+        let scorer = Arc::new(MemBM25Scorer::new(10_000_000, 10_000_000, token_docs));
+        let mut documents = DocSet::default();
+        documents.append(0, 1);
+
+        for slop in [0, 2] {
+            let params = FtsSearchParams::default().with_phrase_slop(Some(slop));
+            let metrics = NoOpMetricsCollector;
+            let phrase = zero_weight_wand(&documents, scorer.clone(), &params, &metrics);
+            // The high-scoring sibling keeps the shared block competitive, while
+            // doc 0 still has a combined doc-local upper below the score floor.
+            let mut phrase = DisjunctionScorer::try_new(
+                vec![phrase, materialized(&[(0, 0.0), (1, 2.0)])],
+                DisjunctionScore::Sum,
+            )
+            .unwrap();
+            let competitive_score = Arc::new(CompetitiveScore::default());
+            competitive_score.raise(1.0);
+
+            assert_eq!(
+                TopKCollector::with_competitive_score(1, competitive_score)
+                    .collect(&mut phrase)
+                    .unwrap(),
+                rows(&[(1, 2.0)])
+            );
+        }
+    }
+
+    #[test]
+    fn phrase_positive_boost_uses_positive_upper_before_confirmation() {
+        let (phrase, _, confirmations) = two_phase(&[(0, 2.0), (1, 10.0)], vec![1], Some(1.0));
+        let mut scorer = BoostScorer::try_new(phrase, materialized(&[(1, 1.0)]), 0.5).unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(9.5);
+
+        assert_eq!(
+            TopKCollector::with_competitive_score(1, competitive_score)
+                .collect(&mut scorer)
+                .unwrap(),
+            rows(&[(1, 9.5)])
+        );
+        assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn phrase_must_not_never_contributes_to_score_upper_bound() {
+        let (prohibited, approximations, confirmations) =
+            two_phase(&[(0, 100.0)], Vec::new(), Some(1.0));
+        let mut scorer = BooleanScorer::try_new(
+            Vec::new(),
+            vec![materialized(&[(0, 1.0), (1, 10.0)])],
+            vec![prohibited],
+        )
+        .unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(10.0);
+
+        assert_eq!(
+            TopKCollector::with_competitive_score(1, competitive_score)
+                .collect(&mut scorer)
+                .unwrap(),
+            rows(&[(1, 10.0)])
+        );
+        // Doc 0 is rejected from the positive score alone. The prohibited
+        // phrase is never advanced, so it cannot inflate that upper bound.
+        assert_eq!(approximations.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn signed_and_unknown_doc_bounds_use_exact_confirmation_fallback() {
+        let (signed_phrase, _, signed_confirmations) = two_phase(&[(0, 2.0)], vec![0], Some(1.0));
+        let signed_optional =
+            Box::new(BoostScorer::try_new(signed_phrase, materialized(&[(0, 2.0)]), 2.0).unwrap());
+        let mut signed = BooleanScorer::try_new(
+            vec![signed_optional],
+            vec![materialized(&[(0, 1.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(10.0);
+
+        assert!(
+            TopKCollector::with_competitive_score(1, competitive_score)
+                .collect(&mut signed)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(signed_confirmations.load(AtomicOrdering::Relaxed), 1);
+        let (unknown_phrase, approximations, confirmations) =
+            two_phase_without_doc_upper(&[(0, 1.0), (1, 100.0)], vec![1]);
+        let mut unknown = BooleanScorer::try_new(
+            vec![unknown_phrase, materialized(&[(0, 0.0), (1, 0.0)])],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(50.0);
+
+        assert_eq!(
+            TopKCollector::with_competitive_score(1, competitive_score)
+                .collect(&mut unknown)
+                .unwrap(),
+            rows(&[(1, 100.0)])
+        );
+        assert_eq!(approximations.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 2);
+    }
+
+    #[test]
+    fn row_address_merge_forwards_phrase_doc_bound_and_avoidance() {
+        // Cross-column eager execution maps each leaf into row-address space
+        // and merges disjoint sources through this same wrapper stack.
+        let (phrase, approximations, confirmations) =
+            two_phase(&[(0, 2.0), (1, 10.0)], vec![1], Some(1.0));
+        let mapped_phrase = Box::new(RowAddressScorer::new(
+            phrase,
+            ordered_row_address_projection_for_test(vec![100, 200]),
+        ));
+        let mut scorer = RowAddressMergeScorer::try_new(vec![
+            RowAddressSource::new(100, mapped_phrase),
+            row_address_source(&[(300, 100.0)]),
+        ])
+        .unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(10.0);
+
+        assert_eq!(
+            TopKCollector::with_competitive_score(2, competitive_score)
+                .collect(&mut scorer)
+                .unwrap(),
+            rows(&[(300, 100.0), (200, 10.0)])
+        );
+        assert_eq!(approximations.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn phrase_outward_upper_equal_to_ulp_floor_still_confirms() {
+        let exact_score = next_down(1.0);
+        let floor = 1.0;
+        assert_eq!(
+            ScoreBounds::ZERO
+                .add(ScoreBounds::point(exact_score).unwrap())
+                .upper(),
+            floor
+        );
+        let (phrase, _, confirmations) = two_phase(&[(7, exact_score)], vec![7], Some(1.0));
+        let mut phrase = DisjunctionScorer::try_new(vec![phrase], DisjunctionScore::Sum).unwrap();
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(floor);
+
+        assert!(
+            TopKCollector::with_competitive_score(1, competitive_score)
+                .collect(&mut phrase)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn surviving_nested_phrase_is_confirmed_exactly_once() {
+        let (phrase, _, confirmations) = two_phase(&[(3, 5.0)], vec![3], Some(1.0));
+        let nested = Box::new(
+            DisjunctionScorer::try_new(
+                vec![phrase, materialized(&[(3, 0.0)])],
+                DisjunctionScore::Sum,
+            )
+            .unwrap(),
+        );
+        let mut scorer = BooleanScorer::try_new(vec![nested], Vec::new(), Vec::new()).unwrap();
+
+        assert_eq!(
+            TopKCollector::new(1).collect(&mut scorer).unwrap(),
+            rows(&[(3, 5.0)])
+        );
+        assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
     fn reqopt_delays_sparse_optional_probes() {
         let values = (0..100).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
         let build = || {
@@ -5406,7 +5946,10 @@ mod tests {
             optional: Some(optional),
             prohibited: None,
             current: None,
+            confirmed_doc: None,
+            confirmed: false,
             optional_matches: false,
+            defer_confirmation: false,
         };
         let eager_results = TopKCollector::new(1).collect(&mut eager).unwrap();
 
@@ -5774,6 +6317,79 @@ mod tests {
         CompoundScorerPlan::Leaf { index, boost: 1.0 }
     }
 
+    #[test]
+    fn phrase_doc_bounds_match_exhaustive_oracle_across_boolean_shapes() {
+        // Leaf 0 models an exact phrase and leaf 1 a sloppy phrase. Their
+        // approximation scores include false position candidates, including a
+        // high-scoring false candidate at doc 4. Docs 1 and 3 deliberately tie.
+        let exact_approximations = [(0, 2.0), (1, 4.0), (2, 3.0), (3, 4.0), (4, 100.0)];
+        let sloppy_approximations = [(0, 1.0), (1, 2.0), (2, 3.0), (3, 2.0), (4, 1.0)];
+        let exact_matches = HashMap::from([(1, 4.0), (3, 4.0)]);
+        let sloppy_matches = HashMap::from([(1, 2.0), (2, 3.0), (3, 2.0)]);
+        let optional = HashMap::from([(0, 1.0), (1, 4.0), (2, 2.0), (3, 4.0), (4, 1.0)]);
+        let required = HashMap::from([(0, 1.0), (1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0)]);
+        let oracle_leaves = vec![exact_matches, sloppy_matches, optional.clone(), required];
+
+        let pure_should = CompoundScorerPlan::Boolean {
+            should: vec![plan_leaf(0), plan_leaf(1), plan_leaf(2)],
+            must: Vec::new(),
+            must_not: Vec::new(),
+        };
+        let must_should = CompoundScorerPlan::Boolean {
+            should: vec![plan_leaf(0), plan_leaf(1), plan_leaf(2)],
+            must: vec![plan_leaf(3)],
+            must_not: Vec::new(),
+        };
+        let nested = CompoundScorerPlan::Boolean {
+            should: vec![pure_should.clone()],
+            must: vec![plan_leaf(3)],
+            must_not: Vec::new(),
+        };
+
+        for (shape, plan, floor) in [
+            ("should", pure_should, 10.0),
+            ("must_should", must_should, 11.0),
+            ("nested", nested, 11.0),
+        ] {
+            let (exact, _, exact_confirmations) =
+                two_phase(&exact_approximations, vec![1, 3], Some(1.0));
+            let (sloppy, _, sloppy_confirmations) =
+                two_phase(&sloppy_approximations, vec![1, 2, 3], Some(2.0));
+            let mut leaves = vec![
+                Some(exact),
+                Some(sloppy),
+                Some(materialized(
+                    &optional
+                        .iter()
+                        .map(|(doc, score)| (*doc, *score))
+                        .collect::<Vec<_>>(),
+                )),
+                Some(materialized(&[
+                    (0, 1.0),
+                    (1, 1.0),
+                    (2, 1.0),
+                    (3, 1.0),
+                    (4, 1.0),
+                ])),
+            ];
+            let mut scorer = plan.build(&mut leaves).unwrap();
+            let competitive_score = Arc::new(CompetitiveScore::default());
+            competitive_score.raise(floor);
+            let actual = TopKCollector::with_competitive_score(2, competitive_score)
+                .collect(scorer.as_mut())
+                .unwrap();
+            let expected = exhaustive_compound_top_k(&plan, &oracle_leaves, 2);
+
+            assert_eq!(actual, expected, "shape={shape}");
+            assert_eq!(actual, rows(&[(1, floor), (3, floor)]), "shape={shape}");
+            assert!(
+                exact_confirmations.load(AtomicOrdering::Relaxed) > 0
+                    && sloppy_confirmations.load(AtomicOrdering::Relaxed) > 0,
+                "shape={shape} must confirm surviving equal-floor phrase candidates"
+            );
+        }
+    }
+
     fn plan_input(possible: bool, cost: usize, lower: f32, upper: f32) -> CompoundLeafPlanInput {
         CompoundLeafPlanInput::new(possible, cost, ScoreBounds::try_new(lower, upper).unwrap())
     }
@@ -6135,7 +6751,6 @@ mod tests {
             for (shape, plan) in &plans {
                 for limit in [1, 3, 7] {
                     let expected = exhaustive_compound_top_k(plan, &leaves, limit);
-                    let metrics = ShouldMetrics::default();
                     let mut mapped_leaves = leaves
                         .iter()
                         .map(|leaf| {
@@ -6146,7 +6761,7 @@ mod tests {
                             ))
                         })
                         .collect::<Vec<_>>();
-                    let mut scorer = plan.build(&mut mapped_leaves, &metrics).unwrap();
+                    let mut scorer = plan.build(&mut mapped_leaves).unwrap();
                     assert!(mapped_leaves.iter().all(Option::is_none));
                     let actual = TopKCollector::new(limit).collect(scorer.as_mut()).unwrap();
                     assert_eq!(actual, expected, "seed={seed} shape={shape} limit={limit}");
@@ -6162,10 +6777,9 @@ mod tests {
         let eager_results = TopKCollector::new(1).collect(&mut eager).unwrap();
         let eager_comparisons = scorer_advances(&eager_work);
 
-        let metrics = ShouldMetrics::default();
         let (children, optimized_work) = pure_should_canary_children();
         let optimized_results = {
-            let mut optimized = should_maxscore(children, Some(&metrics));
+            let mut optimized = should_maxscore(children);
             TopKCollector::new(1).collect(&mut optimized).unwrap()
         };
         let optimized_comparisons = scorer_advances(&optimized_work);
@@ -6177,16 +6791,6 @@ mod tests {
             optimized_comparisons * 5 <= eager_comparisons * 4,
             "pure-SHOULD MAXSCORE should reduce posting candidate probes by at least 20%: \
              optimized={optimized_comparisons} eager={eager_comparisons}"
-        );
-        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
-        assert!(metrics.skipped_windows.load(AtomicOrdering::Relaxed) > 0);
-        assert!(metrics.bound_recomputations.load(AtomicOrdering::Relaxed) > 0);
-        assert!(metrics.essential_evaluations.load(AtomicOrdering::Relaxed) > 0);
-        assert!(
-            metrics
-                .non_essential_evaluations
-                .load(AtomicOrdering::Relaxed)
-                > 0
         );
     }
 
@@ -6212,10 +6816,8 @@ mod tests {
             for limit in [1, 7, 31, 512] {
                 let expected = exhaustive_should_top_k(&children, limit);
 
-                let mut optimized = should_maxscore(
-                    children.iter().map(|values| materialized(values)).collect(),
-                    None,
-                );
+                let mut optimized =
+                    should_maxscore(children.iter().map(|values| materialized(values)).collect());
                 let actual = TopKCollector::new(limit).collect(&mut optimized).unwrap();
                 assert_eq!(actual, expected, "seed={seed} limit={limit}");
             }
@@ -6225,19 +6827,15 @@ mod tests {
     #[test]
     fn pure_should_maxscore_confirms_two_phase_children_before_scoring() {
         let (phrase, _, confirmations) = two_phase(&[(1, 100.0)], Vec::new(), Some(10.0));
-        let metrics = ShouldMetrics::default();
         let competitive_score = Arc::new(CompetitiveScore::default());
         competitive_score.raise(10.0);
         let results = {
-            let mut scorer = should_maxscore(
-                vec![
-                    materialized(&[(0, 10.0)]),
-                    phrase,
-                    materialized(&[(1, 6.0)]),
-                    materialized(&[(1, 5.0)]),
-                ],
-                Some(&metrics),
-            );
+            let mut scorer = should_maxscore(vec![
+                materialized(&[(0, 10.0)]),
+                phrase,
+                materialized(&[(1, 6.0)]),
+                materialized(&[(1, 5.0)]),
+            ]);
             TopKCollector::with_competitive_score(1, competitive_score)
                 .collect(&mut scorer)
                 .unwrap()
@@ -6245,25 +6843,16 @@ mod tests {
 
         assert_eq!(results, rows(&[(1, 11.0)]));
         assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 1);
-        assert!(
-            metrics
-                .non_essential_evaluations
-                .load(AtomicOrdering::Relaxed)
-                > 0
-        );
     }
 
     #[test]
     fn pure_should_maxscore_preserves_query_score_order_and_terminal_doc() {
-        let mut scorer = should_maxscore(
-            vec![
-                materialized(&[(u64::MAX, 16_777_216.0)]),
-                materialized(&[(u64::MAX, 1.0)]),
-                materialized(&[(u64::MAX, 1.0)]),
-                materialized(&[]),
-            ],
-            None,
-        );
+        let mut scorer = should_maxscore(vec![
+            materialized(&[(u64::MAX, 16_777_216.0)]),
+            materialized(&[(u64::MAX, 1.0)]),
+            materialized(&[(u64::MAX, 1.0)]),
+            materialized(&[]),
+        ]);
 
         assert_eq!(
             TopKCollector::new(1).collect(&mut scorer).unwrap(),
@@ -6290,7 +6879,6 @@ mod tests {
                 .into_iter()
                 .map(|score| materialized(&[(7, score)]))
                 .collect(),
-            None,
         );
         let competitive_score = Arc::new(CompetitiveScore::default());
         competitive_score.raise(exact_score);
@@ -6323,9 +6911,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let metrics = ShouldMetrics::default();
         let results = {
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![
                     nested_dismax,
                     nested_boolean,
@@ -6333,21 +6920,18 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
-                Some(&metrics),
             )
             .unwrap();
             TopKCollector::new(1).collect(&mut scorer).unwrap()
         };
 
         assert_eq!(results, rows(&[(2, 6.5)]));
-        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
     }
 
     #[test]
     fn pure_should_maxscore_applies_must_not_before_raising_the_floor() {
-        let metrics = ShouldMetrics::default();
         let results = {
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![
                     materialized(&[(0, 10.0), (1, 5.0)]),
                     materialized(&[(0, 1.0), (1, 1.0)]),
@@ -6355,19 +6939,16 @@ mod tests {
                 ],
                 Vec::new(),
                 vec![materialized(&[(0, 1.0)])],
-                Some(&metrics),
             )
             .unwrap();
             TopKCollector::new(1).collect(&mut scorer).unwrap()
         };
 
         assert_eq!(results, rows(&[(2, 8.0)]));
-        assert_eq!(metrics.reports.load(AtomicOrdering::Relaxed), 4);
     }
 
     #[test]
     fn pure_should_uses_exact_fallback_for_unsupported_shapes() {
-        let signed_metrics = ShouldMetrics::default();
         let signed_results = {
             let signed = Box::new(
                 BoostScorer::try_new(
@@ -6377,7 +6958,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![
                     signed,
                     materialized(&[(0, 1.0), (1, 1.0)]),
@@ -6385,20 +6966,17 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
-                Some(&signed_metrics),
             )
             .unwrap();
             TopKCollector::new(2).collect(&mut scorer).unwrap()
         };
         assert_eq!(signed_results, rows(&[(0, 4.0), (1, 3.0)]));
-        assert_eq!(signed_metrics.reports.load(AtomicOrdering::Relaxed), 0);
 
-        let unbounded_metrics = ShouldMetrics::default();
         let unbounded_results = {
             let unbounded = Box::new(UnboundedScorer {
                 inner: MaterializedScorer::try_new(rows(&[(0, 1.0), (2, 3.0)])).unwrap(),
             });
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![
                     unbounded,
                     materialized(&[(0, 2.0), (1, 2.0)]),
@@ -6406,21 +6984,17 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
-                Some(&unbounded_metrics),
             )
             .unwrap();
             TopKCollector::new(3).collect(&mut scorer).unwrap()
         };
         assert_eq!(unbounded_results, rows(&[(1, 6.0), (0, 3.0), (2, 3.0)]));
-        assert_eq!(unbounded_metrics.reports.load(AtomicOrdering::Relaxed), 0);
 
-        let low_count_metrics = ShouldMetrics::default();
         {
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![materialized(&[(0, 1.0)]), materialized(&[(1, 2.0)])],
                 Vec::new(),
                 Vec::new(),
-                Some(&low_count_metrics),
             )
             .unwrap();
             assert_eq!(
@@ -6428,12 +7002,10 @@ mod tests {
                 rows(&[(1, 2.0), (0, 1.0)])
             );
         }
-        assert_eq!(low_count_metrics.reports.load(AtomicOrdering::Relaxed), 0);
 
-        let overflow_metrics = ShouldMetrics::default();
         let large_score = f32::MAX / 2.0;
         {
-            let mut scorer = BooleanScorer::try_new_with_metrics(
+            let mut scorer = BooleanScorer::try_new(
                 vec![
                     materialized(&[(0, large_score)]),
                     materialized(&[(1, large_score)]),
@@ -6441,7 +7013,6 @@ mod tests {
                 ],
                 Vec::new(),
                 Vec::new(),
-                Some(&overflow_metrics),
             )
             .unwrap();
             assert_eq!(
@@ -6449,6 +7020,5 @@ mod tests {
                 rows(&[(0, large_score), (1, large_score), (2, large_score)])
             );
         }
-        assert_eq!(overflow_metrics.reports.load(AtomicOrdering::Relaxed), 0);
     }
 }

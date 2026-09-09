@@ -78,7 +78,8 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Get an existing entry or compute it from `loader`.
     ///
     /// Implementations should deduplicate concurrent loads for the same key
-    /// so the loader runs at most once.
+    /// so the loader runs at most once, unless caching is disabled. Disabled
+    /// caches may invoke each caller's loader independently.
     ///
     /// Returns `(entry, was_cached)` where `was_cached` is `true` if the entry
     /// was already present in the cache (the loader was not invoked).

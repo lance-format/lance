@@ -1344,7 +1344,10 @@ mod tests {
         SargableQuery::Equals(ScalarValue::Float64(Some(2.0))),
         vec![1]
     )]
+    // Spill-enabled index builds share the cached DataFusion memory pool within the
+    // test process, so keep them in one resource group.
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_btree_update_uses_trained_target_type(
         #[case] initial_docs: &[&str],
         #[case] update_docs: &[&str],
@@ -1443,6 +1446,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_btree_update_reports_type_drift() {
         let (source_store, _source_dir) = local_json_index_store();
         let index = train_and_load_json_index(
@@ -1470,6 +1474,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_derived_params_preserve_wrapper() {
         let (store, _tmpdir) = local_json_index_store();
         let index = train_and_load_json_index(
@@ -1537,12 +1542,6 @@ mod tests {
     /// Rows are fed in raw storage order (not sorted by value) to simulate what an
     /// unordered scan would produce.
     ///
-    /// Each case below runs a spilling `SortExec` that reserves a non-spillable merge
-    /// buffer from the process-wide cached DataFusion memory pool (see
-    /// `get_session_context`); running the cases concurrently contends for that shared
-    /// pool and can spuriously exhaust it, so this guard serializes them.
-    static FLOAT_INDEX_CASE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[rstest]
     #[case::range_gt_zero(
         SargableQuery::Range(Bound::Excluded(ScalarValue::Float64(Some(0.0))), Bound::Unbounded),
@@ -1562,11 +1561,11 @@ mod tests {
         vec![0, 1, 2]
     )]
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_float_btree_index_unsorted_input(
         #[case] query: SargableQuery,
         #[case] expected: Vec<u64>,
     ) {
-        let _guard = FLOAT_INDEX_CASE_GUARD.lock().await;
         use crate::metrics::NoOpMetricsCollector;
         use lance_select::RowAddrTreeMap;
 
@@ -1612,11 +1611,11 @@ mod tests {
     /// contains JSONB bytes, so conversion must use the accompanying type tag to turn it
     /// into an Arrow null before sorting and training the target index.
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_btree_index_null_at_path() {
         use crate::metrics::NoOpMetricsCollector;
         use lance_select::RowAddrTreeMap;
 
-        let _guard = FLOAT_INDEX_CASE_GUARD.lock().await;
         let (store, _tmpdir) = local_json_index_store();
         let index = train_and_load_json_index(
             store,

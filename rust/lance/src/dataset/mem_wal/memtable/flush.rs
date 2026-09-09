@@ -84,6 +84,45 @@ pub struct MemTableFlusher {
     session: Option<Arc<Session>>,
 }
 
+/// What a flushed generation holds, for the manifest entry recording it.
+///
+/// Read off the memtable being flushed, which is frozen. That matters: an
+/// appending store bumps these counters before it publishes the batch, so only
+/// a sealed one agrees with what a scan of it will see.
+#[derive(Clone, Copy)]
+struct FlushedSize {
+    in_memory_bytes: Option<u64>,
+    physical_rows: Option<u64>,
+    primary_key_bytes: Option<u64>,
+}
+
+impl FlushedSize {
+    /// Zero reads as unmeasured. An empty memtable is refused before a flush
+    /// gets here, so a flushed generation always holds rows and a zero can only
+    /// mean the accounting failed.
+    fn of(memtable: &MemTable) -> Self {
+        Self {
+            // `row_bytes`, not the store's retained heap: the window being
+            // written is what a reader of this generation gets back.
+            in_memory_bytes: Some(memtable.batch_store().row_bytes() as u64).filter(|b| *b > 0),
+            physical_rows: Some(memtable.row_count() as u64).filter(|r| *r > 0),
+            // Zero means the table has no primary key, which is not a
+            // measurement of one.
+            primary_key_bytes: Some(memtable.pk_bytes() as u64).filter(|b| *b > 0),
+        }
+    }
+
+    fn sstable(self, generation: u64, path: String) -> SsTable {
+        SsTable {
+            generation,
+            path,
+            in_memory_bytes: self.in_memory_bytes,
+            physical_rows: self.physical_rows,
+            primary_key_bytes: self.primary_key_bytes,
+        }
+    }
+}
+
 impl MemTableFlusher {
     pub fn new(
         object_store: Arc<ObjectStore>,
@@ -232,6 +271,7 @@ impl MemTableFlusher {
 
         let random_hash = generate_random_hash();
         let generation = memtable.generation();
+        let size = FlushedSize::of(memtable);
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
         let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
 
@@ -273,6 +313,7 @@ impl MemTableFlusher {
                 generation,
                 &gen_folder_name,
                 covered_wal_entry_position,
+                size,
             )
             .await?;
 
@@ -282,10 +323,7 @@ impl MemTableFlusher {
         );
 
         Ok(FlushResult {
-            sstable: SsTable {
-                generation,
-                path: gen_folder_name,
-            },
+            sstable: size.sstable(generation, gen_folder_name),
             rows_flushed,
             covered_wal_entry_position,
         })
@@ -465,6 +503,7 @@ impl MemTableFlusher {
 
         let random_hash = generate_random_hash();
         let generation = memtable.generation();
+        let size = FlushedSize::of(memtable);
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
         let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
 
@@ -577,6 +616,7 @@ impl MemTableFlusher {
                 generation,
                 &gen_folder_name,
                 covered_wal_entry_position,
+                size,
             )
             .await?;
 
@@ -586,10 +626,7 @@ impl MemTableFlusher {
         );
 
         Ok(FlushResult {
-            sstable: SsTable {
-                generation,
-                path: gen_folder_name,
-            },
+            sstable: size.sstable(generation, gen_folder_name),
             rows_flushed: memtable.row_count(),
             covered_wal_entry_position,
         })
@@ -1129,16 +1166,14 @@ impl MemTableFlusher {
         generation: u64,
         gen_path: &str,
         covered_wal_entry_position: u64,
+        size: FlushedSize,
     ) -> Result<ShardManifest> {
         let gen_path = gen_path.to_string();
 
         self.manifest_store
             .commit_update(epoch, |current| {
                 let mut sstables = current.sstables.clone();
-                sstables.push(SsTable {
-                    generation,
-                    path: gen_path.clone(),
-                });
+                sstables.push(size.sstable(generation, gen_path.clone()));
 
                 ShardManifest {
                     version: current.next_version(),
@@ -1164,8 +1199,6 @@ pub enum TriggerMemTableFlush {
         /// Optional channel to notify when flush completes.
         done: Option<tokio::sync::oneshot::Sender<Result<FlushResult>>>,
     },
-    /// Periodic tick: evict frozen memtables whose post-flush grace has elapsed.
-    SweepExpired,
 }
 
 impl std::fmt::Debug for TriggerMemTableFlush {
@@ -1177,7 +1210,6 @@ impl std::fmt::Debug for TriggerMemTableFlush {
                 .field("memtable_rows", &memtable.row_count())
                 .field("has_done", &done.is_some())
                 .finish(),
-            Self::SweepExpired => f.write_str("TriggerMemTableFlush::SweepExpired"),
         }
     }
 }
@@ -1196,6 +1228,60 @@ mod tests {
         let uri = format!("file://{}", temp_dir.path().display());
         let (store, path) = ObjectStore::from_uri(&uri).await.unwrap();
         (store, path, uri, temp_dir)
+    }
+
+    /// A local store with one claimed shard and a flusher over it.
+    ///
+    /// Every flush test in this module repeats this setup.
+    struct FlushFixture {
+        manifest_store: Arc<ShardManifestStore>,
+        flusher: MemTableFlusher,
+        epoch: u64,
+        _temp_dir: TempDir,
+    }
+
+    impl FlushFixture {
+        async fn new() -> Self {
+            let (store, base_path, base_uri, temp_dir) = create_local_store().await;
+            let shard_id = Uuid::new_v4();
+            let manifest_store = Arc::new(ShardManifestStore::new(
+                store.clone(),
+                &base_path,
+                shard_id,
+                2,
+            ));
+            let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
+            let flusher =
+                MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store.clone());
+            Self {
+                manifest_store,
+                flusher,
+                epoch,
+                _temp_dir: temp_dir,
+            }
+        }
+
+        /// Flush `memtable` and read the entry it wrote back **off storage**.
+        ///
+        /// Through `read_version`, not `latest`: the store caches the manifest
+        /// it just wrote, so `latest` returns that same Rust value and would
+        /// pass even for a field that never reached the protobuf.
+        async fn flush_and_read_back(&self, memtable: &MemTable, durable: usize) -> SsTable {
+            let result = self
+                .flusher
+                .flush(memtable, self.epoch, 1, durable)
+                .await
+                .unwrap();
+            let version = self.manifest_store.latest().await.unwrap().unwrap().version;
+            self.manifest_store
+                .read_version(version)
+                .await
+                .unwrap()
+                .sstables
+                .into_iter()
+                .find(|sstable| sstable.generation == result.sstable.generation)
+                .expect("the flush recorded its generation")
+        }
     }
 
     fn create_test_schema() -> Arc<ArrowSchema> {
@@ -1338,6 +1424,70 @@ mod tests {
         assert_eq!(updated_manifest.replay_after_wal_entry_position, 1);
         assert_eq!(updated_manifest.current_generation, 2);
         assert_eq!(updated_manifest.sstables.len(), 1);
+    }
+
+    /// A flushed generation records what it holds, read back off storage.
+    ///
+    /// The read goes through the persisted protobuf on purpose: a consumer
+    /// decides whether to open a generation from these numbers, so a field that
+    /// never reached storage is the failure worth catching.
+    #[tokio::test]
+    async fn flushed_sstable_records_what_it_holds() {
+        let fixture = FlushFixture::new().await;
+        let schema = create_test_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        let rows = 10;
+        let frag_id = memtable
+            .insert(create_test_batch(&schema, rows))
+            .await
+            .unwrap();
+        let accounted = memtable.batch_store().row_bytes() as u64;
+
+        let entry = fixture.flush_and_read_back(&memtable, frag_id + 1).await;
+
+        assert_eq!(entry.physical_rows, Some(rows as u64));
+        assert_eq!(entry.in_memory_bytes, Some(accounted));
+        // The MemTable's own accounting, so above the raw payload (4 bytes per
+        // `id`) and not the encoded file size.
+        let payload = rows as u64 * std::mem::size_of::<i32>() as u64;
+        assert!(
+            entry.in_memory_bytes.unwrap() > payload,
+            "recorded {:?} should exceed the raw payload {payload}",
+            entry.in_memory_bytes
+        );
+        // No primary key here: absent, not zero, which a consumer would read as
+        // costing nothing.
+        assert_eq!(entry.primary_key_bytes, None);
+    }
+
+    /// With a primary key, its size is recorded too -- the term neither of the
+    /// others carries, since a narrow key over many rows and a wide key over
+    /// few weigh the same in `in_memory_bytes`.
+    #[tokio::test]
+    async fn flushed_sstable_records_its_primary_key_size() {
+        let fixture = FlushFixture::new().await;
+        let schema = create_pk_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
+        let rows = 10;
+        let frag_id = memtable
+            .insert(create_test_batch(&schema, rows))
+            .await
+            .unwrap();
+
+        let entry = fixture.flush_and_read_back(&memtable, frag_id + 1).await;
+
+        // `id` is a non-nullable Int32, so the key columns hold at least four
+        // bytes a row and cannot reach the whole MemTable's size.
+        let key_bytes = entry.primary_key_bytes.expect("a keyed table records it");
+        assert!(
+            key_bytes >= rows as u64 * std::mem::size_of::<i32>() as u64,
+            "recorded {key_bytes} is below the raw key payload"
+        );
+        assert!(
+            key_bytes < entry.in_memory_bytes.unwrap(),
+            "keys ({key_bytes}) cannot outweigh the whole MemTable ({:?})",
+            entry.in_memory_bytes
+        );
     }
 
     /// A `SsTableWarmer` that counts calls and optionally fails.

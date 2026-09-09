@@ -246,6 +246,29 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn as_any(&self) -> &dyn Any;
     fn clone_arc(&self) -> Arc<dyn IndexStore>;
 
+    /// Return whether this store has the same live storage binding as `other`.
+    ///
+    /// `true` means cached indices holding [`IndexReader`]s created through `other` are safe to
+    /// reuse through this store. `false` means they must be reopened through
+    /// [`IndexStore::open_index_file`]. Implementations should return `true` only when readers,
+    /// credentials, and connection handles are interchangeable between both stores. The
+    /// conservative default prevents custom stores from accidentally reusing a store-bound
+    /// index.
+    ///
+    /// ```
+    /// use lance_index_core::scalar::IndexStore;
+    ///
+    /// fn can_reuse_cached_index(
+    ///     current_store: &dyn IndexStore,
+    ///     cached_store: &dyn IndexStore,
+    /// ) -> bool {
+    ///     current_store.is_same_storage_binding(cached_store)
+    /// }
+    /// ```
+    fn is_same_storage_binding(&self, _other: &dyn IndexStore) -> bool {
+        false
+    }
+
     /// Suggested I/O parallelism for the store
     fn io_parallelism(&self) -> usize;
 

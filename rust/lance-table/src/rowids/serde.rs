@@ -146,10 +146,7 @@ impl TryFrom<pb::U64Segment> for U64Segment {
                 }
                 Ok(Self::RangeWithBitmap {
                     range: start..end,
-                    bitmap: Bitmap {
-                        data: bitmap,
-                        len: range_len,
-                    },
+                    bitmap: Bitmap::from_parts(bitmap, range_len),
                 })
             }
             Some(SortedArray(array)) => {
@@ -258,7 +255,7 @@ impl From<U64Segment> for pb::U64Segment {
                     pb::u64_segment::RangeWithBitmap {
                         start: range.start,
                         end: range.end,
-                        bitmap: bitmap.data,
+                        bitmap: bitmap.into_bytes(),
                     },
                 )),
             },
@@ -327,11 +324,29 @@ pub fn read_row_ids(reader: &[u8]) -> Result<RowIdSequence> {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
     use rstest::rstest;
 
+    use super::*;
+
+    #[test]
+    fn test_bitmap_serialization_is_byte_exact() {
+        let mut bitmap = Bitmap::new_full(10);
+        bitmap.clear(2);
+        let segment = U64Segment::RangeWithBitmap {
+            range: 100..110,
+            bitmap,
+        };
+        assert_eq!(segment.len(), 9);
+
+        let serialized = pb::U64Segment::from(segment.clone());
+        let Some(pb::u64_segment::Segment::RangeWithBitmap(encoded)) = &serialized.segment else {
+            panic!("expected bitmap segment");
+        };
+        assert_eq!(encoded.bitmap, vec![0xfb, 0x03]);
+        assert_eq!(U64Segment::try_from(serialized).unwrap(), segment);
+    }
     fn read_segment(segment: pb::u64_segment::Segment) -> Result<RowIdSequence> {
         let sequence = pb::RowIdSequence {
             segments: vec![pb::U64Segment {

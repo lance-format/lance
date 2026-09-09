@@ -480,14 +480,26 @@ exact size depends on the quantizer:
 100M * (768 + 8) = ~72.3 GiB
 ```
 
-**RQ (RaBitQ):** Vectors are currently quantized to 1-bit binary codes. Each row also stores per-row
-scale and offset factors (4 bytes each) used for distance correction. Each row requires
-`dimension / 8 + 16` bytes (8 bytes for the row ID plus 8 bytes for the factors). For example, 100M
-rows with 768 dimensions and 1 bit per dimension:
+**RQ (RaBitQ):** New indexes default to 5 bits per dimension. Every bit width stores a 1-bit sign
+code plus three 4-byte correction factors. Multi-bit indexes also store the remaining bits in
+64-dimension-padded blocks and two additional 4-byte correction factors. Including the 8-byte row
+ID, the approximate size per row is:
+
+- 1-bit: `dimension / 8 + 20` bytes
+- Multi-bit: `dimension / 8 + round_up(dimension, 64) * (num_bits - 1) / 8 + 28` bytes
+
+For example, the default 5-bit index for 100M rows with 768 dimensions requires:
 
 ```
-100M * (768 / 8 + 16) = ~10.8 GiB
+100M * (768 / 8 + 768 * 4 / 8 + 28) = ~47.3 GiB
 ```
+
+The 5-bit default retains more information for the higher-fidelity distance estimates used by
+`Normal` and `Accurate` search modes, at the cost of more quantization work and index I/O during
+the build and a larger index. `Fast` search mode uses only the 1-bit sign code even when the index
+stores additional bits. Set `num_bits=1` explicitly to minimize index size and build I/O; the same
+100M-row example uses about 10.8 GiB, but searches cannot use the multi-bit distance estimate and
+may have lower recall.
 
 #### AMX Acceleration
 

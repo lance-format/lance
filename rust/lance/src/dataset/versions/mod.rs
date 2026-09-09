@@ -6,7 +6,11 @@
 //! File grammar belongs to `lance_file::versions`. This module contains only
 //! operation-level dataset choices whose behavior actually differs by version.
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    sync::Arc,
+};
 
 use arrow_schema::{DataType, Field as ArrowField};
 use datafusion::catalog::Session;
@@ -19,7 +23,9 @@ use lance_core::{
     Error, Result,
     datatypes::{Field, Projection, Schema, SchemaCompareOptions},
 };
-use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::chunker::{
+    break_stream, break_stream_with_sizes, chunk_stream, chunk_stream_with_sizes,
+};
 use lance_file::{
     version::ConcreteFileVersion,
     versions as file_versions,
@@ -124,6 +130,7 @@ pub async fn write_fragments(
     data: SendableRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
+    file_row_counts: Option<Vec<usize>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let version_name = format!("{version:?}");
     let schema = write::prepare_write_schema(
@@ -151,6 +158,7 @@ pub async fn write_fragments(
         params,
         target_bases_info,
         seed_writers,
+        file_row_counts,
     )
     .await?;
     Ok((fragments, schema))
@@ -167,17 +175,50 @@ pub async fn write_fragments_direct(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     seed_writers: Vec<Box<dyn IndexSeedWriter>>,
+    file_row_counts: Option<Vec<usize>>,
 ) -> Result<Vec<Fragment>> {
     let adapter = SchemaAdapter::new(data.schema());
     let data = adapter.to_physical_stream(data);
-    let buffered_reader = match version {
-        ConcreteFileVersion::V1 => chunk_stream(data, params.max_rows_per_group),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => break_stream(data, params.max_rows_per_file)
-            .map_ok(|batch| vec![batch])
-            .boxed(),
+    let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
+        if file_row_counts.contains(&0) {
+            return Err(Error::invalid_input(
+                "File row counts must be greater than zero",
+            ));
+        }
+        match version {
+            ConcreteFileVersion::V1 => {
+                if params.max_rows_per_group == 0 {
+                    return Err(Error::invalid_input(
+                        "max_rows_per_group must be greater than zero when file row counts are specified",
+                    ));
+                }
+                let max_rows_per_group = params.max_rows_per_group;
+                let batch_row_counts =
+                    file_row_counts
+                        .clone()
+                        .into_iter()
+                        .flat_map(move |file_rows| {
+                            (0..file_rows)
+                                .step_by(max_rows_per_group)
+                                .map(move |offset| (file_rows - offset).min(max_rows_per_group))
+                        });
+                chunk_stream_with_sizes(data, batch_row_counts)
+            }
+            ConcreteFileVersion::V2_0
+            | ConcreteFileVersion::V2_1
+            | ConcreteFileVersion::V2_2
+            | ConcreteFileVersion::V2_3 => break_stream_with_sizes(data, file_row_counts.clone()),
+        }
+    } else {
+        match version {
+            ConcreteFileVersion::V1 => chunk_stream(data, params.max_rows_per_group),
+            ConcreteFileVersion::V2_0
+            | ConcreteFileVersion::V2_1
+            | ConcreteFileVersion::V2_2
+            | ConcreteFileVersion::V2_3 => break_stream(data, params.max_rows_per_file)
+                .map_ok(|batch| vec![batch])
+                .boxed(),
+        }
     };
     let external_base_resolver = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -198,6 +239,7 @@ pub async fn write_fragments_direct(
         external_base_resolver,
         target_bases_info,
         seed_writers,
+        file_row_counts,
     )
     .await
 }
@@ -281,6 +323,16 @@ pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
 }
 
 fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
+    let mut fields_by_id: HashMap<i32, (&Field, bool)> = HashMap::new();
+    for field in manifest.schema.fields_pre_order() {
+        let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
+        fields_by_id
+            .entry(field.id)
+            .or_insert((field, needs_column));
+    }
+
+    let mut validated_lists: HashSet<(usize, usize)> = HashSet::new();
+
     for fragment in manifest.fragments.iter() {
         for data_file in &fragment.files {
             let file_version = data_file.file_version()?;
@@ -299,13 +351,19 @@ fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
             if file_version == ConcreteFileVersion::V2_0 {
                 continue;
             }
+            let list_key = (
+                data_file.fields.as_ptr() as usize,
+                data_file.column_indices.as_ptr() as usize,
+            );
+            if !validated_lists.insert(list_key) {
+                continue;
+            }
             for (field_id, column_index) in
                 data_file.fields.iter().zip(data_file.column_indices.iter())
             {
-                let Some(field) = manifest.schema.field_by_id(*field_id) else {
+                let Some((field, needs_column)) = fields_by_id.get(field_id).copied() else {
                     continue;
                 };
-                let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
                 if needs_column && *column_index == -1 {
                     return Err(Error::invalid_input(format!(
                         "Field '{}' (id={}) in data file '{}' (fragment {}) has column_index=-1, but leaf fields, packed structs, and blob fields must have a valid column index in file format 2.1+.",

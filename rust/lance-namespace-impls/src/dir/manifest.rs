@@ -55,7 +55,7 @@ use lance_namespace::models::{
     TableExistsRequest,
 };
 use lance_namespace::schema::arrow_schema_to_json;
-use lance_table::feature_flags::apply_feature_flags;
+use lance_table::feature_flags::{apply_feature_flags, ensure_can_write_manifest};
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
@@ -1840,6 +1840,7 @@ impl ManifestNamespace {
         indices: Option<Vec<IndexMetadata>>,
         transaction: Transaction,
     ) -> std::result::Result<(), CommitError> {
+        ensure_can_write_manifest(manifest).map_err(CommitError::from)?;
         apply_feature_flags(manifest, false, false).map_err(CommitError::from)?;
         let timestamp_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1932,6 +1933,7 @@ impl ManifestNamespace {
     /// concurrent upgrade in between is still caught.
     async fn ensure_manifest_writable(&self) -> Result<()> {
         let dataset_guard = self.manifest_dataset.get().await?;
+        ensure_can_write_manifest(dataset_guard.manifest())?;
         ensure_writable(dataset_guard.metadata())
     }
 
@@ -1952,10 +1954,11 @@ impl ManifestNamespace {
 
         loop {
             let dataset_guard = self.manifest_dataset.get_refreshed().await?;
+            ensure_can_write_manifest(dataset_guard.manifest())?;
             let dataset = Arc::new(dataset_guard.clone());
             drop(dataset_guard);
-            // Refuse to mutate a manifest written with a writer feature flag this
-            // build does not understand.
+            // The namespace format has its own capabilities in table metadata,
+            // separate from the Lance manifest capabilities checked above.
             ensure_writable(dataset.metadata())?;
             // Staged files, indices, the commit, and cleanup must all use the dataset's
             // own object store (see `commit_manifest_overwrite`).
@@ -3492,6 +3495,8 @@ impl LanceNamespace for ManifestNamespace {
             }
         }
 
+        self.ensure_manifest_writable().await?;
+
         // Atomically create the .lance-reserved file to mark the table as declared.
         // Shared with DirectoryNamespace via put_marker_file_atomic (dotfile-safe
         // staging + MarkerFileError::AlreadyExists → TableAlreadyExists).
@@ -3855,9 +3860,10 @@ mod tests {
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_namespace::LanceNamespace;
     use lance_namespace::models::{
-        CreateNamespaceRequest, CreateTableRequest, DescribeTableRequest, DropTableRequest,
-        ListTablesRequest, TableExistsRequest,
+        CreateNamespaceRequest, CreateTableRequest, DeclareTableRequest, DescribeTableRequest,
+        DropTableRequest, ListTablesRequest, TableExistsRequest,
     };
+    use lance_table::feature_flags::FLAG_UNKNOWN;
     use lance_table::format::Fragment;
     use rstest::rstest;
     use std::collections::{HashMap, HashSet};
@@ -4388,6 +4394,76 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1, 7]
         );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_writes_reject_unknown_writer_flag_before_staging() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_ns = create_manifest_namespace(temp_path, false).await;
+        let data_paths_before = manifest_data_paths(&manifest_ns).await;
+        let original_version = {
+            let mut dataset = manifest_ns.manifest_dataset.get_mut().await.unwrap();
+            let mut manifest = dataset.manifest().clone();
+            manifest.writer_feature_flags |= FLAG_UNKNOWN << 1;
+            let version = manifest.version;
+            dataset.manifest = Arc::new(manifest);
+            version
+        };
+
+        let entries_before = dir_entry_names(temp_path);
+        let mut declare_request = DeclareTableRequest::new();
+        declare_request.id = Some(vec!["declared_table".to_string()]);
+        let error = manifest_ns
+            .declare_table(declare_request)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("upgrade"),
+            "expected an upgrade error, got: {error}"
+        );
+        assert_eq!(dir_entry_names(temp_path), entries_before);
+
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["new_table".to_string()]);
+        let error = manifest_ns
+            .create_table(create_request, Bytes::from(create_test_ipc_data()))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("upgrade"),
+            "expected an upgrade error, got: {error}"
+        );
+        assert_eq!(dir_entry_names(temp_path), entries_before);
+
+        let error = manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("table.lance".to_string()),
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().to_lowercase().contains("upgrade"),
+            "expected an upgrade error, got: {error}"
+        );
+        assert_eq!(
+            manifest_ns
+                .manifest_dataset
+                .get()
+                .await
+                .unwrap()
+                .version()
+                .version,
+            original_version
+        );
+        assert_eq!(manifest_data_paths(&manifest_ns).await, data_paths_before);
     }
 
     #[tokio::test]

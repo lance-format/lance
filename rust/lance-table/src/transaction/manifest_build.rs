@@ -10,7 +10,10 @@
 //! operation vocabulary it matches on, the index rules it applies, the row version
 //! metadata it stamps, the validation that runs before it.
 
-use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags};
+use crate::feature_flags::{
+    FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+};
 use crate::format::overlay::TOMBSTONE_FIELD_ID;
 use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
@@ -38,6 +41,7 @@ use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_io::object_store::ObjectStore;
@@ -100,6 +104,11 @@ impl Transaction {
             .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
         let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
+        // This read bypasses Dataset's feature gates. Refuse unsupported target
+        // manifests before apply_feature_flags can clear their unknown bits and
+        // republish the referenced files as legacy-compatible.
+        ensure_can_read_manifest(&manifest)?;
+        ensure_can_write_manifest(&manifest)?;
         manifest.set_timestamp(config.timestamp_nanos);
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
@@ -117,6 +126,7 @@ impl Transaction {
                  collide with ids this table has already used"
             )));
         }
+        inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
         Ok((manifest, indices))
     }
 
@@ -1301,11 +1311,10 @@ impl Transaction {
         // derived there.
         //
         // Derived fresh from `final_indices` on every commit, never inherited.
-        // Every manifest this reaches starts with both words zeroed -- `Manifest::new`
-        // and `new_from_previous` alike -- so there is no stale bit to clear, and
-        // dropping the last covering index lifts the fence by simply not setting
-        // it again. Inheriting it from the previous manifest instead would make
-        // the fence permanent.
+        // Every manifest this reaches starts without the covering bit, so there
+        // is no stale bit to clear. Dropping the last covering index lifts the
+        // fence by simply not setting it again. Inheriting it from the previous
+        // manifest instead would make the fence permanent.
         //
         // Both words: a reader that selects a vector index by membership of
         // `fields` would answer a query on a merely-carried column with an index
@@ -1317,6 +1326,10 @@ impl Transaction {
         {
             manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
             manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+        }
+
+        if let Some(current_manifest) = current_manifest {
+            inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
         }
 
         manifest.set_timestamp(config.timestamp_nanos);
@@ -1395,9 +1408,7 @@ impl Transaction {
                                 field
                                     .metadata
                                     .get(LANCE_UNENFORCED_PRIMARY_KEY)
-                                    .filter(|s| {
-                                        matches!(s.to_lowercase().as_str(), "true" | "1" | "yes")
-                                    })
+                                    .filter(|s| str_is_truthy(s))
                                     .map(|_| 0)
                             });
                         // Also set unenforced clustering key based on updated
@@ -1433,6 +1444,11 @@ impl Transaction {
                     return Err(Error::invalid_input(
                         "the unenforced primary key is a reserved key and cannot be set to an invalid value",
                     ));
+                }
+                if writes_primary_key {
+                    // Installing by field metadata skips the Arrow-schema
+                    // conversion that would otherwise validate the key.
+                    manifest.schema.verify_primary_key()?;
                 }
                 let clustering_key_after: Vec<i32> = manifest
                     .schema

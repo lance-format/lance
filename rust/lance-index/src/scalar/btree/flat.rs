@@ -619,4 +619,80 @@ mod tests {
             &[0, 1, 2],
         );
     }
+
+    /// Row addresses pack `(fragment_id << 32) | offset`, so a page spanning
+    /// several fragments must report exactly those fragments, deduped and
+    /// sorted. Every other test in this module uses offsets inside fragment 0,
+    /// which never exercises the shift.
+    #[test]
+    fn test_calculate_included_frags_spans_fragments() {
+        let addr = |frag: u32, offset: u32| u64::from(RowAddress::new_from_parts(frag, offset));
+        let batch = record_batch!(
+            (
+                BTREE_VALUES_COLUMN,
+                Int32,
+                [Some(1), Some(2), Some(3), Some(4)]
+            ),
+            (
+                BTREE_IDS_COLUMN,
+                UInt64,
+                [addr(0, 0), addr(2, 7), addr(0, 1), addr(5, 3)]
+            )
+        )
+        .unwrap();
+        let index = FlatIndex::try_new(batch).unwrap();
+
+        assert_eq!(
+            index.calculate_included_frags().unwrap(),
+            RoaringBitmap::from_iter([0u32, 2, 5])
+        );
+
+        // A hit still carries the full 64-bit address, not a bare offset.
+        let hit = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::from(2)),
+                true,
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(
+            hit,
+            NullableRowAddrSet::new(RowAddrTreeMap::from_iter(&[addr(2, 7)]), Default::default())
+        );
+    }
+
+    /// A zero-row page has to answer queries with empty sets rather than
+    /// panicking inside the Arrow predicate evaluation. The roundtrip test
+    /// builds an empty index but never queries one. Both `track_nulls` modes
+    /// take different shortcuts, and neither has any row to return here.
+    #[test]
+    fn test_empty_index_answers_queries_with_empty_sets() {
+        let empty = RecordBatch::new_empty(example_index().data.schema());
+        let index = FlatIndex::try_new(empty).unwrap();
+        let nothing = NullableRowAddrSet::new(RowAddrTreeMap::new(), RowAddrTreeMap::new());
+
+        for query in [
+            SargableQuery::Equals(ScalarValue::from(10)),
+            SargableQuery::Equals(ScalarValue::Int32(None)),
+            SargableQuery::IsNull(),
+            SargableQuery::IsIn(vec![ScalarValue::from(10), ScalarValue::from(20)]),
+            SargableQuery::Range(Bound::Unbounded, Bound::Unbounded),
+        ] {
+            for track_nulls in [true, false] {
+                assert_eq!(
+                    index
+                        .search(&query, track_nulls, &NoOpMetricsCollector)
+                        .unwrap(),
+                    nothing,
+                    "query: {query:?}, track_nulls: {track_nulls}"
+                );
+            }
+        }
+
+        assert!(index.all().true_rows().is_empty());
+        assert_eq!(
+            index.calculate_included_frags().unwrap(),
+            RoaringBitmap::new()
+        );
+    }
 }

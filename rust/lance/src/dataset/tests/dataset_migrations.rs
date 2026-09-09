@@ -17,7 +17,7 @@ use lance_table::rowids::read_row_ids;
 use crate::dataset::write::{WriteMode, WriteParams};
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
-use arrow_array::{Float32Array, Int64Array, RecordBatchIterator};
+use arrow_array::{Array, Float32Array, Int64Array, ListArray, RecordBatchIterator, UInt32Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_file::version::LanceFileVersion;
 
@@ -281,6 +281,43 @@ async fn test_v0_8_14_invalid_index_fragment_bitmap(
     assert_eq!(row_count, 1900);
 }
 
+/// The repair above is triggered by the writer version of the manifest being
+/// committed *from*, and a successful commit stamps the current one. So a
+/// commit that cannot open the index has exactly one chance at the corrupt
+/// bitmap, and carrying it through unverified would hand a later build a
+/// bitmap that looks migrated.
+#[tokio::test]
+async fn test_v0_8_14_invalid_index_fragment_bitmap_repair_is_not_lost() {
+    let test_dir = copy_test_data_to_tmp("v0.8.14/corrupt_index").unwrap();
+    let test_uri = test_dir.path_str();
+
+    let indices_dir = test_dir.std_path().join("_indices");
+    let stashed_dir = test_dir.std_path().join("_indices_stashed");
+    std::fs::rename(&indices_dir, &stashed_dir).unwrap();
+
+    let mut dataset = Dataset::open(&test_uri).await.unwrap();
+    dataset.delete("false").await.unwrap();
+
+    for idx in dataset.load_indices().await.unwrap().iter() {
+        assert_eq!(
+            idx.fragment_bitmap, None,
+            "a bitmap the migration could not verify must be recorded as unknown"
+        );
+    }
+
+    std::fs::rename(&stashed_dir, &indices_dir).unwrap();
+
+    let mut dataset = Dataset::open(&test_uri).await.unwrap();
+    dataset.delete("false").await.unwrap();
+
+    for idx in dataset.load_indices().await.unwrap().iter() {
+        assert!(
+            idx.fragment_bitmap.as_ref().unwrap().contains(0),
+            "the first build that can open the index must repair the coverage"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_fix_v0_10_5_corrupt_schema() {
     // Schemas could be corrupted by successive calls to `add_columns` and
@@ -352,6 +389,50 @@ async fn test_fix_v0_21_0_corrupt_fragment_bitmap() {
     }
     assert_eq!(get_bitmap(&indices[0]), vec![0]);
     assert_eq!(get_bitmap(&indices[1]), vec![1]);
+}
+
+/// Unlike the pre-0.8.15 trigger, an overlap is re-derived from the index
+/// metadata on every commit, so it asks to be recalculated again on its own. A
+/// commit that cannot open the index has nothing to preserve and must leave the
+/// coverage alone: `None` is a state modern indices are not built to recover
+/// from, since `calculate_included_frags` exists only for old manifests.
+#[tokio::test]
+async fn test_v0_21_0_corrupt_fragment_bitmap_kept_when_index_cannot_be_opened() {
+    let test_dir = copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
+    let test_uri = test_dir.path_str();
+
+    std::fs::rename(
+        test_dir.std_path().join("_indices"),
+        test_dir.std_path().join("_indices_stashed"),
+    )
+    .unwrap();
+
+    fn coverage(indices: &[IndexMetadata]) -> Vec<(String, Option<Vec<u32>>)> {
+        let mut coverage = indices
+            .iter()
+            .map(|idx| {
+                (
+                    idx.uuid.to_string(),
+                    idx.fragment_bitmap
+                        .as_ref()
+                        .map(|bitmap| bitmap.iter().collect()),
+                )
+            })
+            .collect::<Vec<_>>();
+        coverage.sort();
+        coverage
+    }
+
+    let mut dataset = Dataset::open(&test_uri).await.unwrap();
+    let before = coverage(&dataset.load_indices().await.unwrap());
+
+    dataset.delete("false").await.unwrap();
+
+    assert_eq!(
+        coverage(&dataset.load_indices().await.unwrap()),
+        before,
+        "coverage the overlap check will ask about again must be left as it stands"
+    );
 }
 
 #[tokio::test]
@@ -581,6 +662,41 @@ async fn test_list_struct_field_reorder_issue_5702() {
 
     // Verify schema has expected columns
     assert_eq!(batch.schema().fields().len(), 3); // id, data, extra
+}
+
+/// Regression test for issue #6936: v6.0.1 truncated a miniblock's structural
+/// level count to u16 while retaining the complete RLE payload.
+#[tokio::test]
+async fn test_v6_0_1_miniblock_level_count_overflow() {
+    let test_dir = copy_test_data_to_tmp("v6.0.1/miniblock_level_count_overflow.lance").unwrap();
+    let test_uri = test_dir.path_str();
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 66_049);
+
+    let captions = batch["captions"]
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let values = captions
+        .values()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    assert_eq!(values.len(), 16_416);
+    assert_eq!(values.values().as_ref(), (0..16_416).collect::<Vec<_>>());
+
+    let offsets = captions.value_offsets();
+    assert_eq!(offsets[513], 16_416);
+    assert!(offsets[513..].iter().all(|offset| *offset == 16_416));
+    assert_eq!(captions.null_count(), 32_768);
+    assert!(captions.is_valid(513));
+    assert_eq!(captions.value(513).len(), 0);
+    assert!(captions.is_null(514));
+    assert!(captions.is_valid(66_047));
+    assert_eq!(captions.value(66_047).len(), 0);
+    assert!(captions.is_null(66_048));
 }
 
 // Helper: create a simple dataset with one fragment of `n` rows at the given URI.

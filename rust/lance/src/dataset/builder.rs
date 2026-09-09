@@ -19,6 +19,7 @@ use lance_io::object_store::{
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::DescribeTableRequest;
 use lance_table::{
+    feature_flags::ensure_can_read_manifest,
     format::{Manifest, populate_manifest_schema_dictionaries},
     io::commit::external_manifest::ExternalManifestCommitHandler,
     io::commit::{CommitHandler, ManifestLocation, commit_handler_from_url},
@@ -868,6 +869,7 @@ impl DatasetBuilder {
         base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Dataset> {
         let (manifest, location) = if let Some(mut manifest) = manifest {
+            ensure_can_read_manifest(&manifest)?;
             let location = commit_handler
                 .resolve_version_location(&base_path, manifest.version, &object_store.inner)
                 .await?;

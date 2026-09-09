@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod data_file_part;
 #[cfg(feature = "substrait")]
 mod dataset_aggregate;
 mod dataset_common;

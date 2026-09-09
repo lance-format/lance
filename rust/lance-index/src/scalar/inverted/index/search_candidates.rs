@@ -201,6 +201,8 @@ pub(in super::super) struct LoadedPostings {
     pub(super) grouped_expansions: Vec<GroupedExpansionTerms>,
     pub(super) impact_safe: bool,
     pub(super) exact_scoring_required: bool,
+    #[cfg(test)]
+    pub(super) no_impact_fallback: bool,
 }
 
 pub(super) enum LoadedDocLengths {
@@ -231,6 +233,8 @@ impl LoadedPostings {
             grouped_expansions: Vec::new(),
             impact_safe: false,
             exact_scoring_required: false,
+            #[cfg(test)]
+            no_impact_fallback: false,
         }
     }
 }

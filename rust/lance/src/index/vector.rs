@@ -8,6 +8,7 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
+mod bounded_partition_stream;
 pub mod builder;
 pub(crate) mod details;
 pub mod hamming;
@@ -27,7 +28,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
@@ -607,7 +608,7 @@ pub(crate) async fn build_distributed_vector_index(
     _name: &str,
     uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<(Uuid, Vec<IndexFile>)> {
@@ -960,7 +961,7 @@ pub(crate) async fn build_vector_index(
     name: &str,
     uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
     build_vector_index_impl(
@@ -984,7 +985,7 @@ pub(crate) async fn build_filtered_vector_index(
     name: &str,
     uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
@@ -1008,7 +1009,7 @@ async fn build_vector_index_impl(
     name: &str,
     uuid: Uuid,
     params: &VectorIndexParams,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
     fragment_ids: Option<&[u32]>,
 ) -> Result<Vec<IndexFile>> {
@@ -1295,7 +1296,7 @@ pub(crate) async fn build_vector_index_incremental(
     uuid: Uuid,
     params: &VectorIndexParams,
     existing_index: Arc<dyn VectorIndex>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<VectorIndexBuildSummary> {
     let stages = &params.stages;
@@ -1617,7 +1618,7 @@ pub(crate) async fn open_vector_index(
     uuid: &Uuid,
     vec_idx: &lance_index::pb::VectorIndex,
     reader: Arc<dyn Reader>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
 
@@ -1712,7 +1713,7 @@ pub(crate) async fn open_vector_index_v2(
     column: &str,
     uuid: &Uuid,
     reader: V1FileReader,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let index_metadata = reader
         .schema()

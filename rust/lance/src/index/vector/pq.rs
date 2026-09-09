@@ -27,7 +27,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_index::metrics::MetricsCollector;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::{ProductQuantizationStorage, transpose};
@@ -72,7 +72,7 @@ pub struct PQIndex {
     /// Metric type.
     metric_type: MetricType,
 
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
 }
 
 async fn read_legacy_index_values(
@@ -150,7 +150,7 @@ impl PQIndex {
     pub(crate) fn new(
         pq: ProductQuantizer,
         metric_type: MetricType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> Self {
         Self {
             code: None,
@@ -459,8 +459,11 @@ impl VectorIndex for PQIndex {
             .map_or(0, |row_ids| row_ids.len() as u64)
     }
 
-    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
-        todo!("this method is for only IVF_HNSW_* index");
+    fn row_ids(&self) -> Box<dyn Iterator<Item = &u64> + '_> {
+        match self.row_ids.as_ref() {
+            Some(row_ids) => Box::new(row_ids.values().iter()),
+            None => Box::new(std::iter::empty()),
+        }
     }
 
     async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {

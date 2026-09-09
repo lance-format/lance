@@ -65,6 +65,25 @@ source of truth for which scheme is supported at each `data_storage_version`.
 
 Use `blob_field` and `blob_array` to build blob v2 columns.
 
+### Logical Arrow schema
+
+A blob v2 field is tagged with `ARROW:extension:name = "lance.blob.v2"`. Writers
+accept these logical struct shapes:
+
+| Shape | Children | Use |
+|---|---|---|
+| Minimal | `data: LargeBinary?`, `uri: Utf8?` | Inline bytes or a complete external object |
+| Complete | Minimal fields plus `position: UInt64?`, `size: UInt64?` | An optional byte range within an external object |
+
+Every non-null row must set exactly one of `data` and `uri`. For the complete
+shape, `position` and `size` must either both be set or both be null, a range
+requires `uri`, and an explicit range must have `size > 0`. Use inline `b""` for
+an empty blob; a URI without range fields still represents the complete external
+object, including an empty object. Python's `blob_field` and `BlobType` use the
+complete shape. Lance preserves an accepted logical shape, including child
+fields, nullability, and metadata, across create, append, and merge-insert
+writes; descriptor scans still return the compact stored descriptor shape.
+
 ```python
 import lance
 import pyarrow as pa

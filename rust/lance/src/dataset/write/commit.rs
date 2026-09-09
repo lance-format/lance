@@ -129,6 +129,14 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Pass the object store of the dataset being cloned from.
+    ///
+    /// The source dataset's commit handler is not used.
+    #[deprecated(since = "12.0.0-beta.12", note = "use with_source_store instead")]
+    pub fn with_source_dataset(self, source: &Dataset) -> Self {
+        self.with_source_store(source.object_store.clone())
+    }
+
     /// Pass a commit handler to use for the dataset.
     ///
     /// Takes precedence over the destination dataset's own handler. If not

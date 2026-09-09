@@ -38,6 +38,7 @@ use crate::object_store::{
     throttle::{AimdThrottleConfig, AimdThrottleState, cloud_http_connector, with_throttling},
 };
 use lance_core::error::{Error, Result};
+use lance_core::utils::parse::str_is_truthy;
 
 #[derive(Default, Debug)]
 pub struct AwsStoreProvider;
@@ -199,7 +200,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
         let use_opendal = storage_options
             .0
             .get("use_opendal")
-            .map(|v| v == "true")
+            .map(|v| str_is_truthy(v))
             .unwrap_or(false);
 
         let profile_config = if std::env::var_os("AWS_PROFILE").is_some() {
@@ -274,7 +275,7 @@ fn check_s3_express(url: &Url, storage_options: &StorageOptions) -> bool {
     storage_options
         .0
         .get("s3_express")
-        .map(|v| v == "true")
+        .map(|v| str_is_truthy(v))
         .unwrap_or(false)
         || url.authority().ends_with("--x-s3")
 }

@@ -13,11 +13,17 @@ use super::dataset_common::{create_file, require_send};
 use crate::dataset::WriteDestination;
 use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::{ManifestWriteConfig, validate_dataset_root_for_drop, write_manifest_file};
+use crate::dataset::mem_wal::DatasetMemWalExt;
+use crate::dataset::schema_evolution::ColumnAlteration;
+use crate::dataset::transaction::Operation;
+use crate::dataset::{
+    ManifestWriteConfig, deep_clone_copy_parallelism, parse_deep_clone_stream_concurrency,
+    validate_dataset_root_for_drop, write_manifest_file,
+};
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
 use crate::{Dataset, Error, Result};
-use lance_table::format::{DataStorageFormat, Fragment};
+use lance_table::format::DataStorageFormat;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
@@ -43,8 +49,9 @@ use lance_file::{
 };
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
-use lance_table::format::BasePath;
+use lance_table::format::{BasePath, Fragment, pb};
 use object_store::ObjectStoreExt;
+use prost::Message;
 
 use crate::index::DatasetIndexExt;
 use futures::TryStreamExt;
@@ -62,6 +69,40 @@ fn file_object_store_uri(path: &std::path::Path) -> String {
     let path = path.to_str().unwrap().replace('\\', "/");
     let path_prefix = if path.starts_with('/') { "" } else { "/" };
     format!("file-object-store://{path_prefix}{path}")
+}
+
+#[rstest]
+#[case::empty("")]
+#[case::zero("0")]
+#[case::negative("-1")]
+#[case::not_a_number("many")]
+fn test_parse_deep_clone_stream_concurrency_rejects_invalid_values(#[case] value: &str) {
+    let error = parse_deep_clone_stream_concurrency(value).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("LANCE_DEEP_CLONE_STREAM_CONCURRENCY"));
+    assert!(message.contains(&format!("{value:?}")));
+}
+
+#[test]
+fn test_parse_deep_clone_stream_concurrency_accepts_positive_value() {
+    assert_eq!(parse_deep_clone_stream_concurrency("17").unwrap(), 17);
+}
+
+#[rstest]
+#[case::direct_local_copy(64, false, None, 64)]
+#[case::streaming_default_cap(64, true, None, 4)]
+#[case::streaming_configured_below_cap(2, true, None, 2)]
+#[case::streaming_override(64, true, Some(17), 17)]
+fn test_deep_clone_copy_parallelism(
+    #[case] configured: usize,
+    #[case] uses_streaming_copy: bool,
+    #[case] stream_override: Option<usize>,
+    #[case] expected: usize,
+) {
+    assert_eq!(
+        deep_clone_copy_parallelism(configured, uses_streaming_copy, stream_override),
+        expected
+    );
 }
 
 #[tokio::test]
@@ -1331,6 +1372,8 @@ async fn test_write_manifest(
         },
         dataset.manifest_location.naming_scheme,
         None,
+        // Previously classified from a None inline copy, which validated.
+        true,
     )
     .await
     .unwrap();
@@ -1360,6 +1403,138 @@ async fn test_write_manifest(
     .await;
 
     assert!(matches!(write_result, Err(Error::NotSupported { .. })));
+}
+
+#[tokio::test]
+async fn test_restore_rejects_unknown_target_flags() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let write_config = ManifestWriteConfig {
+        auto_set_feature_flags: false,
+        ..Default::default()
+    };
+    let mut unknown_manifest = dataset.manifest.as_ref().clone();
+    unknown_manifest.version = 2;
+    unknown_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unknown_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut unknown_manifest,
+        None,
+        &write_config,
+        dataset.manifest_location.naming_scheme,
+        None,
+        // No inline transaction to classify from, so validate.
+        true,
+    )
+    .await
+    .unwrap();
+
+    let mut supported_manifest = dataset.manifest.as_ref().clone();
+    supported_manifest.version = 3;
+    write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut supported_manifest,
+        None,
+        &write_config,
+        dataset.manifest_location.naming_scheme,
+        None,
+        // No inline transaction to classify from, so validate.
+        true,
+    )
+    .await
+    .unwrap();
+
+    let error = Dataset::commit(
+        &test_uri,
+        Operation::Restore { version: 2 },
+        Some(3),
+        None,
+        None,
+        Default::default(),
+        false,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+}
+
+#[tokio::test]
+async fn test_checkout_latest_rejects_unsupported_reader_before_caching() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+    let original_version = dataset.version().version;
+
+    let mut unsupported_manifest = dataset.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    let location = write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        // No inline transaction to classify from, so validate.
+        true,
+    )
+    .await
+    .unwrap();
+
+    let error = dataset.checkout_latest().await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert_eq!(dataset.version().version, original_version);
+    assert!(
+        dataset
+            .metadata_cache
+            .get_with_key(&ManifestKey {
+                version: location.version,
+                e_tag: location.e_tag.as_deref(),
+            })
+            .await
+            .is_none(),
+        "unsupported manifest must not be cached"
+    );
+}
+
+#[tokio::test]
+async fn test_serialized_manifest_rejects_unsupported_reader() {
+    let test_uri = TempStrDir::default();
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
+
+    let mut unsupported_manifest = dataset.manifest.as_ref().clone();
+    unsupported_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
+    let serialized_manifest = pb::Manifest::from(&unsupported_manifest).encode_to_vec();
+
+    let error = DatasetBuilder::from_uri(&test_uri)
+        .with_serialized_manifest(&serialized_manifest)
+        .unwrap()
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
 }
 
 #[tokio::test]
@@ -1743,6 +1918,102 @@ async fn test_deep_clone(
 }
 
 #[tokio::test]
+async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let target_dir = test_dir.join("target");
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1)),
+        source_dir.to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut unsupported_manifest = source.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    write_manifest_file(
+        source.object_store.as_ref(),
+        source.commit_handler.as_ref(),
+        &source.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        source.manifest_location.naming_scheme,
+        None,
+        // No inline transaction to classify from, so validate.
+        true,
+    )
+    .await
+    .unwrap();
+
+    let error = source
+        .deep_clone(
+            target_dir.to_str().unwrap(),
+            unsupported_manifest.version,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }));
+    assert!(!target_dir.exists());
+}
+
+#[tokio::test]
+async fn test_shallow_clone_rejects_unsupported_writer_before_writing_target() {
+    let test_dir = TempStdDir::default();
+    let source_dir = test_dir.join("source");
+    let target_dir = test_dir.join("target");
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1)),
+        source_dir.to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut unsupported_manifest = source.manifest.as_ref().clone();
+    unsupported_manifest.version += 1;
+    unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
+    write_manifest_file(
+        source.object_store.as_ref(),
+        source.commit_handler.as_ref(),
+        &source.base,
+        &mut unsupported_manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            ..Default::default()
+        },
+        source.manifest_location.naming_scheme,
+        None,
+        // No inline transaction to classify from, so validate.
+        true,
+    )
+    .await
+    .unwrap();
+
+    let error = source
+        .shallow_clone(
+            target_dir.to_str().unwrap(),
+            unsupported_manifest.version,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(!target_dir.exists());
+}
+
+#[tokio::test]
 async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
     use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
 
@@ -1781,8 +2052,8 @@ async fn test_deep_clone_recognizes_ambiguous_commit_as_own() {
 // Uses an in-memory source store to force a cross-store copy. The in-memory store has
 // known platform-specific quirks on Windows (it reads back empty there; see the note in
 // tests/resource_tests.rs), so this test is gated to non-Windows. The local write side is
-// covered on Windows by `test_deep_clone` (same-store), and the cross-store streaming path
-// against real cloud stores is platform-agnostic std/tokio I/O.
+// covered on Windows by `test_deep_clone`, and streaming copies against real cloud stores
+// use platform-agnostic std/tokio I/O.
 #[cfg(not(windows))]
 #[rstest]
 #[tokio::test]
@@ -1790,9 +2061,8 @@ async fn test_deep_clone_cross_store(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
 ) {
-    // Source lives in an in-memory store while the target is a local directory, so the
-    // two stores have different `store_prefix`es and `deep_clone` must stream files from
-    // the source store to the target store (the cross-account code path).
+    // Source lives in an in-memory store while the target is a local directory. Their
+    // different `store_prefix`es exercise separate source and destination implementations.
     let session = Arc::new(Session::default());
     let test_dir = TempStdDir::default();
     let clone_dir = test_dir.join("clone_ds");
@@ -3157,4 +3427,272 @@ async fn test_validate_dataset_root_for_drop_allows_missing_path() {
     validate_dataset_root_for_drop(&object_store, &base)
         .await
         .unwrap();
+}
+
+/// Restore and clone rebuild a manifest from a stored one, never passing
+/// through the Arrow-schema conversion that validates a primary key. Both write
+/// through `write_manifest_file`, so the invariant is enforced there — a schema
+/// that reached a manifest before the write paths were validated cannot be
+/// carried forward into a new version.
+#[tokio::test]
+async fn write_manifest_file_rejects_a_nullable_primary_key() {
+    use lance_core::utils::tempfile::TempStrDir;
+
+    let test_dir = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &test_dir,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Stand in for a manifest stored before the write paths were validated.
+    let mut manifest = dataset.manifest.as_ref().clone();
+    let id_field = manifest
+        .schema
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "id")
+        .expect("schema has an id column");
+    id_field.unenforced_primary_key_position = Some(1);
+    id_field.nullable = true;
+    manifest.version += 1;
+
+    let err = write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            timestamp: None,
+            use_stable_row_ids: false,
+            use_legacy_format: None,
+            storage_format: None,
+            disable_transaction_file: false,
+            migration_next_row_id: None,
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+        // Previously classified from a None inline copy, which validated.
+        true,
+    )
+    .await
+    .expect_err("a nullable primary key must not reach a manifest");
+    assert!(
+        format!("{err:?}").contains("must not be nullable"),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// Stand in for a table written by a released version, where the metadata path
+/// could install a primary key on a column that permits nulls. The forging goes
+/// through `write_manifest_file` classified as schema-preserving, which is
+/// precisely the hole those versions had, so the resulting manifest is the one
+/// an upgrade actually finds on disk.
+///
+/// The two rows are `[1, NULL]`, so the null the key must not hold is really
+/// present and the repairing delete has something to remove.
+async fn write_dataset_with_a_legacy_nullable_primary_key(uri: &str) -> Dataset {
+    forge_legacy_nullable_primary_key(uri, false).await
+}
+
+/// The originally reported sequence initialised MemWAL *before* the key was
+/// installed, so `initialize_mem_wal`'s own check never saw it. That ordering
+/// matters: a MemWAL transaction carries mem-table state, so it is far more
+/// likely to outgrow the inline limit than a bare config update.
+async fn forge_legacy_nullable_primary_key(uri: &str, with_mem_wal: bool) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None)
+        .await
+        .unwrap();
+
+    if with_mem_wal {
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .expect("MemWAL initialises while the key is still valid");
+    }
+
+    // Carried forward explicitly: passing None here would drop the MemWAL index
+    // the fixture just installed.
+    let indices = dataset.load_indices().await.unwrap().as_ref().clone();
+
+    let mut manifest = dataset.manifest.as_ref().clone();
+    let id_field = manifest
+        .schema
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "id")
+        .expect("schema has an id column");
+    id_field.unenforced_primary_key_position = Some(1);
+    manifest.version += 1;
+
+    // Committed below `write_manifest_file` on purpose. Going through it would
+    // make building the fixture depend on the very validation these tests
+    // exercise, so a regression would show up as a fixture that cannot be
+    // built rather than as the behaviour under test changing.
+    manifest.set_timestamp(crate::dataset::timestamp_to_nanos(None));
+    manifest.update_max_fragment_id();
+    dataset
+        .commit_handler
+        .commit(
+            &mut manifest,
+            (!indices.is_empty()).then_some(indices),
+            &dataset.base,
+            dataset.object_store.as_ref(),
+            lance_table::io::commit::write_manifest_file_to_path,
+            dataset.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .expect("forging a legacy manifest must not itself be blocked");
+
+    Dataset::open(uri).await.unwrap()
+}
+
+/// An unrelated config update leaves the key exactly as it found it, so it is
+/// exempt -- and must stay exempt no matter how large its payload is. The
+/// disposition comes from the operation; only the inline copy depends on size.
+#[tokio::test]
+async fn an_exempt_operation_stays_exempt_when_its_transaction_spills() {
+    use crate::io::commit::MAX_INLINE_TRANSACTION_BYTES;
+    use lance_core::utils::tempfile::TempStrDir;
+
+    let test_dir = TempStrDir::default();
+    let mut dataset = write_dataset_with_a_legacy_nullable_primary_key(&test_dir).await;
+
+    dataset
+        .update_config([("unrelated".to_string(), "small".to_string())])
+        .await
+        .expect("a small unrelated config update must be exempt");
+    let after_small = dataset.version().version;
+
+    dataset
+        .update_config([(
+            "large-unrelated".to_string(),
+            "x".repeat(2 * MAX_INLINE_TRANSACTION_BYTES),
+        )])
+        .await
+        .expect("the same update must stay exempt once its bytes stop inlining");
+
+    assert!(
+        dataset.version().version > after_small,
+        "the spilling update must have committed a new version"
+    );
+}
+
+/// The repair path: drop the offending rows, then tighten the column. Both have
+/// to be reachable on a table that already carries the bad key, or the only
+/// remaining fix is a full overwrite.
+#[tokio::test]
+async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
+    use lance_core::utils::tempfile::TempStrDir;
+
+    let test_dir = TempStrDir::default();
+    let mut dataset = write_dataset_with_a_legacy_nullable_primary_key(&test_dir).await;
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+
+    dataset
+        .delete("id IS NULL")
+        .await
+        .expect("removing the offending rows must not be blocked");
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+
+    dataset
+        .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(false)])
+        .await
+        .expect("tightening the column completes the repair");
+
+    let id_field = dataset
+        .schema()
+        .fields
+        .iter()
+        .find(|field| field.name == "id")
+        .expect("schema has an id column");
+    assert!(
+        !id_field.nullable,
+        "the key column must end up non-nullable"
+    );
+}
+
+/// The MemWAL variant of the repair path. This is the state the original report
+/// was about, and the one a size-coupled gate blocks: its transactions carry
+/// An overlay attaches files to existing fragments; it carries no schema, so a
+/// dataset that already holds a nullable primary key must still be able to
+/// commit one. `DataOverlay` was missing from the exempt classifier, which
+/// closed that path for exactly the legacy datasets this validation is meant to
+/// leave repairable.
+#[tokio::test]
+async fn an_overlay_commits_on_a_legacy_nullable_primary_key() {
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_table::transaction::Operation;
+
+    let test_dir = TempStrDir::default();
+    let dataset = write_dataset_with_a_legacy_nullable_primary_key(&test_dir).await;
+    let read_version = dataset.manifest.version;
+
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataOverlay { groups: vec![] },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .expect("an overlay leaves the schema alone, so the legacy key must not block it");
+
+    assert_eq!(dataset.manifest.version, read_version + 1);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+}
+
+/// mem-table state, so they stop inlining long before a config update does.
+#[tokio::test]
+async fn a_legacy_nullable_primary_key_can_be_repaired_under_mem_wal() {
+    use lance_core::utils::tempfile::TempStrDir;
+
+    let test_dir = TempStrDir::default();
+    let mut dataset = forge_legacy_nullable_primary_key(&test_dir, true).await;
+    assert!(
+        dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|index| index.name == lance_index::mem_wal::MEM_WAL_INDEX_NAME),
+        "the fixture must really have MemWAL initialised"
+    );
+
+    dataset
+        .update_config([("unrelated".to_string(), "small".to_string())])
+        .await
+        .expect("an unrelated config update must be exempt");
+
+    dataset
+        .delete("id IS NULL")
+        .await
+        .expect("removing the offending rows must not be blocked under MemWAL");
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 }

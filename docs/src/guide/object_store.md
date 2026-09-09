@@ -41,6 +41,26 @@ These options apply to all object stores.
 | `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
 
+### Bulk copy strategy
+
+Lance streams bulk index-file movement and dataset deep-clone files through
+read and write APIs by default. This avoids requiring a provider-native copy
+operation and works across different object stores.
+
+Set `LANCE_IO_SERVER_SIDE_COPY_ENABLED` to a truthy value (`1`, `true`, `on`,
+`yes`, or `y`, case-insensitive) to opt cloud copies whose source and destination
+share the same object-store client into the provider-native server-side copy
+operation. Cross-client, cross-store, and local copies do not use this setting.
+Native copy can reduce client bandwidth and transfer cost, but it requires copy
+support from the object-store integration and is subject to the provider
+request's timeout and retry behavior.
+
+Deep clone bounds non-local file movement to four concurrent files by default.
+Set `LANCE_DEEP_CLONE_STREAM_CONCURRENCY` to a positive integer to override this
+operation-specific limit. The bound also applies when server-side copy is
+enabled because S3 and GCS copies above the provider's single-copy size limit
+fall back to streaming through Lance.
+
 ## Per-Base Configuration
 
 A dataset can register additional base paths that store part of its data, and each
@@ -524,17 +544,19 @@ The Master address can be resolved from (in priority order):
 2. The `GOOSEFS_MASTER_ADDR` environment variable.
 3. The host and port from the URL authority.
 
-The following keys can be used as both environment variables or keys in the
-`storage_options` parameter:
+`storage_options` keys **must be lowercase**. Uppercase or mixed-case spellings
+such as `GOOSEFS_MASTER_ADDR` are rejected with an explicit error — they are
+not ignored, and they are not treated as the matching environment variable.
+Environment variables keep the `GOOSEFS_*` form.
 
-| Key | Description |
-|-----|-------------|
-| `goosefs_master_addr` / `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL. |
-| `goosefs_write_type` / `GOOSEFS_WRITE_TYPE` | Write type, e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`. Optional. |
-| `goosefs_block_size` / `GOOSEFS_BLOCK_SIZE` | GooseFS block size in bytes (this is the GooseFS-side block size, not Lance's I/O block size). Optional. |
-| `goosefs_chunk_size` / `GOOSEFS_CHUNK_SIZE` | Chunk size in bytes used when reading or writing files. Optional. |
-| `goosefs_auth_type` / `GOOSEFS_AUTH_TYPE` | Authentication type. Either `nosasl` or `simple` (case-insensitive; the value is passed through to OpenDAL). Optional. |
-| `goosefs_auth_username` / `GOOSEFS_AUTH_USERNAME` | Username used in `simple` authentication mode. Optional. |
+| storage_options key | env var | Description |
+|---------------------|---------|-------------|
+| `goosefs_master_addr` | `GOOSEFS_MASTER_ADDR` | GooseFS Master address. Supports a single address (`host:port`) or comma-separated HA addresses (`addr1:port,addr2:port`). Optional if the address is provided in the URL. |
+| `goosefs_write_type` | `GOOSEFS_WRITE_TYPE` | Write type, e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`. Optional. |
+| `goosefs_block_size` | `GOOSEFS_BLOCK_SIZE` | GooseFS block size (this is the GooseFS-side block size, not Lance's I/O block size). Accepts a raw byte count or GooseFS suffixes such as `64MB` (binary units: `1KB = 1024`). Optional. |
+| `goosefs_chunk_size` | `GOOSEFS_CHUNK_SIZE` | Chunk size used when reading or writing files. Accepts a raw byte count or GooseFS suffixes such as `4MB` (binary units: `1KB = 1024`). Optional. |
+| `goosefs_auth_type` | `GOOSEFS_AUTH_TYPE` | Authentication type. Either `nosasl` or `simple` (case-insensitive; the value is passed through to OpenDAL). Optional. |
+| `goosefs_auth_username` | `GOOSEFS_AUTH_USERNAME` | Username used in `simple` authentication mode. Optional. |
 
 !!! note "Running the GooseFS integration tests"
 

@@ -6,7 +6,7 @@
 use arrow::array::{AsArray, ListBuilder, UInt32Builder};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, UInt32Type};
-use arrow_array::{ArrayRef, Float32Array, ListArray, RecordBatch, UInt64Array};
+use arrow_array::{Array, ArrayRef, Float32Array, ListArray, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
 use itertools::Itertools;
 use lance_core::deepsize::DeepSizeOf;
@@ -307,6 +307,35 @@ impl HNSW {
         }
     }
 
+    /// Refuse a graph whose nodes outrun the vectors behind them.
+    ///
+    /// Node ids are row numbers into `storage`, so a graph with more nodes than
+    /// storage has rows holds ids no vector backs. Scoring one indexes past the
+    /// storage buffer and panics, which takes the worker rather than the query,
+    /// and the entry point is scored before any traversal decision -- so this has
+    /// to run first.
+    ///
+    /// Only that direction is refused. Storage with rows the graph never reached
+    /// is safe and common: those rows are simply unreachable by traversal, and a
+    /// sparse-prefilter search still brute-forces them.
+    ///
+    /// Written before the export bounded the pair, such an index cannot be
+    /// searched at all -- the vectors are not on disk -- so it is refused with a
+    /// message naming it rather than left to fault.
+    fn ensure_storage_covers_graph(&self, storage: &impl VectorStore) -> Result<()> {
+        let nodes = self.len();
+        let rows = storage.len();
+        if nodes > rows {
+            return Err(Error::index(format!(
+                "HNSW graph has {nodes} nodes but its vector storage has {rows} \
+                 rows, so {} node(s) have no vector to score; the index predates \
+                 the export bound and has to be rebuilt",
+                nodes - rows
+            )));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn search_inner(
         &self,
@@ -318,6 +347,7 @@ impl HNSW {
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
+        self.ensure_storage_covers_graph(storage)?;
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
@@ -501,6 +531,7 @@ impl HNSW {
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
     ) -> Result<Vec<OrderedNode>> {
+        self.ensure_storage_covers_graph(storage)?;
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
@@ -874,6 +905,166 @@ impl HnswBuilder {
         )
     }
 
+    /// Give every node an inbound path from the entry point on level 0.
+    ///
+    /// A query only ever enumerates level 0, so a node without a level-0 path
+    /// from the entry point can never be returned by a graph traversal.
+    /// Parallel insertion cannot rule that out: a node picks its neighbors
+    /// from the graph it searched, and by the time its reciprocal edges are
+    /// written those neighbors may have filled up with closer nodes and pruned
+    /// it straight back out, leaving it with no inbound edge at all. A node
+    /// inserted while the graph was still nearly empty is the usual victim:
+    /// its only neighbors are the first few hubs, and hubs fill up first.
+    /// Nothing inserted afterwards can rediscover such a node, since discovery
+    /// only happens by traversal.
+    ///
+    /// The level-0 graph is walked once from the entry point after the
+    /// parallel phase, and every stranded node is linked from a reachable node
+    /// near it. The work is bounded explicitly, because degenerate data (many
+    /// identical vectors) can strand most of the graph and an unbounded
+    /// per-node search would then cost more than the build itself:
+    ///
+    /// - The audit and the bookkeeping are `O(N + E)`: a stranded node is
+    ///   anchored on its nearest reachable out-neighbor, and a node whose
+    ///   out-neighbors are all stranded waits until one of them is linked.
+    /// - The anchor is refined by a greedy walk over reachable nodes of at
+    ///   most `ef_construction` hops, so a node costs at most
+    ///   `ef_construction * 2 * m` distance computations.
+    /// - Every node anchors at most one stranded node, so a level-0 list never
+    ///   exceeds `2 * m + 1`. Once the candidates near a node are all taken, it
+    ///   chains onto the most recently linked node instead, which has room by
+    ///   construction.
+    ///
+    /// The anchor is allowed that one extra edge rather than evicting a
+    /// neighbor, which could strand that neighbor in turn.
+    fn connect_stranded_nodes(&self, storage: &impl VectorStore) {
+        let nodes = self.nodes.as_slice();
+        let level0 = HnswLevelView::new(0, nodes);
+        let mut reachable = vec![false; nodes.len()];
+        let mut queue = VecDeque::new();
+        // Marks everything the walk reaches from `start` and returns the nodes
+        // that were not reachable before.
+        let mut mark_reachable = |start: u32, reachable: &mut Vec<bool>| -> Vec<u32> {
+            let mut newly_reachable = Vec::new();
+            if reachable[start as usize] {
+                return newly_reachable;
+            }
+            reachable[start as usize] = true;
+            queue.push_back(start);
+            while let Some(current) = queue.pop_front() {
+                newly_reachable.push(current);
+                for &neighbor in level0.neighbors(current).iter() {
+                    if !reachable[neighbor as usize] {
+                        reachable[neighbor as usize] = true;
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+            newly_reachable
+        };
+        mark_reachable(self.entry_point, &mut reachable);
+
+        let stranded: Vec<u32> = (0..nodes.len() as u32)
+            .filter(|node| !reachable[*node as usize])
+            .collect();
+        if stranded.is_empty() {
+            return;
+        }
+
+        // Stranded nodes keyed by the stranded out-neighbors they wait on.
+        let mut waiting_on: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &node in &stranded {
+            for &neighbor in level0.neighbors(node).iter() {
+                if !reachable[neighbor as usize] {
+                    waiting_on.entry(neighbor).or_default().push(node);
+                }
+            }
+        }
+
+        let mut anchored = vec![false; nodes.len()];
+        // The most recently linked node that has not anchored anything yet.
+        let mut chain_tail: Option<u32> = None;
+        let link = |anchor: OrderedNode,
+                    node: u32,
+                    anchored: &mut [bool],
+                    chain_tail: &mut Option<u32>| {
+            let mut anchor_node = nodes[anchor.id as usize].write().unwrap();
+            anchor_node.add_neighbor(node, anchor.dist, 0);
+            anchor_node.update_from_ranked_neighbors(0);
+            anchored[anchor.id as usize] = true;
+            *chain_tail = Some(node);
+        };
+
+        let mut isolated = Vec::new();
+        let mut ready: VecDeque<u32> = stranded.iter().copied().collect();
+        while let Some(node) = ready.pop_front() {
+            if reachable[node as usize] {
+                continue;
+            }
+            let dist_calc = storage.dist_calculator_from_id(node);
+            let mut candidates: Vec<OrderedNode> =
+                nodes[node as usize].read().unwrap().level_neighbors_ranked[0]
+                    .iter()
+                    .filter(|neighbor| reachable[neighbor.id as usize])
+                    .cloned()
+                    .collect();
+            let Some(nearest) = candidates.iter().min().cloned() else {
+                isolated.push(node);
+                continue;
+            };
+
+            // Walk toward the node over reachable nodes only; the walk is
+            // capped so that it cannot degenerate into a graph-wide search.
+            let mut closest = nearest.clone();
+            for _ in 0..self.params.ef_construction {
+                let step = level0
+                    .neighbors(closest.id)
+                    .iter()
+                    .filter(|neighbor| reachable[**neighbor as usize])
+                    .map(|&neighbor| {
+                        OrderedNode::new(neighbor, dist_calc.distance(neighbor).into())
+                    })
+                    .min();
+                match step {
+                    Some(step) if step.dist < closest.dist => closest = step,
+                    _ => break,
+                }
+            }
+
+            candidates.sort_unstable();
+            let anchor = std::iter::once(closest)
+                .chain(candidates)
+                .find(|candidate| !anchored[candidate.id as usize])
+                .or_else(|| {
+                    chain_tail.map(|tail| OrderedNode::new(tail, dist_calc.distance(tail).into()))
+                })
+                .unwrap_or(nearest);
+            link(anchor, node, &mut anchored, &mut chain_tail);
+            for newly_reachable in mark_reachable(node, &mut reachable) {
+                if let Some(waiting) = waiting_on.remove(&newly_reachable) {
+                    ready.extend(waiting);
+                }
+            }
+        }
+
+        // Nodes whose out-edges never lead back to the entry point have no
+        // nearby anchor to offer; chain them onto the last linked node.
+        for node in isolated {
+            if reachable[node as usize] {
+                continue;
+            }
+            let anchor = chain_tail.unwrap_or(self.entry_point);
+            let anchor = OrderedNode::new(anchor, storage.dist_between(anchor, node).into());
+            link(anchor, node, &mut anchored, &mut chain_tail);
+            mark_reachable(node, &mut reachable);
+        }
+
+        log::debug!(
+            "Linked {} HNSW node(s) that parallel construction left unreachable on level 0",
+            stranded.len()
+        );
+    }
+
     fn prune(
         &self,
         storage: &impl VectorStore,
@@ -998,6 +1189,60 @@ enum LevelLookup {
     Sparse(HashMap<u32, u32>),
 }
 
+/// Drop neighbor ids that name no node in this graph.
+///
+/// A writer that read adjacency live while snapshotting a node count could
+/// persist edges past its own node count, and those indices are already on
+/// disk. Traversal scores a neighbor id before it is ever looked up as a node,
+/// so a guard at the lookup is too late -- the id has to be gone before search
+/// begins.
+///
+/// Returns the original array untouched when every id is in domain, which is
+/// the only case that matters for cost: the ids stay zero-copy views of the
+/// loaded batch and nothing is allocated. `to_batch()` still returns the
+/// retained batch verbatim, so a filtered edge is dropped for this reader
+/// without rewriting what is on disk.
+fn neighbors_within_domain(neighbors: &ListArray, node_count: usize) -> (ListArray, usize) {
+    // Ids are `u32` on the wire, so a node count past `u32::MAX` cannot be
+    // addressed by one; clamping keeps every id in domain rather than wrapping.
+    let node_count = u32::try_from(node_count).unwrap_or(u32::MAX);
+    let values = neighbors.values().as_primitive::<UInt32Type>();
+    // Each level is a slice of the concatenated batch and `values()` hands back
+    // the whole child array regardless, so bound the scan to this array's own
+    // offset window. Scanning all of it would count another level's ids, put a
+    // clean level on the rebuild path, and report a count that is not this
+    // level's.
+    let offsets = neighbors.offsets();
+    let start = offsets[0] as usize;
+    let end = offsets[offsets.len() - 1] as usize;
+    let dropped = values.values()[start..end]
+        .iter()
+        .filter(|&&id| id >= node_count)
+        .count();
+    if dropped == 0 {
+        return (neighbors.clone(), 0);
+    }
+
+    let mut builder = ListBuilder::with_capacity(UInt32Builder::new(), neighbors.len());
+    for row in 0..neighbors.len() {
+        if neighbors.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        let row_ids = neighbors.value(row);
+        let row_ids = row_ids.as_primitive::<UInt32Type>();
+        builder.append_value(
+            row_ids
+                .values()
+                .iter()
+                .copied()
+                .filter(|&id| id < node_count)
+                .map(Some),
+        );
+    }
+    (builder.finish(), dropped)
+}
+
 /// A search-only HNSW graph backed directly by the Arrow buffers of the
 /// on-disk `RecordBatch`.
 ///
@@ -1019,6 +1264,10 @@ struct LoadedHnswGraph {
     level_lookup: Vec<LevelLookup>,
     /// Number of nodes present at each level (`level_count[0]` == total).
     level_count: Vec<usize>,
+    /// Bytes in `level_neighbors` that are *not* views into `batch`, from a
+    /// level rebuilt to drop out-of-domain ids. Zero for a clean index, which
+    /// keeps every level zero-copy.
+    owned_neighbor_bytes: usize,
 }
 
 impl DeepSizeOf for LoadedHnswGraph {
@@ -1028,7 +1277,11 @@ impl DeepSizeOf for LoadedHnswGraph {
         // `vector/flat/storage.rs`). The upper-level `level_lookup` maps are
         // sized to the geometrically-shrinking node counts above level 0 --
         // negligible next to the batch and not separately accounted here.
-        self.batch.get_array_memory_size()
+        //
+        // A level rebuilt to drop out-of-domain ids owns its buffers instead,
+        // so those bytes are counted on top: they are real and the cache sizes
+        // itself from this number.
+        self.batch.get_array_memory_size() + self.owned_neighbor_bytes
     }
 }
 
@@ -1038,6 +1291,14 @@ impl LoadedHnswGraph {
     #[inline]
     fn neighbors_at(&self, level: usize, key: u32) -> &[u32] {
         let row = match &self.level_lookup[level] {
+            // `Dense` means row == id, so an id at or beyond the level's row
+            // count addresses nothing. The writers now bound what they emit to
+            // the prefix they publish, but indices written before that are
+            // already on disk, and following such an edge panicked the search
+            // instead of degrading it. Treat it exactly like an absent node: no
+            // neighbors, so greedy search stays put and descends, losing one
+            // edge rather than the whole query.
+            LevelLookup::Dense if key as usize >= self.level_count[level] => return &[],
             LevelLookup::Dense => key as usize,
             LevelLookup::Sparse(id_to_row) => match id_to_row.get(&key) {
                 Some(&row) => row as usize,
@@ -1215,10 +1476,18 @@ impl IvfSubIndex for HNSW {
         // need it, and `to_batch()` returns the retained `data` verbatim.
         let mut level_neighbors = Vec::with_capacity(level_batches.len());
         let mut level_lookup = Vec::with_capacity(level_batches.len());
+        let mut dropped_edges = 0usize;
+        let mut owned_neighbor_bytes = 0usize;
         for (level, batch) in level_batches.iter().enumerate() {
             // `.clone()` on an Arrow array bumps a refcount; buffers stay
             // shared with `data` (zero copy).
             let neighbors = batch[NEIGHBORS_COL].as_list::<i32>().clone();
+            let (neighbors, dropped) = neighbors_within_domain(&neighbors, level_count[0]);
+            if dropped > 0 {
+                // Rebuilt, so it no longer borrows `batch`; see `DeepSizeOf`.
+                owned_neighbor_bytes += neighbors.get_array_memory_size();
+            }
+            dropped_edges += dropped;
             let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
             if level == 0 {
                 // `to_batch` writes every node at level 0 exactly once in
@@ -1259,6 +1528,17 @@ impl IvfSubIndex for HNSW {
             level_neighbors.push(neighbors);
         }
 
+        if dropped_edges > 0 {
+            // Dropped, not rejected: an edge to a node this graph does not hold
+            // costs one edge, where refusing the batch costs every query over
+            // it. The entry point below is refused instead, because search
+            // cannot start without it.
+            log::warn!(
+                "HNSW batch carried {dropped_edges} neighbor id(s) outside its                  {} nodes; dropping them for this reader",
+                level_count[0]
+            );
+        }
+
         // `entry_point` is read from untrusted metadata and indexes the `Dense`
         // level-0 lookup directly; an out-of-range value would read past the
         // level-0 neighbor buffer during search. Validate it under the same
@@ -1286,6 +1566,7 @@ impl IvfSubIndex for HNSW {
             level_neighbors,
             level_lookup,
             level_count: level_count.clone(),
+            owned_neighbor_bytes,
         };
         let inner = HnswCore {
             params: hnsw_metadata.params,
@@ -1444,6 +1725,7 @@ impl IvfSubIndex for HNSW {
             );
 
         assert_eq!(builder.level_count[0].load(Ordering::Relaxed), len);
+        builder.connect_stranded_nodes(storage);
         Ok(builder.finish())
     }
 
@@ -1789,9 +2071,186 @@ mod tests {
         );
     }
 
-    /// The lowest accepted construction settings retain a useful graph, but
-    /// do not promise full reachability. This seeded floor makes that quality
-    /// trade-off explicit and guards against catastrophic fragmentation.
+    /// Every node must have a level-0 path from the entry point, which is what
+    /// [HnswBuilder::connect_stranded_nodes] guarantees after a build.
+    fn assert_all_reachable_on_level0(hnsw: &HNSW) {
+        let nodes = hnsw.nodes().unwrap();
+        let mut reachable = vec![false; nodes.len()];
+        let mut queue = std::collections::VecDeque::from([hnsw.metadata().entry_point]);
+        reachable[hnsw.metadata().entry_point as usize] = true;
+        while let Some(current) = queue.pop_front() {
+            for &neighbor in nodes[current as usize].bottom_neighbors.iter() {
+                if !reachable[neighbor as usize] {
+                    reachable[neighbor as usize] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        let stranded: Vec<usize> = (0..nodes.len()).filter(|id| !reachable[*id]).collect();
+        assert!(
+            stranded.is_empty(),
+            "nodes {stranded:?} are unreachable from the entry point on level 0"
+        );
+    }
+
+    /// Every level-0 list stays within `2 * m` plus the one edge a repair may
+    /// add, which is what bounds the degree of repaired graphs.
+    fn assert_level0_degree_bound(hnsw: &HNSW, m: usize) {
+        for (id, node) in hnsw.nodes().unwrap().iter().enumerate() {
+            let degree = node.level_neighbors[0].len();
+            assert!(
+                degree <= 2 * m + 1,
+                "node {id} has {degree} level-0 neighbors, more than 2 * {m} + 1"
+            );
+        }
+    }
+
+    /// A node that parallel construction left without any inbound level-0
+    /// edge is linked from a reachable node near it: its nearest reachable
+    /// out-neighbor, refined by walking toward the node. A full anchor takes
+    /// the one extra edge. Nodes that only become reachable through a repaired
+    /// node need no link of their own, and a node whose out-edges all lead to
+    /// stranded nodes waits for one of them to be linked, or is chained onto
+    /// the last repaired node when none ever is.
+    #[test]
+    fn test_connect_stranded_nodes_links_from_nearby_reachable_node() {
+        // Points on a line at x = id, except node 4 sits at 4.5 so that node 2
+        // is strictly the nearest reachable node to node 3.
+        let mut xs: Vec<f32> = (0..16).map(|id| id as f32).collect();
+        xs[4] = 4.5;
+        let values = Float32Array::from(xs.into_iter().flat_map(|x| [x, 0.0]).collect::<Vec<_>>());
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HnswBuildParams::default()
+            .num_edges(MIN_HNSW_M)
+            .max_level(1);
+        let builder = HnswBuilder::with_params(params, &store);
+        assert_eq!(builder.entry_point, 0);
+        let set_neighbors = |id: u32, neighbors: &[u32]| {
+            let mut node = builder.nodes[id as usize].write().unwrap();
+            for &neighbor in neighbors {
+                node.add_neighbor(neighbor, store.dist_between(id, neighbor).into(), 0);
+            }
+            node.update_from_ranked_neighbors(0);
+        };
+        // Reachable: 0, 1, 2 and 4..=9. Node 2 is full (2 * MIN_HNSW_M edges).
+        set_neighbors(0, &[1]);
+        set_neighbors(1, &[0, 2]);
+        set_neighbors(2, &[1, 0, 4, 5, 6, 7, 8, 9]);
+        for id in 4..=9 {
+            set_neighbors(id, &[2]);
+        }
+        // Stranded, nearest reachable node is the full node 2.
+        set_neighbors(3, &[2]);
+        // Stranded pair: 10 is anchored on 9, 11 is reached through 10.
+        set_neighbors(10, &[9, 11]);
+        set_neighbors(11, &[10]);
+        // Stranded, only out-neighbor is 9, but walking from 9 reaches 11.
+        set_neighbors(12, &[9]);
+        // Stranded pair whose out-edges never lead back to the entry point.
+        set_neighbors(13, &[14]);
+        set_neighbors(14, &[13]);
+        // Stranded, only out-neighbor is the entry point, far away.
+        set_neighbors(15, &[0]);
+
+        builder.connect_stranded_nodes(&store);
+
+        let hnsw = builder.finish();
+        assert_all_reachable_on_level0(&hnsw);
+        assert_level0_degree_bound(&hnsw, MIN_HNSW_M);
+        let nodes = hnsw.nodes().unwrap();
+        let level0 = |id: usize| nodes[id].level_neighbors[0].as_slice().to_vec();
+        let inbound = |id: u32| -> Vec<usize> {
+            (0..nodes.len())
+                .filter(|other| nodes[*other].level_neighbors[0].contains(&id))
+                .collect()
+        };
+        // 3: the full node 2 takes the extra edge.
+        assert_eq!(level0(2), vec![1, 0, 4, 5, 6, 7, 8, 9, 3]);
+        // 10: anchored on 9; 11 becomes reachable through 10 with no new edge.
+        assert_eq!(level0(9), vec![2, 10]);
+        assert_eq!(inbound(11), vec![10]);
+        // 12: the walk from 9 continues through 10 to 11.
+        assert_eq!(level0(11), vec![10, 12]);
+        // 15: the walk from the entry point ends at 12, the closest reachable node.
+        assert_eq!(level0(12), vec![9, 15]);
+        // 13: never reachable through its own edges, chained onto the last
+        // repaired node; 14 becomes reachable through 13 with no new edge.
+        assert_eq!(level0(15), vec![0, 13]);
+        assert_eq!(inbound(14), vec![13]);
+    }
+
+    /// Every node anchors at most one stranded node. When the nodes near a
+    /// stranded node have all anchored one already, it chains onto the most
+    /// recently repaired node instead of growing an anchor further.
+    #[test]
+    fn test_connect_stranded_nodes_anchors_each_node_once() {
+        let values = Float32Array::from(vec![
+            0.0, 0.0, // entry point
+            1.0, 0.0, // reachable
+            0.0, 5.0, // stranded, anchored on 0
+            5.0, 0.0, // stranded, anchored on 1
+            0.0, -5.0, // stranded, 0 is the closest node but already an anchor
+        ]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HnswBuildParams::default()
+            .num_edges(MIN_HNSW_M)
+            .max_level(1);
+        let builder = HnswBuilder::with_params(params, &store);
+        assert_eq!(builder.entry_point, 0);
+        let set_neighbors = |id: u32, neighbors: &[u32]| {
+            let mut node = builder.nodes[id as usize].write().unwrap();
+            for &neighbor in neighbors {
+                node.add_neighbor(neighbor, store.dist_between(id, neighbor).into(), 0);
+            }
+            node.update_from_ranked_neighbors(0);
+        };
+        set_neighbors(0, &[1]);
+        set_neighbors(1, &[0]);
+        for id in 2..=4 {
+            set_neighbors(id, &[0]);
+        }
+
+        builder.connect_stranded_nodes(&store);
+
+        let hnsw = builder.finish();
+        assert_all_reachable_on_level0(&hnsw);
+        let nodes = hnsw.nodes().unwrap();
+        assert_eq!(*nodes[0].level_neighbors[0], vec![1, 2]);
+        assert_eq!(*nodes[1].level_neighbors[0], vec![0, 3]);
+        assert_eq!(*nodes[3].level_neighbors[0], vec![0, 4]);
+    }
+
+    /// Identical or nearly identical vectors strand most of the graph, since
+    /// pruning keeps the same few ids everywhere. The repair still has to
+    /// finish in linear time and keep every level-0 list within `2 * m + 1`.
+    #[rstest]
+    #[case::identical(1)]
+    #[case::few_distinct(3)]
+    fn test_degenerate_vectors_stay_reachable_within_degree_bound(#[case] distinct: usize) {
+        const TOTAL: usize = 2000;
+        let values = Float32Array::from(
+            (0..TOTAL)
+                .flat_map(|id| [(id % distinct) as f32, 0.0])
+                .collect::<Vec<_>>(),
+        );
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default()
+                .num_edges(MIN_HNSW_M)
+                .ef_construction(MIN_HNSW_M),
+        )
+        .unwrap();
+        assert_all_reachable_on_level0(&hnsw);
+        assert_level0_degree_bound(&hnsw, MIN_HNSW_M);
+    }
+
+    /// The lowest accepted construction settings keep every node reachable on
+    /// level 0, and the greedy descent still lands close enough for a full
+    /// enumeration to cover nearly all of them.
     #[test]
     fn test_minimum_params_reachability() {
         const DIM: usize = 32;
@@ -1811,6 +2270,7 @@ mod tests {
                 .ef_construction(MIN_HNSW_M),
         )
         .unwrap();
+        assert_all_reachable_on_level0(&hnsw);
         let results = hnsw
             .search_basic(
                 vectors.value(0),
@@ -2536,6 +2996,178 @@ mod tests {
             HNSW::load(corrupted).is_err(),
             "load() must reject a misaligned level-0 __vector_id"
         );
+    }
+
+    /// A graph whose nodes outrun its storage must be refused, not faulted.
+    ///
+    /// Node ids are storage row numbers, so scoring a node past the last row
+    /// indexes out of bounds and panics the worker rather than failing the
+    /// query. The entry point is scored before any traversal decision, so the
+    /// refusal has to come first. Storage with rows the graph never reached is
+    /// left alone -- that direction is safe and ordinary.
+    #[test]
+    fn search_refuses_a_graph_its_storage_cannot_cover() {
+        const DIM: usize = 16;
+        const NODES: usize = 256;
+        let build_store = |rows: usize| {
+            let fsl = FixedSizeListArray::try_new_from_values(
+                generate_random_array(rows * DIM),
+                DIM as i32,
+            )
+            .unwrap();
+            Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2))
+        };
+
+        let full = build_store(NODES);
+        let hnsw = HNSW::index_vectors(
+            full.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        assert_eq!(hnsw.len(), NODES);
+
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let query = Arc::new(generate_random_array(DIM)) as ArrayRef;
+
+        // Storage short of the graph: refused with a message, never scored.
+        let short = build_store(NODES / 4);
+        let refused = hnsw.search_basic(query.clone(), 10, &params, None, short.as_ref());
+        let message = refused
+            .expect_err("a graph its storage cannot cover must be refused")
+            .to_string();
+        assert!(
+            message.contains("no vector to score"),
+            "the error has to name the defect, got: {message}"
+        );
+
+        // The safe direction, and the matching one, both still search.
+        let over = build_store(NODES * 2);
+        for storage in [full.as_ref(), over.as_ref()] {
+            let results = hnsw
+                .search_basic(query.clone(), 10, &params, None, storage)
+                .expect("storage that covers the graph must search");
+            assert!(!results.is_empty());
+        }
+    }
+
+    /// The domain scan must see only the rows it was handed.
+    ///
+    /// Each level is a slice of the concatenated batch, and `ListArray::values()`
+    /// hands back the whole child array regardless of the slice, so a scan over
+    /// it would count another level's ids.
+    #[test]
+    fn neighbors_within_domain_counts_only_the_sliced_rows() {
+        use arrow::array::{ListBuilder, UInt32Builder};
+        use arrow_array::Array;
+
+        use super::neighbors_within_domain;
+
+        const NODE_COUNT: usize = 4;
+        let mut builder = ListBuilder::with_capacity(UInt32Builder::new(), 4);
+        // Rows 0..2 stay inside the domain; rows 2..4 do not.
+        builder.append_value([Some(0u32), Some(1)]);
+        builder.append_value([Some(2u32), Some(3)]);
+        builder.append_value([Some(99u32)]);
+        builder.append_value([Some(100u32)]);
+        let all = builder.finish();
+
+        let clean = all.slice(0, 2);
+        let (out, dropped) = neighbors_within_domain(&clean, NODE_COUNT);
+        assert_eq!(dropped, 0, "a clean slice must report no dropped ids");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.value(0).len(), 2, "a clean slice keeps its ids");
+
+        let dirty = all.slice(2, 2);
+        let (out, dropped) = neighbors_within_domain(&dirty, NODE_COUNT);
+        assert_eq!(dropped, 2, "both out-of-domain ids are counted");
+        assert_eq!(out.value(0).len(), 0, "the bad id is gone");
+        assert_eq!(out.value(1).len(), 0);
+    }
+
+    /// A dangling neighbor id must be gone before search, not caught at lookup.
+    ///
+    /// Traversal scores a neighbor before it is ever looked up as a node, so a
+    /// guard inside the node lookup runs too late -- the id has already reached
+    /// the distance calculator. Indices written before the writer bounded its
+    /// own snapshot carry such edges, so `load()` drops them and the query
+    /// still answers.
+    #[tokio::test]
+    async fn test_load_drops_neighbor_ids_outside_the_graph() {
+        use arrow::array::{AsArray, ListBuilder, UInt32Builder};
+        use arrow::datatypes::UInt32Type;
+        use arrow_array::Array;
+
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        let batch = builder.to_batch().unwrap();
+
+        // Put an out-of-domain edge on every node, the shape a writer that
+        // snapshotted a node count while reading adjacency live would persist.
+        // Every node, so whichever ones traversal expands, it scores the bad id
+        // -- `FlatFloatStorage::dist_calculator` panics on an id past its rows.
+        let neighbors = batch.column(1).as_list::<i32>();
+        let mut rebuilt = ListBuilder::with_capacity(UInt32Builder::new(), neighbors.len());
+        for row in 0..neighbors.len() {
+            let ids = neighbors.value(row);
+            let ids = ids.as_primitive::<UInt32Type>();
+            let mut ids: Vec<u32> = ids.values().to_vec();
+            ids.insert(0, TOTAL as u32 + 7);
+            rebuilt.append_value(ids.into_iter().map(Some));
+        }
+        let mut columns = batch.columns().to_vec();
+        columns[1] = Arc::new(rebuilt.finish());
+        // `__distance` is now shorter than `__neighbors` per row, which search
+        // does not read; the ids are what traversal follows.
+        let corrupted = RecordBatch::try_new(batch.schema(), columns).unwrap();
+
+        let corrupted_bytes = corrupted.get_array_memory_size();
+        let clean_loaded = HNSW::load(batch.clone()).expect("the clean batch loads");
+        let loaded = HNSW::load(corrupted).expect("a dangling edge must not fail the load");
+        // A clean load borrows every level from its batch, so it charges little
+        // beyond it. A repaired level owns its buffers, and they have to be
+        // charged too or the index cache sizes itself from memory it is not
+        // holding. Measured: ~0.3 KiB over for clean, ~38 KiB for repaired.
+        let clean_over = clean_loaded.deep_size_of() - batch.get_array_memory_size();
+        let repaired_over = loaded.deep_size_of() - corrupted_bytes;
+        assert!(
+            clean_over < 1024,
+            "a clean load keeps its levels zero-copy, but charged {clean_over} bytes over its batch"
+        );
+        assert!(
+            repaired_over > 16 * 1024,
+            "a repaired load must charge the buffers it owns, but charged only \
+             {repaired_over} bytes over its batch"
+        );
+
+        assert_eq!(loaded.len(), TOTAL);
+        // Searching has to answer rather than panic on the out-of-domain id.
+        let query = Arc::new(generate_random_array(DIM)) as ArrayRef;
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let results = loaded
+            .search_basic(query, 10, &params, None, store.as_ref())
+            .expect("search must survive a dropped edge");
+        assert!(!results.is_empty(), "the query still returns neighbors");
     }
 
     /// `load()` must reject metadata whose `entry_point` is out of range for

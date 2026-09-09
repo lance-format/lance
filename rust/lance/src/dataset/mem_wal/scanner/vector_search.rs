@@ -103,6 +103,9 @@ pub struct LsmVectorSearchPlanner {
     /// SSTable arms use the dataset scanner's native prefilter; memtable arms
     /// route to a filtered brute-force scan.
     filter: Option<Expr>,
+    /// Optional `lower <= _distance < upper` bound, applied inside every source
+    /// arm's KNN so an out-of-range row never consumes a top-k slot.
+    distance_range: (Option<f32>, Option<f32>),
 }
 
 impl LsmVectorSearchPlanner {
@@ -134,6 +137,7 @@ impl LsmVectorSearchPlanner {
             sstable_cache: None,
             warmer: None,
             filter: None,
+            distance_range: (None, None),
         }
     }
 
@@ -142,6 +146,15 @@ impl LsmVectorSearchPlanner {
     /// normal filtered vector scan over base ∪ SSTables ∪ in-memory data.
     pub fn with_filter(mut self, filter: Option<Expr>) -> Self {
         self.filter = filter;
+        self
+    }
+
+    /// Attach an optional distance range, `lower <= _distance < upper` — the
+    /// same half-open semantics as [`crate::dataset::scanner::Scanner::distance_range`].
+    /// Every source arm applies it before its own top-k cut, so an out-of-range
+    /// row can't displace an in-range one.
+    pub fn with_distance_range(mut self, lower: Option<f32>, upper: Option<f32>) -> Self {
+        self.distance_range = (lower, upper);
         self
     }
 
@@ -441,6 +454,7 @@ impl LsmVectorSearchPlanner {
                 }
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
+                scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
                 // Memtables cover unindexed rows; only search indexed data here.
@@ -474,6 +488,7 @@ impl LsmVectorSearchPlanner {
                 // No `with_row_id/address`: per-source IDs would collide with base.
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
+                scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
                 scanner.fast_search();
@@ -503,6 +518,7 @@ impl LsmVectorSearchPlanner {
                     scanner.filter_expr(filter.clone());
                 }
                 scanner.nearest(&self.vector_column, query_vector, k)?;
+                scanner.distance_range(self.distance_range.0, self.distance_range.1);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
                 scanner.create_plan().await
@@ -1068,6 +1084,117 @@ mod tests {
             sorted,
             vec![2, 3],
             "prefilter must drop id=0 and id=1 (nearer but failing `id >= 2`)"
+        );
+    }
+
+    /// `distance_range` must bound the search itself, not its result.
+    ///
+    /// Vectors are `id -> [id*0.1, ..]` and the query is id=1's vector, so L2^2
+    /// distances are id=1: 0.0, id=0 and id=2: 0.04, id=3: 0.16, id=4: 0.36.
+    ///
+    /// The lower-bound probe is the sharp one. It excludes the *nearest* rows,
+    /// which `VectorIndexExec` cannot honor: its HNSW search cuts to k first, so
+    /// a `k = 2` search returns id=1 and id=0/id=2 and the bound then drops both,
+    /// yielding nothing. Only the brute-force arm — which filters the complete
+    /// candidate set before its cut — gets this right, so a lower bound must
+    /// route there (see `MemTableScanner::plan_vector_search`). Regression for
+    /// that routing guard.
+    #[tokio::test]
+    async fn test_vector_search_distance_range_bounds_the_search() {
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        // Base rows are far and unindexed, so `fast_search` contributes nothing;
+        // the test isolates the memtable arms.
+        let base_dataset = Arc::new(
+            create_dataset(&base_uri, vec![create_test_batch(&schema, &[100, 200])]).await,
+        );
+
+        let build_collector = || {
+            let batch_store = Arc::new(BatchStore::with_capacity(16));
+            let mut index_store = IndexStore::new();
+            index_store.enable_pk_index(&[("id".to_string(), 0)]);
+            // An HNSW index must exist, or the arm falls back to brute force for
+            // an unrelated reason and the routing guard goes untested.
+            index_store.add_hnsw(
+                "vector_hnsw".to_string(),
+                1,
+                "vector".to_string(),
+                lance_linalg::distance::DistanceType::L2,
+                64,
+                8,
+            );
+            let batch = create_test_batch(&schema, &[0, 1, 2, 3, 4]);
+            batch_store.append(batch.clone()).unwrap();
+            index_store
+                .insert_with_batch_position(&batch, 0, Some(0))
+                .unwrap();
+            LsmDataSourceCollector::new(base_dataset.clone(), vec![]).with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: Arc::new(index_store),
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            )
+        };
+
+        let run = async |lower: Option<f32>, upper: Option<f32>, k: usize| -> Vec<i32> {
+            let planner = LsmVectorSearchPlanner::new(
+                build_collector(),
+                vec!["id".to_string()],
+                schema.clone(),
+                "vector".to_string(),
+                lance_linalg::distance::DistanceType::L2,
+            )
+            .with_distance_range(lower, upper);
+            let plan = planner
+                .plan_search(&create_query_vector(), k, 1, None, false, 1.0)
+                .await
+                .expect("planner should produce a bounded plan");
+            let stream = plan.execute(0, SessionContext::new().task_ctx()).unwrap();
+            let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+            let mut ids: Vec<i32> = Vec::new();
+            for b in &batches {
+                let col = b
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                for i in 0..b.num_rows() {
+                    ids.push(col.value(i));
+                }
+            }
+            ids.sort();
+            ids
+        };
+
+        // `_distance >= 0.1` keeps only id=3 (0.16) and id=4 (0.36). A top-k cut
+        // taken before the bound would have returned id=1/id=0/id=2 and then
+        // filtered them all away, leaving nothing.
+        assert_eq!(
+            run(Some(0.1), None, 2).await,
+            vec![3, 4],
+            "a lower bound must restrict the search: the two nearest in-range \
+             rows are id=3 and id=4, not an empty result"
+        );
+
+        // `_distance < 0.1` keeps id=0, id=1, id=2. Safe on the HNSW arm — it
+        // trims the far tail the top-k would have dropped anyway.
+        assert_eq!(
+            run(None, Some(0.1), 10).await,
+            vec![0, 1, 2],
+            "an upper bound must drop id=3 (0.16) and id=4 (0.36)"
         );
     }
 

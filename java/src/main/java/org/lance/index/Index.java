@@ -39,6 +39,7 @@ public class Index {
   private final Instant createdAt;
   private final Integer baseId;
   private final Long sizeBytes;
+  private final List<IndexFile> files;
   private final IndexType indexType;
 
   private Index(
@@ -53,6 +54,7 @@ public class Index {
       Instant createdAt,
       Integer baseId,
       Long sizeBytes,
+      List<IndexFile> files,
       IndexType indexType) {
     this.uuid = uuid;
     this.fields = fields;
@@ -64,7 +66,22 @@ public class Index {
     this.indexVersion = indexVersion;
     this.createdAt = createdAt;
     this.baseId = baseId;
-    this.sizeBytes = sizeBytes;
+    boolean hasFiles = files != null && !files.isEmpty();
+    if (hasFiles && sizeBytes == null) {
+      long derivedSizeBytes = 0;
+      try {
+        for (IndexFile file : files) {
+          derivedSizeBytes = Math.addExact(derivedSizeBytes, file.getSizeBytes());
+        }
+      } catch (ArithmeticException e) {
+        throw new IllegalArgumentException(
+            "index file sizes cannot be represented by Java long", e);
+      }
+      this.sizeBytes = derivedSizeBytes;
+    } else {
+      this.sizeBytes = !hasFiles && Long.valueOf(0).equals(sizeBytes) ? null : sizeBytes;
+    }
+    this.files = hasFiles ? files : null;
     this.indexType = indexType;
   }
 
@@ -136,6 +153,11 @@ public class Index {
     return Optional.ofNullable(sizeBytes);
   }
 
+  /** Files and sizes for this index segment, or empty when older writers did not record them. */
+  public Optional<List<IndexFile>> getFiles() {
+    return Optional.ofNullable(files);
+  }
+
   /**
    * Get the index version.
    *
@@ -179,6 +201,7 @@ public class Index {
         && Objects.equals(createdAt, index.createdAt)
         && Objects.equals(baseId, index.baseId)
         && Objects.equals(sizeBytes, index.sizeBytes)
+        && Objects.equals(files, index.files)
         && indexType == index.indexType;
   }
 
@@ -195,6 +218,7 @@ public class Index {
             createdAt,
             baseId,
             sizeBytes,
+            files,
             fragments,
             indexType);
     result = 31 * result + Arrays.hashCode(indexDetails);
@@ -214,6 +238,7 @@ public class Index {
         .add("createdAt", createdAt)
         .add("baseId", baseId)
         .add("sizeBytes", sizeBytes)
+        .add("files", files)
         .toString();
   }
 
@@ -239,6 +264,7 @@ public class Index {
     private Instant createdAt;
     private Integer baseId;
     private Long sizeBytes;
+    private List<IndexFile> files;
     private IndexType indexType;
 
     private Builder() {}
@@ -298,6 +324,11 @@ public class Index {
       return this;
     }
 
+    public Builder files(List<IndexFile> files) {
+      this.files = files;
+      return this;
+    }
+
     public Builder indexType(IndexType indexType) {
       this.indexType = indexType;
       return this;
@@ -316,6 +347,7 @@ public class Index {
           createdAt,
           baseId,
           sizeBytes,
+          files,
           indexType);
     }
   }

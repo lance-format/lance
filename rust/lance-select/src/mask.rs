@@ -85,6 +85,14 @@ impl RowAddrMask {
         matches!(self, Self::BlockList(b) if b.is_empty())
     }
 
+    /// Returns whether this mask selects every row in `rows`.
+    pub fn selects_all(&self, rows: &RowAddrTreeMap) -> bool {
+        match self {
+            Self::AllowList(allow_list) => (rows.clone() - allow_list).is_empty(),
+            Self::BlockList(block_list) => (rows.clone() & block_list).is_empty(),
+        }
+    }
+
     /// Return the indices of the input row ids that were valid
     pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
         row_ids
@@ -1293,6 +1301,23 @@ mod tests {
         assert_eq!(allow_list.max_len(), None);
         assert_mask_selects(&allow_list, &[(2 << 32) + 5], &[(3 << 32) + 5]);
         assert!(allow_list.iter_addrs().is_none());
+    }
+
+    #[test]
+    fn test_row_addr_mask_selects_all_known_rows() {
+        let partition_rows = rows(&[10, 20, 2_u64 << 32 | 3]);
+
+        assert!(RowAddrMask::all_rows().selects_all(&partition_rows));
+        assert!(
+            RowAddrMask::from_allowed(rows(&[10, 20, 30, 2_u64 << 32 | 3]))
+                .selects_all(&partition_rows)
+        );
+        assert!(
+            !RowAddrMask::from_allowed(rows(&[10, 2_u64 << 32 | 3])).selects_all(&partition_rows)
+        );
+        assert!(RowAddrMask::from_block(rows(&[30])).selects_all(&partition_rows));
+        assert!(!RowAddrMask::from_block(rows(&[20, 30])).selects_all(&partition_rows));
+        assert!(RowAddrMask::allow_nothing().selects_all(&RowAddrTreeMap::new()));
     }
 
     #[test]

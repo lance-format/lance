@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use arrow_array::{Decimal128Array, UInt64Array};
 
 const NON_LEGACY_VERSIONS: [LanceFileVersion; 4] = [
     LanceFileVersion::V2_0,
@@ -50,6 +51,82 @@ async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
     );
     let after = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn test_binary_copy_falls_back_for_non_schema_column_order() {
+    let decimal_type = DataType::Decimal128(38, 10);
+    let dataset_schema = Arc::new(Schema::new(vec![
+        Field::new("v_dec", decimal_type.clone(), true),
+        Field::new("v_u64", DataType::UInt64, true),
+    ]));
+    let write_params = WriteParams {
+        max_rows_per_file: 1,
+        data_storage_version: Some(LanceFileVersion::V2_3),
+        ..Default::default()
+    };
+    let test_dir = TempStrDir::default();
+    let empty_batch = RecordBatch::new_empty(dataset_schema.clone());
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(empty_batch)], dataset_schema),
+        &test_dir,
+        Some(write_params.clone()),
+    )
+    .await
+    .unwrap();
+
+    let decimal_values = Decimal128Array::from_iter_values([
+        201_000_000_000_000_000_000_000_i128,
+        202_000_000_000_000_000_000_000_i128,
+    ])
+    .with_precision_and_scale(38, 10)
+    .unwrap();
+    let swapped_schema = Arc::new(Schema::new(vec![
+        Field::new("v_u64", DataType::UInt64, true),
+        Field::new("v_dec", decimal_type, true),
+    ]));
+    let swapped_batch = RecordBatch::try_new(
+        swapped_schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![201, 202])),
+            Arc::new(decimal_values),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(swapped_batch)], swapped_schema),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+    let fragments: Vec<Fragment> = dataset
+        .get_fragments()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    assert_eq!(fragments.len(), 2);
+    for fragment in &fragments {
+        assert_eq!(fragment.files[0].fields.as_ref(), &[1, 0]);
+        assert_eq!(fragment.files[0].column_indices.as_ref(), &[0, 1]);
+    }
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 8,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
+        ..Default::default()
+    };
+    assert!(!can_use_binary_copy(&dataset, &options, &fragments).await);
+    let before = dataset.scan().try_into_batch().await.unwrap();
+
+    compact_files(&mut dataset, options, None).await.unwrap();
+
+    let after = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(before, after);
+    let compacted_file = &dataset.manifest.fragments[0].files[0];
+    assert_eq!(compacted_file.fields.as_ref(), &[0, 1]);
+    assert_eq!(compacted_file.column_indices.as_ref(), &[0, 1]);
 }
 
 #[tokio::test]

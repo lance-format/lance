@@ -50,6 +50,7 @@ pub type RowPosition = u64;
 // Re-export public types used externally
 pub use btree::{BTreeIndexConfig, BTreeMemIndex};
 pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions};
+pub(crate) use fts::{QueryLocalFtsIndex, QueryLocalFtsStats};
 pub use hnsw::{HnswIndexConfig, HnswMemIndex};
 pub use pk_key::encode_pk_tuple;
 
@@ -467,6 +468,23 @@ pub(crate) fn unsupported_index_type(index_name: &str, type_url: &str) -> Error 
         "index '{}' has type {}, which the MemWAL cannot maintain. Supported: BTree, Inverted, Vector",
         index_name, type_url
     ))
+}
+
+/// Which prefix of a MemTable a reader may see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemTableVisibility {
+    /// [`IndexStore::visible_count`]. Required for every reader but the writer
+    /// itself: a row past this bound can still fail its append and never exist.
+    #[default]
+    Published,
+    /// [`IndexStore::indexed_count`], which also covers writes whose append is
+    /// outstanding.
+    ///
+    /// Sound only for a writer reading its own prefix under the lock that makes
+    /// it the sole writer. Both cursors advance over contiguous prefixes, so a
+    /// row derived from `p` cannot be published before `p`, and a failed append
+    /// poisons the writer before either is acknowledged.
+    Indexed,
 }
 
 /// Registry managing all in-memory indexes for a MemTable.
@@ -1304,6 +1322,14 @@ impl IndexStore {
         match &self.durability {
             Some((cursors, global_offset)) => cursors.visible_count(indexed, *global_offset),
             None => indexed,
+        }
+    }
+
+    /// The prefix readable under `visibility`.
+    pub fn prefix_count(&self, visibility: MemTableVisibility) -> usize {
+        match visibility {
+            MemTableVisibility::Published => self.visible_count(),
+            MemTableVisibility::Indexed => self.indexed_count(),
         }
     }
 

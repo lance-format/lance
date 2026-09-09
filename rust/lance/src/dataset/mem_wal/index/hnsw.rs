@@ -432,8 +432,18 @@ impl HnswMemIndex {
         if state.graph.is_empty() {
             return Ok(None);
         }
+        // Bound the graph by storage, and only in that direction. A graph past
+        // storage names rows the batch has no vector for, which is the defect
+        // this fixes. Storage past the graph is left whole on purpose: those
+        // rows are unreachable by traversal either way, but `HNSW::search`
+        // brute-forces the storage domain under a narrow prefilter
+        // (`flat_search`), so dropping them would lose results this export
+        // previously returned. Closing that gap means finishing index
+        // application before export, not trimming storage to match.
         let storage_batch = state.storage.to_record_batch(total_rows)?;
-        let hnsw_batch = state.graph.to_lance_hnsw_batch()?;
+        let hnsw_batch = state
+            .graph
+            .to_lance_hnsw_batch(Some(storage_batch.num_rows()))?;
         let hnsw = HNSW::load(hnsw_batch)?;
         Ok(Some((hnsw, storage_batch)))
     }
@@ -657,6 +667,61 @@ mod tests {
         let query = FixedSizeListArray::try_new_from_values(inner, 4).unwrap();
         let results = index.search(&query, 5, None, u64::MAX).unwrap();
         assert!(results.is_empty());
+    }
+
+    /// Storage leading the graph must keep its rows.
+    ///
+    /// `insert_batches` appends storage before it builds and publishes the
+    /// graph, so storage can lead. Those rows are unreachable by traversal
+    /// either way, but `HNSW::search` brute-forces the storage domain under a
+    /// narrow prefilter, so trimming storage to the graph would drop results
+    /// this export used to return. The graph still may not exceed storage.
+    #[test]
+    fn to_lance_hnsw_keeps_storage_rows_the_graph_has_not_reached() {
+        let dim = 8;
+        let n = 32;
+        let index = HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::L2,
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
+            n * 2,
+            4,
+        );
+        index.insert(&make_batch(0, n, dim), 0).unwrap();
+
+        // Reproduce the interval: storage takes the next batch, the graph does
+        // not see it yet.
+        let state = index.state.get().expect("state is initialized");
+        let extra = make_batch(n as i32, n, dim);
+        let vectors = extra
+            .column_by_name("vector")
+            .unwrap()
+            .as_fixed_size_list_opt()
+            .unwrap()
+            .clone();
+        state
+            .storage
+            .append_batch(Arc::new(vectors), n as u64)
+            .unwrap();
+        assert!(
+            state.storage.committed_len() > state.graph.len(),
+            "the test needs storage ahead of the graph"
+        );
+
+        let Some((hnsw, storage_batch)) = index.to_lance_hnsw(None).unwrap() else {
+            panic!("expected HNSW snapshot");
+        };
+        assert_eq!(
+            storage_batch.num_rows(),
+            n * 2,
+            "storage keeps every committed row; a narrow prefilter scans them"
+        );
+        assert_eq!(hnsw.len(), n, "the graph covers only what it indexed");
+        assert!(
+            hnsw.len() <= storage_batch.num_rows(),
+            "the graph must never name a row storage has no vector for"
+        );
     }
 
     #[test]

@@ -933,6 +933,14 @@ pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
     fn requires_payload(&self) -> bool {
         true
     }
+
+    /// Inspect a block for an exact payload-derived value count when supported.
+    ///
+    /// This must not materialize the decoded values. `None` means the encoding requires an
+    /// external count or cannot safely prove one from this payload.
+    fn infer_num_values(&self, _data: &LanceBuffer) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 pub(crate) fn require_block_payload(data: Option<LanceBuffer>, codec: &str) -> Result<LanceBuffer> {

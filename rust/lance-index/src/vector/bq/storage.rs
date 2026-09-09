@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap};
@@ -39,8 +40,9 @@ use num_traits::AsPrimitive;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-use crate::frag_reuse::FragReuseIndex;
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
 use crate::pb;
+use crate::scalar::RowIdRemapper;
 use crate::vector::ApproxMode;
 use crate::vector::bq::dist_table_quant::{
     DistTableDequant, quantize_dist_table_into, quantize_dist_table_u16_into,
@@ -104,10 +106,7 @@ static RABIT_PRUNE_STATS_INTERVAL: OnceLock<u64> = OnceLock::new();
 
 fn rabit_prune_stats_enabled() -> bool {
     *RABIT_PRUNE_STATS_ENABLED.get_or_init(|| match std::env::var(RABIT_PRUNE_STATS_ENV) {
-        Ok(value) => {
-            let value = value.to_ascii_lowercase();
-            !matches!(value.as_str(), "" | "0" | "false" | "off" | "no")
-        }
+        Ok(value) => str_is_truthy(value.trim()),
         Err(_) => false,
     })
 }
@@ -982,20 +981,39 @@ impl<'a> RabitDistCalculator<'a> {
         };
         let remainder = n % BATCH_SIZE;
         let simd_len = n - remainder;
-        quantized_dists.clear();
-        quantized_dists.reserve(simd_len);
-        unsafe {
-            // Storage construction proves the code and table layouts, and the
-            // reserved output has exactly one slot per SIMD row.
-            simd::dist_table::sum_4bit_dist_table_uninit(
-                simd_len,
-                code_len,
-                self.codes,
-                quantized_dists_table,
-                &mut quantized_dists.spare_capacity_mut()[..simd_len],
-            );
-            // The distance-table kernel initialized every SIMD output slot.
-            quantized_dists.set_len(simd_len);
+        // Past `SAFE_U16_CODE_LEN` a full-range LUT overflows the `u16`
+        // accumulator; the wide sum is what the narrow one would have produced.
+        // Storage construction proves the code and table layouts, and the
+        // reserved output has exactly one slot per SIMD row.
+        let is_wide = code_len > simd::dist_table::SAFE_U16_CODE_LEN;
+        if is_wide {
+            hacc_quantized_dists.clear();
+            hacc_quantized_dists.reserve(simd_len);
+            unsafe {
+                simd::dist_table::sum_4bit_dist_table_u32_uninit(
+                    simd_len,
+                    code_len,
+                    self.codes,
+                    quantized_dists_table,
+                    &mut hacc_quantized_dists.spare_capacity_mut()[..simd_len],
+                );
+                // The kernel initialized every SIMD output slot.
+                hacc_quantized_dists.set_len(simd_len);
+            }
+        } else {
+            quantized_dists.clear();
+            quantized_dists.reserve(simd_len);
+            unsafe {
+                simd::dist_table::sum_4bit_dist_table_uninit(
+                    simd_len,
+                    code_len,
+                    self.codes,
+                    quantized_dists_table,
+                    &mut quantized_dists.spare_capacity_mut()[..simd_len],
+                );
+                // The kernel initialized every SIMD output slot.
+                quantized_dists.set_len(simd_len);
+            }
         }
 
         let range = (qmax - qmin) / 255.0;
@@ -1004,12 +1022,21 @@ impl<'a> RabitDistCalculator<'a> {
         dists.clear();
         dists.reserve(n);
         let uninit_dists = &mut dists.spare_capacity_mut()[..n];
-        uninit_dists[..simd_len]
-            .iter_mut()
-            .zip(quantized_dists.iter())
-            .for_each(|(dist, q_dist)| {
-                dist.write((*q_dist as f32) * range + sum_min);
-            });
+        if is_wide {
+            uninit_dists[..simd_len]
+                .iter_mut()
+                .zip(hacc_quantized_dists.iter())
+                .for_each(|(dist, q_dist)| {
+                    dist.write((*q_dist as f32) * range + sum_min);
+                });
+        } else {
+            uninit_dists[..simd_len]
+                .iter_mut()
+                .zip(quantized_dists.iter())
+                .for_each(|(dist, q_dist)| {
+                    dist.write((*q_dist as f32) * range + sum_min);
+                });
+        }
 
         uninit_dists[simd_len..]
             .iter_mut()
@@ -2393,13 +2420,10 @@ pub fn unpack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
 /// to `Some(new_id)` for surviving rows or `None` for rows whose covering
 /// fragment was compacted away, suitable for `RabitQuantizationStorage::remap`.
 fn build_frag_reuse_mapping(
-    fri: Option<&FragReuseIndex>,
+    fri: Option<&dyn RowIdRemapper>,
     row_ids: &UInt64Array,
 ) -> Option<HashMap<u64, Option<u64>>> {
     let fri = fri?;
-    if fri.row_id_maps.is_empty() {
-        return None;
-    }
     let mut mapping: HashMap<u64, Option<u64>> = HashMap::new();
     for row_id in row_ids.values().iter() {
         match fri.remap_row_id(*row_id) {
@@ -2425,6 +2449,16 @@ impl QuantizerStorage for RabitQuantizationStorage {
         metadata: &Self::Metadata,
         distance_type: DistanceType,
         fri: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let fri = fri.map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::try_from_batch_with_remapper(batch, metadata, distance_type, fri)
+    }
+
+    fn try_from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        fri: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let distance_type = match (metadata.query_estimator, distance_type) {
             (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
@@ -4537,5 +4571,113 @@ mod tests {
             remapped.ex_codes.as_ref().unwrap().value_length() as usize,
             blocked_ex_code_bytes(code_dim, rabit_ex_bits(num_bits).unwrap())
         );
+    }
+
+    /// Past 128 code bytes (rotated dim above 1024) a row's binary sum no
+    /// longer fits a `u16`, and the ranking collapses.
+    /// See https://github.com/lance-format/lance/issues/7157.
+    #[rstest]
+    #[case::narrow(1024, false, false)]
+    #[case::wide_ragged_chunk(1536, true, false)]
+    #[case::wide_overflowing(4096, true, true)]
+    fn test_binary_distances_match_exact_at_high_dim(
+        #[case] code_dim: usize,
+        #[case] expect_wide: bool,
+        #[case] expect_u16_overflow: bool,
+    ) {
+        let num_rows = 64;
+        let code_len = rabit_binary_code_bytes(code_dim);
+        // Not `make_test_codes`: its per-row ramp is nearly parallel to the
+        // all-ones vector, leaving every row sharing over 80% of its bits.
+        let mut rng = SmallRng::seed_from_u64(7157);
+        let codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from_iter_values((0..num_rows * code_len).map(|_| rng.random::<u8>())),
+            code_len as i32,
+        )
+        .unwrap();
+        let metadata = make_test_metadata(code_dim);
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch(codes),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        let query = Arc::new(Float32Array::from_iter_values(
+            (0..code_dim).map(|idx| ((idx % 17) as f32 - 8.0) / 8.0),
+        )) as ArrayRef;
+        let calc = storage.dist_calculator(query, 4.0);
+
+        let mut binary_ips = Vec::new();
+        let mut u16_scratch = Vec::new();
+        let mut u8_scratch = Vec::new();
+        let mut u32_scratch = Vec::new();
+        let simd_len = calc.binary_distances_with_scratch(
+            num_rows,
+            code_len,
+            &mut binary_ips,
+            &mut u16_scratch,
+            &mut u8_scratch,
+            &mut u32_scratch,
+        );
+        assert_eq!(simd_len, num_rows, "every row should take the kernel path");
+
+        let sums: Vec<u32> = if expect_wide {
+            assert_eq!(u32_scratch.len(), num_rows, "dim {code_dim} should be wide");
+            u32_scratch.clone()
+        } else {
+            assert_eq!(
+                u16_scratch.len(),
+                num_rows,
+                "dim {code_dim} should stay narrow"
+            );
+            u16_scratch.iter().map(|sum| *sum as u32).collect()
+        };
+
+        let wide_table: Vec<u16> = u8_scratch.iter().map(|entry| *entry as u16).collect();
+        let mut expected_sums = vec![0u32; num_rows];
+        lance_linalg::simd::dist_table::sum_4bit_dist_table_u16_scalar(
+            code_len,
+            &calc.codes[..num_rows * code_len],
+            &wide_table,
+            &mut expected_sums,
+        );
+        assert_eq!(
+            sums, expected_sums,
+            "dim {code_dim}: quantized sums diverge"
+        );
+
+        // Or the case quietly stops exercising the overflow it was written for.
+        let widest = expected_sums.iter().copied().max().unwrap_or(0);
+        assert_eq!(
+            widest > u16::MAX as u32,
+            expect_u16_overflow,
+            "dim {code_dim}: widest sum {widest} against the u16 ceiling"
+        );
+
+        // Half a step of rounding on each of `2 * code_len` terms.
+        let qmin = calc
+            .dist_table
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let qmax = calc
+            .dist_table
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let quantization_bound = code_len as f32 * (qmax - qmin) / 255.0;
+        assert!(quantization_bound > 0.0, "the test query must vary the LUT");
+
+        for (id, binary_ip) in binary_ips.iter().enumerate() {
+            let exact =
+                compute_single_rq_distance(calc.codes, id, num_rows, code_len, &calc.dist_table);
+            let error = (binary_ip - exact).abs();
+            assert!(
+                error <= quantization_bound + 1e-4 * exact.abs(),
+                "row {id} at dim {code_dim}: binary ip {binary_ip} vs exact {exact}, \
+                 error {error} over the {quantization_bound} quantization bound",
+            );
+        }
     }
 }

@@ -33,7 +33,7 @@ resolver = "3"
 
 
 [workspace.package]
-version = "12.0.0-beta.2"
+version = "12.0.0-beta.15"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -58,27 +58,27 @@ rust-version = "1.91.0"
 [workspace.dependencies]
 arc-swap = "1.7"
 libc = "0.2.176"
-lance = { version = "=12.0.0-beta.2", path = "./rust/lance", default-features = false }
-lance-arrow = { version = "=12.0.0-beta.2", path = "./rust/lance-arrow" }
-lance-core = { version = "=12.0.0-beta.2", path = "./rust/lance-core" }
-lance-datafusion = { version = "=12.0.0-beta.2", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=12.0.0-beta.2", path = "./rust/lance-datagen" }
-lance-derive = { version = "=12.0.0-beta.2", path = "./rust/lance-derive" }
-lance-encoding = { version = "=12.0.0-beta.2", path = "./rust/lance-encoding" }
-lance-file = { version = "=12.0.0-beta.2", path = "./rust/lance-file" }
-lance-geo = { version = "=12.0.0-beta.2", path = "./rust/lance-geo" }
-lance-index = { version = "=12.0.0-beta.2", path = "./rust/lance-index" }
-lance-index-core = { version = "=12.0.0-beta.2", path = "./rust/lance-index-core" }
-lance-io = { version = "=12.0.0-beta.2", path = "./rust/lance-io", default-features = false }
-lance-linalg = { version = "=12.0.0-beta.2", path = "./rust/lance-linalg" }
-lance-namespace = { version = "=12.0.0-beta.2", path = "./rust/lance-namespace" }
-lance-namespace-impls = { version = "=12.0.0-beta.2", path = "./rust/lance-namespace-impls" }
-lance-namespace-reqwest-client = "0.11.0"
-lance-select = { version = "=12.0.0-beta.2", path = "./rust/lance-select" }
-lance-tokenizer = { version = "=12.0.0-beta.2", path = "./rust/lance-tokenizer" }
-lance-table = { version = "=12.0.0-beta.2", path = "./rust/lance-table" }
-lance-test-macros = { version = "=12.0.0-beta.2", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=12.0.0-beta.2", path = "./rust/lance-testing" }
+lance = { version = "=12.0.0-beta.15", path = "./rust/lance", default-features = false }
+lance-arrow = { version = "=12.0.0-beta.15", path = "./rust/lance-arrow" }
+lance-core = { version = "=12.0.0-beta.15", path = "./rust/lance-core" }
+lance-datafusion = { version = "=12.0.0-beta.15", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=12.0.0-beta.15", path = "./rust/lance-datagen" }
+lance-derive = { version = "=12.0.0-beta.15", path = "./rust/lance-derive" }
+lance-encoding = { version = "=12.0.0-beta.15", path = "./rust/lance-encoding" }
+lance-file = { version = "=12.0.0-beta.15", path = "./rust/lance-file" }
+lance-geo = { version = "=12.0.0-beta.15", path = "./rust/lance-geo" }
+lance-index = { version = "=12.0.0-beta.15", path = "./rust/lance-index" }
+lance-index-core = { version = "=12.0.0-beta.15", path = "./rust/lance-index-core" }
+lance-io = { version = "=12.0.0-beta.15", path = "./rust/lance-io", default-features = false }
+lance-linalg = { version = "=12.0.0-beta.15", path = "./rust/lance-linalg" }
+lance-namespace = { version = "=12.0.0-beta.15", path = "./rust/lance-namespace" }
+lance-namespace-impls = { version = "=12.0.0-beta.15", path = "./rust/lance-namespace-impls" }
+lance-namespace-reqwest-client = "0.12.0"
+lance-select = { version = "=12.0.0-beta.15", path = "./rust/lance-select" }
+lance-tokenizer = { version = "=12.0.0-beta.15", path = "./rust/lance-tokenizer" }
+lance-table = { version = "=12.0.0-beta.15", path = "./rust/lance-table" }
+lance-test-macros = { version = "=12.0.0-beta.15", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=12.0.0-beta.15", path = "./rust/lance-testing" }
 all_asserts = "2.3.1"
 approx = "0.5.1"
 # Note that this one does not include pyarrow
@@ -107,7 +107,7 @@ half = { "version" = "2.1", default-features = false, features = [
     "std",
     "bytemuck",
 ] }
-lance-bitpacking = { version = "=12.0.0-beta.2", path = "./rust/compression/bitpacking" }
+lance-bitpacking = { version = "=12.0.0-beta.15", path = "./rust/compression/bitpacking" }
 bitpacking = "0.9"
 bitvec = "1"
 blake3 = "1.8.5"
@@ -151,7 +151,7 @@ dirs = "6.0.0"
 either = "1.0"
 env_logger = "0.11.7"
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=12.0.0-beta.2", path = "./rust/compression/fsst" }
+fsst = { version = "=12.0.0-beta.15", path = "./rust/compression/fsst" }
 futures = "0.3"
 geoarrow-array = "0.8"
 geoarrow-schema = "0.8"
@@ -209,7 +209,7 @@ serial_test = "3"
 snafu = "0.9"
 syn = { version = "2.0.37", features = ["full"] }
 lindera = { version = "3.0.7" }
-tempfile = "3"
+tempfile = "3.10"
 test-log = { version = "0.2.15" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",

@@ -1,0 +1,42 @@
+name: CI scripts
+
+# Tests for helper scripts under ci/ that aren't covered by the language test
+# suites (e.g. the format-spec vote gate logic).
+
+on:
+  push:
+    branches:
+      - main
+      - release/**
+  pull_request:
+    branches:
+      - main
+      - release/**
+    paths:
+      - ci/format_vote_gate.py
+      - ci/test_format_vote_gate.py
+      - ci/test_labeler_area.py
+      - ci/check_proto_comments.py
+      - ci/test_check_proto_comments.py
+      - .github/labeler-area.yml
+      - .github/workflows/format-vote-gate.yml
+      - .github/workflows/ci-scripts.yml
+
+permissions:
+  contents: read
+
+jobs:
+  format-vote-gate:
+    name: Format vote gate unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: pip install pytest PyYAML
+      - name: Run tests
+        run: pytest ci/test_format_vote_gate.py ci/test_labeler_area.py ci/test_check_proto_comments.py

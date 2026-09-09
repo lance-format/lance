@@ -735,6 +735,12 @@ class _Fragment:
         batch_readahead: Optional[int] = None,
         blob_handling: Optional[str] = None,
         order_by: Optional[List[Any]] = None,
+        use_scalar_index: Optional[bool] = None,
+        io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
+        include_deleted_rows: Optional[bool] = None,
+        batch_size_bytes: Optional[int] = None,
+        strict_batch_size: Optional[bool] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,

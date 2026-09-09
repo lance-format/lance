@@ -49,4 +49,7 @@ plugins:
   - mkdocs_protobuf:
       proto_dir: ../protos
 
+hooks:
+  - hooks/pmc_roster.py
+
 copyright: © 2025 Lance Format. All rights reserved.

@@ -14,7 +14,6 @@ use lance_core::deepsize::DeepSizeOf;
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
-use crate::index::DatasetIndexExt;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
@@ -35,7 +34,6 @@ use lance_io::object_store::{
     WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::traits::{WriteExt, Writer};
 use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
 };
@@ -71,6 +69,7 @@ pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
+mod data_file;
 pub mod delta;
 pub mod files;
 pub mod fragment;
@@ -116,6 +115,8 @@ mod utils;
 pub(crate) mod versions;
 pub mod write;
 
+pub use data_file::{DataFilePart, DataFileTarget};
+
 pub(crate) use take::row_offsets_to_row_addresses;
 
 use self::builder::DatasetBuilder;
@@ -125,13 +126,12 @@ use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
-use self::write::{cleanup_data_fragments, write_fragments_internal};
+use self::write::cleanup_data_fragments;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
-use crate::index::retain_supported_indices;
 use crate::io::commit::{
     DEFAULT_COMMIT_RETRY_TIMEOUT, commit_detached_transaction, commit_new_dataset,
     commit_transaction, detect_overlapping_fragments,
@@ -148,7 +148,10 @@ pub use lance_core::ROW_ID;
 use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
-use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
+use lance_table::feature_flags::{
+    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
+    validate_paired_feature_flags,
+};
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use schema_evolution::{
@@ -173,6 +176,32 @@ pub use write::{
 pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
+const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
+
+fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
+    value
+        .parse::<NonZero<usize>>()
+        .map(NonZero::get)
+        .map_err(|_| {
+            Error::invalid_input(format!(
+                "LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be a positive integer, got {value:?}"
+            ))
+        })
+}
+
+fn deep_clone_copy_parallelism(
+    configured_io_parallelism: usize,
+    uses_streaming_copy: bool,
+    stream_copy_parallelism: Option<usize>,
+) -> usize {
+    if !uses_streaming_copy {
+        configured_io_parallelism
+    } else if let Some(value) = stream_copy_parallelism {
+        value
+    } else {
+        configured_io_parallelism.min(DEFAULT_MAX_STREAM_COPY_PARALLELISM)
+    }
+}
 
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
@@ -764,14 +793,7 @@ impl Dataset {
             read_struct(object_reader.as_ref(), offset).await
         }?;
 
-        if !can_read_dataset(manifest.reader_feature_flags) {
-            let message = format!(
-                "This dataset cannot be read by this version of Lance. \
-                 Please upgrade Lance to read this dataset.\n Flags: {}",
-                manifest.reader_feature_flags
-            );
-            return Err(Error::not_supported_source(message.into()));
-        }
+        ensure_can_read_manifest(&manifest)?;
 
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
@@ -783,16 +805,21 @@ impl Dataset {
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
             let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-            let mut indices: Vec<IndexMetadata> = section
+            // Cached unfiltered: this is the same cache the commit path reads
+            // from, and an index this build cannot decode still has to survive
+            // into the next manifest. Version filtering happens on the way out,
+            // in `DatasetIndexExt::load_indices`.
+            let indices: Vec<IndexMetadata> = section
                 .indices
                 .into_iter()
                 .map(IndexMetadata::try_from)
                 .collect::<Result<Vec<_>>>()?;
-            retain_supported_indices(&mut indices);
+            crate::index::warn_about_unsupported_indices(&indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
                 store_identity: &object_store.store_prefix,
+                e_tag: manifest_location.e_tag.as_deref(),
             };
             ds_index_cache
                 .insert_with_key(&metadata_key, Arc::new(indices))
@@ -808,16 +835,17 @@ impl Dataset {
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let transaction: Transaction =
-                lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
-
-            let metadata_cache = session.metadata_cache.for_dataset(uri);
-            let metadata_key = TransactionKey {
-                version: manifest_location.version,
-            };
-            metadata_cache
-                .insert_with_key(&metadata_key, Arc::new(transaction))
-                .await;
+            if let Some(transaction) =
+                decode_inline_transaction(message_data, manifest_location.version)
+            {
+                let metadata_cache = session.metadata_cache.for_dataset(uri);
+                let metadata_key = TransactionKey {
+                    version: manifest_location.version,
+                };
+                metadata_cache
+                    .insert_with_key(&metadata_key, Arc::new(transaction))
+                    .await;
+            }
         }
 
         populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
@@ -844,6 +872,7 @@ impl Dataset {
             e_tag: manifest_location.e_tag.as_deref(),
         };
         if let Some(cached) = metadata_cache.get_with_key(&manifest_key).await {
+            ensure_can_read_manifest(&cached)?;
             return Ok(cached);
         }
         let loaded =
@@ -1203,35 +1232,13 @@ impl Dataset {
             .resolve_latest_location(&self.base, &self.object_store)
             .await?;
 
-        // Check if manifest is in cache before reading from storage
-        let manifest_key = ManifestKey {
-            version: location.version,
-            e_tag: location.e_tag.as_deref(),
-        };
-        let cached_manifest = self.metadata_cache.get_with_key(&manifest_key).await;
-        if let Some(cached_manifest) = cached_manifest {
-            return Ok((cached_manifest, location));
-        }
-
         if self.already_checked_out(&location, self.manifest.branch.as_deref()) {
+            ensure_can_read_manifest(&self.manifest)?;
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
-        let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
-        if manifest.schema.has_dictionary_types() {
-            let reader = if let Some(size) = location.size {
-                self.object_store
-                    .open_with_size(&location.path, size as usize)
-                    .await?
-            } else {
-                self.object_store.open(&location.path).await?
-            };
-            populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
-        }
-        let manifest_arc = Arc::new(manifest);
-        self.metadata_cache
-            .insert_with_key(&manifest_key, manifest_arc.clone())
-            .await;
-        Ok((manifest_arc, location))
+        let manifest =
+            Self::get_manifest(&self.object_store, &location, &self.uri, &self.session).await?;
+        Ok((manifest, location))
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -3012,7 +3019,7 @@ impl Dataset {
             let mut live_ids = Vec::with_capacity(ids.len());
             let mut addresses = Vec::with_capacity(ids.len());
             for id in ids {
-                if let Some(address) = row_id_index.get(*id) {
+                if let Some(address) = row_id_index.get(*id)? {
                     live_ids.push(*id);
                     addresses.push(u64::from(address));
                 }
@@ -3086,8 +3093,12 @@ impl Dataset {
 
         rowids::validate_stable_row_ids(self).await?;
 
-        // Validate indices
-        let indices = self.load_indices().await?;
+        // Validate indices. Over the complete list: these checks are about what
+        // the manifest says, not about what this build can use, and duplicate
+        // uuids or overlapping coverage are no less corrupt for involving an
+        // index this build has no reader for. `migrate_indices` already runs the
+        // same overlap check over the complete list on every commit.
+        let indices = crate::index::load_all_indices(self).await?;
         self.validate_indices(&indices)?;
 
         Ok(())
@@ -3275,13 +3286,15 @@ impl Dataset {
 
     /// Deep clone the target version into a new dataset at target_path.
     /// This copies all relevant dataset files (data files, deletion files, and
-    /// index files) into the target dataset without loading data into memory.
+    /// index files) into the target dataset with bounded memory use.
     ///
     /// The source files are read through this dataset's own object store while the
     /// copies are written through the target object store built from `store_params`.
     /// This makes the clone work across accounts/stores (e.g. between two abfss
-    /// accounts): when the source and target stores are the same the copy stays
-    /// server-side, otherwise the data is streamed through this process.
+    /// accounts). Object-store files are streamed through this process by default;
+    /// `LANCE_IO_SERVER_SIDE_COPY_ENABLED` opts same-store copies into
+    /// provider-native copy operations. Cross-store copies continue to stream, and
+    /// local files retain their filesystem copy path.
     ///
     /// Parameters:
     /// - `target_path`: the URI string to clone the dataset into.
@@ -3292,6 +3305,8 @@ impl Dataset {
     /// Note: external `base_paths` referenced by the source manifest are read through
     /// this dataset's object store; per-base distinct source credentials are not yet
     /// supported (see <https://github.com/lance-format/lance/issues/6093>).
+    /// Object-store streaming defaults to at most four concurrent file copies;
+    /// `LANCE_DEEP_CLONE_STREAM_CONCURRENCY` overrides that limit for this operation.
     pub async fn deep_clone(
         &mut self,
         target_path: &str,
@@ -3302,6 +3317,7 @@ impl Dataset {
 
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
+        ensure_can_write_manifest(&src_ds.manifest)?;
         let src_paths = src_ds.collect_paths().await?;
 
         // Prepare target object store and base path
@@ -3332,18 +3348,28 @@ impl Dataset {
             path
         };
 
-        // When the source and target live in the same store we can keep the copy
-        // server-side. Otherwise (e.g. cloning across accounts) we stream each file
-        // from the source store to the target store.
-        let same_store = src_ds.object_store.store_prefix == target_store.store_prefix;
-
-        // TODO: Leverage object store bulk copy for efficient same-store deep_clone.
-        //
-        // All cloud storage providers support batch copy APIs that would provide significant
-        // performance improvements. We use single file copy before we have upstream support.
-        //
-        // Tracked by: https://github.com/lance-format/lance/issues/5435
-        let io_parallelism = self.object_store.io_parallelism();
+        let configured_io_parallelism = src_ds.object_store.io_parallelism();
+        // Provider-native copy can fall back to streaming for large objects, so every
+        // non-direct-local transfer stays within the bounded file-copy window.
+        let uses_streaming_copy = !(src_ds.object_store.has_direct_local_paths()
+            && target_store.has_direct_local_paths());
+        let stream_copy_parallelism = match std::env::var("LANCE_DEEP_CLONE_STREAM_CONCURRENCY") {
+            Ok(value) => Some(parse_deep_clone_stream_concurrency(&value)?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(value)) => {
+                return Err(Error::invalid_input(format!(
+                    "LANCE_DEEP_CLONE_STREAM_CONCURRENCY must be valid UTF-8 and a positive \
+                     integer, got {value:?}"
+                )));
+            }
+        };
+        // Limit the number of concurrently buffered transfers by default while
+        // preserving efficient local copies and the operation-specific override.
+        let io_parallelism = deep_clone_copy_parallelism(
+            configured_io_parallelism,
+            uses_streaming_copy,
+            stream_copy_parallelism,
+        );
         let copy_futures = src_paths
             .iter()
             .map(|(relative_path, base)| {
@@ -3352,14 +3378,9 @@ impl Dataset {
                 let src_path = build_absolute_path(relative_path, base);
                 let target_path = build_absolute_path(relative_path, &target_base);
                 async move {
-                    if same_store {
-                        target_store.copy(&src_path, &target_path).await?;
-                    } else {
-                        let reader = source_store.open(&src_path).await?;
-                        let mut writer = target_store.create(&target_path).await?;
-                        writer.copy_from_reader(reader.as_ref()).await?;
-                        writer.shutdown().await?;
-                    }
+                    source_store
+                        .copy_bulk(&src_path, &target_store, &target_path)
+                        .await?;
                     Result::Ok(())
                 }
             })
@@ -4093,6 +4114,31 @@ impl ManifestWriteConfig {
     }
 }
 
+/// Decode an inline transaction section for opportunistic caching.
+///
+/// Returns `None` instead of failing when the transaction cannot be decoded:
+/// the section may have been written by a newer version of Lance with an
+/// operation type this version does not know, and that must not prevent
+/// opening the dataset. Paths that need the transaction contents surface the
+/// error at their call sites instead.
+fn decode_inline_transaction(message_data: &[u8], version: u64) -> Option<Transaction> {
+    match lance_table::format::pb::Transaction::decode(message_data)
+        .map_err(Error::from)
+        .and_then(Transaction::try_from)
+    {
+        Ok(transaction) => Some(transaction),
+        Err(err) => {
+            log::warn!(
+                "Failed to decode the inline transaction of version {}; \
+                 it may have been written by a newer version of Lance: {}",
+                version,
+                err
+            );
+            None
+        }
+    }
+}
+
 /// Commit a manifest file and create a copy at the latest manifest path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_manifest_file(
@@ -4104,7 +4150,34 @@ pub(crate) async fn write_manifest_file(
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
     transaction: Option<lance_table::format::Transaction>,
+    may_change_schema: bool,
 ) -> std::result::Result<ManifestLocation, CommitError> {
+    validate_paired_feature_flags(manifest)?;
+    // Every manifest write funnels through here, including restore and clone,
+    // which rebuild a manifest from a stored one rather than from an Arrow
+    // schema, so this is where the invariant holds for a schema that never
+    // passed through that conversion.
+    //
+    // Only for transactions that can change the schema. Released versions could
+    // install a key on a nullable column through the metadata path, and
+    // validating every write would make such a table read-only on upgrade --
+    // including through the delete that removes the offending rows, which is
+    // the first step of repairing it. A repair still has to pass: it changes
+    // the schema, and the schema it produces is valid.
+    //
+    // The caller classifies the operation, rather than this reading it off
+    // `transaction`, which is None whenever the encoded bytes were too large
+    // to inline. Deriving it here would make the verdict depend on payload
+    // size, so the same operation would be exempt while small and validated
+    // once it spilled -- and a MemWAL table spills routinely, since its
+    // transactions carry mem-table state.
+    if may_change_schema {
+        manifest
+            .schema
+            .verify_primary_key()
+            .map_err(CommitError::OtherError)?;
+    }
+
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
