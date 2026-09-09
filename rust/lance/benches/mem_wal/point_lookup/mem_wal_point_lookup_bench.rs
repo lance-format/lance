@@ -4,8 +4,8 @@
 //! Standalone CLI benchmark for PK-based point lookups across LSM levels.
 //!
 //! Measures lookup latency against three tiers of the LSM tree:
-//!   - Base table (on-disk, merged data)
-//!   - Flushed MemTable generations (on-disk L0)
+//!   - Base table (on-disk, compacted data)
+//!   - SSTables (on-disk L0)
 //!   - Active MemTable (in-memory write buffer)
 //!
 //! Two phases, selected with `--phase`:
@@ -151,7 +151,7 @@ struct Args {
     uri: String,
     base_rows: usize,
     max_memtable_rows: usize,
-    flushed_generations: usize,
+    sstables: usize,
     batch_rows: usize,
     queries: usize,
     output: Option<PathBuf>,
@@ -164,7 +164,7 @@ impl Default for Args {
             uri: String::new(),
             base_rows: 1_000_000,
             max_memtable_rows: 100_000,
-            flushed_generations: 2,
+            sstables: 2,
             batch_rows: 1_000,
             queries: 500,
             output: None,
@@ -205,7 +205,7 @@ fn parse_args() -> Result<Args> {
             }
             "--base-rows" => args.base_rows = parse_val(&flag, &value)?,
             "--max-memtable-rows" => args.max_memtable_rows = parse_val(&flag, &value)?,
-            "--flushed-generations" => args.flushed_generations = parse_val(&flag, &value)?,
+            "--sstables" => args.sstables = parse_val(&flag, &value)?,
             "--batch-rows" => args.batch_rows = parse_val(&flag, &value)?,
             "--queries" => args.queries = parse_val(&flag, &value)?,
             "--output" => args.output = Some(PathBuf::from(value)),
@@ -276,11 +276,11 @@ fn is_cloud_uri(uri: &str) -> bool {
 fn generate_lookup_ids(
     base_rows: usize,
     max_memtable_rows: usize,
-    flushed_generations: usize,
+    sstables: usize,
     queries: usize,
 ) -> (Vec<Vec<i64>>, Vec<&'static str>) {
-    let flushed_total = flushed_generations * max_memtable_rows;
-    let active_start = base_rows + flushed_total;
+    let sstable_total = sstables * max_memtable_rows;
+    let active_start = base_rows + sstable_total;
     let active_end = active_start + max_memtable_rows / 2;
 
     let mut groups = Vec::new();
@@ -296,19 +296,19 @@ fn generate_lookup_ids(
     groups.push(base_ids);
     names.push("base");
 
-    // Flushed IDs (only if there are flushed generations)
-    if flushed_generations > 0 {
-        let flushed_start = base_rows;
-        let flushed_end = base_rows + flushed_total;
-        let flushed_ids: Vec<i64> = (0..queries)
+    // SSTable IDs (only if there are SSTables)
+    if sstables > 0 {
+        let sstable_start = base_rows;
+        let sstable_end = base_rows + sstable_total;
+        let sstable_ids: Vec<i64> = (0..queries)
             .map(|i| {
-                let range = flushed_end - flushed_start;
+                let range = sstable_end - sstable_start;
                 let step = range.max(1) / queries.max(1);
-                (flushed_start + (i * step) % range) as i64
+                (sstable_start + (i * step) % range) as i64
             })
             .collect();
-        groups.push(flushed_ids);
-        names.push("flushed");
+        groups.push(sstable_ids);
+        names.push("sstable");
     }
 
     // Active memtable IDs
@@ -334,9 +334,10 @@ async fn run_lookup(args: &Args) -> Result<serde_json::Value> {
     let max_memtable_rows = args.max_memtable_rows;
     let config = ShardWriterConfig {
         shard_id,
+        max_wal_persist_retries: 3,
+        wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write: false,
-        sync_indexed_write: false,
         max_memtable_size: max_memtable_rows * 200,
         max_memtable_rows,
         max_wal_flush_interval: Some(Duration::from_secs(60)),
@@ -352,11 +353,11 @@ async fn run_lookup(args: &Args) -> Result<serde_json::Value> {
     };
 
     let id_base = args.base_rows as i64;
-    let num_flushed = args.flushed_generations;
+    let num_sstables = args.sstables;
     let active_rows = max_memtable_rows / 2;
 
-    // Ingest flushed generations (each triggers a flush) + 1 active (50% full)
-    let mut gen_sizes: Vec<usize> = (0..num_flushed).map(|_| max_memtable_rows).collect();
+    // Ingest SSTables (each triggers a flush) + 1 active (50% full)
+    let mut gen_sizes: Vec<usize> = (0..num_sstables).map(|_| max_memtable_rows).collect();
     gen_sizes.push(active_rows);
 
     let mut cursor = 0usize;
@@ -369,22 +370,22 @@ async fn run_lookup(args: &Args) -> Result<serde_json::Value> {
             writer.put(vec![batch]).await?;
             cursor += rows;
         }
-        let is_flushed = gen_idx < num_flushed;
+        let is_sstable = gen_idx < num_sstables;
         println!(
             "  gen {}: wrote {} rows ({}) cursor={}",
             gen_idx + 1,
             gen_rows,
-            if is_flushed { "flushed" } else { "active" },
+            if is_sstable { "sstable" } else { "active" },
             cursor,
         );
-        if is_flushed {
+        if is_sstable {
             tokio::time::sleep(flush_wait).await;
         }
     }
 
     println!(
-        "ingested {} rows total ({} flushed gens + active)",
-        cursor, num_flushed
+        "ingested {} rows total ({} SSTables + active)",
+        cursor, num_sstables
     );
 
     let manifest = writer.manifest().await.unwrap();
@@ -394,18 +395,15 @@ async fn run_lookup(args: &Args) -> Result<serde_json::Value> {
     let mut shard_snapshot = ShardSnapshot::new(shard_id);
     if let Some(ref m) = manifest {
         shard_snapshot = shard_snapshot.with_current_generation(m.current_generation);
-        for fg in &m.flushed_generations {
-            shard_snapshot = shard_snapshot.with_flushed_generation(fg.generation, fg.path.clone());
+        for sstable in &m.sstables {
+            shard_snapshot = shard_snapshot.with_sstable(sstable.generation, sstable.path.clone());
         }
     }
 
-    let num_flushed = manifest
-        .as_ref()
-        .map(|m| m.flushed_generations.len())
-        .unwrap_or(0);
+    let num_sstables = manifest.as_ref().map(|m| m.sstables.len()).unwrap_or(0);
     println!(
-        "manifest: {} flushed generations, current_generation={}",
-        num_flushed,
+        "manifest: {} SSTables, current_generation={}",
+        num_sstables,
         manifest.as_ref().map(|m| m.current_generation).unwrap_or(0)
     );
 
@@ -416,8 +414,12 @@ async fn run_lookup(args: &Args) -> Result<serde_json::Value> {
     let planner = LsmPointLookupPlanner::new(collector, pk_columns, arrow_schema);
 
     // Generate lookup IDs for each category
-    let (id_groups, category_names) =
-        generate_lookup_ids(args.base_rows, max_memtable_rows, num_flushed, args.queries);
+    let (id_groups, category_names) = generate_lookup_ids(
+        args.base_rows,
+        max_memtable_rows,
+        num_sstables,
+        args.queries,
+    );
 
     let session_ctx = SessionContext::new();
     let task_ctx = session_ctx.task_ctx();
@@ -474,7 +476,7 @@ async fn run_lookup(args: &Args) -> Result<serde_json::Value> {
     output.insert("phase".into(), json!("lookup"));
     output.insert("base_rows".into(), json!(args.base_rows));
     output.insert("max_memtable_rows".into(), json!(max_memtable_rows));
-    output.insert("flushed_generations".into(), json!(num_flushed));
+    output.insert("sstables".into(), json!(num_sstables));
     output.insert("active_rows".into(), json!(active_rows));
     output.insert("queries_per_category".into(), json!(args.queries));
     for (key, val) in &results {
@@ -489,12 +491,12 @@ async fn run_lookup(args: &Args) -> Result<serde_json::Value> {
 
 async fn run(args: Args) -> Result<()> {
     println!(
-        "bench=mem_wal_point_lookup phase={} uri={} base_rows={} max_memtable_rows={} flushed_generations={} batch_rows={} queries={}",
+        "bench=mem_wal_point_lookup phase={} uri={} base_rows={} max_memtable_rows={} sstables={} batch_rows={} queries={}",
         args.phase.as_str(),
         args.uri,
         args.base_rows,
         args.max_memtable_rows,
-        args.flushed_generations,
+        args.sstables,
         args.batch_rows,
         args.queries,
     );

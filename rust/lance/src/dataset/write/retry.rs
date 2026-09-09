@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use either::Either;
-use futures::TryFutureExt;
-use futures::future::FutureExt;
 use lance_core::utils::backoff::SlotBackoff;
 use lance_core::{Error, Result};
 
 use crate::Dataset;
+use crate::io::commit::{maybe_timeout, timeout_error};
 
 /// Configuration for retry behavior
 #[derive(Debug, Clone)]
@@ -44,33 +41,6 @@ pub trait RetryExecutor: Clone {
     fn update_dataset(&mut self, dataset: Arc<Dataset>);
 }
 
-fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
-    Error::too_much_write_contention(format!(
-        "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
-        attempts,
-        retry_timeout.as_secs_f32()
-    ))
-}
-
-fn maybe_timeout<T>(
-    backoff: &SlotBackoff,
-    start: Instant,
-    retry_timeout: Duration,
-    future: impl Future<Output = T>,
-) -> impl Future<Output = Result<T>> {
-    let attempt = backoff.attempt();
-    if attempt == 0 {
-        // No timeout on first attempt
-        Either::Left(future.map(|res| Ok(res)))
-    } else {
-        let remaining = retry_timeout.saturating_sub(start.elapsed());
-        Either::Right(
-            tokio::time::timeout(remaining, future)
-                .map_err(move |_| timeout_error(retry_timeout, attempt + 1)),
-        )
-    }
-}
-
 /// Execute an operation with retry logic for commit conflicts
 pub async fn execute_with_retry<E: RetryExecutor>(
     executor: E,
@@ -86,11 +56,17 @@ pub async fn execute_with_retry<E: RetryExecutor>(
         executor_clone.update_dataset(dataset_ref.clone());
 
         let execute_fut = executor_clone.execute_impl();
-        let execute_fut = maybe_timeout(&backoff, start, config.retry_timeout, execute_fut);
+        let execute_fut =
+            maybe_timeout(backoff.attempt(), start, config.retry_timeout, execute_fut);
         let data = execute_fut.await??;
 
         let commit_future = executor.commit(dataset_ref.clone(), data);
-        let commit_future = maybe_timeout(&backoff, start, config.retry_timeout, commit_future);
+        let commit_future = maybe_timeout(
+            backoff.attempt(),
+            start,
+            config.retry_timeout,
+            commit_future,
+        );
 
         match commit_future.await? {
             Ok(result) => return Ok(result),
@@ -111,7 +87,8 @@ pub async fn execute_with_retry<E: RetryExecutor>(
                 }
 
                 let sleep_fut = tokio::time::sleep(backoff.next_backoff());
-                let sleep_fut = maybe_timeout(&backoff, start, config.retry_timeout, sleep_fut);
+                let sleep_fut =
+                    maybe_timeout(backoff.attempt(), start, config.retry_timeout, sleep_fut);
                 sleep_fut.await?;
 
                 let mut ds = dataset_ref.as_ref().clone();

@@ -15,7 +15,7 @@ use geoarrow_schema::Dimension;
 use lance_core::cache::LanceCache;
 use lance_core::{Error, ROW_ID};
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::registry::ScalarIndexPlugin;
+use lance_index::scalar::registry::BasicTrainer;
 use lance_index::scalar::rtree::{BoundingBox, RTreeIndex, RTreeIndexPlugin, RTreeTrainingRequest};
 use lance_index::scalar::{GeoQuery, RelationQuery, ScalarIndex};
 use lance_io::object_store::ObjectStore;

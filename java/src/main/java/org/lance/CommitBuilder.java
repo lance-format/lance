@@ -200,8 +200,14 @@ public class CommitBuilder {
    * Set the storage format to use for the dataset.
    *
    * <p>This is only needed when creating a new empty table. If any data files are passed, the
-   * storage format will be inferred from the data files. Valid values: "legacy", "v2_0", "stable",
-   * "v2_1", "next", "v2_2".
+   * storage format will be inferred from the data files. Valid values are the numeric versions
+   * ("0.1", "2.0", "2.1", "2.2", "2.3") and the release selectors ("legacy", "stable", "next"),
+   * matching {@link WriteParams.Builder#withDataStorageVersion(String)}. Parsing is
+   * case-insensitive.
+   *
+   * <p>The {@code v}-prefixed spellings ("v2_0", "v2.0", "v2_1", "v2.1", "v2_2", "v2.2") are
+   * deprecated. They were accepted only by this method, never by the rest of Lance, and will be
+   * removed in a future release — use the numeric version instead ("v2_1" becomes "2.1").
    *
    * @param storageFormat the storage format name
    * @return this builder instance
@@ -273,23 +279,25 @@ public class CommitBuilder {
   public Dataset execute(Transaction transaction) {
     Preconditions.checkNotNull(transaction, "Transaction must not be null");
     if (dataset != null) {
-      Dataset result =
-          nativeCommitToDataset(
-              dataset,
-              transaction,
-              detached,
-              enableV2ManifestPaths,
-              writeParams,
-              useStableRowIds,
-              storageFormat,
-              maxRetries,
-              skipAutoCleanup,
-              namespaceClient,
-              tableId,
-              namespaceClientManagedVersioning,
-              commitTimeoutNanos);
-      result.setAllocator(dataset.allocator());
-      return result;
+      try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+        Dataset result =
+            nativeCommitToDataset(
+                dataset,
+                transaction,
+                detached,
+                enableV2ManifestPaths,
+                writeParams,
+                useStableRowIds,
+                storageFormat,
+                maxRetries,
+                skipAutoCleanup,
+                namespaceClient,
+                tableId,
+                namespaceClientManagedVersioning,
+                commitTimeoutNanos);
+        result.setAllocator(dataset.allocator());
+        return result;
+      }
     }
     if (uri != null) {
       Dataset result =

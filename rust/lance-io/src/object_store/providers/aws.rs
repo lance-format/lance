@@ -10,32 +10,72 @@ use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::ObjectStore as OSObjectStore;
-use object_store_opendal::OpendalStore;
+use object_store::list::PaginatedListStore;
 use opendal::{Operator, services::S3};
 
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::ecs::EcsCredentialsProvider;
+use aws_config::provider_config::ProviderConfig;
+use aws_config::web_identity_token::WebIdentityTokenCredentialsProvider;
+use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::provider::ProvideCredentials;
 use object_store::{
     ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
     StaticCredentialProvider,
     aws::{
-        AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
+        AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
         AwsCredentialProvider,
     },
 };
 use tokio::sync::RwLock;
 use url::Url;
 
+use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
-    throttle::{AimdThrottleConfig, AimdThrottledStore},
+    throttle::{AimdThrottleConfig, AimdThrottleState, cloud_http_connector, with_throttling},
 };
 use lance_core::error::{Error, Result};
+use lance_core::utils::parse::str_is_truthy;
 
 #[derive(Default, Debug)]
 pub struct AwsStoreProvider;
+
+struct ResolvedS3StorageOptions {
+    options: HashMap<AmazonS3ConfigKey, String>,
+    profile_region: Option<String>,
+}
+
+impl ResolvedS3StorageOptions {
+    fn new(
+        mut options: HashMap<AmazonS3ConfigKey, String>,
+        profile_config: Option<&SdkConfig>,
+    ) -> Self {
+        if effective_s3_endpoint(&options).is_none()
+            && let Some(endpoint) = profile_config.and_then(SdkConfig::endpoint_url)
+        {
+            options.insert(AmazonS3ConfigKey::Endpoint, endpoint.to_string());
+        }
+        let profile_region = profile_config
+            .and_then(SdkConfig::region)
+            .map(|region| region.as_ref().to_string());
+        Self {
+            options,
+            profile_region,
+        }
+    }
+
+    fn effective_endpoint(&self) -> Option<&str> {
+        effective_s3_endpoint(&self.options)
+    }
+
+    fn requires_constant_size_upload_parts(&self) -> bool {
+        self.effective_endpoint()
+            .is_some_and(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
+    }
+}
 
 impl AwsStoreProvider {
     async fn build_amazon_s3_store(
@@ -43,8 +83,12 @@ impl AwsStoreProvider {
         base_path: &mut Url,
         params: &ObjectStoreParams,
         storage_options: &StorageOptions,
+        mut resolved_s3_options: ResolvedS3StorageOptions,
         is_s3_express: bool,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+        throttle_state: Option<&AimdThrottleState>,
+        // Concrete rather than `dyn`, so the caller keeps the handle a paginated listing
+        // needs: `PaginatedListStore` is a separate trait from `ObjectStore`.
+    ) -> Result<Arc<AmazonS3>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -53,25 +97,34 @@ impl AwsStoreProvider {
             retry_timeout: Duration::from_secs(storage_options.client_retry_timeout()),
         };
 
-        let mut s3_storage_options = storage_options.as_s3_options();
-        let region = resolve_s3_region(base_path, &s3_storage_options).await?;
+        let region = resolve_s3_region(base_path, &resolved_s3_options).await?;
 
         // Get accessor from params
         let accessor = params.get_accessor();
 
+        let provider_scheme = storage_options.aws_provider_scheme()?;
+
         let (aws_creds, region) = build_aws_credential(
             params.s3_credentials_refresh_offset,
             params.aws_credentials.clone(),
-            Some(&s3_storage_options),
+            Some(&resolved_s3_options.options),
             region,
             accessor,
+            provider_scheme,
         )
         .await?;
 
         // Set S3Express flag if detected
         if is_s3_express {
-            s3_storage_options.insert(AmazonS3ConfigKey::S3Express, true.to_string());
+            resolved_s3_options
+                .options
+                .insert(AmazonS3ConfigKey::S3Express, true.to_string());
         }
+
+        // Compute the metrics label before rewriting the URL below so it
+        // matches the prefix the registry uses to key this store.
+        let store_prefix =
+            self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
 
         // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
         base_path.set_scheme("s3").unwrap();
@@ -80,7 +133,7 @@ impl AwsStoreProvider {
         // we can't use parse_url_opts here because we need to manually set the credentials provider
         let mut builder =
             AmazonS3Builder::new().with_client_options(storage_options.client_options()?);
-        for (key, value) in s3_storage_options {
+        for (key, value) in resolved_s3_options.options {
             builder = builder.with_config(key, value);
         }
         builder = builder
@@ -89,7 +142,9 @@ impl AwsStoreProvider {
             .with_retry(retry_config)
             .with_region(region);
 
-        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+        builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
+
+        Ok(Arc::new(builder.build()?))
     }
 
     async fn build_opendal_s3_store(
@@ -108,6 +163,13 @@ impl AwsStoreProvider {
         // OpenDAL will handle environment variables through its default credentials chain
         let mut config_map: HashMap<String, String> = storage_options.0.clone();
 
+        if let Some(provider_scheme) = storage_options.aws_provider_scheme()? {
+            return Result::Err(Error::not_supported(format!(
+                "OpendalStore does not currently support an explicit provider_scheme (currently set to {:?})",
+                provider_scheme
+            )));
+        }
+
         // Set required OpenDAL configuration
         config_map.insert("bucket".to_string(), bucket);
 
@@ -116,8 +178,7 @@ impl AwsStoreProvider {
         }
 
         let operator = Operator::from_iter::<S3>(config_map)
-            .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?
-            .finish();
+            .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?;
 
         Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
     }
@@ -139,36 +200,61 @@ impl ObjectStoreProvider for AwsStoreProvider {
         let use_opendal = storage_options
             .0
             .get("use_opendal")
-            .map(|v| v == "true")
+            .map(|v| str_is_truthy(v))
             .unwrap_or(false);
+
+        let profile_config = if std::env::var_os("AWS_PROFILE").is_some() {
+            Some(aws_config::load_defaults(BehaviorVersion::latest()).await)
+        } else {
+            None
+        };
+        let resolved_s3_options =
+            ResolvedS3StorageOptions::new(storage_options.as_s3_options(), profile_config.as_ref());
 
         // Determine S3 Express and constant size upload parts before building the store
         let is_s3_express = check_s3_express(&base_path, &storage_options);
 
-        let use_constant_size_upload_parts = storage_options
-            .0
-            .get("aws_endpoint")
-            .map(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
-            .unwrap_or(false);
+        let use_constant_size_upload_parts =
+            resolved_s3_options.requires_constant_size_upload_parts();
 
-        let inner = if use_opendal {
+        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
+        let throttle_state = if throttle_config.is_disabled() {
+            None
+        } else {
+            Some(AimdThrottleState::new(throttle_config)?)
+        };
+
+        let (inner, paginated_lister) = if use_opendal {
             // Use OpenDAL implementation
-            self.build_opendal_s3_store(&base_path, &storage_options)
-                .await?
+            // Listed in full: no paginated lister covers OpenDAL yet.
+            (
+                self.build_opendal_s3_store(&base_path, &storage_options)
+                    .await?,
+                None,
+            )
         } else {
             // Use default Amazon S3 implementation
-            self.build_amazon_s3_store(&mut base_path, params, &storage_options, is_s3_express)
-                .await?
+            let store = self
+                .build_amazon_s3_store(
+                    &mut base_path,
+                    params,
+                    &storage_options,
+                    resolved_s3_options,
+                    is_s3_express,
+                    throttle_state.as_ref(),
+                )
+                .await?;
+            (
+                store.clone() as Arc<dyn OSObjectStore>,
+                Some(store as Arc<dyn PaginatedListStore>),
+            )
         };
-        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let inner = if throttle_config.is_disabled() {
-            inner
-        } else {
-            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
-        };
+        let (inner, paginated_lister) =
+            with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
 
         Ok(ObjectStore {
             inner,
+            local_dir_operations: None,
             scheme: String::from(base_path.scheme()),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -179,6 +265,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            paginated_lister,
         })
     }
 }
@@ -188,25 +275,34 @@ fn check_s3_express(url: &Url, storage_options: &StorageOptions) -> bool {
     storage_options
         .0
         .get("s3_express")
-        .map(|v| v == "true")
+        .map(|v| str_is_truthy(v))
         .unwrap_or(false)
         || url.authority().ends_with("--x-s3")
+}
+
+fn effective_s3_endpoint(storage_options: &HashMap<AmazonS3ConfigKey, String>) -> Option<&str> {
+    storage_options
+        .get(&AmazonS3ConfigKey::S3Endpoint)
+        .or_else(|| storage_options.get(&AmazonS3ConfigKey::Endpoint))
+        .map(String::as_str)
 }
 
 /// Figure out the S3 region of the bucket.
 ///
 /// This resolves in order of precedence:
 /// 1. The region provided in the storage options
-/// 2. (If endpoint is not set), the region returned by the S3 API for the bucket
+/// 2. The selected AWS profile's region when a custom endpoint is configured
+/// 3. (If endpoint is not set), the region returned by the S3 API for the bucket
 ///
 /// It can return None if no region is provided and the endpoint is set.
 async fn resolve_s3_region(
     url: &Url,
-    storage_options: &HashMap<AmazonS3ConfigKey, String>,
+    resolved_s3_options: &ResolvedS3StorageOptions,
 ) -> Result<Option<String>> {
+    let storage_options = &resolved_s3_options.options;
     if let Some(region) = storage_options.get(&AmazonS3ConfigKey::Region) {
         Ok(Some(region.clone()))
-    } else if storage_options.get(&AmazonS3ConfigKey::Endpoint).is_none() {
+    } else if resolved_s3_options.effective_endpoint().is_none() {
         // If no endpoint is set, we can assume this is AWS S3 and the region
         // can be resolved from the bucket.
         let bucket = url.host_str().ok_or_else(|| {
@@ -224,18 +320,40 @@ async fn resolve_s3_region(
             object_store::aws::resolve_bucket_region(bucket, &client_options).await?;
         Ok(Some(bucket_region))
     } else {
-        Ok(None)
+        Ok(resolved_s3_options.profile_region.clone())
     }
+}
+
+/// Selects which AWS credential provider to use for a dataset.
+///
+/// When set, overrides automatic credential resolution for everything except an
+/// explicitly-supplied `credentials` provider or `storage_options_accessor`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AwsProviderScheme {
+    /// Require static access-key credentials (`aws_access_key_id` +
+    /// `aws_secret_access_key`). Returns an error if they are absent.
+    Token,
+    /// Use the ECS/Pod Identity container credential endpoint.
+    /// The endpoint URI is read from the `AWS_CONTAINER_CREDENTIALS_FULL_URI`
+    /// or `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` environment variables.
+    Ecs,
+    /// Use IRSA (IAM Roles for Service Accounts) web identity token credentials.
+    /// The token file and role ARN are read from the `AWS_WEB_IDENTITY_TOKEN_FILE`
+    /// and `AWS_ROLE_ARN` environment variables.
+    Irsa,
 }
 
 /// Build AWS credentials
 ///
 /// This resolves credentials from the following sources in order:
-/// 1. An explicit `storage_options_accessor` with a provider
-/// 2. An explicit `credentials` provider
-/// 3. Explicit credentials in storage_options (as in `aws_access_key_id`,
-///    `aws_secret_access_key`, `aws_session_token`)
-/// 4. The default credential provider chain from AWS SDK.
+/// 1. An explicit `credentials` provider
+/// 2. An explicit `storage_options_accessor` with a provider
+/// 3. If `provider_scheme` is set:
+///    - [`AwsProviderScheme::Token`]: static access-key credentials (error if absent)
+///    - [`AwsProviderScheme::Ecs`]: ECS container credential provider
+///    - [`AwsProviderScheme::Irsa`]: web identity token (IRSA) provider
+/// 4. Static access-key credentials from `storage_options`, if present
+/// 5. The default AWS credential provider chain
 ///
 /// # Storage Options Accessor
 ///
@@ -250,6 +368,7 @@ pub async fn build_aws_credential(
     storage_options: Option<&HashMap<AmazonS3ConfigKey, String>>,
     region: Option<String>,
     storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
+    provider_scheme: Option<AwsProviderScheme>,
 ) -> Result<(AwsCredentialProvider, String)> {
     use aws_config::meta::region::RegionProviderChain;
     const DEFAULT_REGION: &str = "us-west-2";
@@ -265,18 +384,22 @@ pub async fn build_aws_credential(
             .unwrap_or(DEFAULT_REGION.to_string())
     };
 
-    let storage_options_credentials = storage_options.and_then(extract_static_s3_credentials);
+    // If the user supplied their own credential provider that takes top priority
+    if let Some(creds) = credentials {
+        return Ok((creds, region));
+    }
 
-    // Explicit aws_credentials takes precedence over dynamic credentials.
-    if credentials.is_none()
-        && let Some(dynamic_creds) = build_dynamic_credential_provider::<ObjectStoreAwsCredential>(
-            storage_options_accessor.clone(),
-        )
-        .await?
+    // Otherwise, if the user provided a storage_options_accessor, try and use that
+    if let Some(dynamic_creds) = build_dynamic_credential_provider::<ObjectStoreAwsCredential>(
+        storage_options_accessor.clone(),
+    )
+    .await?
     {
         return Ok((dynamic_creds, region));
     }
 
+    // If the user provided a storage_options_accessor, then it must not have matched AWS.
+    // Log a message and ignore it.
     if storage_options_accessor
         .as_ref()
         .is_some_and(|a| a.has_provider())
@@ -287,22 +410,61 @@ pub async fn build_aws_credential(
         );
     }
 
-    // Fall back to existing logic for static credentials
-    if let Some(creds) = credentials {
-        Ok((creds, region))
-    } else if let Some(creds) = storage_options_credentials {
-        Ok((Arc::new(creds), region))
-    } else {
-        let credentials_provider = DefaultCredentialsChain::builder().build().await;
-
-        Ok((
-            Arc::new(AwsCredentialAdapter::new(
-                Arc::new(credentials_provider),
-                credentials_refresh_offset,
-            )),
-            region,
-        ))
+    // If the caller specified an explicit provider scheme, use only that provider.
+    if let Some(scheme) = provider_scheme {
+        return match scheme {
+            AwsProviderScheme::Token => {
+                let creds = storage_options
+                    .and_then(extract_static_s3_credentials)
+                    .ok_or_else(|| {
+                        Error::invalid_input(
+                            "aws_provider_scheme=token requires aws_access_key_id \
+                             and aws_secret_access_key to be set",
+                        )
+                    })?;
+                Ok((Arc::new(creds), region))
+            }
+            AwsProviderScheme::Ecs => {
+                let provider = EcsCredentialsProvider::builder().build();
+                Ok((
+                    Arc::new(AwsCredentialAdapter::new(
+                        Arc::new(provider),
+                        credentials_refresh_offset,
+                    )),
+                    region,
+                ))
+            }
+            AwsProviderScheme::Irsa => {
+                let conf = ProviderConfig::default().with_region(Some(Region::new(region.clone())));
+                let provider = WebIdentityTokenCredentialsProvider::builder()
+                    .configure(&conf)
+                    .build();
+                Ok((
+                    Arc::new(AwsCredentialAdapter::new(
+                        Arc::new(provider),
+                        credentials_refresh_offset,
+                    )),
+                    region,
+                ))
+            }
+        };
     }
+
+    if let Some(opts) = storage_options {
+        // Check for static credentials (access key & secret)
+        if let Some(creds) = extract_static_s3_credentials(opts) {
+            return Ok((Arc::new(creds), region));
+        }
+    }
+
+    let credentials_provider = DefaultCredentialsChain::builder().build().await;
+    Ok((
+        Arc::new(AwsCredentialAdapter::new(
+            Arc::new(credentials_provider),
+            credentials_refresh_offset,
+        )),
+        region,
+    ))
 }
 
 fn extract_static_s3_credentials(
@@ -389,10 +551,12 @@ impl CredentialProvider for AwsCredentialAdapter {
                 token: creds.session_token().map(|s| s.to_string()),
             }))
         } else {
-            let refreshed_creds =
-                Arc::new(self.inner.provide_credentials().await.map_err(|e| {
-                    Error::internal(format!("Failed to get AWS credentials: {:?}", e))
-                })?);
+            let refreshed_creds = Arc::new(
+                self.inner
+                    .provide_credentials()
+                    .await
+                    .map_err(|e| Error::io(format!("Failed to get AWS credentials: {:?}", e)))?,
+            );
 
             self.cache
                 .write()
@@ -409,7 +573,10 @@ impl CredentialProvider for AwsCredentialAdapter {
 }
 
 impl StorageOptions {
-    /// Add values from the environment to storage options
+    /// Add values from the environment to storage options.
+    ///
+    /// Only adds keys that are not already present, so explicitly-set options
+    /// (including empty-string sentinels) always take precedence over env vars.
     pub fn with_env_s3(&mut self) {
         for (os_key, os_value) in std::env::vars_os() {
             if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
@@ -431,6 +598,20 @@ impl StorageOptions {
                 Some((s3_key, value.clone()))
             })
             .collect()
+    }
+
+    /// Parse the `aws_provider_scheme` storage option, if set.
+    pub fn aws_provider_scheme(&self) -> Result<Option<AwsProviderScheme>> {
+        match self.0.get("aws_provider_scheme").map(|s| s.as_str()) {
+            None | Some("") => Ok(None),
+            Some("token") => Ok(Some(AwsProviderScheme::Token)),
+            Some("ecs") => Ok(Some(AwsProviderScheme::Ecs)),
+            Some("irsa") => Ok(Some(AwsProviderScheme::Irsa)),
+            Some(other) => Err(Error::invalid_input(format!(
+                "Invalid aws_provider_scheme '{}'. Valid values are: token, ecs, irsa",
+                other
+            ))),
+        }
     }
 }
 
@@ -460,6 +641,9 @@ pub type DynamicStorageOptionsCredentialProvider =
 mod tests {
     use crate::object_store::ObjectStoreRegistry;
     use crate::object_store::StorageOptionsProvider;
+    #[allow(deprecated)]
+    use aws_config::profile::profile_file::{ProfileFileKind, ProfileFiles};
+    use aws_credential_types::provider::error::CredentialsError;
     use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -483,6 +667,58 @@ mod tests {
                 token: None,
             }))
         }
+    }
+
+    #[allow(deprecated)]
+    async fn load_test_profile(config: &str) -> SdkConfig {
+        let profile_files = ProfileFiles::builder()
+            .with_contents(ProfileFileKind::Config, config)
+            .build();
+        aws_config::defaults(BehaviorVersion::latest())
+            .profile_name("selected")
+            .profile_files(profile_files)
+            .load()
+            .await
+    }
+
+    #[derive(Debug)]
+    struct FailingAwsCredentialsProvider;
+
+    impl ProvideCredentials for FailingAwsCredentialsProvider {
+        fn provide_credentials<'a>(
+            &'a self,
+        ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            aws_credential_types::provider::future::ProvideCredentials::new(async {
+                Err(CredentialsError::provider_error(Box::new(
+                    std::io::Error::other("Glue credential endpoint unavailable"),
+                )))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aws_credential_failure_is_io_error() {
+        let provider = AwsCredentialAdapter::new(
+            Arc::new(FailingAwsCredentialsProvider),
+            Duration::from_secs(60),
+        );
+
+        let error = provider.get_credential().await.unwrap_err();
+        let object_store::Error::Generic { source, .. } = &error else {
+            panic!("expected a generic object store error, got {error}");
+        };
+        assert!(matches!(
+            source.downcast_ref::<Error>(),
+            Some(Error::IO { .. })
+        ));
+
+        let message = error.to_string();
+        assert!(message.contains("Failed to get AWS credentials"));
+        assert!(message.contains("Glue credential endpoint unavailable"));
+        assert!(!message.contains("Encountered internal error"));
     }
 
     #[tokio::test]
@@ -514,13 +750,86 @@ mod tests {
         assert!(mock_provider.called.load(Ordering::Relaxed));
     }
 
+    #[tokio::test]
+    async fn test_resolve_s3_region_from_aws_profile() {
+        let profile_config = load_test_profile(
+            "[profile selected]\n\
+             region = us-west-004\n\
+             endpoint_url = https://s3.us-west-004.backblazeb2.com\n\
+             aws_access_key_id = test-key\n\
+             aws_secret_access_key = test-secret",
+        )
+        .await;
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+
+        let resolved_s3_options =
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config));
+        let region = resolve_s3_region(&url, &resolved_s3_options).await.unwrap();
+
+        assert_eq!(region.as_deref(), Some("us-west-004"));
+        assert_eq!(
+            resolved_s3_options
+                .options
+                .get(&AmazonS3ConfigKey::Endpoint),
+            Some(&"https://s3.us-west-004.backblazeb2.com".to_string())
+        );
+
+        let explicit_options = HashMap::from([
+            (AmazonS3ConfigKey::Region, "explicit-region".to_string()),
+            (
+                AmazonS3ConfigKey::Endpoint,
+                "https://explicit.example.com".to_string(),
+            ),
+        ]);
+        let resolved_s3_options =
+            ResolvedS3StorageOptions::new(explicit_options, Some(&profile_config));
+        let region = resolve_s3_region(&url, &resolved_s3_options).await.unwrap();
+
+        assert_eq!(region.as_deref(), Some("explicit-region"));
+        assert_eq!(
+            resolved_s3_options
+                .options
+                .get(&AmazonS3ConfigKey::Endpoint),
+            Some(&"https://explicit.example.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_region_only_aws_profile_preserves_bucket_discovery() {
+        let profile_config = load_test_profile("[profile selected]\nregion = us-east-1").await;
+        let resolved_s3_options =
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config));
+
+        let url = Url::parse("s3:///path").unwrap();
+        let error = resolve_s3_region(&url, &resolved_s3_options)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("Could not parse bucket"));
+    }
+
+    #[tokio::test]
+    async fn test_r2_aws_profile_requires_constant_size_upload_parts() {
+        let profile_config = load_test_profile(
+            "[profile selected]\n\
+             region = auto\n\
+             endpoint_url = https://account.r2.cloudflarestorage.com",
+        )
+        .await;
+        let resolved_s3_options =
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config));
+
+        assert!(resolved_s3_options.requires_constant_size_upload_parts());
+    }
+
     #[test]
     fn test_s3_path_parsing() {
         let provider = AwsStoreProvider;
 
         let cases = [
             ("s3://bucket/path/to/file", "path/to/file"),
-            // for non ASCII string tests
+            // for non ASCII string tests: the URL encodes them, extract_path must decode back
             ("s3://bucket/测试path/to/file", "测试path/to/file"),
             ("s3://bucket/path/&to/file", "path/&to/file"),
             ("s3://bucket/path/=to/file", "path/=to/file"),
@@ -533,9 +842,32 @@ mod tests {
         for (uri, expected_path) in cases {
             let url = Url::parse(uri).unwrap();
             let path = provider.extract_path(&url).unwrap();
-            let expected_path = Path::from(expected_path);
+            // extract_path decodes url.path(), so the Path stores the raw (decoded)
+            // string. Path::parse keeps its input verbatim, matching that, whereas
+            // Path::from would percent-encode non-ASCII bytes and not match.
+            let expected_path = Path::parse(expected_path).unwrap();
             assert_eq!(path, expected_path)
         }
+    }
+
+    // Regression test for https://github.com/lance-format/lance/issues/6643
+    // extract_path must NOT double-encode paths that contain non-ASCII characters.
+    // url.path() returns a percent-encoded string; we must decode it back to raw
+    // UTF-8 before storing it in a Path, so the object store HTTP client can apply
+    // a single, correct percent-encoding when building the request URL.
+    #[test]
+    fn test_s3_non_ascii_path_no_double_encoding() {
+        let provider = AwsStoreProvider;
+
+        // "s3://bucket/中文路径" → url.path() == "/%E4%B8%AD%E6%96%87%E8%B7%AF%E5%BE%84".
+        // The buggy Path::parse(url.path()) stored "%E4%B8%AD..." verbatim; the S3
+        // client then percent-encodes the '%' again, yielding "%25E4%25B8%25AD...".
+        // With Path::from_url_path the Path stores the decoded UTF-8 instead.
+        let url = Url::parse("s3://bucket/中文路径").unwrap();
+        let path = provider.extract_path(&url).unwrap();
+
+        // The Path must hold the decoded UTF-8, not the percent-encoded form.
+        assert_eq!(path.as_ref(), "中文路径");
     }
 
     #[test]
@@ -593,6 +925,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "s3");
+    }
+
+    /// S3 Express ignores `start-after` and does not list in key order, but it does hand back
+    /// continuation tokens, which is all the native store resumes from — so an Express bucket
+    /// pages like any other. The OpenDAL arm has no lister to page with at all.
+    #[rstest::rstest]
+    #[case::native("false", true)]
+    #[case::opendal("true", false)]
+    #[tokio::test]
+    async fn test_s3_express_is_paged_by_continuation_token(
+        #[case] use_opendal: &str,
+        #[case] paginated: bool,
+    ) {
+        let provider = AwsStoreProvider;
+        // Express bucket names carry their availability zone, which the S3 client validates.
+        let url = Url::parse("s3://test-bucket--use1-az4--x-s3/path").unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), use_opendal.to_string()),
+                    ("region".to_string(), "us-west-2".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = provider.new_store(url, &params).await.unwrap();
+
+        assert!(!store.list_is_lexically_ordered);
+        assert_eq!(store.paginated_lister.is_some(), paginated);
     }
 
     #[derive(Debug)]
@@ -1008,6 +1370,7 @@ mod tests {
             None, // no storage_options
             Some("us-west-2".to_string()),
             Some(accessor),
+            None,
         )
         .await
         .unwrap();
@@ -1071,6 +1434,7 @@ mod tests {
             None, // no storage_options
             Some("us-west-2".to_string()),
             Some(accessor),
+            None,
         )
         .await
         .unwrap();
@@ -1093,5 +1457,127 @@ mod tests {
 
         // Storage options provider should have been called once
         assert_eq!(mock_storage_provider.get_call_count().await, 1);
+    }
+
+    // Test that aws_provider_scheme=token selects static credentials.
+    #[tokio::test]
+    async fn test_provider_scheme_token() {
+        let opts = HashMap::from([
+            (AmazonS3ConfigKey::AccessKeyId, "AKID".to_string()),
+            (AmazonS3ConfigKey::SecretAccessKey, "SECRET".to_string()),
+        ]);
+
+        let (provider, _) = build_aws_credential(
+            Duration::from_secs(300),
+            None,
+            Some(&opts),
+            Some("us-east-1".to_string()),
+            None,
+            Some(AwsProviderScheme::Token),
+        )
+        .await
+        .unwrap();
+
+        let cred = provider.get_credential().await.unwrap();
+        assert_eq!(cred.key_id, "AKID");
+        assert_eq!(cred.secret_key, "SECRET");
+    }
+
+    // Test that aws_provider_scheme=token errors when no static credentials are present.
+    #[tokio::test]
+    async fn test_provider_scheme_token_errors_without_credentials() {
+        let opts: HashMap<AmazonS3ConfigKey, String> = HashMap::new();
+
+        let result = build_aws_credential(
+            Duration::from_secs(300),
+            None,
+            Some(&opts),
+            Some("us-east-1".to_string()),
+            None,
+            Some(AwsProviderScheme::Token),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("aws_provider_scheme=token"),
+            "error should mention aws_provider_scheme=token"
+        );
+    }
+
+    // Test that aws_provider_scheme=ecs builds a provider without error.
+    // The ECS provider itself reads from env vars lazily; construction always succeeds.
+    #[tokio::test]
+    async fn test_provider_scheme_ecs() {
+        let opts: HashMap<AmazonS3ConfigKey, String> = HashMap::new();
+
+        let result = build_aws_credential(
+            Duration::from_secs(300),
+            None,
+            Some(&opts),
+            Some("us-east-1".to_string()),
+            None,
+            Some(AwsProviderScheme::Ecs),
+        )
+        .await;
+        assert!(result.is_ok(), "ECS provider should build without error");
+    }
+
+    // Test that aws_provider_scheme=irsa builds a provider and attempts credential
+    // retrieval (which fails with a provider error, not a config error like
+    // "Missing Region" — confirming the region is wired through to the STS client).
+    #[tokio::test]
+    async fn test_provider_scheme_irsa() {
+        let opts: HashMap<AmazonS3ConfigKey, String> = HashMap::new();
+
+        let (provider, _) = build_aws_credential(
+            Duration::from_secs(300),
+            None,
+            Some(&opts),
+            Some("us-east-1".to_string()),
+            None,
+            Some(AwsProviderScheme::Irsa),
+        )
+        .await
+        .unwrap();
+
+        // Credential retrieval must fail with a provider error (missing env vars or
+        // network), NOT a configuration error like "Invalid Configuration: Missing Region".
+        let err = provider.get_credential().await.unwrap_err();
+        assert!(
+            !err.to_string().contains("Missing Region"),
+            "should not fail with Missing Region; region was provided. got: {err}"
+        );
+    }
+
+    // Test that an invalid aws_provider_scheme value produces a clear error.
+    #[test]
+    fn test_provider_scheme_invalid_value() {
+        let opts = StorageOptions::new(HashMap::from([(
+            "aws_provider_scheme".to_string(),
+            "magic".to_string(),
+        )]));
+        let result = opts.aws_provider_scheme();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("magic"));
+    }
+
+    // Test that no aws_provider_scheme falls through to DefaultCredentialsChain without error.
+    #[tokio::test]
+    async fn test_no_provider_scheme_uses_default_chain() {
+        let opts: HashMap<AmazonS3ConfigKey, String> = HashMap::new();
+
+        let result = build_aws_credential(
+            Duration::from_secs(300),
+            None,
+            Some(&opts),
+            Some("us-east-1".to_string()),
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
     }
 }

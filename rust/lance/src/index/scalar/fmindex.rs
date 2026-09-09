@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_index::scalar::index_files_to_table;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use std::sync::Arc;
@@ -14,6 +15,12 @@ use crate::{Dataset, Error, Result};
 /// to combine two BWT structures. This function re-reads text data from the
 /// dataset for all fragments covered by the source segments and builds a fresh
 /// FM-Index over the combined data.
+///
+/// As an exception, a single source segment whose fragment coverage is still
+/// fully live is returned as-is: rebuilding it would produce equivalent content
+/// over the same fragments, which makes distributed builds (one uncommitted
+/// segment per worker, merged 1:1 into final segments) pay for every segment
+/// twice.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
@@ -63,16 +70,19 @@ pub(in crate::index) async fn merge_segments(
 
         return Ok(IndexMetadata {
             uuid: new_uuid,
-            fields: vec![field_id],
             dataset_version: dataset.manifest.version,
             fragment_bitmap: Some(fragment_bitmap),
             index_details: Some(Arc::new(created_index.index_details)),
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
-            files: Some(created_index.files),
+            files: Some(index_files_to_table(created_index.files)),
             ..segments[0].clone()
         });
+    }
+
+    if segments.len() == 1 && segments[0].fragment_bitmap.as_ref() == Some(&fragment_bitmap) {
+        return Ok(segments.into_iter().next().unwrap());
     }
 
     let fragment_ids: Vec<u32> = fragment_bitmap.iter().collect();
@@ -94,14 +104,13 @@ pub(in crate::index) async fn merge_segments(
 
     Ok(IndexMetadata {
         uuid: new_uuid,
-        fields: vec![field_id],
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(created_index.files),
+        files: Some(index_files_to_table(created_index.files)),
         ..segments[0].clone()
     })
 }

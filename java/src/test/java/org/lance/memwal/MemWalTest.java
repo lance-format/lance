@@ -97,6 +97,22 @@ public class MemWalTest {
     return root;
   }
 
+  /** Build a single-batch root carrying only the {@code id} primary key, for deletes. */
+  private static VectorSchemaRoot keysRoot(BufferAllocator allocator, long[] ids) {
+    VectorSchemaRoot root =
+        VectorSchemaRoot.create(
+            new Schema(
+                Collections.singletonList(Field.nullable("id", new ArrowType.Int(64, true)))),
+            allocator);
+    BigIntVector idVector = (BigIntVector) root.getVector("id");
+    idVector.allocateNew(ids.length);
+    for (int i = 0; i < ids.length; i++) {
+      idVector.set(i, ids[i]);
+    }
+    root.setRowCount(ids.length);
+    return root;
+  }
+
   /** Build a single-batch append-only root without primary-key metadata. */
   private static VectorSchemaRoot appendOnlyRoot(
       BufferAllocator allocator, long[] ids, String prefix) {
@@ -144,12 +160,12 @@ public class MemWalTest {
   }
 
   /**
-   * Stage a <em>faithful</em> flushed generation at {@code genPath}: the Lance dataset plus its
-   * primary-key dedup sidecar ({@code _pk_index/}), mirroring what production flush emits. The LSM
-   * scanner's cross-generation block-list opens the sidecar, so a dataset alone (no sidecar) is not
-   * a state production produces. Mirrors the Python {@code _write_flushed_gen} test helper.
+   * Stage a <em>faithful</em> SSTable at {@code genPath}: the Lance dataset plus its primary-key
+   * dedup sidecar ({@code _pk_index/}), mirroring what production flush emits. The LSM scanner's
+   * cross-generation block-list opens the sidecar, so a dataset alone (no sidecar) is not a state
+   * production produces. Mirrors the Python {@code _write_sstable} test helper.
    */
-  private static void writeFlushedGen(
+  private static void writeSsTable(
       BufferAllocator allocator, String genPath, long[] ids, String prefix) throws Exception {
     writeLookupDataset(allocator, genPath, ids, prefix).close();
     try (VectorSchemaRoot root = lookupRoot(allocator, ids, prefix);
@@ -161,8 +177,8 @@ public class MemWalTest {
   }
 
   /**
-   * Test-support native: write the primary-key dedup sidecar for a flushed-generation dataset
-   * already staged at {@code genPath}. See {@link #writeFlushedGen}.
+   * Test-support native: write the primary-key dedup sidecar for an SSTable dataset already staged
+   * at {@code genPath}. See {@link #writeSsTable}.
    */
   private static native void nativeWritePkSidecar(
       String genPath, long streamAddress, List<String> pkColumns);
@@ -383,6 +399,51 @@ public class MemWalTest {
   }
 
   @Test
+  void testShardWriterDeleteMasksBaseRow(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("base").toString();
+    String shardId = UUID.randomUUID().toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeLookupDataset(allocator, path, new long[] {1, 2, 3}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams());
+
+      ShardWriterConfig config =
+          new ShardWriterConfig()
+              .withDurableWrite(true)
+              .withMaxWalBufferSize(1)
+              .withMaxWalFlushIntervalMs(10);
+
+      try (ShardWriter writer = dataset.memWalWriter(shardId, config)) {
+        try (VectorSchemaRoot root = lookupRoot(allocator, new long[] {4}, "writer");
+            ArrowReader reader = toReader(allocator, root)) {
+          writer.put(reader);
+        }
+        try (VectorSchemaRoot keys = keysRoot(allocator, new long[] {2});
+            ArrowReader reader = toReader(allocator, keys)) {
+          writer.delete(reader);
+        }
+
+        Map<Long, String> byId = Collections.emptyMap();
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+          try (LsmScanner scanner = writer.lsmScanner();
+              ArrowReader reader = scanner.scanBatches()) {
+            byId = readByName(reader);
+          }
+          if (!byId.containsKey(2L) && "writer_4".equals(byId.get(4L))) {
+            break;
+          }
+          Thread.sleep(50);
+        }
+
+        assertEquals("base_1", byId.get(1L));
+        assertFalse(byId.containsKey(2L), "deleted base row should be masked by the tombstone");
+        assertEquals("base_3", byId.get(3L));
+        assertEquals("writer_4", byId.get(4L));
+      }
+    }
+  }
+
+  @Test
   void testLsmScannerFromSnapshots(@TempDir Path tempDir) throws Exception {
     String basePath = tempDir.resolve("base").toString();
     String shardId = UUID.randomUUID().toString();
@@ -390,12 +451,12 @@ public class MemWalTest {
         Dataset dataset = writeLookupDataset(allocator, basePath, new long[] {1, 2, 3}, "base")) {
       dataset.initializeMemWal(new InitializeMemWalParams());
 
-      // Flushed generation overwrites id=2.
+      // SSTable overwrites id=2.
       String genPath = basePath + "/_mem_wal/" + shardId + "/gen_1";
-      writeFlushedGen(allocator, genPath, new long[] {2}, "gen1");
+      writeSsTable(allocator, genPath, new long[] {2}, "gen1");
 
       ShardSnapshot snapshot =
-          new ShardSnapshot(shardId).withFlushedGeneration(1, "gen_1").withCurrentGeneration(2);
+          new ShardSnapshot(shardId).withSsTable(1, "gen_1").withCurrentGeneration(2);
 
       try (LsmScanner scanner =
               LsmScanner.fromSnapshots(dataset, Collections.singletonList(snapshot));
@@ -403,8 +464,16 @@ public class MemWalTest {
         Map<Long, String> byId = readByName(reader);
         assertEquals(3, byId.size(), "Expected 3 deduplicated rows");
         assertEquals("base_1", byId.get(1L));
-        assertEquals("gen1_2", byId.get(2L), "Flushed generation must win over base");
+        assertEquals("gen1_2", byId.get(2L), "SSTable must win over base");
         assertEquals("base_3", byId.get(3L));
+      }
+
+      try (LsmScanner scanner =
+              LsmScanner.fromSnapshots(dataset, Collections.singletonList(snapshot))
+                  .limit(Optional.empty(), Optional.of(1L));
+          ArrowReader reader = scanner.scanBatches()) {
+        Map<Long, String> byId = readByName(reader);
+        assertEquals(2, byId.size(), "Offset-only LSM scan should not require a limit");
       }
     }
   }
@@ -418,14 +487,14 @@ public class MemWalTest {
       dataset.initializeMemWal(new InitializeMemWalParams());
 
       String genPath = basePath + "/_mem_wal/" + shardId + "/gen_1";
-      writeFlushedGen(allocator, genPath, new long[] {2}, "gen1");
+      writeSsTable(allocator, genPath, new long[] {2}, "gen1");
 
       ShardSnapshot snapshot =
-          new ShardSnapshot(shardId).withFlushedGeneration(1, "gen_1").withCurrentGeneration(2);
+          new ShardSnapshot(shardId).withSsTable(1, "gen_1").withCurrentGeneration(2);
 
       try (LsmPointLookupPlanner planner =
           new LsmPointLookupPlanner(dataset, Collections.singletonList(snapshot))) {
-        // id=2 must resolve to the flushed-generation value.
+        // id=2 must resolve to the SSTable value.
         assertEquals("gen1_2", lookup(planner, allocator, 2L));
         // id=1 only exists in the base table.
         assertEquals("base_1", lookup(planner, allocator, 1L));
@@ -451,7 +520,7 @@ public class MemWalTest {
   }
 
   @Test
-  void testMergeInsertMarkGenerationsAsMerged(@TempDir Path tempDir) throws Exception {
+  void testMergeInsertMarkSstablesAsCompacted(@TempDir Path tempDir) throws Exception {
     String path = tempDir.resolve("base").toString();
     String shardId = UUID.randomUUID().toString();
     try (BufferAllocator allocator = new RootAllocator()) {
@@ -463,8 +532,8 @@ public class MemWalTest {
             new MergeInsertParams(Collections.singletonList("id"))
                 .withMatchedUpdateAll()
                 .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
-                .markGenerationsAsMerged(
-                    Collections.singletonList(new MergedGeneration(shardId, 1)));
+                .markSstablesAsCompacted(
+                    Collections.singletonList(new CompactedSsTable(shardId, 1)));
 
         try (VectorSchemaRoot root = lookupRoot(allocator, new long[] {2, 4}, "merged");
             ArrowReader reader = toReader(allocator, root);
@@ -569,6 +638,40 @@ public class MemWalTest {
           }
           double recall = (double) found / queryIds.length;
           assertTrue(recall >= 0.5, "vector search recall too low: " + recall);
+        }
+
+        try (LsmVectorSearchPlanner planner =
+                new LsmVectorSearchPlanner(
+                    dataset, Collections.emptyList(), "vec", null, null, "id >= 200");
+            Float4Vector query = new Float4Vector("q", allocator)) {
+          int filteredQueryId = 250;
+          query.allocateNew(VDIM);
+          for (int d = 0; d < VDIM; d++) {
+            query.set(d, (float) (filteredQueryId * VDIM + d));
+          }
+          query.setValueCount(VDIM);
+
+          int filteredRows = 0;
+          boolean foundFilteredNearest = false;
+          try (ExecutionPlan plan =
+                  planner.planSearch(query, 20, 2, Collections.singletonList("id"), false);
+              ArrowReader reader = plan.toReader()) {
+            while (reader.loadNextBatch()) {
+              VectorSchemaRoot result = reader.getVectorSchemaRoot();
+              IntVector ids = (IntVector) result.getVector("id");
+              for (int i = 0; i < result.getRowCount(); i++) {
+                int id = ids.get(i);
+                assertTrue(id >= 200, "filtered vector search returned id " + id);
+                if (id == filteredQueryId) {
+                  foundFilteredNearest = true;
+                }
+                filteredRows++;
+              }
+            }
+          }
+          assertTrue(filteredRows > 0, "filtered vector search should return rows");
+          assertTrue(
+              foundFilteredNearest, "filtered vector search recall missed id " + filteredQueryId);
         }
       } finally {
         dataset.close();

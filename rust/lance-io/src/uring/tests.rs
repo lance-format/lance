@@ -9,6 +9,14 @@ use std::io::Write;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
+macro_rules! skip_if_no_uring_workers {
+    () => {
+        if super::thread::URING_THREADS.threads.is_empty() {
+            return Ok(());
+        }
+    };
+}
+
 /// Helper to create a temporary file with test data
 fn create_test_file(size: usize) -> Result<(NamedTempFile, Vec<u8>)> {
     let mut file = NamedTempFile::new()?;
@@ -20,6 +28,7 @@ fn create_test_file(size: usize) -> Result<(NamedTempFile, Vec<u8>)> {
 
 #[tokio::test]
 async fn test_read_small_file() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, expected_data) = create_test_file(1024)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -36,6 +45,7 @@ async fn test_read_small_file() -> Result<()> {
 
 #[tokio::test]
 async fn test_read_range() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, expected_data) = create_test_file(4096)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -53,6 +63,7 @@ async fn test_read_range() -> Result<()> {
 
 #[tokio::test]
 async fn test_read_multiple_ranges() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, expected_data) = create_test_file(8192)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -72,6 +83,7 @@ async fn test_read_multiple_ranges() -> Result<()> {
 
 #[tokio::test]
 async fn test_file_size() -> Result<()> {
+    skip_if_no_uring_workers!();
     let size = 5000;
     let (file, _) = create_test_file(size)?;
     let file_path = file.path().to_str().unwrap();
@@ -87,6 +99,7 @@ async fn test_file_size() -> Result<()> {
 
 #[tokio::test]
 async fn test_concurrent_reads() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, expected_data) = create_test_file(16384)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -115,6 +128,7 @@ async fn test_concurrent_reads() -> Result<()> {
 
 #[tokio::test]
 async fn test_large_file_read() -> Result<()> {
+    skip_if_no_uring_workers!();
     // Test with a larger file (1MB)
     let size = 1024 * 1024;
     let (file, expected_data) = create_test_file(size)?;
@@ -134,6 +148,7 @@ async fn test_large_file_read() -> Result<()> {
 
 #[tokio::test]
 async fn test_read_edge_cases() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, expected_data) = create_test_file(4096)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -157,17 +172,21 @@ async fn test_read_edge_cases() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_file_not_found() {
+async fn test_file_not_found() -> Result<()> {
+    skip_if_no_uring_workers!();
     let uri = "file+uring:///nonexistent/file.dat";
     let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
 
     // Should fail to open non-existent file
     let result = store.open(&path).await;
     assert!(result.is_err());
+
+    Ok(())
 }
 
 #[tokio::test]
 async fn test_block_size_and_parallelism() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, _) = create_test_file(1024)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -184,6 +203,7 @@ async fn test_block_size_and_parallelism() -> Result<()> {
 
 #[tokio::test]
 async fn test_path() -> Result<()> {
+    skip_if_no_uring_workers!();
     let (file, _) = create_test_file(1024)?;
     let file_path = file.path().to_str().unwrap();
     let uri = format!("file+uring://{}", file_path);
@@ -203,6 +223,7 @@ async fn test_path() -> Result<()> {
 /// than the actual file, causing io_uring to hit EOF before the full read completes.
 #[tokio::test]
 async fn test_short_read_get_all() -> Result<()> {
+    skip_if_no_uring_workers!();
     let actual_size: usize = 8192;
     let (file, _expected_data) = create_test_file(actual_size)?;
     let file_path = file.path().to_str().unwrap();
@@ -225,6 +246,7 @@ async fn test_short_read_get_all() -> Result<()> {
 /// Test that a range read extending past EOF returns an error.
 #[tokio::test]
 async fn test_short_read_get_range_past_eof() -> Result<()> {
+    skip_if_no_uring_workers!();
     let actual_size: usize = 8192;
     let (file, _expected_data) = create_test_file(actual_size)?;
     let file_path = file.path().to_str().unwrap();
@@ -257,6 +279,7 @@ async fn test_short_read_get_range_past_eof() -> Result<()> {
 /// future hangs and the timeout fires.
 #[tokio::test]
 async fn test_retry_sq_full_thread() -> Result<()> {
+    skip_if_no_uring_workers!();
     use super::future::UringReadFuture;
     use super::requests::{IoRequest, RequestState};
     use super::thread::push_to_sq;
@@ -321,6 +344,7 @@ async fn test_retry_sq_full_thread() -> Result<()> {
 /// has already completed the request with an error.
 #[tokio::test(flavor = "current_thread")]
 async fn test_retry_sq_full_current_thread() -> Result<()> {
+    skip_if_no_uring_workers!();
     use super::current_thread_future::UringCurrentThreadFuture;
     use super::requests::{IoRequest, RequestState};
     use super::thread::push_to_sq;

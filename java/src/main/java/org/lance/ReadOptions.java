@@ -189,6 +189,13 @@ public class ReadOptions {
      * Set storage options. Extra options that make sense for a particular storage connection. This
      * is used to store connection parameters like credentials, endpoint, etc.
      *
+     * <p>For datasets with additional registered base paths, a key of the form {@code
+     * base_<id>.<key>} applies {@code <key>} only to the base path with that manifest id,
+     * overriding the unscoped options that every base inherits. For example {@code
+     * base_1.account_key = abc} makes base 1 use {@code account_key = abc} while all other options
+     * are shared. Exact per-base bindings set via {@link #setBaseStoreParams(Map)} take precedence
+     * over base-scoped keys.
+     *
      * @param storageOptions the storage options
      * @return this builder
      */

@@ -13,6 +13,8 @@
  */
 package org.lance.ipc;
 
+import org.lance.DocumentGranularity;
+
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
@@ -39,6 +41,7 @@ public class FullTextQueryTest {
     assertEquals(50, q.getMaxExpansions());
     assertEquals(FullTextQuery.Operator.OR, q.getOperator());
     assertEquals(0, q.getPrefixLength());
+    assertEquals(Optional.empty(), q.getDocumentGranularity());
   }
 
   @Test
@@ -46,7 +49,14 @@ public class FullTextQueryTest {
     FullTextQuery.MatchQuery q =
         (FullTextQuery.MatchQuery)
             FullTextQuery.match(
-                "hello", "title", 2.0f, Optional.of(1), 10, FullTextQuery.Operator.AND, 3);
+                "hello",
+                "title",
+                2.0f,
+                Optional.of(1),
+                10,
+                FullTextQuery.Operator.AND,
+                3,
+                DocumentGranularity.LIST_ELEMENT);
 
     assertEquals(FullTextQuery.Type.MATCH, q.getType());
     assertEquals("hello", q.getQueryText());
@@ -56,6 +66,7 @@ public class FullTextQueryTest {
     assertEquals(10, q.getMaxExpansions());
     assertEquals(FullTextQuery.Operator.AND, q.getOperator());
     assertEquals(3, q.getPrefixLength());
+    assertEquals(Optional.of(DocumentGranularity.LIST_ELEMENT), q.getDocumentGranularity());
   }
 
   @Test
@@ -67,17 +78,20 @@ public class FullTextQueryTest {
     assertEquals("exact match", q.getQueryText());
     assertEquals("content", q.getColumn());
     assertEquals(0, q.getSlop());
+    assertEquals(Optional.empty(), q.getDocumentGranularity());
   }
 
   @Test
   void testPhraseQueryCustomSlop() {
     FullTextQuery.PhraseQuery q =
-        (FullTextQuery.PhraseQuery) FullTextQuery.phrase("ordered terms", "content", 2);
+        (FullTextQuery.PhraseQuery)
+            FullTextQuery.phrase("ordered terms", "content", 2, DocumentGranularity.LIST_ELEMENT);
 
     assertEquals(FullTextQuery.Type.MATCH_PHRASE, q.getType());
     assertEquals("ordered terms", q.getQueryText());
     assertEquals("content", q.getColumn());
     assertEquals(2, q.getSlop());
+    assertEquals(Optional.of(DocumentGranularity.LIST_ELEMENT), q.getDocumentGranularity());
   }
 
   @Test

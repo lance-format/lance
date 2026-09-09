@@ -6,6 +6,7 @@ use arrow_buffer::{BooleanBufferBuilder, bit_util};
 use crate::buffer::LanceBuffer;
 use crate::compression::{
     BlockCompressor, BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor,
+    require_block_payload,
 };
 use crate::data::{
     BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock, NullableDataBlock,
@@ -13,7 +14,7 @@ use crate::data::{
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
-    MiniBlockCompressor,
+    MiniBlockCompressionContext, MiniBlockCompressor,
 };
 use crate::format::ProtobufUtils21;
 use crate::format::pb21::compressive_encoding::Compression;
@@ -27,7 +28,7 @@ pub struct ValueEncoder {}
 
 impl ValueEncoder {
     /// Use the largest chunk we can smaller than 4KiB
-    fn find_log_vals_per_chunk(bytes_per_word: u64, values_per_word: u64) -> (u64, u64) {
+    fn find_log_vals_per_chunk(bytes_per_word: u64, values_per_word: u64) -> Result<(u64, u64)> {
         let mut size_bytes = 2 * bytes_per_word;
         let (mut log_num_vals, mut num_vals) = match values_per_word {
             1 => (1, 2),
@@ -35,8 +36,14 @@ impl ValueEncoder {
             _ => unreachable!(),
         };
 
-        // If the type is so wide that we can't even fit 2 values we shouldn't be here
-        assert!(size_bytes < MAX_MINIBLOCK_BYTES);
+        if size_bytes >= MAX_MINIBLOCK_BYTES {
+            let num_values = 2 * values_per_word;
+            return Err(Error::invalid_input(format!(
+                "Value is too wide for miniblock encoding: {} values require {} bytes but a \
+                 miniblock chunk is limited to {} bytes.",
+                num_values, size_bytes, MAX_MINIBLOCK_BYTES
+            )));
+        }
 
         while 2 * size_bytes < MAX_MINIBLOCK_BYTES && 2 * num_vals <= *MAX_MINIBLOCK_VALUES {
             log_num_vals += 1;
@@ -44,10 +51,10 @@ impl ValueEncoder {
             num_vals *= 2;
         }
 
-        (log_num_vals, num_vals)
+        Ok((log_num_vals, num_vals))
     }
 
-    fn chunk_data(data: FixedWidthDataBlock) -> MiniBlockCompressed {
+    fn chunk_data(data: FixedWidthDataBlock) -> Result<MiniBlockCompressed> {
         // Usually there are X bytes per value.  However, when working with boolean
         // or FSL<boolean> we might have some number of bits per value that isn't
         // divisible by 8.  In this case, to avoid chunking in the middle of a byte
@@ -60,7 +67,7 @@ impl ValueEncoder {
 
         // Aim for 4KiB chunks
         let (log_vals_per_chunk, vals_per_chunk) =
-            Self::find_log_vals_per_chunk(bytes_per_word, values_per_word);
+            Self::find_log_vals_per_chunk(bytes_per_word, values_per_word)?;
         let num_chunks = bit_util::ceil(data.num_values as usize, vals_per_chunk as usize);
         debug_assert_eq!(vals_per_chunk % values_per_word, 0);
         let bytes_per_chunk = bytes_per_word * (vals_per_chunk / values_per_word);
@@ -99,11 +106,11 @@ impl ValueEncoder {
 
         debug_assert_eq!(chunks.len(), num_chunks);
 
-        MiniBlockCompressed {
+        Ok(MiniBlockCompressed {
             chunks,
             data: vec![data_buffer],
             num_values: data.num_values,
-        }
+        })
     }
 }
 
@@ -177,7 +184,7 @@ impl ValueEncoder {
         data: FixedWidthDataBlock,
         layers: Vec<MiniblockFslLayer>,
         num_rows: u64,
-    ) -> (MiniBlockCompressed, CompressiveEncoding) {
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         // Count size to calculate rows per chunk
         let mut ceil_bytes_validity = 0;
         let mut cum_dim = 1;
@@ -198,7 +205,7 @@ impl ValueEncoder {
         };
         let est_bytes_per_word = (ceil_bytes_validity * vals_per_word) + cum_bytes_per_word;
         let (log_rows_per_chunk, rows_per_chunk) =
-            Self::find_log_vals_per_chunk(est_bytes_per_word, vals_per_word);
+            Self::find_log_vals_per_chunk(est_bytes_per_word, vals_per_word)?;
 
         let num_chunks = num_rows.div_ceil(rows_per_chunk) as usize;
 
@@ -258,17 +265,17 @@ impl ValueEncoder {
             .chain(std::iter::once(data.data))
             .collect::<Vec<_>>();
 
-        (
+        Ok((
             MiniBlockCompressed {
                 chunks,
                 data: buffers,
                 num_values: num_rows,
             },
             encoding,
-        )
+        ))
     }
 
-    fn miniblock_fsl(data: DataBlock) -> (MiniBlockCompressed, CompressiveEncoding) {
+    fn miniblock_fsl(data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         let num_rows = data.num_values();
         let fsl = data.as_fixed_size_list().unwrap();
         let mut layers = Vec::new();
@@ -452,26 +459,32 @@ impl ValueEncoder {
 }
 
 impl BlockCompressor for ValueEncoder {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let data = match data {
-            DataBlock::FixedWidth(fixed_width) => fixed_width.data,
-            _ => unimplemented!(
-                "Cannot compress block of type {} with ValueEncoder",
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        let DataBlock::FixedWidth(fixed_width) = data else {
+            return Err(Error::invalid_input(format!(
+                "ValueEncoder cannot compress a {} block",
                 data.name()
-            ),
+            )));
         };
-        Ok(data)
+        Ok((
+            Some(fixed_width.data),
+            ProtobufUtils21::flat(fixed_width.bits_per_value, None),
+        ))
     }
 }
 
 impl MiniBlockCompressor for ValueEncoder {
-    fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        _context: MiniBlockCompressionContext,
+        chunk: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => {
                 let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
-                Ok((Self::chunk_data(fixed_width), encoding))
+                Ok((Self::chunk_data(fixed_width)?, encoding))
             }
-            DataBlock::FixedSizeList(_) => Ok(Self::miniblock_fsl(chunk)),
+            DataBlock::FixedSizeList(_) => Self::miniblock_fsl(chunk),
             _ => Err(Error::invalid_input_source(
                 format!(
                     "Cannot compress a data block of type {} with ValueEncoder",
@@ -565,7 +578,8 @@ impl ValueDecompressor {
 }
 
 impl BlockDecompressor for ValueDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Flat block")?;
         let block = self.buffer_to_block(data, num_values);
         assert_eq!(block.num_values(), num_values);
         Ok(block)
@@ -599,6 +613,15 @@ impl MiniBlockDecompressor for ValueDecompressor {
 
         assert_eq!(lists.num_values(), num_values);
         Ok(lists)
+    }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        if self.has_validity() {
+            return None;
+        }
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
     }
 }
 
@@ -728,6 +751,15 @@ impl FixedPerValueDecompressor for ValueDecompressor {
     fn bits_per_value(&self) -> u64 {
         self.bits_per_value
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        if self.has_validity() {
+            return None;
+        }
+        num_values
+            .checked_mul(self.bits_per_value)
+            .map(|bits| bits.div_ceil(8))
+    }
 }
 
 impl PerValueCompressor for ValueEncoder {
@@ -750,10 +782,7 @@ impl PerValueCompressor for ValueEncoder {
 // public tests module because we share the PRIMITIVE_TYPES constant with fixed_size_list
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, LazyLock},
-    };
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
         Array, ArrayRef, Decimal128Array, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
@@ -761,7 +790,7 @@ mod tests {
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, TimeUnit};
-    use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, array, gen_batch};
+    use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, Seed, array, gen_batch};
 
     use crate::{
         compression::{FixedPerValueDecompressor, MiniBlockDecompressor},
@@ -769,19 +798,21 @@ mod tests {
         encodings::{
             logical::primitive::{
                 fullzip::{PerValueCompressor, PerValueDataBlock},
-                miniblock::MiniBlockCompressor,
+                miniblock::{MiniBlockCompressionContext, MiniBlockCompressor},
             },
             physical::value::ValueDecompressor,
         },
         format::pb21::compressive_encoding::Compression,
         testing::{
-            FnArrayGeneratorProvider, TestCases, check_basic_random,
-            check_round_trip_encoding_generated, check_round_trip_encoding_of_data,
+            TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
         },
-        version::LanceFileVersion,
     };
 
     use super::ValueEncoder;
+
+    fn miniblock_context() -> MiniBlockCompressionContext {
+        MiniBlockCompressionContext::new(0, true, true)
+    }
 
     const PRIMITIVE_TYPES: &[DataType] = &[
         DataType::Null,
@@ -828,7 +859,7 @@ mod tests {
             .with_indices(vec![0, 1, 2])
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
     }
@@ -839,89 +870,114 @@ mod tests {
             (0..5000).map(|i| if i % 2 == 0 { Some(i) } else { None }),
         ));
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_value_primitive() {
-        for data_type in PRIMITIVE_TYPES {
+        const NUM_ROWS: u32 = 1025;
+
+        let test_cases = TestCases::default()
+            .with_batch_size(NUM_ROWS)
+            .with_page_sizes(vec![4096])
+            .with_expected_encoding("flat");
+        let value_metadata =
+            HashMap::from([("lance-encoding:compression".to_string(), "none".to_string())]);
+
+        for (seed, data_type) in PRIMITIVE_TYPES.iter().enumerate() {
             log::info!("Testing encoding for {:?}", data_type);
-            let field = Field::new("", data_type.clone(), false);
-            check_basic_random(field).await;
+            let data = gen_batch()
+                .with_seed(Seed::from(seed as u64))
+                .anon_col(array::rand_type(data_type))
+                .into_batch_rows(RowCount::from(NUM_ROWS as u64))
+                .unwrap()
+                .column(0)
+                .clone();
+
+            check_round_trip_encoding_of_data(vec![data], &test_cases, value_metadata.clone())
+                .await;
         }
     }
 
-    static LARGE_TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
-        vec![DataType::FixedSizeList(
-            Arc::new(Field::new("", DataType::Int32, false)),
-            128,
+    #[rstest::rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_large_primitive(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
         )]
-    });
-
-    #[test_log::test(tokio::test)]
-    async fn test_large_primitive() {
-        for data_type in LARGE_TYPES.iter() {
-            log::info!("Testing encoding for {:?}", data_type);
-            let field = Field::new("", data_type.clone(), false);
-            check_basic_random(field).await;
-        }
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let data_type =
+            DataType::FixedSizeList(Arc::new(Field::new("", DataType::Int32, false)), 128);
+        let field = Field::new("", data_type, false);
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_decimal128_dictionary_encoding() {
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+    async fn test_decimal128_dictionary_encoding(
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        let test_cases = TestCases::default()
+            .with_encoding(encoding)
+            .with_expected_encoding("dictionary");
         let decimals: Vec<i32> = (0..100).collect();
         let repeated_strings: Vec<_> = decimals
             .iter()
             .cycle()
-            .take(decimals.len() * 10000)
+            .take(decimals.len() * 1000)
             .map(|&v| Some(v as i128))
             .collect();
         let decimal_array = Arc::new(Decimal128Array::from(repeated_strings)) as ArrayRef;
         check_round_trip_encoding_of_data(vec![decimal_array], &test_cases, HashMap::new()).await;
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_miniblock_stress() {
+    async fn test_miniblock_stress(
+        #[values(false, true)] mixed_validity: bool,
+        #[values(10, 100, 1500, 15000)] batch_size: u32,
+        #[values(1000, 2000, 3000, 60000)] page_size: u64,
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
         // Tests for strange page sizes and batch sizes and validity scenarios for miniblock
 
-        // 10K integers, 100 per array, all valid
-        let data1 = (0..100)
-            .map(|_| Arc::new(Int32Array::from_iter_values(0..100)) as Arc<dyn Array>)
-            .collect::<Vec<_>>();
-
-        // Same as above but with mixed validity
-        let data2 = (0..100)
+        // 10K integers, 100 per array, either all valid or mixed validity.
+        let data = (0..100)
             .map(|_| {
-                Arc::new(Int32Array::from_iter(
-                    (0..100).map(|i| if i % 2 == 0 { Some(i) } else { None }),
-                )) as Arc<dyn Array>
+                if mixed_validity {
+                    Arc::new(Int32Array::from_iter(
+                        (0..100).map(|i| if i % 2 == 0 { Some(i) } else { None }),
+                    )) as Arc<dyn Array>
+                } else {
+                    Arc::new(Int32Array::from_iter_values(0..100)) as Arc<dyn Array>
+                }
             })
             .collect::<Vec<_>>();
 
-        // Same as above but with all null for first half then all valid
-        // TODO: Re-enable once the all-null path is complete
-        let _data3 = (0..100)
-            .map(|chunk_idx| {
-                Arc::new(Int32Array::from_iter(
-                    (0..100).map(|i| if chunk_idx < 50 { None } else { Some(i) }),
-                )) as Arc<dyn Array>
-            })
-            .collect::<Vec<_>>();
+        let test_cases = TestCases::default()
+            .with_page_sizes(vec![page_size])
+            .with_batch_size(batch_size)
+            .with_encoding(encoding);
 
-        for data in [data1, data2 /*data3*/] {
-            for batch_size in [10, 100, 1500, 15000] {
-                // 40000 bytes of data
-                let test_cases = TestCases::default()
-                    .with_page_sizes(vec![1000, 2000, 3000, 60000])
-                    .with_batch_size(batch_size)
-                    .with_min_file_version(LanceFileVersion::V2_1);
-
-                check_round_trip_encoding_of_data(data.clone(), &test_cases, HashMap::new()).await;
-            }
-        }
+        check_round_trip_encoding_of_data(data, &test_cases, HashMap::new()).await;
     }
 
     fn create_simple_fsl() -> FixedSizeListArray {
@@ -963,7 +1019,8 @@ mod tests {
         let starting_data = DataBlock::from_array(sample_list.clone());
 
         let encoder = ValueEncoder::default();
-        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+        let (data, compression) =
+            MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data).unwrap();
 
         assert_eq!(data.num_values, 3);
         assert_eq!(data.data.len(), 3);
@@ -987,6 +1044,59 @@ mod tests {
         );
 
         assert_eq!(decompressed.as_ref(), &sample_list);
+    }
+
+    fn wide_fixed_size_binary() -> ArrayRef {
+        let wide_value = vec![0xABu8; 5000];
+        Arc::new(
+            arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                std::iter::repeat_n(Some(wide_value.as_slice()), 4),
+                5000,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn wide_fixed_size_list_bool() -> ArrayRef {
+        // A wide FSL<Boolean> is sub-byte, so it chunks eight values per word and the
+        // smallest unit is 16 values rather than 2.
+        let dimension = 4095;
+        let values = arrow_array::BooleanArray::from(vec![false; dimension * 2]);
+        let field = Arc::new(Field::new("item", DataType::Boolean, true));
+        Arc::new(FixedSizeListArray::new(
+            field,
+            dimension as i32,
+            Arc::new(values),
+            None,
+        ))
+    }
+
+    #[rstest::rstest]
+    #[case::fixed_size_binary(wide_fixed_size_binary(), 2)]
+    #[case::fixed_size_list_bool(wide_fixed_size_list_bool(), 16)]
+    fn test_wide_value_miniblock_returns_error(
+        #[case] array: ArrayRef,
+        #[case] expected_min_values: u64,
+    ) {
+        let starting_data = DataBlock::from_array(array);
+
+        let encoder = ValueEncoder::default();
+        let result = MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data);
+
+        let err = result.expect_err("wide values should not be encodable as miniblock");
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too wide for miniblock encoding"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{expected_min_values} values require")),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
@@ -1013,6 +1123,11 @@ mod tests {
         let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
 
         let num_values = data.num_values;
+        assert_eq!(
+            FixedPerValueDecompressor::decoded_size_bytes(&decompressor, num_values),
+            None,
+            "nullable FSL output uses multiple buffers and requires the fallback estimate"
+        );
         let decompressed =
             FixedPerValueDecompressor::decompress(&decompressor, data, num_values).unwrap();
 
@@ -1033,7 +1148,7 @@ mod tests {
         let list_array =
             FixedSizeListArray::new(items_field, 2, items, Some(NullBuffer::new(list_nulls)));
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
@@ -1051,7 +1166,7 @@ mod tests {
         let list_arr = ListArray::new(list_field, OffsetBuffer::new(offsets), Arc::new(fsl), None);
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_structural_encodings()
             .with_batch_size(1);
 
         check_round_trip_encoding_of_data(vec![Arc::new(list_arr)], &test_cases, HashMap::new())
@@ -1083,7 +1198,8 @@ mod tests {
         );
 
         let encoder = ValueEncoder::default();
-        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+        let (data, compression) =
+            MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data).unwrap();
 
         let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
             panic!()
@@ -1138,18 +1254,43 @@ mod tests {
         assert_eq!(decompressed.as_ref(), sample_array.as_ref());
     }
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_fsl_nullable_items() {
-        let datagen = Box::new(FnArrayGeneratorProvider::new(move || {
-            lance_datagen::array::rand_vec_nullable::<UInt32Type>(Dimension::from(128), 0.5)
-        }));
+    async fn test_fsl_nullable_items(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
+        let mut generator =
+            gen_batch()
+                .with_seed(Seed::from(0))
+                .anon_col(array::rand_vec_nullable::<UInt32Type>(
+                    Dimension::from(128),
+                    0.5,
+                ));
+        generator.with_random_nulls(0.2);
+        let source = generator
+            .into_batch_rows(RowCount::from(1026))
+            .unwrap()
+            .column(0)
+            .clone();
+        let test_cases = TestCases::default()
+            .with_page_sizes(vec![4096])
+            .with_encoding(encoding)
+            .with_batch_size(257)
+            .with_range(510..515)
+            .with_indices(vec![0, 511, 512, 1024]);
 
-        let field = Field::new(
-            "",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt32, true)), 128),
-            false,
-        );
-        check_round_trip_encoding_generated(field, datagen, TestCases::default()).await;
+        check_round_trip_encoding_of_data(
+            vec![source.slice(1, 512), source.slice(513, 513)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1158,7 +1299,7 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("flat")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Test both explicit configuration and automatic fallback scenarios
         // 1. Test explicit "none" compression to force flat encoding

@@ -31,8 +31,8 @@ import java.util.Optional;
  * LSM-aware scanner covering all MemWAL data levels.
  *
  * <p>Results are deduplicated by primary key, always returning the newest version of each row
- * across the base table, flushed MemTables, and (when created from a {@link ShardWriter}) the
- * active MemTable.
+ * across the base table, SSTables, and (when created from a {@link ShardWriter}) the active
+ * MemTable.
  *
  * <p>The builder methods ({@link #project}, {@link #filter}, {@link #limit}, {@link
  * #withRowAddress}, {@link #withMemtableGen}) mutate this scanner and return it for chaining.
@@ -55,15 +55,17 @@ public class LsmScanner implements Closeable {
    * read-your-writes consistency.
    *
    * @param dataset the base dataset to scan
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    * @return an LSM scanner
    */
   public static LsmScanner fromSnapshots(Dataset dataset, List<ShardSnapshot> shardSnapshots) {
     Preconditions.checkNotNull(dataset, "dataset must not be null");
     Preconditions.checkNotNull(shardSnapshots, "shardSnapshots must not be null");
-    LsmScanner scanner = createFromSnapshots(dataset, shardSnapshots);
-    scanner.allocator = dataset.allocator();
-    return scanner;
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      LsmScanner scanner = createFromSnapshots(dataset, shardSnapshots);
+      scanner.allocator = dataset.allocator();
+      return scanner;
+    }
   }
 
   static native LsmScanner createFromSnapshots(Dataset dataset, List<ShardSnapshot> shardSnapshots);
@@ -101,9 +103,11 @@ public class LsmScanner implements Closeable {
   private native void nativeFilter(String expr);
 
   /** Limit the number of rows returned, optionally skipping {@code offset} rows first. */
-  public LsmScanner limit(long limit, Optional<Long> offset) {
+  public LsmScanner limit(Optional<Long> limit, Optional<Long> offset) {
+    Preconditions.checkNotNull(limit, "limit must not be null");
     Preconditions.checkNotNull(offset, "offset must not be null");
-    Preconditions.checkArgument(limit >= 0, "limit must not be negative, got %s", limit);
+    limit.ifPresent(
+        l -> Preconditions.checkArgument(l >= 0, "limit must not be negative, got %s", l));
     offset.ifPresent(
         o -> Preconditions.checkArgument(o >= 0, "offset must not be negative, got %s", o));
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
@@ -113,12 +117,17 @@ public class LsmScanner implements Closeable {
     }
   }
 
+  /** Limit the number of rows returned, optionally skipping {@code offset} rows first. */
+  public LsmScanner limit(long limit, Optional<Long> offset) {
+    return limit(Optional.of(limit), offset);
+  }
+
   /** Limit the number of rows returned. */
   public LsmScanner limit(long limit) {
     return limit(limit, Optional.empty());
   }
 
-  private native void nativeLimit(long limit, Optional<Long> offset);
+  private native void nativeLimit(Optional<Long> limit, Optional<Long> offset);
 
   /** Include the {@code _rowaddr} internal column in results. */
   public LsmScanner withRowAddress() {

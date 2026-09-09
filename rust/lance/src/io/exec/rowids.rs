@@ -136,7 +136,9 @@ impl AddRowAddrExec {
                 let mut builder = arrow::array::UInt64Builder::with_capacity(row_id_values.len());
                 for rowid in row_id_values.iter() {
                     if let Some(rowid) = rowid {
-                        if let Some(row_addr) = row_id_index.get(rowid) {
+                        if let Some(row_addr) =
+                            row_id_index.get(rowid).map_err(DataFusionError::from)?
+                        {
                             builder.append_value(row_addr.into());
                         } else {
                             return Err(DataFusionError::Internal(format!(
@@ -153,7 +155,9 @@ impl AddRowAddrExec {
                 // Fast path - no branching for null values
                 let mut rowaddrs: Vec<u64> = Vec::with_capacity(row_id_values.len());
                 for rowid in row_id_values.values() {
-                    if let Some(row_addr) = row_id_index.get(*rowid) {
+                    if let Some(row_addr) =
+                        row_id_index.get(*rowid).map_err(DataFusionError::from)?
+                    {
                         rowaddrs.push(row_addr.into());
                     } else {
                         return Err(DataFusionError::Internal(format!(
@@ -242,10 +246,6 @@ impl ExecutionPlan for AddRowAddrExec {
         "AddRowAddrExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> Arc<Schema> {
         self.output_schema.clone()
     }
@@ -291,8 +291,8 @@ impl ExecutionPlan for AddRowAddrExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> Result<datafusion::physical_plan::Statistics> {
-        let mut stats = self.input.partition_statistics(partition)?;
+    ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
+        let mut stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
 
         let row_id_col_stats = stats.column_statistics.get(self.rowid_pos).ok_or_else(|| {
             DataFusionError::Internal("RowAddrExec: rowid column stats not found".into())
@@ -327,7 +327,7 @@ impl ExecutionPlan for AddRowAddrExec {
             .column_statistics
             .insert(self.rowaddr_pos, row_addr_col_stats);
 
-        Ok(stats)
+        Ok(Arc::new(stats))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -442,15 +442,19 @@ impl AddRowOffsetExec {
         frag_id_to_offset: &HashMap<u32, FragInfo>,
     ) -> Result<ArrayRef> {
         let row_addr_values = row_addr.as_primitive::<UInt64Type>().values();
-        let mut row_offsets = Vec::with_capacity(row_addr_values.len());
+        let mut row_offsets = vec![0; row_addr_values.len()];
+        // The deletion iterator only moves forward, so compute in address order and
+        // scatter the offsets back into input order.
+        let mut sorted_row_indices = (0..row_addr_values.len()).collect::<Vec<_>>();
+        sorted_row_indices.sort_unstable_by_key(|index| row_addr_values[*index]);
 
         let mut last_frag_id = u32::MAX;
         let mut last_frag_offset = 0;
         let mut last_frag_delete_count = 0;
         let mut dv_iter = None;
 
-        for addr in row_addr_values {
-            let addr = RowAddress::new_from_u64(*addr);
+        for row_index in sorted_row_indices {
+            let addr = RowAddress::new_from_u64(row_addr_values[row_index]);
             let frag_id = addr.fragment_id();
             if frag_id != last_frag_id {
                 last_frag_id = frag_id;
@@ -480,10 +484,10 @@ impl AddRowOffsetExec {
                         break;
                     }
                 }
-                row_offsets
-                    .push(last_frag_offset + row_offset as u64 - last_frag_delete_count as u64);
+                row_offsets[row_index] =
+                    last_frag_offset + row_offset as u64 - last_frag_delete_count as u64;
             } else {
-                row_offsets.push(last_frag_offset + row_offset as u64);
+                row_offsets[row_index] = last_frag_offset + row_offset as u64;
             }
         }
 
@@ -506,10 +510,6 @@ impl ExecutionPlan for AddRowOffsetExec {
         "AddRowOffsetExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -526,7 +526,7 @@ impl ExecutionPlan for AddRowOffsetExec {
         vec![false]
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -734,5 +734,28 @@ mod test {
             .iter()
             .fold(0, |acc, col| acc + col.get_array_memory_size());
         assert_eq!(stats.total_byte_size, Precision::Exact(actual_byte_size));
+    }
+
+    #[test]
+    fn test_row_offsets_with_unsorted_addresses() {
+        let row_addrs: ArrayRef = Arc::new(UInt64Array::from(vec![
+            u64::from(RowAddress::new_from_parts(0, 100)),
+            u64::from(RowAddress::new_from_parts(0, 50)),
+        ]));
+        let frag_id_to_offset = HashMap::from([(
+            0,
+            FragInfo {
+                row_offset: 1_000,
+                deletion_vector: Some(Arc::new(DeletionVector::from_iter([10, 60]))),
+            },
+        )]);
+
+        let row_offsets =
+            AddRowOffsetExec::compute_row_offsets(&row_addrs, &frag_id_to_offset).unwrap();
+
+        assert_eq!(
+            row_offsets.as_primitive::<UInt64Type>().values(),
+            &[1_098, 1_049]
+        );
     }
 }

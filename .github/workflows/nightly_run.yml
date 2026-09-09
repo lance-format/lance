@@ -11,7 +11,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-24.04
-    if: github.repository == 'lancedb/lance'
+    if: github.repository == 'lance-format/lance'
     permissions:
       actions: write
     steps:
@@ -25,16 +25,16 @@ jobs:
   jumbo-tests:
     # jumbo tests need more resources
     runs-on: ubuntu-24.04-8x
-    if: github.repository == 'lancedb/lance'
+    if: github.repository == 'lance-format/lance'
     timeout-minutes: 60
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Run Jumbo String/Binary Tests
         run: |
           echo "Running jumbo tests for Lance 2.0 and 2.1..."
@@ -51,7 +51,7 @@ jobs:
   # slow and unbounded in depth, so it runs nightly with a generous timeout rather than blocking
   # merges; the manual escape hatch for arbitrary ref pairs lives in compat-pair.yml.
   compat-sequence:
-    if: github.repository == 'lancedb/lance'
+    if: github.repository == 'lance-format/lance'
     timeout-minutes: 360
     runs-on: ubuntu-24.04
     name: Index Sequence Compat
@@ -71,10 +71,10 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           workspaces: python
-      - name: Install build deps
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Install host deps
         run: pip install pytest pytest-xdist pyarrow packaging maturin
       # Build HEAD once and feed it to the suite as the prebuilt reader, so the two writer

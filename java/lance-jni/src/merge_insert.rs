@@ -5,7 +5,7 @@ use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::import_vec_to_rust;
 use crate::traits::{FromJString, IntoJava};
-use crate::{Error, JNIEnvExt, RT};
+use crate::{Error, JNIEnvExt, block_on};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use jni::JNIEnv;
 use jni::objects::{JObject, JString, JValueGen};
@@ -15,7 +15,7 @@ use lance::dataset::{
     MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
 use lance_core::datatypes::Schema;
-use lance_index::mem_wal::MergedGeneration;
+use lance_index::mem_wal::CompactedSsTable;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -52,7 +52,7 @@ fn inner_merge_insert<'local>(
     let retry_timeout_ms = extract_retry_timeout_ms(env, &jparam)?;
     let skip_auto_cleanup = extract_skip_auto_cleanup(env, &jparam)?;
     let use_index = extract_use_index(env, &jparam)?;
-    let marked_generations = extract_marked_generations(env, &jparam)?;
+    let compacted_sstables = extract_compacted_sstables(env, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
@@ -71,13 +71,13 @@ fn inner_merge_insert<'local>(
             .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
             .skip_auto_cleanup(skip_auto_cleanup)
             .use_index(use_index)
-            .mark_generations_as_merged(marked_generations)
+            .mark_sstables_as_compacted(compacted_sstables)
             .try_build()?;
 
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
         let source_stream = ArrowArrayStreamReader::from_raw(stream_ptr)?;
 
-        RT.block_on(async move { merge_insert_job.execute_reader(source_stream).await })?
+        block_on(async move { merge_insert_job.execute_reader(source_stream).await })?
     };
 
     MergeResult(
@@ -241,23 +241,23 @@ fn extract_use_index<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Resu
     Ok(use_index)
 }
 
-fn extract_marked_generations<'local>(
+fn extract_compacted_sstables<'local>(
     env: &mut JNIEnv<'local>,
     jparam: &JObject,
-) -> Result<Vec<MergedGeneration>> {
+) -> Result<Vec<CompactedSsTable>> {
     let list = env
-        .call_method(jparam, "markedGenerations", "()Ljava/util/List;", &[])?
+        .call_method(jparam, "getCompactedSstables", "()Ljava/util/List;", &[])?
         .l()?;
     import_vec_to_rust(env, &list, |env, obj| {
         let shard_id: JString = env
-            .call_method(&obj, "shardId", "()Ljava/lang/String;", &[])?
+            .call_method(&obj, "getShardId", "()Ljava/lang/String;", &[])?
             .l()?
             .into();
         let shard_id = shard_id.extract(env)?;
-        let generation = env.call_method(&obj, "generation", "()J", &[])?.j()? as u64;
+        let generation = env.call_method(&obj, "getGeneration", "()J", &[])?.j()? as u64;
         let uuid = Uuid::parse_str(&shard_id)
             .map_err(|e| Error::input_error(format!("Invalid shard_id UUID: {}", e)))?;
-        Ok(MergedGeneration::new(uuid, generation))
+        Ok(CompactedSsTable::new(uuid, generation))
     })
 }
 

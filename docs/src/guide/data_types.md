@@ -32,7 +32,7 @@ Lance supports the full Apache Arrow type system. When writing data through Pyth
 
 ### Blob Type for Large Binary Objects
 
-Lance provides a specialized **Blob** type for efficiently storing and retrieving very large binary objects such as videos, images, audio files, or other multimedia content. Unlike regular binary columns, blobs support lazy loading, which means you can read portions of the data without loading everything into memory.
+Lance provides a specialized **Blob** type for efficiently storing and retrieving very large binary objects such as videos, images, audio files, or other multimedia content. Blob columns support planned full-payload reads as well as lazy file-like access for streaming, seeking, and partial reads.
 
 For new datasets, use blob v2 (`lance.blob.v2`) via `blob_field` and `blob_array`.
 
@@ -62,9 +62,7 @@ table = pa.table(
 )
 
 ds = lance.write_dataset(table, "./videos_v22.lance", data_storage_version="2.2")
-blob = ds.take_blobs("video", indices=[0])[0]
-with blob as f:
-    payload = f.read()
+_row_address, payload = ds.read_blobs("video", indices=[0])[0]
 ```
 
 For legacy compatibility (`data_storage_version <= 2.1`), you can still write blob columns using `LargeBinary` with `lance-encoding:blob=true`.
@@ -101,11 +99,18 @@ ds = lance.write_dataset(
 )
 ```
 
-To read blob data, use `take_blobs()` which returns file-like objects for lazy reading:
+To read complete blob payloads into memory, use `read_blobs()`:
+
+```python
+rows = ds.read_blobs("video", indices=[0])
+_row_address, payload = rows[0]
+```
+
+Use `take_blobs()` only when you need file-like objects for lazy, partial, or seek-based reading:
 
 ```python
 # Retrieve blob as a file-like object (lazy loading)
-blobs = ds.take_blobs("video", ids=[0])
+blobs = ds.take_blobs("video", indices=[0])
 
 # Use with libraries that accept file-like objects
 import av  # pip install av
@@ -403,7 +408,7 @@ This maps to Lance's `FixedSizeList(Float32, 384)` type, which is optimized for:
 
 3. **Align dimensions for SIMD**: Vector dimensions divisible by 8 enable optimal SIMD acceleration. Common dimensions: 128, 256, 384, 512, 768, 1024, 1536.
 
-4. **Create indexes for large datasets**: For datasets with more than ~10,000 vectors, create an ANN index for fast search:
+4. **Create indices for large datasets**: For datasets with more than ~10,000 vectors, create an ANN index for fast search:
 
     ```python
     # IVF_PQ is recommended for most use cases

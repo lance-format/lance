@@ -773,8 +773,14 @@ fn bench_fts(c: &mut Criterion) {
                 async move {
                     let mut total_found = 0usize;
                     for (mut scanner, term) in scanners.into_iter().zip(terms.iter()) {
+                        scanner
+                            .full_text_search(
+                                FullTextSearchQuery::new(term.to_string())
+                                    .with_column("text".to_string())
+                                    .unwrap(),
+                            )
+                            .unwrap();
                         let batches: Vec<RecordBatch> = scanner
-                            .full_text_search("text", term)
                             .try_into_stream()
                             .await
                             .unwrap()
@@ -947,11 +953,14 @@ fn bench_vector_search(c: &mut Criterion) {
             let query_array: Arc<dyn arrow_array::Array> = Arc::new(Float32Array::from(q.clone()));
             b.to_async(&rt).iter(|| {
                 let query_array = query_array.clone();
-                async {
+                let memtable = &memtable;
+                async move {
                     let mut scanner = memtable.scan();
+                    scanner
+                        .nearest("vector", query_array.as_ref(), k)
+                        .unwrap()
+                        .nprobes(8);
                     let batches: Vec<RecordBatch> = scanner
-                        .nearest("vector", query_array, k)
-                        .nprobes(8)
                         .try_into_stream()
                         .await
                         .unwrap()

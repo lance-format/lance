@@ -691,6 +691,96 @@ mod tests {
     }
 
     #[test]
+    fn test_distance_with_legacy_truncated_dimension() {
+        const DIM: usize = 64;
+        const NUM_SUB_VECTORS: usize = 14;
+        const NUM_BITS: u32 = 8;
+        const NUM_CENTROIDS: usize = 1 << NUM_BITS;
+        const SUB_VECTOR_DIM: usize = DIM / NUM_SUB_VECTORS;
+        const PERSISTED_DIM: usize = NUM_SUB_VECTORS * SUB_VECTOR_DIM;
+
+        // Older writers silently omitted the tail when the dimension was not
+        // divisible by the number of sub-vectors. Preserve searches over those
+        // indexes even though current writers reject this configuration.
+        let indexed_vector = (1..=DIM).map(|value| value as f32).collect::<Vec<_>>();
+        let mut codebook = Vec::with_capacity(NUM_SUB_VECTORS * NUM_CENTROIDS * SUB_VECTOR_DIM);
+        for sub_vector in indexed_vector[..PERSISTED_DIM].chunks_exact(SUB_VECTOR_DIM) {
+            for _ in 0..NUM_CENTROIDS {
+                codebook.extend_from_slice(sub_vector);
+            }
+        }
+        let query = indexed_vector
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| value + if idx < PERSISTED_DIM { 1.0 } else { 1_000.0 })
+            .collect::<Vec<_>>();
+        let code = UInt8Array::from(vec![0; NUM_SUB_VECTORS]);
+
+        let prepared_l2 = ProductQuantizer::new(
+            NUM_SUB_VECTORS,
+            NUM_BITS,
+            DIM,
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(codebook.clone()),
+                DIM as i32,
+            )
+            .unwrap(),
+            DistanceType::L2,
+        );
+        assert!(prepared_l2.l2_targets.is_some());
+        let distances = prepared_l2
+            .compute_distances(&Float32Array::from(query.clone()), &code)
+            .unwrap();
+        assert_relative_eq!(distances.value(0), PERSISTED_DIM as f32, epsilon = 1e-4);
+
+        let generic_l2 = ProductQuantizer::new(
+            NUM_SUB_VECTORS,
+            NUM_BITS,
+            DIM,
+            FixedSizeListArray::try_new_from_values(
+                PrimitiveArray::<datatypes::Float64Type>::from(
+                    codebook
+                        .iter()
+                        .map(|value| *value as f64)
+                        .collect::<Vec<_>>(),
+                ),
+                DIM as i32,
+            )
+            .unwrap(),
+            DistanceType::L2,
+        );
+        assert!(generic_l2.l2_targets.is_none());
+        let distances = generic_l2
+            .compute_distances(
+                &PrimitiveArray::<datatypes::Float64Type>::from(
+                    query.iter().map(|value| *value as f64).collect::<Vec<_>>(),
+                ),
+                &code,
+            )
+            .unwrap();
+        assert_relative_eq!(distances.value(0), PERSISTED_DIM as f32, epsilon = 1e-4);
+
+        let dot = ProductQuantizer::new(
+            NUM_SUB_VECTORS,
+            NUM_BITS,
+            DIM,
+            FixedSizeListArray::try_new_from_values(Float32Array::from(codebook), DIM as i32)
+                .unwrap(),
+            DistanceType::Dot,
+        );
+        let expected_dot_distance = 1.0
+            - indexed_vector[..PERSISTED_DIM]
+                .iter()
+                .zip(&query[..PERSISTED_DIM])
+                .map(|(left, right)| left * right)
+                .sum::<f32>();
+        let distances = dot
+            .compute_distances(&Float32Array::from(query), &code)
+            .unwrap();
+        assert_relative_eq!(distances.value(0), expected_dot_distance, epsilon = 1e-4);
+    }
+
+    #[test]
     fn test_pq_transform() {
         const DIM: usize = 16;
         const TOTAL: usize = 64;

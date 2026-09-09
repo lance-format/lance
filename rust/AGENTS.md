@@ -17,6 +17,10 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 - Delete obsolete internal (`pub(crate)` / private) methods in the same PR that introduces their replacements. For public API methods, follow the deprecation path in root AGENTS.md instead.
 - Choose log levels by audience: `debug!` for routine/high-frequency ops, `info!` for infrequent operator-visible state changes, `warn!` for unexpected conditions.
 
+## Concurrency
+
+- The closure passed to `spawn_cpu()` must only consume CPU and return — it must **never** wait on anything: **no channels** (blocking send/recv), **no I/O**, **no locks**, and no `block_on`/`.blocking_*`. The CPU pool can collapse to a single worker in resource-constrained environments (`<= 3` CPUs), so a parked closure can deadlock the whole pool with a silent 0% hang. Keep the waiting in surrounding async code and hand only the pure-CPU work to `spawn_cpu()`. Only dispatch substantial work (rule of thumb: ~100µs+ of CPU); below that the pool overhead outweighs the benefit and the work is better left inline. See the doc comment on `spawn_cpu` for the rationale.
+
 ## API Design
 
 - Use `with_`-prefixed builder methods for optional config (e.g., `MyStruct::new(required).with_option(v)`) — don't create separate constructor variants.

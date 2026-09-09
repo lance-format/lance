@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::any::Any;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,7 +25,10 @@ use futures::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
-use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{
+    Error, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD,
+};
 use lance_file::reader::FileReaderOptions;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
@@ -41,7 +43,7 @@ use crate::dataset::scanner::{
 };
 use crate::datatypes::Schema;
 
-use super::utils::IoMetrics;
+use super::utils::{IoMetrics, buffered_fragment_opens};
 
 async fn open_file(
     file_fragment: FileFragment,
@@ -166,18 +168,10 @@ impl LanceStream {
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Result<Self> {
-        let is_v2_scan = fragments
-            .iter()
-            .filter_map(|frag| frag.files.first().map(|f| !f.is_legacy_file()))
-            .next()
-            .unwrap_or(false);
-        if is_v2_scan {
-            Self::try_new_v2(
-                dataset, fragments, offsets, projection, config, metrics, partition,
-            )
-        } else {
-            Self::try_new_v1(dataset, fragments, projection, config, metrics, partition)
-        }
+        let version = dataset.manifest().data_storage_format.lance_file_format();
+        crate::dataset::versions::create_scan_stream(
+            version, dataset, fragments, offsets, projection, config, metrics, partition,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -192,7 +186,36 @@ impl LanceStream {
     ) -> Result<Self> {
         let scan_metrics = ScanMetrics::new(metrics, partition);
         let timer = scan_metrics.baseline_metrics.elapsed_compute().timer();
-        let project_schema = projection.clone();
+        let materialize_blob_v2_binary =
+            crate::dataset::blob::schema_has_blob_v2_binary_view(projection.as_ref());
+        let read_projection = if materialize_blob_v2_binary {
+            Arc::new(crate::dataset::blob::blob_v2_descriptor_schema(
+                projection.as_ref(),
+            ))
+        } else {
+            projection.clone()
+        };
+        let project_schema = read_projection;
+        let output_projection = if materialize_blob_v2_binary {
+            let mut output_projection = projection.as_ref().clone();
+            let mut system_fields = Vec::with_capacity(4);
+            if config.with_row_id {
+                system_fields.push(ROW_ID_FIELD.clone());
+            }
+            if config.with_row_address {
+                system_fields.push(ROW_ADDR_FIELD.clone());
+            }
+            if config.with_row_last_updated_at_version {
+                system_fields.push(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone());
+            }
+            if config.with_row_created_at_version {
+                system_fields.push(ROW_CREATED_AT_VERSION_FIELD.clone());
+            }
+            output_projection.extend(&system_fields)?;
+            Arc::new(output_projection)
+        } else {
+            projection.clone()
+        };
         let io_parallelism = dataset.object_store.io_parallelism();
         // First, use the value specified by the user in the call
         // Second, use the default from the environment variable, if specified
@@ -275,12 +298,18 @@ impl LanceStream {
 
         let scan_scheduler_clone = scan_scheduler.clone();
 
+        let materialize_dataset = dataset;
+        let materialization_context = crate::dataset::blob::BlobMaterializationContext::new(
+            Some(config.io_buffer_size),
+            config.materialization_readahead_bytes,
+        );
         let config_for_stream = config.clone();
         let batches = stream::iter(file_fragments.into_iter().enumerate())
             .map(move |(priority, file_fragment)| {
                 let project_schema = project_schema.clone();
                 let scan_scheduler = scan_scheduler.clone();
                 let config = config_for_stream.clone();
+                let force_row_address = materialize_blob_v2_binary;
                 #[allow(clippy::type_complexity)]
                 let frag_task: BoxFuture<
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
@@ -288,7 +317,7 @@ impl LanceStream {
                     (async move {
                         let mut frag_config = FragReadConfig::default()
                             .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address)
+                            .with_row_address(config.with_row_address || force_row_address)
                             .with_row_last_updated_at_version(
                                 config.with_row_last_updated_at_version,
                             )
@@ -349,6 +378,31 @@ impl LanceStream {
             )
             .stream_in_current_span()
             .boxed();
+        let inner_stream = if materialize_blob_v2_binary {
+            inner_stream
+                .map_ok(move |batch| {
+                    let dataset = materialize_dataset.clone();
+                    let output_projection = output_projection.clone();
+                    let materialization_context = materialization_context.clone();
+                    let admission = materialization_context.admission();
+                    async move {
+                        crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
+                            &dataset,
+                            output_projection.as_ref(),
+                            batch,
+                            &materialization_context,
+                            admission,
+                        )
+                        .await
+                        .map_err(DataFusionError::from)
+                    }
+                })
+                .try_buffered(config.batch_readahead)
+                .map_ok(|batch| batch.into_batch())
+                .boxed()
+        } else {
+            inner_stream
+        };
 
         timer.done();
         Ok(Self {
@@ -364,6 +418,7 @@ impl LanceStream {
     pub fn try_new_v1(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        _offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
         metrics: &ExecutionPlanMetricsSet,
@@ -390,9 +445,11 @@ impl LanceStream {
             .collect::<Vec<_>>();
 
         let batches = if config.ordered_output {
-            let readers = stream::iter(file_fragments)
-                .map(move |file_fragment| {
-                    Ok(open_file(
+            let readers = buffered_fragment_opens(
+                stream::iter(file_fragments),
+                fragment_readahead,
+                move |file_fragment| {
+                    open_file(
                         file_fragment,
                         project_schema.clone(),
                         FragReadConfig::default()
@@ -404,9 +461,9 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    ))
-                })
-                .try_buffered(fragment_readahead);
+                    )
+                },
+            );
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)
@@ -422,9 +479,11 @@ impl LanceStream {
                 .stream_in_current_span()
                 .boxed()
         } else {
-            let readers = stream::iter(file_fragments)
-                .map(move |file_fragment| {
-                    Ok(open_file(
+            let readers = buffered_fragment_opens(
+                stream::iter(file_fragments),
+                fragment_readahead,
+                move |file_fragment| {
+                    open_file(
                         file_fragment,
                         project_schema.clone(),
                         FragReadConfig::default()
@@ -436,9 +495,9 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    ))
-                })
-                .try_buffered(fragment_readahead);
+                    )
+                },
+            );
             let tasks = readers.and_then(move |reader| async move {
                 reader
                     .read_all(config.batch_size as u32)
@@ -482,7 +541,9 @@ impl core::fmt::Debug for LanceStream {
 
 impl RecordBatchStream for LanceStream {
     fn schema(&self) -> SchemaRef {
-        let mut schema: ArrowSchema = self.projection.as_ref().into();
+        let output_projection =
+            crate::dataset::blob::public_blob_v2_binary_output_schema(self.projection.as_ref());
+        let mut schema: ArrowSchema = (&output_projection).into();
         if self.config.with_row_id {
             schema = schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
         }
@@ -509,6 +570,7 @@ pub struct LanceScanConfig {
     pub batch_readahead: usize,
     pub fragment_readahead: Option<usize>,
     pub io_buffer_size: u64,
+    pub materialization_readahead_bytes: Option<u64>,
     pub with_row_id: bool,
     pub with_row_address: bool,
     pub with_row_last_updated_at_version: bool,
@@ -530,6 +592,7 @@ impl Default for LanceScanConfig {
             batch_readahead: get_num_compute_intensive_cpus(),
             fragment_readahead: None,
             io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
+            materialization_readahead_bytes: None,
             with_row_id: false,
             with_row_address: false,
             with_row_last_updated_at_version: false,
@@ -602,7 +665,9 @@ impl LanceScanExec {
         projection: Arc<Schema>,
         config: LanceScanConfig,
     ) -> Self {
-        let mut output_schema: ArrowSchema = projection.as_ref().into();
+        let output_projection =
+            crate::dataset::blob::public_blob_v2_binary_output_schema(projection.as_ref());
+        let mut output_schema: ArrowSchema = (&output_projection).into();
 
         if config.with_row_id {
             output_schema = output_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
@@ -673,10 +738,6 @@ impl ExecutionPlan for LanceScanExec {
         "LanceScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -727,7 +788,7 @@ impl ExecutionPlan for LanceScanExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
         // Some fragments from older datasets might have the row count stats missing.
         let (row_count, is_exact) =
             self.fragments
@@ -744,10 +805,10 @@ impl ExecutionPlan for LanceScanExec {
             false => Precision::Absent,
         };
 
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows,
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

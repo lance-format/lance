@@ -145,6 +145,11 @@ fn fr_options_to_proto(
         threading_mode: Some(threading_mode_to_proto(&options.threading_mode)),
         io_buffer_size_bytes: options.io_buffer_size_bytes,
         filter_schema_ipc,
+        materialization_readahead_bytes: options.materialization_readahead_bytes,
+        batch_size_bytes: options
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes),
     })
 }
 
@@ -193,6 +198,17 @@ async fn fr_options_from_proto(
     }
     if let Some(io_buffer) = proto.io_buffer_size_bytes {
         options = options.with_io_buffer_size(io_buffer);
+    }
+    if let Some(materialization_readahead_bytes) = proto.materialization_readahead_bytes {
+        options = options.with_materialization_readahead_bytes(materialization_readahead_bytes);
+    }
+    if let Some(batch_size_bytes) = proto.batch_size_bytes {
+        // Merge the scanner-level byte budget into the dataset's existing
+        // file-reader options so that distributed execution preserves
+        // validation and I/O settings such as read_chunk_size.
+        let mut file_reader_options = dataset.file_reader_options.clone().unwrap_or_default();
+        file_reader_options.batch_size_bytes = Some(batch_size_bytes);
+        options = options.with_file_reader_options(file_reader_options);
     }
     if let Some(mode) = proto.threading_mode {
         options.threading_mode = threading_mode_from_proto(&mode)?;
@@ -494,6 +510,8 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use lance_encoding::decoder::DecoderConfig;
+    use lance_file::reader::FileReaderOptions;
 
     #[test]
     fn test_range_roundtrip() {
@@ -588,9 +606,27 @@ mod tests {
         Arc::new(dataset)
     }
 
+    /// Create a test dataset with non-default file-reader options so that
+    /// round-trip tests can verify that scanner-level overrides preserve the
+    /// dataset-level defaults.
+    async fn make_test_dataset_with_file_reader_options() -> Arc<Dataset> {
+        let mut dataset = make_test_dataset().await;
+        if let Some(ds) = Arc::get_mut(&mut dataset) {
+            ds.file_reader_options = Some(FileReaderOptions {
+                read_chunk_size: 1234,
+                decoder_config: DecoderConfig {
+                    validate_on_decode: true,
+                    ..Default::default()
+                },
+                batch_size_bytes: None,
+            });
+        }
+        dataset
+    }
+
     #[tokio::test]
     async fn test_options_roundtrip_basic() {
-        let dataset = make_test_dataset().await;
+        let dataset = make_test_dataset_with_file_reader_options().await;
         let ctx = SessionContext::new();
         let state = ctx.state();
         let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
@@ -599,8 +635,13 @@ mod tests {
             .with_scan_range_before_filter(10..90)
             .unwrap()
             .with_batch_size(64)
+            .with_file_reader_options(FileReaderOptions {
+                batch_size_bytes: Some(4096),
+                ..Default::default()
+            })
             .with_fragment_readahead(4)
-            .with_io_buffer_size(1024 * 1024);
+            .with_io_buffer_size(1024 * 1024)
+            .with_materialization_readahead_bytes(8 * 1024 * 1024);
 
         let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
         let back = fr_options_from_proto(proto, &dataset, &state)
@@ -614,6 +655,24 @@ mod tests {
         assert_eq!(options.batch_size, back.batch_size);
         assert_eq!(options.fragment_readahead, back.fragment_readahead);
         assert_eq!(options.io_buffer_size_bytes, back.io_buffer_size_bytes);
+        assert_eq!(
+            options.materialization_readahead_bytes,
+            back.materialization_readahead_bytes
+        );
+        assert_eq!(
+            options
+                .file_reader_options
+                .as_ref()
+                .and_then(|o| o.batch_size_bytes),
+            back.file_reader_options
+                .as_ref()
+                .and_then(|o| o.batch_size_bytes)
+        );
+        // The scanner-level byte budget must be merged into the dataset's
+        // existing file-reader options, not replace them.
+        let effective = back.file_reader_options.as_ref().unwrap();
+        assert_eq!(effective.read_chunk_size, 1234);
+        assert!(effective.decoder_config.validate_on_decode);
         assert_eq!(options.threading_mode, back.threading_mode);
         assert_eq!(options.with_deleted_rows, back.with_deleted_rows);
         assert_eq!(options.projection.field_ids, back.projection.field_ids);
@@ -724,6 +783,59 @@ mod tests {
         assert_eq!(
             exec.options().projection.field_ids,
             back.options().projection.field_ids
+        );
+    }
+
+    /// A row-stream (take) exec serializes like any other: the input plan
+    /// travels as the node's child through the plan codec, and decoding
+    /// re-derives the row-stream selector from the child's schema
+    #[tokio::test]
+    async fn test_exec_to_proto_roundtrip_row_stream() {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use lance_core::{ROW_ID, ROW_ID_FIELD};
+        use lance_datafusion::exec::OneShotExec;
+
+        fn keys_input() -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()]));
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::UInt64Array::from(vec![3u64, 1, 4]))],
+            )
+            .unwrap();
+            let stream = futures::stream::iter(vec![Ok(batch)]);
+            Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+                schema, stream,
+            ))))
+        }
+
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let options = FilteredReadOptions::basic_full_read(&dataset);
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, Some(keys_input())).unwrap();
+        assert!(exec.row_stream_input().is_some());
+
+        let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+
+        // The codec hands the decoded child back; the selector re-derives
+        // from its schema
+        let back =
+            filtered_read_exec_from_proto(proto, Some(dataset.clone()), Some(keys_input()), &state)
+                .await
+                .unwrap();
+        assert!(back.row_stream_input().is_some());
+        assert_eq!(exec.schema(), back.schema());
+        assert_eq!(
+            exec.options().projection.field_ids,
+            back.options().projection.field_ids
+        );
+        assert!(
+            back.row_stream_input()
+                .unwrap()
+                .schema()
+                .column_with_name(ROW_ID)
+                .is_some()
         );
     }
 

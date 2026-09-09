@@ -7,15 +7,15 @@ use arrow_array::{ArrayRef, BooleanArray, ListArray, RecordBatch};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{Criterion, criterion_group, criterion_main};
-use lance_encoding::{
-    encoder::{EncodingOptions, default_encoding_strategy, encode_batch},
-    version::LanceFileVersion,
-};
+use lance_encoding::encoder::{EncodingOptions, encode_batch};
+
+pub mod common;
+use common::{BenchEncoding, encoding_strategy};
 
 fn encode_batch_sync(rt: &tokio::runtime::Runtime, data: &RecordBatch) {
     let lance_schema =
         Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
-    let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
+    let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU32);
 
     rt.block_on(encode_batch(
         data,
@@ -68,7 +68,7 @@ fn bench_encode_compressed(c: &mut Criterion) {
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap());
         // V2_2+ required for general compression
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU32);
 
         group.throughput(criterion::Throughput::Elements(
             (NUM_ROWS * NUM_COLUMNS) as u64,
@@ -204,8 +204,9 @@ fn bench_encode_decimal128(c: &mut Criterion) {
         let data = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap());
-        // u128 bitpacking is gated to 2.3+; use it so the dispatch arms are actually exercised.
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_3);
+        // Only the 2.3 shape offers 128-bit bitpacking, so use it or the dispatch arms this
+        // bench exists for are never reached.
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralSparse);
 
         group.bench_function(label, |b| {
             b.iter(|| {

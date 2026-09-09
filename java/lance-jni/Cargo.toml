@@ -1,6 +1,6 @@
 [package]
 name = "lance-jni"
-version = "9.0.0-beta.8"
+version = "12.0.0-beta.15"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.91"
@@ -9,19 +9,26 @@ repository = "https://github.com/lance-format/lance"
 readme = "../../README.md"
 description = "JNI bindings for Lance Columnar format"
 
+# `java/lance-jni/` is excluded from the top-level workspace (see ../../Cargo.toml) and
+# keeps its own Cargo.lock. Declaring an empty workspace here makes this crate an explicit
+# workspace root, so cargo resolves it standalone even when the checkout is nested inside
+# another cargo project (e.g. a git worktree placed under the main checkout).
+[workspace]
+
 [lib]
 crate-type = ["cdylib"]
 
 [features]
 default = []
+backtrace = ["lance/backtrace", "lance-core/backtrace"]
 
 [dependencies]
-lance = { path = "../../rust/lance", features = ["substrait"] }
+lance = { path = "../../rust/lance", features = ["substrait", "metrics"] }
 lance-datafusion = { path = "../../rust/lance-datafusion" }
 lance-encoding = { path = "../../rust/lance-encoding" }
 lance-linalg = { path = "../../rust/lance-linalg" }
-lance-index = { path = "../../rust/lance-index" }
-lance-io = { path = "../../rust/lance-io" }
+lance-index = { path = "../../rust/lance-index", features = ["tokenizer-jieba", "tokenizer-lindera"] }
+lance-io = { path = "../../rust/lance-io", features = ["metrics"] }
 lance-namespace = { path = "../../rust/lance-namespace" }
 lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = ["rest", "rest-adapter", "dir-goosefs"] }
 lance-core = { path = "../../rust/lance-core" }
@@ -30,8 +37,8 @@ lance-table = { path = "../../rust/lance-table" }
 arrow = { version = "58.0.0", features = ["ffi"] }
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
-datafusion = { version = "53.0.0", default-features = false }
-datafusion-common = "53.0.0"
+datafusion = { version = "54.0.0", default-features = false }
+datafusion-common = "54.0.0"
 object_store = { version = "0.13.2" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
@@ -45,6 +52,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1" }
 bytes = "1.11"
 log = "0.4"
+metrics = "0.24"
+metrics-util = { version = "0.19", default-features = false, features = ["registry"] }
 env_logger = "0.11.7"
 uuid = { version = "1.17.0", features = ["v4"] }
 prost = "0.14.1"
@@ -64,6 +73,9 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
+
+[profile.release]
+strip = true
 
 [lints.clippy]
 disallowed_macros = "deny"

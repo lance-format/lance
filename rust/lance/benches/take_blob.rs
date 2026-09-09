@@ -15,7 +15,7 @@ use lance::dataset::{Dataset, ProjectionRequest, ReadParams, WriteParams};
 use lance_arrow::BLOB_META_KEY;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
 use tokio::runtime::Runtime;
@@ -209,7 +209,10 @@ async fn write_blob_dataset(
     version: LanceFileVersion,
     cache_repetition_index: bool,
 ) -> Dataset {
-    let batches = if version >= LanceFileVersion::V2_2 {
+    let batches = if matches!(
+        version.resolve(),
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+    ) {
         make_blob_v2_batches()
     } else {
         make_legacy_blob_batches()

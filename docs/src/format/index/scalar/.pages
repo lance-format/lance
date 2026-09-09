@@ -7,4 +7,5 @@ nav:
   - Bloom Filter: bloom_filter.md
   - Full Text Search: fts.md
   - N-gram: ngram.md
+  - FM-Index: fmindex.md
   - RTree: rtree.md

@@ -17,9 +17,11 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
+import pytest
 from packaging.version import InvalidVersion, Version
 
 try:
@@ -42,12 +44,46 @@ def _venv_lock(lock_path: Path):
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+_PIP_INSTALL_ATTEMPTS = 3
+_PIP_RETRY_BACKOFF_SECONDS = 2.0
+
+
+def _pip_install(python: Union[str, Path], args: list[str]) -> None:
+    """Run ``pip install`` with output captured, retrying transient failures.
+
+    pip installs hit the network (PyPI / fury.io) and a single flaky download
+    should not fail a whole test run, so retry a bounded number of times with a
+    short backoff. On final failure raise an error that includes pip's
+    stdout/stderr, which a bare CalledProcessError from ``capture_output=True``
+    would hide from the test log.
+    """
+    cmd = [str(python), "-m", "pip", "install", "--quiet", *args]
+    for attempt in range(1, _PIP_INSTALL_ATTEMPTS + 1):
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return
+        except subprocess.CalledProcessError as exc:  # noqa: PERF203
+            if attempt == _PIP_INSTALL_ATTEMPTS:
+                raise RuntimeError(
+                    f"pip install failed after {attempt} attempts "
+                    f"(exit status {exc.returncode}): {cmd}\n"
+                    f"stdout:\n{exc.stdout}\n"
+                    f"stderr:\n{exc.stderr}"
+                ) from exc
+            time.sleep(_PIP_RETRY_BACKOFF_SECONDS * attempt)
+
+
 NAMESPACE_0_6_DEPENDENCY = "lance-namespace<0.7"
 NAMESPACE_0_7_DEPENDENCY = "lance-namespace>=0.7.2,<0.8"
 NAMESPACE_0_8_DEPENDENCY = "lance-namespace>=0.8.0,<0.9"
+NAMESPACE_0_11_DEPENDENCY = "lance-namespace>=0.11.1,<0.12"
 
 
 def _lance_namespace_dependency(pylance_version: str) -> str:
+    # 12.0.0b5 is the last release published while pylance still pinned
+    # lance-namespace <0.9; releases cut after that carry the 0.11 range.
+    if Version(pylance_version) > Version("12.0.0b5"):
+        return NAMESPACE_0_11_DEPENDENCY
     if Version(pylance_version) >= Version("7.2.0b5"):
         return NAMESPACE_0_8_DEPENDENCY
     if Version(pylance_version) >= Version("6.0.0b0"):
@@ -96,6 +132,36 @@ def _safe(ref: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", ref)
 
 
+# Explicit skip whitelist for known (lance_version, python_version) incompatibilities.
+# Each entry is (max_lance_version_inclusive, min_python_version_inclusive).
+# A test is skipped when the tested lance version <= max_lance AND the current
+# Python >= min_python.  Add entries here only after verifying the incompatibility
+# is a runtime/ABI issue rather than a format regression — anything NOT listed
+# will surface as a test failure so new problems are visible.
+_COMPAT_SKIP: list[tuple[str, tuple[int, int]]] = [
+    # lance 0.22.x abi3 wheel was built with old PyO3 (<0.23) that crashes on
+    # Python 3.14+ due to removed internal CPython APIs.
+    ("0.22.0", (3, 14)),
+]
+
+
+def _skip_reason(lance_version: str) -> Optional[str]:
+    """Return a skip reason if this lance/Python combo is whitelisted, else None."""
+    try:
+        ver = Version(lance_version)
+    except InvalidVersion:
+        return None
+    py = sys.version_info[:2]
+    for max_lance, min_python in _COMPAT_SKIP:
+        if ver <= Version(max_lance) and py >= min_python:
+            py_str = f"{py[0]}.{py[1]}"
+            return (
+                f"Lance {lance_version} + Python {py_str}: whitelisted skip "
+                f"(see _COMPAT_SKIP in venv_manager.py)"
+            )
+    return None
+
+
 class VenvExecutor:
     """Manages a virtual environment with a specific Lance version."""
 
@@ -130,15 +196,29 @@ class VenvExecutor:
     def _marker_path(self) -> Path:
         return self.venv_path / ".compat_ref"
 
+    @staticmethod
+    def _python_version_tag() -> str:
+        return f"{sys.version_info.major}.{sys.version_info.minor}"
+
     def _validate_venv(self) -> bool:
-        """A cached venv is reusable if it exists and its recorded ref matches. A marker
-        file is used (not `pip show`) so source-built commit refs also validate."""
+        """A cached venv is reusable if it exists, its recorded ref matches, and it was
+        built with the same Python major.minor as the current interpreter.
+
+        The marker file format is two lines: `<lance_ref>\\n<python_major.minor>`.
+        Old single-line markers (no Python version) are treated as stale so the venv
+        is rebuilt — this handles cached venvs from a different Python installation."""
         if not self.python_path.exists():
             return False
         try:
-            return self._marker_path.read_text().strip() == self.version
+            lines = self._marker_path.read_text().strip().splitlines()
         except OSError:
             return False
+        if not lines or lines[0] != self.version:
+            return False
+        # Require a Python version line; single-line markers are stale.
+        if len(lines) < 2 or lines[1] != self._python_version_tag():
+            return False
+        return True
 
     def create(self):
         """Create the virtual environment and install the specified Lance version."""
@@ -170,24 +250,18 @@ class VenvExecutor:
                     self._install_release_wheel()
                 else:
                     self._build_from_source()
-                self._marker_path.write_text(self.version)
+                self._marker_path.write_text(
+                    f"{self.version}\n{self._python_version_tag()}"
+                )
         self._created = True
 
     def _install_wheel(self, wheel: str):
-        subprocess.run(
-            [str(self.python_path), "-m", "pip", "install", "--quiet", wheel, "pytest"],
-            check=True,
-            capture_output=True,
-        )
+        _pip_install(self.python_path, [wheel, "pytest"])
 
     def _install_release_wheel(self):
-        subprocess.run(
+        _pip_install(
+            self.python_path,
             [
-                str(self.python_path),
-                "-m",
-                "pip",
-                "install",
-                "--quiet",
                 "--pre",
                 "--extra-index-url",
                 "https://pypi.fury.io/lance-format/",
@@ -201,8 +275,6 @@ class VenvExecutor:
                 _lance_namespace_dependency(self.version),
                 "pytest",
             ],
-            check=True,
-            capture_output=True,
         )
 
     def _build_from_source(self):
@@ -225,11 +297,7 @@ class VenvExecutor:
                 check=True,
                 capture_output=True,
             )
-        subprocess.run(
-            [py, "-m", "pip", "install", "--quiet", "maturin", "pytest", "pyarrow"],
-            check=True,
-            capture_output=True,
-        )
+        _pip_install(py, ["maturin", "pytest", "pyarrow"])
         wheels = src / "target" / "compat-wheels"
         subprocess.run(
             [
@@ -249,11 +317,7 @@ class VenvExecutor:
             capture_output=True,
         )
         wheel = next(wheels.glob("pylance-*.whl"))
-        subprocess.run(
-            [py, "-m", "pip", "install", "--quiet", str(wheel)],
-            check=True,
-            capture_output=True,
-        )
+        _pip_install(py, [str(wheel)])
 
     def _ensure_subprocess(self):
         """Ensure the persistent subprocess is running."""
@@ -264,10 +328,13 @@ class VenvExecutor:
         # Start persistent subprocess
         runner_script = Path(__file__).parent / "venv_runner.py"
 
-        # Set PYTHONPATH to include the tests directory
+        # Set PYTHONPATH so the subprocess can import compat test modules.
+        # pytest adds the `tests/` directory (the first ancestor without __init__.py)
+        # to sys.path, so test modules are imported as `compat.<module>`.
         env = os.environ.copy()
         tests_dir = Path(__file__).parent.parent
         env["PYTHONPATH"] = str(tests_dir)
+        env.setdefault("RUST_BACKTRACE", "full")
 
         # Capture stderr to a file so a Rust panic (which crashes the runner) can be
         # surfaced in the error instead of an opaque "broken pipe".
@@ -357,6 +424,10 @@ class VenvExecutor:
         if not self._created:
             raise RuntimeError("Virtual environment not created. Call create() first.")
 
+        reason = _skip_reason(self.version)
+        if reason:
+            pytest.skip(reason)
+
         # Ensure subprocess is running
         self._ensure_subprocess()
         try:
@@ -379,14 +450,16 @@ class VenvExecutor:
 
         except (BrokenPipeError, EOFError, struct.error) as e:
             # Subprocess died (usually a Rust panic); flush it, then surface that.
+            returncode = "unknown"
             if self._subprocess is not None:
                 try:
                     self._subprocess.wait(timeout=2)
+                    returncode = str(self._subprocess.returncode)
                 except Exception:
                     pass
             panic = self._last_panic()
             detail = panic or f"subprocess communication failed: {e}"
-            raise RuntimeError(f"Lance {self.version}: {detail}")
+            raise RuntimeError(f"Lance {self.version} (exit={returncode}): {detail}")
 
     def cleanup(self):
         """Remove the virtual environment directory and terminate subprocess."""
@@ -404,8 +477,6 @@ class VenvExecutor:
 
         # Remove venv directory
         if self.venv_path.exists():
-            import shutil
-
             shutil.rmtree(self.venv_path)
         self._created = False
 

@@ -11,15 +11,34 @@ use datafusion::{
 };
 use datafusion_expr::{LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
 use lance_core::{ROW_ADDR, ROW_ID};
-use std::{cmp::Ordering, sync::Arc};
+use std::{
+    cmp::Ordering,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 use crate::Dataset;
 use crate::dataset::write::merge_insert::exec::{
-    DeleteOnlyMergeInsertExec, FullSchemaMergeInsertExec,
+    DeleteOnlyMergeInsertExec, FullSchemaMergeInsertExec, InPlaceMergeInsertExec,
 };
 use crate::dataset::{WhenMatched, WhenNotMatchedBySource};
 
 use super::{MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertParams};
+
+/// Which write half a planned merge insert will use.
+///
+/// This is the *resolved* choice, so it has no `Auto`: the caller's
+/// [`MergeInsertWriteMode`](super::MergeInsertWriteMode) is resolved against the
+/// operation by [`MergeInsertJob::select_write_sink`](super::MergeInsertJob) before
+/// the plan is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WriteSink {
+    /// Delete the matched rows and write whole rows into new fragments.
+    RewriteRows,
+    /// Attach new data files for the source columns to the fragments that
+    /// already hold the matched rows and tombstone the old versions of those
+    /// columns.
+    RewriteColumns,
+}
 
 /// Logical plan node for merge insert write.
 ///
@@ -36,12 +55,15 @@ pub struct MergeInsertWriteNode {
     input: LogicalPlan,
     pub(crate) dataset: Arc<Dataset>,
     pub(crate) params: MergeInsertParams,
+    pub(crate) source_skipped_duplicates: Arc<AtomicU64>,
+    pub(crate) write_sink: WriteSink,
     schema: Arc<DFSchema>,
 }
 
 impl PartialEq for MergeInsertWriteNode {
     fn eq(&self, other: &Self) -> bool {
         self.params == other.params
+            && self.write_sink == other.write_sink
             && self.input == other.input
             && self.dataset.base == other.dataset.base
     }
@@ -52,6 +74,7 @@ impl Eq for MergeInsertWriteNode {}
 impl std::hash::Hash for MergeInsertWriteNode {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.params.hash(state);
+        self.write_sink.hash(state);
         self.input.hash(state);
         self.dataset.base.hash(state);
     }
@@ -60,20 +83,31 @@ impl std::hash::Hash for MergeInsertWriteNode {
 impl PartialOrd for MergeInsertWriteNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match self.params.partial_cmp(&other.params) {
-            Some(Ordering::Equal) => self.input.partial_cmp(&other.input),
+            Some(Ordering::Equal) => match self.write_sink.cmp(&other.write_sink) {
+                Ordering::Equal => self.input.partial_cmp(&other.input),
+                cmp => Some(cmp),
+            },
             cmp => cmp,
         }
     }
 }
 
 impl MergeInsertWriteNode {
-    pub fn new(input: LogicalPlan, dataset: Arc<Dataset>, params: MergeInsertParams) -> Self {
+    pub fn new(
+        input: LogicalPlan,
+        dataset: Arc<Dataset>,
+        params: MergeInsertParams,
+        source_skipped_duplicates: Arc<AtomicU64>,
+        write_sink: WriteSink,
+    ) -> Self {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let schema = Arc::new(DFSchema::try_from(empty_schema).unwrap());
         Self {
             input,
             dataset,
             params,
+            source_skipped_duplicates,
+            write_sink,
             schema,
         }
     }
@@ -121,7 +155,11 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             f,
             "MergeInsertWrite: on=[{}], when_matched={}, when_not_matched={}, when_not_matched_by_source={}",
             on_keys, when_matched, when_not_matched, when_not_matched_by_source
-        )
+        )?;
+        if self.write_sink == WriteSink::RewriteColumns {
+            write!(f, ", mode=RewriteColumns")?;
+        }
+        Ok(())
     }
 
     fn with_exprs_and_inputs(
@@ -143,6 +181,8 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             inputs[0].clone(),
             self.dataset.clone(),
             self.params.clone(),
+            self.source_skipped_duplicates.clone(),
+            self.write_sink,
         ))
     }
 
@@ -248,12 +288,21 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         physical_inputs[0].clone(),
                         write_node.dataset.clone(),
                         write_node.params.clone(),
+                        write_node.source_skipped_duplicates.clone(),
+                    )?)
+                } else if write_node.write_sink == WriteSink::RewriteColumns {
+                    Arc::new(InPlaceMergeInsertExec::try_new(
+                        physical_inputs[0].clone(),
+                        write_node.dataset.clone(),
+                        write_node.params.clone(),
+                        write_node.source_skipped_duplicates.clone(),
                     )?)
                 } else {
                     Arc::new(FullSchemaMergeInsertExec::try_new(
                         physical_inputs[0].clone(),
                         write_node.dataset.clone(),
                         write_node.params.clone(),
+                        write_node.source_skipped_duplicates.clone(),
                     )?)
                 };
                 Some(exec)

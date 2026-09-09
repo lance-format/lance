@@ -1,31 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+pub mod concat;
 pub mod datatypes;
 pub mod format;
 pub(crate) mod io;
-pub mod previous;
 pub mod reader;
 pub mod testing;
+pub mod version;
+pub mod versions;
 pub mod writer;
+
+#[cfg(test)]
+mod compatibility_tests;
 
 pub use io::LanceEncodingsIo;
 
 use format::MAGIC;
-pub use lance_encoding::version;
-
 use lance_core::{Error, Result};
-use lance_encoding::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
+use version::ConcreteFileVersion;
 
 pub async fn determine_file_version(
     store: &ObjectStore,
     path: &Path,
     known_size: Option<usize>,
-) -> Result<LanceFileVersion> {
+) -> Result<ConcreteFileVersion> {
     let size = match known_size {
-        None => store.size(path).await.unwrap() as usize,
+        None => usize::try_from(store.size(path).await?).map_err(|_| {
+            Error::invalid_input(format!("file {} is too large for this platform", path))
+        })?,
         Some(size) => size,
     };
     if size < 8 {
@@ -51,5 +56,5 @@ pub async fn determine_file_version(
     let major_version = u16::from_le_bytes([footer[0], footer[1]]);
     let minor_version = u16::from_le_bytes([footer[2], footer[3]]);
 
-    LanceFileVersion::try_from_major_minor(major_version as u32, minor_version as u32)
+    ConcreteFileVersion::from_footer_numbers(major_version, minor_version)
 }

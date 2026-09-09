@@ -55,14 +55,27 @@ impl EncodingsIo for LanceEncodingsIo {
     ) -> BoxFuture<'static, lance_core::Result<Vec<bytes::Bytes>>> {
         let mut split_ranges = Vec::new();
         let mut split_indices = Vec::new(); // Track which original range each split came from
+        // Large ranges (above read_chunk_size) will be split into
+        // multiple reads.  Empty ranges will skip the I/O layer
+        // entirely.  If we have either of these we will need to
+        // reassemble our results, inserting empties and merging parts
+        let mut needs_reassembly = false;
 
         // Split large ranges into smaller chunks
         //
         // TODO: consider read_chunk_size before submitting requests.
         for (idx, range) in ranges.iter().enumerate() {
+            if range.start == range.end {
+                // EncodingsIo requires one result per input range. Zero-length
+                // ranges schedule no I/O, so their empty results are restored
+                // after the non-empty requests complete.
+                needs_reassembly = true;
+                continue;
+            }
             let range_size = range.end - range.start;
 
             if range_size > self.read_chunk_size {
+                needs_reassembly = true;
                 let num_chunks = range_size.div_ceil(self.read_chunk_size);
                 let chunk_size = range_size / num_chunks;
 
@@ -87,34 +100,48 @@ impl EncodingsIo for LanceEncodingsIo {
         async move {
             let split_results = fut.await?;
 
-            // Fast path: if no splitting occurred, return results directly
-            if split_results.len() == ranges.len() {
+            if split_results.len() != split_indices.len() {
+                return Err(lance_core::Error::internal(format!(
+                    "Encoding I/O returned {} results for {} requested range chunks",
+                    split_results.len(),
+                    split_indices.len()
+                )));
+            }
+            if !needs_reassembly {
                 return Ok(split_results);
             }
 
-            // Slow path: reassemble split results
             let mut results = vec![Vec::new(); ranges.len()];
 
-            for (split_result, &orig_idx) in split_results.iter().zip(split_indices.iter()) {
-                results[orig_idx].push(split_result.clone());
+            for (split_result, orig_idx) in split_results.into_iter().zip(split_indices) {
+                results[orig_idx].push(split_result);
             }
 
-            Ok(results
-                .into_iter()
-                .map(|chunks| {
-                    if chunks.len() == 1 {
-                        chunks.into_iter().next().unwrap()
-                    } else {
-                        // Concatenate multiple chunks
-                        let total_size: usize = chunks.iter().map(|c| c.len()).sum();
-                        let mut combined = Vec::with_capacity(total_size);
-                        for chunk in chunks {
-                            combined.extend_from_slice(&chunk);
-                        }
-                        bytes::Bytes::from(combined)
+            let mut reassembled = Vec::with_capacity(ranges.len());
+            for (range, chunks) in ranges.iter().zip(results) {
+                if chunks.is_empty() {
+                    if range.start == range.end {
+                        reassembled.push(bytes::Bytes::new());
+                        continue;
                     }
-                })
-                .collect())
+                    return Err(lance_core::Error::internal(format!(
+                        "Encoding I/O returned no data for non-empty range {}..{}",
+                        range.start, range.end
+                    )));
+                }
+                if chunks.len() == 1 {
+                    reassembled.push(chunks[0].clone());
+                    continue;
+                }
+
+                let total_size: usize = chunks.iter().map(|c| c.len()).sum();
+                let mut combined = Vec::with_capacity(total_size);
+                for chunk in chunks {
+                    combined.extend_from_slice(&chunk);
+                }
+                reassembled.push(bytes::Bytes::from(combined));
+            }
+            Ok(reassembled)
         }
         .boxed()
     }

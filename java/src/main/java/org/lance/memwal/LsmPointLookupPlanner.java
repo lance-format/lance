@@ -44,7 +44,7 @@ public class LsmPointLookupPlanner implements AutoCloseable {
 
   /**
    * @param dataset the base dataset
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    */
   public LsmPointLookupPlanner(Dataset dataset, List<ShardSnapshot> shardSnapshots) {
     this(dataset, shardSnapshots, null);
@@ -52,7 +52,7 @@ public class LsmPointLookupPlanner implements AutoCloseable {
 
   /**
    * @param dataset the base dataset
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    * @param pkColumns primary key column names; inferred from schema metadata when {@code null}
    */
   public LsmPointLookupPlanner(
@@ -60,7 +60,9 @@ public class LsmPointLookupPlanner implements AutoCloseable {
     Preconditions.checkNotNull(dataset, "dataset must not be null");
     Preconditions.checkNotNull(shardSnapshots, "shardSnapshots must not be null");
     this.allocator = dataset.allocator();
-    nativeCreate(dataset, shardSnapshots, Optional.ofNullable(pkColumns));
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      nativeCreate(dataset, shardSnapshots, Optional.ofNullable(pkColumns));
+    }
   }
 
   private native void nativeCreate(

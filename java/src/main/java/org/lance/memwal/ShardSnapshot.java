@@ -24,13 +24,13 @@ import java.util.List;
  * Snapshot of a MemWAL shard's state, used when constructing scanners and planners.
  *
  * <p>The builder methods ({@link #withSpecId}, {@link #withCurrentGeneration}, {@link
- * #withFlushedGeneration}) mutate this instance and return it for chaining.
+ * #withSsTable}) mutate this instance and return it for chaining.
  */
 public class ShardSnapshot {
   private final String shardId;
   private int specId = 0;
   private long currentGeneration = 0;
-  private final List<FlushedGeneration> flushedGenerations = new ArrayList<>();
+  private final List<SsTable> sstables = new ArrayList<>();
 
   /**
    * @param shardId UUID string for the write shard
@@ -52,10 +52,10 @@ public class ShardSnapshot {
     return this;
   }
 
-  /** Add a flushed generation with its storage path. */
-  public ShardSnapshot withFlushedGeneration(long generation, String path) {
+  /** Add an SSTable with its storage path. */
+  public ShardSnapshot withSsTable(long generation, String path) {
     Preconditions.checkNotNull(path, "path must not be null");
-    this.flushedGenerations.add(new FlushedGeneration(generation, path));
+    this.sstables.add(new SsTable(generation, path));
     return this;
   }
 
@@ -74,9 +74,9 @@ public class ShardSnapshot {
     return currentGeneration;
   }
 
-  /** The flushed generations included in this snapshot. */
-  public List<FlushedGeneration> flushedGenerations() {
-    return Collections.unmodifiableList(flushedGenerations);
+  /** The SSTables included in this snapshot. */
+  public List<SsTable> sstables() {
+    return Collections.unmodifiableList(sstables);
   }
 
   @Override
@@ -85,7 +85,7 @@ public class ShardSnapshot {
         .add("shardId", shardId)
         .add("specId", specId)
         .add("currentGeneration", currentGeneration)
-        .add("flushedGenerations", flushedGenerations)
+        .add("sstables", sstables)
         .toString();
   }
 }

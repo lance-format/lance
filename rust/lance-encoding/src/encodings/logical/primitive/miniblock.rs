@@ -19,7 +19,8 @@ use lance_core::Result;
 pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 6;
 
 const DEFAULT_MAX_MINIBLOCK_VALUES: u64 = 4096;
-const MAX_CONFIGURABLE_MINIBLOCK_VALUES: u64 = 32768;
+/// Maximum number of values that any mini-block decoder accepts from page metadata.
+pub(crate) const MAX_CONFIGURABLE_MINIBLOCK_VALUES: u64 = 32768;
 
 fn parse_max_miniblock_values() -> u64 {
     let val = std::env::var("LANCE_MINIBLOCK_MAX_VALUES")
@@ -51,6 +52,29 @@ pub struct MiniBlockCompressed {
     pub chunks: Vec<MiniBlockChunk>,
     /// The number of values in the entire page
     pub num_values: u64,
+}
+
+/// Per-page framing details that can affect a mini-block compressor's choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MiniBlockCompressionContext {
+    common_chunk_buffers: u64,
+    support_large_chunk: bool,
+    allow_generic_offsets: bool,
+}
+
+impl MiniBlockCompressionContext {
+    /// Creates the framing context supplied by the owning mini-block page.
+    pub fn new(
+        common_chunk_buffers: u64,
+        support_large_chunk: bool,
+        allow_generic_offsets: bool,
+    ) -> Self {
+        Self {
+            common_chunk_buffers,
+            support_large_chunk,
+            allow_generic_offsets,
+        }
+    }
 }
 
 /// Describes the size of a mini-block chunk of data
@@ -112,7 +136,11 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
     ///
     /// This method also returns a description of the encoding applied that will be
     /// used at decode time to read the data.
-    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
+    fn compress(
+        &self,
+        context: MiniBlockCompressionContext,
+        page: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
 }
 
 #[cfg(test)]

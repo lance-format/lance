@@ -14,8 +14,9 @@ use lance_encoding::decoder::{DecoderConfig, DecoderPlugins, FilterExpression};
 use lance_file::{
     reader::{FileReader, FileReaderOptions},
     testing::test_cache,
-    version::LanceFileVersion,
-    writer::{FileWriter, FileWriterOptions},
+    version::ConcreteFileVersion,
+    versions as file_versions,
+    writer::FileWriterOptions,
 };
 use lance_io::{
     object_store::ObjectStore,
@@ -28,9 +29,9 @@ use tokio::runtime::Runtime;
 
 fn bench_reader(c: &mut Criterion) {
     for version in [
-        LanceFileVersion::V2_0,
-        LanceFileVersion::V2_1,
-        LanceFileVersion::V2_2,
+        ConcreteFileVersion::V2_0,
+        ConcreteFileVersion::V2_1,
+        ConcreteFileVersion::V2_2,
     ] {
         let mut group = c.benchmark_group(format!("reader_{}", version));
         let data = lance_datagen::gen_batch()
@@ -47,13 +48,11 @@ fn bench_reader(c: &mut Criterion) {
         let file_path = base_path.clone().join("foo.lance");
         let object_writer = rt.block_on(object_store.create(&file_path)).unwrap();
 
-        let mut writer = FileWriter::try_new(
+        let mut writer = file_versions::create_writer(
+            version,
             object_writer,
             data.schema().as_ref().try_into().unwrap(),
-            FileWriterOptions {
-                format_version: Some(version),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )
         .unwrap();
         rt.block_on(writer.write_batch(&data)).unwrap();
@@ -175,7 +174,7 @@ fn get_cached_readers(
     tmpdir: &TempDir,
     filesystem: &str,
     rt: &Runtime,
-    version: LanceFileVersion,
+    version: ConcreteFileVersion,
 ) -> Arc<CachedReaders> {
     use std::sync::{LazyLock, Mutex};
 
@@ -213,13 +212,11 @@ fn get_cached_readers(
 
     // Write file
     let object_writer = rt.block_on(object_store.create(&file_path)).unwrap();
-    let mut writer = FileWriter::try_new(
+    let mut writer = file_versions::create_writer(
+        version,
         object_writer,
         data.schema().as_ref().try_into().unwrap(),
-        FileWriterOptions {
-            format_version: Some(version),
-            ..Default::default()
-        },
+        FileWriterOptions::default(),
     )
     .unwrap();
     rt.block_on(writer.write_batch(&data)).unwrap();
@@ -366,9 +363,9 @@ fn bench_random_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("take");
 
     let versions = [
-        LanceFileVersion::V2_0,
-        LanceFileVersion::V2_1,
-        LanceFileVersion::V2_2,
+        ConcreteFileVersion::V2_0,
+        ConcreteFileVersion::V2_1,
+        ConcreteFileVersion::V2_2,
     ];
 
     for filesystem in filesystems {
@@ -379,7 +376,8 @@ fn bench_random_access(c: &mut Criterion) {
             for multithreaded in [false, true] {
                 for rows_at_a_time in [1, 100] {
                     for cached in [true, false] {
-                        if !cached && (filesystem == "mem" || version == LanceFileVersion::V2_0) {
+                        if !cached && (filesystem == "mem" || version == ConcreteFileVersion::V2_0)
+                        {
                             continue;
                         }
 

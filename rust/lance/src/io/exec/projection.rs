@@ -44,7 +44,7 @@ pub fn project(input: Arc<dyn ExecutionPlan>, projection: &ArrowSchema) -> Resul
 
     let field_names = projection.fields().iter().map(|f| f.name()).cloned();
 
-    for (name, selection) in field_names.zip(selections.into_iter()) {
+    for (name, selection) in field_names.zip(selections) {
         let expr = selection_as_expr(&selection, input_schema.fields(), None);
         exprs.push((expr, name));
     }

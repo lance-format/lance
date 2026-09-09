@@ -13,7 +13,7 @@
  */
 package org.lance.merge;
 
-import org.lance.memwal.MergedGeneration;
+import org.lance.memwal.CompactedSsTable;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
@@ -39,7 +39,7 @@ public class MergeInsertParams {
   private long retryTimeoutMs = 30 * 1000;
   private boolean skipAutoCleanup = false;
   private boolean useIndex = true;
-  private List<MergedGeneration> markedGenerations = Collections.emptyList();
+  private List<CompactedSsTable> compactedSstables = Collections.emptyList();
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -245,17 +245,23 @@ public class MergeInsertParams {
   }
 
   /**
-   * Mark MemWAL generations as merged into the base table.
+   * Mark MemWAL SSTables as compacted into the base table.
    *
-   * <p>Use this when the merge insert incorporates data from MemWAL flushed generations. It updates
-   * the MemWAL generation tracking to prevent the same generations from being merged again.
+   * <p>Use this when merge insert compacts MemWAL SSTables. It updates MemWAL compaction progress
+   * to prevent the same SSTables from being compacted again, in the same commit as the data.
    *
-   * @param generations the flushed generations being merged
+   * <p><b>For multi-pass compaction, call this only on the final successful data-changing pass.</b>
+   * Intermediate passes must not carry compaction progress. Lance cannot tell whether a caller has
+   * another pass planned, so it cannot enforce this: if a delete pass carried the marker and the
+   * process then died before the matching upsert, the recorded progress would claim rows were
+   * copied in that never were.
+   *
+   * @param sstables the SSTables being compacted
    * @return This MergeInsertParams instance
    */
-  public MergeInsertParams markGenerationsAsMerged(List<MergedGeneration> generations) {
-    Preconditions.checkNotNull(generations, "generations must not be null");
-    this.markedGenerations = generations;
+  public MergeInsertParams markSstablesAsCompacted(List<CompactedSsTable> sstables) {
+    Preconditions.checkNotNull(sstables, "sstables must not be null");
+    this.compactedSstables = sstables;
     return this;
   }
 
@@ -263,8 +269,8 @@ public class MergeInsertParams {
     return on;
   }
 
-  public List<MergedGeneration> markedGenerations() {
-    return markedGenerations;
+  public List<CompactedSsTable> getCompactedSstables() {
+    return compactedSstables;
   }
 
   public WhenMatched whenMatched() {

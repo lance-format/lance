@@ -4,7 +4,7 @@
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::FromJString;
-use crate::{Error, JNIEnvExt, RT};
+use crate::{Error, JNIEnvExt, RT, block_on};
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
@@ -57,7 +57,7 @@ fn inner_into_batch_records(
         with_row_addr,
     )?;
 
-    let stream = RT.block_on(async move {
+    let stream = block_on(async move {
         let query = builder.build().await?;
         query.into_stream().await
     })?;

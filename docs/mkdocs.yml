@@ -6,37 +6,13 @@ docs_dir: src
 repo_name: lance-format/lance
 repo_url: https://github.com/lance-format/lance
 
+# Custom theme implementing the "Lance Docs" design (see theme/).
 theme:
-  name: material
-  custom_dir: overrides
-  logo: logo/white.png
-  favicon: logo/logo.png
-  palette:
-    - scheme: default
-      primary: custom
-      accent: custom
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
-    - scheme: slate
-      primary: custom
-      accent: custom
-      toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
-  features:
-    - navigation.tabs
-    - navigation.sections
-    - navigation.instant
-    - navigation.indexes
-    - navigation.tracking
-    - navigation.top
-    - search.highlight
-    - search.share
-    - content.code.copy
-    - content.code.annotate
-  icon:
-    repo: fontawesome/brands/github
+  name: null
+  custom_dir: theme
+  locale: en
+  static_templates:
+    - 404.html
 
 markdown_extensions:
   - admonition
@@ -51,9 +27,16 @@ markdown_extensions:
       line_spans: __span
       pygments_lang_class: true
   - pymdownx.inlinehilite
-  - pymdownx.snippets
+  - pymdownx.snippets:
+      # Allow snippets to pull in files from the repo root (e.g. shared docs
+      # kept alongside Rust source). Paths are relative to the docs/ dir.
+      base_path:
+        - .
+        - ..
   - pymdownx.tabbed:
       alternate_style: true
+  # Autolink bare URLs (e.g. repository tables on the community pages).
+  - pymdownx.magiclink
   - attr_list
   - md_in_html
   - tables
@@ -66,18 +49,7 @@ plugins:
   - mkdocs_protobuf:
       proto_dir: ../protos
 
-extra:
-  generator: false
-  social:
-    - icon: fontawesome/brands/github
-      link: https://github.com/lance-format/lance
-    - icon: fontawesome/brands/discord
-      link: https://discord.gg/lance
+hooks:
+  - hooks/pmc_roster.py
 
 copyright: © 2025 Lance Format. All rights reserved.
-
-extra_css:
-  - assets/stylesheets/home.css
-extra_javascript:
-  - assets/javascripts/nav-expand.js
-

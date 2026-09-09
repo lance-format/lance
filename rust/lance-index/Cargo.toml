@@ -12,9 +12,10 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-arc-swap.workspace = true
+arc-swap = { workspace = true, features = ["weak"] }
 arrow.workspace = true
 arrow-array.workspace = true
+arrow-ipc.workspace = true
 arrow-ord.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
@@ -39,11 +40,13 @@ jsonb.workspace = true
 lance-arrow.workspace = true
 lance-arrow-stats.workspace = true
 lance-core.workspace = true
+lance-index-core.workspace = true
 lance-datafusion.workspace = true
 lance-encoding.workspace = true
 lance-file.workspace = true
 lance-geo = { workspace = true, optional = true }
 lance-io.workspace = true
+lance-bitpacking.workspace = true
 libsais-rs = "0.2"
 lance-linalg.workspace = true
 lance-select.workspace = true
@@ -67,24 +70,24 @@ tracing.workspace = true
 tempfile.workspace = true
 crossbeam-queue.workspace = true
 bytes.workspace = true
-chrono.workspace = true
-uuid.workspace = true
 async-channel = "2.3.1"
-bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
 rand_distr.workspace = true
-lance-datagen.workspace = true
 rangemap.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
 criterion.workspace = true
-env_logger = "0.11.6"
+env_logger.workspace = true
 geo-traits.workspace = true
 lance-datagen.workspace = true
+lance-datafusion = { workspace = true, features = ["datagen"] }
 lance-testing.workspace = true
+libc.workspace = true
 test-log.workspace = true
 rstest.workspace = true
+serial_test.workspace = true
 chrono.workspace = true
+uuid.workspace = true
 
 [features]
 geo = ["dep:lance-geo", "lance-geo/geo", "dep:geoarrow-array", "dep:geoarrow-schema", "dep:geo-types"]
@@ -96,7 +99,7 @@ tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
 
 [build-dependencies]
 prost-build.workspace = true
-protobuf-src = { version = "2.1", optional = true }
+protobuf-src = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
@@ -165,6 +168,10 @@ required-features = ["geo"]
 
 [[bench]]
 name = "residual_transform"
+harness = false
+
+[[bench]]
+name = "two_file_shuffle_read"
 harness = false
 
 [lints]

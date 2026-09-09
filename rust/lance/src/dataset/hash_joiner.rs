@@ -194,21 +194,11 @@ impl HashJoiner {
     }
 
     pub fn check_lance_support_null(array: &ArrayRef, dataset: &Dataset) -> Result<()> {
-        if array.null_count() > 0 && !dataset.lance_supports_nulls(array.data_type()) {
-            return Err(Error::invalid_input(format!(
-                "Join produced null values for type: {:?}, but storing \
-                 nulls for this data type is not supported by the \
-                 dataset's current Lance file format version: {:?}. This \
-                 can be caused by an explicit null in the new data.",
-                array.data_type(),
-                dataset
-                    .manifest()
-                    .data_storage_format
-                    .lance_file_version()
-                    .unwrap()
-            )));
-        }
-        Ok(())
+        super::versions::validate_nulls(
+            dataset.manifest().data_storage_format.lance_file_format(),
+            array.data_type(),
+            array.null_count() > 0,
+        )
     }
 
     /// Collecting the data using the index column from left table,
@@ -305,6 +295,48 @@ mod tests {
         Dataset::write(batches, &uri, None).await.unwrap();
 
         Dataset::open(&uri).await.unwrap()
+    }
+
+    #[test]
+    fn test_null_validation_is_selected_by_exact_version() {
+        use lance_file::version::ConcreteFileVersion;
+
+        assert!(
+            super::super::versions::validate_nulls(
+                ConcreteFileVersion::V1,
+                &DataType::Int32,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::versions::validate_nulls(ConcreteFileVersion::V1, &DataType::Utf8, true,)
+                .is_ok()
+        );
+        assert!(
+            super::super::versions::validate_nulls(
+                ConcreteFileVersion::V2_0,
+                &DataType::Struct(arrow_schema::Fields::empty()),
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::versions::validate_nulls(
+                ConcreteFileVersion::V2_1,
+                &DataType::Struct(arrow_schema::Fields::empty()),
+                true,
+            )
+            .is_ok()
+        );
+        assert!(
+            super::super::versions::validate_nulls(
+                ConcreteFileVersion::V1,
+                &DataType::Int32,
+                false,
+            )
+            .is_ok()
+        );
     }
 
     #[tokio::test]

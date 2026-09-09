@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 mod delete;
+mod in_place;
 mod write;
 
 use std::collections::BTreeMap;
@@ -13,6 +14,7 @@ use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 
 pub use delete::DeleteOnlyMergeInsertExec;
+pub use in_place::InPlaceMergeInsertExec;
 pub use write::FullSchemaMergeInsertExec;
 
 use super::MergeStats;

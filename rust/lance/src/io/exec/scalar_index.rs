@@ -1,22 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
     Dataset,
-    dataset::rowids::load_row_id_sequences,
+    dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids},
     index::{
         prefilter::DatasetPreFilter,
         scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
     },
 };
-use arrow_array::{Array, RecordBatch, UInt64Array};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
+    execution::memory_pool::{MemoryConsumer, MemoryReservation},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
@@ -27,7 +29,7 @@ use datafusion::{
 };
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
-use lance_core::{Error, ROW_ID_FIELD, Result, utils::address::RowAddress};
+use lance_core::{Error, ROW_ID_FIELD, Result, deepsize::DeepSizeOf, utils::address::RowAddress};
 use lance_datafusion::{
     chunker::break_stream,
     utils::{
@@ -42,7 +44,8 @@ use lance_index::{
     },
 };
 use lance_select::{
-    IndexExprResult, RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
+    IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrMask,
+    RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -58,6 +61,50 @@ impl ScalarIndexLoader for Dataset {
     ) -> Result<Arc<dyn ScalarIndex>> {
         open_named_scalar_index(self, column, index_name, metrics).await
     }
+
+    async fn row_addr_result_to_row_ids(
+        &self,
+        result: NullableIndexExprResult,
+    ) -> Result<NullableIndexExprResult> {
+        // Addresses and row ids only diverge under stable row ids; otherwise the
+        // address is the row id and there is nothing to translate.
+        if !self.manifest.uses_stable_row_ids() {
+            return Ok(result);
+        }
+
+        let NullableIndexExprResult { lower, upper, .. } = result;
+        let lower = translate_addr_mask_to_row_ids(self, lower).await?;
+        let upper = translate_addr_mask_to_row_ids(self, upper).await?;
+        Ok(NullableIndexExprResult::new(lower, upper))
+    }
+}
+
+/// Translate an address-domain [`NullableRowAddrMask`] into the row-id domain
+///
+/// Address-domain index results are always positive allow-lists (`AtMost`), so
+/// a block-list here would mean a boolean op was applied before translation,
+/// which is unsupported.
+async fn translate_addr_mask_to_row_ids(
+    dataset: &Dataset,
+    mask: NullableRowAddrMask,
+) -> Result<NullableRowAddrMask> {
+    match mask {
+        NullableRowAddrMask::AllowList(set) => Ok(NullableRowAddrMask::AllowList(
+            translate_addr_set_to_row_ids(dataset, set).await?,
+        )),
+        NullableRowAddrMask::BlockList(_) => Err(Error::internal(
+            "cannot translate a block-list address mask to the row-id domain",
+        )),
+    }
+}
+
+async fn translate_addr_set_to_row_ids(
+    dataset: &Dataset,
+    set: NullableRowAddrSet,
+) -> Result<NullableRowAddrSet> {
+    let selected = translate_addr_treemap_to_row_ids(dataset, set.selected_rows()).await?;
+    let nulls = translate_addr_treemap_to_row_ids(dataset, set.null_rows()).await?;
+    Ok(NullableRowAddrSet::new(selected, nulls))
 }
 
 /// An execution node that performs a scalar index search
@@ -103,7 +150,7 @@ impl ScalarIndexExec {
         ));
         Self {
             dataset,
-            expr,
+            expr: expr.optimize(),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,
@@ -182,10 +229,6 @@ impl ExecutionPlan for ScalarIndexExec {
         "ScalarIndexExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.result_format.schema().clone()
     }
@@ -233,11 +276,11 @@ impl ExecutionPlan for ScalarIndexExec {
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
-    ) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        Ok(datafusion::physical_plan::Statistics {
+    ) -> datafusion::error::Result<Arc<datafusion::physical_plan::Statistics>> {
+        Ok(Arc::new(datafusion::physical_plan::Statistics {
             num_rows: datafusion::common::stats::Precision::Exact(2),
             ..datafusion::physical_plan::Statistics::new_unknown(self.result_format.schema())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -267,6 +310,82 @@ pub struct IndexLookup {
     pub index_name: String,
 }
 
+const MAP_INDEX_CANDIDATES_MEMORY_CONSUMER: &str = "MapIndexExecCandidates";
+
+/// Per-address allowance for cooperative pool accounting of the retained map.
+/// This conservatively bounds its approximate [`DeepSizeOf`] growth, but is not
+/// an allocator-level peak-memory bound. The reservation is shrunk to the
+/// measured retained-map size after each input batch.
+const ROW_ADDR_INSERT_RESERVATION_BYTES: usize = 256;
+
+#[derive(Debug)]
+struct DistinctRowAddrs {
+    emitted: RowAddrTreeMap,
+    reservation: MemoryReservation,
+}
+
+impl DistinctRowAddrs {
+    fn new(reservation: MemoryReservation) -> Self {
+        Self {
+            emitted: RowAddrTreeMap::new(),
+            reservation,
+        }
+    }
+
+    fn retain_unseen(&mut self, row_addrs: &UInt64Array) -> datafusion::error::Result<UInt64Array> {
+        let initial_reservation_size = self.reservation.size();
+        // The first batch also has to account for the empty map's inline size,
+        // which is not part of the initially empty reservation.
+        let retained_size = initial_reservation_size.max(std::mem::size_of::<RowAddrTreeMap>());
+        let unaccounted_candidates = row_addrs
+            .values()
+            .iter()
+            .filter(|row_addr| !self.emitted.contains(**row_addr))
+            .count();
+        let provisional_size = unaccounted_candidates
+            .checked_mul(ROW_ADDR_INSERT_RESERVATION_BYTES)
+            .and_then(|additional| retained_size.checked_add(additional))
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::ResourcesExhausted(format!(
+                    "Candidate memory reservation overflowed for {MAP_INDEX_CANDIDATES_MEMORY_CONSUMER}"
+                ))
+            })?;
+        self.reservation.try_resize(provisional_size)?;
+
+        // Allocate output storage only after the complete retained-state
+        // reservation succeeds.
+        let mut unseen = Vec::with_capacity(unaccounted_candidates);
+        for row_addr in row_addrs.values() {
+            if self.emitted.insert(*row_addr) {
+                unseen.push(*row_addr);
+            }
+        }
+
+        let measured_size = self.emitted.deep_size_of();
+        if measured_size > provisional_size {
+            self.rollback_batch(&unseen, initial_reservation_size);
+            return Err(datafusion::error::DataFusionError::ResourcesExhausted(
+                format!(
+                    "MapIndexExecCandidates batch exceeded its {ROW_ADDR_INSERT_RESERVATION_BYTES}-byte per-candidate reservation"
+                ),
+            ));
+        }
+        self.reservation.resize(measured_size);
+        Ok(UInt64Array::from(unseen))
+    }
+
+    fn rollback_batch(&mut self, unseen: &[u64], reservation_size: usize) {
+        for row_addr in unseen {
+            let is_removed = self.emitted.remove(*row_addr);
+            debug_assert!(
+                is_removed,
+                "a newly inserted MapIndexExec candidate must be removable"
+            );
+        }
+        self.reservation.resize(reservation_size);
+    }
+}
+
 impl IndexLookup {
     pub fn new(column: impl Into<String>, index_name: impl Into<String>) -> Self {
         Self {
@@ -282,10 +401,13 @@ impl IndexLookup {
 ///
 /// Multiple `(column, index_name)` lookups can be supplied: the operator
 /// expects one input column per lookup (in matching order) and emits the
-/// row addresses where every column's value is present in its respective
-/// index — that is, the AND of the per-column index probes. This lets a
-/// composite-key join trim the candidate row set with every available
-/// scalar index before the downstream take.
+/// row addresses that could match on every column. The result is an upper
+/// bound, not an exact set — the probes are evaluated one key at a time,
+/// most-selective first, and stop as soon as the candidate set is no larger
+/// than the input batch, so a caller must still filter on the full key.
+/// This lets a composite-key join trim the candidate row set before the
+/// downstream take without paying for a probe that prunes nothing. A row
+/// address reached by more than one input batch is emitted only once.
 #[derive(Debug)]
 pub struct MapIndexExec {
     dataset: Arc<Dataset>,
@@ -332,9 +454,10 @@ impl MapIndexExec {
         )
     }
 
-    /// Build a `MapIndexExec` that probes one or more scalar indices and
-    /// emits the AND of their results. `lookups` must be non-empty and
-    /// `input` must produce one column per lookup, in the same order.
+    /// Build a `MapIndexExec` that probes one or more scalar indices and emits
+    /// an upper bound on the row addresses matching every one of them (see the
+    /// type docs). `lookups` must be non-empty and `input` must produce one
+    /// column per lookup, in the same order.
     pub fn new_multi(
         dataset: Arc<Dataset>,
         lookups: Vec<IndexLookup>,
@@ -366,11 +489,21 @@ impl MapIndexExec {
         lookups: Vec<IndexLookup>,
         index_metrics: Arc<IndexMetrics>,
         metrics_set: ExecutionPlanMetricsSet,
+        candidate_reservation: MemoryReservation,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         // A row can be found by the composite probe only if it lives in a
         // fragment covered by *every* index in `lookups`; restrict the
         // deletion mask to that intersection so we only filter deletes we
         // could actually see.
+        //
+        // This loop must keep covering every lookup even though `map_batch`
+        // may skip some probes. A skipped probe leaves candidates from
+        // fragments that its index does not cover, and the restricted mask is
+        // the only thing that then blocks them. Those fragments are read
+        // separately by the unindexed-fragment scan in
+        // `create_indexed_scan_joined_stream`, so letting candidates through
+        // would feed the same target row into the join twice, which the
+        // default `SourceDedupeBehavior::Fail` reports as an error.
         let mut fragment_bitmap: Option<RoaringBitmap> = None;
         for lookup in &lookups {
             let bm = scalar_index_fragment_bitmap(&dataset, &lookup.column, &lookup.index_name)
@@ -412,6 +545,19 @@ impl MapIndexExec {
                 Self::map_batch(lookups, dataset, deletion_mask, batch, metrics).await
             }
         });
+        let mut distinct_row_addrs = DistinctRowAddrs::new(candidate_reservation);
+        let stream = stream.and_then(move |batch| {
+            // Each batch's index result is already a set. Retain first
+            // occurrences here to make the complete candidate stream a set too.
+            let row_addrs = batch.column(0).as_primitive::<UInt64Type>();
+            let result = distinct_row_addrs
+                .retain_unseen(row_addrs)
+                .and_then(|unseen| {
+                    RecordBatch::try_new(INDEX_LOOKUP_SCHEMA.clone(), vec![Arc::new(unseen)])
+                        .map_err(datafusion::error::DataFusionError::from)
+                });
+            futures::future::ready(result)
+        });
         let stream = stream.map(move |batch| {
             let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
             match poll {
@@ -425,32 +571,43 @@ impl MapIndexExec {
         )))
     }
 
-    /// Build the AND-of-IsIn `ScalarIndexExpr` describing this batch's
-    /// composite lookup: each input column contributes one `IsIn` query
-    /// against its matching index.
-    fn build_query(
-        lookups: &[IndexLookup],
-        batch: &RecordBatch,
-    ) -> datafusion::error::Result<ScalarIndexExpr> {
-        let per_column = lookups.iter().enumerate().map(|(idx, lookup)| {
-            let column = batch.column(idx);
-            let values = (0..column.len())
-                .map(|row| ScalarValue::try_from_array(column, row))
-                .collect::<datafusion::error::Result<Vec<_>>>()?;
-            Ok::<_, datafusion::error::DataFusionError>(ScalarIndexExpr::Query(ScalarIndexSearch {
-                column: lookup.column.clone(),
-                index_name: lookup.index_name.clone(),
-                // Internal IndexedLookup-style query — type is unknown at this layer
-                index_type: String::new(),
-                query: Arc::new(SargableQuery::IsIn(values)),
-                needs_recheck: false,
-                fragment_bitmap: None,
-            }))
-        });
+    /// The values of one input column, deduped when `dedupe` is set.
+    ///
+    /// Deduping earns its keep once there is more than one key: the distinct
+    /// count doubles as the probe-ordering signal in [`Self::map_batch`], and a
+    /// repeated value only adds an `IsIn` entry that re-selects index pages
+    /// already selected. With a single key there is nothing to order, so
+    /// hashing every value would be pure overhead on the most common path.
+    ///
+    /// One NULL survives dedupe on purpose: an index reads a NULL in the list
+    /// as "also match null rows", which is a flag rather than a count.
+    fn key_values(column: &ArrayRef, dedupe: bool) -> datafusion::error::Result<Vec<ScalarValue>> {
+        let mut values = Vec::with_capacity(column.len());
+        let mut seen = HashSet::with_capacity(if dedupe { column.len() } else { 0 });
+        for row in 0..column.len() {
+            let value = ScalarValue::try_from_array(column, row)?;
+            if dedupe {
+                if seen.contains(&value) {
+                    continue;
+                }
+                seen.insert(value.clone());
+            }
+            values.push(value);
+        }
+        Ok(values)
+    }
 
-        per_column
-            .reduce(|lhs, rhs| Ok(ScalarIndexExpr::And(Box::new(lhs?), Box::new(rhs?))))
-            .expect("MapIndexExec built with no lookups")
+    /// Build the `IsIn` query for one join key against its matching index.
+    fn build_key_query(lookup: &IndexLookup, values: Vec<ScalarValue>) -> ScalarIndexExpr {
+        ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: lookup.column.clone(),
+            index_name: lookup.index_name.clone(),
+            // Internal IndexedLookup-style query — type is unknown at this layer
+            index_type: String::new(),
+            query: Arc::new(SargableQuery::IsIn(values)),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        })
     }
 
     async fn map_batch(
@@ -460,12 +617,89 @@ impl MapIndexExec {
         batch: RecordBatch,
         metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<RecordBatch> {
-        let query = Self::build_query(&lookups, &batch)?;
-        let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
-        if !query_result.is_exact() {
-            todo!("Support for non-exact query results as input for merge_insert")
+        // The operator's contract is one input column per lookup, in order (see
+        // `new_multi`). Check it here rather than letting `batch.column` panic
+        // deep inside a DataFusion stream, and check it before the probe loop:
+        // the loop can skip the offending lookup, which would turn a broken
+        // plan into a failure that depends on the data.
+        if lookups.len() != batch.num_columns() {
+            return Err(datafusion::error::DataFusionError::Internal(format!(
+                "MapIndexExec has {} lookups but its input produced {} columns",
+                lookups.len(),
+                batch.num_columns()
+            )));
         }
-        let mut row_addr_mask = query_result.upper;
+
+        // Probe the keys one at a time and intersect, rather than evaluating an
+        // AND of every probe at once. A join key whose values repeat across the
+        // target (a bucket or status column) matches most of the table, so its
+        // probe materializes a candidate set the size of the dataset while
+        // pruning almost nothing: on a 10M-row table, probing a 1024-distinct
+        // key asked for 2.4 GB of candidates.
+        // With one key there is nothing to order and nothing a second probe
+        // could intersect away, so that path stays exactly as it was.
+        let several_keys = lookups.len() > 1;
+        let mut values_per_key = Vec::with_capacity(lookups.len());
+        for column in batch.columns() {
+            values_per_key.push(Self::key_values(column, several_keys)?);
+        }
+
+        // Probe the most selective key first. The key with the most distinct
+        // source values partitions the target most finely, so its probe is the
+        // one most likely to leave a candidate set small enough to skip the
+        // rest. Following the caller's `on` order instead would run the
+        // expensive probe first, because the natural way to write a composite
+        // key is coarse-to-fine (`["tenant_id", "row_id"]`). The distinct count
+        // is a source-side proxy for target-side selectivity, and it only knows
+        // how many values a probe will look up, not how many target rows each
+        // of them matches. A skewed batch — many distinct values that each
+        // match many rows, sitting next to few values that each match few —
+        // can therefore be ordered worse than the caller wrote it. The floor is
+        // the old behaviour's probe set — run sequentially, see below — because
+        // the break only ever removes probes.
+        let mut probe_order: Vec<usize> = (0..lookups.len()).collect();
+        if several_keys {
+            // Stable, so keys with equally distinct values keep `on` order.
+            probe_order.sort_by_key(|&idx| std::cmp::Reverse(values_per_key[idx].len()));
+        }
+
+        // Stop once the candidate set is no larger than the source batch. A
+        // further probe could still remove false positives, but what is left to
+        // remove is bounded by the source batch, so it cannot save more work
+        // downstream than the probe itself costs. That bound is the point: per
+        // batch the emitted set is either the full intersection or at most
+        // `batch.num_rows()` rows, which is also what keeps the cross-batch
+        // candidate set in `DistinctRowAddrs` bounded.
+        //
+        // Skipping a probe only leaves extra candidates, never drops a match:
+        // the downstream hash join filters on the full composite key (see
+        // `create_indexed_scan_joined_stream`), the same reason an unindexed
+        // `on` column is allowed to prune nothing. Extra candidates stay inside
+        // the index-covered fragments because the restricted deletion mask
+        // applied below is built from *every* lookup's fragment bitmap.
+        //
+        // The probes run in sequence where the old `ScalarIndexExpr::And` ran
+        // them concurrently. That is the price of being able to stop, and it
+        // shows up only when no probe is skipped and the index cache is cold.
+        let source_rows = batch.num_rows() as u64;
+        // `all_rows()` is the identity for `intersect`, so the first probe
+        // needs no special case.
+        let mut row_addr_mask = RowAddrMask::all_rows();
+        for idx in probe_order {
+            if row_addr_mask
+                .max_len()
+                .is_some_and(|len| len <= source_rows)
+            {
+                break;
+            }
+            let values = std::mem::take(&mut values_per_key[idx]);
+            let query = Self::build_key_query(&lookups[idx], values);
+            let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
+            if !query_result.is_exact() {
+                todo!("Support for non-exact query results as input for merge_insert")
+            }
+            row_addr_mask = row_addr_mask.intersect(query_result.upper);
+        }
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
             row_addr_mask = row_addr_mask & deletion_mask.as_ref().clone();
@@ -487,10 +721,6 @@ impl MapIndexExec {
 impl ExecutionPlan for MapIndexExec {
     fn name(&self) -> &str {
         "MapIndexExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -523,6 +753,10 @@ impl ExecutionPlan for MapIndexExec {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        // Cross-batch deduplication retains every emitted candidate until the
+        // stream ends, so this state is not covered by per-batch reservations.
+        let candidate_reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
+            .register(context.memory_pool());
         let input = self.input.execute(partition, context)?;
         let stream_fut = Self::build_stream(
             input,
@@ -531,6 +765,7 @@ impl ExecutionPlan for MapIndexExec {
             self.lookups.clone(),
             Arc::new(IndexMetrics::new(&self.metrics, partition)),
             self.metrics.clone(),
+            candidate_reservation,
         );
         let stream = futures::stream::once(stream_fut).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -561,6 +796,10 @@ pub struct MaterializeIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
     fragments: Arc<Vec<Fragment>>,
+    /// Row addresses blocked from the index result due to data overlay files committed after the
+    /// index was built. ANDead into the candidate mask before row ID materialisation so that stale
+    /// index entries never reach downstream operators.
+    overlay_block: Option<RowAddrMask>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -633,9 +872,16 @@ impl MaterializeIndexExec {
             dataset,
             expr,
             fragments,
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Block specific row addresses (see the `overlay_block` field) from the index result.
+    pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
+        self.overlay_block = Some(block);
+        self
     }
 
     #[instrument(name = "materialize_scalar_index", skip_all, level = "debug")]
@@ -643,6 +889,7 @@ impl MaterializeIndexExec {
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        overlay_block: Option<RowAddrMask>,
         metrics: Arc<IndexMetrics>,
     ) -> Result<RecordBatch> {
         let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
@@ -670,12 +917,15 @@ impl MaterializeIndexExec {
             }
             Ok(result.upper)
         };
-        let mask = if let Some(prefilter) = prefilter {
+        let mut mask = if let Some(prefilter) = prefilter {
             let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
             take_upper(expr_result)? & (*prefilter).clone()
         } else {
             take_upper(expr_result.await?)?
         };
+        if let Some(block) = overlay_block {
+            mask = mask & block;
+        }
         let ids = row_ids_for_mask(mask, &dataset, &fragments).await?;
         let ids = UInt64Array::from(ids);
         Ok(RecordBatch::try_new(
@@ -776,10 +1026,6 @@ impl ExecutionPlan for MaterializeIndexExec {
         "MaterializeIndexExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         MATERIALIZE_INDEX_SCHEMA.clone()
     }
@@ -811,6 +1057,7 @@ impl ExecutionPlan for MaterializeIndexExec {
             self.expr.clone(),
             self.dataset.clone(),
             self.fragments.clone(),
+            self.overlay_block.clone(),
             metrics,
         );
         let stream = futures::stream::iter(vec![batch_fut])
@@ -849,13 +1096,24 @@ mod tests {
 
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
+    use arrow::record_batch::RecordBatchIterator;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::Schema;
     use datafusion::{
-        execution::TaskContext, physical_plan::ExecutionPlan, prelude::SessionConfig,
+        error::DataFusionError,
+        execution::{
+            TaskContext,
+            memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool},
+        },
+        physical_plan::ExecutionPlan,
+        prelude::SessionConfig,
         scalar::ScalarValue,
     };
     use futures::TryStreamExt;
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::{
+        deepsize::DeepSizeOf,
+        utils::{address::RowAddress, tempfile::TempStrDir},
+    };
     use lance_datagen::gen_batch;
     use lance_index::{
         IndexType,
@@ -864,15 +1122,19 @@ mod tests {
             expression::{ScalarIndexExpr, ScalarIndexSearch},
         },
     };
-    use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat};
 
     use crate::{
         Dataset,
+        dataset::WriteParams,
         io::exec::scalar_index::MaterializeIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
 
-    use super::{MapIndexExec, ScalarIndexExec};
+    use super::{
+        DistinctRowAddrs, MAP_INDEX_CANDIDATES_MEMORY_CONSUMER, MapIndexExec,
+        ROW_ADDR_INSERT_RESERVATION_BYTES, ScalarIndexExec,
+    };
 
     struct TestFixture {
         dataset: Arc<Dataset>,
@@ -910,6 +1172,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_map_index_candidates_accept_empty_first_batch() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
+        let reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER).register(&pool);
+        let mut candidates = DistinctRowAddrs::new(reservation);
+
+        let empty = candidates
+            .retain_unseen(&UInt64Array::from(Vec::<u64>::new()))
+            .unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(pool.reserved(), RowAddrTreeMap::new().deep_size_of());
+    }
+
+    #[test]
+    fn test_map_index_candidates_respect_memory_pool() {
+        let mut first_candidate = RowAddrTreeMap::new();
+        first_candidate.insert(1);
+        let first_candidate_size = first_candidate.deep_size_of();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(
+            ROW_ADDR_INSERT_RESERVATION_BYTES + first_candidate_size,
+        ));
+        let reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER).register(&pool);
+        let mut candidates = DistinctRowAddrs::new(reservation);
+
+        let first = candidates
+            .retain_unseen(&UInt64Array::from(vec![1]))
+            .unwrap();
+        assert_eq!(first.values(), &[1]);
+        assert_eq!(pool.reserved(), first_candidate_size);
+
+        let second = candidates
+            .retain_unseen(&UInt64Array::from(vec![2]))
+            .unwrap();
+        assert_eq!(second.values(), &[2]);
+        let retained_size = pool.reserved();
+        assert!(retained_size > first_candidate_size);
+
+        let error = candidates
+            .retain_unseen(&UInt64Array::from(vec![3]))
+            .unwrap_err();
+        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+        assert!(
+            error
+                .to_string()
+                .contains(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
+        );
+        assert!(candidates.emitted.contains(1));
+        assert!(candidates.emitted.contains(2));
+        assert!(!candidates.emitted.contains(3));
+        assert_eq!(pool.reserved(), retained_size);
+
+        let duplicate = candidates
+            .retain_unseen(&UInt64Array::from(vec![1, 2]))
+            .unwrap();
+        assert!(duplicate.values().is_empty());
+
+        drop(candidates);
+        assert_eq!(pool.reserved(), 0);
+    }
+
     #[tokio::test]
     async fn test_materialize_index_exec() {
         let TestFixture {
@@ -928,7 +1250,6 @@ mod tests {
             needs_recheck: false,
             fragment_bitmap: None,
         });
-
         let fragments = dataset.fragments().clone();
 
         let plan = MaterializeIndexExec::new(dataset, query, fragments);
@@ -947,6 +1268,51 @@ mod tests {
 
         assert_eq!(batches.len(), 10);
         assert_eq!(batches[0].num_rows(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_translate_addr_treemap_to_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from((0..10).collect::<Vec<_>>())) as ArrayRef,
+        )])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 5,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+            .await
+            .unwrap();
+        let fragment_id = dataset.get_fragments()[1].id() as u32;
+
+        let mut full_fragment = RowAddrTreeMap::new();
+        full_fragment.insert_fragment(fragment_id);
+        let translated = super::translate_addr_treemap_to_row_ids(&dataset, &full_fragment)
+            .await
+            .unwrap();
+        let row_ids = translated
+            .get_fragment_bitmap(0)
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(row_ids, vec![5, 6, 7, 8, 9]);
+
+        let mut partial_fragment = RowAddrTreeMap::new();
+        partial_fragment.insert(RowAddress::new_from_parts(fragment_id, 1).into());
+        partial_fragment.insert(RowAddress::new_from_parts(fragment_id, 3).into());
+        let translated = super::translate_addr_treemap_to_row_ids(&dataset, &partial_fragment)
+            .await
+            .unwrap();
+        let row_ids = translated
+            .get_fragment_bitmap(0)
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(row_ids, vec![6, 8]);
     }
 
     /// `ScalarIndexExec::schema()` (and the stream it emits) must advertise

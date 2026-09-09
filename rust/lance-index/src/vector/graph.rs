@@ -5,7 +5,7 @@
 //!
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field};
@@ -303,7 +303,6 @@ macro_rules! beam_search_loop {
         $visited:ident,
         $k:expr,
         $dist_calc:expr,
-        $prefetch_distance:expr,
         $accepts_result:expr,
         |$current:ident, $process_neighbor:ident| $visit_neighbors:block
     ) => {{
@@ -321,6 +320,10 @@ macro_rules! beam_search_loop {
                 }
                 $visited.insert(neighbor);
                 let dist: OrderedFloat = $dist_calc.distance(neighbor).into();
+                // Algorithm 2 refreshes the furthest result after every
+                // update to W, including updates made by an earlier neighbor
+                // of this same expanded node.
+                let furthest = furthest_distance(&$results);
                 if dist <= furthest || $results.len() < $k {
                     if $accepts_result(neighbor, dist) {
                         push_result(&mut $results, (dist, neighbor).into(), $k);
@@ -338,7 +341,6 @@ macro_rules! greedy_search_loop {
         $current:ident,
         $closest_dist:ident,
         $dist_calc:expr,
-        $prefetch_distance:expr,
         |$process_neighbor:ident| $visit_neighbors:block
     ) => {{
         loop {
@@ -412,7 +414,6 @@ pub fn beam_search(
             visited,
             k,
             dist_calc,
-            prefetch_distance,
             accepts_result,
             |current, process_neighbor| {
                 let neighbors = graph.neighbors(current.id);
@@ -451,7 +452,6 @@ pub fn beam_search(
         visited,
         k,
         dist_calc,
-        prefetch_distance,
         accepts_result,
         |current, process_neighbor| {
             let neighbors = graph.neighbors(current.id);
@@ -493,7 +493,6 @@ pub fn beam_search_borrowed(
             visited,
             k,
             dist_calc,
-            prefetch_distance,
             accepts_result,
             |current, process_neighbor| {
                 let neighbors = graph.neighbors(current.id);
@@ -531,7 +530,6 @@ pub fn beam_search_borrowed(
         visited,
         k,
         dist_calc,
-        prefetch_distance,
         accepts_result,
         |current, process_neighbor| {
             let neighbors = graph.neighbors(current.id);
@@ -543,6 +541,152 @@ pub fn beam_search_borrowed(
             );
         }
     );
+    results.into_sorted_vec()
+}
+
+/// Number of mask-passing nodes used to seed [beam_search_acorn]'s frontier.
+const ACORN_SEED_COUNT: usize = 16;
+
+/// Cap on starved-frontier waypoint expansions in [beam_search_acorn],
+/// as a multiple of `ef`.
+const ACORN_BRIDGE_BUDGET_FACTOR: usize = 4;
+
+/// Beam search over the mask-passing subgraph (ACORN-1).
+///
+/// Only nodes in `bitset` get distances. A filtered-out neighbor contributes
+/// its own neighbors instead, expanded once via `expanded`. Deeper masked
+/// chains are crossed through unscored waypoints under a budget. The frontier
+/// starts from the entry point plus mask-sampled seeds. May return fewer than
+/// `min(ef, passing)` results if the budget runs out, so callers needing a
+/// guarantee must check the count.
+#[allow(clippy::too_many_arguments)]
+pub fn beam_search_acorn(
+    graph: &impl BorrowingGraph,
+    ep: &OrderedNode,
+    params: &HnswQueryParams,
+    dist_calc: &impl DistCalculator,
+    bitset: &Visited,
+    prefetch_distance: Option<usize>,
+    visited: &mut Visited,
+    expanded: &mut Visited,
+) -> Vec<OrderedNode> {
+    let ef = params.ef;
+    let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
+    let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
+    let passing_total = bitset.count_ones();
+    let mut candidates = BinaryHeap::with_capacity(ef);
+    let mut results = BinaryHeap::with_capacity(ef);
+    // collected per node before scoring so prefetch targets are the ids
+    // that actually get distances
+    let mut passing: Vec<u32> = Vec::with_capacity(64);
+    // masked nodes seen two hops out, expandable if the frontier starves,
+    // deduped against `expanded` at pop rather than at push
+    let mut waypoints: VecDeque<u32> = VecDeque::new();
+    let mut bridge_budget = ACORN_BRIDGE_BUDGET_FACTOR * ef;
+
+    // the entry point seeds the traversal even if it fails the mask
+    visited.insert(ep.id);
+    candidates.push(Reverse(ep.clone()));
+    if bitset.contains(ep.id) && ep.dist >= lower_bound && ep.dist < upper_bound {
+        results.push(ep.clone());
+    }
+
+    let stride = (passing_total / ACORN_SEED_COUNT).max(1);
+    for seed in bitset.iter_ones().step_by(stride).take(ACORN_SEED_COUNT) {
+        let seed = seed as u32;
+        if visited.contains(seed) {
+            continue;
+        }
+        visited.insert(seed);
+        let dist: OrderedFloat = dist_calc.distance(seed).into();
+        if dist >= lower_bound && dist < upper_bound {
+            push_result(&mut results, (dist, seed).into(), ef);
+        }
+        candidates.push(Reverse((dist, seed).into()));
+    }
+
+    loop {
+        let Some(Reverse(current)) = candidates.pop() else {
+            // frontier starved: burn bridge budget through masked waypoints
+            // until a new passing node is found
+            if results.len() >= ef.min(passing_total) {
+                break;
+            }
+            let mut found = false;
+            while let Some(waypoint) = waypoints.pop_front() {
+                if bridge_budget == 0 {
+                    break;
+                }
+                if expanded.contains(waypoint) {
+                    continue;
+                }
+                expanded.insert(waypoint);
+                bridge_budget -= 1;
+                for &neighbor in graph.neighbors(waypoint) {
+                    if bitset.contains(neighbor) {
+                        if !visited.contains(neighbor) {
+                            visited.insert(neighbor);
+                            let dist: OrderedFloat = dist_calc.distance(neighbor).into();
+                            if dist >= lower_bound && dist < upper_bound {
+                                push_result(&mut results, (dist, neighbor).into(), ef);
+                            }
+                            candidates.push(Reverse((dist, neighbor).into()));
+                            found = true;
+                        }
+                    } else if !expanded.contains(neighbor) {
+                        waypoints.push_back(neighbor);
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+            if !found {
+                break;
+            }
+            continue;
+        };
+        if current.dist > furthest_distance(&results) && results.len() == ef {
+            break;
+        }
+
+        passing.clear();
+        for &neighbor in graph.neighbors(current.id) {
+            if bitset.contains(neighbor) {
+                if !visited.contains(neighbor) {
+                    visited.insert(neighbor);
+                    passing.push(neighbor);
+                }
+            } else if !expanded.contains(neighbor) {
+                expanded.insert(neighbor);
+                for &second_hop in graph.neighbors(neighbor) {
+                    if bitset.contains(second_hop) {
+                        if !visited.contains(second_hop) {
+                            visited.insert(second_hop);
+                            passing.push(second_hop);
+                        }
+                    } else if !expanded.contains(second_hop) {
+                        waypoints.push_back(second_hop);
+                    }
+                }
+            }
+        }
+
+        process_neighbors_with_look_ahead(
+            &passing,
+            |node| {
+                let dist: OrderedFloat = dist_calc.distance(node).into();
+                if dist <= furthest_distance(&results) || results.len() < ef {
+                    if dist >= lower_bound && dist < upper_bound {
+                        push_result(&mut results, (dist, node).into(), ef);
+                    }
+                    candidates.push(Reverse((dist, node).into()));
+                }
+            },
+            prefetch_distance,
+            dist_calc,
+        );
+    }
     results.into_sorted_vec()
 }
 
@@ -572,21 +716,15 @@ pub fn greedy_search(
 ) -> OrderedNode {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
-    greedy_search_loop!(
-        current,
-        closest_dist,
-        dist_calc,
-        prefetch_distance,
-        |process_neighbor| {
-            let neighbors = graph.neighbors(current);
-            process_neighbors_with_look_ahead(
-                &neighbors,
-                process_neighbor,
-                prefetch_distance,
-                dist_calc,
-            );
-        }
-    );
+    greedy_search_loop!(current, closest_dist, dist_calc, |process_neighbor| {
+        let neighbors = graph.neighbors(current);
+        process_neighbors_with_look_ahead(
+            &neighbors,
+            process_neighbor,
+            prefetch_distance,
+            dist_calc,
+        );
+    });
     OrderedNode::new(current, closest_dist.into())
 }
 
@@ -598,23 +736,168 @@ pub fn greedy_search_borrowed(
 ) -> OrderedNode {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
-    greedy_search_loop!(
-        current,
-        closest_dist,
-        dist_calc,
-        prefetch_distance,
-        |process_neighbor| {
-            let neighbors = graph.neighbors(current);
-            process_neighbors_with_look_ahead(
-                neighbors,
-                process_neighbor,
-                prefetch_distance,
-                dist_calc,
-            );
-        }
-    );
+    greedy_search_loop!(current, closest_dist, dist_calc, |process_neighbor| {
+        let neighbors = graph.neighbors(current);
+        process_neighbors_with_look_ahead(
+            neighbors,
+            process_neighbor,
+            prefetch_distance,
+            dist_calc,
+        );
+    });
     OrderedNode::new(current, closest_dist.into())
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    struct ChainGraph {
+        neighbors: Vec<Vec<u32>>,
+    }
+
+    impl BorrowingGraph for ChainGraph {
+        fn len(&self) -> usize {
+            self.neighbors.len()
+        }
+
+        fn neighbors(&self, key: u32) -> &[u32] {
+            &self.neighbors[key as usize]
+        }
+    }
+
+    struct ZeroDistance;
+
+    impl DistCalculator for ZeroDistance {
+        fn distance(&self, _id: u32) -> f32 {
+            0.0
+        }
+
+        fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
+            Vec::new()
+        }
+    }
+
+    struct CountingDistCalculator<'a> {
+        distances: &'a [f32],
+        computations: Cell<usize>,
+    }
+
+    impl DistCalculator for CountingDistCalculator<'_> {
+        fn distance(&self, id: u32) -> f32 {
+            self.computations.set(self.computations.get() + 1);
+            self.distances[id as usize]
+        }
+
+        fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
+            self.distances.to_vec()
+        }
+    }
+
+    #[test]
+    fn test_beam_search_refreshes_furthest_neighbor_bound() {
+        // The entry point is closer than the first candidates. Once those
+        // candidates fill W, its furthest distance grows from 1 to 10. The
+        // next neighbor must be compared with that new bound so it can enter
+        // the candidate queue and lead the search to node 4.
+        let graph = ChainGraph {
+            neighbors: vec![vec![1, 2, 3], vec![], vec![], vec![4], vec![]],
+        };
+        let distances = [1.0, 10.0, 9.0, 8.0, 7.0];
+        let dist_calc = CountingDistCalculator {
+            distances: &distances,
+            computations: Cell::new(0),
+        };
+        let params = HnswQueryParams {
+            ef: 3,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let entry = OrderedNode::new(0, distances[0].into());
+        let mut visited_generator = VisitedGenerator::new(graph.len());
+
+        let results = beam_search_borrowed(
+            &graph,
+            &entry,
+            &params,
+            &dist_calc,
+            None,
+            None,
+            &mut visited_generator.generate(graph.len()),
+        );
+
+        assert_eq!(
+            results.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![0, 4, 3]
+        );
+        assert_eq!(dist_calc.computations.get(), 4);
+    }
+
+    /// Passing components joined only through chains of two masked nodes
+    /// must still all be found (from review: without waypoint expansion
+    /// only the seeded nodes return).
+    #[test]
+    fn test_acorn_reaches_across_masked_chains() {
+        const PASSING_COUNT: usize = 20;
+        const FAILING_COUNT: usize = (PASSING_COUNT - 1) * 2;
+        let mut neighbors = vec![Vec::new(); PASSING_COUNT + FAILING_COUNT];
+        for index in 0..PASSING_COUNT - 1 {
+            let left = index as u32;
+            let first_failing = (PASSING_COUNT + index * 2) as u32;
+            let second_failing = first_failing + 1;
+            let right = left + 1;
+
+            neighbors[left as usize].push(first_failing);
+            neighbors[first_failing as usize].extend([left, second_failing]);
+            neighbors[second_failing as usize].extend([first_failing, right]);
+            neighbors[right as usize].push(second_failing);
+        }
+        let graph = ChainGraph { neighbors };
+        let params = HnswQueryParams {
+            ef: 30,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let entry = OrderedNode::new(0, 0.0.into());
+
+        let mut mask_generator = VisitedGenerator::new(graph.len());
+        let mut mask = mask_generator.generate(graph.len());
+        for id in 0..PASSING_COUNT as u32 {
+            mask.insert(id);
+        }
+
+        let mut acorn_visited_generator = VisitedGenerator::new(graph.len());
+        let mut acorn_expanded_generator = VisitedGenerator::new(graph.len());
+        let acorn_results = beam_search_acorn(
+            &graph,
+            &entry,
+            &params,
+            &ZeroDistance,
+            &mask,
+            None,
+            &mut acorn_visited_generator.generate(graph.len()),
+            &mut acorn_expanded_generator.generate(graph.len()),
+        );
+
+        let mut basic_visited_generator = VisitedGenerator::new(graph.len());
+        let basic_results = beam_search_borrowed(
+            &graph,
+            &entry,
+            &params,
+            &ZeroDistance,
+            Some(&mask),
+            None,
+            &mut basic_visited_generator.generate(graph.len()),
+        );
+
+        assert_eq!(basic_results.len(), PASSING_COUNT);
+        assert_eq!(acorn_results.len(), PASSING_COUNT);
+        assert!(acorn_results.iter().all(|node| mask.contains(node.id)));
+    }
+}

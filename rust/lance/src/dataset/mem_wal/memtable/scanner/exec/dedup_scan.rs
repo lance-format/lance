@@ -16,7 +16,6 @@
 //! forward-aligned mask. A single `filter_record_batch` over the original
 //! batch then emits the survivors with no per-column reverse copy.
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -44,7 +43,7 @@ use crate::dataset::mem_wal::write::BatchStore;
 /// that satisfy the (optional) predicate. See the module doc.
 pub struct MemTableDedupScanExec {
     batch_store: Arc<BatchStore>,
-    max_visible_batch_position: usize,
+    readable_count: usize,
     /// Column indices to project (into the source schema).
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
@@ -62,10 +61,7 @@ pub struct MemTableDedupScanExec {
 impl Debug for MemTableDedupScanExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemTableDedupScanExec")
-            .field(
-                "max_visible_batch_position",
-                &self.max_visible_batch_position,
-            )
+            .field("readable_count", &self.readable_count)
             .field("projection", &self.projection)
             .field("pk_indices", &self.pk_indices)
             .field("with_row_address", &self.with_row_address)
@@ -79,7 +75,7 @@ impl MemTableDedupScanExec {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         batch_store: Arc<BatchStore>,
-        max_visible_batch_position: usize,
+        readable_count: usize,
         projection: Option<Vec<usize>>,
         output_schema: SchemaRef,
         pk_indices: Vec<usize>,
@@ -97,7 +93,7 @@ impl MemTableDedupScanExec {
 
         Self {
             batch_store,
-            max_visible_batch_position,
+            readable_count,
             projection,
             output_schema,
             pk_indices,
@@ -155,10 +151,6 @@ impl ExecutionPlan for MemTableDedupScanExec {
         "MemTableDedupScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -188,7 +180,7 @@ impl ExecutionPlan for MemTableDedupScanExec {
         // back-to-front below.
         let mut batches = self
             .batch_store
-            .visible_batches_with_offsets(self.max_visible_batch_position);
+            .visible_batches_with_offsets(self.readable_count);
         batches.reverse();
 
         let projection = self.projection.clone();
@@ -280,12 +272,12 @@ impl ExecutionPlan for MemTableDedupScanExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
             column_statistics: vec![],
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -347,7 +339,7 @@ mod tests {
     /// Run the exec and collect (id -> (value, rowaddr)).
     async fn run(
         store: Arc<BatchStore>,
-        max_visible: usize,
+        readable_count: usize,
         filter: Option<Expr>,
     ) -> HashMap<i32, (Option<i32>, u64)> {
         let filter_predicate = filter.map(|expr| {
@@ -358,7 +350,7 @@ mod tests {
         let filter_expr = None;
         let exec = MemTableDedupScanExec::new(
             store,
-            max_visible,
+            readable_count,
             None,
             output_schema(),
             vec![0],
@@ -392,11 +384,11 @@ mod tests {
         // id=10 inserted (100) then updated to NULL, all in one batch.
         store.append(batch(&[(10, Some(100)), (10, None)])).unwrap();
 
-        let no_filter = run(store.clone(), 0, None).await;
+        let no_filter = run(store.clone(), 1, None).await;
         assert_eq!(no_filter.len(), 1);
         assert_eq!(no_filter[&10].0, None, "newest version of id=10 is NULL");
 
-        let not_null = run(store, 0, Some(col("value").is_not_null())).await;
+        let not_null = run(store, 1, Some(col("value").is_not_null())).await;
         assert!(
             !not_null.contains_key(&10),
             "id=10 newest is NULL; the stale value=100 must not leak under value IS NOT NULL"
@@ -413,7 +405,7 @@ mod tests {
         store.append(batch(&[(20, Some(999)), (30, None)])).unwrap();
 
         // No filter: newest per PK = {10:NULL@2, 20:999@3, 30:NULL@4}.
-        let all = run(store.clone(), 1, None).await;
+        let all = run(store.clone(), 2, None).await;
         assert_eq!(all.len(), 3);
         assert_eq!(all[&10], (None, 2));
         assert_eq!(all[&20], (Some(999), 3));
@@ -421,7 +413,7 @@ mod tests {
 
         // value IS NOT NULL: only id=20 (newest 999) survives; 10 and 30 are
         // newest-NULL so they must be absent (no stale leak).
-        let not_null = run(store, 1, Some(col("value").is_not_null())).await;
+        let not_null = run(store, 2, Some(col("value").is_not_null())).await;
         assert_eq!(not_null.len(), 1);
         assert_eq!(not_null[&20], (Some(999), 3));
     }
@@ -434,7 +426,7 @@ mod tests {
         // id=40 inserted NULL then updated to 400 (newest non-NULL).
         store.append(batch(&[(40, None), (40, Some(400))])).unwrap();
 
-        let is_null = run(store, 0, Some(col("value").is_null())).await;
+        let is_null = run(store, 1, Some(col("value").is_null())).await;
         assert!(
             !is_null.contains_key(&40),
             "id=40 newest is 400; the stale NULL must not leak under value IS NULL"

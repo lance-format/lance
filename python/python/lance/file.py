@@ -26,6 +26,7 @@ from .lance import (
 )
 
 if TYPE_CHECKING:
+    from .blob import DedicatedBlobWriter, PackedBlobWriter
     from .namespace import LanceNamespace
 
 
@@ -332,6 +333,24 @@ class LanceFileSession:
             _inner_writer=inner,
         )
 
+    def open_packed_blob_writer(self, path: str, blob_id: int) -> "PackedBlobWriter":
+        """
+        Opens a packed blob writer for the given data file path.
+
+        The path will be appended to the base path of the session.
+        """
+        return self._session.open_packed_blob_writer(path, blob_id)
+
+    def open_dedicated_blob_writer(
+        self, path: str, blob_id: int
+    ) -> "DedicatedBlobWriter":
+        """
+        Opens a dedicated blob writer for the given data file path.
+
+        The path will be appended to the base path of the session.
+        """
+        return self._session.open_dedicated_blob_writer(path, blob_id)
+
     def contains(self, path: str) -> bool:
         """
         Check if a file exists at the given path (relative to this session's base path).
@@ -463,6 +482,12 @@ class LanceFileWriter:
     This class is used to write Lance data files, a low level structure
     optimized for storing multi-modal tabular data.  If you are working with
     Lance datasets then you should use the LanceDataset class instead.
+
+    Attributes
+    ----------
+    size_bytes: Optional[int]
+        The final size of the file in bytes.  This is None until `close` is
+        called.
     """
 
     def __init__(
@@ -529,6 +554,7 @@ class LanceFileWriter:
                 **kwargs,
             )
         self.closed = False
+        self.size_bytes: Optional[int] = None
 
     def write_batch(self, batch: Union[pa.RecordBatch, pa.Table]) -> None:
         """
@@ -550,11 +576,17 @@ class LanceFileWriter:
         Write the file metadata and close the file
 
         Returns the number of rows written to the file
+
+        After this returns, ``size_bytes`` holds the final size of the file.  This
+        is reported by the writer itself, so it is available for object stores
+        without issuing a separate metadata request.
         """
         if self.closed:
             return
         self.closed = True
-        return self._writer.finish()
+        summary = self._writer.finish()
+        self.size_bytes = summary.size_bytes
+        return summary.num_rows
 
     def add_schema_metadata(self, key: str, value: str) -> None:
         """

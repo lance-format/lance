@@ -87,7 +87,7 @@ import pyarrow as pa
 # Open dataset
 ds = lance.dataset("/tmp/test.lance")
 
-# Create branch from latest version (default: current branch's latest)
+# Create branch from the currently checked-out version
 experiment_branch = ds.create_branch("experiment")
 experimental_data = pa.Table.from_pydict({"a": [11], "b": [12]})
 lance.write_dataset(experimental_data, experiment_branch, mode="append")

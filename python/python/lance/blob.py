@@ -8,11 +8,28 @@ from typing import IO, Any, Iterator, Optional, Union
 
 import pyarrow as pa
 
-from .lance import LanceBlobFile
+from .lance import (
+    BlobDescriptor as BlobDescriptor,
+)
+from .lance import (
+    BlobDescriptorArrayBuilder as BlobDescriptorArrayBuilder,
+)
+from .lance import (
+    DedicatedBlobWriter as DedicatedBlobWriter,
+)
+from .lance import (
+    LanceBlobFile,
+)
+from .lance import (
+    PackedBlobWriter as PackedBlobWriter,
+)
 
 _BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"
 _BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY = (
     b"lance-encoding:blob-dedicated-size-threshold"
+)
+_BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY = (
+    b"lance-encoding:blob-pack-file-size-threshold"
 )
 _MAX_RUST_USIZE = ctypes.c_size_t(-1).value
 
@@ -24,8 +41,10 @@ class Blob:
 
     A blob can be represented as:
     - inline bytes
-    - an external URI with position and size, if position and size are not set,
-      use the full uri.
+    - an external URI, optionally with a non-empty range
+
+    Every blob must use exactly one representation. Use ``None`` for a null
+    blob and :meth:`empty` for a valid empty blob.
     """
 
     data: Optional[bytes] = None
@@ -48,6 +67,10 @@ class Blob:
             raise ValueError(
                 "Blob cannot have both inline data and external slice metadata"
             )
+        if self.data is None and self.uri is None:
+            raise ValueError("Blob must set `data` or `uri`; use None for a null blob")
+        if self.size == 0:
+            raise ValueError("External blob range size must be greater than zero")
 
     @staticmethod
     def from_bytes(data: Union[bytes, bytearray, memoryview]) -> "Blob":
@@ -73,7 +96,13 @@ class BlobType(pa.ExtensionType):
     A PyArrow extension type for Lance blob columns.
 
     This is the "logical" type users write. Lance will store it in a compact
-    descriptor format, and reads will return descriptors by default.
+    descriptor format, and reads will return descriptors by default. Its storage
+    type defaults to ``Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?,
+    size: UInt64?>``. Arrow deserialization also preserves the accepted minimal
+    ``Struct<data: LargeBinary?, uri: Utf8?>`` storage type. ``position`` and
+    ``size`` select a range within an external ``uri`` and must either both be set
+    or both be null. When set, ``size`` must be greater than zero. Every non-null
+    value must set exactly one of ``data`` and ``uri``.
     """
 
     def __init__(self) -> None:
@@ -90,11 +119,47 @@ class BlobType(pa.ExtensionType):
     def __arrow_ext_serialize__(self) -> bytes:
         return b""
 
+    @staticmethod
+    def _validate_storage_type(storage_type: pa.DataType) -> None:
+        if not pa.types.is_struct(storage_type):
+            raise TypeError("BlobType storage type must be a struct")
+
+        fields = list(storage_type)
+        if len(fields) not in (2, 4):
+            raise TypeError(
+                "BlobType storage struct must contain either data/uri or "
+                "data/uri/position/size"
+            )
+
+        expected_fields = [
+            ("data", pa.large_binary()),
+            ("uri", pa.utf8()),
+            ("position", pa.uint64()),
+            ("size", pa.uint64()),
+        ]
+        for index, field in enumerate(fields):
+            expected_name, expected_type = expected_fields[index]
+            if field.name != expected_name or field.type != expected_type:
+                raise TypeError(
+                    "BlobType storage field "
+                    f"{index} must be {expected_name}: {expected_type}, got "
+                    f"{field.name}: {field.type}"
+                )
+            if index < 2 and not field.nullable:
+                raise TypeError(f"BlobType storage field {field.name} must be nullable")
+
+    @classmethod
+    def _from_storage_type(cls, storage_type: pa.DataType) -> "BlobType":
+        cls._validate_storage_type(storage_type)
+        instance = cls.__new__(cls)
+        pa.ExtensionType.__init__(instance, storage_type, "lance.blob.v2")
+        return instance
+
     @classmethod
     def __arrow_ext_deserialize__(
         cls, storage_type: pa.DataType, serialized: bytes
     ) -> "BlobType":
-        return BlobType()
+        return cls._from_storage_type(storage_type)
 
     def __arrow_ext_class__(self):
         return BlobArray
@@ -217,9 +282,17 @@ def blob_field(
     nullable: bool = True,
     inline_size_threshold: Optional[int] = None,
     dedicated_size_threshold: Optional[int] = None,
+    pack_file_size_threshold: Optional[int] = None,
 ) -> pa.Field:
     """
     Construct an Arrow field for a Lance blob column.
+
+    The returned field uses the complete logical blob shape
+    ``Struct<data: LargeBinary?, uri: Utf8?, position: UInt64?, size: UInt64?>``.
+    Every non-null value must set exactly one of ``data`` and ``uri``. External
+    ranges must set both ``position`` and a positive ``size``. Lance preserves
+    this logical schema across create, append, and merge-insert writes while
+    storing compact descriptors internally.
 
     Parameters
     ----------
@@ -234,14 +307,24 @@ def blob_field(
         Maximum payload size in bytes to store in packed blob storage before
         using dedicated blob storage. This threshold is checked before
         ``inline_size_threshold``.
+    pack_file_size_threshold : optional, int
+        Maximum size in bytes of a single packed blob sidecar (``.pack``) file.
+        Once a sidecar reaches this size a new one is started.
     """
     _validate_threshold("inline_size_threshold", inline_size_threshold, allow_zero=True)
     _validate_threshold(
         "dedicated_size_threshold", dedicated_size_threshold, allow_zero=False
     )
+    _validate_threshold(
+        "pack_file_size_threshold", pack_file_size_threshold, allow_zero=False
+    )
 
     field = pa.field(name, BlobType(), nullable=nullable)
-    if inline_size_threshold is None and dedicated_size_threshold is None:
+    if (
+        inline_size_threshold is None
+        and dedicated_size_threshold is None
+        and pack_file_size_threshold is None
+    ):
         return field
 
     metadata = dict(field.metadata or {})
@@ -252,6 +335,10 @@ def blob_field(
     if dedicated_size_threshold is not None:
         metadata[_BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY] = str(
             dedicated_size_threshold
+        ).encode()
+    if pack_file_size_threshold is not None:
+        metadata[_BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY] = str(
+            pack_file_size_threshold
         ).encode()
     return field.with_metadata(metadata)
 
@@ -273,9 +360,11 @@ class BlobColumn:
     file-like objects.
 
     This can be useful for working with medium-to-small binary objects that need
-    to interface with APIs that expect file-like objects.  For very large binary
-    objects (4-8MB or more per value) you might be better off creating a blob column
-    and using :py:meth:`lance.Dataset.take_blobs` to access the blob data.
+    to interface with APIs that expect file-like objects. For very large binary
+    objects (4-8MB or more per value) you might be better off creating a blob
+    column. Use :py:meth:`lance.Dataset.read_blobs` when you need complete blob
+    bytes, or :py:meth:`lance.Dataset.take_blobs` when you need lazy file-like
+    access.
     """
 
     def __init__(self, blob_column: Union[pa.Array, pa.ChunkedArray]):
@@ -348,6 +437,28 @@ class BlobFile(io.RawIOBase):
     def read_range(self, offset: int, length: int) -> bytes:
         """Read a blob-local byte range without changing the current cursor."""
         return self.inner.read_range(offset, length)
+
+    def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
+        """
+        Read multiple blob-local byte ranges without changing the current cursor.
+
+        Each range is an ``(offset, length)`` pair, matching
+        :py:meth:`read_range`. The underlying physical reads may be reordered,
+        coalesced, or split for efficiency. For every range, offset plus length
+        must fit in an unsigned 64-bit integer and must not extend beyond the
+        blob size.
+
+        Parameters
+        ----------
+        ranges : List[Tuple[int, int]]
+            The ``(offset, length)`` byte ranges to read.
+
+        Returns
+        -------
+        data : List[bytes]
+            One payload per requested range, in input order.
+        """
+        return self.inner.read_ranges(ranges)
 
     def readinto(self, b: bytearray) -> int:
         return self.inner.read_into(b)

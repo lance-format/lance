@@ -10,21 +10,21 @@
 //! - [`BloomFilterGuardExec`]: Guards child execution with bloom filter check
 //! - [`CoalesceFirstExec`]: Returns first non-empty result with short-circuit
 //! - [`PkBlockFilterExec`]: Drops rows whose PK was superseded by a newer generation (the cross-generation block-list)
-//! - [`NewestPkFilterExec`]: Drops active-memtable hits that aren't the newest visible version of their PK (the within-source recency filter)
+//! - [`SchemaRelabelExec`]: Re-labels batches to an exact schema (the logical/storage nullability boundary)
 
 mod bloom_guard;
 mod coalesce_first;
 mod generation_tag;
-mod newest_pk_filter;
 mod pk;
 mod pk_block_filter;
+mod schema_relabel;
 
 pub use bloom_guard::{BloomFilterGuardExec, compute_pk_hash_from_scalars};
 pub use coalesce_first::CoalesceFirstExec;
 pub use generation_tag::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec};
-pub use newest_pk_filter::NewestPkFilterExec;
 pub use pk::{
     ROW_ADDRESS_COLUMN, compute_pk_hash, is_supported_pk_type, resolve_pk_indices,
     validate_pk_types,
 };
 pub use pk_block_filter::PkBlockFilterExec;
+pub use schema_relabel::SchemaRelabelExec;

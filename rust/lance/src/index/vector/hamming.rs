@@ -5,36 +5,299 @@
 //!
 //! This module provides functionality to perform pairwise hamming distance
 //! computation and clustering on specific partitions of IVF_FLAT indices.
+//!
+//! A logical IVF_FLAT index may consist of multiple physical segments (e.g.
+//! delta segments created by `optimize_indices` in append mode, or segments
+//! committed by distributed index builds). All segments of one logical index
+//! are assumed to share the same global IVF centroids, so one partition id
+//! refers to the same centroid region in every segment; this is validated and
+//! an error is returned if the centroids differ.
 
+use std::sync::Arc;
 use std::time::Instant;
 
-use arrow_array::RecordBatchReader;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
+use arrow_array::{Array, FixedSizeListArray, RecordBatchReader};
 use arrow_schema::DataType;
 use lance_core::{Error, Result};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::VectorIndex;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex};
 use lance_index::vector::flat::storage::FLAT_COLUMN;
+use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::storage::VectorStore;
 use lance_linalg::distance::{
-    ClusteringResult, cluster_pairwise_result, extract_hashes_from_fixed_list,
+    BinaryHashValues, ClusteringResult, cluster_pairwise_result,
+    extract_binary_hashes_from_fixed_list, pairwise_hamming_distance_binary_parallel,
     pairwise_hamming_distance_parallel,
 };
+use lance_table::format::IndexMetadata;
 use rand::rng;
 use rand::seq::index::sample;
+use uuid::Uuid;
 
 use crate::dataset::Dataset;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, filter_index_segments_by_ids};
 
 use super::ivf::v2::IVFIndex;
 
+/// One opened physical segment of a logical IVF_FLAT binary index.
+struct HashIndexSegment {
+    metadata: IndexMetadata,
+    index: Arc<dyn VectorIndex>,
+}
+
+impl HashIndexSegment {
+    fn ivf_flat_bin(&self) -> &IVFIndex<FlatIndex, FlatBinQuantizer> {
+        self.index
+            .as_any()
+            .downcast_ref::<IVFIndex<FlatIndex, FlatBinQuantizer>>()
+            .expect("segment type validated in open_hash_index_segments")
+    }
+}
+
+/// Validate that a column stores fixed-width binary hashes as
+/// `FixedSizeList<UInt8, N>`, where `N` is a positive multiple of 8 bytes.
+fn validate_hash_column(column: &str, data_type: &DataType) -> Result<usize> {
+    match data_type {
+        DataType::FixedSizeList(inner, size) if *inner.data_type() == DataType::UInt8 => {
+            if *size <= 0 || !(*size as usize).is_multiple_of(8) {
+                return Err(Error::invalid_input(format!(
+                    "Column '{}' must be FixedSizeList<UInt8, N> where N is a positive \
+                     multiple of 8 bytes, got FixedSizeList<UInt8, {}>",
+                    column, size
+                )));
+            }
+            Ok(*size as usize)
+        }
+        DataType::FixedSizeList(inner, size) => Err(Error::invalid_input(format!(
+            "Column '{}' must be FixedSizeList<UInt8, N> where N is a positive \
+             multiple of 8 bytes, got FixedSizeList<{:?}, {}>",
+            column,
+            inner.data_type(),
+            size
+        ))),
+        _ => Err(Error::invalid_input(format!(
+            "Column '{}' must be FixedSizeList<UInt8, N> where N is a positive \
+             multiple of 8 bytes, got {:?}",
+            column, data_type
+        ))),
+    }
+}
+
+/// Validate that every segment of a logical IVF index shares the same global
+/// centroids, so one partition id refers to the same centroid region in each
+/// segment. Fails if any segment has no centroids or diverging centroids.
+fn validate_shared_centroids<'a>(
+    index_name: &str,
+    models: impl IntoIterator<Item = (Uuid, &'a IvfModel)>,
+) -> Result<()> {
+    struct Reference<'a> {
+        uuid: Uuid,
+        num_partitions: usize,
+        centroids: &'a FixedSizeListArray,
+    }
+
+    let mut reference: Option<Reference<'a>> = None;
+    for (uuid, model) in models {
+        let centroids = model.centroids_array().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Index '{}' segment {} has no IVF centroids; hamming clustering requires \
+                 segments built from a shared global IVF model",
+                index_name, uuid
+            ))
+        })?;
+        match &reference {
+            None => {
+                reference = Some(Reference {
+                    uuid,
+                    num_partitions: model.num_partitions(),
+                    centroids,
+                });
+            }
+            Some(reference) => {
+                if centroids.to_data() != reference.centroids.to_data() {
+                    return Err(Error::invalid_input(format!(
+                        "Index '{}' segments do not share the same global IVF centroids: \
+                         segment {} ({} partitions) differs from segment {} ({} partitions); \
+                         retrain the index to merge segments before hamming clustering",
+                        index_name,
+                        uuid,
+                        model.num_partitions(),
+                        reference.uuid,
+                        reference.num_partitions
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open the physical segments of a logical IVF_FLAT binary index.
+///
+/// When `segment_ids` is `None` all segments are opened; otherwise only the
+/// requested segments are opened and every requested id must exist. Validates
+/// that all selected segments index the same fixed-width binary hash column,
+/// are IVF_FLAT indices for binary data, and share the same global centroids.
+async fn open_hash_index_segments(
+    dataset: &Dataset,
+    index_name: &str,
+    segment_ids: Option<&[Uuid]>,
+) -> Result<Vec<HashIndexSegment>> {
+    let metadatas = dataset.load_indices_by_name(index_name).await?;
+    if metadatas.is_empty() {
+        return Err(Error::invalid_input(format!(
+            "Index '{}' not found on dataset",
+            index_name
+        )));
+    }
+
+    let metadatas = match segment_ids {
+        None => metadatas,
+        Some(segment_ids) => {
+            if segment_ids.is_empty() {
+                return Err(Error::invalid_input(format!(
+                    "Segment selection for index '{}' must not be empty; \
+                     omit index_segments to use all segments",
+                    index_name
+                )));
+            }
+            filter_index_segments_by_ids(index_name, metadatas, segment_ids)?
+        }
+    };
+
+    let fields = metadatas[0].fields.clone();
+    if let Some(mismatched) = metadatas.iter().find(|meta| meta.fields != fields) {
+        return Err(Error::invalid_input(format!(
+            "Index '{}' segments cover different fields: segment {} covers {:?} \
+             while segment {} covers {:?}",
+            index_name, metadatas[0].uuid, fields, mismatched.uuid, mismatched.fields
+        )));
+    }
+
+    let field_id = fields
+        .first()
+        .ok_or_else(|| Error::invalid_input(format!("Index '{}' has no fields", index_name)))?;
+    let schema = dataset.schema();
+    let field = schema.field_by_id(*field_id).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Field with id {} not found in schema for index '{}'",
+            field_id, index_name
+        ))
+    })?;
+    validate_hash_column(&field.name, &field.data_type())?;
+
+    let mut segments = Vec::with_capacity(metadatas.len());
+    for metadata in metadatas {
+        let index = dataset
+            .open_vector_index(&field.name, &metadata.uuid, &NoOpMetricsCollector)
+            .await?;
+        if index
+            .as_any()
+            .downcast_ref::<IVFIndex<FlatIndex, FlatBinQuantizer>>()
+            .is_none()
+        {
+            return Err(Error::invalid_input(format!(
+                "Index '{}' segment {} is not an IVF_FLAT index for binary data",
+                index_name, metadata.uuid
+            )));
+        }
+        segments.push(HashIndexSegment { metadata, index });
+    }
+
+    validate_shared_centroids(
+        index_name,
+        segments
+            .iter()
+            .map(|segment| (segment.metadata.uuid, segment.ivf_flat_bin().ivf_model())),
+    )?;
+
+    Ok(segments)
+}
+
+async fn hamming_clustering_for_ivf_partition_impl(
+    dataset: &Dataset,
+    index_name: &str,
+    segment_ids: Option<&[Uuid]>,
+    partition_id: usize,
+    hamming_threshold: u32,
+) -> Result<Box<dyn RecordBatchReader + Send>> {
+    let segments = open_hash_index_segments(dataset, index_name, segment_ids).await?;
+
+    // All segments share centroids, so the partition count is uniform.
+    let num_partitions = segments[0].ivf_flat_bin().ivf_model().num_partitions();
+    if partition_id >= num_partitions {
+        return Err(Error::invalid_input(format!(
+            "Partition ID {} is out of range (0..{})",
+            partition_id, num_partitions
+        )));
+    }
+
+    // Concatenate the partition's row ids and hashes across segments; identical
+    // hashes land in the same partition of every segment, so one pairwise pass
+    // over the union finds cross-segment duplicates.
+    let mut all_row_ids: Vec<u64> = Vec::new();
+    let mut hash_chunks = Vec::new();
+    let mut num_hashes = 0;
+    for segment in &segments {
+        let storage = segment
+            .ivf_flat_bin()
+            .load_partition_storage(partition_id, None)
+            .await?;
+        all_row_ids.extend(storage.row_ids().copied());
+        for batch in storage.to_batches()? {
+            let vectors = batch
+                .column_by_name(FLAT_COLUMN)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("Column '{}' not found in storage", FLAT_COLUMN))
+                })?
+                .as_fixed_size_list();
+            let hashes = extract_binary_hashes_from_fixed_list(vectors)?;
+            num_hashes += hashes.len();
+            hash_chunks.push(hashes);
+        }
+        if all_row_ids.len() != num_hashes {
+            return Err(Error::internal(format!(
+                "Index '{}' segment {} partition {}: row id count {} does not match hash count {}",
+                index_name,
+                segment.metadata.uuid,
+                partition_id,
+                all_row_ids.len(),
+                num_hashes
+            )));
+        }
+    }
+
+    if all_row_ids.is_empty() {
+        let empty = ClusteringResult {
+            clusters: Vec::new(),
+        };
+        return Ok(empty.into_reader(None));
+    }
+    let all_hashes = BinaryHashValues::concat(&hash_chunks)?;
+
+    // Compute pairwise hamming distances with threshold filtering
+    let pairwise_result = pairwise_hamming_distance_binary_parallel(
+        &all_hashes,
+        Some(&all_row_ids),
+        Some(hamming_threshold),
+    );
+
+    // Cluster the results
+    let clustering = cluster_pairwise_result(&pairwise_result);
+
+    Ok(clustering.into_reader(None))
+}
+
 /// Perform pairwise hamming distance clustering on a partition of an IVF_FLAT index.
 ///
-/// This function loads a specific partition from an IVF_FLAT index on a hash column,
-/// computes pairwise hamming distances between all hashes in the partition,
-/// filters by threshold, and clusters the results using union-find.
+/// This function loads a specific partition from every segment of an IVF_FLAT
+/// index on a hash column, computes pairwise hamming distances between all
+/// hashes in the combined partition, filters by threshold, and clusters the
+/// results using union-find. See [`hamming_clustering_for_ivf_partition_segments`]
+/// to restrict the computation to selected segments.
 ///
 /// # Arguments
 ///
@@ -53,7 +316,9 @@ use super::ivf::v2::IVFIndex;
 ///
 /// Returns an error if:
 /// - The index doesn't exist or is not an IVF_FLAT index
-/// - The indexed column has wrong type (must be `FixedSizeList<UInt8, 8>`)
+/// - The indexed column has wrong type (must be `FixedSizeList<UInt8, N>` where
+///   `N` is a positive multiple of 8 bytes)
+/// - The index segments do not share the same global IVF centroids
 /// - The partition ID is out of range
 pub async fn hamming_clustering_for_ivf_partition(
     dataset: &Dataset,
@@ -61,174 +326,88 @@ pub async fn hamming_clustering_for_ivf_partition(
     partition_id: usize,
     hamming_threshold: u32,
 ) -> Result<Box<dyn RecordBatchReader + Send>> {
-    // Load indices and find the IVF_FLAT index
-    let indices = dataset.load_indices().await?;
-    let index_meta = indices
-        .iter()
-        .find(|idx| idx.name == index_name)
-        .ok_or_else(|| {
-            Error::invalid_input(format!("Index '{}' not found on dataset", index_name))
-        })?;
+    hamming_clustering_for_ivf_partition_impl(
+        dataset,
+        index_name,
+        None,
+        partition_id,
+        hamming_threshold,
+    )
+    .await
+}
 
-    // Get the column name from the index metadata
-    let schema = dataset.schema();
-    let field_id = index_meta
-        .fields
-        .first()
-        .ok_or_else(|| Error::invalid_input(format!("Index '{}' has no fields", index_name)))?;
-    let field = schema.field_by_id(*field_id).ok_or_else(|| {
-        Error::invalid_input(format!(
-            "Field with id {} not found in schema for index '{}'",
-            field_id, index_name
-        ))
-    })?;
-    let column = &field.name;
+/// Perform pairwise hamming distance clustering on a partition of selected
+/// segments of an IVF_FLAT index.
+///
+/// Same as [`hamming_clustering_for_ivf_partition`] but only the requested
+/// physical segments contribute rows. Segment ids are the index UUIDs reported
+/// by index descriptions; every requested id must belong to the named index and
+/// the selection must not be empty.
+pub async fn hamming_clustering_for_ivf_partition_segments(
+    dataset: &Dataset,
+    index_name: &str,
+    segment_ids: &[Uuid],
+    partition_id: usize,
+    hamming_threshold: u32,
+) -> Result<Box<dyn RecordBatchReader + Send>> {
+    hamming_clustering_for_ivf_partition_impl(
+        dataset,
+        index_name,
+        Some(segment_ids),
+        partition_id,
+        hamming_threshold,
+    )
+    .await
+}
 
-    // Check column is FixedSizeList<UInt8, 8>
-    let data_type = field.data_type();
-    match data_type {
-        DataType::FixedSizeList(inner, 8) => {
-            if *inner.data_type() != DataType::UInt8 {
-                return Err(Error::invalid_input(format!(
-                    "Column '{}' must be FixedSizeList<UInt8, 8>, got FixedSizeList<{:?}, 8>",
-                    column,
-                    inner.data_type()
-                )));
-            }
+async fn get_ivf_partition_info_impl(
+    dataset: &Dataset,
+    index_name: &str,
+    segment_ids: Option<&[Uuid]>,
+) -> Result<Vec<PartitionInfo>> {
+    let segments = open_hash_index_segments(dataset, index_name, segment_ids).await?;
+
+    let num_partitions = segments[0].ivf_flat_bin().ivf_model().num_partitions();
+    let mut partition_infos: Vec<PartitionInfo> = (0..num_partitions)
+        .map(|partition_id| PartitionInfo {
+            partition_id,
+            size: 0,
+        })
+        .collect();
+    for segment in &segments {
+        // Sizes come from the partition storage; the IVF model of a v3 index
+        // file does not carry partition lengths.
+        let index = segment.ivf_flat_bin();
+        for info in partition_infos.iter_mut() {
+            info.size += index.partition_size(info.partition_id);
         }
-        _ => {
-            return Err(Error::invalid_input(format!(
-                "Column '{}' must be FixedSizeList<UInt8, 8>, got {:?}",
-                column, data_type
-            )));
-        }
     }
 
-    // Open the vector index
-    let index = dataset
-        .open_vector_index(column, &index_meta.uuid, &NoOpMetricsCollector)
-        .await?;
-
-    // Try to downcast to IVFIndex<FlatIndex, FlatBinQuantizer> (IVF_FLAT for binary data)
-    let ivf_index = index
-        .as_any()
-        .downcast_ref::<IVFIndex<FlatIndex, FlatBinQuantizer>>()
-        .ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Index '{}' is not an IVF_FLAT index for binary data",
-                index_name
-            ))
-        })?;
-
-    // Check partition ID is valid
-    let num_partitions = ivf_index.ivf_model().num_partitions();
-    if partition_id >= num_partitions {
-        return Err(Error::invalid_input(format!(
-            "Partition ID {} is out of range (0..{})",
-            partition_id, num_partitions
-        )));
-    }
-
-    // Load the partition storage
-    let storage = ivf_index.load_partition_storage(partition_id, None).await?;
-
-    // Get row IDs
-    let row_id_slice: Vec<u64> = storage.row_ids().copied().collect();
-
-    if row_id_slice.is_empty() {
-        let empty = ClusteringResult {
-            clusters: Vec::new(),
-        };
-        return Ok(empty.into_reader(None));
-    }
-
-    // Get vectors from the storage batches
-    let batches: Vec<_> = storage.to_batches()?.collect();
-    if batches.is_empty() {
-        let empty = ClusteringResult {
-            clusters: Vec::new(),
-        };
-        return Ok(empty.into_reader(None));
-    }
-
-    // Extract the hash vectors from the FLAT_COLUMN
-    let mut all_hashes = Vec::new();
-    for batch in &batches {
-        let vectors = batch
-            .column_by_name(FLAT_COLUMN)
-            .ok_or_else(|| {
-                Error::invalid_input(format!("Column '{}' not found in storage", FLAT_COLUMN))
-            })?
-            .as_fixed_size_list();
-        let hashes = extract_hashes_from_fixed_list(vectors)?;
-        all_hashes.extend(hashes);
-    }
-
-    // Compute pairwise hamming distances with threshold filtering
-    let pairwise_result = pairwise_hamming_distance_parallel(
-        &all_hashes,
-        Some(&row_id_slice),
-        Some(hamming_threshold),
-    );
-
-    // Cluster the results
-    let clustering = cluster_pairwise_result(&pairwise_result);
-
-    Ok(clustering.into_reader(None))
+    Ok(partition_infos)
 }
 
 /// Get partition statistics for an IVF_FLAT index.
+///
+/// Partition sizes are aggregated across all segments of the logical index.
+/// See [`get_ivf_partition_info_segments`] to restrict the statistics to
+/// selected segments.
 pub async fn get_ivf_partition_info(
     dataset: &Dataset,
     index_name: &str,
 ) -> Result<Vec<PartitionInfo>> {
-    let indices = dataset.load_indices().await?;
-    let index_meta = indices
-        .iter()
-        .find(|idx| idx.name == index_name)
-        .ok_or_else(|| {
-            Error::invalid_input(format!("Index '{}' not found on dataset", index_name))
-        })?;
+    get_ivf_partition_info_impl(dataset, index_name, None).await
+}
 
-    // Get the column name from the index metadata
-    let schema = dataset.schema();
-    let field_id = index_meta
-        .fields
-        .first()
-        .ok_or_else(|| Error::invalid_input(format!("Index '{}' has no fields", index_name)))?;
-    let field = schema.field_by_id(*field_id).ok_or_else(|| {
-        Error::invalid_input(format!(
-            "Field with id {} not found in schema for index '{}'",
-            field_id, index_name
-        ))
-    })?;
-    let column = &field.name;
-
-    let index = dataset
-        .open_vector_index(column, &index_meta.uuid, &NoOpMetricsCollector)
-        .await?;
-
-    let ivf_index = index
-        .as_any()
-        .downcast_ref::<IVFIndex<FlatIndex, FlatBinQuantizer>>()
-        .ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Index '{}' is not an IVF_FLAT index for binary data",
-                index_name
-            ))
-        })?;
-
-    let num_partitions = ivf_index.ivf_model().num_partitions();
-    let mut partition_infos = Vec::with_capacity(num_partitions);
-
-    for i in 0..num_partitions {
-        partition_infos.push(PartitionInfo {
-            partition_id: i,
-            size: ivf_index.ivf_model().partition_size(i),
-        });
-    }
-
-    Ok(partition_infos)
+/// Get partition statistics for selected segments of an IVF_FLAT index.
+///
+/// Same as [`get_ivf_partition_info`] but only the requested physical segments
+/// contribute to the partition sizes.
+pub async fn get_ivf_partition_info_segments(
+    dataset: &Dataset,
+    index_name: &str,
+    segment_ids: &[Uuid],
+) -> Result<Vec<PartitionInfo>> {
+    get_ivf_partition_info_impl(dataset, index_name, Some(segment_ids)).await
 }
 
 /// Information about an IVF partition.
@@ -247,7 +426,8 @@ pub struct PartitionInfo {
 /// # Arguments
 ///
 /// * `dataset` - The Lance dataset
-/// * `column` - Name of the hash column (must be `FixedSizeList<UInt8, 8>`)
+/// * `column` - Name of the hash column (must be `FixedSizeList<UInt8, N>`
+///   where `N` is a positive multiple of 8 bytes)
 /// * `sample_size` - Number of rows to sample (if None or >= total rows, uses all rows)
 /// * `hamming_threshold` - Maximum hamming distance to consider as similar
 ///
@@ -267,26 +447,7 @@ pub async fn hamming_clustering_for_sample(
     let field = schema.field(column).ok_or_else(|| {
         Error::invalid_input(format!("Column '{}' not found in dataset schema", column))
     })?;
-
-    // Check column is FixedSizeList<UInt8, 8>
-    let data_type = field.data_type();
-    match data_type {
-        DataType::FixedSizeList(inner, 8) => {
-            if *inner.data_type() != DataType::UInt8 {
-                return Err(Error::invalid_input(format!(
-                    "Column '{}' must be FixedSizeList<UInt8, 8>, got FixedSizeList<{:?}, 8>",
-                    column,
-                    inner.data_type()
-                )));
-            }
-        }
-        _ => {
-            return Err(Error::invalid_input(format!(
-                "Column '{}' must be FixedSizeList<UInt8, 8>, got {:?}",
-                column, data_type
-            )));
-        }
-    }
+    validate_hash_column(column, &field.data_type())?;
 
     // Get total row count
     let total_rows: usize = dataset
@@ -326,7 +487,7 @@ pub async fn hamming_clustering_for_sample(
             Error::invalid_input(format!("Column '{}' not found in result", column))
         })?;
         let hashes_arr = hash_col.as_fixed_size_list();
-        let hashes = extract_hashes_from_fixed_list(hashes_arr)?;
+        let hashes = extract_binary_hashes_from_fixed_list(hashes_arr)?;
 
         (hashes, row_id_vec)
     } else {
@@ -348,7 +509,7 @@ pub async fn hamming_clustering_for_sample(
             Error::invalid_input(format!("Column '{}' not found in result", column))
         })?;
         let hashes_arr = hash_col.as_fixed_size_list();
-        let hashes = extract_hashes_from_fixed_list(hashes_arr)?;
+        let hashes = extract_binary_hashes_from_fixed_list(hashes_arr)?;
 
         (hashes, row_id_vec)
     };
@@ -362,7 +523,7 @@ pub async fn hamming_clustering_for_sample(
 
     // Compute pairwise hamming distances
     let pairwise =
-        pairwise_hamming_distance_parallel(&hashes, Some(&row_ids), Some(hamming_threshold));
+        pairwise_hamming_distance_binary_parallel(&hashes, Some(&row_ids), Some(hamming_threshold));
 
     // Cluster edges
     let clustering = cluster_pairwise_result(&pairwise);
@@ -380,7 +541,8 @@ pub async fn hamming_clustering_for_sample(
 /// # Arguments
 ///
 /// * `dataset` - The Lance dataset
-/// * `column` - Name of the hash column (must be `FixedSizeList<UInt8, 8>`)
+/// * `column` - Name of the hash column (must be `FixedSizeList<UInt8, N>`
+///   where `N` is a positive multiple of 8 bytes)
 /// * `fragment_id` - The fragment ID to read from
 /// * `start_row` - The starting row offset within the fragment
 /// * `num_rows` - Number of rows to read from the start position
@@ -396,7 +558,8 @@ pub async fn hamming_clustering_for_sample(
 ///
 /// Returns an error if:
 /// - The fragment doesn't exist
-/// - The column has wrong type (must be `FixedSizeList<UInt8, 8>`)
+/// - The column has wrong type (must be `FixedSizeList<UInt8, N>` where `N`
+///   is a positive multiple of 8 bytes)
 /// - The row range is out of bounds
 pub async fn hamming_clustering_for_range(
     dataset: &Dataset,
@@ -411,26 +574,7 @@ pub async fn hamming_clustering_for_range(
     let field = schema.field(column).ok_or_else(|| {
         Error::invalid_input(format!("Column '{}' not found in dataset schema", column))
     })?;
-
-    // Check column is FixedSizeList<UInt8, 8>
-    let data_type = field.data_type();
-    match data_type {
-        DataType::FixedSizeList(inner, 8) => {
-            if *inner.data_type() != DataType::UInt8 {
-                return Err(Error::invalid_input(format!(
-                    "Column '{}' must be FixedSizeList<UInt8, 8>, got FixedSizeList<{:?}, 8>",
-                    column,
-                    inner.data_type()
-                )));
-            }
-        }
-        _ => {
-            return Err(Error::invalid_input(format!(
-                "Column '{}' must be FixedSizeList<UInt8, 8>, got {:?}",
-                column, data_type
-            )));
-        }
-    }
+    validate_hash_column(column, &field.data_type())?;
 
     // Get the fragment
     let fragment = dataset.get_fragment(fragment_id).ok_or_else(|| {
@@ -483,7 +627,7 @@ pub async fn hamming_clustering_for_range(
         .column_by_name(column)
         .ok_or_else(|| Error::invalid_input(format!("Column '{}' not found in result", column)))?;
     let hashes_arr = hash_col.as_fixed_size_list();
-    let hashes = extract_hashes_from_fixed_list(hashes_arr)?;
+    let hashes = extract_binary_hashes_from_fixed_list(hashes_arr)?;
 
     if hashes.len() < 2 {
         let empty = ClusteringResult {
@@ -493,8 +637,11 @@ pub async fn hamming_clustering_for_range(
     }
 
     // Compute pairwise hamming distances
-    let pairwise =
-        pairwise_hamming_distance_parallel(&hashes, Some(&row_id_vec), Some(hamming_threshold));
+    let pairwise = pairwise_hamming_distance_binary_parallel(
+        &hashes,
+        Some(&row_id_vec),
+        Some(hamming_threshold),
+    );
 
     // Cluster edges
     let clustering = cluster_pairwise_result(&pairwise);
@@ -597,6 +744,31 @@ mod tests {
             }
         }
         clusters
+    }
+
+    #[test]
+    fn test_validate_hash_column_generic_widths() {
+        use arrow_schema::{DataType, Field};
+        use std::sync::Arc;
+
+        fn hash_type(size: i32) -> DataType {
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt8, true)), size)
+        }
+
+        assert_eq!(validate_hash_column("hash", &hash_type(8)).unwrap(), 8);
+        assert_eq!(validate_hash_column("hash", &hash_type(16)).unwrap(), 16);
+        assert_eq!(validate_hash_column("hash", &hash_type(32)).unwrap(), 32);
+
+        let err = validate_hash_column("hash", &hash_type(12)).unwrap_err();
+        assert!(err.to_string().contains("12"), "{}", err);
+        assert!(err.to_string().contains("multiple of 8 bytes"), "{}", err);
+
+        let err = validate_hash_column("hash", &hash_type(4)).unwrap_err();
+        assert!(err.to_string().contains("4"), "{}", err);
+        assert!(err.to_string().contains("multiple of 8 bytes"), "{}", err);
+
+        let err = validate_hash_column("hash", &hash_type(-8)).unwrap_err();
+        assert!(err.to_string().contains("-8"), "{}", err);
     }
 
     #[test]
@@ -762,6 +934,200 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(err.to_string().contains("not found"), "Error: {}", err);
+    }
+
+    #[test]
+    fn test_validate_shared_centroids() {
+        use arrow_array::UInt8Array;
+        use lance_arrow::FixedSizeListArrayExt;
+
+        fn model_from_bytes(bytes: Vec<u8>) -> IvfModel {
+            let centroids =
+                FixedSizeListArray::try_new_from_values(UInt8Array::from(bytes), 8).unwrap();
+            IvfModel::new(centroids, None)
+        }
+
+        let uuid_a = Uuid::new_v4();
+        let uuid_b = Uuid::new_v4();
+
+        let model_a = model_from_bytes(vec![0u8; 16]);
+        let model_b = model_from_bytes(vec![0u8; 16]);
+        validate_shared_centroids("idx", [(uuid_a, &model_a), (uuid_b, &model_b)]).unwrap();
+
+        let mut diverged = vec![0u8; 16];
+        diverged[0] = 1;
+        let model_c = model_from_bytes(diverged);
+        let err =
+            validate_shared_centroids("idx", [(uuid_a, &model_a), (uuid_b, &model_c)]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("do not share the same global IVF centroids"),
+            "{}",
+            err
+        );
+        assert!(err.to_string().contains(&uuid_b.to_string()), "{}", err);
+
+        let model_d = model_from_bytes(vec![0u8; 24]);
+        let err =
+            validate_shared_centroids("idx", [(uuid_a, &model_a), (uuid_b, &model_d)]).unwrap_err();
+        assert!(err.to_string().contains("2 partitions"), "{}", err);
+        assert!(err.to_string().contains("3 partitions"), "{}", err);
+
+        let err = validate_shared_centroids("idx", [(uuid_a, &IvfModel::empty())]).unwrap_err();
+        assert!(err.to_string().contains("has no IVF centroids"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn test_hamming_clustering_for_ivf_partition_multi_segment_128_bit() {
+        use arrow_array::{FixedSizeListArray, RecordBatchIterator, UInt8Array};
+        use arrow_schema::{Field, Schema};
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_index::optimize::OptimizeOptions;
+        use lance_index::vector::ivf::IvfBuildParams;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+
+        const HASH_BYTES: i32 = 16;
+
+        fn hash_batch(schema: Arc<Schema>, values: &[u64]) -> arrow_array::RecordBatch {
+            let mut bytes = Vec::with_capacity(values.len() * HASH_BYTES as usize);
+            for value in values {
+                bytes.extend_from_slice(&value.to_le_bytes());
+                let high = value.rotate_left(17) ^ 0xA5A5_A5A5_A5A5_A5A5;
+                bytes.extend_from_slice(&high.to_le_bytes());
+            }
+            let array =
+                FixedSizeListArray::try_new_from_values(UInt8Array::from(bytes), HASH_BYTES)
+                    .unwrap();
+            arrow_array::RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap()
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "hash",
+            arrow_schema::DataType::FixedSizeList(
+                Arc::new(Field::new("item", arrow_schema::DataType::UInt8, true)),
+                HASH_BYTES,
+            ),
+            false,
+        )]));
+
+        // 25 distinct hash values, two copies each; the same batch is written to
+        // fragment 0 and appended as fragment 1, so every value has duplicates
+        // in both fragments.
+        let values: Vec<u64> = (0..50)
+            .map(|i| ((i / 2) as u64).wrapping_mul(0x9E3779B97F4A7C15))
+            .collect();
+        let num_values = 25;
+
+        let temp_dir = tempdir().unwrap();
+        let uri = temp_dir.path().to_str().unwrap();
+        let reader = RecordBatchIterator::new(
+            vec![Ok(hash_batch(schema.clone(), &values))],
+            schema.clone(),
+        );
+        let mut dataset = crate::Dataset::write(reader, uri, None).await.unwrap();
+
+        let params = crate::index::vector::VectorIndexParams::with_ivf_flat_params(
+            lance_linalg::distance::MetricType::Hamming,
+            IvfBuildParams::new(4),
+        );
+        dataset
+            .create_index(
+                &["hash"],
+                crate::index::IndexType::Vector,
+                Some("hash_idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let reader = RecordBatchIterator::new(
+            vec![Ok(hash_batch(schema.clone(), &values))],
+            schema.clone(),
+        );
+        dataset.append(reader, None).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let segments = dataset.load_indices_by_name("hash_idx").await.unwrap();
+        assert_eq!(
+            segments.len(),
+            2,
+            "expected a delta segment after optimize append"
+        );
+
+        // Partition sizes aggregate across both segments.
+        let infos = get_ivf_partition_info(&dataset, "hash_idx").await.unwrap();
+        assert_eq!(infos.len(), 4);
+        assert_eq!(infos.iter().map(|info| info.size).sum::<usize>(), 100);
+
+        // Clustering each partition with threshold 0 must group all four copies
+        // of every value, including the copies in the appended fragment.
+        const FRAG1_START: u64 = 1 << 32;
+        let mut clusters = Vec::new();
+        for partition_id in 0..4 {
+            let reader =
+                hamming_clustering_for_ivf_partition(&dataset, "hash_idx", partition_id, 0)
+                    .await
+                    .unwrap();
+            clusters.extend(collect_clusters(reader));
+        }
+        assert_eq!(clusters.len(), num_values);
+        for (representative, duplicates) in &clusters {
+            assert_eq!(duplicates.len(), 3);
+            assert!(*representative < FRAG1_START);
+            assert!(
+                duplicates.iter().any(|row_id| *row_id >= FRAG1_START),
+                "cluster {} should contain rows from the appended fragment",
+                representative
+            );
+        }
+
+        // Selecting only the original segment reproduces the single-segment scope.
+        let first_segment = segments
+            .iter()
+            .find(|meta| meta.fragment_bitmap.as_ref().unwrap().contains(0))
+            .unwrap();
+        let mut old_clusters = Vec::new();
+        for partition_id in 0..4 {
+            let reader = hamming_clustering_for_ivf_partition_segments(
+                &dataset,
+                "hash_idx",
+                &[first_segment.uuid],
+                partition_id,
+                0,
+            )
+            .await
+            .unwrap();
+            old_clusters.extend(collect_clusters(reader));
+        }
+        assert_eq!(old_clusters.len(), num_values);
+        for (representative, duplicates) in &old_clusters {
+            assert_eq!(duplicates.len(), 1);
+            assert!(*representative < FRAG1_START);
+            assert!(duplicates.iter().all(|row_id| *row_id < FRAG1_START));
+        }
+        let infos = get_ivf_partition_info_segments(&dataset, "hash_idx", &[first_segment.uuid])
+            .await
+            .unwrap();
+        assert_eq!(infos.iter().map(|info| info.size).sum::<usize>(), 50);
+
+        // Invalid segment selections are rejected.
+        let err = hamming_clustering_for_ivf_partition_segments(&dataset, "hash_idx", &[], 0, 0)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("must not be empty"), "{}", err);
+        let missing = Uuid::new_v4();
+        let err =
+            hamming_clustering_for_ivf_partition_segments(&dataset, "hash_idx", &[missing], 0, 0)
+                .await
+                .err()
+                .unwrap();
+        assert!(err.to_string().contains(&missing.to_string()), "{}", err);
     }
 
     #[tokio::test]

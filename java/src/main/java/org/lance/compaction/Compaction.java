@@ -15,6 +15,7 @@ package org.lance.compaction;
 
 import org.lance.Dataset;
 import org.lance.JniLoader;
+import org.lance.LockManager;
 
 import com.google.common.base.Preconditions;
 
@@ -32,19 +33,24 @@ public class Compaction {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(compactionOptions);
 
-    return nativePlanCompaction(
-        dataset,
-        compactionOptions.getTargetRowsPerFragment(),
-        compactionOptions.getMaxRowsPerGroup(),
-        compactionOptions.getMaxBytesPerFile(),
-        compactionOptions.getMaterializeDeletions(),
-        compactionOptions.getMaterializeDeletionsThreshold(),
-        compactionOptions.getNumThreads(),
-        compactionOptions.getBatchSize(),
-        compactionOptions.getDeferIndexRemap(),
-        compactionOptions.getCompactionMode(),
-        compactionOptions.getBinaryCopyReadBatchBytes(),
-        compactionOptions.getMaxSourceFragments());
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativePlanCompaction(
+          dataset,
+          compactionOptions.getTargetRowsPerFragment(),
+          compactionOptions.getMaxRowsPerGroup(),
+          compactionOptions.getMaxBytesPerFile(),
+          compactionOptions.getMaterializeDeletions(),
+          compactionOptions.getMaterializeDeletionsThreshold(),
+          compactionOptions.getNumThreads(),
+          compactionOptions.getBatchSize(),
+          compactionOptions.getDeferIndexRemap(),
+          compactionOptions.getCompactionMode(),
+          compactionOptions.getBinaryCopyReadBatchBytes(),
+          compactionOptions.getMaxSourceFragments(),
+          compactionOptions.getMaxSourceRows(),
+          compactionOptions.getMaxSourceBytes(),
+          compactionOptions.getExcludedFragmentIds());
+    }
   }
 
   public static CompactionMetrics commitCompaction(
@@ -65,10 +71,18 @@ public class Compaction {
         compactionOptions.getDeferIndexRemap(),
         compactionOptions.getCompactionMode(),
         compactionOptions.getBinaryCopyReadBatchBytes(),
-        compactionOptions.getMaxSourceFragments());
+        compactionOptions.getMaxSourceFragments(),
+        compactionOptions.getMaxSourceRows(),
+        compactionOptions.getMaxSourceBytes(),
+        compactionOptions.getExcludedFragmentIds());
   }
 
-  public static native CompactionMetrics nativeCommitCompaction(
+  /**
+   * Java wrapper around the raw commit-compaction JNI call. It acquires the dataset read lock so
+   * the native call cannot race with {@link Dataset#close()}; keep the raw native method private so
+   * no caller can bypass this lock.
+   */
+  public static CompactionMetrics nativeCommitCompaction(
       Dataset dataset,
       List<RewriteResult> rewriteResults,
       Optional<Long> targetRowsPerFragment,
@@ -81,7 +95,48 @@ public class Compaction {
       Optional<Boolean> deferIndexRemap,
       Optional<String> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes,
-      Optional<Long> maxSourceFragments);
+      Optional<Long> maxSourceFragments,
+      Optional<Long> maxSourceRows,
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds) {
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return commitCompactionNative(
+          dataset,
+          rewriteResults,
+          targetRowsPerFragment,
+          maxRowsPerGroup,
+          maxBytesPerFile,
+          materializeDeletions,
+          materializeDeletionsThreshold,
+          numThreads,
+          batchSize,
+          deferIndexRemap,
+          compactionMode,
+          binaryCopyReadBatchBytes,
+          maxSourceFragments,
+          maxSourceRows,
+          maxSourceBytes,
+          excludedFragmentIds);
+    }
+  }
+
+  private static native CompactionMetrics commitCompactionNative(
+      Dataset dataset,
+      List<RewriteResult> rewriteResults,
+      Optional<Long> targetRowsPerFragment,
+      Optional<Long> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile,
+      Optional<Boolean> materializeDeletions,
+      Optional<Float> materializeDeletionsThreshold,
+      Optional<Long> numThreads,
+      Optional<Long> batchSize,
+      Optional<Boolean> deferIndexRemap,
+      Optional<String> compactionMode,
+      Optional<Long> binaryCopyReadBatchBytes,
+      Optional<Long> maxSourceFragments,
+      Optional<Long> maxSourceRows,
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds);
 
   private static native CompactionPlan nativePlanCompaction(
       Dataset dataset,
@@ -95,5 +150,8 @@ public class Compaction {
       Optional<Boolean> deferIndexRemap,
       Optional<String> compactionMode,
       Optional<Long> binaryCopyReadBatchBytes,
-      Optional<Long> maxSourceFragments);
+      Optional<Long> maxSourceFragments,
+      Optional<Long> maxSourceRows,
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds);
 }

@@ -79,6 +79,32 @@ impl LanceBlobFile {
         Ok(PyBytes::new(py, &data))
     }
 
+    /// Read multiple blob-local `(offset, length)` ranges without changing the current cursor.
+    pub fn read_ranges<'py>(
+        &self,
+        py: Python<'py>,
+        ranges: Vec<(u64, u64)>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let ranges = ranges
+            .into_iter()
+            .enumerate()
+            .map(|(i, (offset, length))| {
+                let end = offset.checked_add(length).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "Blob range request {i} offset + length overflowed u64: \
+                         offset={offset}, length={length}"
+                    ))
+                })?;
+                Ok(offset..end)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let inner = self.inner.clone();
+        let data = rt()
+            .block_on(Some(py), inner.read_ranges(&ranges))?
+            .infer_error()?;
+        Ok(data.iter().map(|bytes| PyBytes::new(py, bytes)).collect())
+    }
+
     pub fn read_into(&self, dst: Bound<'_, PyByteArray>) -> PyResult<usize> {
         let inner = self.inner.clone();
 

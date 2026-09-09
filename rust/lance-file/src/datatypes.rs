@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_schema::DataType;
-use async_recursion::async_recursion;
 use lance_arrow::ARROW_EXT_NAME_KEY;
-use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Dictionary, Encoding, Field, LogicalType, Schema};
 use lance_core::{Error, Result};
-use lance_io::traits::Reader;
-use lance_io::utils::{read_binary_array, read_fixed_stride_array};
 use std::collections::HashMap;
 
 use crate::format::pb;
@@ -99,6 +94,32 @@ impl From<&Field> for pb::Field {
 
 pub struct Fields(pub Vec<pb::Field>);
 
+struct FieldNode {
+    field: Field,
+    child_indices: Vec<usize>,
+}
+
+/// Searches in pre-order depth-first order and returns the first matching node,
+/// preserving the legacy parent tie-break for duplicate field IDs.
+fn first_field_index_by_id(
+    nodes: &[FieldNode],
+    root_indices: &[usize],
+    field_id: i32,
+) -> Option<usize> {
+    let mut to_visit = Vec::with_capacity(nodes.len());
+    to_visit.extend(root_indices.iter().rev().copied());
+
+    while let Some(node_index) = to_visit.pop() {
+        let node = &nodes[node_index];
+        if node.field.id == field_id {
+            return Some(node_index);
+        }
+        to_visit.extend(node.child_indices.iter().rev().copied());
+    }
+
+    None
+}
+
 impl From<&Field> for Fields {
     fn from(field: &Field) -> Self {
         let mut protos = vec![pb::Field::from(field)];
@@ -107,24 +128,119 @@ impl From<&Field> for Fields {
     }
 }
 
-/// Convert list of protobuf `Field` to a Schema.
-impl From<&Fields> for Schema {
-    fn from(fields: &Fields) -> Self {
-        let mut schema = Self {
-            fields: vec![],
-            metadata: HashMap::default(),
-        };
+/// Reconstruct a schema from a flat, pre-order protobuf field list.
+///
+/// Parent fields must appear before their children. Historical manifests may
+/// contain duplicate field IDs, so an ID may not identify a unique parent. For
+/// those references, reconstruction preserves the legacy
+/// [`Schema::mut_field_by_id`] tie-break by selecting the first matching field
+/// in pre-order depth-first traversal.
+///
+/// # Examples
+///
+/// ```
+/// use lance_core::datatypes::Schema;
+/// use lance_file::{datatypes::Fields, format::pb};
+///
+/// let field = pb::Field {
+///     id: 0,
+///     parent_id: -1,
+///     name: "value".to_owned(),
+///     logical_type: "int32".to_owned(),
+///     ..Default::default()
+/// };
+/// let fields = Fields(vec![field]);
+/// let schema = Schema::try_from(&fields)?;
+/// assert_eq!(schema.fields[0].name, "value");
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+impl TryFrom<&Fields> for Schema {
+    type Error = Error;
 
-        fields.0.iter().for_each(|f| {
-            if f.parent_id == -1 {
-                schema.fields.push(Field::from(f));
+    fn try_from(fields: &Fields) -> Result<Self> {
+        let mut nodes: Vec<FieldNode> = Vec::with_capacity(fields.0.len());
+        let mut root_indices = Vec::with_capacity(fields.0.len());
+        let mut field_indices: HashMap<i32, Option<usize>> = HashMap::with_capacity(fields.0.len());
+
+        for proto_field in &fields.0 {
+            let parent_index = if proto_field.parent_id == -1 {
+                None
             } else {
-                let parent = schema.mut_field_by_id(f.parent_id).unwrap();
-                parent.children.push(Field::from(f));
-            }
-        });
+                let parent_index = match field_indices.get(&proto_field.parent_id) {
+                    Some(Some(parent_index)) => *parent_index,
+                    Some(None) => {
+                        // Duplicate IDs are invalid but occur in historical
+                        // manifests. Match the legacy tree traversal only for
+                        // these ambiguous parent references so valid schemas
+                        // retain the linear fast path.
+                        first_field_index_by_id(&nodes, &root_indices, proto_field.parent_id)
+                            .ok_or_else(|| {
+                                Error::internal(format!(
+                                    "Duplicate field id {} has no existing arena node",
+                                    proto_field.parent_id
+                                ))
+                            })?
+                    }
+                    None => {
+                        return Err(Error::schema(format!(
+                            "Field '{}' (id={}) references parent id {}, which must appear earlier in the protobuf field list",
+                            proto_field.name, proto_field.id, proto_field.parent_id
+                        )));
+                    }
+                };
+                Some(parent_index)
+            };
 
-        schema
+            let node_index = nodes.len();
+            if let Some(parent_index) = parent_index {
+                nodes[parent_index].child_indices.push(node_index);
+            } else {
+                root_indices.push(node_index);
+            }
+            nodes.push(FieldNode {
+                field: Field::from(proto_field),
+                child_indices: Vec::new(),
+            });
+
+            field_indices
+                .entry(proto_field.id)
+                .and_modify(|field_index| *field_index = None)
+                .or_insert(Some(node_index));
+        }
+
+        let mut fields_by_node = Vec::with_capacity(nodes.len());
+        fields_by_node.resize_with(nodes.len(), || None);
+        for (node_index, mut node) in nodes.into_iter().enumerate().rev() {
+            node.field.children.reserve(node.child_indices.len());
+            for child_index in node.child_indices {
+                let child = fields_by_node
+                    .get_mut(child_index)
+                    .and_then(Option::take)
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "Schema field arena node {child_index} was not materialized before its parent"
+                        ))
+                    })?;
+                node.field.children.push(child);
+            }
+            fields_by_node[node_index] = Some(node.field);
+        }
+
+        let fields = root_indices
+            .into_iter()
+            .map(|root_index| {
+                fields_by_node[root_index].take().ok_or_else(|| {
+                    Error::internal(format!(
+                        "Schema field arena root node {root_index} was not materialized"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            fields,
+            metadata: HashMap::default(),
+        })
     }
 }
 
@@ -133,9 +249,28 @@ pub struct FieldsWithMeta {
     pub metadata: HashMap<String, Vec<u8>>,
 }
 
-/// Convert list of protobuf `Field` and Metadata to a Schema.
-impl From<FieldsWithMeta> for Schema {
-    fn from(fields_with_meta: FieldsWithMeta) -> Self {
+/// Reconstruct a schema from flat protobuf fields and schema metadata.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+///
+/// use lance_core::datatypes::Schema;
+/// use lance_file::datatypes::{Fields, FieldsWithMeta};
+///
+/// let fields = FieldsWithMeta {
+///     fields: Fields(Vec::new()),
+///     metadata: HashMap::from([("owner".to_owned(), b"lance".to_vec())]),
+/// };
+/// let schema = Schema::try_from(fields)?;
+/// assert_eq!(schema.metadata["owner"], "lance");
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+impl TryFrom<FieldsWithMeta> for Schema {
+    type Error = Error;
+
+    fn try_from(fields_with_meta: FieldsWithMeta) -> Result<Self> {
         let lance_metadata = fields_with_meta
             .metadata
             .into_iter()
@@ -145,11 +280,11 @@ impl From<FieldsWithMeta> for Schema {
             })
             .collect();
 
-        let schema_with_fields = Self::from(&fields_with_meta.fields);
-        Self {
+        let schema_with_fields = Self::try_from(&fields_with_meta.fields)?;
+        Ok(Self {
             fields: schema_with_fields.fields,
             metadata: lance_metadata,
-        }
+        })
     }
 }
 
@@ -208,76 +343,29 @@ impl From<Encoding> for pb::Encoding {
     }
 }
 
-#[async_recursion]
-async fn load_field_dictionary<'a>(field: &mut Field, reader: &dyn Reader) -> Result<()> {
-    if let DataType::Dictionary(_, value_type) = field.data_type() {
-        assert!(field.dictionary.is_some());
-        if let Some(dict_info) = field.dictionary.as_mut() {
-            use DataType::*;
-            match value_type.as_ref() {
-                _ if value_type.is_binary_like() => {
-                    dict_info.values = Some(
-                        read_binary_array(
-                            reader,
-                            value_type.as_ref(),
-                            true, // Empty values are null
-                            dict_info.offset,
-                            dict_info.length,
-                            ..,
-                        )
-                        .await?,
-                    );
-                }
-                Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
-                    dict_info.values = Some(
-                        read_fixed_stride_array(
-                            reader,
-                            value_type.as_ref(),
-                            dict_info.offset,
-                            dict_info.length,
-                            ..,
-                        )
-                        .await?,
-                    );
-                }
-                _ => {
-                    return Err(Error::schema(format!(
-                        "Does not support {} as dictionary value type",
-                        value_type
-                    )));
-                }
-            }
-        } else {
-            panic!("Should not reach here: dictionary field does not load dictionary info")
-        }
-        Ok(())
-    } else {
-        for child in field.children.as_mut_slice() {
-            load_field_dictionary(child, reader).await?;
-        }
-        Ok(())
-    }
-}
-
-/// Load dictionary value array from manifest files.
-// TODO: pub(crate)
-pub async fn populate_schema_dictionary(schema: &mut Schema, reader: &dyn Reader) -> Result<()> {
-    for field in schema.fields.as_mut_slice() {
-        load_field_dictionary(field, reader).await?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use arrow_schema::DataType;
     use arrow_schema::Field as ArrowField;
     use arrow_schema::Fields as ArrowFields;
     use arrow_schema::Schema as ArrowSchema;
+    use lance_core::Error;
     use lance_core::datatypes::Schema;
-    use std::collections::HashMap;
 
     use super::{Fields, FieldsWithMeta};
+    use crate::format::pb;
+
+    fn proto_field(id: i32, parent_id: i32, name: String, logical_type: &str) -> pb::Field {
+        pb::Field {
+            id,
+            parent_id,
+            name,
+            logical_type: logical_type.to_owned(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn test_schema_set_ids() {
@@ -317,8 +405,118 @@ mod tests {
         let expected_schema = Schema::try_from(&arrow_schema).unwrap();
         let fields_with_meta: FieldsWithMeta = (&expected_schema).into();
 
-        let schema = Schema::from(fields_with_meta);
+        let schema = Schema::try_from(fields_with_meta).unwrap();
         assert_eq!(expected_schema, schema);
+    }
+
+    #[test]
+    fn test_reconstruct_wide_nested_schema() {
+        const NUM_STRUCTS: usize = 4096;
+
+        let mut proto_fields = Vec::with_capacity(NUM_STRUCTS * 3);
+        for struct_index in 0..NUM_STRUCTS {
+            let parent_id = (struct_index * 3) as i32;
+            proto_fields.push(proto_field(
+                parent_id,
+                -1,
+                format!("struct_{struct_index}"),
+                "struct",
+            ));
+            proto_fields.push(proto_field(
+                parent_id + 1,
+                parent_id,
+                format!("left_{struct_index}"),
+                "int32",
+            ));
+            proto_fields.push(proto_field(
+                parent_id + 2,
+                parent_id,
+                format!("right_{struct_index}"),
+                "int32",
+            ));
+        }
+
+        let fields = Fields(proto_fields);
+        let schema = Schema::try_from(&fields).unwrap();
+        assert_eq!(schema.fields.len(), NUM_STRUCTS);
+        for (struct_index, field) in schema.fields.iter().enumerate() {
+            let parent_id = (struct_index * 3) as i32;
+            assert_eq!(field.id, parent_id);
+            assert_eq!(field.name, format!("struct_{struct_index}"));
+            assert_eq!(field.children.len(), 2);
+            assert_eq!(field.children[0].id, parent_id + 1);
+            assert_eq!(field.children[0].name, format!("left_{struct_index}"));
+            assert_eq!(field.children[1].id, parent_id + 2);
+            assert_eq!(field.children[1].name, format!("right_{struct_index}"));
+        }
+    }
+
+    #[test]
+    fn test_reconstruct_deep_nested_schema() {
+        const DEPTH: usize = 1024;
+
+        let proto_fields = (0..DEPTH)
+            .map(|depth| {
+                proto_field(
+                    depth as i32,
+                    if depth == 0 { -1 } else { depth as i32 - 1 },
+                    format!("level_{depth}"),
+                    if depth + 1 == DEPTH {
+                        "int32"
+                    } else {
+                        "struct"
+                    },
+                )
+            })
+            .collect();
+
+        let fields = Fields(proto_fields);
+        let schema = Schema::try_from(&fields).unwrap();
+        assert_eq!(schema.fields.len(), 1);
+        let mut field = &schema.fields[0];
+        for depth in 0..DEPTH {
+            assert_eq!(field.id, depth as i32);
+            assert_eq!(field.name, format!("level_{depth}"));
+            if depth + 1 == DEPTH {
+                assert!(field.children.is_empty());
+            } else {
+                assert_eq!(field.children.len(), 1);
+                field = &field.children[0];
+            }
+        }
+    }
+
+    #[test]
+    fn test_reconstruct_schema_reports_missing_parent() {
+        let fields = Fields(vec![proto_field(7, 42, "child".to_owned(), "int32")]);
+
+        let error = Schema::try_from(&fields).unwrap_err();
+        assert!(matches!(&error, Error::Schema { .. }));
+        assert!(
+            error.to_string().contains(
+                "Field 'child' (id=7) references parent id 42, which must appear earlier"
+            )
+        );
+    }
+
+    #[test]
+    fn test_reconstruct_schema_preserves_legacy_duplicate_id_match() {
+        let fields = Fields(vec![
+            proto_field(1, -1, "root_a".to_owned(), "struct"),
+            proto_field(2, -1, "root_b".to_owned(), "struct"),
+            proto_field(2, 1, "nested_duplicate".to_owned(), "struct"),
+            proto_field(3, 2, "child".to_owned(), "int32"),
+        ]);
+
+        let schema = Schema::try_from(&fields).unwrap();
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(schema.fields[0].name, "root_a");
+        assert_eq!(schema.fields[0].children.len(), 1);
+        assert_eq!(schema.fields[0].children[0].name, "nested_duplicate");
+        assert_eq!(schema.fields[0].children[0].children.len(), 1);
+        assert_eq!(schema.fields[0].children[0].children[0].name, "child");
+        assert_eq!(schema.fields[1].name, "root_b");
+        assert!(schema.fields[1].children.is_empty());
     }
 
     #[test]
@@ -351,7 +549,7 @@ mod tests {
 
         // Round-trip through protobuf
         let fields_with_meta: FieldsWithMeta = (&schema).into();
-        let restored = Schema::from(fields_with_meta);
+        let restored = Schema::try_from(fields_with_meta).unwrap();
 
         let ck2 = restored.unenforced_clustering_key();
         assert_eq!(ck2.len(), 2);

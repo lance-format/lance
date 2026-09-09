@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 
-use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::blocking_scanner::{ScannerOptions, build_scanner_with_options};
 use crate::dispatcher::{DISPATCHER, DispatcherMessage};
 use crate::error::Result;
 use crate::task_tracker::{TASK_TRACKER, TaskInfo};
+use crate::{RT, block_on};
 use arrow::ffi::FFI_ArrowSchema;
 use jni::JNIEnv;
 use jni::objects::JObject;
@@ -82,7 +82,7 @@ impl AsyncScanner {
             // Will be aborted when real handle is registered
         });
 
-        RT.block_on(async {
+        block_on(async {
             TASK_TRACKER
                 .register(
                     task_id,
@@ -163,7 +163,7 @@ impl AsyncScanner {
         });
 
         // Step 3: Update registration with real handle
-        RT.block_on(async {
+        block_on(async {
             TASK_TRACKER.update_handle(task_id, handle).await;
         });
     }
@@ -181,6 +181,8 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
     substrait_filter_obj: JObject<'local>,
     filter_obj: JObject<'local>,
     batch_size_obj: JObject<'local>,
+    batch_size_bytes_obj: JObject<'local>,
+    io_buffer_size_obj: JObject<'local>,
     limit_obj: JObject<'local>,
     offset_obj: JObject<'local>,
     query_obj: JObject<'local>,
@@ -189,6 +191,9 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
     with_row_id: jboolean,
     with_row_address: jboolean,
     batch_readahead: jint,
+    fragment_readahead_obj: JObject<'local>,
+    scan_in_order: jboolean,
+    late_materialization_obj: JObject<'local>,
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
     fast_search: jboolean,
@@ -207,6 +212,8 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
             substrait_filter_obj,
             filter_obj,
             batch_size_obj,
+            batch_size_bytes_obj,
+            io_buffer_size_obj,
             limit_obj,
             offset_obj,
             query_obj,
@@ -215,6 +222,9 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
             with_row_id,
             with_row_address,
             batch_readahead,
+            fragment_readahead_obj,
+            scan_in_order,
+            late_materialization_obj,
             column_orderings,
             use_scalar_index,
             fast_search,
@@ -235,6 +245,8 @@ fn inner_create_async_scanner<'local>(
     substrait_filter_obj: JObject<'local>,
     filter_obj: JObject<'local>,
     batch_size_obj: JObject<'local>,
+    batch_size_bytes_obj: JObject<'local>,
+    io_buffer_size_obj: JObject<'local>,
     limit_obj: JObject<'local>,
     offset_obj: JObject<'local>,
     query_obj: JObject<'local>,
@@ -243,6 +255,9 @@ fn inner_create_async_scanner<'local>(
     with_row_id: jboolean,
     with_row_address: jboolean,
     batch_readahead: jint,
+    fragment_readahead_obj: JObject<'local>,
+    scan_in_order: jboolean,
+    late_materialization_obj: JObject<'local>,
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
     fast_search: jboolean,
@@ -262,6 +277,8 @@ fn inner_create_async_scanner<'local>(
         substrait_filter_obj,
         filter_obj,
         batch_size_obj,
+        batch_size_bytes_obj,
+        io_buffer_size_obj,
         limit_obj,
         offset_obj,
         query_obj,
@@ -270,6 +287,9 @@ fn inner_create_async_scanner<'local>(
         with_row_id,
         with_row_address,
         batch_readahead,
+        fragment_readahead_obj,
+        scan_in_order,
+        late_materialization_obj,
         column_orderings,
         use_scalar_index,
         fast_search,
@@ -323,7 +343,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_nativeCancelTask(
     _j_scanner: JObject,
     task_id: jlong,
 ) {
-    RT.block_on(async {
+    block_on(async {
         TASK_TRACKER.cancel(task_id as u64).await;
     });
 }
@@ -361,7 +381,7 @@ fn inner_import_async_ffi_schema(
     let scanner_guard =
         unsafe { env.get_rust_field::<_, _, AsyncScanner>(j_scanner, NATIVE_ASYNC_SCANNER)? };
 
-    let schema = RT.block_on(scanner_guard.inner.schema())?;
+    let schema = block_on(scanner_guard.inner.schema())?;
     let ffi_schema = FFI_ArrowSchema::try_from(&*schema)?;
     unsafe { std::ptr::write_unaligned(schema_addr as *mut FFI_ArrowSchema, ffi_schema) }
     Ok(())

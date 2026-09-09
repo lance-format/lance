@@ -8,38 +8,40 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.file import LanceFileReader
+from lance.file import LanceFileReader, LanceFileWriter
 from lance.indices import IndicesBuilder, IvfModel, PqModel
 
-NUM_ROWS_PER_FRAGMENT = 10000
 DIMENSION = 128
 NUM_SUBVECTORS = 8
 NUM_FRAGMENTS = 3
-NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
-NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
-
-
 SMALL_ROWS_PER_FRAGMENT = 100
 SMALL_NUM_ROWS = SMALL_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
+SMALL_NUM_PARTITIONS = round(np.sqrt(SMALL_NUM_ROWS))
+PQ_ROWS_PER_FRAGMENT = 512
+PQ_NUM_ROWS = PQ_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
+MOSTLY_NULL_ROWS_PER_FRAGMENT = 2000
+MOSTLY_NULL_NUM_ROWS = MOSTLY_NULL_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
+MOSTLY_NULL_NUM_PARTITIONS = round(np.sqrt(MOSTLY_NULL_NUM_ROWS))
+TRAINING_SAMPLE_RATE = 2
+TRAINING_MAX_ITERS = 2
 
 
-def make_ds(num_rows: int, rows_per_frag: int, tmpdir: pathlib.Path, dtype: str):
-    vectors = np.random.randn(num_rows, DIMENSION).astype(dtype)
+def make_ds(
+    num_rows: int,
+    rows_per_frag: int,
+    tmpdir: pathlib.Path,
+    dtype: str,
+    name: str = "dataset",
+):
+    vectors = np.random.default_rng(42).standard_normal((num_rows, DIMENSION))
+    vectors = vectors.astype(dtype)
     vectors = vectors.reshape(-1)
     vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
     table = pa.Table.from_arrays([vectors], names=["vectors"])
-    uri = str(tmpdir / "dataset")
+    uri = str(tmpdir / name)
 
     ds = lance.write_dataset(table, uri, max_rows_per_file=rows_per_frag)
     return ds
-
-
-@pytest.fixture(
-    params=[np.float16, np.float32, np.float64],
-    ids=["f16", "f32", "f64"],
-)
-def rand_dataset(tmpdir, request):
-    return make_ds(NUM_ROWS, NUM_ROWS_PER_FRAGMENT, tmpdir, request.param)
 
 
 @pytest.fixture(
@@ -51,17 +53,53 @@ def small_rand_dataset(tmpdir, request):
 
 
 @pytest.fixture
-def mostly_null_dataset(tmpdir, request):
-    vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(np.float32)
-    vectors = vectors.reshape(-1)
-    vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
-    vectors = vectors.to_pylist()
-    vectors = [vec if i % 10 == 0 else None for i, vec in enumerate(vectors)]
-    vectors = pa.array(vectors, pa.list_(pa.float32(), DIMENSION))
+def small_float32_dataset(tmpdir):
+    return make_ds(SMALL_NUM_ROWS, SMALL_ROWS_PER_FRAGMENT, tmpdir, np.float32)
+
+
+@pytest.fixture(
+    params=[np.float16, np.float32, np.float64],
+    ids=["f16", "f32", "f64"],
+)
+def pq_rand_dataset(tmpdir, request):
+    return make_ds(
+        PQ_NUM_ROWS,
+        PQ_ROWS_PER_FRAGMENT,
+        tmpdir,
+        request.param,
+        name="pq_dataset",
+    )
+
+
+@pytest.fixture
+def pq_float32_dataset(tmpdir):
+    return make_ds(
+        PQ_NUM_ROWS,
+        PQ_ROWS_PER_FRAGMENT,
+        tmpdir,
+        np.float32,
+        name="pq_dataset",
+    )
+
+
+@pytest.fixture
+def mostly_null_dataset(tmpdir):
+    values = np.random.default_rng(42).standard_normal(MOSTLY_NULL_NUM_ROWS * DIMENSION)
+    values = pa.array(values.astype(np.float32))
+    null_mask = pa.array(np.arange(MOSTLY_NULL_NUM_ROWS) % 10 != 0)
+    vectors = pa.FixedSizeListArray.from_arrays(
+        values,
+        DIMENSION,
+        mask=null_mask,
+    )
     table = pa.Table.from_arrays([vectors], names=["vectors"])
 
     uri = str(tmpdir / "nulls_dataset")
-    ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
+    ds = lance.write_dataset(
+        table,
+        uri,
+        max_rows_per_file=MOSTLY_NULL_ROWS_PER_FRAGMENT,
+    )
     return ds
 
 
@@ -91,11 +129,14 @@ def make_multivector_dataset(tmpdir):
     return ds, dimension
 
 
-def test_ivf_centroids(tmpdir, rand_dataset):
-    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(sample_rate=16)
+def test_ivf_centroids(tmpdir, small_rand_dataset):
+    ivf = IndicesBuilder(small_rand_dataset, "vectors").train_ivf(
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
+    )
 
     assert ivf.distance_type == "l2"
-    assert len(ivf.centroids) == NUM_PARTITIONS
+    assert len(ivf.centroids) == SMALL_NUM_PARTITIONS
 
     ivf.save(str(tmpdir / "ivf"))
     reloaded = IvfModel.load(str(tmpdir / "ivf"))
@@ -104,18 +145,25 @@ def test_ivf_centroids(tmpdir, rand_dataset):
 
 
 def test_ivf_centroids_hamming(tmpdir):
-    num_rows = NUM_ROWS
-    vectors = np.random.randint(0, 256, size=(num_rows, DIMENSION), dtype=np.uint8)
+    num_rows = SMALL_NUM_ROWS
+    vectors = np.random.default_rng(42).integers(
+        0,
+        256,
+        size=(num_rows, DIMENSION),
+        dtype=np.uint8,
+    )
     vectors_flat = vectors.reshape(-1)
     vectors_arr = pa.FixedSizeListArray.from_arrays(
         pa.array(vectors_flat, type=pa.uint8()), DIMENSION
     )
     table = pa.Table.from_arrays([vectors_arr], names=["vectors"])
     uri = str(tmpdir / "hamming_dataset")
-    ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
+    ds = lance.write_dataset(table, uri, max_rows_per_file=SMALL_ROWS_PER_FRAGMENT)
 
     ivf = IndicesBuilder(ds, "vectors").train_ivf(
-        sample_rate=16, distance_type="hamming"
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
+        distance_type="hamming",
     )
 
     assert ivf.distance_type == "hamming"
@@ -131,40 +179,49 @@ def test_ivf_centroids_hamming(tmpdir):
 @pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
 def test_ivf_centroids_mostly_null(mostly_null_dataset, distance_type):
     ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(
-        sample_rate=16, distance_type=distance_type
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
+        distance_type=distance_type,
     )
 
     assert ivf.distance_type == distance_type
-    assert len(ivf.centroids) == NUM_PARTITIONS
+    assert len(ivf.centroids) == MOSTLY_NULL_NUM_PARTITIONS
 
 
 @pytest.mark.cuda
-def test_ivf_centroids_cuda(rand_dataset):
-    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
-        sample_rate=16, accelerator="cuda"
+def test_ivf_centroids_cuda(small_rand_dataset):
+    ivf = IndicesBuilder(small_rand_dataset, "vectors").train_ivf(
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
+        accelerator="cuda",
     )
 
     assert ivf.distance_type == "l2"
-    # Can't use NUM_PARTITIONS here because
+    # Can't use SMALL_NUM_PARTITIONS here because
     # CUDA uses math.ceil and CPU uses round to calc. num_partitions
-    assert len(ivf.centroids) == math.ceil(np.sqrt(NUM_ROWS))
+    assert len(ivf.centroids) == math.ceil(np.sqrt(SMALL_NUM_ROWS))
 
 
 @pytest.mark.cuda
 @pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
 def test_ivf_centroids_mostly_null_cuda(mostly_null_dataset, distance_type):
     ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(
-        sample_rate=16, accelerator="cuda", distance_type=distance_type
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
+        accelerator="cuda",
+        distance_type=distance_type,
     )
 
     assert ivf.distance_type == distance_type
-    assert len(ivf.centroids) == NUM_PARTITIONS
+    assert len(ivf.centroids) == MOSTLY_NULL_NUM_PARTITIONS
 
 
-def test_ivf_centroids_distance_type(tmpdir, rand_dataset):
+def test_ivf_centroids_distance_type(tmpdir, small_float32_dataset):
     def check(distance_type):
-        ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
-            sample_rate=16, distance_type=distance_type
+        ivf = IndicesBuilder(small_float32_dataset, "vectors").train_ivf(
+            sample_rate=TRAINING_SAMPLE_RATE,
+            max_iters=TRAINING_MAX_ITERS,
+            distance_type=distance_type,
         )
         assert ivf.distance_type == distance_type
         ivf.save(str(tmpdir / "ivf"))
@@ -176,31 +233,44 @@ def test_ivf_centroids_distance_type(tmpdir, rand_dataset):
     check("dot")
 
 
-def test_num_partitions(rand_dataset):
-    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
-        sample_rate=16, num_partitions=10
+def test_num_partitions(small_float32_dataset):
+    ivf = IndicesBuilder(small_float32_dataset, "vectors").train_ivf(
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
+        num_partitions=10,
     )
     assert ivf.num_partitions == 10
 
 
 @pytest.fixture
-def rand_ivf(rand_dataset):
-    dtype = rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
-    centroids = np.random.rand(DIMENSION * 100).astype(dtype)
+def small_rand_ivf(small_rand_dataset):
+    dtype = small_rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
+    centroids = np.random.default_rng(42).random(DIMENSION * 100).astype(dtype)
     centroids = pa.FixedSizeListArray.from_arrays(centroids, DIMENSION)
     return IvfModel(centroids, "l2")
 
 
 @pytest.fixture
-def small_rand_ivf(small_rand_dataset):
-    dtype = small_rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
-    centroids = np.random.rand(DIMENSION * 100).astype(dtype)
+def pq_rand_ivf(pq_rand_dataset):
+    dtype = pq_rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
+    centroids = np.random.default_rng(42).random(DIMENSION * 100).astype(dtype)
     centroids = pa.FixedSizeListArray.from_arrays(centroids, DIMENSION)
     return IvfModel(centroids, "l2")
 
 
-def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
-    pq = IndicesBuilder(rand_dataset, "vectors").train_pq(rand_ivf, sample_rate=2)
+@pytest.fixture
+def small_float32_ivf(small_float32_dataset):
+    centroids = np.random.default_rng(42).random(DIMENSION * 100).astype(np.float32)
+    centroids = pa.FixedSizeListArray.from_arrays(centroids, DIMENSION)
+    return IvfModel(centroids, "l2")
+
+
+def test_gen_pq(tmpdir, pq_rand_dataset, pq_rand_ivf):
+    pq = IndicesBuilder(pq_rand_dataset, "vectors").train_pq(
+        pq_rand_ivf,
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
+    )
     assert pq.dimension == DIMENSION
     assert pq.num_subvectors == NUM_SUBVECTORS
 
@@ -208,6 +278,30 @@ def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
     reloaded = PqModel.load(str(tmpdir / "pq"))
     assert pq.dimension == reloaded.dimension
     assert pq.codebook == reloaded.codebook
+
+    pq_4bit = IndicesBuilder(pq_rand_dataset, "vectors").train_pq(
+        pq_rand_ivf,
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
+        num_bits=4,
+    )
+    assert pq_4bit.num_bits == 4
+    assert len(pq_4bit.codebook) == 16
+
+    pq_4bit.save(str(tmpdir / "pq_4bit"))
+    reloaded = PqModel.load(str(tmpdir / "pq_4bit"))
+    assert reloaded.num_bits == 4
+
+    legacy_pq_uri = str(tmpdir / "legacy_pq")
+    with LanceFileWriter(
+        legacy_pq_uri,
+        pa.schema(
+            [pa.field("codebook", pq.codebook.type)],
+            metadata={b"num_subvectors": str(pq.num_subvectors).encode()},
+        ),
+    ) as writer:
+        writer.write_batch(pa.table([pq.codebook], names=["codebook"]))
+    assert PqModel.load(legacy_pq_uri).num_bits == 8
 
 
 def test_ivf_centroids_fragment_ids(tmpdir):
@@ -231,10 +325,16 @@ def test_ivf_centroids_fragment_ids(tmpdir):
     fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
 
     first_ivf = IndicesBuilder(ds, "vectors").train_ivf(
-        num_partitions=1, sample_rate=2, fragment_ids=[fragment_ids[0]]
+        num_partitions=1,
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
+        fragment_ids=[fragment_ids[0]],
     )
     second_ivf = IndicesBuilder(ds, "vectors").train_ivf(
-        num_partitions=1, sample_rate=2, fragment_ids=[fragment_ids[1]]
+        num_partitions=1,
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
+        fragment_ids=[fragment_ids[1]],
     )
 
     first_centroid = first_ivf.centroids.values.to_numpy().reshape(-1, DIMENSION)[0]
@@ -300,7 +400,7 @@ def test_indices_builder_multivector_distributed_dimensions(tmpdir, monkeypatch)
 
     captured_dimensions = {}
 
-    def train_pq_model(*args):
+    def train_pq_model(*args, **kwargs):
         captured_dimensions["train_pq"] = args[2]
         return codebook
 
@@ -326,17 +426,19 @@ def test_indices_builder_multivector_distributed_dimensions(tmpdir, monkeypatch)
     }
 
 
-def test_pq_fragment_ids(rand_dataset):
-    fragment_id = rand_dataset.get_fragments()[0].fragment_id
-    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+def test_pq_fragment_ids(pq_float32_dataset):
+    fragment_id = pq_float32_dataset.get_fragments()[0].fragment_id
+    ivf = IndicesBuilder(pq_float32_dataset, "vectors").train_ivf(
         num_partitions=4,
-        sample_rate=16,
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
         fragment_ids=[fragment_id],
     )
 
-    pq = IndicesBuilder(rand_dataset, "vectors").train_pq(
+    pq = IndicesBuilder(pq_float32_dataset, "vectors").train_pq(
         ivf,
-        sample_rate=2,
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
         fragment_ids=[fragment_id],
     )
 
@@ -344,31 +446,41 @@ def test_pq_fragment_ids(rand_dataset):
     assert pq.num_subvectors == NUM_SUBVECTORS
 
 
-def test_pq_invalid_sub_vectors(tmpdir, rand_dataset, rand_ivf):
+def test_pq_invalid_sub_vectors(
+    small_float32_dataset,
+    small_float32_ivf,
+):
     with pytest.raises(
         ValueError,
         match="must be divisible by num_subvectors .* without remainder",
     ):
-        IndicesBuilder(rand_dataset, "vectors").train_pq(
-            rand_ivf, sample_rate=2, num_subvectors=5
+        IndicesBuilder(small_float32_dataset, "vectors").train_pq(
+            small_float32_ivf,
+            sample_rate=TRAINING_SAMPLE_RATE,
+            max_iters=TRAINING_MAX_ITERS,
+            num_subvectors=5,
         )
 
 
 def test_gen_pq_mostly_null(mostly_null_dataset):
-    centroids = np.random.rand(DIMENSION * 100).astype(np.float32)
+    centroids = np.random.default_rng(42).random(DIMENSION * 100).astype(np.float32)
     centroids = pa.FixedSizeListArray.from_arrays(centroids, DIMENSION)
     ivf = IvfModel(centroids, "l2")
 
-    pq = IndicesBuilder(mostly_null_dataset, "vectors").train_pq(ivf, sample_rate=2)
+    pq = IndicesBuilder(mostly_null_dataset, "vectors").train_pq(
+        ivf,
+        sample_rate=TRAINING_SAMPLE_RATE,
+        max_iters=TRAINING_MAX_ITERS,
+    )
     assert pq.dimension == DIMENSION
     assert pq.num_subvectors == NUM_SUBVECTORS
 
 
 @pytest.mark.cuda
-def test_assign_partitions(rand_dataset, rand_ivf):
-    builder = IndicesBuilder(rand_dataset, "vectors")
+def test_assign_partitions(small_rand_dataset, small_rand_ivf):
+    builder = IndicesBuilder(small_rand_dataset, "vectors")
 
-    partitions_uri = builder.assign_ivf_partitions(rand_ivf, accelerator="cuda")
+    partitions_uri = builder.assign_ivf_partitions(small_rand_ivf, accelerator="cuda")
 
     partitions = lance.dataset(partitions_uri)
     found_row_ids = set()
@@ -379,13 +491,13 @@ def test_assign_partitions(rand_dataset, rand_ivf):
         part_ids = batch["partition"]
         for part_id in part_ids:
             assert part_id.as_py() < 100
-    assert len(found_row_ids) == rand_dataset.count_rows()
+    assert len(found_row_ids) == small_rand_dataset.count_rows()
 
 
 @pytest.mark.cuda
 @pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
 def test_assign_partitions_mostly_null(mostly_null_dataset, distance_type):
-    centroids = np.random.rand(DIMENSION * 100).astype(np.float32)
+    centroids = np.random.default_rng(42).random(DIMENSION * 100).astype(np.float32)
     centroids = pa.FixedSizeListArray.from_arrays(centroids, DIMENSION)
     ivf = IvfModel(centroids, distance_type)
 
@@ -408,7 +520,7 @@ def test_assign_partitions_mostly_null(mostly_null_dataset, distance_type):
 @pytest.fixture
 def small_rand_pq(small_rand_dataset, small_rand_ivf):
     dtype = small_rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
-    codebook = np.random.rand(DIMENSION * 256).astype(dtype)
+    codebook = np.random.default_rng(42).random(DIMENSION * 256).astype(dtype)
     codebook = pa.FixedSizeListArray.from_arrays(codebook, DIMENSION)
     pq = PqModel(NUM_SUBVECTORS, codebook)
     return pq

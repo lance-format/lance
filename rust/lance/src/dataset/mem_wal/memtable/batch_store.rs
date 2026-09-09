@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Lock-free append-only batch storage for MemTable.
+//! Append-only batch storage with lock-free readers for MemTable.
 //!
-//! This module provides a high-performance, lock-free storage structure for
-//! RecordBatches in the MemTable. It is designed for a single-writer,
-//! multiple-reader scenario where:
+//! This module provides high-performance storage for RecordBatches in the
+//! MemTable. Reads remain lock-free, while appends are serialized so the
+//! single-writer invariant is also upheld for safe callers.
 //!
-//! - A single writer task (WriteBatchHandler) appends batches
+//! - A writer task (WriteBatchHandler) appends batches
 //! - Multiple reader tasks concurrently read batches
-//! - No locks are needed for either reads or writes
+//! - Accidental concurrent appends are serialized
 //!
 //! # Safety Model
 //!
 //! The lock-free design relies on these invariants:
 //!
-//! 1. **Single Writer**: Only one thread calls `append()` at a time.
-//!    Enforced by the WriteBatchHandler architecture.
+//! 1. **Serialized Writers**: Only one thread mutates slots at a time.
+//!    Enforced by an internal writer guard in addition to the
+//!    WriteBatchHandler architecture.
 //!
 //! 2. **Append-Only**: Once written, slots are never modified or removed
 //!    until the entire store is dropped.
@@ -40,10 +41,15 @@
 //! ```
 
 use std::cell::UnsafeCell;
+use std::collections::HashSet;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
+use arrow_buffer::Buffer;
+use arrow_schema::DataType;
 
 /// A batch stored in the lock-free store.
 #[derive(Clone)]
@@ -75,13 +81,55 @@ impl StoredBatch {
     }
 
     /// Estimate the memory size of a RecordBatch.
+    ///
+    /// Sums each column's slice-aware buffer size (see
+    /// [`Self::estimate_array_size`]) plus the struct overhead, so a column that
+    /// is a zero-copy slice of a larger parent contributes only its own window
+    /// rather than the whole shared buffer.
     fn estimate_batch_size(batch: &RecordBatch) -> usize {
         batch
             .columns()
             .iter()
-            .map(|col| col.get_array_memory_size())
+            .map(|col| Self::estimate_array_size(&col.to_data()))
             .sum::<usize>()
             + std::mem::size_of::<RecordBatch>()
+    }
+
+    /// Slice-aware buffer size of a single array.
+    ///
+    /// [`ArrayData::get_slice_memory_size`] reports each buffer's own window
+    /// (not the whole shared buffer), but omits the variadic data buffers of
+    /// `Utf8View`/`BinaryView` (values > 12 bytes) while still returning `Ok`, so
+    /// [`Self::view_data_buffers_size`] adds them. Those buffers are shared across
+    /// zero-copy slices and are counted at full capacity for each slice — an
+    /// over-count in the safe direction.
+    pub(crate) fn estimate_array_size(data: &ArrayData) -> usize {
+        match data.get_slice_memory_size() {
+            Ok(size) => size + Self::view_data_buffers_size(data),
+            // Fall back to the full-buffer sum for layouts the slice-aware call
+            // cannot handle.
+            Err(_) => data.get_array_memory_size(),
+        }
+    }
+
+    /// Capacity of the variadic `Utf8View`/`BinaryView` data buffers that
+    /// [`ArrayData::get_slice_memory_size`] omits, summed recursively over children.
+    fn view_data_buffers_size(data: &ArrayData) -> usize {
+        let mut size = 0;
+        if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
+            // buffers()[0] is the 16-byte view array that get_slice_memory_size
+            // already counts; [1..] are the data buffers it skips.
+            size += data
+                .buffers()
+                .iter()
+                .skip(1)
+                .map(|b| b.capacity())
+                .sum::<usize>();
+        }
+        for child in data.child_data() {
+            size += Self::view_data_buffers_size(child);
+        }
+        size
     }
 }
 
@@ -112,10 +160,9 @@ impl std::fmt::Display for StoreFull {
 
 impl std::error::Error for StoreFull {}
 
-/// Lock-free append-only storage for memtable batches.
+/// Append-only storage with lock-free readers for memtable batches.
 ///
-/// This structure provides O(1) lock-free appends and reads for a
-/// single-writer, multiple-reader scenario.
+/// This structure provides O(1) serialized appends and lock-free reads.
 ///
 /// # Example
 ///
@@ -142,6 +189,9 @@ pub struct BatchStore {
     /// Invariant: all slots [0, committed_len) contain valid data.
     committed_len: AtomicUsize,
 
+    /// Serializes slot initialization for safe callers.
+    writer_active: AtomicBool,
+
     /// Total capacity (fixed at creation).
     capacity: usize,
 
@@ -151,19 +201,45 @@ pub struct BatchStore {
     /// Estimated size in bytes (for flush threshold).
     estimated_bytes: AtomicUsize,
 
-    /// WAL flush watermark: the last batch ID that has been flushed to WAL (inclusive).
-    /// Uses usize::MAX as sentinel for "nothing flushed yet".
-    /// This is per-memtable tracking, not global.
-    max_flushed_batch_position: AtomicUsize,
+    /// Sum of [`Buffer::capacity`] over the distinct allocations the stored
+    /// batches keep alive. See [`Self::retained_bytes`].
+    retained_bytes: AtomicUsize,
+
+    /// Addresses of the allocations already counted into `retained_bytes`, so
+    /// batches sharing a parent buffer charge it once.
+    ///
+    /// Only `append`/`append_batches` touch it, already serialized by the
+    /// writer guard; the `Mutex` is what makes that sound for a `Sync` type,
+    /// not a second layer of exclusion.
+    retained_buffers: Mutex<HashSet<usize>>,
+
+    /// Writer-global coordinate of this store's batch 0.
+    ///
+    /// A *coordinate*, not a cursor: stamped once at construction and never
+    /// moved. `global_position = global_offset + local_position`. Batch
+    /// positions restart at 0 in every memtable, so this is the only thing that
+    /// lets a writer-global cursor (the WAL durability count) be mapped onto a
+    /// particular store.
+    global_offset: usize,
 }
 
 // SAFETY: Safe to share across threads because:
-// - Single writer guarantee (architectural invariant)
+// - writer_active serializes all slot initialization
 // - Readers only access committed slots (index < committed_len)
 // - Atomic operations provide proper synchronization
 // - Slots are never modified after being written
 unsafe impl Sync for BatchStore {}
 unsafe impl Send for BatchStore {}
+
+struct BatchStoreWriterGuard<'a> {
+    writer_active: &'a AtomicBool,
+}
+
+impl Drop for BatchStoreWriterGuard<'_> {
+    fn drop(&mut self) {
+        self.writer_active.store(false, Ordering::Release);
+    }
+}
 
 impl BatchStore {
     /// Create a new store with the given capacity.
@@ -177,6 +253,13 @@ impl BatchStore {
     ///
     /// Panics if capacity is 0.
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_at(capacity, 0)
+    }
+
+    /// Create a store whose batch 0 sits at `global_offset` in the writer's
+    /// batch sequence. Used by `freeze_memtable` for every memtable after the
+    /// first; the first starts at 0.
+    pub fn with_capacity_at(capacity: usize, global_offset: usize) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
 
         // Allocate uninitialized storage
@@ -188,10 +271,13 @@ impl BatchStore {
         Self {
             slots: slots.into_boxed_slice(),
             committed_len: AtomicUsize::new(0),
+            writer_active: AtomicBool::new(false),
             capacity,
             total_rows: AtomicUsize::new(0),
             estimated_bytes: AtomicUsize::new(0),
-            max_flushed_batch_position: AtomicUsize::new(usize::MAX), // Nothing flushed yet
+            retained_bytes: AtomicUsize::new(0),
+            retained_buffers: Mutex::new(HashSet::new()),
+            global_offset,
         }
     }
 
@@ -227,22 +313,19 @@ impl BatchStore {
     }
 
     // =========================================================================
-    // Writer API (Single Writer Only)
+    // Writer API
     // =========================================================================
 
     /// Append a batch to the store.
-    ///
-    /// # Safety Requirements
-    ///
-    /// This method MUST only be called from the single writer task.
-    /// Concurrent calls from multiple threads cause undefined behavior.
     ///
     /// # Returns
     ///
     /// - `Ok((batch_position, row_offset, estimated_size))` - The index, row offset, and size of the appended batch
     /// - `Err(StoreFull)` - The store is at capacity, needs flush
     pub fn append(&self, batch: RecordBatch) -> Result<(usize, u64, usize), StoreFull> {
-        // Load current length (Relaxed is fine - we're the only writer)
+        let _writer_guard = self.acquire_writer();
+
+        // The writer guard makes Relaxed sufficient for writer-owned state.
         let idx = self.committed_len.load(Ordering::Relaxed);
 
         if idx >= self.capacity {
@@ -252,13 +335,14 @@ impl BatchStore {
         // Row offset is the total rows BEFORE this batch
         let row_offset = self.total_rows.load(Ordering::Relaxed) as u64;
 
+        let retained = self.charge_retained(&batch);
         let stored = StoredBatch::new(batch, row_offset, idx);
         let num_rows = stored.num_rows;
         let estimated_size = stored.estimated_size;
 
         // SAFETY:
         // 1. idx < capacity, so slot exists
-        // 2. Single writer guarantee - no concurrent writes to this slot
+        // 2. The writer guard prevents concurrent writes to this slot
         // 3. Slot at idx is uninitialized (never written before, append-only)
         unsafe {
             let slot_ptr = self.slots[idx].get();
@@ -269,6 +353,7 @@ impl BatchStore {
         self.total_rows.fetch_add(num_rows, Ordering::Relaxed);
         self.estimated_bytes
             .fetch_add(estimated_size, Ordering::Relaxed);
+        self.retained_bytes.fetch_add(retained, Ordering::Relaxed);
 
         // CRITICAL: Publish with Release ordering.
         // This ensures all writes above are visible to readers
@@ -283,11 +368,6 @@ impl BatchStore {
     /// All batches are written before publishing, so readers see either
     /// none of the batches or all of them (atomic visibility).
     ///
-    /// # Safety Requirements
-    ///
-    /// This method MUST only be called from the single writer task.
-    /// Concurrent calls from multiple threads cause undefined behavior.
-    ///
     /// # Returns
     ///
     /// - `Ok(Vec<(batch_position, row_offset, estimated_size)>)` - Info for each appended batch
@@ -300,7 +380,9 @@ impl BatchStore {
             return Ok(vec![]);
         }
 
-        // Load current length (Relaxed is fine - we're the only writer)
+        let _writer_guard = self.acquire_writer();
+
+        // The writer guard makes Relaxed sufficient for writer-owned state.
         let start_idx = self.committed_len.load(Ordering::Relaxed);
         let count = batches.len();
 
@@ -312,18 +394,20 @@ impl BatchStore {
         let mut results = Vec::with_capacity(count);
         let mut total_rows_added = 0usize;
         let mut total_bytes_added = 0usize;
+        let mut total_retained_added = 0usize;
         let mut row_offset = self.total_rows.load(Ordering::Relaxed) as u64;
 
         // Write all batches to slots (not yet visible to readers)
         for (i, batch) in batches.into_iter().enumerate() {
             let idx = start_idx + i;
+            total_retained_added += self.charge_retained(&batch);
             let stored = StoredBatch::new(batch, row_offset, idx);
             let num_rows = stored.num_rows;
             let estimated_size = stored.estimated_size;
 
             // SAFETY:
             // 1. idx < capacity (checked above)
-            // 2. Single writer guarantee - no concurrent writes to this slot
+            // 2. The writer guard prevents concurrent writes to this slot
             // 3. Slot at idx is uninitialized (never written before, append-only)
             unsafe {
                 let slot_ptr = self.slots[idx].get();
@@ -341,6 +425,8 @@ impl BatchStore {
             .fetch_add(total_rows_added, Ordering::Relaxed);
         self.estimated_bytes
             .fetch_add(total_bytes_added, Ordering::Relaxed);
+        self.retained_bytes
+            .fetch_add(total_retained_added, Ordering::Relaxed);
 
         // CRITICAL: Publish ALL batches at once with Release ordering.
         // This ensures all writes above are visible to readers
@@ -349,6 +435,70 @@ impl BatchStore {
             .store(start_idx + count, Ordering::Release);
 
         Ok(results)
+    }
+
+    /// Charge the allocations `batch` retains that this store has not counted
+    /// yet, and return how much that added.
+    ///
+    /// The unit is the allocation, not the window a batch reads through it: a
+    /// one-row zero-copy slice pins its whole parent buffer, so measuring the
+    /// window would let an unbounded footprint in under a small number.
+    ///
+    /// Charged once per *distinct buffer view*, not strictly once per
+    /// allocation. `ArrayData::slice` advances the offset and leaves the buffer
+    /// pointer alone, so ordinary slices of one parent do dedupe; a buffer that
+    /// came back re-sliced from a kernel (`Buffer::slice_with_length`, concat or
+    /// take output) presents a different `data_ptr` for the same allocation and
+    /// is charged again in full. That over-counts, which is the safe direction
+    /// for a ceiling.
+    ///
+    /// `retained_buffers` is never pruned: it grows with every batch this store
+    /// accepts, bounded only by the store being dropped at flush. The walk plus
+    /// `to_data`, the mutex and a hash insert run per column per append — fine
+    /// at current batch rates, and the thing to look at first if that changes.
+    ///
+    /// Call under the writer guard, before the batch is moved into its slot.
+    fn charge_retained(&self, batch: &RecordBatch) -> usize {
+        let mut seen = self.retained_buffers.lock().unwrap();
+        let mut added = 0;
+        for column in batch.columns() {
+            Self::walk_buffers(&column.to_data(), &mut |buffer| {
+                if seen.insert(buffer.data_ptr().as_ptr() as usize) {
+                    // `capacity` reads 0 for a foreign allocation whose size
+                    // arrow was not told; the window is the only figure left.
+                    added += buffer.capacity().max(buffer.len());
+                }
+            });
+        }
+        added
+    }
+
+    /// Every buffer reachable from `data`, validity and nested children
+    /// included — `ArrayData::buffers` alone omits both, and the variadic
+    /// `Utf8View`/`BinaryView` data buffers hang off it as ordinary entries.
+    fn walk_buffers(data: &ArrayData, visit: &mut impl FnMut(&Buffer)) {
+        for buffer in data.buffers() {
+            visit(buffer);
+        }
+        if let Some(nulls) = data.nulls() {
+            visit(nulls.buffer());
+        }
+        for child in data.child_data() {
+            Self::walk_buffers(child, visit);
+        }
+    }
+
+    fn acquire_writer(&self) -> BatchStoreWriterGuard<'_> {
+        while self
+            .writer_active
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        BatchStoreWriterGuard {
+            writer_active: &self.writer_active,
+        }
     }
 
     // =========================================================================
@@ -385,82 +535,79 @@ impl BatchStore {
 
     /// Get estimated size in bytes.
     #[inline]
-    pub fn estimated_bytes(&self) -> usize {
+    pub fn row_bytes(&self) -> usize {
         self.estimated_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Heap this store actually keeps alive: every distinct allocation its
+    /// batches reference, counted once at its full capacity.
+    ///
+    /// Differs from [`Self::row_bytes`] wherever a batch is a zero-copy slice.
+    /// `row_bytes` measures the window, because it drives the flush threshold
+    /// and a flush writes only the rows in that window. This measures what the
+    /// allocator cannot hand back until the memtable is dropped — which is the
+    /// question a memory ceiling is asking. Sixteen one-row slices of sixteen
+    /// large parents are megabytes here and a few hundred bytes there.
+    ///
+    /// Deduplicated within a store, not across them: two memtables slicing one
+    /// parent each charge it in full, which errs toward refusing writes.
+    #[inline]
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes.load(Ordering::Relaxed)
     }
 
     // =========================================================================
     // WAL Flush Tracking API
     // =========================================================================
 
-    /// Get the WAL flush watermark (the last batch ID that was flushed, inclusive).
-    /// Returns None if nothing has been flushed yet.
+    /// Writer-global coordinate one past this store's last committed batch.
     #[inline]
-    pub fn max_flushed_batch_position(&self) -> Option<usize> {
-        let watermark = self.max_flushed_batch_position.load(Ordering::Acquire);
-        if watermark == usize::MAX {
-            None
-        } else {
-            Some(watermark)
-        }
+    pub fn global_end(&self) -> usize {
+        self.global_offset + self.committed_len.load(Ordering::Acquire)
     }
 
-    /// Update the WAL flush watermark after successful WAL flush.
+    /// This store's writer-global coordinate for batch 0.
+    #[inline]
+    pub fn global_offset(&self) -> usize {
+        self.global_offset
+    }
+
+    /// The local exclusive end of this store covered by a writer-global cursor.
     ///
-    /// # Arguments
+    /// Saturating in both directions, and both directions are reachable in
+    /// normal operation: a cursor *below* this store's offset means "nothing
+    /// here yet" (the store was rotated in after the cursor last advanced —
+    /// the ordinary state of a fresh memtable), and a cursor beyond its end
+    /// clamps to what is committed.
     ///
-    /// * `batch_position` - The last batch ID that was flushed (inclusive)
+    /// This is the **only** place the global-to-local subtraction is written.
+    /// Open-coding it underflows on every memtable rotation, which in release
+    /// wraps to a huge end and makes the whole new memtable instantly visible.
     #[inline]
-    pub fn set_max_flushed_batch_position(&self, batch_position: usize) {
-        debug_assert!(
-            batch_position != usize::MAX,
-            "batch_position cannot be usize::MAX (reserved as sentinel)"
-        );
-        self.max_flushed_batch_position
-            .store(batch_position, Ordering::Release);
+    pub fn local_end(&self, global_cursor: usize) -> usize {
+        global_cursor
+            .saturating_sub(self.global_offset)
+            .min(self.committed_len.load(Ordering::Acquire))
     }
 
-    /// Get the number of batches pending WAL flush.
+    /// Batches in this store still waiting on their WAL append.
     #[inline]
-    pub fn pending_wal_flush_count(&self) -> usize {
-        let committed = self.committed_len.load(Ordering::Acquire);
-        let watermark = self.max_flushed_batch_position.load(Ordering::Acquire);
-        if watermark == usize::MAX {
-            // Nothing flushed yet, all committed batches are pending
-            committed
-        } else {
-            // Batches [0, watermark] are flushed, so pending = committed - (watermark + 1)
-            committed.saturating_sub(watermark + 1)
-        }
+    pub fn pending_wal_flush_count(&self, durable: usize) -> usize {
+        self.committed_len.load(Ordering::Acquire) - self.local_end(durable)
     }
 
-    /// Check if all committed batches have been WAL-flushed.
+    /// Local range `[start, end)` of batches still waiting on their WAL append,
+    /// or `None` when the store is fully durable.
     #[inline]
-    pub fn is_wal_flush_complete(&self) -> bool {
-        self.pending_wal_flush_count() == 0
-    }
-
-    /// Get the range of batch IDs pending WAL flush: [start, end).
-    /// Returns None if nothing pending.
-    #[inline]
-    pub fn pending_wal_flush_range(&self) -> Option<(usize, usize)> {
-        let committed = self.committed_len.load(Ordering::Acquire);
-        let watermark = self.max_flushed_batch_position.load(Ordering::Acquire);
-        let start = if watermark == usize::MAX {
-            0
-        } else {
-            watermark + 1
-        };
-        if committed > start {
-            Some((start, committed))
-        } else {
-            None
-        }
+    pub fn pending_wal_flush_range(&self, durable: usize) -> Option<(usize, usize)> {
+        let start = self.local_end(durable);
+        let end = self.committed_len.load(Ordering::Acquire);
+        (end > start).then_some((start, end))
     }
 
     /// Get a point-in-time summary of batches pending WAL flush.
-    pub fn pending_wal_flush_stats(&self) -> PendingWalFlushStats {
-        let Some((start, end)) = self.pending_wal_flush_range() else {
+    pub fn pending_wal_flush_stats(&self, durable: usize) -> PendingWalFlushStats {
+        let Some((start, end)) = self.pending_wal_flush_range(durable) else {
             return PendingWalFlushStats::default();
         };
 
@@ -599,66 +746,53 @@ impl BatchStore {
     // Visibility API
     // =========================================================================
 
-    /// Get batches visible up to a specific batch position (inclusive).
+    /// Batches in the visible prefix `[0, visible_count)`.
     ///
-    /// A batch at position `i` is visible if `i <= max_visible_batch_position`.
-    pub fn visible_batches(&self, max_visible_batch_position: usize) -> Vec<&StoredBatch> {
-        let len = self.committed_len.load(Ordering::Acquire);
-        let end = (max_visible_batch_position + 1).min(len);
+    /// `visible_count` is an **exclusive count**, not an inclusive position: 0
+    /// means nothing is visible. As an inclusive position, 0 meant *both*
+    /// "nothing visible" and "batch 0 is visible", so a batch that was committed
+    /// to the store but not yet indexed or WAL-durable was readable for a full
+    /// PUT round-trip. The count makes that off-by-one inexpressible.
+    pub fn visible_batches(&self, visible_count: usize) -> Vec<&StoredBatch> {
+        let end = visible_count.min(self.committed_len.load(Ordering::Acquire));
         (0..end).filter_map(|i| self.get(i)).collect()
     }
 
-    /// Get batch positions visible up to a specific batch position (inclusive).
-    pub fn max_visible_batch_positions(&self, max_visible_batch_position: usize) -> Vec<usize> {
-        let len = self.committed_len.load(Ordering::Acquire);
-        let end = (max_visible_batch_position + 1).min(len);
+    /// Positions of the batches in the visible prefix.
+    pub fn visible_batch_positions(&self, visible_count: usize) -> Vec<usize> {
+        let end = visible_count.min(self.committed_len.load(Ordering::Acquire));
         (0..end).collect()
     }
 
-    /// The inclusive maximum visible *row* position at `max_visible_batch_position`,
-    /// or `None` when no rows are visible. The visible batches are the committed
-    /// prefix `[0, last_visible_idx]`; each batch carries its cumulative
-    /// `row_offset`, so this is the end of the last visible batch minus one.
-    /// Used to bound MVCC seeks against the maintained PK-position index.
-    pub fn max_visible_row(&self, max_visible_batch_position: usize) -> Option<u64> {
-        let len = self.committed_len.load(Ordering::Acquire);
-        if len == 0 {
-            return None;
-        }
-        let last_visible_idx = max_visible_batch_position.min(len - 1);
-        let last = self.get(last_visible_idx)?;
+    /// The inclusive maximum visible *row* position, or `None` when no rows are
+    /// visible. Each batch carries its cumulative `row_offset`, so this is the
+    /// end of the last visible batch minus one. Bounds MVCC seeks against the
+    /// maintained PK-position index.
+    pub fn max_visible_row(&self, visible_count: usize) -> Option<u64> {
+        let end = visible_count.min(self.committed_len.load(Ordering::Acquire));
+        let last = self.get(end.checked_sub(1)?)?;
         let visible_end = last.row_offset + last.num_rows as u64; // exclusive
         visible_end.checked_sub(1)
     }
 
-    /// Check if a specific batch is visible at a given visibility position.
+    /// Whether a batch falls inside the visible prefix.
     #[inline]
-    pub fn is_batch_visible(
-        &self,
-        batch_position: usize,
-        max_visible_batch_position: usize,
-    ) -> bool {
+    pub fn is_batch_visible(&self, batch_position: usize, visible_count: usize) -> bool {
         let len = self.committed_len.load(Ordering::Acquire);
-        batch_position < len && batch_position <= max_visible_batch_position
+        batch_position < len && batch_position < visible_count
     }
 
-    /// Get visible RecordBatches (clones the data).
-    pub fn visible_record_batches(&self, max_visible_batch_position: usize) -> Vec<RecordBatch> {
-        self.visible_batches(max_visible_batch_position)
+    /// Visible RecordBatches (clones the data).
+    pub fn visible_record_batches(&self, visible_count: usize) -> Vec<RecordBatch> {
+        self.visible_batches(visible_count)
             .into_iter()
             .map(|b| b.data.clone())
             .collect()
     }
 
-    /// Get visible RecordBatches with their row offsets.
-    ///
-    /// Returns tuples of (batch, row_offset) for each visible batch.
-    /// The row_offset is the starting row position for that batch.
-    pub fn visible_batches_with_offsets(
-        &self,
-        max_visible_batch_position: usize,
-    ) -> Vec<(RecordBatch, u64)> {
-        self.visible_batches(max_visible_batch_position)
+    /// Visible RecordBatches paired with the row position each one starts at.
+    pub fn visible_batches_with_offsets(&self, visible_count: usize) -> Vec<(RecordBatch, u64)> {
+        self.visible_batches(visible_count)
             .into_iter()
             .map(|b| (b.data.clone(), b.row_offset))
             .collect()
@@ -766,7 +900,7 @@ mod tests {
     use super::*;
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     fn create_test_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
@@ -891,17 +1025,52 @@ mod tests {
         store.append(create_test_batch(10)).unwrap(); // position 3
         store.append(create_test_batch(10)).unwrap(); // position 4
 
-        // max_visible_batch_position=2 means positions 0, 1, 2 are visible
-        let visible = store.max_visible_batch_positions(2);
-        assert_eq!(visible, vec![0, 1, 2]);
+        // A count of N exposes the prefix [0, N).
+        assert_eq!(store.visible_batch_positions(3), vec![0, 1, 2]);
+        assert_eq!(store.visible_batch_positions(5), vec![0, 1, 2, 3, 4]);
 
-        // max_visible_batch_position=4 means all visible
-        let visible = store.max_visible_batch_positions(4);
-        assert_eq!(visible, vec![0, 1, 2, 3, 4]);
+        // A count of 0 exposes nothing. Under the old inclusive cursor this
+        // case was indistinguishable from "batch 0 is visible", so every
+        // memtable leaked its first batch before it was indexed or durable.
+        assert!(store.visible_batch_positions(0).is_empty());
 
-        // max_visible_batch_position=0 means only position 0 visible
-        let visible = store.max_visible_batch_positions(0);
-        assert_eq!(visible, vec![0]);
+        // Beyond the committed range, clamp.
+        assert_eq!(store.visible_batch_positions(99), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// The zero of the visibility cursor must be unambiguous.
+    ///
+    /// `BatchStore::append` publishes `committed_len` on the put path, under the
+    /// state lock, *before* the WAL flush that indexes the batch is even
+    /// triggered — and that flush is a ~100ms S3 PUT on another task. So batch 0
+    /// sits committed and readable for a full round-trip before it is indexed or
+    /// durable. As an inclusive position, a cursor of 0 meant both "nothing is
+    /// visible" and "batch 0 is visible", so every read arm backed by the batch
+    /// store served that batch while the index-backed arms did not — the tiers
+    /// actively disagreed. An exclusive count makes the state inexpressible.
+    #[test]
+    fn test_zero_cursor_hides_the_committed_but_unindexed_prefix() {
+        let store = BatchStore::with_capacity(4);
+        store.append(create_test_batch(10)).unwrap();
+        store.append(create_test_batch(10)).unwrap();
+
+        // Committed, but nothing indexed yet: every visibility query must agree
+        // that there is nothing to read.
+        assert!(store.visible_batches(0).is_empty());
+        assert!(store.visible_batch_positions(0).is_empty());
+        assert!(store.visible_record_batches(0).is_empty());
+        assert!(store.visible_batches_with_offsets(0).is_empty());
+        assert!(!store.is_batch_visible(0, 0));
+        assert_eq!(store.max_visible_row(0), None);
+
+        // The batches are there — they are simply not yet published.
+        assert_eq!(store.len(), 2);
+
+        // Indexing batch 0 publishes exactly batch 0.
+        assert_eq!(store.visible_batches(1).len(), 1);
+        assert!(store.is_batch_visible(0, 1));
+        assert!(!store.is_batch_visible(1, 1));
+        assert_eq!(store.max_visible_row(1), Some(9));
     }
 
     #[test]
@@ -912,14 +1081,17 @@ mod tests {
         store.append(create_test_batch(10)).unwrap(); // position 1
         store.append(create_test_batch(10)).unwrap(); // position 2
 
-        // Batch at position 0 is visible when max_visible_batch_position >= 0
-        assert!(store.is_batch_visible(0, 0));
+        // A count of 0 means *nothing* is visible — including batch 0. As an
+        // inclusive position this case was indistinguishable from "batch 0 is
+        // visible", so a batch that was committed to the store but not yet
+        // indexed or WAL-durable was readable for a full PUT round-trip.
+        assert!(!store.is_batch_visible(0, 0));
+
+        // Batch i is visible once the count exceeds i.
         assert!(store.is_batch_visible(0, 1));
         assert!(store.is_batch_visible(0, 2));
-
-        // Batch at position 2 is only visible when max_visible_batch_position >= 2
         assert!(!store.is_batch_visible(2, 1));
-        assert!(store.is_batch_visible(2, 2));
+        assert!(!store.is_batch_visible(2, 2));
         assert!(store.is_batch_visible(2, 3));
 
         // Batch 3 doesn't exist
@@ -928,7 +1100,7 @@ mod tests {
 
     #[test]
     fn test_max_visible_row() {
-        // (1) Empty store: no rows are visible at any position.
+        // (1) Empty store: no rows are visible at any count.
         let store = BatchStore::with_capacity(10);
         assert_eq!(store.max_visible_row(0), None);
         assert_eq!(store.max_visible_row(100), None);
@@ -938,23 +1110,24 @@ mod tests {
         store.append(create_test_batch(20)).unwrap(); // position 1
         store.append(create_test_batch(30)).unwrap(); // position 2
 
-        // (2) A position within range yields the inclusive end of that prefix.
-        assert_eq!(store.max_visible_row(0), Some(9)); // batch 0: 0..10
-        assert_eq!(store.max_visible_row(1), Some(29)); // batch 1: 10..30
-        assert_eq!(store.max_visible_row(2), Some(59)); // batch 2: 30..60
+        // (2) A count of 0 means nothing is visible — not "batch 0 is visible".
+        assert_eq!(store.max_visible_row(0), None);
 
-        // (3) A position beyond the committed range clamps to the last batch,
-        // i.e. the inclusive max over all rows.
+        // (3) A count of N yields the inclusive last row of the prefix [0, N).
+        assert_eq!(store.max_visible_row(1), Some(9)); // batch 0: 0..10
+        assert_eq!(store.max_visible_row(2), Some(29)); // + batch 1: 10..30
+        assert_eq!(store.max_visible_row(3), Some(59)); // + batch 2: 30..60
+
+        // (4) A count beyond the committed range clamps to the last batch.
         assert_eq!(store.max_visible_row(100), Some(59));
 
-        // (4) An empty leading batch contributes no rows: at its own position
-        // the inclusive end underflows to None, while a later non-empty batch
-        // is reported correctly.
+        // (5) An empty leading batch contributes no rows, so a prefix covering
+        // only it still yields None, while a later non-empty batch is reported.
         let store = BatchStore::with_capacity(10);
         store.append(create_test_batch(0)).unwrap(); // position 0: rows [0,0)
         store.append(create_test_batch(5)).unwrap(); // position 1: rows [0,5)
-        assert_eq!(store.max_visible_row(0), None); // empty prefix → no rows
-        assert_eq!(store.max_visible_row(1), Some(4)); // through batch 1
+        assert_eq!(store.max_visible_row(1), None); // empty prefix → no rows
+        assert_eq!(store.max_visible_row(2), Some(4)); // through batch 1
     }
 
     #[test]
@@ -970,6 +1143,170 @@ mod tests {
         // Very small memtable should get minimum capacity
         let cap = BatchStore::recommended_capacity(1024);
         assert_eq!(cap, 16); // minimum
+    }
+
+    #[test]
+    fn test_estimated_size_is_slice_aware() {
+        // A batch that is a zero-copy slice of a larger parent must contribute
+        // only its own window to the estimate, not the whole shared buffer.
+        // `get_array_memory_size` counts every buffer's full capacity regardless
+        // of offset/length, so N slices tiling one parent each report the
+        // parent's size and inflate the memtable estimate ~N×, tripping the
+        // flush threshold far below the configured size.
+        let chunk = 1_000;
+        let num_slices = 100;
+        let parent = create_test_batch(chunk * num_slices);
+
+        // One window vs an equivalently-sized owned batch should track each
+        // other; the buggy per-slice estimate would be ~num_slices× larger.
+        let slice_est = StoredBatch::estimate_batch_size(&parent.slice(0, chunk));
+        let owned_est = StoredBatch::estimate_batch_size(&create_test_batch(chunk));
+        assert!(
+            slice_est <= owned_est * 2,
+            "slice estimate {slice_est} should track its own window (~{owned_est}), not the parent"
+        );
+
+        // End-to-end: tiling the parent with zero-copy slices must not multiply
+        // the store's running estimate. Track what the old full-buffer behavior
+        // would have summed to for contrast.
+        let store = BatchStore::with_capacity(num_slices);
+        let mut over_counting_sum = 0usize;
+        for k in 0..num_slices {
+            let s = parent.slice(k * chunk, chunk);
+            over_counting_sum += s
+                .columns()
+                .iter()
+                .map(|col| col.get_array_memory_size())
+                .sum::<usize>()
+                + std::mem::size_of::<RecordBatch>();
+            store.append(s).unwrap();
+        }
+
+        // Two non-nullable Int32 columns → exactly 4 bytes/row/col of payload.
+        let payload_bytes = num_slices * chunk * 2 * std::mem::size_of::<i32>();
+        let estimated = store.row_bytes();
+        assert!(
+            estimated >= payload_bytes,
+            "estimate {estimated} should cover the actual payload {payload_bytes}"
+        );
+        // The old behavior over-counts by ~num_slices×; the fix must be far
+        // below it (generous 10× margin against struct/alignment overhead).
+        assert!(
+            estimated * 10 < over_counting_sum,
+            "estimate {estimated} should be far below the over-counting sum {over_counting_sum}"
+        );
+    }
+
+    /// `row_bytes` and `retained_bytes` answer different questions about the
+    /// same slices, and a memory ceiling needs the second one.
+    #[test]
+    fn test_retained_bytes_counts_pinned_parents_once() {
+        let chunk = 100_000;
+
+        // Sixteen one-row slices, each off its own parent. The windows are
+        // trivial, but every parent stays alive in full for as long as the
+        // store does — this is the shape that lets a window-based ledger admit
+        // an unbounded footprint.
+        let distinct = BatchStore::with_capacity(16);
+        for _ in 0..16 {
+            distinct
+                .append(create_test_batch(chunk).slice(0, 1))
+                .unwrap();
+        }
+        // Two non-nullable Int32 columns.
+        let parent_payload = 16 * chunk * 2 * std::mem::size_of::<i32>();
+        assert!(
+            distinct.retained_bytes() >= parent_payload,
+            "retained {} must cover the {parent_payload} bytes of pinned parents",
+            distinct.retained_bytes()
+        );
+        assert!(
+            distinct.row_bytes() * 1_000 < distinct.retained_bytes(),
+            "row_bytes {} measures the windows and is nowhere near the retained {}",
+            distinct.row_bytes(),
+            distinct.retained_bytes()
+        );
+
+        // Sixteen slices of *one* parent pin one allocation, so the ledger must
+        // charge it once — the failure this shares with a naive full-capacity
+        // sum, which would report ~16×.
+        let parent = create_test_batch(chunk);
+        let shared = BatchStore::with_capacity(16);
+        for k in 0..16 {
+            shared
+                .append(parent.slice(k * (chunk / 16), chunk / 16))
+                .unwrap();
+        }
+        assert!(
+            shared.retained_bytes() * 8 < distinct.retained_bytes(),
+            "one shared parent ({}) must not be charged like sixteen ({})",
+            shared.retained_bytes(),
+            distinct.retained_bytes()
+        );
+    }
+
+    #[test]
+    fn test_estimated_size_counts_view_data_buffers() {
+        // Long Utf8View/BinaryView values live in variadic data buffers that
+        // `get_slice_memory_size` ignores (returning ~16 * rows). The estimate
+        // must include them, both for a top-level view column and for a view
+        // array nested in a container, which is only reached via child_data
+        // recursion.
+        use arrow_array::{Array, ArrayRef, StringViewArray, StructArray};
+
+        let num_rows = 1_000;
+        // Each value exceeds the 12-byte inline limit, so it spills to a data buffer.
+        let long_value = "x".repeat(64);
+        let payload_bytes = num_rows * long_value.len();
+        // What the slice-aware call alone reports: just the 16-byte view entries.
+        let view_entries_only = num_rows * 16;
+
+        let make_views = || {
+            StringViewArray::from(
+                (0..num_rows)
+                    .map(|_| Some(long_value.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let assert_covers = |batch: &RecordBatch| {
+            let estimated = StoredBatch::estimate_batch_size(batch);
+            assert!(
+                estimated >= payload_bytes,
+                "estimate {estimated} should cover the view data-buffer payload {payload_bytes}"
+            );
+            assert!(
+                estimated > view_entries_only * 2,
+                "estimate {estimated} must exceed the ~{view_entries_only}-byte view-entry-only undercount"
+            );
+        };
+
+        // Top-level view column.
+        let flat = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "s",
+                DataType::Utf8View,
+                false,
+            )])),
+            vec![Arc::new(make_views())],
+        )
+        .unwrap();
+        assert_covers(&flat);
+
+        // View nested inside a struct — reachable only through child_data recursion.
+        let nested = StructArray::from(vec![(
+            Arc::new(Field::new("s", DataType::Utf8View, false)),
+            Arc::new(make_views()) as ArrayRef,
+        )]);
+        let nested = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "st",
+                nested.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(nested)],
+        )
+        .unwrap();
+        assert_covers(&nested);
     }
 
     #[test]
@@ -1112,6 +1449,42 @@ mod tests {
 
         for r in readers {
             r.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_concurrent_writers_are_serialized() {
+        const NUM_WRITERS: usize = 8;
+        const BATCHES_PER_WRITER: usize = 50;
+        let expected_batches = NUM_WRITERS * BATCHES_PER_WRITER;
+        let store = Arc::new(BatchStore::with_capacity(expected_batches));
+        let start = Arc::new(Barrier::new(NUM_WRITERS));
+
+        let writers: Vec<_> = (0..NUM_WRITERS)
+            .map(|_| {
+                let writer_store = store.clone();
+                let writer_start = start.clone();
+                std::thread::spawn(move || {
+                    writer_start.wait();
+                    for _ in 0..BATCHES_PER_WRITER {
+                        writer_store.append(create_test_batch(1)).unwrap();
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        assert_eq!(store.len(), expected_batches);
+        assert_eq!(store.total_rows(), expected_batches);
+        let mut expected_row_offset = 0;
+        for (batch_position, batch) in store.iter().enumerate() {
+            assert_eq!(batch.batch_position, batch_position);
+            assert_eq!(batch.row_offset, expected_row_offset);
+            expected_row_offset += batch.num_rows as u64;
         }
     }
 

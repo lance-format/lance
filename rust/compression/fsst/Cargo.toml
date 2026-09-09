@@ -16,7 +16,6 @@ arrow-array.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
-arrow-array.workspace = true
 test-log.workspace = true
 tokio.workspace = true
 

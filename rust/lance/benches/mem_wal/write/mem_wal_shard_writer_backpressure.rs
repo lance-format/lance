@@ -99,10 +99,6 @@ impl Mode {
     fn durable_write(self) -> bool {
         matches!(self, Self::SyncNoIndex | Self::SyncIndexed)
     }
-
-    fn sync_indexed_write(self) -> bool {
-        matches!(self, Self::SyncIndexed)
-    }
 }
 
 /// Which index the MemTable maintains in the indexed (`*_idx`) modes.
@@ -192,7 +188,6 @@ struct Args {
     max_memtable_batches: Option<usize>,
     max_wal_buffer_size: usize,
     max_wal_flush_interval_ms: u64,
-    async_index_buffer_rows: usize,
     sample_interval_ms: u64,
     target_rows_per_sec: Option<f64>,
     num_partitions: usize,
@@ -223,7 +218,6 @@ impl Default for Args {
             max_memtable_batches: None,
             max_wal_buffer_size: 10 * 1024 * 1024,
             max_wal_flush_interval_ms: 100,
-            async_index_buffer_rows: 10_000,
             sample_interval_ms: 500,
             target_rows_per_sec: None,
             num_partitions: 1,
@@ -343,11 +337,9 @@ async fn run(args: Args) -> Result<()> {
     let shard_id = Uuid::new_v4();
     let mut config = ShardWriterConfig::new(shard_id)
         .with_durable_write(args.mode.durable_write())
-        .with_sync_indexed_write(args.mode.sync_indexed_write())
         .with_max_memtable_size(args.max_memtable_size)
         .with_max_unflushed_memtable_bytes(args.max_unflushed_memtable_bytes)
         .with_max_wal_buffer_size(args.max_wal_buffer_size)
-        .with_async_index_buffer_rows(args.async_index_buffer_rows)
         .with_max_memtable_rows(memtable_limits.rows)
         .with_max_memtable_batches(memtable_limits.batches);
     if args.max_wal_flush_interval_ms == 0 {
@@ -406,6 +398,7 @@ async fn run(args: Args) -> Result<()> {
                 elapsed,
                 &stats_handle.snapshot(),
                 writer.memtable_stats().await.ok(),
+                writer.memory().active_bytes(),
             );
             while next_sample_at <= elapsed {
                 next_sample_at += interval;
@@ -424,12 +417,14 @@ async fn run(args: Args) -> Result<()> {
     }
     let elapsed_puts_s = puts_start.elapsed().as_secs_f64();
     let final_memtable_stats = writer.memtable_stats().await.ok();
+    let final_resident_bytes = writer.memory().active_bytes();
     push_sample(
         &mut samples,
         "puts_done",
         puts_start.elapsed(),
         &stats_handle.snapshot(),
         final_memtable_stats.clone(),
+        final_resident_bytes,
     );
 
     let (elapsed_drain_s, elapsed_total_s, stats) = if args.skip_close {
@@ -440,6 +435,7 @@ async fn run(args: Args) -> Result<()> {
             puts_start.elapsed(),
             &stats,
             final_memtable_stats.clone(),
+            final_resident_bytes,
         );
         (0.0, elapsed_puts_s, stats)
     } else {
@@ -448,7 +444,14 @@ async fn run(args: Args) -> Result<()> {
         let elapsed_drain_s = close_start.elapsed().as_secs_f64();
         let elapsed_total_s = puts_start.elapsed().as_secs_f64();
         let stats = stats_handle.snapshot();
-        push_sample(&mut samples, "closed", puts_start.elapsed(), &stats, None);
+        push_sample(
+            &mut samples,
+            "closed",
+            puts_start.elapsed(),
+            &stats,
+            None,
+            0,
+        );
         (elapsed_drain_s, elapsed_total_s, stats)
     };
 
@@ -544,7 +547,6 @@ async fn run(args: Args) -> Result<()> {
         "max_memtable_batches": memtable_limits.batches,
         "max_wal_buffer_size": args.max_wal_buffer_size,
         "max_wal_flush_interval_ms": args.max_wal_flush_interval_ms,
-        "async_index_buffer_rows": args.async_index_buffer_rows,
         "sample_interval_ms": args.sample_interval_ms,
         "skip_close": args.skip_close,
         "setup_seconds": setup_s,
@@ -564,7 +566,7 @@ async fn run(args: Args) -> Result<()> {
         "p99_ms": p99_ms,
         "slow_puts_1s": slow_puts_1s,
         "slow_puts_10s": slow_puts_10s,
-        "final_memtable_stats": memtable_stats_json(final_memtable_stats.as_ref()),
+        "final_memtable_stats": memtable_stats_json(final_memtable_stats.as_ref(), final_resident_bytes),
         "puts": puts,
         "samples": samples,
         "write_stats": {
@@ -631,6 +633,7 @@ fn push_sample(
     elapsed: Duration,
     stats: &WriteStatsSnapshot,
     memtable: Option<MemTableStats>,
+    resident_bytes: usize,
 ) {
     samples.push(json!({
         "phase": phase,
@@ -647,10 +650,10 @@ fn push_sample(
         "memtable_flush_rows": stats.memtable_flush_rows,
         "active_memtable_rows": memtable.as_ref().map(|stats| stats.row_count),
         "active_memtable_batches": memtable.as_ref().map(|stats| stats.batch_count),
-        "active_memtable_bytes": memtable.as_ref().map(|stats| stats.estimated_size),
+        "active_memtable_bytes": resident_bytes,
         "active_memtable_generation": memtable.as_ref().map(|stats| stats.generation),
         "active_memtable_max_buffered_batch_position": memtable.as_ref().and_then(|stats| stats.max_buffered_batch_position),
-        "active_memtable_max_flushed_batch_position": memtable.as_ref().and_then(|stats| stats.max_flushed_batch_position),
+        "active_memtable_durable_batch_count": memtable.as_ref().map(|stats| stats.durable_batch_count),
         "wal_queue_pending_batches": memtable.as_ref().map(|stats| stats.pending_wal_batch_count),
         "wal_queue_pending_rows": memtable.as_ref().map(|stats| stats.pending_wal_row_count),
         "wal_queue_pending_bytes": memtable.as_ref().map(|stats| stats.pending_wal_estimated_bytes),
@@ -659,15 +662,18 @@ fn push_sample(
     }));
 }
 
-fn memtable_stats_json(memtable: Option<&MemTableStats>) -> serde_json::Value {
+fn memtable_stats_json(
+    memtable: Option<&MemTableStats>,
+    resident_bytes: usize,
+) -> serde_json::Value {
     match memtable {
         Some(stats) => json!({
             "row_count": stats.row_count,
             "batch_count": stats.batch_count,
-            "estimated_size": stats.estimated_size,
+            "resident_bytes": resident_bytes,
             "generation": stats.generation,
             "max_buffered_batch_position": stats.max_buffered_batch_position,
-            "max_flushed_batch_position": stats.max_flushed_batch_position,
+            "durable_batch_count": stats.durable_batch_count,
             "wal_queue_pending_start_batch_position": stats.pending_wal_start_batch_position,
             "wal_queue_pending_end_batch_position": stats.pending_wal_end_batch_position,
             "wal_queue_pending_batches": stats.pending_wal_batch_count,
@@ -980,7 +986,6 @@ fn parse_args() -> Result<Args> {
             "--max-wal-flush-interval-ms" => {
                 args.max_wal_flush_interval_ms = parse(&flag, &value)?;
             }
-            "--async-index-buffer-rows" => args.async_index_buffer_rows = parse(&flag, &value)?,
             "--sample-interval-ms" => args.sample_interval_ms = parse(&flag, &value)?,
             "--target-rows-per-sec" => args.target_rows_per_sec = Some(parse(&flag, &value)?),
             "--num-partitions" => args.num_partitions = parse(&flag, &value)?,

@@ -168,6 +168,29 @@ However, this invalidates row addresses and requires rebuilding indices, which c
 
 </details>
 
+## Data Overlay Files
+
+!!! warning "Experimental"
+
+    This feature is currently experimental and not yet supported in any library.
+
+<!-- TODO: When overlay file support is implemented, update this note to state
+     the released version that first supports the feature. -->
+
+!!! note "Overlay files require feature flag 64 (data overlay files)"
+
+Overlay files supply new values for a subset of cells within
+a fragment without rewriting the base data files. They make updates cheap when only
+a small percentage of rows and/or columns change: a writer appends a small file
+carrying just the changed cells instead of rewriting whole columns or moving rows
+to a new fragment.
+
+For the full specification — coverage and resolution rules, dense vs. sparse layout,
+versioning, index integration, compaction, and a worked example — see the
+[Data Overlay Files Specification](data_overlay_file.md).
+
+
+
 ## Related Specifications
 
 ### Storage Layout

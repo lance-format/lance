@@ -1,9 +1,6 @@
 nav:
   - Overview: index.md
   - Apache DataFusion: datafusion.md
-  - PostgreSQL: https://github.com/lancedb/pglance
+  - PostgreSQL: https://github.com/lance-format/pglance
   - PyTorch: pytorch.md
-  - Tensorflow: tensorflow.md
-  - Apache Spark: spark
-  - Ray: ray
-  - Trino: trino
+  - TensorFlow: tensorflow.md

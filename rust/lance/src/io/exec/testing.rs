@@ -4,7 +4,6 @@
 //! Testing Node
 //!
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -49,10 +48,6 @@ impl DisplayAs for TestingExec {
 impl ExecutionPlan for TestingExec {
     fn name(&self) -> &str {
         "TestingExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {

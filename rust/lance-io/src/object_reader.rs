@@ -5,6 +5,7 @@ use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::local::join_local_io;
 #[cfg(windows)]
 use crate::local::read_exact_at;
 #[cfg(unix)]
@@ -70,6 +71,7 @@ pub struct CloudObjectReader {
     size: OnceCell<usize>,
 
     block_size: usize,
+    io_parallelism: usize,
     download_retry_count: usize,
 }
 
@@ -94,8 +96,20 @@ impl CloudObjectReader {
             path,
             size: OnceCell::new_with(known_size),
             block_size,
+            io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
         })
+    }
+
+    /// Override the I/O parallelism this reader advertises.
+    ///
+    /// `ObjectStore::open` / `open_with_size` pass their normalized effective
+    /// parallelism (`LANCE_IO_THREADS` override applied, at least 1) so
+    /// consumers that size concurrency windows off the reader honor the
+    /// configured request limit instead of the hardcoded cloud default.
+    pub fn with_io_parallelism(mut self, io_parallelism: usize) -> Self {
+        self.io_parallelism = io_parallelism;
+        self
     }
 }
 
@@ -169,7 +183,7 @@ impl Reader for CloudObjectReader {
     }
 
     fn io_parallelism(&self) -> usize {
-        DEFAULT_CLOUD_IO_PARALLELISM
+        self.io_parallelism
     }
 
     /// Object/File Size.
@@ -419,7 +433,9 @@ pub(crate) fn stream_local_range(
             let next = (start + chunk_size).min(end);
             let file_clone = file.clone();
             let path_clone = path.clone();
-            let bytes = tokio::task::spawn_blocking(move || {
+            let num_bytes = (next - start) as u64;
+            let metrics = io_tracker.begin_io("get");
+            let result = join_local_io(tokio::task::spawn_blocking(move || {
                 let mut buf = bytes::BytesMut::with_capacity(next - start);
                 // Safety: buffer capacity matches the exact number of bytes we read below.
                 unsafe { buf.set_len(next - start) };
@@ -428,17 +444,15 @@ pub(crate) fn stream_local_range(
                 #[cfg(windows)]
                 read_exact_at(file_clone, buf.as_mut(), start as u64)?;
                 Ok::<_, std::io::Error>(buf.freeze())
-            })
-            .await?
-            .map_err(|err: std::io::Error| object_store::Error::Generic {
-                store: "LocalFileSystem",
-                source: err.into(),
-            })?;
+            }))
+            .await;
+            metrics.record(&result, num_bytes);
+            let bytes = result?;
 
             io_tracker.record_read(
                 "get_range_stream",
                 path_clone,
-                (next - start) as u64,
+                num_bytes,
                 Some(start as u64..next as u64),
             );
 

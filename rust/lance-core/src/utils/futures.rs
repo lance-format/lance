@@ -382,6 +382,19 @@ mod tests {
         assert_eq!(right.next().await, None);
     }
 
+    #[test]
+    fn test_shared_stream_replaces_waiting_waker() {
+        let inner_stream = futures::stream::pending::<u32>();
+        let (mut left, mut right) = inner_stream.boxed().share(Capacity::Unbounded);
+
+        let mut left_fut = left.next();
+        assert!(is_pending(&mut left_fut));
+
+        let mut right_fut = right.next();
+        assert!(is_pending(&mut right_fut));
+        assert!(is_pending(&mut right_fut));
+    }
+
     #[tokio::test]
     async fn test_unbounded_shared_stream() {
         let (tx, rx) = tokio::sync::mpsc::channel::<u32>(10);

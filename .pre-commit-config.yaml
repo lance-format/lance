@@ -15,3 +15,22 @@ repos:
     rev: v1.26.0
     hooks:
     - id: typos
+
+  # Catch a Cargo.toml change that wasn't reflected in the matching Cargo.lock.
+  # Runs fully offline (`--frozen` = `--locked` + `--offline`) and does not compile,
+  # so it stays fast. Checks all three lockfiles since a workspace dep change can
+  # touch the excluded python/ and java/ locks too.
+  - repo: local
+    hooks:
+      - id: cargo-lock-sync
+        name: Cargo.lock in sync with Cargo.toml (offline)
+        entry: bash -c 'for m in Cargo.toml python/Cargo.toml java/lance-jni/Cargo.toml; do cargo metadata --frozen --format-version 1 --manifest-path "$m" >/dev/null 2>&1 || { echo "Cargo.lock is out of date for $m. Refresh it (e.g. cargo check --manifest-path $m) and commit the updated lockfile."; exit 1; }; done'
+        language: system
+        files: '(^|/)Cargo\.(toml|lock)$'
+        pass_filenames: false
+
+      - id: proto-comment-style
+        name: Multi-line .proto comments use /* ... */
+        entry: python3 ci/check_proto_comments.py --fix
+        language: system
+        files: '\.proto$'

@@ -197,6 +197,17 @@ public class WriteParams {
       return this;
     }
 
+    /**
+     * Set storage options for the write.
+     *
+     * <p>For writes involving additional registered base paths, a key of the form {@code
+     * base_<id>.<key>} applies {@code <key>} only to the base path with that id, overriding the
+     * unscoped options that every base inherits. Exact per-base bindings set via {@link
+     * #withBaseStoreParams(Map)} take precedence over base-scoped keys.
+     *
+     * @param storageOptions the storage options
+     * @return this builder
+     */
     public Builder withStorageOptions(Map<String, String> storageOptions) {
       this.storageOptions = storageOptions;
       return this;

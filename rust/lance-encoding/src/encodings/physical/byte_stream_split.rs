@@ -62,7 +62,7 @@ use crate::compression::MiniBlockDecompressor;
 use crate::compression_config::BssMode;
 use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
+    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
 };
 use crate::format::ProtobufUtils21;
 use crate::format::pb21::CompressiveEncoding;
@@ -107,7 +107,11 @@ impl ByteStreamSplitEncoder {
 }
 
 impl MiniBlockCompressor for ByteStreamSplitEncoder {
-    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        _context: MiniBlockCompressionContext,
+        page: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match page {
             DataBlock::FixedWidth(data) => {
                 let num_values = data.num_values;
@@ -263,6 +267,10 @@ impl MiniBlockDecompressor for ByteStreamSplitDecompressor {
             block_info: BlockInfo::new(),
         }))
     }
+
+    fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
+        num_values.checked_mul(self.bytes_per_value() as u64)
+    }
 }
 
 /// Determine if BSS should be used based on mode and data characteristics
@@ -345,7 +353,9 @@ mod tests {
         });
 
         // Compress
-        let (compressed, _encoding) = encoder.compress(data_block).unwrap();
+        let (compressed, _encoding) = encoder
+            .compress(MiniBlockCompressionContext::new(0, true, true), data_block)
+            .unwrap();
 
         // Decompress
         let decompressed = decompressor
@@ -391,7 +401,9 @@ mod tests {
         });
 
         // Compress
-        let (compressed, _encoding) = encoder.compress(data_block).unwrap();
+        let (compressed, _encoding) = encoder
+            .compress(MiniBlockCompressionContext::new(0, true, true), data_block)
+            .unwrap();
 
         // Decompress
         let decompressed = decompressor
@@ -424,7 +436,9 @@ mod tests {
         });
 
         // Compress empty data
-        let (compressed, _encoding) = encoder.compress(data_block).unwrap();
+        let (compressed, _encoding) = encoder
+            .compress(MiniBlockCompressionContext::new(0, true, true), data_block)
+            .unwrap();
 
         // Decompress empty data
         let decompressed = decompressor.decompress(compressed.data, 0).unwrap();

@@ -105,4 +105,4 @@ dataset.to_table().to_pandas()
 Now that you've mastered the basics of creating Lance datasets, here's what you can explore next:
 
 - **[Versioning Your Datasets with Lance](versioning.md)** - Learn how to track changes over time with native versioning
-- **[Vector Indexing and Vector Search With Lance](vector-search.md)** - Build high-performance vector search capabilities with ANN indexes
+- **[Vector Indexing and Vector Search With Lance](vector-search.md)** - Build high-performance vector search capabilities with ANN indices

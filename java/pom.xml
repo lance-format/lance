@@ -7,7 +7,7 @@
     <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>9.0.0-beta.8</version>
+    <version>12.0.0-beta.15</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -29,6 +29,7 @@
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <arrow.version>18.3.0</arrow.version>
+        <opentelemetry.version>1.64.0</opentelemetry.version>
         <substrait.version>0.28.1</substrait.version>
         <spotless.skip>false</spotless.skip>
         <spotless.version>2.43.0</spotless.version>
@@ -39,6 +40,7 @@
         <spotless.scala.scalafmt.version>3.7.5</spotless.scala.scalafmt.version>
         <spotless.delimiter>package</spotless.delimiter>
         <rust.release.build>false</rust.release.build>
+        <rust.features></rust.features>
         <skip.build.jni>false</skip.build.jni>
         <shade.base>org.lance.shaded</shade.base>
         <spotless.license.header>
@@ -109,17 +111,22 @@
         <dependency>
             <groupId>org.lance</groupId>
             <artifactId>lance-namespace-core</artifactId>
-            <version>0.7.7</version>
+            <version>0.11.1</version>
         </dependency>
         <dependency>
             <groupId>org.lance</groupId>
             <artifactId>lance-namespace-apache-client</artifactId>
-            <version>0.7.7</version>
+            <version>0.11.1</version>
         </dependency>
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
             <version>2.15.2</version>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+            <version>${opentelemetry.version}</version>
         </dependency>
         <!-- AWS SDK for S3 integration testing -->
         <dependency>
@@ -132,6 +139,18 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>auth</artifactId>
             <version>2.20.26</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+            <version>${opentelemetry.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk-testing</artifactId>
+            <version>${opentelemetry.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
@@ -396,6 +415,9 @@
                                 <configuration>
                                     <path>lance-jni</path>
                                     <release>${rust.release.build}</release>
+                                    <features>
+                                        <feature>${rust.features}</feature>
+                                    </features>
                                     <!-- Copy native libraries to target/classes for runtime access -->
                                     <copyTo>${project.build.directory}/classes/nativelib</copyTo>
                                     <copyWithPlatformDir>true</copyWithPlatformDir>
@@ -409,6 +431,9 @@
                                 <configuration>
                                     <path>lance-jni</path>
                                     <release>${rust.release.build}</release>
+                                    <features>
+                                        <feature>${rust.features}</feature>
+                                    </features>
                                     <verbosity>-v</verbosity>
                                 </configuration>
                             </execution>
@@ -465,6 +490,9 @@
                             <forkNode
                                 implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
                             <useSystemClassLoader>false</useSystemClassLoader>
+                            <environmentVariables>
+                                <LANCE_LANGUAGE_MODEL_HOME>${project.basedir}/src/test/resources/language_models</LANCE_LANGUAGE_MODEL_HOME>
+                            </environmentVariables>
                         </configuration>
                     </plugin>
                 </plugins>

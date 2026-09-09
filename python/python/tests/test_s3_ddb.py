@@ -315,6 +315,29 @@ def test_file_writer_reader(s3_bucket: str):
         == global_buffer_text
     )
 
+    # The writer reports the size of the object it just wrote, so callers do not
+    # need a second client to stat it.
+    s3 = get_boto3_client("s3", endpoint_url=CONFIG["aws_endpoint"])
+    head = s3.head_object(Bucket=s3_bucket, Key="foo.lance")
+    assert writer.size_bytes == head["ContentLength"]
+
+
+@pytest.mark.integration
+def test_file_writer_size_bytes_multipart(s3_bucket: str):
+    # Large enough to exceed the single-PUT threshold, so the write goes through
+    # the multipart path where the reported size is filled in on completion.
+    storage_options = copy.deepcopy(CONFIG)
+    del storage_options["dynamodb_endpoint"]
+    table = pa.table({"a": pa.array(range(4 * 1024 * 1024), type=pa.int64())})
+    file_path = f"s3://{s3_bucket}/multipart.lance"
+    with LanceFileWriter(str(file_path), storage_options=storage_options) as writer:
+        writer.write_batch(table)
+
+    s3 = get_boto3_client("s3", endpoint_url=CONFIG["aws_endpoint"])
+    head = s3.head_object(Bucket=s3_bucket, Key="multipart.lance")
+    assert head["ContentLength"] > 5 * 1024 * 1024
+    assert writer.size_bytes == head["ContentLength"]
+
 
 @pytest.mark.integration
 def test_file_session_upload_download(s3_bucket: str, tmp_path):

@@ -25,7 +25,7 @@ fn get_operator() -> Operator {
     cfg.insert("master_addr".to_string(), addr);
     cfg.insert("root".to_string(), "/lance-test/opendal".to_string());
     cfg.insert("auth_type".to_string(), auth_type);
-    Operator::from_iter::<GooseFs>(cfg).unwrap().finish()
+    Operator::from_iter::<GooseFs>(cfg).unwrap()
 }
 
 // ============================================================
@@ -192,6 +192,17 @@ async fn test_diag_lance_io_write_modes() {
         .await
         .expect("Failed to create ObjectStore");
 
+    // Best-effort cleanup of leftover test files. object_store_opendal maps
+    // relative paths to the GooseFS root, so prior runs leave files at /
+    // even when the ObjectStore URI uses a per-run subdirectory. The
+    // concurrent exactly-one-winner race now lives in its own
+    // `test_diag_concurrent_put_create_exactly_one_winner` test, which
+    // uses a per-run filename so it does not share state with this test.
+    for name in ["test_file.txt", "test_create.txt"].iter() {
+        let p = object_store::path::Path::parse(name).unwrap();
+        let _ = object_store.inner.delete(&p).await;
+    }
+
     // Test 1: Basic put + get
     let test_path = object_store::path::Path::parse("test_file.txt").unwrap();
     let test_data = bytes::Bytes::from("Hello from lance-io ObjectStore!");
@@ -224,12 +235,14 @@ async fn test_diag_lance_io_write_modes() {
         Err(e) => eprintln!("[DIAG] Read FAILED: {:?}", e),
     }
 
-    // Test 2: PutMode::Create (if_not_exists)
+    // PutMode::Create (if_not_exists) — required by
+    // ConditionalPutCommitHandler for concurrent-safe manifest commits.
+    let create_path = object_store::path::Path::parse("test_create.txt").unwrap();
     eprintln!("[DIAG] Writing with PutMode::Create (if_not_exists)...");
-    match object_store
+    object_store
         .inner
         .put_opts(
-            &object_store::path::Path::parse("test_create.txt").unwrap(),
+            &create_path,
             bytes::Bytes::from("conditional write!").into(),
             object_store::PutOptions {
                 mode: object_store::PutMode::Create,
@@ -237,12 +250,30 @@ async fn test_diag_lance_io_write_modes() {
             },
         )
         .await
-    {
-        Ok(_) => eprintln!("[DIAG] PutMode::Create succeeded! ✅"),
-        Err(e) => {
-            eprintln!("[DIAG] PutMode::Create FAILED: {:?}", e);
-        }
-    }
+        .expect("PutMode::Create should succeed for a new path");
+    eprintln!("[DIAG] PutMode::Create succeeded! ✅");
+
+    eprintln!("[DIAG] Second PutMode::Create on same path (expect AlreadyExists)...");
+    let conflict = object_store
+        .inner
+        .put_opts(
+            &create_path,
+            bytes::Bytes::from("should not overwrite").into(),
+            object_store::PutOptions {
+                mode: object_store::PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            conflict,
+            Err(object_store::Error::AlreadyExists { .. })
+                | Err(object_store::Error::Precondition { .. })
+        ),
+        "second PutMode::Create must fail with AlreadyExists/Precondition, got: {conflict:?}"
+    );
+    eprintln!("[DIAG] PutMode::Create conflict correctly rejected! ✅");
 
     // Test 3: rename_if_not_exists
     eprintln!("[DIAG] Testing rename_if_not_exists...");
@@ -268,4 +299,187 @@ async fn test_diag_lance_io_write_modes() {
     }
 
     eprintln!("[DIAG] lance-io direct write test complete ✅");
+}
+
+/// Concurrency regression: two `PutMode::Create` writers racing on the
+/// same fresh path must produce exactly one winner, and the stored bytes
+/// must match the winner's payload byte-for-byte. This is the property
+/// that makes `ConditionalPutCommitHandler` safe under concurrent
+/// manifest commits: every writer either commits its manifest or observes
+/// the loser's precondition failure and retries against a fresh version.
+///
+/// Split out of `test_diag_lance_io_write_modes` so the race assertions
+/// cannot be silently skipped — the basic-write `return` on error in the
+/// diagnostic test no longer covers the race, and the race is now a
+/// first-class ignored test with its own setup/teardown invariants:
+///
+/// 1. **Per-run path.** The race filename embeds a nanosecond timestamp so
+///    concurrent or back-to-back runs in the same process never share
+///    state. `object_store_opendal` maps the relative filename to the
+///    GooseFS root regardless of the ObjectStore URI path, so a
+///    per-run URI subdirectory would not isolate runs on its own.
+/// 2. **Explicit pre-cleanup.** A leftover from a prior crashed run is
+///    expected (`NotFound` is the only accepted pre-cleanup error); any
+///    other error fails the test rather than being silently ignored.
+/// 3. **Strict setup.** Every setup step uses `expect` so a transient
+///    `ObjectStore` construction or filename-parse error is surfaced
+///    rather than logged and skipped.
+/// 4. **Post-cleanup.** The winning path is removed on success; cleanup
+///    must report `Ok` or `NotFound`.
+///
+/// Requires a live GooseFS cluster.
+#[tokio::test]
+#[ignore = "Requires GooseFS cluster"]
+async fn test_diag_concurrent_put_create_exactly_one_winner() {
+    let addr = std::env::var("GOOSEFS_MASTER_ADDR").unwrap_or_else(|_| "127.0.0.1:9200".into());
+    // Nanosecond timestamp gives effectively unique filenames even for
+    // back-to-back runs in the same process. The race path is *not* put
+    // under the per-run URI subdirectory because `object_store_opendal`
+    // ignores the URL path when resolving relative keys.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let race_filename = format!("test_create_race_{}.txt", ts);
+    let root = format!("goosefs://{}/lance-test", addr);
+    eprintln!(
+        "[DIAG] Creating ObjectStore at: {} (race path: {})",
+        root, race_filename
+    );
+
+    let params = ObjectStoreParams::default();
+    let registry = Arc::new(ObjectStoreRegistry::default());
+    let (object_store, _path) = ObjectStore::from_uri_and_params(registry.clone(), &root, &params)
+        .await
+        .expect("Failed to create ObjectStore");
+
+    let race_path = object_store::path::Path::parse(&race_filename).unwrap();
+
+    // Pre-flight cleanup: the race path is per-run, so a leftover can
+    // only come from a prior run that crashed before its post-cleanup
+    // completed. `Ok` and `NotFound` are both expected; any other error
+    // is a setup failure that would otherwise silently skip the race.
+    match object_store.inner.delete(&race_path).await {
+        Ok(_) => {}
+        Err(object_store::Error::NotFound { .. }) => {}
+        Err(e) => panic!("pre-cleanup of race path {race_filename} failed: {e:?}"),
+    }
+
+    let store_a = object_store.clone();
+    let store_b = object_store.clone();
+    let path_a = race_path.clone();
+    let path_b = race_path.clone();
+    let payload_a = bytes::Bytes::from("writer-A");
+    let payload_b = bytes::Bytes::from("writer-B");
+
+    eprintln!("[DIAG] Launching two concurrent PutMode::Create on fresh path...");
+    let fut_a = tokio::spawn(async move {
+        store_a
+            .inner
+            .put_opts(
+                &path_a,
+                payload_a.clone().into(),
+                object_store::PutOptions {
+                    mode: object_store::PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| payload_a)
+    });
+    let fut_b = tokio::spawn(async move {
+        store_b
+            .inner
+            .put_opts(
+                &path_b,
+                payload_b.clone().into(),
+                object_store::PutOptions {
+                    mode: object_store::PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| payload_b)
+    });
+    let (res_a, res_b) = tokio::join!(fut_a, fut_b);
+    let res_a = res_a.expect("writer A join");
+    let res_b = res_b.expect("writer B join");
+
+    let mut wins = 0usize;
+    let mut conflicts = 0usize;
+    let mut other_err: Option<String> = None;
+    let mut winner_payload: Option<bytes::Bytes> = None;
+    match (&res_a, &res_b) {
+        (Ok(p), Err(_)) => {
+            wins = 1;
+            conflicts = 1;
+            winner_payload = Some(p.clone());
+        }
+        (Err(_), Ok(p)) => {
+            wins = 1;
+            conflicts = 1;
+            winner_payload = Some(p.clone());
+        }
+        (Ok(_), Ok(_)) => {
+            other_err = Some("both writers reported success — if-not-exists violated".into());
+        }
+        (Err(ea), Err(eb)) => {
+            other_err = Some(format!("both writers failed: a={ea:?} b={eb:?}"));
+        }
+    }
+    for r in [&res_a, &res_b] {
+        if let Err(e) = r {
+            let s = format!("{e:?}").to_lowercase();
+            assert!(
+                s.contains("already exists")
+                    || s.contains("precondition")
+                    || s.contains("conditionnotmatch")
+                    || s.contains("if_not_exists"),
+                "loser must report AlreadyExists/Precondition, got: {e:?}"
+            );
+        }
+    }
+    assert!(
+        other_err.is_none(),
+        "exactly-one-winner violated: {}",
+        other_err.unwrap()
+    );
+    assert_eq!(wins, 1, "exactly one writer must win (got {wins})");
+    assert_eq!(
+        conflicts, 1,
+        "exactly one writer must conflict (got {conflicts})"
+    );
+
+    // Read back — stored bytes must match the winner's payload exactly.
+    let stored = object_store
+        .inner
+        .get(&race_path)
+        .await
+        .expect("get winning payload")
+        .bytes()
+        .await
+        .expect("read winning payload");
+    let expected = winner_payload.expect("winner payload recorded");
+    assert_eq!(
+        stored, expected,
+        "stored bytes must match the winner's payload"
+    );
+    eprintln!(
+        "[DIAG] concurrent exactly-one-winner ok ✅ stored={} bytes",
+        stored.len()
+    );
+
+    // Post-flight cleanup: must succeed. `NotFound` after a winning write
+    // would mean the file never actually persisted, contradicting the
+    // assertion above, so we surface it as a failure rather than masking
+    // a real regression.
+    match object_store.inner.delete(&race_path).await {
+        Ok(_) => {}
+        Err(object_store::Error::NotFound { .. }) => {
+            panic!(
+                "post-cleanup of race path {race_filename} reported NotFound after a winning write"
+            )
+        }
+        Err(e) => panic!("post-cleanup of race path {race_filename} failed: {e:?}"),
+    }
 }

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
 
@@ -12,7 +13,12 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_datagen::{BatchCount, BatchGeneratorBuilder, ByteCount, RowCount};
 use lance_file::version::LanceFileVersion;
-use lance_table::format::Fragment;
+use lance_table::format::pb::transaction::Operation as PbOperation;
+use lance_table::format::{Fragment, Transaction as TableTransaction};
+use lance_table::io::commit::{
+    CommitError, CommitHandler, ConditionalPutCommitHandler, ManifestLocation,
+    ManifestNamingScheme, ManifestWriter,
+};
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
 
@@ -21,7 +27,9 @@ use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 
+pub mod covering;
 mod failing_store;
+pub mod serializing_cache;
 mod throttle_store;
 
 pub use failing_store::FailingProxyStore;
@@ -243,6 +251,7 @@ impl TestDatasetGenerator {
         Fragment {
             id: 0,
             files,
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(batch.num_rows()),
@@ -632,17 +641,8 @@ mod tests {
                 .flat_map(|file| file.fields.iter())
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut field_ids = schema
-                .fields_pre_order()
-                .filter_map(|f| {
-                    if data_storage_version < LanceFileVersion::V2_1 || f.children.is_empty() {
-                        Some(f.id)
-                    } else {
-                        // In 2.1+, struct / list fields don't have their own column
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
+            let (mut field_ids, _) =
+                lance_file::versions::data_file_columns(data_storage_version.resolve(), &schema);
             field_ids_frags.sort_unstable();
             field_ids.sort_unstable();
             assert_eq!(field_ids_frags, field_ids);
@@ -727,5 +727,203 @@ mod tests {
         fn from(value: &'a TempStrDir) -> Self {
             WriteDestination::Uri(value.as_str())
         }
+    }
+}
+
+/// How [`AmbiguousCommitHandler`] should treat the next commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbiguousFailure {
+    /// Apply the commit (the manifest lands), then report a conflict — the
+    /// store equivalent of a successful conditional PUT whose response was
+    /// lost and whose internal retry saw "already exists".
+    LandAndConflict,
+    /// Apply the commit, then report an I/O error.
+    LandAndError,
+    /// Do not apply the commit; report an I/O error.
+    FailOutright,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmbiguousFailureTarget {
+    Any,
+    Rewrite,
+    ReserveFragments,
+}
+
+/// A commit handler for tests that can make a commit physically land while
+/// reporting a failure, and can make commit-outcome verification unavailable.
+///
+/// Delegates real work to [`ConditionalPutCommitHandler`].
+#[derive(Debug)]
+pub struct AmbiguousCommitHandler {
+    /// Failure to inject into the next commit; taken (reset to `None`) when
+    /// the commit runs.
+    fail_next_commit: Mutex<Option<(AmbiguousFailure, AmbiguousFailureTarget)>>,
+    /// When set, version resolution fails, making commit-outcome verification
+    /// impossible.
+    pub fail_resolve: AtomicBool,
+    /// Number of upcoming resolution calls that should return NotFound.
+    resolve_not_found_remaining: AtomicUsize,
+    /// Whether a persistent NotFound proves that the requested version is
+    /// absent. Tests can disable this to model an eventually visible resolver.
+    not_found_is_definitive: AtomicBool,
+    /// Number of version resolutions requested (a proxy for how often commit
+    /// verification ran).
+    resolve_calls: AtomicUsize,
+}
+
+impl Default for AmbiguousCommitHandler {
+    fn default() -> Self {
+        Self {
+            fail_next_commit: Mutex::new(None),
+            fail_resolve: AtomicBool::new(false),
+            resolve_not_found_remaining: AtomicUsize::new(0),
+            not_found_is_definitive: AtomicBool::new(true),
+            resolve_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl AmbiguousCommitHandler {
+    pub fn fail_next(&self, failure: AmbiguousFailure) {
+        *self.fail_next_commit.lock().unwrap() = Some((failure, AmbiguousFailureTarget::Any));
+    }
+
+    /// Arm the failure for the next Rewrite commit only.
+    pub fn fail_next_rewrite(&self, failure: AmbiguousFailure) {
+        *self.fail_next_commit.lock().unwrap() = Some((failure, AmbiguousFailureTarget::Rewrite));
+    }
+
+    /// Arm the failure for the next ReserveFragments commit only.
+    pub fn fail_next_reserve(&self, failure: AmbiguousFailure) {
+        *self.fail_next_commit.lock().unwrap() =
+            Some((failure, AmbiguousFailureTarget::ReserveFragments));
+    }
+
+    pub fn fail_next_resolves_with_not_found(&self, count: usize) {
+        self.resolve_not_found_remaining
+            .store(count, Ordering::SeqCst);
+        self.not_found_is_definitive.store(false, Ordering::SeqCst);
+    }
+
+    pub fn resolve_calls(&self) -> usize {
+        self.resolve_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl CommitHandler for AmbiguousCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        self.not_found_is_definitive.load(Ordering::SeqCst)
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        false
+    }
+
+    async fn commit(
+        &self,
+        manifest: &mut lance_table::format::Manifest,
+        indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        base_path: &object_store::path::Path,
+        object_store: &lance_io::object_store::ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<TableTransaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        let operation = transaction
+            .as_ref()
+            .and_then(|t| t.as_pb().operation.as_ref())
+            .map(|operation| match operation {
+                PbOperation::Rewrite(_) => AmbiguousFailureTarget::Rewrite,
+                PbOperation::ReserveFragments(_) => AmbiguousFailureTarget::ReserveFragments,
+                _ => AmbiguousFailureTarget::Any,
+            });
+        let failure = {
+            let mut armed = self.fail_next_commit.lock().unwrap();
+            let matches_target = armed.as_ref().is_some_and(|(_, target)| {
+                *target == AmbiguousFailureTarget::Any || operation == Some(*target)
+            });
+            matches_target.then(|| armed.take().unwrap().0)
+        };
+        match failure {
+            None => {
+                ConditionalPutCommitHandler
+                    .commit(
+                        manifest,
+                        indices,
+                        base_path,
+                        object_store,
+                        manifest_writer,
+                        naming_scheme,
+                        transaction,
+                    )
+                    .await
+            }
+            Some(AmbiguousFailure::LandAndConflict) => {
+                ConditionalPutCommitHandler
+                    .commit(
+                        manifest,
+                        indices,
+                        base_path,
+                        object_store,
+                        manifest_writer,
+                        naming_scheme,
+                        transaction,
+                    )
+                    .await?;
+                Err(CommitError::CommitConflict)
+            }
+            Some(AmbiguousFailure::LandAndError) => {
+                ConditionalPutCommitHandler
+                    .commit(
+                        manifest,
+                        indices,
+                        base_path,
+                        object_store,
+                        manifest_writer,
+                        naming_scheme,
+                        transaction,
+                    )
+                    .await?;
+                Err(CommitError::OtherError(lance_core::Error::io(
+                    "simulated ambiguous commit failure",
+                )))
+            }
+            Some(AmbiguousFailure::FailOutright) => Err(CommitError::OtherError(
+                lance_core::Error::io("simulated outright commit failure"),
+            )),
+        }
+    }
+
+    async fn resolve_version_location(
+        &self,
+        base_path: &object_store::path::Path,
+        version: u64,
+        object_store: &dyn object_store::ObjectStore,
+    ) -> lance_core::Result<ManifestLocation> {
+        self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_resolve.load(Ordering::SeqCst) {
+            return Err(lance_core::Error::io("simulated verification outage"));
+        }
+        let mut remaining = self.resolve_not_found_remaining.load(Ordering::SeqCst);
+        while remaining > 0 {
+            match self.resolve_not_found_remaining.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Err(lance_core::Error::not_found(
+                        "simulated temporarily invisible manifest",
+                    ));
+                }
+                Err(actual) => remaining = actual,
+            }
+        }
+        ConditionalPutCommitHandler
+            .resolve_version_location(base_path, version, object_store)
+            .await
     }
 }

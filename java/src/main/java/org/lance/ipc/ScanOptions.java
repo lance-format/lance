@@ -24,6 +24,8 @@ import java.util.Optional;
 public class ScanOptions {
   private final Optional<List<Integer>> fragmentIds;
   private final Optional<Long> batchSize;
+  private final Optional<Long> batchSizeBytes;
+  private final Optional<Long> ioBufferSize;
   private final Optional<List<String>> columns;
   private final Optional<String> filter;
   private final Optional<ByteBuffer> substraitFilter;
@@ -35,6 +37,9 @@ public class ScanOptions {
   private final boolean withRowId;
   private final boolean withRowAddress;
   private final int batchReadahead;
+  private final Optional<Integer> fragmentReadahead;
+  private final boolean scanInOrder;
+  private final Optional<MaterializationStyle> lateMaterialization;
   private final Optional<List<ColumnOrdering>> columnOrderings;
   private final boolean useScalarIndex;
   private final Optional<ByteBuffer> substraitAggregate;
@@ -131,11 +136,86 @@ public class ScanOptions {
       boolean includeDeletedRows,
       boolean strictBatchSize,
       boolean disableScoringAutoprojection) {
+    this(
+        fragmentIds,
+        batchSize,
+        Optional.empty(),
+        Optional.empty(),
+        columns,
+        filter,
+        substraitFilter,
+        limit,
+        offset,
+        nearest,
+        fullTextQuery,
+        prefilter,
+        withRowId,
+        withRowAddress,
+        batchReadahead,
+        Optional.empty(),
+        true,
+        Optional.empty(),
+        columnOrderings,
+        useScalarIndex,
+        substraitAggregate,
+        collectStats,
+        fastSearch,
+        includeDeletedRows,
+        strictBatchSize,
+        disableScoringAutoprojection);
+  }
+
+  private ScanOptions(
+      Optional<List<Integer>> fragmentIds,
+      Optional<Long> batchSize,
+      Optional<Long> batchSizeBytes,
+      Optional<Long> ioBufferSize,
+      Optional<List<String>> columns,
+      Optional<String> filter,
+      Optional<ByteBuffer> substraitFilter,
+      Optional<Long> limit,
+      Optional<Long> offset,
+      Optional<Query> nearest,
+      Optional<FullTextQuery> fullTextQuery,
+      boolean prefilter,
+      boolean withRowId,
+      boolean withRowAddress,
+      int batchReadahead,
+      Optional<Integer> fragmentReadahead,
+      boolean scanInOrder,
+      Optional<MaterializationStyle> lateMaterialization,
+      Optional<List<ColumnOrdering>> columnOrderings,
+      boolean useScalarIndex,
+      Optional<ByteBuffer> substraitAggregate,
+      boolean collectStats,
+      boolean fastSearch,
+      boolean includeDeletedRows,
+      boolean strictBatchSize,
+      boolean disableScoringAutoprojection) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
+    Preconditions.checkArgument(
+        batchReadahead > 0, "batchReadahead must be greater than 0, got %s", batchReadahead);
+    batchSizeBytes.ifPresent(
+        value ->
+            Preconditions.checkArgument(
+                value > 0, "batchSizeBytes must be greater than 0, got %s", value));
+    ioBufferSize.ifPresent(
+        value ->
+            Preconditions.checkArgument(
+                value > 0, "ioBufferSize must be greater than 0, got %s", value));
+    fragmentReadahead.ifPresent(
+        value ->
+            Preconditions.checkArgument(
+                value > 0, "fragmentReadahead must be greater than 0, got %s", value));
+    Preconditions.checkArgument(
+        !(strictBatchSize && batchSizeBytes.isPresent()),
+        "strictBatchSize=true cannot be combined with batchSizeBytes");
     this.fragmentIds = fragmentIds;
     this.batchSize = batchSize;
+    this.batchSizeBytes = batchSizeBytes;
+    this.ioBufferSize = ioBufferSize;
     this.columns = columns;
     this.filter = filter;
     this.substraitFilter = substraitFilter;
@@ -147,6 +227,9 @@ public class ScanOptions {
     this.withRowId = withRowId;
     this.withRowAddress = withRowAddress;
     this.batchReadahead = batchReadahead;
+    this.fragmentReadahead = fragmentReadahead;
+    this.scanInOrder = scanInOrder;
+    this.lateMaterialization = lateMaterialization;
     this.columnOrderings = columnOrderings;
     this.useScalarIndex = useScalarIndex;
     this.substraitAggregate = substraitAggregate;
@@ -173,6 +256,24 @@ public class ScanOptions {
    */
   public Optional<Long> getBatchSize() {
     return batchSize;
+  }
+
+  /**
+   * Get the target batch size in bytes.
+   *
+   * @return Optional containing the target batch size in bytes if specified, otherwise empty.
+   */
+  public Optional<Long> getBatchSizeBytes() {
+    return batchSizeBytes;
+  }
+
+  /**
+   * Get the I/O buffer size in bytes.
+   *
+   * @return Optional containing the I/O buffer size if specified, otherwise empty.
+   */
+  public Optional<Long> getIoBufferSize() {
+    return ioBufferSize;
   }
 
   /**
@@ -274,6 +375,33 @@ public class ScanOptions {
     return batchReadahead;
   }
 
+  /**
+   * Get the number of fragments to read ahead concurrently.
+   *
+   * @return Optional containing the fragment readahead if specified, otherwise empty.
+   */
+  public Optional<Integer> getFragmentReadahead() {
+    return fragmentReadahead;
+  }
+
+  /**
+   * Get whether batches should be returned in fragment and batch order.
+   *
+   * @return true to preserve scan order, false to return batches as soon as they are ready.
+   */
+  public boolean isScanInOrder() {
+    return scanInOrder;
+  }
+
+  /**
+   * Get the materialization policy for projected columns.
+   *
+   * @return Optional containing the materialization policy if specified, otherwise empty.
+   */
+  public Optional<MaterializationStyle> getLateMaterialization() {
+    return lateMaterialization;
+  }
+
   public Optional<List<ColumnOrdering>> getColumnOrderings() {
     return columnOrderings;
   }
@@ -341,6 +469,8 @@ public class ScanOptions {
     return MoreObjects.toStringHelper(this)
         .add("fragmentIds", fragmentIds.orElse(null))
         .add("batchSize", batchSize.orElse(null))
+        .add("batchSizeBytes", batchSizeBytes.orElse(null))
+        .add("ioBufferSize", ioBufferSize.orElse(null))
         .add("columns", columns.orElse(null))
         .add("filter", filter.orElse(null))
         .add(
@@ -354,6 +484,9 @@ public class ScanOptions {
         .add("withRowId", withRowId)
         .add("WithRowAddress", withRowAddress)
         .add("batchReadahead", batchReadahead)
+        .add("fragmentReadahead", fragmentReadahead.orElse(null))
+        .add("scanInOrder", scanInOrder)
+        .add("lateMaterialization", lateMaterialization.orElse(null))
         .add("columnOrdering", columnOrderings)
         .add("useScalarIndex", useScalarIndex)
         .add("fastSearch", fastSearch)
@@ -371,6 +504,8 @@ public class ScanOptions {
   public static class Builder {
     private Optional<List<Integer>> fragmentIds = Optional.empty();
     private Optional<Long> batchSize = Optional.empty();
+    private Optional<Long> batchSizeBytes = Optional.empty();
+    private Optional<Long> ioBufferSize = Optional.empty();
     private Optional<List<String>> columns = Optional.empty();
     private Optional<String> filter = Optional.empty();
     private Optional<ByteBuffer> substraitFilter = Optional.empty();
@@ -382,6 +517,9 @@ public class ScanOptions {
     private boolean withRowId = false;
     private boolean withRowAddress = false;
     private int batchReadahead = 16;
+    private Optional<Integer> fragmentReadahead = Optional.empty();
+    private boolean scanInOrder = true;
+    private Optional<MaterializationStyle> lateMaterialization = Optional.empty();
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
     private boolean useScalarIndex = true;
     private boolean fastSearch = false;
@@ -401,6 +539,8 @@ public class ScanOptions {
     public Builder(ScanOptions options) {
       this.fragmentIds = options.getFragmentIds();
       this.batchSize = options.getBatchSize();
+      this.batchSizeBytes = options.getBatchSizeBytes();
+      this.ioBufferSize = options.getIoBufferSize();
       this.columns = options.getColumns();
       this.filter = options.getFilter();
       this.substraitFilter = options.getSubstraitFilter();
@@ -412,6 +552,9 @@ public class ScanOptions {
       this.withRowId = options.isWithRowId();
       this.withRowAddress = options.isWithRowAddress();
       this.batchReadahead = options.getBatchReadahead();
+      this.fragmentReadahead = options.getFragmentReadahead();
+      this.scanInOrder = options.isScanInOrder();
+      this.lateMaterialization = options.getLateMaterialization();
       this.columnOrderings = options.getColumnOrderings();
       this.useScalarIndex = options.isUseScalarIndex();
       this.fastSearch = options.isFastSearch();
@@ -441,6 +584,34 @@ public class ScanOptions {
      */
     public Builder batchSize(long batchSize) {
       this.batchSize = Optional.of(batchSize);
+      return this;
+    }
+
+    /**
+     * Set the approximate target size of each returned Arrow record batch in bytes.
+     *
+     * <p>If {@link #batchSize(long)} is also set, the limit reached first determines the batch
+     * size. This option cannot be combined with {@link #strictBatchSize(boolean)}.
+     *
+     * @param batchSizeBytes target batch size in bytes; must be greater than zero.
+     * @return Builder instance for method chaining.
+     */
+    public Builder batchSizeBytes(long batchSizeBytes) {
+      this.batchSizeBytes = Optional.of(batchSizeBytes);
+      return this;
+    }
+
+    /**
+     * Set the amount of memory reserved for buffering storage I/O.
+     *
+     * <p>This controls scanner backpressure but is not a hard upper bound on total scanner memory.
+     * It currently applies only to v2 files.
+     *
+     * @param ioBufferSize I/O buffer size in bytes; must be greater than zero.
+     * @return Builder instance for method chaining.
+     */
+    public Builder ioBufferSize(long ioBufferSize) {
+      this.ioBufferSize = Optional.of(ioBufferSize);
       return this;
     }
 
@@ -565,6 +736,46 @@ public class ScanOptions {
       return this;
     }
 
+    /**
+     * Set the number of fragments to read ahead concurrently.
+     *
+     * @param fragmentReadahead number of fragments to read ahead; must be greater than zero.
+     * @return Builder instance for method chaining.
+     */
+    public Builder fragmentReadahead(int fragmentReadahead) {
+      this.fragmentReadahead = Optional.of(fragmentReadahead);
+      return this;
+    }
+
+    /**
+     * Set whether batches are returned in fragment and batch order.
+     *
+     * <p>Disabling ordering can increase scan concurrency at the cost of additional memory. This
+     * option is ignored for v2 files, which always scan in order. It is also ignored when a column
+     * ordering or nearest-neighbor query is configured; the query determines the result order.
+     *
+     * @param scanInOrder true to preserve scan order, false to return ready batches immediately.
+     * @return Builder instance for method chaining.
+     */
+    public Builder scanInOrder(boolean scanInOrder) {
+      this.scanInOrder = scanInOrder;
+      return this;
+    }
+
+    /**
+     * Set when projected columns that are not used by the filter should be materialized.
+     *
+     * <p>This option only affects regular scans. Vector search and full-text search always use late
+     * materialization.
+     *
+     * @param lateMaterialization materialization policy.
+     * @return Builder instance for method chaining.
+     */
+    public Builder lateMaterialization(MaterializationStyle lateMaterialization) {
+      this.lateMaterialization = Optional.of(lateMaterialization);
+      return this;
+    }
+
     public Builder setColumnOrderings(List<ColumnOrdering> columnOrderings) {
       this.columnOrderings = Optional.of(columnOrderings);
       return this;
@@ -667,6 +878,8 @@ public class ScanOptions {
       return new ScanOptions(
           fragmentIds,
           batchSize,
+          batchSizeBytes,
+          ioBufferSize,
           columns,
           filter,
           substraitFilter,
@@ -678,6 +891,9 @@ public class ScanOptions {
           withRowId,
           withRowAddress,
           batchReadahead,
+          fragmentReadahead,
+          scanInOrder,
+          lateMaterialization,
           columnOrderings,
           useScalarIndex,
           substraitAggregate,

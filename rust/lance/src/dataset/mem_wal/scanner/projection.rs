@@ -6,8 +6,8 @@
 //!
 //! `MemTableScanner::project()` only special-cases `_rowid`; passing other
 //! system columns through it errors. And cross-LSM values for system
-//! columns aren't comparable (a `_rowid` of 5 in the base and in a flushed
-//! memtable refer to different rows).
+//! columns aren't comparable (a `_rowid` of 5 in the base and in an
+//! SSTable refer to different rows).
 //!
 //! - [`build_scanner_projection`] — strips system / `_distance` cols, appends PKs.
 //! - [`canonical_output_schema`] — final schema honoring user order; system
@@ -24,6 +24,8 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
 use lance_core::{ROW_ADDR, ROW_ID, Result, is_system_column};
+
+use super::exec::SchemaRelabelExec;
 
 /// Column name for distance in vector search results.
 pub const DISTANCE_COLUMN: &str = "_distance";
@@ -73,12 +75,37 @@ pub fn build_scanner_projection(
     cols
 }
 
+/// Validate user-facing projection names before constructing a canonical schema.
+pub fn validate_projection_names(
+    user_projection: Option<&[String]>,
+    base_schema: &SchemaRef,
+    extra_columns: &[&str],
+) -> Result<()> {
+    let Some(user_projection) = user_projection else {
+        return Ok(());
+    };
+    for name in user_projection {
+        if is_system_column(name)
+            || extra_columns.contains(&name.as_str())
+            || base_schema.field_with_name(name).is_ok()
+        {
+            continue;
+        }
+        return Err(lance_core::Error::invalid_input(format!(
+            "Column '{}' not found in schema",
+            name
+        )));
+    }
+    Ok(())
+}
+
 /// Canonical output schema honoring user column order.
 ///
 /// System cols → nullable `UInt64` at user position (filled by
 /// `project_to_canonical`). `_distance` (when `include_distance`) →
 /// nullable `Float32` at user position, appended if absent. PKs appended.
-/// Unknown names are silently dropped.
+/// Callers should run [`validate_projection_names`] before using this with a
+/// user-supplied projection.
 pub fn canonical_output_schema(
     user_projection: Option<&[String]>,
     base_schema: &SchemaRef,
@@ -164,9 +191,26 @@ pub fn null_columns(
     Ok(Arc::new(projection_exec))
 }
 
+/// Force `plan` to report exactly `target_schema`; a no-op when they agree.
+///
+/// `ProjectionExec` derives its nullability from the expressions, so the
+/// storage schema's widened columns leave the WAL arms disagreeing with the
+/// base arm — which `CoalesceFirstExec` and `concat_batches` both reject.
+pub(super) fn force_schema(
+    plan: Arc<dyn ExecutionPlan>,
+    target_schema: &SchemaRef,
+) -> Arc<dyn ExecutionPlan> {
+    if plan.schema() == *target_schema {
+        return plan;
+    }
+    Arc::new(SchemaRelabelExec::new(plan, target_schema.clone()))
+}
+
 /// Wrap `plan` to emit exactly `target_schema`. Source columns are
 /// forwarded by name; system / `_distance` cols missing from the source
 /// are NULL-filled. Other missing columns are an internal error.
+///
+/// Reports `target_schema` exactly, nullability included — see [`force_schema`].
 pub fn project_to_canonical(
     plan: Arc<dyn ExecutionPlan>,
     target_schema: &SchemaRef,
@@ -197,13 +241,15 @@ pub fn project_to_canonical(
     let projection_exec = ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
         lance_core::Error::internal(format!("Failed to build canonical ProjectionExec: {}", e))
     })?;
-    Ok(Arc::new(projection_exec))
+    Ok(force_schema(Arc::new(projection_exec), target_schema))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::RecordBatch;
     use arrow_schema::Schema as ArrowSchema;
+    use datafusion_physical_plan::test::TestMemoryExec;
 
     fn schema() -> SchemaRef {
         Arc::new(ArrowSchema::new(vec![
@@ -211,6 +257,20 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new("vector", DataType::Float32, true),
         ]))
+    }
+
+    /// [`schema`] as `relax_non_pk_nullability` would leave it: `id` widened.
+    fn widened_schema() -> SchemaRef {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("vector", DataType::Float32, true),
+        ]))
+    }
+
+    fn plan_emitting(schema: SchemaRef) -> Arc<dyn ExecutionPlan> {
+        let batch = RecordBatch::new_empty(schema.clone());
+        TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap()
     }
 
     #[test]
@@ -294,5 +354,31 @@ mod tests {
         let names: Vec<&str> = out.fields().iter().map(|f| f.name().as_str()).collect();
         // _distance dropped because include_distance=false (e.g. point lookup / scan).
         assert_eq!(names, vec!["vector", "id"]);
+    }
+
+    #[test]
+    fn force_schema_leaves_a_matching_plan_alone() {
+        let plan = plan_emitting(schema());
+        let forced = force_schema(plan.clone(), &schema());
+        assert!(
+            Arc::ptr_eq(&plan, &forced),
+            "a plan already reporting the target schema must not be wrapped"
+        );
+    }
+
+    #[test]
+    fn force_schema_relabels_a_nullability_mismatch() {
+        let forced = force_schema(plan_emitting(widened_schema()), &schema());
+        assert_eq!(forced.name(), "SchemaRelabelExec");
+        assert_eq!(forced.schema(), schema());
+    }
+
+    #[test]
+    fn project_to_canonical_reports_the_target_schema() {
+        // The ProjectionExec alone would follow its input and report `id` as
+        // nullable; the relabel is what pins the output to the target.
+        let target = schema();
+        let plan = project_to_canonical(plan_emitting(widened_schema()), &target).unwrap();
+        assert_eq!(plan.schema(), target);
     }
 }

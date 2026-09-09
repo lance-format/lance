@@ -73,10 +73,10 @@ jobs:
           ruff format --check --diff python
           ruff check python
           pyright
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Lint Rust
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
@@ -93,11 +93,99 @@ jobs:
         run: |
           source venv/bin/activate
           pytest --doctest-modules python/lance
+
+  python-rust-test:
+    timeout-minutes: 30
+    name: pylance crate Rust tests
+    runs-on: "ubuntu-24.04-4x"
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    env:
+      # Need up-to-date compilers for kernels
+      CC: clang-18
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: 3.11
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      # The default `extension-module` feature leaves libpython unlinked, which the
+      # host interpreter resolves at load time but a test binary cannot. Disabling it
+      # links libpython so these tests run instead of only compiling.
+      - name: Test Rust
+        run: cargo test --profile ci --locked --no-default-features
+
+  linux-wheel:
+    timeout-minutes: 45
+    name: Python Linux x86_64 wheel
+    runs-on: "ubuntu-24.04-4x"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.10"
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: python
+          prefix-key: ${{ env.CACHE_PREFIX }}
+      # python/Cargo.toml enables abi3-py310, so this wheel is reusable by
+      # every CPython version in the Linux test matrix.
+      - name: Build cp310 ABI3 wheel
+        uses: ./.github/workflows/build_linux_wheel
+        with:
+          python-minor-version: "10"
+          args: "--profile ci"
+      - name: Upload wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-x86_64-wheel
+          path: python/target/wheels/pylance-*.whl
+          if-no-files-found: error
+
+  linux-memtest:
+    timeout-minutes: 15
+    name: Python Linux x86_64 memtest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+        with:
+          cache: "false"
+          rustflags: ""
+      - name: Build memtest
+        working-directory: memtest
+        run: cargo build --release
+      - name: Upload memtest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-x86_64-memtest
+          path: memtest/target/release/libmemtest.so
+          if-no-files-found: error
+
   linux:
+    needs: [linux-wheel, linux-memtest]
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: ["10", "13"]
+        python-minor-version: ["10", "13", "14"]
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-24.04-4x"
     defaults:
@@ -113,27 +201,24 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: 3.${{ matrix.python-minor-version }}
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Download wheel
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          workspaces: python
-          prefix-key: ${{ env.CACHE_PREFIX }}
-      - uses: ./.github/workflows/build_linux_wheel
+          name: linux-x86_64-wheel
+          path: python/target/wheels
+      - name: Download memtest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          args: "--profile ci"
+          name: linux-x86_64-memtest
+          path: memtest/python/memtest
       - uses: ./.github/workflows/run_tests
         with:
           memtest: true
-      - name: Upload wheels as artifacts
-        if: ${{ matrix.python-minor-version == '13' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: linux-wheels
-          path: python/target/wheels/pylance-*.whl
 
   compat:
-    needs: linux
+    needs: linux-wheel
     timeout-minutes: 60
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-8x
     name: Compatibility Tests
     defaults:
       run:
@@ -147,25 +232,29 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: 3.13
-      - name: Download wheels
+          python-version: 3.14
+      - name: Download wheel
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: linux-wheels
-          path: python/wheels
+          name: linux-x86_64-wheel
+          path: python/target/wheels
       - name: Install dependencies
         run: |
-          pip install $(ls wheels/pylance-*.whl)[tests,ray]
+          pip install $(ls target/wheels/pylance-*.whl)[tests,ray]
+      # Nearly every test here shells out to an old pylance in its own venv, so the
+      # job spends most of its time waiting on subprocesses rather than on CPU.
+      # Oversubscribing cores follows what nightly_run.yml already does with this
+      # suite. Leaving COMPAT_TEMP_VENV unset is what makes that pay off: the venvs
+      # then land in the shared cache directory, where VenvFactory's flock lets all
+      # workers reuse one venv per version instead of each building its own.
       - name: Run compatibility tests
         run: |
-          make compattest
-        env:
-          COMPAT_TEMP_VENV: 1
+          make compattest PYTEST_WORKERS=$(( $(nproc) * 2 ))
 
   linux-arm:
     timeout-minutes: 45
     runs-on: ubuntu-24.04-arm64-4x
-    name: Python Linux 3.13 ARM
+    name: Python Linux 3.14 ARM
     defaults:
       run:
         shell: bash
@@ -178,7 +267,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: 3.13
+          python-version: 3.14
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           workspaces: python
@@ -195,7 +284,7 @@ jobs:
       - uses: ./.github/workflows/run_tests
   mac:
     timeout-minutes: 45
-    name: Python macOS 3.13 ARM
+    name: Python macOS 3.14 ARM
     runs-on: "warp-macos-14-arm64-6x"
     defaults:
       run:
@@ -209,7 +298,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           workspaces: python
@@ -242,6 +331,7 @@ jobs:
           args: "--profile ci"
       - uses: ./.github/workflows/run_tests
   aws-integtest:
+    needs: linux-wheel
     timeout-minutes: 45
     runs-on: "ubuntu-24.04-4x"
     defaults:
@@ -257,13 +347,11 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11" # TODO: upgrade when ray supports 3.12
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Download wheel
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          workspaces: python
-          prefix-key: ${{ env.CACHE_PREFIX }}
-      - uses: ./.github/workflows/build_linux_wheel
-        with:
-          args: "--profile ci"
+          name: linux-x86_64-wheel
+          path: python/target/wheels
       - name: Install dependencies
         run: |
           pip install ray[data]

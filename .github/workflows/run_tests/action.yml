@@ -11,8 +11,12 @@ inputs:
     default: "false"
   memtest:
     required: false
-    description: "Run memtest"
+    description: "Install and preload the prebuilt memtest library"
     default: "false"
+  pytest-workers:
+    required: false
+    description: "pytest-xdist worker count; 'auto' matches the runner's cores"
+    default: "auto"
 runs:
   using: "composite"
   steps:
@@ -36,9 +40,10 @@ runs:
       if: inputs.memtest == 'true'
       shell: bash
       run: |
-        make build-release
-        echo "LD_PRELOAD=$(lance-memtest)" >> $GITHUB_ENV
+        test -f python/memtest/libmemtest.so
+        pip install -e .
+        echo "LD_PRELOAD=$(lance-memtest)" >> "$GITHUB_ENV"
     - name: Run python tests
       shell: bash
       working-directory: python
-      run: make test
+      run: make test PYTEST_WORKERS=${{ inputs.pytest-workers }}
