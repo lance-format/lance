@@ -55,31 +55,3 @@ more address translations must be applied.
 Once all scalar and vector indices have been rebuilt past a given reuse version, that version is no
 longer needed and can be trimmed. Users should schedule a periodic process to trim stale reuse
 versions and keep the FRI size under control.
-
-## FRI index versions
-
-`IndexMetadata.index_version = 0` retains the existing compaction format and
-read/write behavior. Version 1 adds `InlineContent.transitions` at field 2;
-field 1 retains the original compaction versions without changing their wire
-representation. Each legacy group becomes an ordered-compaction transition
-when read as part of a version-1 history.
-
-A transition records ordered sources at field 1 and ordered destinations at
-field 2. Exactly one mapping is required: ordered compaction at field 3 or
-stable partition at field 4. Additional fields may carry ordinary metadata;
-field numbers outside the known mapping alternatives do not identify mappings.
-New mapping types require a new FRI `index_version`. Readers that do not support
-that version must reject it and request an upgrade before decoding its content.
-
-The outer inline/external content choice is unchanged. External content stores
-serialized `InlineContent`, while stable-partition references inside that content
-identify separate immutable row-map files. A history has one producer and at most
-one consumer for each produced fragment; root source fragments need not have a
-producer in the retained history. Lineage must be acyclic. Transition order is
-derived from fragment dependencies, not the serialization order.
-
-Source digests record physical and deleted row counts at rewrite time.
-Destination digests record creation-time counts with zero deleted rows.
-Within each transition, total surviving source rows equal total destination rows.
-Across transitions, a fragment's physical row count is unchanged; its deletion
-count may increase. These metadata checks do not validate external row-map data.
