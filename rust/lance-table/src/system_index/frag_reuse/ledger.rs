@@ -30,6 +30,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::Cursor;
+use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
 use lance_core::deepsize::{Context, DeepSizeOf};
@@ -47,7 +48,7 @@ use crate::format::pb::fragment_reuse_index_details::{self as pb, transition};
 #[derive(Debug)]
 pub enum Mapping {
     /// Bitmap/rank translation, including lifted legacy compaction groups.
-    OrderedCompaction(RowAddrRemap),
+    OrderedCompaction(Arc<RowAddrRemap>),
     /// Immutable row-map reference, with the base selected by its optional base ID.
     StablePartition(pb::StablePartition),
 }
@@ -391,7 +392,7 @@ fn decode_transition(value: pb::Transition) -> Result<Transition> {
                 new_frags: layout(&value.destinations),
             }])
             .map_err(|e| corrupt(e.to_string()))?;
-            Mapping::OrderedCompaction(remap)
+            Mapping::OrderedCompaction(Arc::new(remap))
         }
         Some(transition::Mapping::StablePartition(partition)) => {
             Uuid::parse_str(&partition.map_id).map_err(|e| {
