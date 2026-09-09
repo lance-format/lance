@@ -34,10 +34,11 @@
 //! deleted row is simply dropped along with the row. This matches the spec with no
 //! special casing.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
+use arrow_buffer::{NullBuffer, NullBufferBuilder};
 use arrow_select::interleave::interleave;
 use futures::StreamExt;
 use lance_core::datatypes::{Field, Schema};
@@ -286,6 +287,8 @@ fn assemble_overlay_column(
 /// One overlay's contribution to one projected atomic field, with its file reader opened.
 #[derive(Debug, Clone)]
 struct LoadedAtomicFieldOverlay {
+    /// Index of this overlay in the planner's newest-first file list. Lower is newer.
+    file: usize,
     /// The `offset_in_frag` cells this overlay covers for the atomic field.
     coverage: Arc<RoaringBitmap>,
     /// Reader over the overlay data file, projected to the covered atomic fields; shared
@@ -307,11 +310,28 @@ pub struct LoadedAtomicField {
     /// field *is* the top-level column). Drives descending to, and splicing back, the
     /// atomic field.
     ancestor_ids: Vec<i32>,
+    /// Paths from `top_field` to each struct ancestor of the atomic field. The
+    /// fetched array carries these ancestors' validity alongside the leaf value.
+    struct_ancestor_ids: Vec<Vec<i32>>,
     /// Projection of exactly the atomic field (its ancestor path pruned to the atomic
     /// field subtree), used to fetch the atomic field's values from the overlay file.
     fetch_projection: Arc<Schema>,
     overlays_newest_first: Vec<LoadedAtomicFieldOverlay>,
 }
+
+struct FetchedAtomicField {
+    top_level: ArrayRef,
+    value: ArrayRef,
+}
+
+struct StructValidityCandidates {
+    top_field: Arc<Field>,
+    ancestor_ids: Vec<i32>,
+    /// Per output row, the newest overlay file and the validity it supplies.
+    rows: Vec<Option<(usize, bool)>>,
+}
+
+type StructValidityMap = BTreeMap<(i32, Vec<i32>), StructValidityCandidates>;
 
 /// One overlay file that may contribute to a read, before it is opened. Opened
 /// lazily by [`resolve_overlays`], and only if the read actually touches it.
@@ -337,8 +357,15 @@ struct PlannedAtomicFieldOverlay {
 struct PlannedAtomicField {
     top_field: Arc<Field>,
     ancestor_ids: Vec<i32>,
+    struct_ancestor_ids: Vec<Vec<i32>>,
     fetch_projection: Arc<Schema>,
     overlays_newest_first: Vec<PlannedAtomicFieldOverlay>,
+}
+
+struct EnumeratedAtomicField<'a> {
+    field: &'a Field,
+    ancestor_ids: Vec<i32>,
+    struct_ancestor_ids: Vec<Vec<i32>>,
 }
 
 /// A fragment's overlay-resolution plan for a projection, derived from coverage
@@ -373,9 +400,10 @@ impl OverlayReadPlanner {
 /// structural encoding records only leaves), so an overlay contributes to a projected
 /// atomic field when any id in its `data_file.fields` falls in that atomic field's leaf
 /// set. At merge time the atomic field's value is fetched and spliced into its output
-/// column, so an overlay on a sub-field never disturbs the column's other leaves. Each
-/// contributing overlay *file* appears once in `files`, shared by every atomic field it
-/// covers.
+/// column, so an overlay on a sub-field never disturbs the column's other leaves. The
+/// fetched struct spine is retained so validity at every struct ancestor is resolved
+/// from the newest overlay covering any descendant field. Each contributing overlay
+/// *file* appears once in `files`, shared by every atomic field it covers.
 pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<OverlayReadPlanner> {
     let overlays = &fragment.metadata.overlays;
     debug_assert!(
@@ -390,22 +418,24 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
     struct AtomicFieldInfo<'a> {
         top_field: &'a Field,
         ancestor_ids: Vec<i32>,
+        struct_ancestor_ids: Vec<Vec<i32>>,
         atomic_field_id: i32,
     }
     let mut atomic_field_infos: Vec<AtomicFieldInfo> = Vec::new();
     let mut leaf_to_atomic_field: HashMap<i32, usize> = HashMap::new();
     for top in &projection.fields {
-        for (atomic_field, ancestor_ids) in enumerate_atomic_fields(top) {
+        for atomic_field in enumerate_atomic_fields(top) {
             let idx = atomic_field_infos.len();
             let mut value_leaf_ids = Vec::new();
-            collect_leaf_ids(atomic_field, &mut value_leaf_ids);
+            collect_leaf_ids(atomic_field.field, &mut value_leaf_ids);
             for leaf in value_leaf_ids {
                 leaf_to_atomic_field.insert(leaf, idx);
             }
             atomic_field_infos.push(AtomicFieldInfo {
                 top_field: top,
-                ancestor_ids,
-                atomic_field_id: atomic_field.id,
+                ancestor_ids: atomic_field.ancestor_ids,
+                struct_ancestor_ids: atomic_field.struct_ancestor_ids,
+                atomic_field_id: atomic_field.field.id,
             });
         }
     }
@@ -456,6 +486,7 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
         atomic_fields.push(PlannedAtomicField {
             top_field: Arc::new(info.top_field.clone()),
             ancestor_ids: info.ancestor_ids.clone(),
+            struct_ancestor_ids: info.struct_ancestor_ids.clone(),
             fetch_projection: Arc::new(projection.project_by_ids(&[info.atomic_field_id], true)),
             overlays_newest_first,
         });
@@ -470,21 +501,33 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
 /// the top-level field down to it. Structs are recursed through; a primitive leaf or a
 /// whole list/map field is an atomic field (values are one-per-row). A top-level primitive or
 /// list yields a single atomic field with an empty path.
-fn enumerate_atomic_fields(top: &Field) -> Vec<(&Field, Vec<i32>)> {
-    fn recurse<'a>(field: &'a Field, path: &mut Vec<i32>, out: &mut Vec<(&'a Field, Vec<i32>)>) {
+fn enumerate_atomic_fields(top: &Field) -> Vec<EnumeratedAtomicField<'_>> {
+    fn recurse<'a>(
+        field: &'a Field,
+        path: &mut Vec<i32>,
+        struct_ancestor_ids: &mut Vec<Vec<i32>>,
+        out: &mut Vec<EnumeratedAtomicField<'a>>,
+    ) {
         if field.logical_type.is_struct() {
+            struct_ancestor_ids.push(path.clone());
             for child in &field.children {
                 path.push(child.id);
-                recurse(child, path, out);
+                recurse(child, path, struct_ancestor_ids, out);
                 path.pop();
             }
+            struct_ancestor_ids.pop();
         } else {
-            out.push((field, path.clone()));
+            out.push(EnumeratedAtomicField {
+                field,
+                ancestor_ids: path.clone(),
+                struct_ancestor_ids: struct_ancestor_ids.clone(),
+            });
         }
     }
     let mut out = Vec::new();
     let mut path = Vec::new();
-    recurse(top, &mut path, &mut out);
+    let mut struct_ancestor_ids = Vec::new();
+    recurse(top, &mut path, &mut struct_ancestor_ids, &mut out);
     out
 }
 
@@ -573,6 +616,154 @@ fn splice_by_ids(
     )?))
 }
 
+/// Replace only the validity of the struct at `ancestor_ids`, preserving its
+/// children and the rest of the top-level column.
+fn replace_struct_nulls_by_ids(
+    array: &ArrayRef,
+    field: &Field,
+    ancestor_ids: &[i32],
+    nulls: Option<NullBuffer>,
+) -> Result<ArrayRef> {
+    let target = descend_by_ids(array, field, ancestor_ids)?;
+    let structs = target
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "overlay validity replacement expected a struct under '{}'",
+                field.name
+            ))
+        })?;
+    let len = structs.len();
+    let (fields, children, _) = structs.clone().into_parts();
+    let replacement: ArrayRef = Arc::new(StructArray::try_new_with_length(
+        fields, children, nulls, len,
+    )?);
+    splice_by_ids(array, field, ancestor_ids, replacement)
+}
+
+/// Record the struct validity carried alongside one atomic field's fetched values.
+/// A struct ancestor may receive candidates from several independently overlaid
+/// children, so the planner's global file order selects the newest one per row.
+fn collect_struct_validity_candidates(
+    plan: &LoadedAtomicField,
+    routing: &OverlayRouting,
+    fetched: &[FetchedAtomicField],
+    struct_validities: &mut StructValidityMap,
+) -> Result<()> {
+    for ancestor_ids in &plan.struct_ancestor_ids {
+        let candidates = struct_validities
+            .entry((plan.top_field.id, ancestor_ids.clone()))
+            .or_insert_with(|| StructValidityCandidates {
+                top_field: plan.top_field.clone(),
+                ancestor_ids: ancestor_ids.clone(),
+                rows: vec![None; routing.indices.len()],
+            });
+        if candidates.rows.len() != routing.indices.len() {
+            return Err(Error::invalid_input(format!(
+                "overlay validity routing for '{}' has {} rows, expected {}",
+                plan.top_field.name,
+                routing.indices.len(),
+                candidates.rows.len()
+            )));
+        }
+        let fetched_structs = fetched
+            .iter()
+            .map(|fetched| {
+                descend_by_ids(
+                    &fetched.top_level,
+                    &plan.fetch_projection.fields[0],
+                    ancestor_ids,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (offset_in_batch, &(source, position)) in routing.indices.iter().enumerate() {
+            let Some(overlay_pos) = source.checked_sub(1) else {
+                continue;
+            };
+            let overlay = plan.overlays_newest_first.get(overlay_pos).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "overlay routing selected source {source}, but field '{}' has {} overlays",
+                    plan.top_field.name,
+                    plan.overlays_newest_first.len()
+                ))
+            })?;
+            let current_file = candidates.rows[offset_in_batch].map(|(file, _)| file);
+            if current_file.is_none_or(|file| overlay.file < file) {
+                let fetched_struct = fetched_structs
+                    .get(overlay_pos)
+                    .and_then(|array| array.as_any().downcast_ref::<StructArray>())
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "overlay validity source expected a struct under '{}'",
+                            plan.top_field.name
+                        ))
+                    })?;
+                if position >= fetched_struct.len() {
+                    return Err(Error::invalid_input(format!(
+                        "overlay validity source for '{}' has {} rows, but routing selected row {}",
+                        plan.top_field.name,
+                        fetched_struct.len(),
+                        position
+                    )));
+                }
+                candidates.rows[offset_in_batch] =
+                    Some((overlay.file, fetched_struct.is_valid(position)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild every affected struct ancestor with its resolved per-row validity.
+fn apply_struct_validities(
+    schema: &arrow_schema::Schema,
+    columns: &mut [ArrayRef],
+    struct_validities: StructValidityMap,
+) -> Result<()> {
+    for candidates in struct_validities.into_values() {
+        let Some(idx) = schema.index_of(&candidates.top_field.name).ok() else {
+            continue;
+        };
+        let target = descend_by_ids(
+            &columns[idx],
+            &candidates.top_field,
+            &candidates.ancestor_ids,
+        )?;
+        let structs = target
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "overlay validity target expected a struct under '{}'",
+                    candidates.top_field.name
+                ))
+            })?;
+        if structs.len() != candidates.rows.len() {
+            return Err(Error::invalid_input(format!(
+                "overlay validity target '{}' has {} rows, expected {}",
+                candidates.top_field.name,
+                structs.len(),
+                candidates.rows.len()
+            )));
+        }
+        let mut nulls = NullBufferBuilder::new(candidates.rows.len());
+        for (offset_in_batch, candidate) in candidates.rows.into_iter().enumerate() {
+            nulls.append(candidate.map_or_else(
+                || structs.is_valid(offset_in_batch),
+                |(_, is_valid)| is_valid,
+            ));
+        }
+        columns[idx] = replace_struct_nulls_by_ids(
+            &columns[idx],
+            &candidates.top_field,
+            &candidates.ancestor_ids,
+            nulls.finish(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Open the overlay readers a specific read needs and return the per-field plans to
 /// merge, pruned to that read.
 ///
@@ -633,6 +824,7 @@ pub async fn resolve_overlays(
                 continue; // pruned: coverage disjoint from the read
             };
             overlays_newest_first.push(LoadedAtomicFieldOverlay {
+                file: overlay.file,
                 coverage: overlay.coverage.clone(),
                 reader: reader.clone(),
             });
@@ -641,6 +833,7 @@ pub async fn resolve_overlays(
             plans.push(LoadedAtomicField {
                 top_field: atomic_field.top_field.clone(),
                 ancestor_ids: atomic_field.ancestor_ids.clone(),
+                struct_ancestor_ids: atomic_field.struct_ancestor_ids.clone(),
                 fetch_projection: atomic_field.fetch_projection.clone(),
                 overlays_newest_first,
             });
@@ -683,9 +876,8 @@ pub async fn merge_overlay_batch(
         if !routing.any_overlay {
             return Ok::<_, Error>((plan, None));
         }
-        // Fetch each overlay's values and descend to the atomic field array. The fetch is
-        // projected to the atomic field's ancestor path, so the fetched column is the pruned
-        // top-level column; `descend_by_ids` walks it down to the atomic field.
+        // Retain the pruned top-level column because it carries every struct
+        // ancestor's validity alongside the atomic field value.
         let atomic_field = &plan.fetch_projection.fields[0];
         let fetched = futures::future::try_join_all(
             plan.overlays_newest_first
@@ -698,7 +890,11 @@ pub async fn merge_overlay_batch(
                         offsets_in_overlay,
                     )
                     .await?;
-                    descend_by_ids(&column, atomic_field, &plan.ancestor_ids)
+                    let value = descend_by_ids(&column, atomic_field, &plan.ancestor_ids)?;
+                    Ok::<_, Error>(FetchedAtomicField {
+                        top_level: column,
+                        value,
+                    })
                 }),
         )
         .await?;
@@ -710,6 +906,7 @@ pub async fn merge_overlay_batch(
 
     let schema = batch.schema();
     let mut columns = batch.columns().to_vec();
+    let mut struct_validities = StructValidityMap::new();
     for (plan, work) in resolved {
         let Some((routing, fetched)) = work else {
             continue;
@@ -718,8 +915,14 @@ pub async fn merge_overlay_batch(
             // The plan's column is not in this batch's projection; skip it.
             continue;
         };
+        collect_struct_validity_candidates(plan, &routing, &fetched, &mut struct_validities)?;
         let base_atomic_field = descend_by_ids(&columns[idx], &plan.top_field, &plan.ancestor_ids)?;
-        let merged_atomic_field = assemble_overlay_column(&base_atomic_field, &routing, &fetched)?;
+        let fetched_values: Vec<ArrayRef> = fetched
+            .iter()
+            .map(|fetched| fetched.value.clone())
+            .collect();
+        let merged_atomic_field =
+            assemble_overlay_column(&base_atomic_field, &routing, &fetched_values)?;
         columns[idx] = splice_by_ids(
             &columns[idx],
             &plan.top_field,
@@ -727,6 +930,10 @@ pub async fn merge_overlay_batch(
             merged_atomic_field,
         )?;
     }
+
+    // Child values resolve independently, but a struct cell has one shared
+    // validity, selected from the newest overlay contributing any descendant.
+    apply_struct_validities(schema.as_ref(), &mut columns, struct_validities)?;
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
