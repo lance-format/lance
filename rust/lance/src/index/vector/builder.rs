@@ -115,6 +115,13 @@ const REASSIGN_SAMPLE_SIZE: usize = 512;
 /// margin of its own centroid's distance, so near-ties do not prune a neighbor
 /// that unsampled rows would still leave.
 const REASSIGN_MARGIN: f32 = 0.05;
+/// Logical rows a join fetches at a time from a multivector column, where a
+/// row can expand to many vectors; a single oversized row is the one working
+/// set that cannot be split further.
+const JOIN_MULTIVECTOR_ROWS_PER_FETCH: usize = 64;
+/// Vectors a join routes and quantizes at a time before handing them to the
+/// shuffler, whatever the fetched rows expanded to.
+const JOIN_VECTORS_PER_BATCH: usize = 1024;
 
 /// Number of partitions the split partitions' rows now belong to.
 fn new_partition_ids_len(split_partitions: &[(usize, Vec<usize>)]) -> usize {
@@ -1872,29 +1879,35 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         store: &ObjectStore,
         row_ids: &[u64],
     ) -> Result<Vec<RecordBatch>> {
-        Self::take_vectors_stream(dataset, column, store, row_ids)
-            .await?
-            .try_collect()
-            .await
+        Self::take_vectors_stream(
+            dataset,
+            column,
+            row_ids,
+            store.block_size(),
+            store.io_parallelism(),
+        )
+        .await?
+        .try_collect()
+        .await
     }
 
-    /// The raw vectors of `row_ids` in chunks of `store.block_size()` rows,
-    /// each batch with schema | row_id | vector |, loaded as they are read.
+    /// The raw vectors of `row_ids` in chunks of `rows_per_chunk` rows with up
+    /// to `prefetch` chunks in flight, each batch with schema | row_id | vector |.
     async fn take_vectors_stream(
         dataset: &Dataset,
         column: &str,
-        store: &ObjectStore,
         row_ids: &[u64],
+        rows_per_chunk: usize,
+        prefetch: usize,
     ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send + 'static> {
         let projection = Arc::new(dataset.schema().project(&[column])?);
         // arrow uses i32 for index, so we chunk the row ids to avoid large batch causing overflow
         let row_ids = dataset.filter_deleted_ids(row_ids).await?;
         let chunks: Vec<Vec<u64>> = row_ids
-            .chunks(store.block_size())
+            .chunks(rows_per_chunk.max(1))
             .map(|chunk| chunk.to_vec())
             .collect();
         let dataset = dataset.clone();
-        let io_parallelism = store.io_parallelism();
         Ok(stream::iter(chunks)
             .map(move |chunk| {
                 let dataset = dataset.clone();
@@ -1916,7 +1929,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     )?)
                 }
             })
-            .buffered(io_parallelism))
+            .buffered(prefetch.max(1)))
     }
 
     /// A chunk of raw vectors flattened to one row id per vector (a multivector
@@ -2528,6 +2541,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf,
                     &removed,
                     &mut room,
+                    multivector,
                 )
                 .await?
             }
@@ -2538,6 +2552,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf,
                     &removed,
                     &mut room,
+                    multivector,
                 )
                 .await?
             }
@@ -2548,6 +2563,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf,
                     &removed,
                     &mut room,
+                    multivector,
                 )
                 .await?
             }
@@ -2558,6 +2574,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf,
                     &removed,
                     &mut room,
+                    multivector,
                 )
                 .await?
             }
@@ -2577,7 +2594,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     /// Route and quantize the rows of each joined partition chunk by chunk,
-    /// writing them through a shuffler keyed by old partition id.
+    /// writing them through a shuffler keyed by old partition id. A single
+    /// vector row is routed within its partition's window; every vector of a
+    /// multivector row gets its own, since it may lie far from the joined
+    /// partition the row was found under.
     async fn join_partitions_impl<T: ArrowPrimitiveType>(
         &self,
         partitions: &[usize],
@@ -2585,6 +2605,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         ivf: &IvfModel,
         removed: &HashSet<usize>,
         room: &mut [usize],
+        multivector: bool,
     ) -> Result<Arc<dyn ShuffleReader>>
     where
         T::Native: Dot + L2 + Normalize,
@@ -2626,6 +2647,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .shuffle(Box::new(RecordBatchStreamAdapter::new(schema, batches)))
                 .await
         };
+        let (rows_per_fetch, prefetch) = if multivector {
+            (JOIN_MULTIVECTOR_ROWS_PER_FETCH, 1)
+        } else {
+            (self.store.block_size(), 2)
+        };
         let route = async move {
             for (&part_idx, row_ids) in partitions.iter().zip(rows_per_partition) {
                 if row_ids.is_empty() {
@@ -2634,44 +2660,62 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let c0 = ivf
                     .centroid(part_idx)
                     .ok_or(Error::invalid_input("original centroid not found"))?;
-                let (window_ids, window_centroids) =
+                let partition_window =
                     self.select_reassign_candidates(ivf, part_idx, &c0, removed)?;
                 let mut overflowed = 0usize;
-                let mut chunks =
-                    Self::take_vectors_stream(dataset, &self.column, &self.store, row_ids).await?;
+                let mut chunks = Self::take_vectors_stream(
+                    dataset,
+                    &self.column,
+                    row_ids,
+                    rows_per_fetch,
+                    prefetch,
+                )
+                .await?;
                 while let Some(chunk) = chunks.try_next().await? {
                     let (row_ids, vectors) = self.flatten_raw_vectors(&chunk)?;
-                    let mut assign_ops: BTreeMap<u32, Vec<AssignOp>> = BTreeMap::new();
-                    for i in 0..row_ids.len() {
-                        let (target, had_room) = choose_join_destination(
-                            self.distance_type,
-                            vectors.value(i).as_primitive::<T>(),
-                            &window_ids,
-                            &window_centroids,
-                            ivf,
-                            removed,
-                            room,
-                        )?;
-                        if had_room {
-                            room[target as usize] -= 1;
-                        } else {
-                            overflowed += 1;
+                    for start in (0..row_ids.len()).step_by(JOIN_VECTORS_PER_BATCH) {
+                        let end = (start + JOIN_VECTORS_PER_BATCH).min(row_ids.len());
+                        let mut assign_ops: BTreeMap<u32, Vec<AssignOp>> = BTreeMap::new();
+                        for i in start..end {
+                            let vector = vectors.value(i);
+                            let vector_window;
+                            let (window_ids, window_centroids) = if multivector {
+                                vector_window =
+                                    window_for_vector(self.distance_type, ivf, &vector, removed)?;
+                                &vector_window
+                            } else {
+                                &partition_window
+                            };
+                            let (target, had_room) = choose_join_destination(
+                                self.distance_type,
+                                vector.as_primitive::<T>(),
+                                window_ids,
+                                window_centroids,
+                                ivf,
+                                removed,
+                                room,
+                            )?;
+                            if had_room {
+                                room[target as usize] -= 1;
+                            } else {
+                                overflowed += 1;
+                            }
+                            assign_ops
+                                .entry(target)
+                                .or_default()
+                                .push(AssignOp::Add((row_ids.value(i), vector)));
                         }
-                        assign_ops
-                            .entry(target)
-                            .or_default()
-                            .push(AssignOp::Add((row_ids.value(i), vectors.value(i))));
-                    }
-                    for (target, ops) in assign_ops {
-                        let batch = Self::build_assign_batch::<T>(
-                            &transformer,
-                            &vector_field,
-                            target,
-                            &ops,
-                        )?;
-                        sender.send(batch).await.map_err(|_| {
-                            Error::internal("the join shuffler stopped taking batches")
-                        })?;
+                        for (target, ops) in assign_ops {
+                            let batch = Self::build_assign_batch::<T>(
+                                &transformer,
+                                &vector_field,
+                                target,
+                                &ops,
+                            )?;
+                            sender.send(batch).await.map_err(|_| {
+                                Error::internal("the join shuffler stopped taking batches")
+                            })?;
+                        }
                     }
                 }
                 if overflowed > 0 {
@@ -3036,6 +3080,19 @@ where
     })?
     .ok_or_else(|| Error::internal("a joined partition has no neighbor to receive its rows"))?;
     Ok((target, false))
+}
+
+/// The `REASSIGN_RANGE` nearest surviving partitions to `vector` itself, for a
+/// vector of a reindexed multivector row: it may belong to a region far from
+/// the joined partition the row was found under, so that partition's window
+/// would place it wrongly.
+fn window_for_vector(
+    distance_type: DistanceType,
+    ivf: &IvfModel,
+    vector: &ArrayRef,
+    removed: &HashSet<usize>,
+) -> Result<(UInt32Array, FixedSizeListArray)> {
+    select_reassign_candidates_impl(distance_type, ivf, usize::MAX, vector, removed)
 }
 
 /// The nearest `REASSIGN_RANGE` partitions to `c0`, skipping `part_idx` itself and
@@ -4170,6 +4227,38 @@ mod tests {
             sizes.iter().all(|&rows| rows <= 400),
             "a join destination exceeds the split threshold: {sizes:?}"
         );
+    }
+
+    #[test]
+    fn join_window_follows_each_vector_of_a_multivector_row() {
+        // A row found under joined partition 0 has a vector at 100, whose exact
+        // surviving centroid (66) lies outside partition 0's 64-neighbor window
+        // of centroids near 0; routed by its own window it goes to 66.
+        let mut positions: Vec<f32> = (0..65).map(|i| i as f32 * 0.001).collect();
+        positions.extend([100.0, 100.0]);
+        let ivf = ivf_on_a_line(&positions);
+        let removed: HashSet<usize> = [0, 65].into_iter().collect();
+        let vector: ArrayRef = Arc::new(Float32Array::from(vec![100.0_f32]));
+        let (window_ids, window_centroids) =
+            window_for_vector(DistanceType::L2, &ivf, &vector, &removed).unwrap();
+        assert_eq!(window_ids.value(0), 66);
+        let room = vec![1; positions.len()];
+        let (target, had_room) = choose_join_destination(
+            DistanceType::L2,
+            vector.as_primitive::<Float32Type>(),
+            &window_ids,
+            &window_centroids,
+            &ivf,
+            &removed,
+            &room,
+        )
+        .unwrap();
+        assert_eq!((target, had_room), (66, true));
+        // Partition 0's own window would have kept it near 0.
+        let c0 = ivf.centroid(0).unwrap();
+        let (partition_window, _) =
+            select_reassign_candidates_impl(DistanceType::L2, &ivf, 0, &c0, &removed).unwrap();
+        assert!(!partition_window.values().contains(&66));
     }
 
     #[test]
