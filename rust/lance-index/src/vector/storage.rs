@@ -5,7 +5,7 @@
 
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, cast::AsArray};
 use arrow_schema::SchemaRef;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
@@ -13,6 +13,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
+use lance_index_core::remapping::RowIdRemapping;
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::IoStats;
 use lance_linalg::distance::DistanceType;
@@ -517,7 +518,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     metadata: Q::Metadata,
 
     ivf: IvfModel,
-    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    frag_reuse_index: Option<RowIdRemapping>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -588,7 +589,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             distance_type,
             metadata,
             ivf,
-            frag_reuse_index,
+            frag_reuse_index: frag_reuse_index.map(RowIdRemapping::InMemory),
         })
     }
 
@@ -619,8 +620,14 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             distance_type,
             metadata,
             ivf,
-            frag_reuse_index,
+            frag_reuse_index: frag_reuse_index.map(RowIdRemapping::InMemory),
         }
+    }
+
+    /// Set the shared row-ID remapper used when decoding each partition.
+    pub fn with_row_id_remapping(mut self, remapping: RowIdRemapping) -> Self {
+        self.frag_reuse_index = Some(remapping);
+        self
     }
 
     pub fn reader(&self) -> &FileReader {
@@ -696,11 +703,24 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let schema = Arc::new(self.reader.schema().as_ref().into());
             concat_batches(&schema, batches.iter())?
         };
+        let remapper = match &self.frag_reuse_index {
+            None => None,
+            Some(RowIdRemapping::InMemory(remapper)) => Some(remapper.clone()),
+            Some(remapping) => {
+                let ids = batch
+                    .column_by_name(lance_core::ROW_ID)
+                    .and_then(|array| array.as_primitive_opt::<arrow_array::types::UInt64Type>())
+                    .ok_or_else(|| {
+                        Error::invalid_input("vector storage must contain a UInt64 row-ID column")
+                    })?;
+                Some(remapping.prepare(ids.values()).await?)
+            }
+        };
         Q::Storage::try_from_batch_with_remapper(
             batch,
             self.metadata(),
             self.distance_type,
-            self.frag_reuse_index.clone(),
+            remapper,
         )
     }
 }

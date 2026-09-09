@@ -2,12 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
-use crate::index::DatasetIndexExt;
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::Error;
 use lance_index::frag_reuse::{
-    CompactFragReuseIndex, FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup,
-    FragReuseIndexDetails, FragReuseVersion,
+    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_DETAILS_FILE_NAME,
+    FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
 };
+use lance_index::scalar::{MetricsCollector, RowIdRemapping};
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
@@ -17,11 +18,53 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+/// Resolve the FRI remapper shared by scalar and vector index loading.
+pub(super) async fn open_row_id_remapping(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+    metrics: &dyn MetricsCollector,
+) -> lance_core::Result<Option<(Uuid, RowIdRemapping)>> {
+    let indices = dataset.load_indices().await?;
+    let Some(fri) = indices
+        .iter()
+        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return Ok(None);
+    };
+    if fri.index_version == 0 {
+        return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
+            (
+                legacy.uuid,
+                RowIdRemapping::InMemory(Arc::new(CompactFragReuseIndexHandle(legacy))),
+            )
+        }));
+    }
+    let mapping = super::frag_reuse_query::QueryFragReuseIndex::open(dataset, fri).await?;
+    let coverage = indices
+        .iter()
+        .find(|entry| entry.uuid == index.uuid)
+        .and_then(|entry| entry.fragment_bitmap.clone())
+        .unwrap_or_default()
+        & dataset.fragment_bitmap.as_ref();
+    Ok(Some((
+        fri.uuid,
+        RowIdRemapping::External(Arc::new(super::frag_reuse_query::QueryRowIdRemapper::new(
+            mapping, coverage,
+        ))),
+    )))
+}
+
 /// Load fragment reuse index details from index metadata
 pub async fn load_frag_reuse_index_details(
     dataset: &Dataset,
     index: &IndexMetadata,
 ) -> lance_core::Result<Arc<FragReuseIndexDetails>> {
+    if index.index_version != 0 {
+        return Err(Error::not_supported(format!(
+            "This operation requires interpreting FRI index_version {}; tagged FRI maintenance is not supported by this client. Upgrade to a client supporting this operation",
+            index.index_version
+        )));
+    }
     let details_any = index.index_details.clone();
     if details_any.is_none()
         || !details_any

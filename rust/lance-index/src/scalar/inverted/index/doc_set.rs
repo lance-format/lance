@@ -410,8 +410,25 @@ impl DocSet {
         is_legacy: bool,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
+        Self::load_with_remapping(
+            reader,
+            is_legacy,
+            frag_reuse_index.map(RowIdRemapping::InMemory),
+        )
+        .await
+    }
+
+    pub(crate) async fn load_with_remapping(
+        reader: Arc<dyn IndexReader>,
+        is_legacy: bool,
+        remapping: Option<RowIdRemapping>,
+    ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+        let frag_reuse_index = match remapping {
+            Some(remapping) => Some(remapping.prepare(row_id_col.values()).await?),
+            None => None,
+        };
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
         let mut doc_indices = Vec::new();
         for rank in 0.. {

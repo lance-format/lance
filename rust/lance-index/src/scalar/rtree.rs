@@ -38,6 +38,7 @@ use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
+use lance_index_core::remapping::RowIdRemapping;
 use lance_io::object_store::ObjectStore;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -296,7 +297,7 @@ impl CacheKey for RTreeCacheKey {
 pub struct RTreeIndex {
     pub(crate) metadata: Arc<RTreeMetadata>,
     store: Arc<dyn IndexStore>,
-    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    frag_reuse_index: Option<RowIdRemapping>,
     index_cache: WeakLanceCache,
     pages_reader: Arc<dyn IndexReader>,
     nulls_reader: Arc<dyn IndexReader>,
@@ -315,6 +316,19 @@ impl RTreeIndex {
     pub async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        Self::load_with_remapping(
+            store,
+            frag_reuse_index.map(RowIdRemapping::InMemory),
+            index_cache,
+        )
+        .await
+    }
+
+    async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<RowIdRemapping>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
@@ -502,13 +516,12 @@ fn filter_rtree_data(
 
 fn remap_rtree_data(
     data: SendableRecordBatchStream,
-    remapper: Arc<dyn RowIdRemapper>,
+    remapper: RowIdRemapping,
 ) -> SendableRecordBatchStream {
     let schema = data.schema();
-    let remapped = data.map(move |batch_result| {
-        let batch = batch_result?;
-        // The row ID is column 1 in BBOX_ROWID_SCHEMA.
-        Ok(remapper.remap_row_ids_record_batch(batch, 1)?)
+    let remapped = data.and_then(move |batch| {
+        let remapper = remapper.clone();
+        async move { Ok(remapper.remap_row_ids_record_batch(batch, 1).await?) }
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
 }
@@ -584,7 +597,7 @@ pub async fn merge_rtree_indices(
         }
         let mut source_nulls = source.search_null(&NoOpMetricsCollector).await?;
         if let Some(remapper) = &source.frag_reuse_index {
-            source_nulls = remapper.remap_row_addrs_tree_map(&source_nulls);
+            source_nulls = remapper.remap_row_addrs_tree_map(&source_nulls).await?;
         }
         if let Some(filter) = filter {
             filter.retain_old_rows(&mut source_nulls);
@@ -713,8 +726,8 @@ impl ScalarIndex for RTreeIndex {
                 let mut null_map = self.search_null(metrics).await?;
 
                 if let Some(fri) = &self.frag_reuse_index {
-                    rowids = fri.remap_row_addrs_tree_map(&rowids);
-                    null_map = fri.remap_row_addrs_tree_map(&null_map);
+                    rowids = fri.remap_row_addrs_tree_map(&rowids).await?;
+                    null_map = fri.remap_row_addrs_tree_map(&null_map).await?;
                 }
                 Ok(SearchResult::AtMost(NullableRowAddrSet::new(
                     rowids, null_map,
@@ -724,7 +737,7 @@ impl ScalarIndex for RTreeIndex {
                 let mut null_map = self.search_null(metrics).await?;
 
                 if let Some(fri) = &self.frag_reuse_index {
-                    null_map = fri.remap_row_addrs_tree_map(&null_map);
+                    null_map = fri.remap_row_addrs_tree_map(&null_map).await?;
                 }
                 Ok(SearchResult::Exact(NullableRowAddrSet::new(
                     null_map,
@@ -1193,6 +1206,19 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(RTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        remapping: Option<RowIdRemapping>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(RTreeIndex::load_with_remapping(index_store, remapping, cache).await?)
+    }
 }
 
 struct EncodedBatch {
@@ -1546,7 +1572,7 @@ mod tests {
             FragReuseIndexDetails { versions: vec![] },
         )));
         let mut first_index = first_index.as_ref().clone();
-        first_index.frag_reuse_index = Some(Arc::new(remapper));
+        first_index.frag_reuse_index = Some(RowIdRemapping::InMemory(Arc::new(remapper)));
 
         let mut keep_first_rows = RowAddrTreeMap::new();
         keep_first_rows.insert(remapped_geometry);

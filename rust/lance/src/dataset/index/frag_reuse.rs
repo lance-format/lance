@@ -57,9 +57,7 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         return Ok(());
     };
 
-    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta)
-        .await
-        .unwrap();
+    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
 
     let chain_frag_bitmap = reuse_chain_frag_bitmap(&frag_reuse_details.versions);
 

@@ -17,6 +17,7 @@ mod scorer;
 pub mod tokenizer;
 mod wand;
 
+use lance_index_core::remapping::RowIdRemapping;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -474,6 +475,30 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let index = InvertedIndex::load(index_store, frag_reuse_index, cache).await?;
+        let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
+        let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
+        let physical_granularity = index.params().get_document_granularity();
+        if physical_granularity != expected_granularity {
+            return Err(Error::index(format!(
+                "FTS document granularity in index details is {expected_granularity:?}, but the physical document schema implies {physical_granularity:?}"
+            )));
+        }
+        Ok(index as Arc<dyn ScalarIndex>)
+    }
+
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        frag_reuse_index: Option<RowIdRemapping>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let index =
+            InvertedIndex::load_with_remapping(index_store, frag_reuse_index, cache).await?;
         let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
         let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
         let physical_granularity = index.params().get_document_granularity();

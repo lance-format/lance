@@ -25,6 +25,7 @@ use crate::scalar::{
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowIdRemapping;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::sync::LazyLock;
@@ -113,7 +114,7 @@ pub struct ZoneMapIndex {
     rows_per_zone: u64,
     use_seeds: bool,
     store: Arc<dyn IndexStore>,
-    fri: Option<Arc<dyn RowIdRemapper>>,
+    fri: Option<RowIdRemapping>,
     index_cache: WeakLanceCache,
     // Exact set of null row addresses across all zones; None when loaded from an
     // older index that did not persist this bitmap.
@@ -512,7 +513,7 @@ impl ZoneMapIndex {
     /// Load the scalar index from storage
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<dyn RowIdRemapper>>,
+        fri: Option<RowIdRemapping>,
         index_cache: &LanceCache,
         use_seeds: bool,
     ) -> Result<Arc<Self>>
@@ -555,7 +556,7 @@ impl ZoneMapIndex {
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<dyn RowIdRemapper>>,
+        fri: Option<RowIdRemapping>,
         index_cache: &LanceCache,
         rows_per_zone: u64,
         null_rows: Option<RowAddrTreeMap>,
@@ -719,8 +720,12 @@ impl ScalarIndex for ZoneMapIndex {
         let Some(remapper) = &self.fri else {
             return Ok(result);
         };
-        let selected = remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows());
-        let nulls = remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows());
+        let selected = remapper
+            .remap_row_addrs_tree_map(result.row_addrs().selected_rows())
+            .await?;
+        let nulls = remapper
+            .remap_row_addrs_tree_map(result.row_addrs().null_rows())
+            .await?;
 
         Ok(match result {
             SearchResult::Exact(_) => SearchResult::exact(selected).with_nulls(nulls),
@@ -995,6 +1000,11 @@ pub async fn merge_zonemap_indices(
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut any_missing_bitmap = false;
     for source in source_indices {
+        let remapper = source
+            .fri
+            .as_ref()
+            .map(RowIdRemapping::synchronous)
+            .transpose()?;
         if source.rows_per_zone != rows_per_zone {
             return Err(Error::invalid_input(format!(
                 "cannot merge ZoneMap segments with different rows_per_zone values: {} and {}",
@@ -1008,13 +1018,13 @@ pub async fn merge_zonemap_indices(
             )));
         }
         let remapped_null_rows = source.null_rows.as_ref().map(|null_rows| {
-            source.fri.as_deref().map_or_else(
+            remapper.map_or_else(
                 || null_rows.clone(),
                 |remapper| remapper.remap_row_addrs_tree_map(null_rows),
             )
         });
         for zone in &source.zones {
-            let source_zones = source.fri.as_deref().map_or_else(
+            let source_zones = remapper.map_or_else(
                 || Ok(vec![zone.clone()]),
                 |remapper| {
                     remap_zone(
@@ -1503,6 +1513,31 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             .ok()
             .and_then(|d| d.use_seeds)
             .unwrap_or(false);
+        Ok(ZoneMapIndex::load(
+            index_store,
+            frag_reuse_index.map(RowIdRemapping::InMemory),
+            cache,
+            use_seeds,
+        )
+        .await? as Arc<dyn ScalarIndex>)
+    }
+
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        frag_reuse_index: Option<RowIdRemapping>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let use_seeds = index_details
+            .to_msg::<pbold::ZoneMapIndexDetails>()
+            .ok()
+            .and_then(|d| d.use_seeds)
+            .unwrap_or(false);
         Ok(
             ZoneMapIndex::load(index_store, frag_reuse_index, cache, use_seeds).await?
                 as Arc<dyn ScalarIndex>,
@@ -1903,6 +1938,7 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
 mod tests {
     use crate::scalar::registry::VALUE_COLUMN_NAME;
     use crate::scalar::{IndexStore, zonemap::ROWS_PER_ZONE_DEFAULT};
+    use lance_index_core::remapping::RowIdRemapping;
     use std::sync::Arc;
 
     use crate::scalar::zoned::ZoneBound;
@@ -2158,7 +2194,10 @@ mod tests {
         zone.min = ScalarValue::Decimal128(None, 38, 10);
         zone.max = ScalarValue::Decimal128(None, 38, 10);
         source_mut.null_rows = None;
-        source_mut.fri = Some(Arc::new(TestRemapper::new([(1, 3_u64 << 32)])));
+        source_mut.fri = Some(RowIdRemapping::InMemory(Arc::new(TestRemapper::new([(
+            1,
+            3_u64 << 32,
+        )]))));
 
         let candidate = ScalarValue::Decimal128(Some(200), 38, 10);
         let queries = [

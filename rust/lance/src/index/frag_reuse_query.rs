@@ -4,23 +4,17 @@
 //! Query-time translation for tagged FRI histories. Mapping files are opened on demand.
 
 use std::collections::HashMap;
-use std::ops::Range;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
-use futures::TryStreamExt;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::row_map::RowMapReader;
+use lance_index::scalar::IndexStore;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::{IndexFile, IndexReader, IndexStore, IndexWriter};
-use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_table::format::{IndexMetadata, pb};
 use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
 use prost::Message;
@@ -46,24 +40,7 @@ pub struct QueryFragReuseIndex {
 
 impl DeepSizeOf for QueryFragReuseIndex {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.ledger.raw_content().len()
-            + self
-                .ledger
-                .transitions()
-                .iter()
-                .map(|t| {
-                    std::mem::size_of_val(t)
-                        + std::mem::size_of_val(t.sources())
-                        + std::mem::size_of_val(t.destinations())
-                        + match t.mapping() {
-                            Mapping::OrderedCompaction(remap) => {
-                                remap.deep_size_of_children(context)
-                            }
-                            Mapping::StablePartition(reference) => reference.map_id.capacity(),
-                            Mapping::Unknown { .. } => 0,
-                        }
-                })
-                .sum::<usize>()
+        self.ledger.deep_size_of_children(context)
             + self
                 .partitions
                 .values()
@@ -95,6 +72,55 @@ impl CacheKey for QueryKey {
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_str(&self.0);
     }
+}
+
+#[derive(Clone)]
+struct VectorFormatKey(uuid::Uuid);
+
+impl CacheKey for VectorFormatKey {
+    type ValueType = bool;
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        self.0.to_string().into()
+    }
+    fn type_name() -> &'static str {
+        "VectorBatchRemapping"
+    }
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.vector-batch-remapping", 1)
+    }
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.0.as_bytes());
+    }
+}
+
+/// Legacy vector file readers keep their existing V1 behavior and scan fallback.
+pub async fn vector_supports_batch_remapping(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<bool> {
+    let supported = dataset
+        .index_cache
+        .get_or_insert_with_key(VectorFormatKey(index.uuid), || async {
+            let path = dataset
+                .indice_files_dir(index)?
+                .join(index.uuid.to_string())
+                .join(super::INDEX_FILE_NAME);
+            let store = dataset.object_store_for_index(index).await?;
+            let reader = super::vector::open_index_file(
+                store.as_ref(),
+                &path,
+                super::INDEX_FILE_NAME,
+                &index.file_size_map(),
+            )
+            .await?;
+            let tail = lance_io::utils::read_last_block(reader.as_ref()).await?;
+            Ok(matches!(
+                lance_io::utils::read_version(&tail)?,
+                (0, 3) | (2, _)
+            ))
+        })
+        .await?;
+    Ok(*supported)
 }
 
 impl QueryFragReuseIndex {
@@ -407,193 +433,45 @@ async fn load_ledger(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReu
     FragReuseLedger::decode(index.index_version, content)
 }
 
-/// B-tree decode adapter. Translates bounded batches before the scalar index
-/// evaluates predicates, preserving lazy row-map I/O and current coverage.
-#[derive(Clone)]
-pub struct TranslatedIndexStore {
-    inner: Arc<dyn IndexStore>,
+/// Applies the shared FRI history and limits translated rows to this segment's coverage.
+pub struct QueryRowIdRemapper {
     mapping: Arc<QueryFragReuseIndex>,
     coverage: RoaringBitmap,
 }
 
-impl std::fmt::Debug for TranslatedIndexStore {
+impl std::fmt::Debug for QueryRowIdRemapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TranslatedIndexStore")
-            .field("inner", &self.inner)
+        f.debug_struct("QueryRowIdRemapper")
+            .field("coverage", &self.coverage)
             .finish_non_exhaustive()
     }
 }
 
-impl DeepSizeOf for TranslatedIndexStore {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.inner.deep_size_of_children(context)
-            + self.mapping.deep_size_of_children(context)
-            + self.coverage.serialized_size()
-    }
-}
-
-impl TranslatedIndexStore {
-    pub(crate) fn new(
-        inner: Arc<dyn IndexStore>,
-        mapping: Arc<QueryFragReuseIndex>,
-        coverage: RoaringBitmap,
-    ) -> Self {
-        Self {
-            inner,
-            mapping,
-            coverage,
-        }
+impl QueryRowIdRemapper {
+    pub(crate) fn new(mapping: Arc<QueryFragReuseIndex>, coverage: RoaringBitmap) -> Self {
+        Self { mapping, coverage }
     }
 }
 
 #[async_trait]
-impl IndexStore for TranslatedIndexStore {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn clone_arc(&self) -> Arc<dyn IndexStore> {
-        Arc::new(self.clone())
-    }
-    fn io_parallelism(&self) -> usize {
-        self.inner.io_parallelism()
-    }
-    async fn new_index_file(
-        &self,
-        name: &str,
-        _schema: Arc<arrow_schema::Schema>,
-    ) -> Result<Box<dyn IndexWriter>> {
-        Err(Error::not_supported(format!(
-            "cannot create {name} through a translated query store"
-        )))
-    }
-    async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
-        Ok(Arc::new(TranslatedIndexReader {
-            inner: self.inner.open_index_file(name).await?,
-            mapping: self.mapping.clone(),
-            coverage: self.coverage.clone(),
-        }))
-    }
-    fn with_io_priority(&self, priority: u64) -> Arc<dyn IndexStore> {
-        Arc::new(Self {
-            inner: self.inner.with_io_priority(priority),
-            ..self.clone()
-        })
-    }
-    async fn copy_index_file(
-        &self,
-        name: &str,
-        _destination: &dyn IndexStore,
-    ) -> Result<IndexFile> {
-        Err(Error::not_supported(format!(
-            "copying translated B-tree file {name} requires rebuilding its page lookup"
-        )))
-    }
-
-    async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile> {
-        Err(Error::not_supported(format!(
-            "cannot rename {name} to {new_name} through a translated query store"
-        )))
-    }
-    async fn delete_index_file(&self, name: &str) -> Result<()> {
-        Err(Error::not_supported(format!(
-            "cannot delete {name} through a translated query store"
-        )))
-    }
-    async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
-        self.inner.list_files_with_sizes().await
-    }
-}
-
-#[derive(Clone)]
-struct TranslatedIndexReader {
-    inner: Arc<dyn IndexReader>,
-    mapping: Arc<QueryFragReuseIndex>,
-    coverage: RoaringBitmap,
-}
-
-impl TranslatedIndexReader {
-    async fn translate(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        let Ok(column) = batch.schema().index_of("ids") else {
-            return Ok(batch);
-        };
-        // B-tree page files store physical row addresses in the `ids` column.
-        let ids = batch
-            .column_by_name("ids")
-            .ok_or_else(|| Error::invalid_input("B-tree page is missing its ids column"))?
-            .as_primitive_opt::<arrow_array::types::UInt64Type>()
-            .ok_or_else(|| Error::invalid_input("B-tree row addresses must be UInt64"))?;
-        let (valid_positions, addresses): (Vec<_>, Vec<_>) = ids
+impl lance_index::scalar::BatchRowIdRemapper for QueryRowIdRemapper {
+    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        let addresses = row_ids
             .iter()
-            .enumerate()
-            .filter_map(|(position, address)| {
-                address.map(|address| (position, RowAddress::from(address)))
+            .copied()
+            .map(RowAddress::from)
+            .collect::<Vec<_>>();
+        Ok(self
+            .mapping
+            .translate(&addresses)
+            .await?
+            .into_iter()
+            .map(|address| {
+                address
+                    .filter(|address| self.coverage.contains(address.fragment_id()))
+                    .map(u64::from)
             })
-            .unzip();
-        let translated = self.mapping.translate(&addresses).await?;
-        let mut positions = Vec::with_capacity(batch.num_rows());
-        let mut addresses = Vec::with_capacity(batch.num_rows());
-        for (position, address) in valid_positions.into_iter().zip(translated) {
-            if ids.is_valid(position)
-                && let Some(address) = address
-                && self.coverage.contains(address.fragment_id())
-            {
-                positions.push(position as u32);
-                addresses.push(u64::from(address));
-            }
-        }
-        let positions = UInt32Array::from(positions);
-        let mut columns = batch
-            .columns()
-            .iter()
-            .map(|array| arrow::compute::take(array, &positions, None))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        columns[column] = Arc::new(UInt64Array::from(addresses));
-        Ok(RecordBatch::try_new(batch.schema(), columns)?)
-    }
-}
-
-#[async_trait]
-impl IndexReader for TranslatedIndexReader {
-    async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
-        self.translate(self.inner.read_record_batch(n, batch_size).await?)
-            .await
-    }
-    async fn read_range(
-        &self,
-        range: Range<usize>,
-        projection: Option<&[&str]>,
-    ) -> Result<RecordBatch> {
-        self.translate(self.inner.read_range(range, projection).await?)
-            .await
-    }
-    async fn read_range_stream(
-        &self,
-        range: Range<usize>,
-        projection: Option<&[&str]>,
-    ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
-        let stream = self.inner.read_range_stream(range, projection).await?;
-        let schema = stream.schema();
-        let reader = self.clone();
-        let stream = stream.and_then(move |batch| {
-            let reader = reader.clone();
-            async move { reader.translate(batch).await }
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-    async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
-        self.inner.read_global_buffer(index).await
-    }
-    async fn num_batches(&self, batch_size: u64) -> u32 {
-        self.inner.num_batches(batch_size).await
-    }
-    fn num_rows(&self) -> usize {
-        self.inner.num_rows()
-    }
-    fn schema(&self) -> &lance_core::datatypes::Schema {
-        self.inner.schema()
-    }
-    fn file_size_bytes(&self) -> Option<u64> {
-        self.inner.file_size_bytes()
+            .collect())
     }
 }
 
@@ -605,6 +483,7 @@ mod tests {
     use crate::session::index_caches::IndexMetadataKey;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::Int32Type;
+    use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array, cast::AsArray};
     use lance_core::cache::LanceCache;
     use lance_index::IndexType;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
@@ -619,11 +498,28 @@ mod tests {
     use uuid::Uuid;
 
     async fn fixture() -> Dataset {
+        fixture_with_index(IndexType::BTree).await
+    }
+
+    async fn fixture_with_index(index_type: IndexType) -> Dataset {
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
             .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
             .await
             .unwrap();
+        if index_type != IndexType::BTree {
+            dataset
+                .create_index(
+                    &["i"],
+                    index_type,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            return dataset;
+        }
         let batch = dataset
             .scan()
             .with_row_id()
@@ -678,7 +574,11 @@ mod tests {
             );
             let batch = RecordBatch::try_new(
                 batch.schema(),
-                vec![arrow::compute::take(values, &positions, None).unwrap()],
+                batch
+                    .columns()
+                    .iter()
+                    .map(|column| arrow::compute::take(column, &positions, None).unwrap())
+                    .collect(),
             )
             .unwrap();
             let transaction = InsertBuilder::new(Arc::new(dataset.clone()))
@@ -831,8 +731,17 @@ mod tests {
     #[case::inline(false)]
     #[case::external(true)]
     #[tokio::test]
-    async fn btree_queries_translate_deleted_sources_and_lazy_blocks(#[case] external: bool) {
-        let mut dataset = fixture().await;
+    async fn scalar_queries_translate_deleted_sources_and_lazy_blocks(
+        #[case] external: bool,
+        #[values(
+            IndexType::BTree,
+            IndexType::Bitmap,
+            IndexType::ZoneMap,
+            IndexType::BloomFilter
+        )]
+        index_type: IndexType,
+    ) {
+        let mut dataset = fixture_with_index(index_type).await;
         dataset.delete("i = 3").await.unwrap();
         let (transition, destinations) = prepare(&dataset).await;
         let content = InlineContent {
@@ -918,6 +827,250 @@ mod tests {
                 Some(RowAddress::new_from_parts(10, 1)),
                 None
             ]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::ngram(IndexType::NGram)]
+    #[case::inverted(IndexType::Inverted)]
+    #[tokio::test]
+    async fn text_indices_translate_through_the_shared_remapper(#[case] index_type: IndexType) {
+        let batch = arrow_array::record_batch!(
+            ("i", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
+            (
+                "text",
+                Utf8,
+                [
+                    Some("even"),
+                    Some("odd"),
+                    Some("even"),
+                    Some("odd"),
+                    None,
+                    Some("odd"),
+                    Some("even"),
+                    Some("odd")
+                ]
+            )
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if index_type == IndexType::Inverted {
+            dataset
+                .create_index(
+                    &["text"],
+                    index_type,
+                    Some("text_idx".into()),
+                    &lance_index::scalar::InvertedIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        } else {
+            dataset
+                .create_index(
+                    &["text"],
+                    index_type,
+                    Some("text_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        dataset.delete("i = 3").await.unwrap();
+        let (transition, destinations) = prepare(&dataset).await;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        install(&mut dataset, content, destinations, false).await;
+        let index = dataset
+            .load_index_by_name("text_idx")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            index.fragment_bitmap.as_ref().unwrap(),
+            dataset.fragment_bitmap.as_ref()
+        );
+        for _ in 0..2 {
+            let mut scan = dataset.scan();
+            if index_type == IndexType::Inverted {
+                scan.full_text_search(lance_index::scalar::FullTextSearchQuery::new("even".into()))
+                    .unwrap();
+            } else {
+                scan.filter("contains(text, 'even')").unwrap();
+                let plan = scan.explain_plan(false).await.unwrap();
+                assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+            }
+            let result = scan.try_into_batch().await.unwrap();
+            let actual = result
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(actual, std::collections::BTreeSet::from([0, 2, 6]));
+        }
+    }
+
+    #[tokio::test]
+    async fn label_list_translates_values_and_null_rows() {
+        let labels =
+            arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Int64Type, _, _>(
+                (0..8).map(|i| {
+                    if i == 4 {
+                        None
+                    } else {
+                        Some(vec![Some(i % 2)])
+                    }
+                }),
+            );
+        let batch = RecordBatch::try_from_iter([
+            (
+                "i",
+                Arc::new(arrow_array::Int32Array::from_iter_values(0..8)) as arrow_array::ArrayRef,
+            ),
+            ("labels", Arc::new(labels) as arrow_array::ArrayRef),
+        ])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["labels"],
+                IndexType::LabelList,
+                Some("labels_idx".into()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset.delete("i = 3").await.unwrap();
+        let (transition, destinations) = prepare(&dataset).await;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        install(&mut dataset, content, destinations, false).await;
+        for (predicate, expected) in [
+            ("array_has_any(labels, [0])", vec![0, 2, 6]),
+            ("NOT array_has_any(labels, [0])", vec![1, 5, 7]),
+        ] {
+            let mut scan = dataset.scan();
+            scan.filter(predicate).unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+            let result = scan.try_into_batch().await.unwrap();
+            let actual = result
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(actual, expected.into_iter().collect());
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_partition_uses_shared_remapping_and_cached_reconstruction() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let params = crate::index::vector::VectorIndexParams::ivf_flat(
+            1,
+            lance_linalg::distance::DistanceType::L2,
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        let original = dataset
+            .scan()
+            .filter("i = 2")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let query = original
+            .column_by_name("vector")
+            .unwrap()
+            .as_fixed_size_list()
+            .value(0);
+        let query = query.as_primitive::<arrow_array::types::Float32Type>();
+        dataset.delete("i = 3").await.unwrap();
+        let (transition, destinations) = prepare(&dataset).await;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        let fri = install(&mut dataset, content, destinations, false).await;
+        let mapping = QueryFragReuseIndex::open(&dataset, &fri).await.unwrap();
+        assert!(
+            mapping
+                .partitions
+                .values()
+                .all(|partition| partition.reader.get().is_none())
+        );
+        for _ in 0..2 {
+            let mut scan = dataset.scan();
+            scan.nearest("vector", query, 1).unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ANN"), "{plan}");
+            let result = scan.try_into_batch().await.unwrap();
+            assert_eq!(result.num_rows(), 1);
+            assert_eq!(
+                result
+                    .column_by_name("i")
+                    .unwrap()
+                    .as_primitive::<Int32Type>()
+                    .value(0),
+                2
+            );
+        }
+        assert!(
+            mapping
+                .partitions
+                .values()
+                .all(|partition| partition.reader.get().is_some())
         );
     }
 
@@ -1009,7 +1162,7 @@ mod tests {
         let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
         indices[0].index_version = 0;
         indices[0].index_details = Some(Arc::new(
-            prost_types::Any::from_msg(&lance_index::pbold::BitmapIndexDetails::default()).unwrap(),
+            prost_types::Any::from_msg(&lance_index::pb::FmIndexDetails::default()).unwrap(),
         ));
         let key = IndexMetadataKey {
             version: dataset.manifest.version,
@@ -1087,5 +1240,121 @@ mod tests {
                 .segment_coverage(&[RoaringBitmap::from_iter([0]), RoaringBitmap::from_iter([2])]),
             vec![RoaringBitmap::new(), RoaringBitmap::from_iter([3])]
         );
+    }
+    #[rstest::rstest]
+    #[case::inline(false)]
+    #[case::external(true)]
+    #[tokio::test]
+    async fn append_carries_unknown_fri_without_interpreting_it(#[case] external: bool) {
+        let mut dataset = fixture().await;
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let mut transition = Transition {
+            sources: vec![FragmentDigest {
+                id: 900,
+                physical_rows: 1,
+                num_deleted_rows: 0,
+            }],
+            destinations: vec![FragmentDigest {
+                id: 901,
+                physical_rows: 1,
+                num_deleted_rows: 0,
+            }],
+            encoding: None,
+        }
+        .encode_to_vec();
+        transition.extend(field(17, b"opaque future mapping reference"));
+        let content = field(2, &transition);
+        let uuid = Uuid::new_v4();
+        let details_path = dataset
+            .indices_dir()
+            .join(uuid.to_string())
+            .join("details.binpb");
+        let details = if external {
+            let mut writer = dataset.object_store.create(&details_path).await.unwrap();
+            writer.write_all(&content).await.unwrap();
+            writer.shutdown().await.unwrap();
+            field(
+                2,
+                &pb::ExternalFile {
+                    path: "details.binpb".into(),
+                    offset: 0,
+                    size: content.len() as u64,
+                }
+                .encode_to_vec(),
+            )
+        } else {
+            field(1, &content)
+        };
+        let fri = IndexMetadata {
+            uuid,
+            fields: vec![],
+            covering_fields: vec![],
+            name: FRAG_REUSE_INDEX_NAME.into(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([901])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                value: details,
+            })),
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![fri.clone()],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let version = dataset.manifest.version;
+        let error = crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("Upgrade"));
+        assert_eq!(dataset.manifest.version, version);
+        let key = QueryKey(format!("{}:{}", dataset.manifest_location.path, uuid));
+        assert!(dataset.index_cache.get_with_key(&key).await.is_none());
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, version + 1);
+        assert!(dataset.index_cache.get_with_key(&key).await.is_none());
+        let indices = lance_table::io::manifest::read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        assert_eq!(indices.iter().find(|index| index.uuid == uuid), Some(&fri));
+        if external {
+            let bytes = dataset
+                .object_store
+                .open(&details_path)
+                .await
+                .unwrap()
+                .get_range(0..content.len())
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), content);
+        }
     }
 }
