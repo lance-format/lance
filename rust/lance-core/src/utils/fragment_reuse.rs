@@ -20,19 +20,16 @@ use crate::{Error, Result};
 #[async_trait]
 pub trait MappingReader: Send + Sync + std::fmt::Debug + DeepSizeOf {
     /// Remap one physical row ID, or return `None` if the row was deleted.
-    async fn remap_row_id(&self, row_id: u64) -> Result<Option<u64>> {
-        let mapped = self.remap_row_ids(&[row_id]).await?;
-        match mapped.as_slice() {
-            [result] => Ok(*result),
-            _ => Err(Error::internal(format!(
-                "mapping returned {} results for one row ID",
-                mapped.len(),
-            ))),
-        }
-    }
+    async fn remap_row_id(&self, row_id: u64) -> Result<Option<u64>>;
 
     /// Remap a batch, preserving input order and duplicates, with one result per input.
-    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>>;
+    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        let mut mapped = Vec::with_capacity(row_ids.len());
+        for &row_id in row_ids {
+            mapped.push(self.remap_row_id(row_id).await?);
+        }
+        Ok(mapped)
+    }
 }
 
 /// Ordered-compaction adapter for one rewrite group's existing bitmap/rank remap.
@@ -81,6 +78,32 @@ mod tests {
     use crate::utils::address::RowAddress;
     use crate::utils::row_addr_remap::GroupInputWithLayout;
     use roaring::RoaringTreemap;
+
+    #[derive(Debug, DeepSizeOf)]
+    struct SingleRowReader;
+
+    #[async_trait]
+    impl MappingReader for SingleRowReader {
+        async fn remap_row_id(&self, row_id: u64) -> Result<Option<u64>> {
+            if row_id == u64::MAX {
+                return Err(Error::invalid_input("invalid test row ID"));
+            }
+            Ok((row_id != 0).then_some(row_id))
+        }
+    }
+
+    #[tokio::test]
+    async fn default_batch_preserves_positions_and_propagates_errors() {
+        let reader = SingleRowReader;
+        assert_eq!(
+            reader.remap_row_ids(&[2, 0, 1, 2]).await.unwrap(),
+            vec![Some(2), None, Some(1), Some(2)],
+        );
+        assert!(reader.remap_row_ids(&[]).await.unwrap().is_empty());
+        let error = reader.remap_row_ids(&[1, u64::MAX]).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("invalid test row ID"));
+    }
 
     #[tokio::test]
     async fn compaction_reader_preserves_legacy_mapping_semantics() {
