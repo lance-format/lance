@@ -3743,8 +3743,9 @@ mod tests {
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::types::Float32Type;
     use arrow_array::{
-        Array, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array, ListArray,
-        NullArray, RecordBatchIterator, RecordBatchReader, StringArray, StructArray, UInt32Array,
+        Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
+        ListArray, NullArray, RecordBatchIterator, RecordBatchReader, StringArray, StructArray,
+        UInt32Array, UInt64Array,
         types::{Int32Type, UInt32Type},
     };
     use arrow_array::{RecordBatch, record_batch};
@@ -3974,6 +3975,124 @@ mod tests {
             .unwrap();
         let n: usize = filtered.iter().map(|b| b.num_rows()).sum();
         assert_eq!(n, 1, "expected exactly one row for slug='t30'");
+    }
+
+    // The slow path (indexed merge key) re-chunks the captured updated-row ids
+    // across the new fragments by position: fragment k receives the k-th slice
+    // of the captured sequence, and `assign_row_ids` back-fills fresh ids at
+    // each fragment's tail. That is only correct when every updated row is
+    // written before every inserted row — otherwise an inserted row at the head
+    // of a mixed fragment steals the stable id of an updated row behind it.
+    // The indexed path's full outer `HashJoinExec` collects the source as the
+    // build side, so source-unmatched rows (the inserts) are emitted only at
+    // end of stream and the invariant holds. This test pins it: an update
+    // surrounded by inserts in the source must keep its original row id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_indexed_merge_preserves_row_ids_with_inserts_around_update() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::UInt64, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let batch = |keys: Vec<u64>, values: Vec<i32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(keys)) as ArrayRef,
+                    Arc::new(Int32Array::from(values)) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        };
+
+        // Target: keys 1, 2 with stable row ids 0 and 1.
+        let dir = TempStrDir::default();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch(vec![1, 2], vec![10, 20]))], schema.clone()),
+            dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["key"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Source arrives in two batches: inserts first, then the update of key
+        // 1 followed by one more insert. All six rows land in one new fragment.
+        let (ds, stats) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new(
+                vec![
+                    Ok(batch(vec![100, 101], vec![1, 2])),
+                    Ok(batch(vec![1, 102], vec![11, 3])),
+                ],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 3);
+
+        let batches: Vec<RecordBatch> = ds
+            .scan()
+            .with_row_id()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut key_to_id_and_value: HashMap<u64, (u64, i32)> = HashMap::new();
+        for b in &batches {
+            let ids = b
+                .column_by_name(ROW_ID)
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            let keys = b
+                .column_by_name("key")
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            let values = b
+                .column_by_name("value")
+                .unwrap()
+                .as_primitive::<Int32Type>();
+            for i in 0..b.num_rows() {
+                key_to_id_and_value.insert(keys.value(i), (ids.value(i), values.value(i)));
+            }
+        }
+
+        // The updated row kept its stable id and its new value; the untouched
+        // row kept its id; every inserted row received a fresh id.
+        assert_eq!(
+            key_to_id_and_value.get(&1),
+            Some(&(0, 11)),
+            "updated row must keep stable row id 0 with the new value"
+        );
+        assert_eq!(
+            key_to_id_and_value.get(&2),
+            Some(&(1, 20)),
+            "untouched row must keep stable row id 1"
+        );
+        for key in [100, 101, 102] {
+            let Some((id, _)) = key_to_id_and_value.get(&key) else {
+                panic!("inserted key {key} missing from scan result");
+            };
+            assert!(*id >= 2, "inserted key {key} must get a fresh id, got {id}");
+        }
     }
 
     async fn check_then_refresh_dataset(
