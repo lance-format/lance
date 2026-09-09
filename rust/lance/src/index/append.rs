@@ -485,7 +485,9 @@ async fn merge_scalar_indices<'a>(
     // Scalar Index that expos an N:1 segment-merge primitive reachable without
     // rescanning the dataset
     let has_segment_merge_primitive = matches!(index_type, IndexType::BTree | IndexType::NGram);
-    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let frag_reuse_index = dataset
+        .frag_reuse_index_for(reference_idx, &NoOpMetricsCollector)
+        .await?;
     let ngram_requires_rebuild = index_type == IndexType::NGram
         && frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
             fragment_reuse_affects_segments(frag_reuse_index, selected_old_indices.iter().copied())

@@ -67,7 +67,9 @@ pub(in crate::index) async fn merge_segments(
     let segment_refs = segments.iter().collect::<Vec<_>>();
 
     let new_uuid = Uuid::new_v4();
-    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let frag_reuse_index = dataset
+        .frag_reuse_index_for(&segments[0], &NoOpMetricsCollector)
+        .await?;
     let has_retired_coverage = segments.iter().any(|segment| {
         segment
             .deleted_fragment_bitmap(&dataset.fragment_bitmap)
@@ -160,7 +162,14 @@ pub(in crate::index) async fn open_and_merge_segments(
 ) -> Result<CreatedIndex> {
     let segments = segments.iter().map(|&s| s.clone()).collect::<Vec<_>>();
     let segment_stores = collect_ngram_segment_stores(dataset, &segments).await?;
-    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let frag_reuse_index = match segments.first() {
+        Some(segment) => {
+            dataset
+                .frag_reuse_index_for(segment, &NoOpMetricsCollector)
+                .await?
+        }
+        None => None,
+    };
     let frag_reuse_index = frag_reuse_index
         .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
     NGramIndex::merge_segments_with_remapper(

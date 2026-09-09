@@ -17,6 +17,7 @@ use uuid::Uuid;
 use super::pb;
 use lance_core::cache::{CacheEntryReader, CacheEntryWriter};
 use lance_core::{Error, Result};
+use prost::Message;
 
 /// Metadata about a single file within an index segment.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -93,6 +94,27 @@ pub struct IndexMetadata {
     pub files: Option<Vec<IndexFile>>,
 }
 
+/// Index detail types whose matches are physical row addresses.
+fn type_url_is_row_addr_domain(type_url: &str) -> bool {
+    let is_fm = type_url
+        .rsplit_once('/')
+        .is_some_and(|(_, details_type_name)| {
+            details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
+        });
+    type_url.ends_with("ZoneMapIndexDetails")
+        || type_url.ends_with("BloomFilterIndexDetails")
+        || is_fm
+}
+
+/// The field of `lance.index.pb.JsonIndexDetails` this crate reads. `index.proto` is
+/// compiled by `lance-index`, so the target type is read through this wire-compatible
+/// view; `path` (tag 1) is skipped as an unknown field.
+#[derive(Clone, PartialEq, prost::Message)]
+struct JsonIndexDetailsTarget {
+    #[prost(message, optional, tag = "2")]
+    target_details: Option<prost_types::Any>,
+}
+
 impl IndexMetadata {
     pub fn effective_fragment_bitmap(
         &self,
@@ -138,19 +160,49 @@ impl IndexMetadata {
     /// (`ScalarIndex::results_are_row_addresses`).
     ///
     /// Such an index cannot follow its data through a rewrite: the addresses it stores
-    /// name fragments and offsets, and neither kind supports remap.
-    pub fn results_are_row_addrs(&self) -> bool {
-        self.index_details.as_ref().is_some_and(|details| {
-            let is_fm = details
-                .type_url
-                .rsplit_once('/')
-                .is_some_and(|(_, details_type_name)| {
-                    details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
-                });
-            details.type_url.ends_with("ZoneMapIndexDetails")
-                || details.type_url.ends_with("BloomFilterIndexDetails")
-                || is_fm
-        })
+    /// name fragments and offsets, and neither kind supports remap. A JSON index answers
+    /// for its target index, so its details are decoded to find the target's type.
+    ///
+    /// This decides whether stored identifiers may be rewritten, so JSON details that
+    /// cannot be decoded or name no target are an error rather than a guess.
+    pub fn results_are_row_addrs(&self) -> Result<bool> {
+        let Some(details) = self.index_details.as_ref() else {
+            return Ok(false);
+        };
+        if !details.type_url.ends_with("JsonIndexDetails") {
+            return Ok(type_url_is_row_addr_domain(&details.type_url));
+        }
+        let json_details =
+            JsonIndexDetailsTarget::decode(details.value.as_slice()).map_err(|err| {
+                Error::corrupt_file_named(
+                    "index metadata",
+                    format!(
+                        "index {} ({}) has JsonIndexDetails that do not decode: {err}",
+                        self.name, self.uuid
+                    ),
+                )
+            })?;
+        let target = json_details.target_details.ok_or_else(|| {
+            Error::corrupt_file_named(
+                "index metadata",
+                format!(
+                    "index {} ({}) has JsonIndexDetails without target_details",
+                    self.name, self.uuid
+                ),
+            )
+        })?;
+        Ok(type_url_is_row_addr_domain(&target.type_url))
+    }
+
+    /// Whether the identifiers this index stores are physical row addresses, the only
+    /// identifiers a fragment reuse index may remap. Without stable row ids every index
+    /// stores addresses; with them only an address-domain index does, and remapping
+    /// stable row ids as if they were addresses rewrites unrelated rows.
+    pub fn stores_row_addrs(&self, uses_stable_row_ids: bool) -> Result<bool> {
+        if !uses_stable_row_ids {
+            return Ok(true);
+        }
+        self.results_are_row_addrs()
     }
 
     /// The prefix of [`Self::fields`] this index is keyed on, with the carried
@@ -642,21 +694,70 @@ mod tests {
         }
     }
 
+    fn json_details_over(target_type_url: &str) -> Vec<u8> {
+        JsonIndexDetailsTarget {
+            target_details: Some(prost_types::Any {
+                type_url: target_type_url.to_string(),
+                value: Vec::new(),
+            }),
+        }
+        .encode_to_vec()
+    }
+
     #[rstest]
-    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", true)]
-    #[case::bloom_filter("type.googleapis.com/lance.index.pb.BloomFilterIndexDetails", true)]
-    #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true)]
-    #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true)]
-    #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false)]
-    #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
-    fn test_results_are_row_addrs(#[case] type_url: &str, #[case] expected: bool) {
+    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", vec![], true)]
+    #[case::bloom_filter("type.googleapis.com/lance.index.pb.BloomFilterIndexDetails", vec![], true)]
+    #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", vec![], true)]
+    #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", vec![], true)]
+    #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", vec![], false)]
+    #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", vec![], false)]
+    #[case::rtree("type.googleapis.com/lance.index.pb.RTreeIndexDetails", vec![], false)]
+    #[case::json_over_zone_map(
+        "type.googleapis.com/lance.index.pb.JsonIndexDetails",
+        json_details_over("type.googleapis.com/lance.table.ZoneMapIndexDetails"),
+        true
+    )]
+    #[case::json_over_btree(
+        "type.googleapis.com/lance.index.pb.JsonIndexDetails",
+        json_details_over("type.googleapis.com/lance.table.BTreeIndexDetails"),
+        false
+    )]
+    fn test_results_are_row_addrs(
+        #[case] type_url: &str,
+        #[case] value: Vec<u8>,
+        #[case] expected: bool,
+    ) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
         metadata.index_details = Some(Arc::new(prost_types::Any {
             type_url: type_url.to_string(),
-            value: Vec::new(),
+            value,
         }));
 
-        assert_eq!(metadata.results_are_row_addrs(), expected);
+        assert_eq!(metadata.results_are_row_addrs().unwrap(), expected);
+        assert!(metadata.stores_row_addrs(false).unwrap());
+        assert_eq!(metadata.stores_row_addrs(true).unwrap(), expected);
+    }
+
+    /// The domain decides whether stored identifiers get rewritten, so JSON details
+    /// that establish no target are refused instead of read as "stable row ids".
+    #[rstest]
+    #[case::undecodable(vec![0xff], "do not decode")]
+    #[case::no_target(vec![], "without target_details")]
+    fn test_results_are_row_addrs_rejects_incomplete_json_details(
+        #[case] value: Vec<u8>,
+        #[case] expected_message: &str,
+    ) {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.index.pb.JsonIndexDetails".to_string(),
+            value,
+        }));
+
+        let error = metadata.results_are_row_addrs().unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(error.to_string().contains(expected_message), "{error}");
+        assert!(metadata.stores_row_addrs(true).is_err());
+        assert!(metadata.stores_row_addrs(false).unwrap());
     }
 
     #[rstest]

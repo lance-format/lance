@@ -56,9 +56,9 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
 /// The table uses stable row ids and carries a fragment reuse index.
 ///
-/// Reserved ahead of its implementation. This build treats the bit as unknown
-/// (see `supported_flags_when`), so a build that knows the flag but not the
-/// handling behind it cannot open such a table.
+/// Set by `build_manifest` whenever both hold, and lifted when either stops
+/// holding. Supported since index loading honors the identifier domain; see
+/// `supported_flags_when`.
 pub const FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS: u64 = 1 << 9;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 10;
@@ -91,12 +91,12 @@ pub fn apply_feature_flags(
     disable_transaction_file: bool,
 ) -> Result<()> {
     // Carried across the reset: a `Manifest` only points at its index section,
-    // so whether any index declares covering columns is not visible here. `build_manifest` decides it from the index list it is
-    // committing and sets the bit after calling this; without the carry the
-    // second call, from `write_manifest_file`, would clear that decision
-    // immediately before the write.
-    let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
-        & FLAG_COVERED_INDEX_METADATA;
+    // so what its indices declare is not visible here. `build_manifest` decides
+    // these from the index list it is committing and sets the bits after calling
+    // this; without the carry the second call, from `write_manifest_file`, would
+    // clear that decision immediately before the write.
+    let index_derived_flags = (manifest.reader_feature_flags | manifest.writer_feature_flags)
+        & (FLAG_COVERED_INDEX_METADATA | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS);
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
 
     // Reset flags
@@ -157,8 +157,8 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
 
-    manifest.reader_feature_flags |= covered_index_metadata;
-    manifest.writer_feature_flags |= covered_index_metadata;
+    manifest.reader_feature_flags |= index_derived_flags;
+    manifest.writer_feature_flags |= index_derived_flags;
     manifest.reader_feature_flags |= sticky_paired_flags;
     manifest.writer_feature_flags |= sticky_paired_flags;
 
@@ -198,22 +198,28 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 }
 
 /// The feature-flag bits this build understands, given whether overlay support
-/// is enabled. Split out from [`supported_flags`] so the policy is testable
-/// without toggling the build profile or environment.
-fn supported_flags_when(overlay_enabled: bool) -> u64 {
+/// is enabled and whether index loading honors the identifier domain of a
+/// fragment reuse index on a stable-row-id table. Split out from
+/// [`supported_flags`] so the policy is testable without toggling the build
+/// profile or environment, and so the compatibility test can show what a build
+/// without the domain-aware loading does with such a table.
+fn supported_flags_when(overlay_enabled: bool, frag_reuse_with_stable_row_ids: bool) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
         overlay_enabled,
     );
-    // Reserved, not implemented: see the flag's doc comment.
-    mark_supported(&mut supported, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, false);
+    mark_supported(
+        &mut supported,
+        FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+        frag_reuse_with_stable_row_ids,
+    );
     supported
 }
 
 fn supported_flags() -> u64 {
-    supported_flags_when(data_overlay_files_enabled())
+    supported_flags_when(data_overlay_files_enabled(), true)
 }
 
 pub fn can_read_dataset(reader_flags: u64) -> bool {
@@ -311,18 +317,26 @@ mod tests {
     use super::*;
     use crate::format::BasePath;
 
-    /// Reserved ahead of its implementation: refused for reading and writing
-    /// until the handling lands, so a build from the gap cannot open the table.
+    /// A build without domain-aware index loading must refuse the table for
+    /// reading and writing, or it would remap stable row ids as if they were
+    /// row addresses; this build accepts it.
     #[test]
-    fn test_frag_reuse_with_stable_row_ids_flag_is_reserved_not_supported() {
+    fn test_frag_reuse_with_stable_row_ids_flag_gating() {
         use crate::format::{DataStorageFormat, Manifest};
         use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
         use std::collections::HashMap;
         use std::sync::Arc;
 
-        assert!(!can_read_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS));
-        assert!(!can_write_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS));
+        let without_support = supported_flags_when(true, false);
+        assert_eq!(
+            without_support & FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+            0,
+            "a build without the implementation must not accept the flag"
+        );
+        assert_ne!(without_support & FLAG_STABLE_ROW_IDS, 0);
+        assert!(can_read_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS));
+        assert!(can_write_dataset(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS));
 
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -337,14 +351,13 @@ mod tests {
         );
         manifest.reader_feature_flags = FLAG_STABLE_ROW_IDS | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
         manifest.writer_feature_flags = FLAG_STABLE_ROW_IDS | FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
-        assert!(matches!(
-            ensure_can_read_manifest(&manifest).unwrap_err(),
-            Error::NotSupported { .. }
-        ));
-        assert!(matches!(
-            ensure_can_write_manifest(&manifest).unwrap_err(),
-            Error::NotSupported { .. }
-        ));
+        ensure_can_read_manifest(&manifest).unwrap();
+        ensure_can_write_manifest(&manifest).unwrap();
+        assert_ne!(
+            manifest.reader_feature_flags & !without_support,
+            0,
+            "the same manifest is refused without the implementation"
+        );
     }
 
     #[test]
@@ -375,12 +388,12 @@ mod tests {
     fn test_data_overlay_flag_release_gating() {
         // Release default (overlays disabled): the overlay flag is treated as
         // unknown so the dataset is refused, while other known flags still pass.
-        let supported = supported_flags_when(false);
+        let supported = supported_flags_when(false, true);
         assert_eq!(supported & FLAG_UNSTABLE_DATA_OVERLAY_FILES, 0);
         assert_eq!(FLAG_DELETION_FILES & !supported, 0);
         assert_ne!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
         // Enabled (debug or env opt-in): the overlay flag is understood.
-        let supported = supported_flags_when(true);
+        let supported = supported_flags_when(true, true);
         assert_eq!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
     }
 

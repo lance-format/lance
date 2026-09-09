@@ -123,6 +123,10 @@ impl ScalarIndex for JsonIndex {
             .await
     }
 
+    fn results_are_row_addresses(&self) -> bool {
+        self.target_index.results_are_row_addresses()
+    }
+
     fn can_remap(&self) -> bool {
         self.target_index.can_remap()
     }

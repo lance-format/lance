@@ -265,7 +265,7 @@ impl<'a> CreateIndexBuilder<'a> {
         let indices = load_all_indices(self.dataset).await?;
         let fri = self
             .dataset
-            .open_frag_reuse_index(&NoOpMetricsCollector)
+            .frag_reuse_index_for_row_id_entries(&NoOpMetricsCollector)
             .await?;
         let index_name = if let Some(name) = self.name.take() {
             name
