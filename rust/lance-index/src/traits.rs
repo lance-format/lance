@@ -188,6 +188,8 @@ impl Display for FtsPrewarmDiagnostics {
 pub struct FtsPrewarmSegmentStatus {
     pub segment_id: String,
     pub scalar_index_container_resident: bool,
+    /// Whether the cached container shares the opened segment's prewarm state,
+    /// including when its storage readers have been rebound to another request.
     pub scalar_index_container_matches_prewarmed: bool,
 }
 
@@ -204,7 +206,7 @@ impl Display for FtsPrewarmSegmentStatus {
             missing.push("resident scalar index container");
         }
         if !self.scalar_index_container_matches_prewarmed {
-            missing.push("stable scalar index container identity");
+            missing.push("shared scalar index prewarm state");
         }
         write!(
             f,
