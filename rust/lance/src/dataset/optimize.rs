@@ -962,10 +962,7 @@ pub async fn compact_files_with_planner(
         && crate::index::load_all_indices(dataset)
             .await?
             .iter()
-            .any(|index| {
-                index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME
-                    && index.index_version != 0
-            })
+            .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
     {
         return Err(Error::not_supported(
             "Compaction of FRI index_version 1 requires an upgraded writer",

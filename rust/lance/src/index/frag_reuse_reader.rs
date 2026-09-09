@@ -28,49 +28,60 @@ fn check_reader_path() -> Result<()> {
     Ok(())
 }
 
-/// Plan version-1 histories separately from the unchanged legacy index path.
 pub(super) async fn load_indices(
     dataset: &Dataset,
     fri: &IndexMetadata,
     indices: &[IndexMetadata],
 ) -> Result<Arc<Vec<IndexMetadata>>> {
     let mapping = FragmentReuseIndex::open(dataset, fri).await?;
-    let mut supported = Vec::with_capacity(indices.len());
-    for index in indices {
+    let mut groups: HashMap<&str, Vec<(usize, &IndexMetadata)>> = HashMap::new();
+    let mut result = vec![None; indices.len()];
+    for (position, index) in indices.iter().enumerate() {
         if !super::index_is_usable(index) {
             continue;
         }
-        if index.name != lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME
-            && mapping.may_need_translation(index.fragment_bitmap.as_ref())
-        {
-            // The consumer integration is a separate layer. Until then,
-            // affected segments must scan even when coverage is derivable.
-            continue;
-        }
-        supported.push(index.clone());
-    }
-    let mut indices = supported;
-    let mut groups: HashMap<String, Vec<(usize, RoaringBitmap)>> = HashMap::new();
-    for (position, index) in indices.iter().enumerate() {
-        if index.name != lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME
-            && let Some(bitmap) = &index.fragment_bitmap
-        {
+        if index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME {
+            result[position] = Some(index.clone());
+        } else {
             groups
-                .entry(index.name.clone())
+                .entry(&index.name)
                 .or_default()
-                .push((position, bitmap.clone()));
+                .push((position, index));
         }
     }
     for members in groups.into_values() {
-        let (positions, provenance): (Vec<_>, Vec<_>) = members.into_iter().unzip();
-        for (position, coverage) in positions
+        let mut supported = Vec::with_capacity(members.len());
+        for (position, index) in members {
+            if mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
+                // Async consumers are installed in the next PR. Until then,
+                // these segments cannot contribute to destination coverage.
+                continue;
+            }
+            supported.push((position, index));
+        }
+        // Only usable segments may establish coverage. A destination needs all
+        // contributing sources; every retained contributing segment must be queried.
+        let provenance: Vec<_> = supported
+            .iter()
+            .map(|(_, index)| {
+                index.fragment_bitmap.clone().ok_or_else(|| {
+                    Error::internal(format!(
+                        "query segment {} has no fragment coverage",
+                        index.uuid
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?;
+        for ((position, index), coverage) in supported
             .into_iter()
             .zip(mapping.segment_coverage(&provenance))
         {
-            indices[position].fragment_bitmap = Some(coverage);
+            let mut index = index.clone();
+            index.fragment_bitmap = Some(coverage);
+            result[position] = Some(index);
         }
     }
-    Ok(Arc::new(indices))
+    Ok(Arc::new(result.into_iter().flatten().collect()))
 }
 
 /// A validated FRI graph whose mapping payloads are opened only when needed.
@@ -86,6 +97,12 @@ impl FragmentReuseIndex {
         #[cfg(test)]
         check_reader_path()?;
         let ledger = cache::open_ledger(dataset, index).await?;
+        if ledger.has_unsupported_transitions() {
+            log::debug!(
+                "FRI {} has unsupported mappings; only paths reaching live fragments can provide query coverage",
+                index.uuid
+            );
+        }
         let mut readers = Vec::with_capacity(ledger.transitions().len());
         for transition in ledger.transitions() {
             readers.push(cache::open_mapping(dataset, transition).await?);
@@ -99,12 +116,15 @@ impl FragmentReuseIndex {
 
     /// Whether segment metadata could require translation. V1 may have projected
     /// coverage to destinations without changing addresses stored in the index.
-    /// Only metadata disjoint from the whole lineage proves independence.
+    /// Identity requires live-only coverage disjoint from supported lineage.
+    /// Dead fragments may belong to an omitted unknown mapping; those must not
+    /// get an identity remapper merely because they are absent from the graph.
     pub fn may_need_translation(&self, provenance: Option<&RoaringBitmap>) -> bool {
         provenance.is_none_or(|bitmap| {
-            bitmap
-                .iter()
-                .any(|fragment| self.ledger.contains_fragment(fragment))
+            !bitmap.is_subset(self.live_fragments.as_ref())
+                || bitmap
+                    .iter()
+                    .any(|fragment| self.ledger.contains_fragment(fragment))
         })
     }
 
@@ -556,6 +576,8 @@ mod tests {
     #[case::cleanup("cleanup")]
     #[case::shallow_clone("shallow")]
     #[case::deep_clone("deep")]
+    #[case::restore_legacy("restore_legacy")]
+    #[case::restore_tagged("restore_tagged")]
     #[tokio::test]
     async fn unsupported_maintenance_preserves_snapshot(#[case] operation: &str) {
         let mut dataset = fixture().await;
@@ -596,6 +618,14 @@ mod tests {
                 .shallow_clone("memory://fri-shallow", version, None)
                 .await
                 .unwrap_err(),
+            "restore_legacy" => dataset
+                .checkout_version(1)
+                .await
+                .unwrap()
+                .restore()
+                .await
+                .unwrap_err(),
+            "restore_tagged" => dataset.restore().await.unwrap_err(),
             "deep" => dataset
                 .deep_clone("memory://fri-deep", version, None)
                 .await
@@ -614,6 +644,67 @@ mod tests {
             Some(&fri)
         );
         assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn manifest_publication_rejects_tagged_history_without_flags() {
+        let mut dataset = fixture().await;
+        let (transition, destinations) = prepare(&dataset).await;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        install(&mut dataset, content, destinations, false).await;
+        let indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        let mut manifest = dataset.manifest.as_ref().clone();
+        let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.reader_feature_flags &= !flag;
+        manifest.writer_feature_flags &= !flag;
+        let error = crate::dataset::write_manifest_file(
+            &dataset.object_store,
+            dataset.commit_handler.as_ref(),
+            &dataset.base,
+            &mut manifest,
+            Some(indices),
+            &Default::default(),
+            dataset.manifest_location.naming_scheme,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                lance_table::io::commit::CommitError::OtherError(Error::CorruptFile { .. })
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("tagged FRI metadata requires both"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clone_without_fri_flag_does_not_read_index_metadata() {
+        let dataset = fixture().await;
+        let mut location = dataset.manifest_location.clone();
+        location.path = dataset.base.child("missing.manifest");
+        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
+            &dataset.object_store,
+            &location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -988,6 +1079,7 @@ mod tests {
         let fri = install(&mut dataset, field(2, &raw), destinations, external).await;
         let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
         assert!(mapping.ledger.has_unsupported_transitions());
+        assert!(mapping.may_need_translation(Some(&RoaringBitmap::from_iter([0, 1]))));
         assert!(mapping.ledger.transitions().is_empty());
 
         let mut scan = dataset.scan();

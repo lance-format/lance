@@ -12,12 +12,9 @@ use lance_core::Result;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::fragment_reuse::{MappingReader, OrderedCompactionMapping};
-use lance_index::frag_reuse::stable_partition::{
-    FragmentLayout, MAPPING_FILE, StablePartitionMapping,
-};
+use lance_index::frag_reuse::stable_partition::{MAPPING_FILE, StablePartitionMapping};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
-use lance_table::format::pb::fragment_reuse_index_details::FragmentDigest;
 use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping, Transition};
 use uuid::Uuid;
 
@@ -124,6 +121,7 @@ impl CachedMapping {
         row_ids: &[u64],
     ) -> Result<Vec<Option<u64>>> {
         let result = self.reader.remap_row_ids(row_ids).await;
+        // TODO: Evaluate cache size accuracy versus latency impact.
         if self.grows_on_open {
             // Counts are loaded lazily. Refresh the cache's weight even when a
             // subsequent label read fails; invalid input alone does not grow it.
@@ -206,19 +204,10 @@ pub(super) async fn open_mapping(
                             MAPPING_FILE.to_string(),
                             reference.map_size_bytes,
                         )]));
-                    let layout = |fragments: &[FragmentDigest]| {
-                        fragments
-                            .iter()
-                            .map(|fragment| FragmentLayout {
-                                id: fragment.id as u32,
-                                physical_rows: fragment.physical_rows,
-                            })
-                            .collect()
-                    };
                     Arc::new(StablePartitionMapping::try_new(
                         Arc::new(store),
-                        layout(transition.sources()),
-                        layout(transition.destinations()),
+                        transition.sources().to_vec(),
+                        transition.destinations().to_vec(),
                     )?)
                 }
             };

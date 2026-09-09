@@ -3320,19 +3320,12 @@ impl Dataset {
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
         ensure_can_write_manifest(&src_ds.manifest)?;
-        let indices = read_manifest_indexes(
+        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
             &src_ds.object_store,
             &src_ds.manifest_location,
             &src_ds.manifest,
         )
         .await?;
-        if indices.iter().any(|index| {
-            index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME && index.index_version != 0
-        }) {
-            return Err(Error::not_supported(
-                "Cloning tagged FRI requires row-map reference relocation. Please upgrade to a version supporting FRI clone",
-            ));
-        }
         let src_paths = src_ds.collect_paths().await?;
 
         // Prepare target object store and base path
@@ -4168,6 +4161,9 @@ pub(crate) async fn write_manifest_file(
     may_change_schema: bool,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     validate_paired_feature_flags(manifest)?;
+    if let Some(indices) = &indices {
+        lance_table::system_index::frag_reuse::metadata::validate_flags(manifest, indices)?;
+    }
     // Every manifest write funnels through here, including restore and clone,
     // which rebuild a manifest from a stored one rather than from an Arrow
     // schema, so this is where the invariant holds for a schema that never

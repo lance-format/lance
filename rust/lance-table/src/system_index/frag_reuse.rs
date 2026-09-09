@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod ledger;
+pub mod metadata;
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 
