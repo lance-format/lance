@@ -2642,10 +2642,17 @@ mod tests {
         row_ids: Vec<u64>,
     }
 
+    #[derive(Clone, Copy, Debug, DeepSizeOf)]
+    enum PreparedIndexKind {
+        Flat,
+        Product,
+        Hnsw,
+    }
+
     #[derive(Debug, DeepSizeOf)]
     struct PreparedThreadCapturingIndex {
         metric: DistanceType,
-        sub_index: (SubIndexType, QuantizationType),
+        kind: PreparedIndexKind,
         prepared_partitions: Arc<Mutex<Vec<usize>>>,
         searched_partitions: Arc<Mutex<Vec<usize>>>,
         search_threads: Arc<Mutex<Vec<String>>>,
@@ -3021,7 +3028,11 @@ mod tests {
         }
 
         fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
-            self.sub_index
+            match self.kind {
+                PreparedIndexKind::Flat => (SubIndexType::Flat, QuantizationType::Flat),
+                PreparedIndexKind::Product => (SubIndexType::Flat, QuantizationType::Product),
+                PreparedIndexKind::Hnsw => (SubIndexType::Hnsw, QuantizationType::Flat),
+            }
         }
 
         fn metric_type(&self) -> DistanceType {
@@ -3198,7 +3209,7 @@ mod tests {
         let search_threads = Arc::new(Mutex::new(Vec::new()));
         let index: Arc<dyn VectorIndex> = Arc::new(PreparedThreadCapturingIndex {
             metric: DistanceType::L2,
-            sub_index: (SubIndexType::Flat, QuantizationType::Flat),
+            kind: PreparedIndexKind::Flat,
             prepared_partitions: prepared_partitions.clone(),
             searched_partitions: searched_partitions.clone(),
             search_threads: search_threads.clone(),
@@ -3265,10 +3276,10 @@ mod tests {
                 "hamming" => DistanceType::Hamming,
                 _ => DistanceType::L2,
             },
-            sub_index: match scenario {
-                "product" => (SubIndexType::Flat, QuantizationType::Product),
-                "hnsw" => (SubIndexType::Hnsw, QuantizationType::Flat),
-                _ => (SubIndexType::Flat, QuantizationType::Flat),
+            kind: match scenario {
+                "product" => PreparedIndexKind::Product,
+                "hnsw" => PreparedIndexKind::Hnsw,
+                _ => PreparedIndexKind::Flat,
             },
             prepared_partitions: Arc::default(),
             searched_partitions: Arc::default(),
