@@ -4,6 +4,7 @@
 use super::tests::{fixture, fixture_with_index, install, persist_fixture, prepare};
 use super::*;
 use crate::dataset::WriteParams;
+use crate::index::create::CreateIndexBuilder;
 use crate::index::frag_reuse_remapping::vector_supports_batch_remapping;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::session::index_caches::IndexMetadataKey;
@@ -28,6 +29,101 @@ use lance_table::system_index::frag_reuse::ledger::Mapping;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
+
+#[rstest::rstest]
+#[case::complete("complete")]
+#[case::missing_segment("missing")]
+#[case::unsupported_version("version")]
+#[case::unsupported_async_plugin("plugin")]
+#[tokio::test]
+async fn destination_coverage_requires_every_contributing_segment(#[case] scenario: &str) {
+    let mut dataset = fixture().await;
+    let params = ScalarIndexParams::default();
+    let fragments: Vec<_> = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let mut segments = Vec::new();
+    for fragment in &fragments {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+                .name("i_idx".into())
+                .fragments(vec![*fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments("i_idx", "i", segments)
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let mut indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    let second = indices
+        .iter()
+        .position(|index| {
+            index.name == "i_idx"
+                && index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.contains(fragments[1]))
+        })
+        .unwrap();
+    match scenario {
+        "missing" => {
+            indices.remove(second);
+        }
+        "version" => {
+            indices[second].index_version = i32::MAX;
+        }
+        "plugin" => {
+            // A segment requiring an unsupported consumer must not be opened or
+            // counted toward the logical index's destination coverage.
+            indices[second].index_details = Some(Arc::new(
+                prost_types::Any::from_msg(&lance_index::pb::FmIndexDetails::default()).unwrap(),
+            ));
+        }
+        "complete" => {}
+        _ => unreachable!(),
+    }
+    persist_fixture(&mut dataset, indices).await;
+    let complete = scenario == "complete";
+    let usable = crate::index::scalar_logical::load_named_scalar_segments(&dataset, "i", "i_idx")
+        .await
+        .unwrap();
+    assert_eq!(usable.len(), if complete { 2 } else { 0 });
+    for segment in &usable {
+        assert_eq!(
+            segment.fragment_bitmap.as_ref().unwrap(),
+            dataset.fragment_bitmap.as_ref()
+        );
+    }
+    for value in 0..8 {
+        let mut scan = dataset.scan();
+        scan.filter(&format!("i = {value}")).unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("ScalarIndexQuery"), complete, "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            1,
+            "missing or duplicated row {value}: {plan}"
+        );
+        assert_eq!(batch["i"].as_primitive::<Int32Type>().value(0), value);
+    }
+}
 
 #[tokio::test]
 async fn projected_coverage_does_not_skip_address_translation() {
