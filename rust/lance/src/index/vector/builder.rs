@@ -1919,11 +1919,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(batches)
     }
 
-    // helper to load row ids and vectors for a partition
-    async fn load_partition_raw_vectors(
-        &self,
-        part_idx: usize,
-    ) -> Result<Option<(UInt64Array, FixedSizeListArray)>> {
+    /// The raw vectors of every logical row with an entry in a partition,
+    /// flattened to one row id per vector, plus how many entries of each row the
+    /// partition held (a multivector row's vectors can be spread over several
+    /// partitions, and the dataset returns all of them).
+    async fn load_partition_raw_vectors(&self, part_idx: usize) -> Result<Option<PartitionRows>> {
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
                 "dataset not set before split partition",
@@ -1933,6 +1933,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut row_ids = self.partition_row_ids(part_idx).await?;
         if !row_ids.is_sorted() {
             row_ids.sort();
+        }
+        let mut entries_per_row: HashMap<u64, usize> = HashMap::new();
+        for &row_id in &row_ids {
+            *entries_per_row.entry(row_id).or_default() += 1;
         }
         // dedup is needed if it's multivector
         row_ids.dedup();
@@ -1955,7 +1959,35 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             )))?
             .as_fixed_size_list()
             .clone();
-        Ok(Some((row_ids, vectors)))
+        Ok(Some(PartitionRows {
+            row_ids,
+            vectors,
+            entries_per_row,
+        }))
+    }
+
+    /// This partition's centroid followed by its `REASSIGN_RANGE` nearest
+    /// neighbors in the old model, for [`vectors_held_by_partition`].
+    fn provenance_centroids(&self, ivf: &IvfModel, part_idx: usize) -> Result<FixedSizeListArray> {
+        let c0 = ivf
+            .centroid(part_idx)
+            .ok_or(Error::invalid_input("original centroid not found"))?;
+        let (neighbor_ids, _) = select_reassign_candidates_impl(
+            self.distance_type,
+            ivf,
+            part_idx,
+            &c0,
+            &HashSet::new(),
+        )?;
+        let ids = UInt32Array::from_iter_values(
+            std::iter::once(part_idx as u32).chain(neighbor_ids.values().iter().copied()),
+        );
+        let centroids = ivf
+            .centroids_array()
+            .ok_or_else(|| Error::invalid_input("IVF model has no centroids"))?;
+        Ok(arrow::compute::take(centroids, &ids, None)?
+            .as_fixed_size_list()
+            .clone())
     }
 
     /// Rows per partition that split and join thresholds are derived from: the
@@ -2612,7 +2644,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let mut assigned: Vec<Vec<RecordBatch>> = vec![Vec::new(); kept_partitions.len()];
         for &part_idx in partitions {
-            let Some((row_ids, vectors)) = self.load_partition_raw_vectors(part_idx).await? else {
+            let Some(PartitionRows {
+                row_ids,
+                vectors,
+                entries_per_row,
+            }) = self.load_partition_raw_vectors(part_idx).await?
+            else {
                 continue;
             };
             assert_eq!(row_ids.len(), vectors.len());
@@ -2622,9 +2659,43 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let (reassign_part_ids, reassign_part_centroids) =
                 self.select_reassign_candidates(ivf, part_idx, &c0, &removed)?;
 
+            // Only the vectors this partition held move; the rest of a
+            // multivector row stays where it is, so entries are conserved and
+            // the room and byte accounting see the same units as the planner.
+            let mut provenance_centroids = None;
+            let mut held = Vec::with_capacity(row_ids.len());
+            let mut start = 0;
+            while start < row_ids.len() {
+                let row_id = row_ids.value(start);
+                let mut end = start + 1;
+                while end < row_ids.len() && row_ids.value(end) == row_id {
+                    end += 1;
+                }
+                let count = entries_per_row.get(&row_id).copied().unwrap_or(0);
+                if end - start <= count {
+                    held.extend(start..end);
+                } else {
+                    let centroids = match &provenance_centroids {
+                        Some(centroids) => centroids,
+                        None => {
+                            provenance_centroids.insert(self.provenance_centroids(ivf, part_idx)?)
+                        }
+                    };
+                    held.extend(vectors_held_by_partition::<T>(
+                        self.distance_type,
+                        &vectors,
+                        start..end,
+                        centroids,
+                        count,
+                    )?);
+                }
+                start = end;
+            }
+
             let mut assign_ops = vec![Vec::new(); kept_partitions.len()];
             let mut overflowed = 0usize;
-            for (i, &row_id) in row_ids.values().iter().enumerate() {
+            for i in held {
+                let row_id = row_ids.value(i);
                 let (target, had_room) = choose_join_destination(
                     self.distance_type,
                     vectors.value(i).as_primitive::<T>(),
@@ -2970,6 +3041,39 @@ fn nearest_surviving_neighbor(
     Ok(nearest)
 }
 
+/// Which `count` of a multivector row's `vectors[range]` a partition held.
+/// The index placed every vector with its nearest centroid, so they are the
+/// ones for which this centroid (first in `provenance_centroids`) beats the
+/// nearest neighbors (the rest) by the largest margin.
+fn vectors_held_by_partition<T: ArrowPrimitiveType>(
+    distance_type: DistanceType,
+    vectors: &FixedSizeListArray,
+    range: std::ops::Range<usize>,
+    provenance_centroids: &FixedSizeListArray,
+    count: usize,
+) -> Result<Vec<usize>>
+where
+    T::Native: Dot + L2 + Normalize,
+{
+    let mut margins = Vec::with_capacity(range.len());
+    for i in range {
+        let dists = distance_type.arrow_batch_func()(
+            vectors.value(i).as_primitive::<T>(),
+            provenance_centroids,
+        )?;
+        let own = dists.value(0);
+        let nearest_neighbor = dists.values()[1..]
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        margins.push((own - nearest_neighbor, i));
+    }
+    margins.sort_by(|(a, i), (b, j)| a.total_cmp(b).then(i.cmp(j)));
+    let mut held: Vec<usize> = margins.into_iter().take(count).map(|(_, i)| i).collect();
+    held.sort_unstable();
+    Ok(held)
+}
+
 /// The candidate nearest to `vector` among those `accept` allows.
 fn nearest_candidate<T: ArrowPrimitiveType>(
     distance_type: DistanceType,
@@ -3080,6 +3184,14 @@ fn select_reassign_candidates_impl(
         reassign_candidate_ids,
         reassign_candidate_centroids.as_fixed_size_list().clone(),
     ))
+}
+
+/// The rows of one partition, flattened to one row id per vector, with the
+/// number of entries the partition held for each row.
+struct PartitionRows {
+    row_ids: UInt64Array,
+    vectors: FixedSizeListArray,
+    entries_per_row: HashMap<u64, usize>,
 }
 
 /// What one optimize pass does to the partitions, from the sizes it saw.
@@ -3950,7 +4062,9 @@ mod tests {
                 .unwrap();
         let elapsed = started.elapsed();
         assert_eq!(joins.len(), NUM_PARTITIONS - 1);
-        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+        // Recomputing every distance at each step took about 8 s here; the
+        // cached orderings take well under a second even in a loaded debug run.
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
     }
 
     /// Send `sizes[partition]` rows at `value` of each joined partition to the

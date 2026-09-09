@@ -2566,11 +2566,15 @@ mod tests {
         (batch, schema)
     }
 
+    /// Rows of `vectors_per_row` vectors around their cluster's centroid. The
+    /// `straddling_row`, if any, spreads its vectors over the centroids instead,
+    /// one per vector, so it belongs to several partitions at once.
     fn generate_clustered_multivec_batch(
         cluster_sizes: &[usize],
         centroids: &[(f32, f32)],
         vectors_per_row: usize,
         start_id: u64,
+        straddling_row: Option<u64>,
     ) -> (RecordBatch, SchemaRef) {
         assert_eq!(
             cluster_sizes.len(),
@@ -2585,9 +2589,14 @@ mod tests {
         let mut current_id = start_id;
         for (&rows, &(x, y)) in cluster_sizes.iter().zip(centroids.iter()) {
             for _ in 0..rows {
-                ids.push(current_id);
+                let row_id = current_id;
+                ids.push(row_id);
                 current_id += 1;
-                for _ in 0..vectors_per_row {
+                for vector_idx in 0..vectors_per_row {
+                    let (x, y) = match straddling_row {
+                        Some(id) if id == row_id => centroids[vector_idx % centroids.len()],
+                        _ => (x, y),
+                    };
                     for dim in 0..DIM {
                         let base = match dim {
                             0 => x,
@@ -6821,9 +6830,17 @@ mod tests {
         // distinct directions avoid the collinear assignment in the old fixture.
         let centroids = [(-1.0, 0.0), (0.0, 1.0), (1.0, 0.0)];
         let total_rows = cluster_sizes.iter().sum::<usize>();
+        // Row 1600, the one retained below, has one vector in each partition.
+        // Joining the partition that holds one of them must reassign only that
+        // vector, not re-add the two the other partitions keep.
         let mut dataset = {
-            let (batch, schema) =
-                generate_clustered_multivec_batch(&cluster_sizes, &centroids, MULTIVEC_PER_ROW, 0);
+            let (batch, schema) = generate_clustered_multivec_batch(
+                &cluster_sizes,
+                &centroids,
+                MULTIVEC_PER_ROW,
+                0,
+                Some(1600),
+            );
             let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
             Dataset::write(
                 batches,
@@ -6895,6 +6912,7 @@ mod tests {
             &centroids[2..],
             MULTIVEC_PER_ROW,
             total_rows as u64,
+            None,
         );
         dataset
             .append(
