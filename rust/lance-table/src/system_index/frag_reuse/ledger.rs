@@ -254,6 +254,12 @@ impl FragReuseLedger {
         self.consumers.get(&fragment_id).copied()
     }
 
+    /// Find the transition producing a fragment in expected constant time.
+    /// The returned position indexes [`Self::transitions`]. Original fragments return `None`.
+    pub fn producer(&self, fragment_id: u32) -> Option<usize> {
+        self.producers.get(&fragment_id).copied()
+    }
+
     /// Whether a fragment occurs anywhere in the retained lineage.
     /// Destination coverage can still describe an index storing source addresses.
     pub fn contains_fragment(&self, fragment_id: u32) -> bool {
@@ -636,9 +642,11 @@ mod tests {
             }
         }
         assert_eq!(ledger.consumer(u32::MAX), None);
+        assert_eq!(ledger.producer(u32::MAX), None);
         assert!(!ledger.contains_fragment(u32::MAX));
-        for transition in ledger.transitions() {
+        for (position, transition) in ledger.transitions().iter().enumerate() {
             for destination in transition.destinations() {
+                assert_eq!(ledger.producer(destination.id as u32), Some(position));
                 assert!(ledger.contains_fragment(destination.id as u32));
             }
         }
