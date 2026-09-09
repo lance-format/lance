@@ -22,7 +22,6 @@ use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use lance_index_core::remapping::RowIdRemapping;
 use lance_select::RowAddrTreeMap;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -93,7 +92,7 @@ pub struct BloomFilterIndex {
     probability: f64,
     // Exact set of null row addresses; None for older indices without this bitmap.
     null_rows: Option<RowAddrTreeMap>,
-    frag_reuse_index: Option<RowIdRemapping>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 }
 
 impl DeepSizeOf for BloomFilterIndex {
@@ -105,7 +104,7 @@ impl DeepSizeOf for BloomFilterIndex {
 impl BloomFilterIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<RowIdRemapping>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         Self::load_with_max_array_length(store, fri, index_cache, MAX_BLOOMFILTER_ARRAY_LENGTH)
@@ -114,7 +113,7 @@ impl BloomFilterIndex {
 
     async fn load_with_max_array_length(
         store: Arc<dyn IndexStore>,
-        fri: Option<RowIdRemapping>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         _index_cache: &LanceCache,
         max_array_length: usize,
     ) -> Result<Arc<Self>> {
@@ -496,12 +495,8 @@ impl ScalarIndex for BloomFilterIndex {
         let Some(remapper) = &self.frag_reuse_index else {
             return Ok(result);
         };
-        let selected = remapper
-            .remap_row_addrs_tree_map(result.row_addrs().selected_rows())
-            .await?;
-        let nulls = remapper
-            .remap_row_addrs_tree_map(result.row_addrs().null_rows())
-            .await?;
+        let selected = remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows());
+        let nulls = remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows());
 
         Ok(match result {
             SearchResult::Exact(_) => SearchResult::exact(selected).with_nulls(nulls),
@@ -649,11 +644,6 @@ pub async fn merge_bloomfilter_indices(
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut has_missing_null_bitmap = false;
     for (source, fragment_filter) in source_indices {
-        let remapper = source
-            .frag_reuse_index
-            .as_ref()
-            .map(RowIdRemapping::synchronous)
-            .transpose()?;
         if fragment_filter.is_empty() {
             continue;
         }
@@ -670,7 +660,7 @@ pub async fn merge_bloomfilter_indices(
             )));
         }
         let source_zones = source.zones.iter().flat_map(|block| {
-            remapper.map_or_else(
+            source.frag_reuse_index.as_deref().map_or_else(
                 || vec![block.clone()],
                 |remapper| remap_zone(block, remapper),
             )
@@ -681,7 +671,7 @@ pub async fn merge_bloomfilter_indices(
         }));
         match &source.null_rows {
             Some(null_rows) => {
-                let mut filtered = remapper.map_or_else(
+                let mut filtered = source.frag_reuse_index.as_deref().map_or_else(
                     || null_rows.clone(),
                     |remapper| remapper.remap_row_addrs_tree_map(null_rows),
                 );
@@ -1464,25 +1454,6 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(BloomFilterIndex::load(
-            index_store,
-            frag_reuse_index.map(RowIdRemapping::InMemory),
-            cache,
-        )
-        .await? as Arc<dyn ScalarIndex>)
-    }
-
-    fn supports_batch_row_id_remapping(&self) -> bool {
-        true
-    }
-
-    async fn load_index_with_remapping(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
-        frag_reuse_index: Option<RowIdRemapping>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
             BloomFilterIndex::load(index_store, frag_reuse_index, cache).await?
                 as Arc<dyn ScalarIndex>,
@@ -1527,7 +1498,6 @@ impl TrainingRequest for BloomFilterIndexTrainingRequest {
 mod tests {
     use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
     use crate::scalar::registry::VALUE_COLUMN_NAME;
-    use lance_index_core::remapping::RowIdRemapping;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -2919,7 +2889,7 @@ mod tests {
         )));
         let remapped_first = BloomFilterIndex::load(
             first_store,
-            Some(RowIdRemapping::InMemory(Arc::new(remapper))),
+            Some(Arc::new(remapper)),
             &LanceCache::no_cache(),
         )
         .await

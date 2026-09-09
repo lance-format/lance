@@ -1379,46 +1379,6 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_async_remap_preserves_transposed_codes() {
-        #[derive(Debug)]
-        struct Mapping(RowAddrRemap);
-        #[async_trait::async_trait]
-        impl lance_index_core::remapping::BatchRowIdRemapper for Mapping {
-            async fn remap_row_ids(&self, ids: &[u64]) -> Result<Vec<Option<u64>>> {
-                Ok(ids
-                    .iter()
-                    .map(|id| self.0.get(*id).unwrap_or(Some(*id)))
-                    .collect())
-            }
-        }
-        let storage = create_pq_storage().await;
-        let mapping = pq_remap_compact();
-        let expected = storage.remap(&mapping).unwrap();
-        let remapping =
-            lance_index_core::remapping::RowIdRemapping::External(Arc::new(Mapping(mapping)));
-        let row_id_idx = storage.batch.schema().index_of(ROW_ID).unwrap();
-        let (batch, remapper) = remapping
-            .remap_row_ids_preserving_layout(storage.batch.clone(), row_id_idx)
-            .await
-            .unwrap();
-        assert_eq!(
-            batch.column_by_name(PQ_CODE_COLUMN),
-            storage.batch.column_by_name(PQ_CODE_COLUMN)
-        );
-        let mut metadata = storage.metadata.clone();
-        metadata.transposed = true;
-        let actual = ProductQuantizationStorage::try_from_batch_with_remapper(
-            batch,
-            &metadata,
-            storage.distance_type,
-            Some(remapper),
-        )
-        .unwrap();
-        assert_eq!(actual.row_ids, expected.row_ids);
-        assert_eq!(actual.pq_code, expected.pq_code);
-    }
-
     #[rstest]
     #[case(pq_remap_compact())]
     #[case(pq_remap_explicit())]

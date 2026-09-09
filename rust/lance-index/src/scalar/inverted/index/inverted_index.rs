@@ -203,7 +203,7 @@ impl InvertedIndex {
 impl InvertedIndex {
     async fn load_legacy_index(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<RowIdRemapping>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         log::warn!("loading legacy FTS index");
@@ -236,7 +236,7 @@ impl InvertedIndex {
             let store = store.clone();
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;
-                let docs = DocSet::load_with_remapping(docs_reader, true, frag_reuse_index).await?;
+                let docs = DocSet::load(docs_reader, true, frag_reuse_index).await?;
                 Result::Ok(docs)
             }
         });
@@ -325,19 +325,6 @@ impl InvertedIndex {
     where
         Self: Sized,
     {
-        Self::load_with_remapping(
-            store,
-            frag_reuse_index.map(RowIdRemapping::InMemory),
-            index_cache,
-        )
-        .await
-    }
-
-    pub(crate) async fn load_with_remapping(
-        store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<RowIdRemapping>,
-        index_cache: &LanceCache,
-    ) -> Result<Arc<Self>> {
         // for new index format, there is a metadata file and multiple partitions,
         // each partition is a separate index containing tokens, inverted list and docs.
         // for old index format, there is no metadata file, and it's just like a single partition
@@ -387,7 +374,7 @@ impl InvertedIndex {
                     let token_set_format = format;
                     async move {
                         Result::Ok(Arc::new(
-                            InvertedPartition::load_with_remapping(
+                            InvertedPartition::load(
                                 store,
                                 id,
                                 frag_reuse_index_clone,

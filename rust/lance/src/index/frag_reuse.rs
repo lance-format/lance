@@ -5,10 +5,10 @@ use crate::Dataset;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::Error;
 use lance_index::frag_reuse::{
-    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_DETAILS_FILE_NAME,
-    FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
+    CompactFragReuseIndex, FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup,
+    FragReuseIndexDetails, FragReuseVersion,
 };
-use lance_index::scalar::{MetricsCollector, RowIdRemapping};
+use lance_index::scalar::MetricsCollector;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
@@ -18,65 +18,31 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-/// Resolve the FRI remapper shared by scalar and vector index loading.
-pub(super) async fn open_row_id_remapping(
+/// Keep legacy loading for independent segments while tagged consumers are not installed.
+/// This is a query boundary; maintenance still rejects tagged FRI in its existing entry point.
+pub(super) async fn open_legacy_query_remapper(
     dataset: &Dataset,
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
-) -> lance_core::Result<Option<(Uuid, RowIdRemapping)>> {
-    let indices = dataset.load_indices().await?;
-    let Some(fri) = indices
+) -> lance_core::Result<Option<Arc<CompactFragReuseIndex>>> {
+    let indices = super::load_all_indices(dataset).await?;
+    if let Some(fri) = indices
         .iter()
-        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
-    else {
+        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME && entry.index_version != 0)
+    {
+        let reader = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
+        let stored = indices
+            .iter()
+            .find(|entry| entry.uuid == index.uuid)
+            .ok_or_else(|| Error::not_supported("FRI requires committed segment metadata"))?;
+        if reader.may_need_translation(stored.fragment_bitmap.as_ref()) {
+            return Err(Error::not_supported(
+                "This index requires tagged FRI translation; upgrade to a client with index consumer support",
+            ));
+        }
         return Ok(None);
-    };
-    if fri.index_version == 0 {
-        return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
-            (
-                legacy.uuid,
-                RowIdRemapping::InMemory(Arc::new(CompactFragReuseIndexHandle(legacy))),
-            )
-        }));
     }
-    let mapping = super::frag_reuse_query::QueryFragReuseIndex::open(dataset, fri).await?;
-    // Resolve provenance here, before query coverage is rewritten. Callers may
-    // hold metadata returned by load_indices and cannot supply this distinction.
-    let stored = super::load_all_indices(dataset).await?;
-    let source = stored
-        .iter()
-        .find(|entry| entry.uuid == index.uuid)
-        .ok_or_else(|| {
-            Error::not_supported(format!(
-                "FRI remapping requires committed segment metadata for {}",
-                index.uuid
-            ))
-        })?;
-    if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
-        let identity =
-            CompactFragReuseIndex::try_new(fri.uuid, FragReuseIndexDetails { versions: vec![] })?;
-        return Ok(Some((
-            fri.uuid,
-            RowIdRemapping::InMemory(Arc::new(CompactFragReuseIndexHandle(Arc::new(identity)))),
-        )));
-    }
-    let coverage = indices
-        .iter()
-        .find(|entry| entry.uuid == index.uuid)
-        .and_then(|entry| entry.fragment_bitmap.clone())
-        .ok_or_else(|| {
-            Error::not_supported(format!(
-                "FRI query coverage is unavailable for segment {}",
-                index.uuid
-            ))
-        })?
-        & dataset.fragment_bitmap.as_ref();
-    Ok(Some((
-        fri.uuid,
-        RowIdRemapping::External(Arc::new(super::frag_reuse_query::QueryRowIdRemapper::new(
-            mapping, coverage,
-        ))),
-    )))
+    dataset.open_frag_reuse_index(metrics).await
 }
 
 /// Load fragment reuse index details from index metadata

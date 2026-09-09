@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use lance_index_core::remapping::RowIdRemapping;
 use std::{
     any::Any,
     collections::HashMap,
@@ -95,12 +94,11 @@ impl LabelListIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<RowIdRemapping>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let values_index =
-            BitmapIndex::load_with_remapping(store.clone(), frag_reuse_index.clone(), index_cache)
-                .await?;
+            BitmapIndex::load(store.clone(), frag_reuse_index.clone(), index_cache).await?;
         let list_nulls = read_list_nulls(store, frag_reuse_index).await?;
         Ok(Arc::new(Self::new(values_index, Arc::new(list_nulls))))
     }
@@ -443,7 +441,7 @@ fn unnest_chunks(
 
 async fn read_list_nulls(
     store: Arc<dyn IndexStore>,
-    frag_reuse_index: Option<RowIdRemapping>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 ) -> Result<RowAddrTreeMap> {
     let reader = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
     if let Some(buffer_idx_str) = reader.schema().metadata.get(LABEL_LIST_NULLS_METADATA_KEY) {
@@ -456,7 +454,7 @@ async fn read_list_nulls(
         let bytes = reader.read_global_buffer(buffer_idx).await?;
         let null_map = RowAddrTreeMap::deserialize_from(bytes.as_ref())?;
         return if let Some(frag_reuse_index) = frag_reuse_index {
-            frag_reuse_index.remap_row_addrs_tree_map(&null_map).await
+            Ok(frag_reuse_index.remap_row_addrs_tree_map(&null_map))
         } else {
             Ok(null_map)
         };
@@ -808,26 +806,10 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(LabelListIndex::load(
-            index_store,
-            frag_reuse_index.map(RowIdRemapping::InMemory),
-            cache,
+        Ok(
+            LabelListIndex::load(index_store, frag_reuse_index, cache).await?
+                as Arc<dyn ScalarIndex>,
         )
-        .await? as Arc<dyn ScalarIndex>)
-    }
-
-    fn supports_batch_row_id_remapping(&self) -> bool {
-        true
-    }
-
-    async fn load_index_with_remapping(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
-        remapping: Option<RowIdRemapping>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(LabelListIndex::load(index_store, remapping, cache).await?)
     }
 
     async fn get_from_cache(
