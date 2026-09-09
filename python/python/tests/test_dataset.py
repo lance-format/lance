@@ -6907,3 +6907,196 @@ def test_all_files(tmp_path):
     assert result.schema.field("size_bytes").type == pa.int64()
     assert result.num_rows >= 2  # at least manifest + data file
     assert all(s > 0 for s in result.column("size_bytes").to_pylist())
+
+
+# --- write_dataset(n_jobs=...) parallel in-memory writes (issue #1980) ---
+
+
+def _n_jobs_table(num_rows: int = 1000) -> pa.Table:
+    return pa.table(
+        {
+            "id": pa.array(range(num_rows), pa.int64()),
+            "val": pa.array([float(i) for i in range(num_rows)], pa.float32()),
+        }
+    )
+
+
+@pytest.mark.parametrize("n_jobs", [None, 1])
+@pytest.mark.parametrize("mode", ["create", "overwrite", "append"])
+def test_write_dataset_n_jobs_sequential_all_modes(tmp_path: Path, n_jobs, mode):
+    # n_jobs None/1 must behave exactly like the sequential path in every mode.
+    table = _n_jobs_table(1000)
+    uri = str(tmp_path / "ds")
+
+    lance.write_dataset(table, uri, mode=mode, n_jobs=n_jobs)
+
+    ds = lance.dataset(uri)
+    assert ds.count_rows() == table.num_rows
+    assert ds.schema == table.schema
+    assert ds.to_table().sort_by("id").to_pydict() == table.sort_by("id").to_pydict()
+
+
+@pytest.mark.parametrize("n_jobs", [2, 4])
+def test_write_dataset_n_jobs_parallel_correctness(tmp_path: Path, n_jobs):
+    table = _n_jobs_table(1000)
+    uri = str(tmp_path / "ds")
+
+    lance.write_dataset(table, uri, mode="overwrite", n_jobs=n_jobs)
+
+    ds = lance.dataset(uri)
+    assert ds.count_rows() == table.num_rows
+    assert ds.schema == table.schema
+    assert ds.to_table().sort_by("id").to_pydict() == table.sort_by("id").to_pydict()
+
+
+@pytest.mark.parametrize("mode", ["create", "append"])
+@pytest.mark.parametrize("n_jobs", [2, 4])
+def test_write_dataset_n_jobs_unsupported_mode_rejected(tmp_path: Path, n_jobs, mode):
+    # Parallel writes currently support only mode="overwrite"; create/append
+    # must raise clearly rather than silently degrade their semantics.
+    table = _n_jobs_table(10)
+    with pytest.raises(ValueError, match="only supports mode='overwrite'"):
+        lance.write_dataset(table, str(tmp_path / "ds"), mode=mode, n_jobs=n_jobs)
+
+
+def test_write_dataset_n_jobs_produces_multiple_fragments(tmp_path: Path):
+    table = _n_jobs_table(1000)
+    uri = str(tmp_path / "ds")
+
+    lance.write_dataset(table, uri, mode="overwrite", n_jobs=4)
+
+    ds = lance.dataset(uri)
+    # Parallel writes fan out into several fragments. The exact count is not a
+    # public guarantee, so only assert that more than one fragment was produced.
+    assert len(ds.get_fragments()) > 1
+    assert ds.count_rows() == 1000
+
+
+def test_write_dataset_n_jobs_one_matches_sequential(tmp_path: Path):
+    table = _n_jobs_table(1000)
+    seq_uri = str(tmp_path / "seq")
+    one_uri = str(tmp_path / "one")
+
+    lance.write_dataset(table, seq_uri, mode="create")
+    lance.write_dataset(table, one_uri, mode="create", n_jobs=1)
+
+    seq = lance.dataset(seq_uri)
+    one = lance.dataset(one_uri)
+    # n_jobs=1 must be identical to the sequential path, including fragment layout.
+    assert len(one.get_fragments()) == len(seq.get_fragments())
+    assert one.to_table().to_pydict() == seq.to_table().to_pydict()
+
+
+@pytest.mark.parametrize("bad", [0, -1, -5])
+def test_write_dataset_n_jobs_invalid_value(tmp_path: Path, bad):
+    table = _n_jobs_table(10)
+    with pytest.raises(ValueError, match="n_jobs must be >= 1"):
+        lance.write_dataset(table, str(tmp_path / "ds"), n_jobs=bad)
+
+
+@pytest.mark.parametrize("bad", [2.5, "2", True, False])
+def test_write_dataset_n_jobs_invalid_type(tmp_path: Path, bad):
+    table = _n_jobs_table(10)
+    with pytest.raises(TypeError, match="n_jobs must be an int or None"):
+        lance.write_dataset(table, str(tmp_path / "ds"), n_jobs=bad)
+
+
+def test_write_dataset_n_jobs_oversized_workers(tmp_path: Path):
+    table = _n_jobs_table(3)
+    uri = str(tmp_path / "ds")
+
+    # More workers requested than rows: must succeed and cap effective workers
+    # at the number of non-empty partitions (no empty fragments).
+    lance.write_dataset(table, uri, mode="overwrite", n_jobs=100)
+
+    ds = lance.dataset(uri)
+    assert ds.count_rows() == 3
+    assert 1 <= len(ds.get_fragments()) <= 3
+    assert ds.to_table().sort_by("id").to_pydict() == table.sort_by("id").to_pydict()
+
+
+@pytest.mark.parametrize("n_jobs", [2, 4])
+def test_write_dataset_n_jobs_empty_table(tmp_path: Path, n_jobs):
+    table = _n_jobs_table(0)
+    uri = str(tmp_path / "ds")
+
+    # An empty table cannot be partitioned; this must not create a zero-worker
+    # executor and must write a valid empty dataset.
+    lance.write_dataset(table, uri, mode="overwrite", n_jobs=n_jobs)
+
+    ds = lance.dataset(uri)
+    assert ds.count_rows() == 0
+    assert ds.schema == table.schema
+
+
+def test_write_dataset_n_jobs_null_values(tmp_path: Path):
+    num_rows = 100
+    table = pa.table(
+        {
+            "id": pa.array(range(num_rows), pa.int64()),
+            "maybe": pa.array([None] * num_rows, pa.int64()),
+        }
+    )
+    uri = str(tmp_path / "ds")
+
+    lance.write_dataset(table, uri, mode="overwrite", n_jobs=4)
+
+    ds = lance.dataset(uri)
+    assert ds.count_rows() == num_rows
+    assert ds.to_table().column("maybe").null_count == num_rows
+
+
+def test_write_dataset_n_jobs_unsupported_input_type(tmp_path: Path):
+    table = _n_jobs_table(10)
+
+    with pytest.raises(TypeError, match="only supported for in-memory pyarrow.Table"):
+        lance.write_dataset(table.to_reader(), str(tmp_path / "reader"), n_jobs=2)
+
+    with pytest.raises(TypeError, match="only supported for in-memory pyarrow.Table"):
+        lance.write_dataset(table.to_pandas(), str(tmp_path / "pandas"), n_jobs=2)
+
+
+def test_write_dataset_n_jobs_unsupported_option(tmp_path: Path):
+    table = _n_jobs_table(10)
+    with pytest.raises(ValueError, match="cannot be combined with"):
+        lance.write_dataset(
+            table,
+            str(tmp_path / "ds"),
+            mode="overwrite",
+            n_jobs=2,
+            commit_message="hello",
+        )
+
+
+def test_write_dataset_n_jobs_schema_not_silently_ignored(tmp_path: Path):
+    table = _n_jobs_table(10)
+    # The parallel path uses table.schema directly, so an explicit schema= must
+    # be rejected rather than silently ignored.
+    other_schema = pa.schema(
+        [pa.field("id", pa.int64()), pa.field("val", pa.float64())]
+    )
+    with pytest.raises(ValueError, match="cannot be combined with.*schema"):
+        lance.write_dataset(
+            table,
+            str(tmp_path / "ds"),
+            mode="overwrite",
+            n_jobs=2,
+            schema=other_schema,
+        )
+
+
+def test_write_dataset_n_jobs_worker_failure_no_commit(tmp_path: Path, monkeypatch):
+    table = _n_jobs_table(1000)
+    uri = str(tmp_path / "ds")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(lance.fragment, "write_fragments", boom)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        lance.write_dataset(table, uri, mode="overwrite", n_jobs=4)
+
+    # A failed worker must prevent the commit, so no dataset version exists.
+    with pytest.raises(ValueError):
+        lance.dataset(uri)

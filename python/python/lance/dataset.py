@@ -7797,6 +7797,149 @@ class LanceStats:
         return self._ds.data_stats()
 
 
+# Parallel writes (n_jobs >= 2) currently support only mode="overwrite".
+#
+# "create" and "append" are intentionally excluded: the parallel path writes
+# fragments and then commits them with a single LanceOperation.Overwrite. That
+# operation ("overwrite or create", no read_version) can reproduce neither the
+# atomic create-only guarantee the native writer enforces, nor append's
+# conflict-detection/retry semantics, so supporting those modes here would
+# silently weaken their concurrency guarantees.
+# TODO(#1980): extend parallel writes to create/append once the fragment-commit
+# path can preserve their transaction semantics (most likely a Rust-core impl,
+# which owns these semantics and could be shared across all bindings).
+_PARALLEL_WRITE_SUPPORTED_MODES = ("overwrite",)
+
+
+def _validate_n_jobs(n_jobs: Optional[int]) -> None:
+    """Validate the ``n_jobs`` argument of :func:`write_dataset`.
+
+    ``None`` and ``1`` are always accepted and select the existing sequential
+    write path. Any other value must be an ``int`` >= 1. ``bool`` is rejected
+    explicitly because ``True``/``False`` are almost always a mistake for a
+    worker count.
+    """
+    if n_jobs is None:
+        return
+    if isinstance(n_jobs, bool) or not isinstance(n_jobs, int):
+        raise TypeError(
+            f"n_jobs must be an int or None, got {type(n_jobs).__name__}: {n_jobs!r}"
+        )
+    if n_jobs < 1:
+        raise ValueError(f"n_jobs must be >= 1, got {n_jobs}")
+
+
+def _ensure_parallel_write_supported(
+    data_obj: ReaderLike,
+    mode: str,
+    *,
+    unsupported: List[tuple[str, bool]],
+) -> None:
+    """Reject requests that the parallel write path cannot faithfully honor.
+
+    Parallel writes (``n_jobs >= 2``) fan a single in-memory table out into
+    concurrent :func:`lance.fragment.write_fragments` calls followed by one
+    commit. That path only reproduces a subset of :func:`write_dataset`
+    behavior, so anything it cannot honor is rejected with a clear error rather
+    than being silently ignored or run sequentially.
+    """
+    if not isinstance(data_obj, pa.Table):
+        raise TypeError(
+            "n_jobs >= 2 is only supported for in-memory pyarrow.Table input, got "
+            f"{type(data_obj).__name__}. Convert the input to a pyarrow.Table, or "
+            "use the default n_jobs=1 for other input types."
+        )
+    if mode not in _PARALLEL_WRITE_SUPPORTED_MODES:
+        raise ValueError(
+            "n_jobs >= 2 currently only supports mode='overwrite' "
+            f"(create/append are not yet supported), got mode={mode!r}."
+        )
+    set_options = sorted(name for name, is_set in unsupported if is_set)
+    if set_options:
+        raise ValueError(
+            "n_jobs >= 2 cannot be combined with the following option(s): "
+            f"{', '.join(set_options)}. Use the default n_jobs=1 to use them."
+        )
+
+
+def _write_dataset_parallel(
+    table: pa.Table,
+    uri: Union[str, Path, LanceDataset],
+    *,
+    n_jobs: int,
+    max_rows_per_file: int,
+    max_rows_per_group: int,
+    max_bytes_per_file: int,
+    data_storage_version: Optional[str],
+    storage_options: Optional[Dict[str, str]],
+    enable_v2_manifest_paths: bool,
+) -> LanceDataset:
+    """Write ``table`` with ``n_jobs`` parallel ``write_fragments`` calls and
+    commit the resulting fragments in a single ``LanceOperation.Overwrite``.
+
+    The caller guarantees ``table`` is a non-empty ``pyarrow.Table``,
+    ``n_jobs >= 2`` and ``mode == "overwrite"`` (the only mode parallel writes
+    currently support). Fragments are collected in partition order so the
+    committed layout is deterministic.
+
+    Failure semantics: if a worker fails, no commit is performed and the dataset
+    is never updated, but fragment files written by already-completed workers are
+    left uncommitted in storage. This matches the low-level
+    :func:`lance.fragment.write_fragments` API used for distributed writes.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .fragment import write_fragments
+
+    if isinstance(uri, Path):
+        uri = os.fspath(uri)
+
+    num_rows = table.num_rows
+    # Ceil division so every row falls into exactly one contiguous partition.
+    partition_size = -(-num_rows // n_jobs)
+    partitions = []
+    offset = 0
+    while offset < num_rows:
+        length = min(partition_size, num_rows - offset)
+        partitions.append(table.slice(offset, length))
+        offset += length
+    # Effective worker count is capped at the number of non-empty partitions, so
+    # a small table with a large n_jobs never spawns idle or empty workers.
+    num_workers = len(partitions)
+
+    def _write_partition(partition: pa.Table) -> List[FragmentMetadata]:
+        return write_fragments(
+            partition,
+            uri,
+            mode="overwrite",
+            max_rows_per_file=max_rows_per_file,
+            max_rows_per_group=max_rows_per_group,
+            max_bytes_per_file=max_bytes_per_file,
+            data_storage_version=data_storage_version,
+            storage_options=storage_options,
+        )
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # executor.map preserves input (partition) order and, when materialized,
+        # raises the first worker error before we reach the commit below — so a
+        # failed parallel write never produces a partial dataset version.
+        per_partition_fragments = list(executor.map(_write_partition, partitions))
+
+    fragments = [
+        fragment
+        for partition_fragments in per_partition_fragments
+        for fragment in partition_fragments
+    ]
+
+    operation = LanceOperation.Overwrite(table.schema, fragments)
+    return LanceDataset.commit(
+        uri,
+        operation,
+        storage_options=storage_options,
+        enable_v2_manifest_paths=enable_v2_manifest_paths,
+    )
+
+
 def write_dataset(
     data_obj: ReaderLike,
     uri: Optional[Union[str, Path, LanceDataset]] = None,
@@ -7806,6 +7949,7 @@ def write_dataset(
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
+    n_jobs: Optional[int] = None,
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
@@ -7859,6 +8003,23 @@ def write_dataset(
         means larger groups may cause this to be overshot meaningfully. This
         defaults to 90 GB, since we have a hard limit of 100 GB per file on
         object stores.
+    n_jobs: int, optional, default None
+        Number of parallel workers to use when writing a large in-memory
+        ``pyarrow.Table``. ``None`` (the default) and ``1`` use the existing
+        sequential write path unchanged. When ``n_jobs >= 2``, the table is
+        split into that many contiguous partitions that are written concurrently
+        with :func:`lance.fragment.write_fragments` and then committed in a
+        single ``LanceOperation.Overwrite`` transaction. The effective number of
+        workers is capped at the number of non-empty partitions. This is
+        currently only supported for in-memory ``pyarrow.Table`` input with
+        ``mode="overwrite"``; ``create`` and ``append`` are not yet supported for
+        ``n_jobs >= 2`` (the parallel commit cannot reproduce their concurrency
+        semantics — use the default ``n_jobs=1`` for those modes). Requesting
+        ``n_jobs >= 2`` with an unsupported input type, mode or option raises an
+        error. Parallel writes produce multiple fragments; the exact fragment
+        count is not part of the public API. If any worker fails, no commit is
+        performed (though fragment files from completed workers may be left
+        uncommitted in storage).
     commit_lock : CommitLock, optional
         A custom commit lock.  Only needed if your object store does not support
         atomic commits.  See the user guide for more details.
@@ -7988,6 +8149,40 @@ def write_dataset(
             "Must specify either 'uri' or both 'namespace_client' and 'table_id'."
         )
 
+    _validate_n_jobs(n_jobs)
+    parallel_write = n_jobs is not None and n_jobs >= 2
+    if parallel_write:
+        # Validate the parallel request up front, before any namespace side
+        # effects (declare_table / describe_table) can occur.
+        _ensure_parallel_write_supported(
+            data_obj,
+            mode,
+            unsupported=[
+                ("schema", schema is not None),
+                ("namespace_client", namespace_client is not None),
+                ("table_id", table_id is not None),
+                ("initial_bases", initial_bases is not None),
+                ("target_bases", target_bases is not None),
+                ("target_all_bases", target_all_bases is not None),
+                ("base_store_params", base_store_params is not None),
+                ("commit_lock", commit_lock is not None),
+                ("progress", progress is not None),
+                ("auto_cleanup_options", auto_cleanup_options is not None),
+                ("commit_message", commit_message is not None),
+                ("transaction_properties", transaction_properties is not None),
+                ("enable_stable_row_ids", enable_stable_row_ids),
+                ("external_blob_mode", external_blob_mode != "reference"),
+                (
+                    "allow_external_blob_outside_bases",
+                    allow_external_blob_outside_bases,
+                ),
+                (
+                    "blob_pack_file_size_threshold",
+                    blob_pack_file_size_threshold is not None,
+                ),
+            ],
+        )
+
     # Handle namespace-based dataset writing
     if namespace_client is not None:
         if table_id is None:
@@ -8057,6 +8252,22 @@ def write_dataset(
             data_storage_version = "legacy"
         else:
             data_storage_version = "stable"
+
+    if parallel_write and data_obj.num_rows > 0:
+        # An empty table cannot be split into non-empty partitions, so it falls
+        # through to the standard path below, which writes an empty dataset.
+        _validate_schema(data_obj.schema)
+        return _write_dataset_parallel(
+            data_obj,
+            uri,
+            n_jobs=n_jobs,
+            max_rows_per_file=max_rows_per_file,
+            max_rows_per_group=max_rows_per_group,
+            max_bytes_per_file=max_bytes_per_file,
+            data_storage_version=data_storage_version,
+            storage_options=storage_options,
+            enable_v2_manifest_paths=enable_v2_manifest_paths,
+        )
 
     reader = _coerce_reader(data_obj, schema)
     _validate_schema(reader.schema)
