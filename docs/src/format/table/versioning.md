@@ -31,10 +31,15 @@ they should return an "unsupported" error on any read or write operation.
 | 32       | `FLAG_DISABLE_TRANSACTION_FILE` | No              | Yes             | Transactions are recorded in the manifest rather than in a separate transaction file.                       |
 | 64       | `FLAG_UNSTABLE_DATA_OVERLAY_FILES` | Yes          | Yes             | Fragments may carry data overlay files. Unstable: release builds reject it unless explicitly opted in.      |
 | 128      | `FLAG_COVERED_INDEX_METADATA`   | Yes             | Yes             | Some index declares covering columns (`IndexMetadata.covering_fields`), so `fields` means keyed columns followed by carried ones. An implementation without this flag selects an index by membership of `fields` and would answer a query on a merely-carried column with an index keyed on a different one. |
-| 512      | `FLAG_FRAGMENT_REUSE_INDEX` | Yes | Yes | Support for the new FRI format, which can be extended with new encodings, including stable partition encoding. |
+| 512      | `FLAG_FRAGMENT_REUSE_INDEX` | Yes | Yes | Support for the new FRI format, which can be extended with new mappings, including stable partition. |
 
 </div>
 
 Flags with bit values 256 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error.
 
-Legacy compaction FRI does not require any flags. Set `FLAG_FRAGMENT_REUSE_INDEX` in both reader and writer flags when stable partition or another new FRI encoding is first written. This prevents readers and writers that only understand legacy compaction FRI from misinterpreting the new transitions. Subsequent versions retain both flags.
+Legacy compaction FRI does not require any flags. Set `FLAG_FRAGMENT_REUSE_INDEX` in both reader and writer flags when stable partition or another new FRI mapping is first written. This prevents readers and writers that only understand legacy compaction FRI from misinterpreting the new transitions. Subsequent versions retain both flags.
+
+The FRI capability bit does not imply support for every future mapping. Readers
+and operations that interpret FRI must also validate its `index_version`; an
+unsupported version requires an upgrade. Adding a mapping does not automatically
+allocate a new manifest feature bit.
