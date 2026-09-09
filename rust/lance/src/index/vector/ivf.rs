@@ -49,6 +49,7 @@ use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
     cache::{CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey, WeakLanceCache},
@@ -73,6 +74,9 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatMetadata
 use lance_index::vector::flat::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatStorage};
 use lance_index::vector::hnsw::HnswMetadata;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
+use lance_index::vector::ivf::norm_ranges::{
+    IvfNormRanges, NORM_RANGES_METADATA_KEY, VectorNormRange,
+};
 use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::kmeans::{KMeans, KMeansParams};
@@ -2790,6 +2794,17 @@ async fn write_root_vector_index_from_auxiliary(
             let meta_vec_json = serde_json::to_string(&meta_vec)?;
             v2_writer.add_schema_metadata("lance:flat", meta_vec_json);
         }
+        if idx_meta.index_type == "IVF_FLAT"
+            && let Some(ranges) = merged_flat_norm_ranges(
+                &aux_reader,
+                &ivf_model,
+                DistanceType::try_from(idx_meta.distance_type.as_str())?,
+            )
+            .await?
+        {
+            v2_writer
+                .add_schema_metadata(NORM_RANGES_METADATA_KEY, serde_json::to_string(&ranges)?);
+        }
 
         let empty_batch = RecordBatch::new_empty(arrow_schema);
         v2_writer.write_batch(&empty_batch).await?;
@@ -2803,6 +2818,93 @@ async fn write_root_vector_index_from_auxiliary(
         path: INDEX_FILE_NAME.to_string(),
         size_bytes: summary.size_bytes,
     })
+}
+
+/// Recompute statistics from the final, filtered output rather than combining
+/// source extrema that may describe deleted rows or different source coverage.
+async fn merged_flat_norm_ranges(
+    reader: &V2Reader,
+    ivf: &IvfModel,
+    metric: DistanceType,
+) -> Result<Option<IvfNormRanges>> {
+    let schema: Schema = reader.schema().as_ref().into();
+    let field = schema.field_with_name(FLAT_COLUMN)?;
+    let DataType::FixedSizeList(item, dimension) = field.data_type() else {
+        return Ok(None);
+    };
+    if item.data_type() != &DataType::Float32 || metric == DistanceType::Hamming {
+        return Ok(None);
+    }
+    if *dimension as usize != ivf.dimension() {
+        return Err(Error::corrupt_file_named(
+            NORM_RANGES_METADATA_KEY,
+            format!(
+                "merged FLAT dimension {dimension} differs from IVF dimension {}",
+                ivf.dimension()
+            ),
+        ));
+    }
+    let projection = file_versions::reader_projection_from_column_names(
+        reader.metadata().version(),
+        reader.schema(),
+        &[FLAT_COLUMN],
+    )?;
+    let mut ranges = Vec::with_capacity(ivf.num_partitions());
+    for partition in 0..ivf.num_partitions() {
+        let rows = ivf.row_range(partition);
+        if rows.is_empty() {
+            ranges.push(None);
+            continue;
+        }
+        let mut batches = reader
+            .read_stream_projected(
+                ReadBatchParams::Range(rows),
+                4096,
+                1,
+                projection.clone(),
+                FilterExpression::no_filter(),
+            )
+            .await?;
+        let mut range: Option<VectorNormRange> = None;
+        let mut has_unavailable_range = false;
+        let mut observed_rows = 0usize;
+        while let Some(batch) = batches.try_next().await? {
+            observed_rows = observed_rows.checked_add(batch.num_rows()).ok_or_else(|| {
+                Error::index(format!(
+                    "merged FLAT row count overflow in partition {partition}"
+                ))
+            })?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let vectors = batch
+                .column_by_name(FLAT_COLUMN)
+                .ok_or_else(|| Error::index("merged FLAT batch has no vector column"))?
+                .as_fixed_size_list()
+                .clone();
+            let batch_range =
+                spawn_cpu(move || Ok::<_, Error>(VectorNormRange::from_vectors(&vectors))).await?;
+            match (range.as_mut(), batch_range) {
+                (Some(range), Some(batch_range)) => {
+                    range.min = range.min.min(batch_range.min);
+                    range.max = range.max.max(batch_range.max);
+                }
+                (None, Some(batch_range)) => range = Some(batch_range),
+                (_, None) => has_unavailable_range = true,
+            }
+        }
+        if observed_rows != ivf.partition_size(partition) {
+            return Err(Error::corrupt_file_named(
+                NORM_RANGES_METADATA_KEY,
+                format!(
+                    "merged FLAT partition {partition} returned {observed_rows} rows, expected {}",
+                    ivf.partition_size(partition)
+                ),
+            ));
+        }
+        ranges.push(if has_unavailable_range { None } else { range });
+    }
+    IvfNormRanges::new(ivf.dimension(), metric, ivf.lengths.clone(), ranges).map(Some)
 }
 
 async fn read_hnsw_index_metadata_from_sources(

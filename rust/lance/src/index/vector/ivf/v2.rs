@@ -5060,6 +5060,131 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::l2(DistanceType::L2)]
+    #[case::cosine(DistanceType::Cosine)]
+    #[case::dot(DistanceType::Dot)]
+    #[tokio::test]
+    async fn test_merge_flat_segments_recomputes_norm_ranges_after_deletion(
+        #[case] metric: DistanceType,
+    ) {
+        // The merged partition spans two read batches. Its old source maximum
+        // is deleted, while its new extrema occur in the final short batch.
+        let mut vectors = [3.0_f32, 4.0].repeat(4097);
+        vectors.extend([300.0, 400.0, 1.0, 0.0, 5.0, 12.0, 8.0, 15.0]);
+        let vectors = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vectors), 2).unwrap(),
+        );
+        let ids = Arc::new(UInt64Array::from((0..4101).collect::<Vec<_>>()));
+        let batch =
+            RecordBatch::try_from_iter([("id", ids as ArrayRef), ("vector", vectors as ArrayRef)])
+                .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4098,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![1.0, 0.0, -1.0, 0.0, 0.0, -1.0]),
+                2,
+            )
+            .unwrap(),
+        );
+        let params = VectorIndexParams::with_ivf_flat_params(
+            metric,
+            IvfBuildParams::try_with_centroids(3, centroids).unwrap(),
+        );
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                dataset
+                    .create_index_builder(&["vector"], IndexType::Vector, &params)
+                    .name("norm_merge".to_owned())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset.delete("id = 4097").await.unwrap();
+        let merged = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("norm_merge", "vector", vec![merged])
+            .await
+            .unwrap();
+        let context = load_vector_index_context(&dataset, "vector", "norm_merge").await;
+        let index = context.ivf_flat();
+        assert_eq!(index.partition_size(0), 4100);
+        assert_eq!(index.partition_size(1), 0);
+        assert_eq!(index.partition_size(2), 0);
+        let range = index
+            .partition_norm_range(0)
+            .expect("merged FLAT must retain norm statistics");
+        if metric == DistanceType::Cosine {
+            assert!((range.min - 1.0).abs() < 1e-6);
+            assert!((range.max - 1.0).abs() < 1e-6);
+        } else {
+            assert_eq!(
+                range,
+                super::VectorNormRange {
+                    min: 1.0,
+                    max: 17.0
+                }
+            );
+        }
+        assert_eq!(index.partition_norm_range(1), None);
+        assert_eq!(index.partition_norm_range(2), None);
+        let metadata: serde_json::Value = serde_json::from_str(
+            index
+                .reader
+                .schema()
+                .metadata
+                .get(super::NORM_RANGES_METADATA_KEY)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata["partition_lengths"],
+            serde_json::json!([4100, 0, 0])
+        );
+        assert_eq!(metadata["metric"], metric.to_string());
+        assert!(
+            !index
+                .storage
+                .reader()
+                .schema()
+                .metadata
+                .contains_key(super::NORM_RANGES_METADATA_KEY)
+        );
+        let query = Float32Array::from(vec![1.0, 0.0]);
+        let expected = ground_truth(&dataset, "vector", &query, 1, metric).await;
+        let found = dataset
+            .scan()
+            .nearest("vector", &query, 1)
+            .unwrap()
+            .nprobes(3)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(
+            expected.contains(&found[ROW_ID].as_primitive::<UInt64Type>().value(0)),
+            "merged FLAT recall must be 1.0"
+        );
+    }
+
     #[tokio::test]
     async fn test_merge_index_metadata_reports_progress() {
         const INDEX_NAME: &str = "vector_idx";
