@@ -1875,60 +1875,16 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indices = load_all_indices(self).await?;
-        if let Some(fri) = indices
-            .iter()
-            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version != 0)
-        {
-            let mapping = frag_reuse_reader::FragmentReuseIndex::open(self, fri).await?;
-            let mut supported = Vec::with_capacity(indices.len());
-            for index in indices.iter() {
-                if !index_is_usable(index) {
-                    continue;
-                }
-                if index.name != FRAG_REUSE_INDEX_NAME
-                    && mapping.may_need_translation(index.fragment_bitmap.as_ref())
-                {
-                    let can_remap = if segment_has_vector_details(index) {
-                        frag_reuse_remapping::vector_supports_batch_remapping(self, index).await?
-                    } else {
-                        index
-                            .index_details
-                            .as_ref()
-                            .and_then(|details| {
-                                scalar::SCALAR_INDEX_PLUGIN_REGISTRY
-                                    .get_plugin_by_details(details)
-                                    .ok()
-                            })
-                            .is_some_and(|plugin| plugin.supports_batch_row_id_remapping())
-                    };
-                    if index.fragment_bitmap.is_none() || !can_remap {
-                        continue;
-                    }
-                }
-                supported.push(index.clone());
-            }
-            let mut indices = supported;
-            let mut groups: HashMap<String, Vec<(usize, RoaringBitmap)>> = HashMap::new();
-            for (position, index) in indices.iter().enumerate() {
-                if index.name != FRAG_REUSE_INDEX_NAME
-                    && let Some(bitmap) = &index.fragment_bitmap
-                {
-                    groups
-                        .entry(index.name.clone())
-                        .or_default()
-                        .push((position, bitmap.clone()));
+        if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
+            match fri.index_version {
+                0 => {}
+                1 => return frag_reuse_reader::load_indices(self, fri, &indices).await,
+                version => {
+                    return Err(Error::not_supported(format!(
+                        "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+                    )));
                 }
             }
-            for members in groups.into_values() {
-                let (positions, provenance): (Vec<_>, Vec<_>) = members.into_iter().unzip();
-                for (position, coverage) in positions
-                    .into_iter()
-                    .zip(mapping.segment_coverage(&provenance))
-                {
-                    indices[position].fragment_bitmap = Some(coverage);
-                }
-            }
-            return Ok(Arc::new(indices));
         }
         if indices.iter().all(index_is_usable) {
             return Ok(indices);
@@ -2602,10 +2558,17 @@ async fn migrate_and_recompute_index_statistics(ds: &Dataset, index_name: &str) 
 }
 
 async fn index_statistics_frag_reuse(ds: &Dataset) -> Result<String> {
+    if let Some(fri) = ds.load_index_by_name(FRAG_REUSE_INDEX_NAME).await?
+        && fri.index_version != 0
+    {
+        return Err(Error::not_supported(
+            "FRI index_version 1 statistics are not implemented. Please upgrade to a supporting version",
+        ));
+    }
     let index = ds
         .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?
-        .ok_or_else(|| Error::not_supported("FRI statistics require a supported legacy history"))?;
+        .expect("FragmentReuse index does not exist");
     serialize_index_statistics(&CompactFragReuseIndexHandle(index).statistics()?)
 }
 
@@ -3448,9 +3411,15 @@ impl DatasetIndexInternalExt for Dataset {
     ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
         if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             if frag_reuse_index_meta.index_version != 0 {
-                return Err(Error::not_supported(
-                    "This operation requires legacy FRI; tagged history maintenance requires an upgraded writer",
-                ));
+                // Version-1 consumers are installed separately. The planner excludes
+                // affected segments; independent segments need no legacy remapper.
+                // Maintenance is rejected before entering the legacy write path.
+                return match frag_reuse_index_meta.index_version {
+                    1 => Ok(None),
+                    version => Err(Error::not_supported(format!(
+                        "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+                    ))),
+                };
             }
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
             let frag_reuse_key = FragReuseIndexKey {
