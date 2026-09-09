@@ -70,6 +70,7 @@ use std::{
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{Span, debug, info, instrument, warn};
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Default)]
 struct ReferencedFiles {
@@ -302,6 +303,11 @@ struct CleanupTask<'a> {
 #[derive(Clone, Debug, Default)]
 struct CleanupInspection {
     old_manifests: HashMap<Path, u64>,
+    /// Every manifest path known to the commit handler, including the latest
+    /// version and any live manifests recorded in an external store. Used to
+    /// distinguish staging-manifest orphans from real commit-after manifests
+    /// that share the same `<name>-<uuid>` filename shape.
+    live_manifest_paths: HashSet<Path>,
     /// Store records to retire once their manifests are gone, by version;
     /// see `CommitHandler::forget_version`.
     retired_records: HashMap<u64, String>,
@@ -349,6 +355,20 @@ const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
 const S3_DELETE_STREAM_BATCH_SIZE: u64 = 1_000;
 const AZURE_DELETE_STREAM_BATCH_SIZE: u64 = 256;
 const DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES: usize = 1_000;
+
+/// Detect a staging-manifest filename written by `make_staging_manifest_path`:
+/// `<number>.manifest-<uuid>`. Because there is only one dot, the path's
+/// extension is the whole `manifest-<uuid>` suffix, so we parse the suffix
+/// after `.manifest-` as a UUID.
+fn is_staging_manifest_filename(filename: &str) -> bool {
+    let Some((number_part, suffix)) = filename.split_once(".manifest-") else {
+        return false;
+    };
+    if number_part.is_empty() || !number_part.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    Uuid::try_parse(suffix).is_ok()
+}
 
 /// Builder-style cleanup operation.
 ///
@@ -546,6 +566,15 @@ impl<'a> CleanupTask<'a> {
         inspection: &Mutex<CleanupInspection>,
         tagged_versions: &HashSet<u64>,
     ) -> Result<()> {
+        // Every manifest path returned by the commit handler is live (or was live
+        // at the start of cleanup). Staging manifests that share the same filename
+        // shape must be compared against this set.
+        inspection
+            .lock()
+            .unwrap()
+            .live_manifest_paths
+            .insert(location.path.clone());
+
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
         // between an invalid manifest and a temporary I/O error.  It's also not safe
         // to ignore a manifest error because if it is a temporary I/O error and we
@@ -909,6 +938,28 @@ impl<'a> CleanupTask<'a> {
                     true,
                     size_bytes,
                 ));
+            }
+        }
+        if relative_path.as_ref().starts_with("_versions/") {
+            // Staging manifests are written as `<manifest>-<uuid>` and are meant
+            // to be deleted or renamed during commit. If one is left behind and
+            // is not a manifest path recorded by the commit handler, it is an
+            // orphan. Be as conservative as for `.tmp` manifests: only remove
+            // when not maybe_in_progress.
+            if let Some(filename) = path.filename()
+                && is_staging_manifest_filename(filename)
+                && !inspection.live_manifest_paths.contains(&path)
+            {
+                if maybe_in_progress {
+                    return Ok(None);
+                } else {
+                    return Ok(cleanup_file(
+                        path,
+                        CleanupFileKind::TemporaryManifest,
+                        true,
+                        size_bytes,
+                    ));
+                }
             }
         }
         if relative_path.as_ref().starts_with("_indices") {
@@ -3781,6 +3832,39 @@ mod tests {
         assert!(os.exists(&img).await.unwrap());
         assert!(os.exists(&misc).await.unwrap());
         assert!(os.exists(&branch_file).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_orphaned_staging_manifest() {
+        // Staging manifests written as `<manifest>-<uuid>` by an external commit
+        // handler should be garbage-collected once they are no longer recorded
+        // as live manifest paths.
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let (os, base) =
+            ObjectStore::from_uri_and_params(registry, &fixture.dataset_path, &fixture.os_params())
+                .await
+                .unwrap();
+
+        let staging_manifest = base
+            .clone()
+            .join("_versions")
+            .join("00000000000000000001.manifest-cee4fbbb-eb19-4ea3-8ca7-54f5ec33dedc");
+        os.put(&staging_manifest, b"orphan").await.unwrap();
+
+        // Advance the clock so the orphan is old enough to be removed, while the
+        // live manifest is still protected as the latest version.
+        MockClock::set_system_time(TimeDelta::try_days(20).unwrap().to_std().unwrap());
+
+        fixture.run_cleanup(utc_now()).await.unwrap();
+
+        assert!(
+            !os.exists(&staging_manifest).await.unwrap(),
+            "orphaned staging manifest should be removed"
+        );
     }
 
     // Lineage overview with annotated base versions:
