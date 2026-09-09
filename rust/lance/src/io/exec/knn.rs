@@ -1830,6 +1830,16 @@ impl ANNIvfSubIndexExec {
                 return futures::stream::empty().boxed();
             }
 
+            if seg_mask
+                .as_ref()
+                .is_some_and(|mask| mask.max_len() == Some(0))
+            {
+                // Every fragment this segment used to own now belongs to a newer delta,
+                // so probing it can neither produce a row nor move the shared budget that
+                // stops the late search. Skip both completion and underfill probes.
+                return futures::stream::empty().boxed();
+            }
+
             if found_so_far >= query.k {
                 let Some(positions) = state.kth_distance().and_then(|kth| {
                     radial_completion_positions(&query, index.as_ref(), &partitions, kth)
@@ -1887,16 +1897,6 @@ impl ANNIvfSubIndexExec {
                 })
                 .try_flatten()
                 .boxed();
-            }
-
-            if seg_mask
-                .as_ref()
-                .is_some_and(|mask| mask.max_len() == Some(0))
-            {
-                // Every fragment this segment used to own now belongs to a newer delta,
-                // so probing it can neither produce a row nor move the shared budget that
-                // stops the late search. Skip it instead of scanning to maximum_nprobes.
-                return futures::stream::empty().boxed();
             }
 
             // We know the prefilter should be ready at this point so we shouldn't
@@ -2629,7 +2629,9 @@ mod tests {
     use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
-    use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, PreparedPartitionSearchHandle};
+    use lance_index::vector::{
+        DEFAULT_QUERY_PARALLELISM, PreparedPartitionSearchHandle, VectorNormRange,
+    };
     use lance_index::{Index, IndexType};
     use lance_io::traits::Reader;
     use lance_linalg::distance::MetricType;
@@ -2728,6 +2730,8 @@ mod tests {
         search_threads: Arc<Mutex<Vec<String>>>,
         /// The rows each partition returns, indexed by partition id.
         row_ids: Vec<Vec<u64>>,
+        /// Optional complete norm statistics for completion-specific fixtures.
+        norm_stats: Option<(lance_index::vector::ivf::storage::IvfModel, VectorNormRange)>,
     }
 
     #[async_trait]
@@ -3086,15 +3090,20 @@ mod tests {
         }
 
         fn ivf_model(&self) -> &lance_index::vector::ivf::storage::IvfModel {
-            unimplemented!()
+            &self.norm_stats.as_ref().expect("norm-enabled fixture").0
+        }
+
+        fn partition_norm_range(&self, part_id: usize) -> Option<VectorNormRange> {
+            self.row_ids.get(part_id)?;
+            self.norm_stats.as_ref().map(|(_, range)| *range)
         }
 
         fn quantizer(&self) -> lance_index::vector::quantizer::Quantizer {
             unimplemented!()
         }
 
-        fn partition_size(&self, _part_id: usize) -> usize {
-            unimplemented!()
+        fn partition_size(&self, part_id: usize) -> usize {
+            self.row_ids[part_id].len()
         }
 
         fn sub_index_type(
@@ -3103,7 +3112,10 @@ mod tests {
             lance_index::vector::v3::subindex::SubIndexType,
             lance_index::vector::quantizer::QuantizationType,
         ) {
-            unimplemented!()
+            (
+                lance_index::vector::v3::subindex::SubIndexType::Flat,
+                lance_index::vector::quantizer::QuantizationType::Flat,
+            )
         }
 
         fn metric_type(&self) -> DistanceType {
@@ -3283,6 +3295,7 @@ mod tests {
             searched_partitions: searched_partitions.clone(),
             search_threads: search_threads.clone(),
             row_ids,
+            norm_stats: None,
         });
         (
             index,
@@ -3664,6 +3677,121 @@ mod tests {
             vec![0],
             "only the initial probe may run; the late search must not probe at all"
         );
+    }
+
+    #[tokio::test]
+    async fn test_segment_owning_nothing_skips_affordable_norm_completion() {
+        let old_rows = vec![vec![21, 22, 23], vec![24], vec![25], vec![26]];
+        let mut ivf = lance_index::vector::ivf::storage::IvfModel::empty();
+        for rows in &old_rows {
+            ivf.add_partition(rows.len() as u32);
+        }
+        let old_searched = Arc::new(Mutex::new(Vec::new()));
+        let old_prepared = Arc::new(Mutex::new(Vec::new()));
+        let old_index: Arc<dyn VectorIndex> = Arc::new(PreparedThreadCapturingIndex {
+            prepared_partitions: old_prepared.clone(),
+            searched_partitions: old_searched.clone(),
+            search_threads: Arc::new(Mutex::new(Vec::new())),
+            row_ids: old_rows,
+            norm_stats: Some((ivf, VectorNormRange { min: 0.0, max: 1.0 })),
+        });
+        let (new_index, _, new_searched, _) = prepared_index_multi(vec![vec![31, 32, 33, 34]]);
+        let old_mask = Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::new()));
+        let old_parts = Arc::new(UInt32Array::from(vec![0, 1, 2, 3]));
+        let old_distances = Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3, 0.4]));
+        let new_parts = Arc::new(UInt32Array::from(vec![0]));
+        let new_distances = Arc::new(Float32Array::from(vec![0.1]));
+        let mut query = base_query();
+        query.k = 4;
+        query.minimum_nprobes = 1;
+        query.maximum_nprobes = None;
+        query.query_parallelism = 1;
+        let state = Arc::new(ANNIvfEarlySearchResults::new(2, query.k));
+        let prefilter = empty_prefilter().await;
+        let old_metrics = prepared_metrics();
+        for (index, parts, distances, mask, metrics) in [
+            (
+                old_index.clone(),
+                old_parts.clone(),
+                old_distances.clone(),
+                Some(old_mask.clone()),
+                old_metrics.clone(),
+            ),
+            (
+                new_index.clone(),
+                new_parts.clone(),
+                new_distances.clone(),
+                None,
+                prepared_metrics(),
+            ),
+        ] {
+            ANNIvfSubIndexExec::initial_search(
+                index,
+                query.clone(),
+                parts,
+                distances,
+                prefilter.clone(),
+                metrics,
+                state.clone(),
+                usize::MAX,
+                mask,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        }
+        // The sibling supplied all four valid rows. Without the ownership exit,
+        // the old segment's three remaining rows fit its nominal three-row budget.
+        assert_eq!(state.kth_distance(), Some(1.5));
+        assert_eq!(
+            radial_completion_positions(&query, old_index.as_ref(), &old_parts, 1.5),
+            Some(vec![1, 2, 3])
+        );
+        let old_late = ANNIvfSubIndexExec::late_search(
+            old_index,
+            query.clone(),
+            old_parts,
+            old_distances,
+            prefilter.clone(),
+            prefilter.clone(),
+            old_metrics.clone(),
+            state.clone(),
+            usize::MAX,
+            Some(old_mask),
+        )
+        .try_collect::<Vec<_>>();
+        let new_late = ANNIvfSubIndexExec::late_search(
+            new_index,
+            query,
+            new_parts,
+            new_distances,
+            prefilter.clone(),
+            prefilter,
+            prepared_metrics(),
+            state,
+            usize::MAX,
+            None,
+        )
+        .try_collect::<Vec<_>>();
+        let (old_late, new_late) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(old_late, new_late)
+        })
+        .await
+        .expect("both deltas must pass the initial barrier");
+        assert!(old_late.unwrap().is_empty());
+        assert!(new_late.unwrap().is_empty());
+        assert_eq!(
+            *old_searched.lock().unwrap(),
+            vec![0],
+            "an unowned segment must not search norm candidates"
+        );
+        assert_eq!(
+            *old_prepared.lock().unwrap(),
+            vec![0],
+            "an unowned segment must not prepare norm candidates"
+        );
+        assert_eq!(*new_searched.lock().unwrap(), vec![0]);
+        assert_eq!(old_metrics.partitions_searched.value(), 1);
     }
 
     #[tokio::test]
