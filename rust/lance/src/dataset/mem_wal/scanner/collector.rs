@@ -29,6 +29,41 @@ pub struct InMemoryMemTableRef {
     pub generation: u64,
 }
 
+impl InMemoryMemTableRef {
+    /// Row-data bytes: the buffered batches.
+    ///
+    /// This is the **flush unit**, not the memtable's footprint — it drives the
+    /// `max_memtable_size` seal trigger, so it stays a function of the rows in
+    /// it. Use [`Self::resident_bytes`] to budget memory.
+    pub fn row_bytes(&self) -> usize {
+        self.batch_store.row_bytes()
+    }
+
+    /// Heap held by this memtable's auxiliary lookup structures: its in-memory
+    /// indexes plus the fixed PK bloom filter.
+    ///
+    /// Usually the term that explains an indexed table's footprint — an HNSW
+    /// index pre-allocates its whole graph on the first insert — so it can dwarf
+    /// row bytes while [`Self::row_bytes`] reads near zero.
+    pub fn index_bytes(&self) -> usize {
+        self.index_store.resident_bytes()
+            + crate::dataset::mem_wal::memtable::pk_bloom_filter_bytes()
+    }
+
+    /// Heap the buffered batches keep alive, which is not [`Self::row_bytes`]
+    /// once any batch is a zero-copy slice: a slice's window is a fraction of
+    /// the parent buffer it pins. See [`BatchStore::retained_bytes`].
+    pub fn retained_row_bytes(&self) -> usize {
+        self.batch_store.retained_bytes()
+    }
+
+    /// Total resident heap bytes. This, not [`Self::row_bytes`], is what a
+    /// memory ceiling must be built on.
+    pub fn resident_bytes(&self) -> usize {
+        self.retained_row_bytes() + self.index_bytes()
+    }
+}
+
 /// Back-compat alias; prefer [`InMemoryMemTableRef`].
 pub type ActiveMemTableRef = InMemoryMemTableRef;
 

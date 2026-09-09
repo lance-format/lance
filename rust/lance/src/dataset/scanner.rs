@@ -114,7 +114,8 @@ use crate::io::exec::filtered_read::{
 };
 use crate::io::exec::fts::{
     BoostQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec, FlatMatchFilterExec,
-    FlatMatchQueryExec, FtsDocumentExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
+    FlatMatchQueryExec, FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec,
+    SharedFtsScorer,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -283,6 +284,76 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
     !columns.is_empty() && (!matches!(query, FtsQuery::MultiMatch(_)) || columns.len() == 1)
 }
 
+fn supports_indexed_stats_residual_compound(query: &FtsQuery) -> bool {
+    match query {
+        FtsQuery::Match(query) => query.fuzziness == Some(0),
+        // MemWAL phrase matching currently collapses tokenizer position gaps.
+        // Keep phrase queries on the established fallback until it can retain
+        // those gaps exactly (notably when stop words are configured).
+        FtsQuery::Phrase(_) => false,
+        FtsQuery::Boost(query) => {
+            supports_indexed_stats_residual_compound(&query.positive)
+                && supports_indexed_stats_residual_compound(&query.negative)
+        }
+        FtsQuery::MultiMatch(query) => query
+            .match_queries
+            .iter()
+            .all(|query| query.fuzziness == Some(0)),
+        FtsQuery::Boolean(query) => query
+            .should
+            .iter()
+            .chain(&query.must)
+            .chain(&query.must_not)
+            .all(supports_indexed_stats_residual_compound),
+    }
+}
+
+const MAX_QUERY_LOCAL_RESIDUAL_ROWS: usize = 100_000;
+
+fn has_bounded_query_local_residual_rows(fragments: &[Fragment]) -> bool {
+    fragments
+        .iter()
+        .try_fold(0usize, |total, fragment| {
+            total.checked_add(fragment.physical_rows?)
+        })
+        .is_some_and(|total| total <= MAX_QUERY_LOCAL_RESIDUAL_ROWS)
+}
+
+fn has_complete_hybrid_fts_coverage(
+    segments: &[IndexMetadata],
+    residual_fragments: &[Fragment],
+    target_fragments: &[Fragment],
+) -> bool {
+    let Some(target) = target_fragments
+        .iter()
+        .map(|fragment| u32::try_from(fragment.id).ok())
+        .collect::<Option<RoaringBitmap>>()
+    else {
+        return false;
+    };
+    let Some(residual) = residual_fragments
+        .iter()
+        .map(|fragment| u32::try_from(fragment.id).ok())
+        .collect::<Option<RoaringBitmap>>()
+    else {
+        return false;
+    };
+    let mut indexed = RoaringBitmap::new();
+    for segment in segments {
+        let Some(coverage) = segment.fragment_bitmap.as_ref() else {
+            return false;
+        };
+        if !indexed.is_disjoint(coverage) {
+            return false;
+        }
+        indexed |= coverage;
+    }
+    if !indexed.is_subset(&target) || !indexed.is_disjoint(&residual) {
+        return false;
+    }
+    indexed | residual == target
+}
+
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
     fn validate_multiplier(name: &str, value: f32) -> Result<()> {
         if value.is_finite() && value >= 0.0 {
@@ -355,6 +426,41 @@ fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
                 .chain(&mut query.must_not)
             {
                 normalize_fts_zero_boosts(child);
+            }
+        }
+    }
+}
+
+/// Keep AUTO fuzziness exact at the public dataset-planning boundary.
+///
+/// Low-level index preparation already understands `fuzziness=None`, but a
+/// partial dataset plan must prepare one vocabulary across indexed and current
+/// unindexed rows. AUTO activation is deferred until OSS-2105 lands that
+/// current-row preparation atomically. Until then, recursively rewrite AUTO to
+/// exact while preserving explicit positive fuzziness.
+fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
+    match query {
+        FtsQuery::Match(query) => {
+            query.fuzziness.get_or_insert(0);
+        }
+        FtsQuery::Phrase(_) => {}
+        FtsQuery::Boost(query) => {
+            apply_dataset_planner_auto_fuzziness_compatibility_gate(&mut query.positive);
+            apply_dataset_planner_auto_fuzziness_compatibility_gate(&mut query.negative);
+        }
+        FtsQuery::MultiMatch(query) => {
+            for match_query in &mut query.match_queries {
+                match_query.fuzziness.get_or_insert(0);
+            }
+        }
+        FtsQuery::Boolean(query) => {
+            for child in query
+                .should
+                .iter_mut()
+                .chain(&mut query.must)
+                .chain(&mut query.must_not)
+            {
+                apply_dataset_planner_auto_fuzziness_compatibility_gate(child);
             }
         }
     }
@@ -1011,6 +1117,9 @@ pub struct Scanner {
     /// Number of bytes to allow to queue up in the I/O buffer
     io_buffer_size: Option<u64>,
 
+    /// Total bytes reserved by asynchronously materialized blob v2 batches
+    materialization_readahead_bytes: Option<u64>,
+
     limit: Option<i64>,
     offset: Option<i64>,
 
@@ -1293,6 +1402,7 @@ impl Scanner {
             batch_readahead: get_num_compute_intensive_cpus(),
             fragment_readahead: None,
             io_buffer_size: None,
+            materialization_readahead_bytes: None,
             limit: None,
             offset: None,
             ordering: None,
@@ -1658,6 +1768,27 @@ impl Scanner {
     ///
     pub fn io_buffer_size(&mut self, size: u64) -> &mut Self {
         self.io_buffer_size = Some(size);
+        self
+    }
+
+    /// Set the memory budget for asynchronous blob v2 materialization.
+    ///
+    /// Blob descriptors are decoded before their payloads are fetched. When this
+    /// budget is set, payload materialization may run ahead while the aggregate
+    /// descriptor arrays, output offsets, and payload bytes awaiting ordered
+    /// emission stay within `size`. Admission follows output order, and each
+    /// reservation is retained until its batch is emitted. A single oversized
+    /// batch is admitted when no other materialization is reserved, which
+    /// guarantees forward progress. External descriptors without a stored size
+    /// resolve the complete object length before admission.
+    ///
+    /// This budget is separate from [`Self::io_buffer_size`], which controls the
+    /// storage I/O scheduler, and [`Self::batch_size_bytes`], which targets the
+    /// size of individual decoded batches. If this setting is not provided,
+    /// Blob v2 materialization has no independent memory bound. A size of zero
+    /// is rejected when the scan plan is built.
+    pub fn materialization_readahead_bytes(&mut self, size: u64) -> &mut Self {
+        self.materialization_readahead_bytes = Some(size);
         self
     }
 
@@ -2740,6 +2871,12 @@ impl Scanner {
             ));
         }
 
+        if self.materialization_readahead_bytes == Some(0) {
+            return Err(Error::invalid_input_source(
+                "materialization_readahead_bytes must be greater than 0, got 0".into(),
+            ));
+        }
+
         if let Some(batch_size) = self.batch_size {
             validate_batch_size(batch_size)?;
         }
@@ -3358,6 +3495,11 @@ impl Scanner {
 
         if let Some(io_buffer_size_bytes) = self.io_buffer_size {
             read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
+        }
+
+        if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
+            read_options =
+                read_options.with_materialization_readahead_bytes(materialization_readahead_bytes);
         }
 
         if self.fast_search && filter_plan.has_index_query() {
@@ -4113,6 +4255,7 @@ impl Scanner {
             resolved.query = fill_fts_query_column(&resolved.query, &indexed_columns, false)?;
             Self::set_missing_query_granularity(&mut resolved.query, DocumentGranularity::Row);
         }
+        apply_dataset_planner_auto_fuzziness_compatibility_gate(&mut resolved.query);
         resolved.query = self
             .resolve_fts_query_document_granularity(resolved.query)
             .await?;
@@ -4160,6 +4303,7 @@ impl Scanner {
         &self,
         query: &FtsQuery,
         params: &FtsSearchParams,
+        filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
         document_granularity: DocumentGranularity,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
@@ -4184,6 +4328,21 @@ impl Scanner {
         }
         let mut phrase_columns = HashSet::new();
         collect_phrase_columns(query, &mut phrase_columns);
+        // Query-local residual scoring intentionally reuses committed-index
+        // BM25 statistics. Matching remains exact for the supported leaf
+        // shapes, but ranking is approximate until the appended rows are
+        // incorporated into a persistent index.
+        let allow_indexed_stats_residual = !cross_column
+            && !self.fast_search
+            && self.fragments.is_none()
+            && filter_plan.is_empty()
+            && self.external_row_mask.is_none()
+            && params.limit.is_some()
+            && document_granularity == DocumentGranularity::Row
+            && target_fragments
+                .iter()
+                .all(|fragment| fragment.deletion_file.is_none())
+            && supports_indexed_stats_residual_compound(query);
 
         let segment_groups = futures::future::try_join_all(columns.into_iter().map(|column| {
             let phrase_columns = &phrase_columns;
@@ -4206,10 +4365,20 @@ impl Scanner {
                     self.fts_overlay_plan(&column, document_granularity, target_fragments),
                 )
                 .await?;
-                if !self.retain_target_fragments(unindexed_fragments).is_empty() {
+                let unindexed_fragments = self.retain_target_fragments(unindexed_fragments);
+                let has_bounded_residual = allow_indexed_stats_residual
+                    && has_bounded_query_local_residual_rows(&unindexed_fragments);
+                if !unindexed_fragments.is_empty()
+                    && (!self.fast_search || unindexed_fragments.len() == target_fragments.len())
+                    && !(has_bounded_residual
+                        && unindexed_fragments.len() < target_fragments.len())
+                {
                     // Flat and posting-backed leaves do not share a document
                     // domain, so preserve the exact fallback for partial index
-                    // coverage.
+                    // coverage. Fast search deliberately excludes unindexed
+                    // fragments, so its indexed-only domain remains valid for
+                    // the compound scorer when at least one target fragment is
+                    // indexed.
                     return Ok(None);
                 }
                 let segments = match overlay_plan {
@@ -4225,6 +4394,23 @@ impl Scanner {
                     }
                     FtsOverlayPlan::RowLevel { .. } | FtsOverlayPlan::FullScan => return Ok(None),
                 };
+                if has_bounded_residual && !unindexed_fragments.is_empty() {
+                    if !has_complete_hybrid_fts_coverage(
+                        &segments,
+                        &unindexed_fragments,
+                        target_fragments,
+                    ) {
+                        return Ok(None);
+                    }
+                    if segments.is_empty() {
+                        return Err(Error::internal(
+                            "hybrid compound FTS requires one indexed segment",
+                        ));
+                    }
+                    // Preserve the established semantic mismatch error before
+                    // constructing query-local postings with the same tokenizer.
+                    load_segment_details(&self.dataset, &column, &segments).await?;
+                }
 
                 if cross_column {
                     let details = futures::future::try_join_all(
@@ -4260,7 +4446,7 @@ impl Scanner {
                     }
                 }
 
-                Ok(Some((column, segments)))
+                Ok(Some((column, segments, unindexed_fragments)))
             }
         }))
         .await?;
@@ -4269,9 +4455,43 @@ impl Scanner {
         };
 
         if !cross_column {
-            let (_, segments) = segment_groups.into_iter().next().ok_or_else(|| {
-                Error::internal("compound scorer requires one column".to_string())
-            })?;
+            let (column, segments, unindexed_fragments) =
+                segment_groups.into_iter().next().ok_or_else(|| {
+                    Error::internal("compound scorer requires one column".to_string())
+                })?;
+            if allow_indexed_stats_residual && !unindexed_fragments.is_empty() {
+                let resolved =
+                    resolve_fts_field(self.dataset.schema(), &column, document_granularity)?;
+                let scan_column = if resolved.has_lists() {
+                    resolved.root_column.clone()
+                } else {
+                    resolved.canonical_path.clone()
+                };
+                let scan_projection = self
+                    .dataset
+                    .empty_projection()
+                    .with_row_id()
+                    .union_columns(&[scan_column], OnMissing::Error)?;
+                let PlannedFilteredScan { plan, .. } = self
+                    .filtered_read(
+                        &ExprFilterPlan::default(),
+                        scan_projection,
+                        /* make_deletions_null */ false,
+                        Some(Arc::new(unindexed_fragments)),
+                        None,
+                        /* is_prefilter */ true,
+                        None,
+                    )
+                    .await?;
+                return Ok(Some(Arc::new(HybridCompoundQueryExec::new(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    column,
+                    segments,
+                    plan,
+                ))));
+            }
             return Ok(Some(Arc::new(
                 CompoundQueryExec::new_with_segments(
                     self.dataset.clone(),
@@ -4284,6 +4504,32 @@ impl Scanner {
             )));
         }
 
+        let mut coverage_groups = segment_groups.iter();
+        let Some((_, _, first_unindexed_fragments)) = coverage_groups.next() else {
+            return Ok(None);
+        };
+        let first_unindexed_fragment_ids = first_unindexed_fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<RoaringBitmap>();
+        if coverage_groups.any(|(_, _, unindexed_fragments)| {
+            unindexed_fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect::<RoaringBitmap>()
+                != first_unindexed_fragment_ids
+        }) {
+            // The cross-column scorer builds one shared prefilter. If column
+            // coverage differs, that prefilter's union can re-admit stale
+            // postings from a fragment invalidated only for another column.
+            // Keep the field-local fallback, which preserves each column's
+            // own index domain.
+            return Ok(None);
+        }
+        let segment_groups = segment_groups
+            .into_iter()
+            .map(|(column, segments, _)| (column, segments))
+            .collect();
         let exec = CrossColumnCompoundQueryExec::new_with_segments(
             self.dataset.clone(),
             query.clone(),
@@ -4306,7 +4552,13 @@ impl Scanner {
         if !document_granularity.is_list_element()
             && supports_compound_scorer(query)
             && let Some(plan) = self
-                .plan_compound_scorer(query, params, prefilter_source, document_granularity)
+                .plan_compound_scorer(
+                    query,
+                    params,
+                    filter_plan,
+                    prefilter_source,
+                    document_granularity,
+                )
                 .await?
         {
             return Ok(plan);
@@ -4360,35 +4612,43 @@ impl Scanner {
                 let unlimited_params = params.clone().with_limit(None);
                 let can_use_bounded_compound =
                     !document_granularity.is_list_element() && params.limit.is_some();
-                let children =
-                    futures::future::try_join_all(query.match_queries.iter().map(|match_query| {
-                        let unlimited_params = &unlimited_params;
-                        async move {
-                            if can_use_bounded_compound {
-                                let child_query = FtsQuery::Match(match_query.clone());
-                                if let Some(plan) = self
-                                    .plan_compound_scorer(
-                                        &child_query,
-                                        params,
-                                        prefilter_source,
-                                        document_granularity,
-                                    )
-                                    .await?
-                                {
-                                    return Ok(plan);
+                let field_prefilter_sources =
+                    prefilter_source.shared_for_multimatch_fields(query.match_queries.len());
+                let children = futures::future::try_join_all(
+                    query
+                        .match_queries
+                        .iter()
+                        .zip(field_prefilter_sources.iter())
+                        .map(|(match_query, field_prefilter_source)| {
+                            let unlimited_params = &unlimited_params;
+                            async move {
+                                if can_use_bounded_compound {
+                                    let child_query = FtsQuery::Match(match_query.clone());
+                                    if let Some(plan) = self
+                                        .plan_compound_scorer(
+                                            &child_query,
+                                            params,
+                                            filter_plan,
+                                            field_prefilter_source,
+                                            document_granularity,
+                                        )
+                                        .await?
+                                    {
+                                        return Ok(plan);
+                                    }
                                 }
-                            }
 
-                            self.plan_match_query(
-                                match_query,
-                                unlimited_params,
-                                filter_plan,
-                                prefilter_source,
-                            )
-                            .await
-                        }
-                    }))
-                    .await?;
+                                self.plan_match_query(
+                                    match_query,
+                                    unlimited_params,
+                                    filter_plan,
+                                    field_prefilter_source,
+                                )
+                                .await
+                            }
+                        }),
+                )
+                .await?;
 
                 let schema = children[0].schema();
                 let group_expr = vec![(
@@ -5102,10 +5362,9 @@ impl Scanner {
             // from `covering_fields` either -- that is computed from a field older
             // writers drop, so it would widen to the carried columns exactly when the
             // declaration is lost.
-            else if let Some(index) = indices
-                .iter()
-                .find(|i| i.fields.first() == Some(&column_id))
-            {
+            else if let Some(index) = indices.iter().find(|i| {
+                i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
+            }) {
                 // Try to get metric type from index metadata first (fast path for newer indices)
                 let index_metric = if let Some(metric) =
                     crate::index::vector::details::metric_type_from_index_metadata(index)
@@ -5973,6 +6232,7 @@ impl Scanner {
             batch_readahead: self.batch_readahead,
             fragment_readahead: self.fragment_readahead,
             io_buffer_size: self.get_io_buffer_size(),
+            materialization_readahead_bytes: self.materialization_readahead_bytes,
             with_row_id,
             with_row_address,
             with_row_last_updated_at_version,
@@ -6628,6 +6888,22 @@ impl Scanner {
             if let Some(fragments) = &self.fragments {
                 read_options = read_options.with_fragments(Arc::new(fragments.clone()));
             }
+            read_options = read_options.with_threading_mode(
+                FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
+            );
+            if let Some(file_reader_options) = self.resolved_file_reader_options() {
+                read_options = read_options.with_file_reader_options(file_reader_options);
+            }
+            if let Some(fragment_readahead) = self.fragment_readahead {
+                read_options = read_options.with_fragment_readahead(fragment_readahead);
+            }
+            if let Some(io_buffer_size_bytes) = self.io_buffer_size {
+                read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
+            }
+            if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
+                read_options = read_options
+                    .with_materialization_readahead_bytes(materialization_readahead_bytes);
+            }
             return Ok(Arc::new(FilteredReadExec::try_new(
                 self.dataset.clone(),
                 read_options,
@@ -7155,6 +7431,28 @@ mod test {
     }
 
     #[test]
+    fn test_query_local_residual_row_bound() {
+        let fragment_with_rows = |id, physical_rows| {
+            let mut fragment = Fragment::new(id);
+            fragment.physical_rows = physical_rows;
+            fragment
+        };
+
+        assert!(has_bounded_query_local_residual_rows(&[
+            fragment_with_rows(0, Some(40_000)),
+            fragment_with_rows(1, Some(60_000)),
+        ]));
+        assert!(!has_bounded_query_local_residual_rows(&[
+            fragment_with_rows(0, Some(40_000)),
+            fragment_with_rows(1, Some(60_001)),
+        ]));
+        assert!(!has_bounded_query_local_residual_rows(&[
+            fragment_with_rows(0, Some(1)),
+            fragment_with_rows(1, None),
+        ]));
+    }
+
+    #[test]
     fn test_normalize_fts_zero_boosts_recurses_and_preserves_nonzero_values() {
         fn boost_bits(query: &FtsQuery) -> Vec<u32> {
             match query {
@@ -7209,6 +7507,69 @@ mod test {
         assert_eq!(boost_bits(&query), vec![nz, nz, nz, nz, b2, b3, nz, b4]);
         normalize_fts_zero_boosts(&mut query);
         assert_eq!(boost_bits(&query), vec![pz, pz, pz, pz, b2, b3, pz, b4]);
+    }
+
+    #[test]
+    fn test_dataset_planner_defers_auto_fuzziness_recursively() {
+        fn collect_fuzziness(query: &FtsQuery, values: &mut Vec<Option<u32>>) {
+            match query {
+                FtsQuery::Match(query) => values.push(query.fuzziness),
+                FtsQuery::Phrase(_) => {}
+                FtsQuery::Boost(query) => {
+                    collect_fuzziness(&query.positive, values);
+                    collect_fuzziness(&query.negative, values);
+                }
+                FtsQuery::MultiMatch(query) => {
+                    values.extend(query.match_queries.iter().map(|query| query.fuzziness));
+                }
+                FtsQuery::Boolean(query) => {
+                    for child in query
+                        .should
+                        .iter()
+                        .chain(&query.must)
+                        .chain(&query.must_not)
+                    {
+                        collect_fuzziness(child, values);
+                    }
+                }
+            }
+        }
+
+        let auto_match = |terms: &str| {
+            MatchQuery::new(terms.to_owned())
+                .with_fuzziness(None)
+                .into()
+        };
+        let mut multi_match = MultiMatchQuery::try_new(
+            "multi".to_owned(),
+            vec!["title".to_owned(), "body".to_owned()],
+        )
+        .unwrap();
+        multi_match.match_queries[0].fuzziness = None;
+        multi_match.match_queries[1].fuzziness = Some(1);
+        let boost = BoostQuery::new(
+            auto_match("positive"),
+            MatchQuery::new("negative".to_owned())
+                .with_fuzziness(Some(0))
+                .into(),
+            None,
+        );
+        let mut query: FtsQuery = BooleanQuery::new([
+            (Occur::Should, auto_match("root")),
+            (Occur::Must, FtsQuery::MultiMatch(multi_match)),
+            (Occur::MustNot, boost.into()),
+        ])
+        .into();
+
+        apply_dataset_planner_auto_fuzziness_compatibility_gate(&mut query);
+
+        let mut fuzziness = Vec::new();
+        collect_fuzziness(&query, &mut fuzziness);
+        assert_eq!(
+            fuzziness,
+            [Some(0), Some(0), Some(1), Some(0), Some(0)],
+            "AUTO must become exact without changing explicit fuzzy or exact leaves"
+        );
     }
 
     #[test]
@@ -8271,9 +8632,9 @@ mod test {
         // smaller scale): a large leading block of matches, a large gap of
         // non-matches, then a small trailing match. Single fragment.
         let batches = vec![
-            make_batch(0, 100_000, 7),
-            make_batch(100_000, 400_000, 1),
-            make_batch(500_000, 7_300, 7),
+            make_batch(0, 20_000, 7),
+            make_batch(20_000, 80_000, 1),
+            make_batch(100_000, 1_500, 7),
         ];
 
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -8307,7 +8668,7 @@ mod test {
         scan.project(&["id", "items"]).unwrap();
         scan.materialization_style(MaterializationStyle::AllEarlyExcept(vec![items_b_field_id]));
         let result = scan.try_into_batch().await.unwrap();
-        assert_eq!(result.num_rows(), 107_300);
+        assert_eq!(result.num_rows(), 21_500);
     }
 
     #[tokio::test]
@@ -8527,7 +8888,7 @@ mod test {
         // Make the store slow so that if we don't cancel the scan, it will take a loooong time.
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
-                wait_get_per_call: Duration::from_secs(1),
+                wait_get_per_call: Duration::from_millis(100),
                 ..Default::default()
             },
         });
@@ -8566,8 +8927,8 @@ mod test {
 
         // This test is a timing test, which is unfortunate, as it may be flaky.  I'm hoping
         // we have enough wiggle room here.  The failure case is 30s on my machine and the pass
-        // case is 2-3s.
-        assert!(duration < Duration::from_secs(10));
+        // case is a few hundred milliseconds.
+        assert!(duration < Duration::from_secs(3));
     }
 
     #[rstest]
@@ -11360,6 +11721,8 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
         #[values(false, true)] use_stable_row_ids: bool,
+        #[values(false, true)] use_index: bool,
+        #[values(false, true)] use_projection: bool,
     ) {
         let fixture = Box::pin(ScalarIndexTestFixture::new(
             data_storage_version,
@@ -11367,42 +11730,36 @@ mod test {
         ))
         .await;
 
-        for use_index in [false, true] {
-            for use_projection in [false, true] {
-                for use_deleted_data in [false, true] {
-                    for use_new_data in [false, true] {
-                        // Don't test compaction in conjunction with deletion and new data, it's too
-                        // many combinations with no clear benefit.  Feel free to update if there is
-                        // a need
-                        // TODO: enable compaction for stable row id once supported.
-                        let compaction_choices =
-                            if use_deleted_data || use_new_data || use_stable_row_ids {
-                                vec![false]
-                            } else {
-                                vec![false, true]
+        for use_deleted_data in [false, true] {
+            for use_new_data in [false, true] {
+                // Don't test compaction in conjunction with deletion and new data, it's too
+                // many combinations with no clear benefit.  Feel free to update if there is
+                // a need
+                // TODO: enable compaction for stable row id once supported.
+                let compaction_choices = if use_deleted_data || use_new_data || use_stable_row_ids {
+                    vec![false]
+                } else {
+                    vec![false, true]
+                };
+                for use_compaction in compaction_choices {
+                    let updated_choices = if use_deleted_data || use_new_data || use_compaction {
+                        vec![false]
+                    } else {
+                        vec![false, true]
+                    };
+                    for use_updated in updated_choices {
+                        for with_row_id in [false, true] {
+                            let params = ScalarTestParams {
+                                use_index,
+                                use_projection,
+                                use_deleted_data,
+                                use_new_data,
+                                with_row_id,
+                                use_compaction,
+                                use_updated,
                             };
-                        for use_compaction in compaction_choices {
-                            let updated_choices =
-                                if use_deleted_data || use_new_data || use_compaction {
-                                    vec![false]
-                                } else {
-                                    vec![false, true]
-                                };
-                            for use_updated in updated_choices {
-                                for with_row_id in [false, true] {
-                                    let params = ScalarTestParams {
-                                        use_index,
-                                        use_projection,
-                                        use_deleted_data,
-                                        use_new_data,
-                                        with_row_id,
-                                        use_compaction,
-                                        use_updated,
-                                    };
-                                    fixture.check_vector_queries(&params).await;
-                                    fixture.check_simple_queries(&params).await;
-                                }
-                            }
+                            fixture.check_vector_queries(&params).await;
+                            fixture.check_simple_queries(&params).await;
                         }
                     }
                 }
@@ -11467,7 +11824,7 @@ mod test {
             .col("ngram", array::rand_utf8(ByteCount::from(5), false))
             .col("exact", array::rand_type(&DataType::UInt32))
             .col("no_index", array::rand_type(&DataType::UInt32))
-            .into_reader_rows(RowCount::from(1000), BatchCount::from(5));
+            .into_reader_rows(RowCount::from(32), BatchCount::from(2));
 
         let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
         dataset
@@ -11530,6 +11887,82 @@ mod test {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fm_index_with_stable_row_ids() {
+        let batch = arrow_array::record_batch!(
+            (
+                "text",
+                Utf8,
+                [
+                    "alpha",
+                    "needle in first",
+                    "beta",
+                    "first needle suffix",
+                    "delta",
+                    "needle in second",
+                    "epsilon",
+                    "second needle suffix"
+                ]
+            ),
+            ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let write_params = WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://test_fm_index_with_stable_row_ids",
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm);
+        dataset
+            .create_index(&["text"], IndexType::Fm, None, &params, true)
+            .await
+            .unwrap();
+
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter("contains(text, 'needle')").unwrap();
+        let indexed_plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(
+            indexed_plan.contains("ScalarIndexQuery") && indexed_plan.contains("Fm"),
+            "expected the FM index in the plan, got:\n{indexed_plan}"
+        );
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+        let unindexed = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter("contains(text, 'needle')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let indexed_ids = indexed["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let unindexed_ids = unindexed["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(unindexed_ids, BTreeSet::from([1, 3, 5, 7]));
+        assert_eq!(indexed_ids, unindexed_ids);
     }
 
     #[tokio::test]
@@ -13054,7 +13487,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "memory://test",
             Some(WriteParams {
                 commit_handler: Some(Arc::new(RenameCommitHandler)),
-                data_storage_version: Some(LanceFileVersion::Stable),
+                data_storage_version: Some(LanceFileVersion::V2_1),
                 ..Default::default()
             }),
         )
@@ -13142,7 +13575,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "memory://test",
             Some(WriteParams {
                 commit_handler: Some(Arc::new(RenameCommitHandler)),
-                data_storage_version: Some(LanceFileVersion::Stable),
+                data_storage_version: Some(LanceFileVersion::V2_1),
                 ..Default::default()
             }),
         )
@@ -15697,6 +16130,43 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let filtered = find_filtered_read(plan.as_ref())
             .expect("expected a FilteredReadExec in the scan plan");
         assert_eq!(filtered.options().io_buffer_size_bytes, Some(7777));
+    }
+
+    #[tokio::test]
+    async fn test_materialization_readahead_bytes_propagated() {
+        let data = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(data, "memory://test_materialization_readahead_bytes", None)
+            .await
+            .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner.materialization_readahead_bytes(7777);
+        let plan = scanner.create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert_eq!(
+            filtered.options().materialization_readahead_bytes,
+            Some(7777)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zero_materialization_readahead_bytes_rejected() {
+        let data = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(data, "memory://test_zero_materialization_budget", None)
+            .await
+            .unwrap();
+        let mut scanner = dataset.scan();
+        scanner.materialization_readahead_bytes(0);
+        let err = scanner.create_plan().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("materialization_readahead_bytes must be greater than 0")
+        );
     }
 
     #[tokio::test]

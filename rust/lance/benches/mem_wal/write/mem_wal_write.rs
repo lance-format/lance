@@ -630,6 +630,9 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     observer: None,
                                     store_params: default_config.store_params,
                                     session: default_config.session,
+                                    // Measure the built-in per-shard valve, not
+                                    // an injected policy.
+                                    backpressure: None,
                                 };
 
                                 // Get writer through Dataset API (index configs loaded automatically)

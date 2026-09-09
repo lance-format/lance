@@ -191,9 +191,7 @@ impl TakeStream {
 
             if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
                 let row_id_array = row_id_array.as_primitive::<UInt64Type>();
-                Ok(Self::resolve_row_addrs(row_id_array, |id| {
-                    row_id_index.get(id).map(u64::from)
-                }))
+                Self::resolve_row_addrs(row_id_array, |id| Ok(row_id_index.get(id)?.map(u64::from)))
             } else {
                 let row_id_array = row_id_array.as_primitive::<UInt64Type>();
                 let fragments = row_id_array
@@ -205,9 +203,7 @@ impl TakeStream {
                     DatasetPreFilter::create_deletion_mask(self.dataset.clone(), fragments)
                 {
                     let mask = mask.await?;
-                    Ok(Self::resolve_row_addrs(row_id_array, |id| {
-                        mask.selected(id).then_some(id)
-                    }))
+                    Self::resolve_row_addrs(row_id_array, |id| Ok(mask.selected(id).then_some(id)))
                 } else {
                     Ok((Arc::new(row_id_array.clone()), None))
                 }
@@ -217,13 +213,13 @@ impl TakeStream {
 
     fn resolve_row_addrs(
         row_ids: &UInt64Array,
-        mut resolve: impl FnMut(u64) -> Option<u64>,
-    ) -> (Arc<dyn Array>, Option<BooleanArray>) {
+        mut resolve: impl FnMut(u64) -> Result<Option<u64>>,
+    ) -> Result<(Arc<dyn Array>, Option<BooleanArray>)> {
         let mut addresses = Vec::with_capacity(row_ids.len());
         let mut valid = Vec::with_capacity(row_ids.len());
 
         for id in row_ids.values().iter() {
-            if let Some(address) = resolve(*id) {
+            if let Some(address) = resolve(*id)? {
                 addresses.push(address);
                 valid.push(true);
             } else {
@@ -236,7 +232,7 @@ impl TakeStream {
         } else {
             None
         };
-        (Arc::new(UInt64Array::from(addresses)), mask)
+        Ok((Arc::new(UInt64Array::from(addresses)), mask))
     }
 
     async fn map_batch(

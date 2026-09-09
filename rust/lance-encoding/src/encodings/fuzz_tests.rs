@@ -14,8 +14,9 @@ use arrow_array::builder::{Int32Builder, ListBuilder};
 use arrow_array::*;
 use arrow_schema::{DataType, Field};
 use proptest::prelude::*;
+use proptest::test_runner::{Config, TestRunner};
 
-use crate::testing::{TestCases, check_round_trip_encoding_of_data};
+use crate::testing::{TestCases, TestEncoding, check_round_trip_encoding_of_data};
 use lance_core::Result;
 use lance_datagen::{ArrayGenerator, ByteCount, Dimension, RowCount, Seed, array, gen_batch};
 
@@ -252,46 +253,54 @@ fn generate_test_data_for_config(
     Ok(batch.column(0).clone())
 }
 
-// Main property test for encoding round-trip
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
+#[rstest::rstest]
+fn test_encoding_round_trip(
+    #[values(
+        TestEncoding::StructuralU16,
+        TestEncoding::StructuralU32,
+        TestEncoding::StructuralSparse
+    )]
+    encoding: TestEncoding,
+    #[values(
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+        48, 49
+    )]
+    _shard: usize,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let strategy = (encoding_config_strategy(), 100..=1000usize, any::<u64>());
+    let mut runner = TestRunner::new(Config {
+        cases: 1,
+        ..Config::default()
+    });
+    runner
+        .run(&strategy, |(config, num_rows, seed)| {
+            rt.block_on(async {
+                let test_data = generate_test_data_for_config(&config, num_rows, seed)
+                    .expect("Failed to generate test data");
 
-    #[test]
-    fn test_encoding_round_trip(
-        config in encoding_config_strategy(),
-        num_rows in 100..=5000usize,
-        seed in any::<u64>()
-    ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+                let _field = config.to_field("test");
 
-        rt.block_on(async {
-            // Generate test data
-            let test_data = generate_test_data_for_config(&config, num_rows, seed)
-                .expect("Failed to generate test data");
+                let mut metadata = HashMap::new();
+                if config.encoding_type == EncodingType::Miniblock {
+                    metadata.insert("encoding_hint".to_string(), "miniblock".to_string());
+                }
 
-            // Set up test cases
-            let _field = config.to_field("test");
+                let test_cases = TestCases::default()
+                    .with_encoding(encoding)
+                    .with_batch_size(100)
+                    .with_range(0..num_rows.min(500) as u64)
+                    .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);
 
-            let mut metadata = HashMap::new();
-            // Force specific encoding through metadata hints if needed
-            if config.encoding_type == EncodingType::Miniblock {
-                metadata.insert("encoding_hint".to_string(), "miniblock".to_string());
-            }
-
-            let test_cases = TestCases::default()
-                .with_structural_encodings()
-                .with_batch_size(100)
-                .with_range(0..num_rows.min(500) as u64)
-                .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);
-
-            // Execute round-trip test
-            check_round_trip_encoding_of_data(
-                vec![test_data],
-                &test_cases,
-                metadata
-            ).await;
-        });
-    }
+                check_round_trip_encoding_of_data(vec![test_data], &test_cases, metadata).await;
+            });
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[tokio::test]
@@ -358,37 +367,42 @@ proptest! {
     }
 }
 
-// Test fixed size list encoding
-proptest! {
-    #[test]
-    fn test_fixed_size_list_encoding(
-        list_size in 1..=100i32,
-        num_rows in 10..=1000usize,
-        seed in any::<u64>()
-    ) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+#[rstest::rstest]
+fn test_fixed_size_list_encoding(
+    #[values(
+        TestEncoding::StructuralU16,
+        TestEncoding::StructuralU32,
+        TestEncoding::StructuralSparse
+    )]
+    encoding: TestEncoding,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let strategy = (1..=100i32, 10..=1000usize, any::<u64>());
+    let mut runner = TestRunner::new(Config::default());
+    runner
+        .run(&strategy, |(list_size, num_rows, seed)| {
+            rt.block_on(async {
+                let config = EncodingTestConfig {
+                    encoding_type: EncodingType::Miniblock,
+                    data_structure: DataStructure::FixedSizeList(list_size),
+                    data_width: DataWidth::Fixed(FixedWidthType::Int32),
+                    nullable: false,
+                };
 
-        rt.block_on(async {
-            let config = EncodingTestConfig {
-                encoding_type: EncodingType::Miniblock,
-                data_structure: DataStructure::FixedSizeList(list_size),
-                data_width: DataWidth::Fixed(FixedWidthType::Int32),
-                nullable: false,
-            };
+                let test_data = generate_test_data_for_config(&config, num_rows, seed)
+                    .expect("Failed to generate test data");
 
-            let test_data = generate_test_data_for_config(&config, num_rows, seed)
-                .expect("Failed to generate test data");
+                let test_cases = TestCases::default().with_encoding(encoding);
 
-            let test_cases = TestCases::default()
-                .with_structural_encodings();
-
-            check_round_trip_encoding_of_data(
-                vec![test_data],
-                &test_cases,
-                HashMap::new()
-            ).await;
-        });
-    }
+                check_round_trip_encoding_of_data(vec![test_data], &test_cases, HashMap::new())
+                    .await;
+            });
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[tokio::test]

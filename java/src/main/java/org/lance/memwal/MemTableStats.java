@@ -31,6 +31,9 @@ public class MemTableStats {
   private final long pendingWalBatchCount;
   private final long pendingWalRowCount;
   private final long pendingWalEstimatedBytes;
+  private final long indexBytes;
+  private final long graceBytes;
+  private final long retainedBytes;
 
   public MemTableStats(
       long rowCount,
@@ -44,7 +47,10 @@ public class MemTableStats {
       Long pendingWalEndBatchPosition,
       long pendingWalBatchCount,
       long pendingWalRowCount,
-      long pendingWalEstimatedBytes) {
+      long pendingWalEstimatedBytes,
+      long indexBytes,
+      long graceBytes,
+      long retainedBytes) {
     this.rowCount = rowCount;
     this.batchCount = batchCount;
     this.estimatedSizeBytes = estimatedSizeBytes;
@@ -57,6 +63,9 @@ public class MemTableStats {
     this.pendingWalBatchCount = pendingWalBatchCount;
     this.pendingWalRowCount = pendingWalRowCount;
     this.pendingWalEstimatedBytes = pendingWalEstimatedBytes;
+    this.indexBytes = indexBytes;
+    this.graceBytes = graceBytes;
+    this.retainedBytes = retainedBytes;
   }
 
   /** Number of rows currently buffered in the active MemTable. */
@@ -69,7 +78,10 @@ public class MemTableStats {
     return batchCount;
   }
 
-  /** Estimated in-memory size of the active MemTable, in bytes. */
+  /**
+   * Row-data bytes of the active MemTable: the unit the flush trigger measures. Its in-memory
+   * indexes are reported separately by {@link #indexBytes()} and are <em>not</em> included here.
+   */
   public long estimatedSizeBytes() {
     return estimatedSizeBytes;
   }
@@ -122,6 +134,31 @@ public class MemTableStats {
     return pendingWalEstimatedBytes;
   }
 
+  /**
+   * Bytes held by the active MemTable's in-memory indexes, its primary-key bloom filter included.
+   * Usually what explains a shard near its ceiling with few rows in it: an HNSW graph is
+   * pre-allocated in full from the configured row capacity.
+   */
+  public long indexBytes() {
+    return indexBytes;
+  }
+
+  /**
+   * Bytes held by generations that have flushed but are lingering out the configured
+   * frozen-MemTable grace. Resident, but no flush reclaims them — the sweeper does, on a timer.
+   */
+  public long graceBytes() {
+    return graceBytes;
+  }
+
+  /**
+   * Every resident byte this shard holds. The figure a process-wide budget meters, as opposed to
+   * what a flush can still give back.
+   */
+  public long retainedBytes() {
+    return retainedBytes;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -137,6 +174,9 @@ public class MemTableStats {
         .add("pendingWalBatchCount", pendingWalBatchCount)
         .add("pendingWalRowCount", pendingWalRowCount)
         .add("pendingWalEstimatedBytes", pendingWalEstimatedBytes)
+        .add("indexBytes", indexBytes)
+        .add("graceBytes", graceBytes)
+        .add("retainedBytes", retainedBytes)
         .toString();
   }
 }

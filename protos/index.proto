@@ -55,9 +55,10 @@ message Tensor {
 
 // Inverted Index File Metadata.
 message IVF {
-  // Centroids of partitions. `dimension * num_partitions` of float32s.
-  //
-  // Deprecated, use centroids_tensor instead.
+  /* Centroids of partitions. `dimension * num_partitions` of float32s.
+   *
+   * Deprecated, use centroids_tensor instead.
+   */
   repeated float centroids = 1;  // [deprecated = true];
 
   // File offset of each partition.
@@ -171,13 +172,14 @@ message VectorIndex {
   // Vector dimension;
   uint32 dimension = 2;
 
-  // Composed vector index stages.
-  //
-  // For example, `IVF_PQ` index type can be expressed as:
-  //
-  // ```text
-  // let stages = vec![Ivf{}, PQ{num_bits: 8, num_sub_vectors: 16}]
-  // ```
+  /* Composed vector index stages.
+   *
+   * For example, `IVF_PQ` index type can be expressed as:
+   *
+   * ```text
+   * let stages = vec![Ivf{}, PQ{num_bits: 8, num_sub_vectors: 16}]
+   * ```
+   */
   repeated VectorIndexStage stages = 3;
 
   // Vector distance metrics type
@@ -188,8 +190,9 @@ message VectorIndex {
 message VectorIndexDetails {
   VectorMetricType metric_type = 1;
 
-  // The target number of vectors per partition.
-  // 0 means unset.
+  /* The target number of vectors per partition.
+   * 0 means unset.
+   */
   uint64 target_partition_size = 2;
 
   // Optional HNSW index configuration. If set, the index has an HNSW layer.
@@ -221,20 +224,23 @@ message VectorIndexDetails {
     FlatCompression flat = 8;
   }
 
-  // Runtime hints: optional build preferences that don't affect index structure.
-  // Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters", "lancedb.accelerator").
-  // Unrecognized keys must be silently ignored by all runtimes.
+  /* Runtime hints: optional build preferences that don't affect index structure.
+   * Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters", "lancedb.accelerator").
+   * Unrecognized keys must be silently ignored by all runtimes.
+   */
   map<string, string> runtime_hints = 9;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.
 message HnswParameters {
-  // The maximum number of outgoing edges per node in the HNSW graph. Higher values
-  // means more connections, better recall, but more memory and slower builds.
-  // Referred to as "M" in the HNSW literature.
+  /* The maximum number of outgoing edges per node in the HNSW graph. Higher values
+   * means more connections, better recall, but more memory and slower builds.
+   * Referred to as "M" in the HNSW literature.
+   */
   uint32 max_connections = 1;
-  // "construction exploration factor": The size of the dynamic list used during
-  // index construction.
+  /* "construction exploration factor": The size of the dynamic list used during
+   * index construction.
+   */
   uint32 construction_ef = 2;
   // The maximum number of levels in the HNSW graph.
   uint32 max_level = 3;

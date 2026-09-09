@@ -30,7 +30,10 @@ use lance_index::scalar::{
     BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
 };
 use lance_index::vector::{
-    bq::RQBuildParams, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+    bq::{RABIT_MAX_NUM_BITS, RABIT_MIN_NUM_BITS, RQBuildParams, validate_supported_rq_num_bits},
+    hnsw::builder::HnswBuildParams,
+    ivf::IvfBuildParams,
+    pq::PQBuildParams,
     sq::builder::SQBuildParams,
 };
 use lance_index::{IndexType, is_system_index};
@@ -49,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
 use crate::context::DynamicContextProvider;
+use crate::merge_insert_on_columns;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
@@ -80,6 +84,7 @@ use lance_namespace::models::{
     UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
 
+use lance_core::utils::parse::str_to_bool;
 use lance_core::{Error, Result, box_error};
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
@@ -498,31 +503,31 @@ impl DirectoryNamespaceBuilder {
         // Extract manifest_enabled (default: true)
         let manifest_enabled = properties
             .get("manifest_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
         // Extract dir_listing_enabled (default: true)
         let dir_listing_enabled = properties
             .get("dir_listing_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
         // Extract inline_optimization_enabled (default: true)
         let inline_optimization_enabled = properties
             .get("inline_optimization_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(true);
 
         // Extract table_version_tracking_enabled (default: false)
         let table_version_tracking_enabled = properties
             .get("table_version_tracking_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         // Extract dir_listing_to_manifest_migration_enabled (default: false)
         let dir_listing_to_manifest_migration_enabled = properties
             .get("dir_listing_to_manifest_migration_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         // Extract credential vendor properties (properties prefixed with "credential_vendor.")
@@ -543,7 +548,7 @@ impl DirectoryNamespaceBuilder {
         // Extract vend_input_storage_options (default: false)
         let vend_input_storage_options = properties
             .get("vend_input_storage_options")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         // Extract vend_input_storage_options_refresh_interval_millis (optional)
@@ -554,7 +559,7 @@ impl DirectoryNamespaceBuilder {
         // Extract ops_metrics_enabled (default: false)
         let ops_metrics_enabled = properties
             .get("ops_metrics_enabled")
-            .and_then(|v| v.parse::<bool>().ok())
+            .and_then(|v| str_to_bool(v))
             .unwrap_or(false);
 
         Ok(Self {
@@ -1920,63 +1925,92 @@ impl DirectoryNamespace {
         limit: Option<i32>,
     ) -> Result<Vec<TableVersion>> {
         let versions_dir = table_path.clone().join(VERSIONS_DIR);
-        let manifest_metas: Vec<_> = self
-            .object_store
-            .read_dir_all(&versions_dir, None)
-            .try_collect()
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to list manifest files under '{}': {}",
-                        versions_dir, e
-                    ),
-                })
-            })?;
-
-        let is_v2_naming = manifest_metas
-            .first()
-            .is_some_and(|meta| meta.location.filename().is_some_and(|f| f.len() == 29));
-
-        let mut table_versions: Vec<TableVersion> = manifest_metas
-            .into_iter()
-            .filter_map(|meta| {
-                let filename = meta.location.filename()?;
-                let actual_version = Self::manifest_version_from_filename(filename)?;
-
-                Some(TableVersion {
-                    version: actual_version as i64,
-                    manifest_path: meta.location.to_string(),
-                    manifest_size: Some(meta.size as i64),
-                    e_tag: meta.e_tag,
-                    timestamp_millis: Some(meta.last_modified.timestamp_millis()),
-                    metadata: None,
-                })
+        let mut stream = self.object_store.read_dir_all(&versions_dir, None);
+        let list_err = |e: lance_core::Error| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to list manifest files under '{}': {}",
+                    versions_dir, e
+                ),
             })
-            .collect();
+        };
 
-        let list_is_ordered = self.object_store.list_is_lexically_ordered;
+        let limit = limit
+            .filter(|limit| *limit >= 0)
+            .map(|limit| limit as usize);
 
-        let needs_sort = if list_is_ordered {
-            if is_v2_naming {
-                !descending
-            } else {
-                descending
-            }
-        } else {
+        let mut table_versions: Vec<TableVersion> = Vec::new();
+        let push_meta = |meta: ObjectMeta, out: &mut Vec<TableVersion>| -> bool {
+            let Some(filename) = meta.location.filename() else {
+                return false;
+            };
+            let Some(actual_version) = Self::manifest_version_from_filename(filename) else {
+                return false;
+            };
+            out.push(TableVersion {
+                version: actual_version as i64,
+                manifest_path: meta.location.to_string(),
+                manifest_size: Some(meta.size as i64),
+                e_tag: meta.e_tag,
+                timestamp_millis: Some(meta.last_modified.timestamp_millis()),
+                metadata: None,
+            });
             true
         };
 
-        if needs_sort {
+        // Detect the naming scheme from the first committed manifest, not the
+        // first raw entry: retained staging blobs (`{manifest}-<uuid>`) sort
+        // ahead of it and would misclassify the stream as non-V2. V2 filenames
+        // are a fixed 29 chars (`{u64::MAX - version:020}.manifest`).
+        let mut first_manifest_filename_len = None;
+        while first_manifest_filename_len.is_none() {
+            match stream.try_next().await.map_err(list_err)? {
+                Some(meta) => {
+                    let filename_len = meta.location.filename().map(|f| f.len());
+                    if push_meta(meta, &mut table_versions) {
+                        first_manifest_filename_len = filename_len;
+                    }
+                }
+                None => break,
+            }
+        }
+        let is_v2_naming = first_manifest_filename_len == Some(29);
+
+        // V2 filenames invert the version, so a lexically-ordered stream
+        // arrives newest-first; when that matches the requested order, stop
+        // after `limit` manifests instead of paginating the whole directory
+        // (the `get_latest_version` hot path: descending, limit 1).
+        let list_is_ordered = self.object_store.list_is_lexically_ordered;
+        let stream_matches_request = list_is_ordered
+            && if is_v2_naming {
+                descending
+            } else {
+                !descending
+            };
+        let early_stop_at = limit.filter(|_| stream_matches_request);
+
+        while early_stop_at.is_none_or(|n| table_versions.len() < n) {
+            match stream.try_next().await.map_err(list_err)? {
+                Some(meta) => {
+                    push_meta(meta, &mut table_versions);
+                }
+                None => break,
+            }
+        }
+
+        // Scheme detection pushes the first manifest regardless of the limit,
+        // so re-enforce the limit on both paths (covers limit=0).
+        if let Some(n) = early_stop_at {
+            table_versions.truncate(n);
+        } else {
             if descending {
                 table_versions.sort_by_key(|v| std::cmp::Reverse(v.version));
             } else {
                 table_versions.sort_by_key(|v| v.version);
             }
-        }
-
-        if let Some(limit) = limit {
-            table_versions.truncate(limit as usize);
+            if let Some(limit) = limit {
+                table_versions.truncate(limit);
+            }
         }
 
         Ok(table_versions)
@@ -2424,14 +2458,30 @@ impl DirectoryNamespace {
                     SQBuildParams::default(),
                 ),
             },
-            IndexType::IvfRq => DirectoryIndexParams::Vector {
-                index_type,
-                params: VectorIndexParams::with_ivf_rq_params(
-                    Self::parse_metric_type(request.distance_type.as_deref())?,
-                    IvfBuildParams::default(),
-                    RQBuildParams::default(),
-                ),
-            },
+            IndexType::IvfRq => {
+                let rq_params = if let Some(requested_num_bits) = request.num_bits {
+                    let invalid_num_bits = || NamespaceError::InvalidInput {
+                        message: format!(
+                            "IVF_RQ num_bits must be in {}..={}, got {}",
+                            RABIT_MIN_NUM_BITS, RABIT_MAX_NUM_BITS, requested_num_bits
+                        ),
+                    };
+                    let num_bits =
+                        u8::try_from(requested_num_bits).map_err(|_| invalid_num_bits())?;
+                    validate_supported_rq_num_bits(num_bits).map_err(|_| invalid_num_bits())?;
+                    RQBuildParams::new(num_bits)
+                } else {
+                    RQBuildParams::default()
+                };
+                DirectoryIndexParams::Vector {
+                    index_type,
+                    params: VectorIndexParams::with_ivf_rq_params(
+                        Self::parse_metric_type(request.distance_type.as_deref())?,
+                        IvfBuildParams::default(),
+                        rq_params,
+                    ),
+                }
+            }
             IndexType::IvfHnswFlat => DirectoryIndexParams::Vector {
                 index_type,
                 params: VectorIndexParams::ivf_hnsw(
@@ -5066,11 +5116,7 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<MergeInsertIntoTableResponse> {
         self.record_op("merge_insert_into_table");
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let on = request.on.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "'on' field is required for merge_insert_into_table".to_string(),
-            })
-        })?;
+        let on = merge_insert_on_columns(request.on.as_deref(), "merge_insert_into_table")?;
 
         let table_has_manifests = self.table_uri_has_actual_manifests(&table_uri).await?;
         let (reader, num_rows) =
@@ -5096,8 +5142,8 @@ impl LanceNamespace for DirectoryNamespace {
                 .await?,
         );
 
-        let mut merge_builder = MergeInsertBuilder::try_new(dataset.clone(), vec![on.clone()])
-            .map_err(|e| {
+        let mut merge_builder =
+            MergeInsertBuilder::try_new(dataset.clone(), on.to_vec()).map_err(|e| {
                 lance_core::Error::from(NamespaceError::InvalidInput {
                     message: format!("Failed to create merge_insert_into_table builder: {}", e),
                 })
@@ -6075,6 +6121,55 @@ fn build_engine_match_query(
 mod tests {
     use super::*;
     use arrow_ipc::reader::{FileReader, StreamReader};
+    use lance::index::vector::StageParams;
+    use rstest::rstest;
+
+    fn build_ivf_rq_num_bits(num_bits: Option<i32>) -> Result<u8> {
+        let mut request = CreateTableIndexRequest::new("vector".to_string(), "IVF_RQ".to_string());
+        request.num_bits = num_bits;
+
+        let DirectoryIndexParams::Vector {
+            index_type: IndexType::IvfRq,
+            params,
+        } = DirectoryNamespace::build_index_params(&request)?
+        else {
+            panic!("expected IVF_RQ vector index params");
+        };
+        match params.stages.as_slice() {
+            [StageParams::Ivf(_), StageParams::RQ(rq)] => Ok(rq.num_bits),
+            stages => panic!("expected IVF and RQ stages, got {stages:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::omitted(None, 5)]
+    #[case::explicit_one(Some(1), 1)]
+    #[case::explicit_max(Some(9), 9)]
+    fn test_build_index_params_ivf_rq_num_bits(
+        #[case] requested: Option<i32>,
+        #[case] expected: u8,
+    ) {
+        assert_eq!(build_ivf_rq_num_bits(requested).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::negative(-1)]
+    #[case::zero(0)]
+    #[case::above_max(10)]
+    #[case::conversion_overflow(i32::MAX)]
+    fn test_build_index_params_rejects_invalid_ivf_rq_num_bits(#[case] requested: i32) {
+        let error = build_ivf_rq_num_bits(Some(requested))
+            .expect_err("invalid IVF_RQ num_bits should fail");
+        let message = error.to_string();
+
+        assert_eq!(mutation_error_code(error), ErrorCode::InvalidInput);
+        assert!(
+            message.contains(&format!(
+                "IVF_RQ num_bits must be in 1..=9, got {requested}"
+            )),
+            "unexpected error message: {message}"
+        );
+    }
 
     #[test]
     fn test_build_engine_fts_query_match() {
@@ -6295,6 +6390,250 @@ mod tests {
             .await
             .unwrap();
         (namespace, temp_dir)
+    }
+
+    /// The early-stop path (ordered stores) and the collect-then-sort path
+    /// must return the same results for every descending/limit combination.
+    #[tokio::test]
+    async fn test_list_versions_under_ordering_and_limit() {
+        use lance_table::io::commit::ManifestNamingScheme;
+
+        async fn seed_and_check(ns: &DirectoryNamespace) {
+            let table_path = ns.base_path.clone().join("lv_test.lance");
+            for v in 1..=7u64 {
+                let p = ManifestNamingScheme::V2.manifest_path(&table_path, v);
+                ns.object_store.put(&p, b"m".as_slice()).await.unwrap();
+            }
+            // A retained staging blob (sorts ahead of every committed
+            // manifest) and a detached manifest (sorts after) must be excluded
+            // without breaking naming-scheme detection.
+            let staging = Path::parse(format!(
+                "{}-cee4fbbb-eb19-4ea3-8ca7-54f5ec33dedc",
+                ManifestNamingScheme::V2.manifest_path(&table_path, 8)
+            ))
+            .unwrap();
+            ns.object_store
+                .put(&staging, b"s".as_slice())
+                .await
+                .unwrap();
+            let detached = table_path.clone().join(VERSIONS_DIR).join("d123.manifest");
+            ns.object_store
+                .put(&detached, b"d".as_slice())
+                .await
+                .unwrap();
+            fn versions(r: &[TableVersion]) -> Vec<i64> {
+                r.iter().map(|t| t.version).collect()
+            }
+
+            let got = ns
+                .list_versions_under(&table_path, true, Some(1))
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![7]);
+            let got = ns
+                .list_versions_under(&table_path, true, Some(3))
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![7, 6, 5]);
+
+            let got = ns
+                .list_versions_under(&table_path, false, Some(2))
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![1, 2]);
+
+            let got = ns
+                .list_versions_under(&table_path, true, None)
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
+            let got = ns
+                .list_versions_under(&table_path, false, None)
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![1, 2, 3, 4, 5, 6, 7]);
+
+            let got = ns
+                .list_versions_under(&table_path, true, Some(0))
+                .await
+                .unwrap();
+            assert!(got.is_empty());
+            let got = ns
+                .list_versions_under(&table_path, true, Some(100))
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
+
+            // Negative limits are ignored, matching `apply_pagination`.
+            let got = ns
+                .list_versions_under(&table_path, true, Some(-1))
+                .await
+                .unwrap();
+            assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
+        }
+
+        let ns_mem = DirectoryNamespaceBuilder::new("memory://lv-test")
+            .build()
+            .await
+            .unwrap();
+        assert!(ns_mem.object_store.list_is_lexically_ordered);
+        seed_and_check(&ns_mem).await;
+
+        let (ns_fs, _tmp) = create_test_namespace().await;
+        assert!(!ns_fs.object_store.list_is_lexically_ordered);
+        seed_and_check(&ns_fs).await;
+    }
+
+    /// A retained staging blob sorts ahead of the newest committed manifest;
+    /// if scheme detection reads it, the `descending, limit=1` hot path falls
+    /// back to consuming the whole directory. Asserts the consumption bound.
+    #[tokio::test]
+    async fn test_list_versions_under_early_stop_bounded_consumption() {
+        use lance_io::object_store::providers::memory::MemoryStoreProvider;
+        use lance_table::io::commit::ManifestNamingScheme;
+
+        #[derive(Debug)]
+        struct EntryCountingStore {
+            target: Arc<dyn OSObjectStore>,
+            entries_listed: Arc<AtomicUsize>,
+        }
+
+        impl std::fmt::Display for EntryCountingStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "EntryCountingStore({})", self.target)
+            }
+        }
+
+        #[async_trait]
+        impl OSObjectStore for EntryCountingStore {
+            async fn put_opts(
+                &self,
+                location: &Path,
+                bytes: PutPayload,
+                opts: PutOptions,
+            ) -> OSResult<PutResult> {
+                self.target.put_opts(location, bytes, opts).await
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: PutMultipartOptions,
+            ) -> OSResult<Box<dyn MultipartUpload>> {
+                self.target.put_multipart_opts(location, opts).await
+            }
+
+            async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+                self.target.get_opts(location, options).await
+            }
+
+            fn delete_stream(
+                &self,
+                locations: BoxStream<'static, OSResult<Path>>,
+            ) -> BoxStream<'static, OSResult<Path>> {
+                self.target.delete_stream(locations)
+            }
+
+            fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+                let entries_listed = self.entries_listed.clone();
+                self.target
+                    .list(prefix)
+                    .inspect(move |_| {
+                        entries_listed.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .boxed()
+            }
+
+            async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+                self.target.list_with_delimiter(prefix).await
+            }
+
+            async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+                self.target.copy_opts(from, to, opts).await
+            }
+        }
+
+        #[derive(Debug)]
+        struct EntryCountingMemoryProvider {
+            entries_listed: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl lance_io::object_store::ObjectStoreProvider for EntryCountingMemoryProvider {
+            async fn new_store(
+                &self,
+                base_path: Url,
+                params: &ObjectStoreParams,
+            ) -> Result<ObjectStore> {
+                let mut store = MemoryStoreProvider.new_store(base_path, params).await?;
+                store.inner = Arc::new(EntryCountingStore {
+                    target: store.inner.clone(),
+                    entries_listed: self.entries_listed.clone(),
+                });
+                Ok(store)
+            }
+
+            fn extract_path(&self, url: &Url) -> Result<Path> {
+                MemoryStoreProvider.extract_path(url)
+            }
+
+            fn calculate_object_store_prefix(
+                &self,
+                url: &Url,
+                storage_options: Option<&HashMap<String, String>>,
+            ) -> Result<String> {
+                MemoryStoreProvider.calculate_object_store_prefix(url, storage_options)
+            }
+        }
+
+        let entries_listed = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        registry.insert(
+            "memory-object-store",
+            Arc::new(EntryCountingMemoryProvider {
+                entries_listed: entries_listed.clone(),
+            }),
+        );
+        let session = Arc::new(Session::new(0, 0, registry));
+        let ns = DirectoryNamespaceBuilder::new("memory-object-store://lv-count")
+            .session(session)
+            .build()
+            .await
+            .unwrap();
+        assert!(ns.object_store.list_is_lexically_ordered);
+
+        let table_path = ns.base_path.clone().join("lv_count.lance");
+        for v in 1..=100u64 {
+            let p = ManifestNamingScheme::V2.manifest_path(&table_path, v);
+            ns.object_store.put(&p, b"m".as_slice()).await.unwrap();
+        }
+        // Sorts ahead of every committed manifest: the first raw entry.
+        let staging = Path::parse(format!(
+            "{}-cee4fbbb-eb19-4ea3-8ca7-54f5ec33dedc",
+            ManifestNamingScheme::V2.manifest_path(&table_path, 101)
+        ))
+        .unwrap();
+        ns.object_store
+            .put(&staging, b"s".as_slice())
+            .await
+            .unwrap();
+
+        let consumed_before = entries_listed.load(Ordering::SeqCst);
+        let got = ns
+            .list_versions_under(&table_path, true, Some(1))
+            .await
+            .unwrap();
+        let consumed = entries_listed.load(Ordering::SeqCst) - consumed_before;
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].version, 100);
+        assert_eq!(
+            consumed, 2,
+            "latest-version query must consume only the staging entry plus the \
+             first committed manifest, not the whole directory (consumed {} of \
+             101 entries)",
+            consumed
+        );
     }
 
     #[derive(Debug)]
@@ -11042,7 +11381,7 @@ mod tests {
 
         let mut merge_req = MergeInsertIntoTableRequest::new();
         merge_req.id = Some(vec!["test_table".to_string()]);
-        merge_req.on = Some("id".to_string());
+        merge_req.on = Some(vec!["id".to_string()]);
         let response = namespace
             .merge_insert_into_table(
                 merge_req,
@@ -11093,7 +11432,7 @@ mod tests {
 
         let mut merge_req = MergeInsertIntoTableRequest::new();
         merge_req.id = Some(vec!["test_table".to_string()]);
-        merge_req.on = Some("id".to_string());
+        merge_req.on = Some(vec!["id".to_string()]);
         let response = namespace
             .merge_insert_into_table(
                 merge_req,
@@ -11118,6 +11457,244 @@ mod tests {
         assert_eq!(
             namespace.list_tables(list_req).await.unwrap().tables,
             vec!["test_table".to_string()]
+        );
+    }
+
+    /// `(region, id, value)` rows, for merge inserts keyed on `region` + `id`.
+    ///
+    /// `region` is nullable so tests can cover a NULL in one half of the key.
+    fn create_composite_key_ipc_data(rows: &[(Option<&str>, i32, &str)]) -> Vec<u8> {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter(
+                    rows.iter().map(|(region, _, _)| *region),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    rows.iter().map(|(_, id, _)| *id),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    rows.iter().map(|(_, _, value)| *value),
+                )),
+            ],
+        )
+        .unwrap();
+        create_ipc_data_from_batches(schema, vec![batch])
+    }
+
+    /// `test_table`'s rows as `(region, id, value)`, sorted for a stable comparison.
+    async fn read_composite_key_rows(root: &str) -> Vec<(Option<String>, i32, String)> {
+        use arrow::array::Array;
+
+        let dataset = Dataset::open(&format!("{}/test_table.lance", root))
+            .await
+            .unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let regions = batch["region"]
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let ids = batch["id"]
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        let values = batch["value"]
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        let mut rows: Vec<_> = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    regions
+                        .is_valid(row)
+                        .then(|| regions.value(row).to_string()),
+                    ids.value(row),
+                    values.value(row).to_string(),
+                )
+            })
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_matches_on_every_column_of_a_composite_key() {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let seed = create_composite_key_ipc_data(&[
+            (Some("us"), 1, "a"),
+            (Some("us"), 2, "b"),
+            (Some("eu"), 1, "c"),
+        ]);
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        namespace
+            .merge_insert_into_table(merge_req, bytes::Bytes::from(seed))
+            .await
+            .unwrap();
+
+        // ("us", 1) matches an existing row; ("eu", 2) matches nothing even though a row
+        // with region "eu" and a row with id 2 both exist.
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        merge_req.when_matched_update_all = Some(true);
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[
+                    (Some("us"), 1, "updated"),
+                    (Some("eu"), 2, "inserted"),
+                ])),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.num_updated_rows, Some(1));
+        assert_eq!(response.num_inserted_rows, Some(1));
+
+        assert_eq!(
+            read_composite_key_rows(temp_path).await,
+            vec![
+                // ("eu", 1) keeps its value: matching on `id` alone would have clobbered it.
+                (Some("eu".into()), 1, "c".into()),
+                (Some("eu".into()), 2, "inserted".into()),
+                (Some("us".into()), 1, "updated".into()),
+                (Some("us".into()), 2, "b".into()),
+            ]
+        );
+    }
+
+    /// Core switches NULL join semantics on the arity of the match key
+    /// (`merge_insert.rs`, `NullEquality`): a single-column key treats NULL as equal to
+    /// NULL, while a composite key uses standard SQL equality, under which it is not. So
+    /// adding a second key column changes whether NULL-keyed rows match at all.
+    #[tokio::test]
+    async fn test_merge_insert_composite_key_never_matches_a_null_key_column() {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[
+                    (None, 1, "seeded"),
+                    (Some("us"), 1, "us-seeded"),
+                ])),
+            )
+            .await
+            .unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        merge_req.when_matched_update_all = Some(true);
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[(None, 1, "not-a-match")])),
+            )
+            .await
+            .unwrap();
+
+        // The incoming row is byte-identical to the seeded one, and still does not match.
+        assert_eq!(response.num_updated_rows, Some(0));
+        assert_eq!(response.num_inserted_rows, Some(1));
+
+        assert_eq!(
+            read_composite_key_rows(temp_path).await,
+            vec![
+                (None, 1, "not-a-match".into()),
+                (None, 1, "seeded".into()),
+                (Some("us".into()), 1, "us-seeded".into()),
+            ]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing(None, "'on' field is required")]
+    #[case::empty(Some(vec![]), "must name at least one column")]
+    #[case::duplicate(
+        Some(vec!["region".to_string(), "region".to_string()]),
+        "names column 'region' more than once"
+    )]
+    #[tokio::test]
+    async fn test_merge_insert_rejects_an_invalid_on_key(
+        #[case] on: Option<Vec<String>>,
+        #[case] expected_message: &str,
+    ) {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = on;
+        let error = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[(Some("us"), 1, "a")])),
+            )
+            .await
+            .unwrap_err();
+
+        let lance_core::Error::Namespace { source, .. } = &error else {
+            panic!("expected a Namespace error, got: {}", error);
+        };
+        let ns_err = source
+            .downcast_ref::<NamespaceError>()
+            .expect("expected a NamespaceError source");
+        assert_eq!(ns_err.code(), lance_namespace::ErrorCode::InvalidInput);
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error message: {error}"
         );
     }
 

@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::Fragment;
-use crate::feature_flags::FLAG_COVERED_INDEX_METADATA;
+use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_PAIRED_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -219,8 +219,8 @@ impl Manifest {
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
-            reader_feature_flags: 0, // These will be set on commit
-            writer_feature_flags: 0, // These will be set on commit
+            reader_feature_flags: previous.reader_feature_flags & STICKY_PAIRED_FLAGS,
+            writer_feature_flags: previous.writer_feature_flags & STICKY_PAIRED_FLAGS,
             max_fragment_id: previous.max_fragment_id,
             transaction_file: None,
             transaction_section: None,
@@ -283,8 +283,12 @@ impl Manifest {
             // covering could then open it and read carried columns as keyed ones.
             // Kept unconditionally rather than derived from the cloned indexes:
             // over-fencing a clone is harmless, under-fencing one is not.
-            reader_feature_flags: self.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
-            writer_feature_flags: self.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            // Sticky capabilities are also retained because the clone keeps the
+            // source file identities that require them.
+            reader_feature_flags: self.reader_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
+            writer_feature_flags: self.writer_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_PAIRED_FLAGS),
             max_fragment_id: self.max_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,

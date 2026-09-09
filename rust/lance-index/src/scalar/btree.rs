@@ -3377,7 +3377,12 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         )?))
     }
 
-    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
+    async fn put_in_cache(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        cache: &LanceCache,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
         let state = BTreeIndexState::from_index(index.as_ref())?;
         cache
             .insert_with_key(&BTreeIndexStateKey, Arc::new(state))
@@ -5146,7 +5151,10 @@ mod tests {
         assert_eq!(original_data, remapped_data);
     }
 
+    // Spill-enabled index builds share the cached DataFusion memory pool within the
+    // test process, so keep them in one resource group.
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_update_ranged_index() {
         // Setup stores for both indexes
         let old_tmpdir = TempObjDir::default();
@@ -5297,6 +5305,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_update_with_exact_row_id_filter() {
         let old_tmpdir = TempObjDir::default();
         let old_store = Arc::new(LanceIndexStore::new(
@@ -6365,7 +6374,10 @@ mod tests {
         // The plugin's put/get hooks round-trip through a real cache + the codec.
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let plugin = BTreeIndexPlugin;
-        plugin.put_in_cache(&cache, index.clone()).await.unwrap();
+        plugin
+            .put_in_cache(test_store.clone(), &cache, index.clone())
+            .await
+            .unwrap();
         let from_cache = plugin
             .get_from_cache(test_store.clone(), None, &cache)
             .await
@@ -6570,7 +6582,10 @@ mod tests {
 
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
         let plugin = BTreeIndexPlugin;
-        plugin.put_in_cache(&cache, index.clone()).await.unwrap();
+        plugin
+            .put_in_cache(store.clone(), &cache, index.clone())
+            .await
+            .unwrap();
         let from_cache = plugin
             .get_from_cache(store.clone(), None, &cache)
             .await

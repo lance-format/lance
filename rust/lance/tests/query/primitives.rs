@@ -6,18 +6,20 @@ use std::sync::Arc;
 use arrow::datatypes::*;
 use arrow_array::{
     ArrayRef, BinaryArray, BinaryViewArray, Float32Array, Float64Array, Int32Array,
-    LargeBinaryArray, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+    LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
+    StringViewArray,
 };
 use arrow_schema::DataType;
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
-use lance::dataset::{InsertBuilder, WriteParams};
+use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
 
 use lance::index::DatasetIndexExt;
 use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_batch};
 use lance_index::IndexType;
+use lance_index::scalar::ScalarIndexParams;
 
-use super::{test_filter, test_scan, test_take};
+use super::{assert_filter_ids, test_filter, test_scan, test_take};
 use crate::utils::DatasetTestCases;
 
 #[tokio::test]
@@ -172,6 +174,9 @@ async fn test_query_float(#[case] data_type: DataType) {
 
 #[tokio::test]
 #[rstest::rstest]
+// Float16 is missing on purpose: `safe_coerce_scalar` has no Float16 arm, so
+// `value < 0.0` against a Float16 column fails to resolve the literal long before
+// any of this matters. See rust/lance-datafusion/src/expr.rs.
 #[case::float32(DataType::Float32)]
 #[case::float64(DataType::Float64)]
 async fn test_query_float_special_values(#[case] data_type: DataType) {
@@ -223,15 +228,142 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
         .run(|ds: Dataset, original: RecordBatch| async move {
             test_scan(&original, &ds).await;
             test_take(&original, &ds).await;
-            test_filter(&original, &ds, "value > 0.0").await;
-            test_filter(&original, &ds, "value < 0.0").await;
-            test_filter(&original, &ds, "value = 0.0").await;
             test_filter(&original, &ds, "value is null").await;
             test_filter(&original, &ds, "value is not null").await;
             test_filter(&original, &ds, "isnan(value)").await;
             test_filter(&original, &ds, "not isnan(value)").await;
+
+            // The remaining predicates compare against zero, where DataFusion
+            // 54 answers by Arrow's total order: it ranks `-0.0` below `+0.0`
+            // instead of treating the two encodings as one number the way
+            // IEEE 754 and SQL do. That makes it useless as the reference, so
+            // assert the rows. Ids are 0: +0.0, 1: -0.0, 2: +inf, 3: -inf,
+            // 4: NaN, 5: 1.0, 6: -1.0, 7: MIN, 8: MAX, 9: NULL.
+            for zero in ["0.0", "-0.0"] {
+                assert_filter_ids(&ds, &format!("value < {zero}"), &[3, 6, 7]).await;
+                assert_filter_ids(&ds, &format!("value <= {zero}"), &[0, 1, 3, 6, 7]).await;
+                assert_filter_ids(&ds, &format!("value = {zero}"), &[0, 1]).await;
+                assert_filter_ids(&ds, &format!("value != {zero}"), &[2, 3, 4, 5, 6, 7, 8]).await;
+                // NaN is row 4. Arrow sorts it above every other value, so it
+                // survives `>` and `>=`, which IEEE would reject. That gap is
+                // not specific to zero and this rewrite leaves it alone.
+                assert_filter_ids(&ds, &format!("value > {zero}"), &[2, 4, 5, 8]).await;
+                assert_filter_ids(&ds, &format!("value >= {zero}"), &[0, 1, 2, 4, 5, 8]).await;
+                // A literal on the left. DataFusion's canonicalizer swaps it back
+                // before the rewrite runs, so this pins the answer rather than the
+                // mirroring branch, which `a_literal_on_the_left_mirrors_the_operator`
+                // owns and which SQL reaches only when the other side is not a
+                // bare column.
+                assert_filter_ids(&ds, &format!("{zero} > value"), &[3, 6, 7]).await;
+                // BETWEEN only works because the simplifier expands it into two
+                // comparisons before the rewrite runs.
+                assert_filter_ids(&ds, &format!("value BETWEEN {zero} AND {zero}"), &[0, 1]).await;
+                assert_filter_ids(
+                    &ds,
+                    &format!("value NOT BETWEEN {zero} AND {zero}"),
+                    &[2, 3, 4, 5, 6, 7, 8],
+                )
+                .await;
+                // An IN list gains the encoding it does not spell out.
+                assert_filter_ids(&ds, &format!("value IN ({zero}, 1.0)"), &[0, 1, 5]).await;
+                assert_filter_ids(
+                    &ds,
+                    &format!("value NOT IN ({zero}, 1.0)"),
+                    &[2, 3, 4, 6, 7, 8],
+                )
+                .await;
+                // Composed with NULL logic, where this index layer has broken before.
+                assert_filter_ids(
+                    &ds,
+                    &format!("value != {zero} OR value IS NULL"),
+                    &[2, 3, 4, 5, 6, 7, 8, 9],
+                )
+                .await;
+            }
         })
         .await
+}
+
+/// A rewritten zero predicate still has to reach a scalar index. Without this,
+/// the rewrite could reshape the predicate into something `maybe_indexed_column`
+/// no longer recognizes, and every zero filter would quietly fall back to a full
+/// scan plus refine while still returning the right rows. Only the default BTree
+/// index is covered here; the other index types are exercised for row equality by
+/// `test_query_float_special_values`, not for pushdown.
+#[tokio::test]
+async fn test_float_zero_predicate_uses_scalar_index() {
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..4)) as ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Float64Array::from(vec![0.0, -0.0, 1.0, -1.0])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut ds = Dataset::write(reader, "memory://zero_index_pushdown", None)
+        .await
+        .unwrap();
+    ds.create_index(
+        &["value"],
+        IndexType::Scalar,
+        None,
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    for predicate in ["value = 0.0", "value < 0.0", "value != 0.0"] {
+        let plan = ds
+            .scan()
+            .filter(predicate)
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "`{predicate}` should use the scalar index, got plan:\n{plan}"
+        );
+        // The rewrite's output survives a second `optimize_expr`, which the scan
+        // path does run, so the predicate must not appear twice.
+        assert_eq!(
+            plan.matches("value_idx").count(),
+            1,
+            "`{predicate}` should search the index once, got plan:\n{plan}"
+        );
+    }
+
+    // Rows appended after the index is built are answered by the unindexed scan
+    // while the rest come from the index. Both halves have to agree.
+    let appended = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(4..8)) as ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Float64Array::from(vec![0.0, -0.0, 1.0, -1.0])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let ds = InsertBuilder::new(Arc::new(ds))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![appended])
+        .await
+        .unwrap();
+
+    assert_filter_ids(&ds, "value = 0.0", &[0, 1, 4, 5]).await;
+    assert_filter_ids(&ds, "value < 0.0", &[3, 7]).await;
+    assert_filter_ids(&ds, "value >= 0.0", &[0, 1, 2, 4, 5, 6]).await;
 }
 
 #[tokio::test]

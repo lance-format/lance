@@ -264,7 +264,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ProductQuantizer> {
             None,
         )?;
 
-        Ok(Self { index, storage })
+        Ok(Self::new(index, storage))
     }
 }
 
@@ -308,7 +308,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatQuantizer> {
             None,
         )?;
 
-        Ok(Self { index, storage })
+        Ok(Self::new(index, storage))
     }
 }
 
@@ -352,7 +352,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatBinQuantizer> {
             None,
         )?;
 
-        Ok(Self { index, storage })
+        Ok(Self::new(index, storage))
     }
 }
 
@@ -399,7 +399,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ScalarQuantizer> {
             None,
         )?;
 
-        Ok(Self { index, storage })
+        Ok(Self::new(index, storage))
     }
 }
 
@@ -478,7 +478,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             None,
         )?;
 
-        Ok(Self { index, storage })
+        Ok(Self::new(index, storage))
     }
 }
 
@@ -584,10 +584,8 @@ mod tests {
         let num_rows = 100;
 
         let storage = make_test_pq_storage(num_rows, dim, num_sub_vectors);
-        let entry = PartitionEntry::<FlatIndex, ProductQuantizer> {
-            index: FlatIndex::default(),
-            storage,
-        };
+        let entry =
+            PartitionEntry::<FlatIndex, ProductQuantizer>::new(FlatIndex::default(), storage);
 
         let serialized = ser_body(&entry);
         let deserialized =
@@ -634,10 +632,8 @@ mod tests {
             )
             .unwrap();
 
-            let entry = PartitionEntry::<FlatIndex, ProductQuantizer> {
-                index: FlatIndex::default(),
-                storage,
-            };
+            let entry =
+                PartitionEntry::<FlatIndex, ProductQuantizer>::new(FlatIndex::default(), storage);
 
             let bytes = ser_body(&entry);
             let restored = de_body::<PartitionEntry<FlatIndex, ProductQuantizer>>(bytes).unwrap();
@@ -653,10 +649,8 @@ mod tests {
         let dim = 16;
         let num_sub_vectors = 2;
         let storage = make_test_pq_storage(0, dim, num_sub_vectors);
-        let entry = PartitionEntry::<FlatIndex, ProductQuantizer> {
-            index: FlatIndex::default(),
-            storage,
-        };
+        let entry =
+            PartitionEntry::<FlatIndex, ProductQuantizer>::new(FlatIndex::default(), storage);
 
         let serialized = ser_body(&entry);
         let deserialized =
@@ -669,10 +663,8 @@ mod tests {
         // Serialize a valid entry, then truncate the bytes and verify that
         // deserialization fails rather than panicking.
         let storage = make_test_pq_storage(1, 16, 2);
-        let entry = PartitionEntry::<FlatIndex, ProductQuantizer> {
-            index: FlatIndex::default(),
-            storage,
-        };
+        let entry =
+            PartitionEntry::<FlatIndex, ProductQuantizer>::new(FlatIndex::default(), storage);
         let mut bytes = ser_body(&entry);
         bytes.truncate(3);
         assert!(de_body::<PartitionEntry<FlatIndex, ProductQuantizer>>(bytes).is_err());
@@ -708,10 +700,7 @@ mod tests {
     #[test]
     fn test_roundtrip_flat_flat() {
         let storage = make_flat_storage(50, 64);
-        let entry = PartitionEntry::<FlatIndex, FlatQuantizer> {
-            index: FlatIndex::default(),
-            storage,
-        };
+        let entry = PartitionEntry::<FlatIndex, FlatQuantizer>::new(FlatIndex::default(), storage);
 
         let bytes = ser_body(&entry);
         let restored = de_body::<PartitionEntry<FlatIndex, FlatQuantizer>>(bytes).unwrap();
@@ -736,10 +725,8 @@ mod tests {
             let values = Float32Array::from(vec![1.0f32; 32]);
             let vectors = FixedSizeListArray::try_new_from_values(values, 32).unwrap();
             let storage = FlatFloatStorage::new(vectors, dt);
-            let entry = PartitionEntry::<FlatIndex, FlatQuantizer> {
-                index: FlatIndex::default(),
-                storage,
-            };
+            let entry =
+                PartitionEntry::<FlatIndex, FlatQuantizer>::new(FlatIndex::default(), storage);
             let bytes = ser_body(&entry);
             let restored = de_body::<PartitionEntry<FlatIndex, FlatQuantizer>>(bytes).unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
@@ -749,10 +736,7 @@ mod tests {
     #[test]
     fn test_roundtrip_flat_flat_f16() {
         let storage = make_flat_storage_f16(8, 16);
-        let entry = PartitionEntry::<FlatIndex, FlatQuantizer> {
-            index: FlatIndex::default(),
-            storage,
-        };
+        let entry = PartitionEntry::<FlatIndex, FlatQuantizer>::new(FlatIndex::default(), storage);
 
         let bytes = ser_body(&entry);
         let restored = de_body::<PartitionEntry<FlatIndex, FlatQuantizer>>(bytes).unwrap();
@@ -771,10 +755,7 @@ mod tests {
     #[test]
     fn test_roundtrip_flat_flat_f64() {
         let storage = make_flat_storage_f64(8, 16);
-        let entry = PartitionEntry::<FlatIndex, FlatQuantizer> {
-            index: FlatIndex::default(),
-            storage,
-        };
+        let entry = PartitionEntry::<FlatIndex, FlatQuantizer>::new(FlatIndex::default(), storage);
 
         let bytes = ser_body(&entry);
         let restored = de_body::<PartitionEntry<FlatIndex, FlatQuantizer>>(bytes).unwrap();
@@ -824,10 +805,8 @@ mod tests {
     #[test]
     fn test_roundtrip_flat_sq() {
         let storage = make_sq_storage(100, 64, DistanceType::L2);
-        let entry = PartitionEntry::<FlatIndex, ScalarQuantizer> {
-            index: FlatIndex::default(),
-            storage,
-        };
+        let entry =
+            PartitionEntry::<FlatIndex, ScalarQuantizer>::new(FlatIndex::default(), storage);
 
         let bytes = ser_body(&entry);
         let restored = de_body::<PartitionEntry<FlatIndex, ScalarQuantizer>>(bytes).unwrap();
@@ -852,10 +831,8 @@ mod tests {
     fn test_sq_distance_types() {
         for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
             let storage = make_sq_storage(10, 16, dt);
-            let entry = PartitionEntry::<FlatIndex, ScalarQuantizer> {
-                index: FlatIndex::default(),
-                storage,
-            };
+            let entry =
+                PartitionEntry::<FlatIndex, ScalarQuantizer>::new(FlatIndex::default(), storage);
             let bytes = ser_body(&entry);
             let restored = de_body::<PartitionEntry<FlatIndex, ScalarQuantizer>>(bytes).unwrap();
             assert_eq!(restored.storage.distance_type(), dt);
@@ -894,10 +871,8 @@ mod tests {
         .unwrap();
         assert_eq!(storage.len(), 30);
 
-        let entry = PartitionEntry::<FlatIndex, ScalarQuantizer> {
-            index: FlatIndex::default(),
-            storage,
-        };
+        let entry =
+            PartitionEntry::<FlatIndex, ScalarQuantizer>::new(FlatIndex::default(), storage);
         let bytes = ser_body(&entry);
         let restored = de_body::<PartitionEntry<FlatIndex, ScalarQuantizer>>(bytes).unwrap();
 
@@ -988,10 +963,7 @@ mod tests {
         let num_rows = 50;
         let code_dim = 64;
         let storage = make_rabit_storage_fast(num_rows, code_dim, DistanceType::L2);
-        let entry = PartitionEntry::<FlatIndex, RabitQuantizer> {
-            index: FlatIndex::default(),
-            storage,
-        };
+        let entry = PartitionEntry::<FlatIndex, RabitQuantizer>::new(FlatIndex::default(), storage);
 
         let bytes = ser_body(&entry);
         let restored = de_body::<PartitionEntry<FlatIndex, RabitQuantizer>>(bytes).unwrap();
@@ -1028,10 +1000,8 @@ mod tests {
     fn test_rabitq_distance_types() {
         for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
             let storage = make_rabit_storage_fast(10, 32, dt);
-            let entry = PartitionEntry::<FlatIndex, RabitQuantizer> {
-                index: FlatIndex::default(),
-                storage,
-            };
+            let entry =
+                PartitionEntry::<FlatIndex, RabitQuantizer>::new(FlatIndex::default(), storage);
             let bytes = ser_body(&entry);
             let restored = de_body::<PartitionEntry<FlatIndex, RabitQuantizer>>(bytes).unwrap();
             // The codec round-trips the distance type faithfully.
@@ -1057,10 +1027,7 @@ mod tests {
             storage.metadata().query_estimator,
             RabitQueryEstimator::RawQuery
         );
-        let entry = PartitionEntry::<FlatIndex, RabitQuantizer> {
-            index: FlatIndex::default(),
-            storage,
-        };
+        let entry = PartitionEntry::<FlatIndex, RabitQuantizer>::new(FlatIndex::default(), storage);
 
         let bytes = ser_body(&entry);
         let restored = de_body::<PartitionEntry<FlatIndex, RabitQuantizer>>(bytes).unwrap();
@@ -1081,10 +1048,7 @@ mod tests {
             RQRotationType::Matrix,
             RabitQueryEstimator::ResidualQuery,
         );
-        let entry = PartitionEntry::<FlatIndex, RabitQuantizer> {
-            index: FlatIndex::default(),
-            storage,
-        };
+        let entry = PartitionEntry::<FlatIndex, RabitQuantizer>::new(FlatIndex::default(), storage);
 
         let bytes = ser_body(&entry);
         let restored = de_body::<PartitionEntry<FlatIndex, RabitQuantizer>>(bytes).unwrap();
@@ -1117,10 +1081,10 @@ mod tests {
         use lance_core::cache::CacheCodec;
         const ALIGN: usize = 64;
 
-        let entry = PartitionEntry::<FlatIndex, ScalarQuantizer> {
-            index: FlatIndex::default(),
-            storage: make_sq_storage(64, 32, DistanceType::L2),
-        };
+        let entry = PartitionEntry::<FlatIndex, ScalarQuantizer>::new(
+            FlatIndex::default(),
+            make_sq_storage(64, 32, DistanceType::L2),
+        );
         let codec = CacheCodec::from_impl::<PartitionEntry<FlatIndex, ScalarQuantizer>>();
         let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(entry);
         let mut buf = Vec::new();

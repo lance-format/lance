@@ -32,8 +32,9 @@ pub struct DatasetIndexRemapperOptions {}
 
 /// Loads index metadata when compaction has at least one index to remap.
 ///
-/// Returns all index metadata, including system indices, so the remapper uses a
-/// consistent snapshot. Returns `None` when there are no non-system indices.
+/// Returns all usable index metadata, including system indices, so the remapper
+/// uses a consistent snapshot. Returns `None` when there are no usable
+/// non-system indices.
 pub(crate) async fn load_indices_for_remapping(
     dataset: &Dataset,
 ) -> Result<Option<Arc<Vec<IndexMetadata>>>> {
@@ -253,6 +254,56 @@ mod tests {
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, FRAG_REUSE_INDEX_NAME);
         assert!(options.create_remapper(&dataset).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remapper_not_created_for_unknown_index_type() {
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let current = dataset.load_indices().await.unwrap();
+        let unknown = IndexMetadata {
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/example.ForeignIndexDetails".to_string(),
+                value: Vec::new(),
+            })),
+            fragment_bitmap: None,
+            ..current[0].clone()
+        };
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![unknown],
+                removed_indices: current.to_vec(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+        assert!(
+            DatasetIndexRemapperOptions::default()
+                .create_remapper(&dataset)
+                .await
+                .unwrap()
+                .is_none(),
+            "compaction must not migrate an index type this build cannot open"
+        );
     }
 
     #[tokio::test]
@@ -494,6 +545,7 @@ mod tests {
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
         };
         dataset
             .index_cache

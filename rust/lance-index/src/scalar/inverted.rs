@@ -17,13 +17,18 @@ mod scorer;
 pub mod tokenizer;
 mod wand;
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
-pub use compound::{compound_search, compound_search_with_base_scorer};
+pub use compound::{
+    compound_search, compound_search_prepared_match,
+    compound_search_prepared_match_with_score_floor, compound_search_with_base_scorer,
+    compound_search_with_base_scorer_and_score_floor, exclusive_scaled_score_floor,
+    materialized_compound_top_k,
+};
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
 use datafusion::execution::SendableRecordBatchStream;
@@ -33,93 +38,354 @@ pub use lance_tokenizer::Language;
 pub use scorer::{MemBM25Scorer, Scorer};
 pub use tokenizer::*;
 
-use crate::scalar::inverted::query::{FtsSearchParams, Tokens};
+use crate::scalar::inverted::query::{FtsSearchParams, Tokens, uses_fuzzy_expansion};
 
-/// Collect the unique terms needed to build a shared BM25 scorer.
+/// Canonical token vocabulary and BM25 statistics for one indexed query leaf.
 ///
-/// The scorer only needs corpus-level document frequencies, so we keep a
-/// deduplicated term list here instead of constructing a full `Tokens`
-/// object with positions. When fuzziness is enabled, each segment may
-/// contribute additional terms (via `expand_fuzzy_tokens`); the union of
-/// those terms is what the global scorer must cover.
-fn scorer_terms(
+/// Keeping these values together prevents a search path from expanding one
+/// vocabulary while scoring another. Positions on `tokens` identify fuzzy
+/// alternatives belonging to the same original query position.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PreparedBm25Query {
+    tokens: Arc<Tokens>,
+    scorer: Arc<MemBM25Scorer>,
+    has_all_query_positions: bool,
+    can_reuse_scorer: bool,
+}
+
+impl std::fmt::Debug for PreparedBm25Query {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedBm25Query")
+            .field("token_count", &self.tokens.len())
+            .field("has_all_query_positions", &self.has_all_query_positions)
+            .field("can_reuse_scorer", &self.can_reuse_scorer)
+            .field("scorer", &self.scorer)
+            .finish()
+    }
+}
+
+impl PreparedBm25Query {
+    pub(crate) fn from_parts(
+        tokens: Arc<Tokens>,
+        scorer: Arc<MemBM25Scorer>,
+        has_all_query_positions: bool,
+    ) -> Self {
+        Self {
+            tokens,
+            scorer,
+            has_all_query_positions,
+            can_reuse_scorer: false,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn tokens(&self) -> &Arc<Tokens> {
+        &self.tokens
+    }
+
+    #[doc(hidden)]
+    pub fn scorer(&self) -> &Arc<MemBM25Scorer> {
+        &self.scorer
+    }
+
+    pub(crate) fn reusable_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
+        self.can_reuse_scorer.then_some(&self.scorer)
+    }
+
+    pub(crate) fn has_all_query_positions(&self) -> bool {
+        self.has_all_query_positions
+    }
+}
+
+pub(crate) fn final_query_tokens(
     indices: &[Arc<InvertedIndex>],
     query_tokens: &Tokens,
     params: &FtsSearchParams,
-) -> Result<Vec<String>> {
-    let mut terms = Vec::new();
+) -> Result<Tokens> {
+    if !uses_fuzzy_expansion(params.fuzziness) {
+        return Ok(query_tokens.clone());
+    }
+
+    let initial_capacity = query_tokens.len().min(params.max_expansions);
+    let mut expanded_tokens = Vec::with_capacity(initial_capacity);
+    let mut expanded_positions = Vec::with_capacity(initial_capacity);
     let mut seen = HashSet::new();
-
-    if !matches!(params.fuzziness, Some(n) if n != 0) {
-        for token in query_tokens {
-            if seen.insert(token.to_string()) {
-                terms.push(token.to_string());
+    let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
+    for token_idx in 0..query_tokens.len() {
+        source_terms_by_position
+            .entry(query_tokens.position(token_idx))
+            .or_default()
+            .push(query_tokens.get_token(token_idx));
+    }
+    for (position, source_terms) in source_terms_by_position {
+        let remaining = params.max_expansions.saturating_sub(expanded_tokens.len());
+        if remaining == 0 {
+            break;
+        }
+        let mut candidates = BTreeSet::new();
+        let mut seen_source_terms = HashSet::new();
+        for source_term in source_terms {
+            if !seen_source_terms.insert(source_term) {
+                continue;
+            }
+            // One source token has one canonical automaton across every
+            // selected segment. Drop it after this source term so peak DFA
+            // memory is independent of the number of query terms.
+            let automaton = FuzzyAutomaton::new(source_term, query_tokens.token_type(), params)?;
+            for index in indices {
+                index.collect_fuzzy_candidates_with_automaton(
+                    &automaton,
+                    remaining,
+                    &mut candidates,
+                )?;
             }
         }
-        return Ok(terms);
+        for candidate in candidates {
+            if expanded_tokens.len() >= params.max_expansions {
+                break;
+            }
+            if seen.insert((candidate.clone(), position)) {
+                expanded_tokens.push(candidate);
+                expanded_positions.push(position);
+            }
+        }
+    }
+    Ok(Tokens::with_positions(
+        expanded_tokens,
+        expanded_positions,
+        query_tokens.token_type().clone(),
+    ))
+}
+
+fn unique_terms(tokens: &Tokens) -> Vec<String> {
+    let mut terms = Vec::with_capacity(tokens.len());
+    let mut seen = HashSet::new();
+    for token in tokens {
+        if seen.insert(token.clone()) {
+            terms.push(token.clone());
+        }
+    }
+    terms
+}
+
+pub(crate) fn has_all_query_positions(query_tokens: &Tokens, final_tokens: &Tokens) -> bool {
+    let surviving_positions = (0..final_tokens.len())
+        .map(|index| final_tokens.position(index))
+        .collect::<HashSet<_>>();
+    (0..query_tokens.len()).all(|index| surviving_positions.contains(&query_tokens.position(index)))
+}
+
+const LANCE_FTS_SYNC_DF_ENV: &str = "LANCE_FTS_SYNC_DF";
+
+fn sync_df_enabled_from_value(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        let value = value.trim();
+        value == "0" || value.eq_ignore_ascii_case("off")
+    })
+}
+
+static LANCE_FTS_SYNC_DF_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    sync_df_enabled_from_value(std::env::var(LANCE_FTS_SYNC_DF_ENV).ok().as_deref())
+});
+
+/// Build the global scorer without futures when a completed full prewarm made
+/// every segment statistic and posting-length table synchronously available.
+/// Returning `None` leaves the existing asynchronous path entirely in charge.
+fn bm25_scorer_from_loaded_stats(
+    indices: &[Arc<InvertedIndex>],
+    terms: &[String],
+) -> Result<Option<Arc<MemBM25Scorer>>> {
+    bm25_scorer_from_loaded_stats_with_enabled(indices, terms, *LANCE_FTS_SYNC_DF_ENABLED)
+}
+
+fn bm25_scorer_from_loaded_stats_with_enabled(
+    indices: &[Arc<InvertedIndex>],
+    terms: &[String],
+    is_enabled: bool,
+) -> Result<Option<Arc<MemBM25Scorer>>> {
+    // Keep the kill switch first so an ablation does not even probe prewarm
+    // state or resident metadata.
+    if !is_enabled {
+        return Ok(None);
     }
 
+    let mut loaded_stats = Vec::with_capacity(indices.len());
     for index in indices {
-        let expanded = index.expand_fuzzy_tokens(query_tokens, params)?;
-        for idx in 0..expanded.len() {
-            let token = expanded.get_token(idx);
-            if seen.insert(token.to_string()) {
-                terms.push(token.to_string());
-            }
+        let Some(stats) = index.bm25_stats_for_terms_if_loaded(terms)? else {
+            return Ok(None);
+        };
+        loaded_stats.push(stats);
+    }
+
+    merge_loaded_bm25_stats(terms, loaded_stats)
+}
+
+fn merge_loaded_bm25_stats(
+    terms: &[String],
+    loaded_stats: Vec<(u64, usize, Vec<usize>)>,
+) -> Result<Option<Arc<MemBM25Scorer>>> {
+    let mut loaded_stats = loaded_stats.into_iter();
+    let Some((mut total_tokens, mut num_docs, first_token_docs)) = loaded_stats.next() else {
+        return Ok(None);
+    };
+    if first_token_docs.len() != terms.len() {
+        return Err(lance_core::Error::internal(format!(
+            "loaded FTS document-frequency count is {}, expected {}",
+            first_token_docs.len(),
+            terms.len()
+        )));
+    }
+    let mut token_docs = HashMap::with_capacity(terms.len());
+    for (term, count) in terms.iter().cloned().zip(first_token_docs) {
+        token_docs.insert(term, count);
+    }
+    for (segment_total_tokens, segment_num_docs, segment_token_docs) in loaded_stats {
+        if segment_token_docs.len() != terms.len() {
+            return Err(lance_core::Error::internal(format!(
+                "loaded FTS document-frequency count is {}, expected {}",
+                segment_token_docs.len(),
+                terms.len()
+            )));
+        }
+        total_tokens = total_tokens
+            .checked_add(segment_total_tokens)
+            .ok_or_else(|| lance_core::Error::index("FTS corpus token count overflows u64"))?;
+        num_docs = num_docs
+            .checked_add(segment_num_docs)
+            .ok_or_else(|| lance_core::Error::index("FTS corpus document count overflows usize"))?;
+        for (term, count) in terms.iter().zip(segment_token_docs) {
+            let total = token_docs.get_mut(term).ok_or_else(|| {
+                lance_core::Error::internal(format!(
+                    "global scorer term '{term}' was not initialized"
+                ))
+            })?;
+            *total = total.checked_add(count).ok_or_else(|| {
+                lance_core::Error::index(format!(
+                    "FTS document frequency for term '{term}' overflows usize"
+                ))
+            })?;
         }
     }
-    Ok(terms)
+    Ok(Some(Arc::new(MemBM25Scorer::new(
+        total_tokens,
+        num_docs,
+        token_docs,
+    ))))
+}
+
+/// Expand and score one indexed query leaf exactly once across all segments.
+///
+/// Expansion consumes one deterministic `max_expansions` budget in query
+/// position order, with terms ordered lexicographically across every physical
+/// segment and partition and deduplicated by `(term, position)`. The scorer's
+/// document frequencies are then merged for exactly those final terms.
+///
+/// `base_scorer` is an API-compatibility hook for distributed/mixed callers
+/// that already own corpus-wide statistics. It is validated against the final
+/// vocabulary before being paired with the tokens.
+#[doc(hidden)]
+pub async fn prepare_bm25_query(
+    indices: &[Arc<InvertedIndex>],
+    query_tokens: Tokens,
+    params: &FtsSearchParams,
+    metrics: Option<&dyn crate::scalar::MetricsCollector>,
+    base_scorer: Option<Arc<MemBM25Scorer>>,
+) -> Result<PreparedBm25Query> {
+    let first_index = indices.first().ok_or_else(|| {
+        lance_core::Error::invalid_input("FTS index requires at least one segment")
+    })?;
+    let (tokens, has_all_query_positions) = if uses_fuzzy_expansion(params.fuzziness) {
+        let tokens = Arc::new(final_query_tokens(indices, &query_tokens, params)?);
+        let has_all_query_positions = has_all_query_positions(&query_tokens, tokens.as_ref());
+        (tokens, has_all_query_positions)
+    } else {
+        (Arc::new(query_tokens), true)
+    };
+    let terms = unique_terms(tokens.as_ref());
+    let (scorer, can_reuse_scorer) = if let Some(scorer) = base_scorer {
+        if let Some(missing) = terms
+            .iter()
+            .find(|term| !scorer.token_docs.contains_key(term.as_str()))
+        {
+            return Err(lance_core::Error::invalid_input(format!(
+                "injected BM25 scorer is missing compound FTS token '{missing}'"
+            )));
+        }
+        (scorer, false)
+    } else if let Some(scorer) = bm25_scorer_from_loaded_stats(indices, &terms)? {
+        (scorer, true)
+    } else {
+        let (mut total_tokens, mut num_docs, first_token_docs) =
+            first_index.bm25_stats_for_terms(&terms, metrics).await?;
+        let mut token_docs = HashMap::with_capacity(terms.len());
+        for (term, count) in terms.iter().cloned().zip(first_token_docs) {
+            token_docs.insert(term, count);
+        }
+
+        for index in indices.iter().skip(1) {
+            let (segment_total_tokens, segment_num_docs, segment_token_docs) =
+                index.bm25_stats_for_terms(&terms, metrics).await?;
+            total_tokens = total_tokens
+                .checked_add(segment_total_tokens)
+                .ok_or_else(|| lance_core::Error::index("FTS corpus token count overflows u64"))?;
+            num_docs = num_docs.checked_add(segment_num_docs).ok_or_else(|| {
+                lance_core::Error::index("FTS corpus document count overflows usize")
+            })?;
+            for (term, count) in terms.iter().zip(segment_token_docs) {
+                let total = token_docs.get_mut(term).ok_or_else(|| {
+                    lance_core::Error::internal(format!(
+                        "global scorer term '{term}' was not initialized"
+                    ))
+                })?;
+                *total = total.checked_add(count).ok_or_else(|| {
+                    lance_core::Error::index(format!(
+                        "FTS document frequency for term '{term}' overflows usize"
+                    ))
+                })?;
+            }
+        }
+        (
+            Arc::new(MemBM25Scorer::new(total_tokens, num_docs, token_docs)),
+            true,
+        )
+    };
+
+    Ok(PreparedBm25Query {
+        tokens,
+        scorer,
+        has_all_query_positions,
+        can_reuse_scorer,
+    })
 }
 
 /// Build a shared [`MemBM25Scorer`] across a set of FTS index segments.
 ///
+/// Compatibility wrapper for callers that only need statistics. Indexed
+/// execution should retain the [`PreparedBm25Query`] returned by
+/// [`prepare_bm25_query`] so the same final vocabulary reaches search.
+///
 /// Aggregates each segment's `(total_tokens, num_docs, per_term_doc_freq)`
-/// statistics — obtained via [`InvertedIndex::bm25_stats_for_terms`] — into a
-/// single corpus-wide scorer, so that BM25 IDF scoring uses *global*
-/// statistics rather than per-segment statistics. Computes the union of
-/// fuzzy-expanded terms when `params.fuzziness` is set.
+/// statistics into a single corpus-wide scorer.
 ///
 /// `metrics`, when provided, is forwarded to the per-token metadata cache
 /// boundary on each segment so callers running under an `ExecutionPlan`
 /// (e.g. `MatchQueryExec`) see the reads triggered here in their per-query
 /// `index_cache_hits`/`index_cache_misses` counters.
 ///
-/// Public as the canonical producer paired with the `with_base_scorer`
-/// consumer on FTS exec types: callers holding `Arc<InvertedIndex>` segment
-/// handles locally can construct an injectable scorer without reimplementing
-/// per-segment stat aggregation, term deduplication, and fuzzy-expansion
-/// union. Keeps a single source of truth for BM25 IDF arithmetic across
-/// segments.
+/// For exact queries this remains the compatibility producer paired with the
+/// `with_base_scorer` consumer on FTS exec types. Fuzzy distributed execution
+/// must retain the full [`PreparedBm25Query`] from [`prepare_bm25_query`]; a
+/// scorer alone cannot preserve the canonical expansion vocabulary.
 pub async fn build_global_bm25_scorer(
     indices: &[Arc<InvertedIndex>],
     query_tokens: &Tokens,
     params: &FtsSearchParams,
     metrics: Option<&dyn crate::scalar::MetricsCollector>,
 ) -> Result<MemBM25Scorer> {
-    let terms = scorer_terms(indices, query_tokens, params)?;
-    let first_index = indices.first().ok_or_else(|| {
-        lance_core::Error::invalid_input("FTS index requires at least one segment")
-    })?;
-    let (mut total_tokens, mut num_docs, first_token_docs) =
-        first_index.bm25_stats_for_terms(&terms, metrics).await?;
-    let mut token_docs = HashMap::with_capacity(terms.len());
-    for (term, count) in terms.iter().cloned().zip(first_token_docs) {
-        token_docs.insert(term, count);
-    }
-
-    for index in indices.iter().skip(1) {
-        let (segment_total_tokens, segment_num_docs, segment_token_docs) =
-            index.bm25_stats_for_terms(&terms, metrics).await?;
-        total_tokens += segment_total_tokens;
-        num_docs += segment_num_docs;
-        for (term, count) in terms.iter().zip(segment_token_docs) {
-            *token_docs
-                .get_mut(term)
-                .expect("global scorer terms should already be initialized") += count;
-        }
-    }
-
-    Ok(MemBM25Scorer::new(total_tokens, num_docs, token_docs))
+    let prepared = prepare_bm25_query(indices, query_tokens.clone(), params, metrics, None).await?;
+    Ok(prepared.scorer.as_ref().clone())
 }
 
 use lance_core::Error;
@@ -130,8 +396,8 @@ use crate::scalar::{
     CreatedIndex, RowIdRemapper, ScalarIndex,
     expression::{FtsQueryParser, ScalarQueryParser},
     registry::{
-        BasicTrainer, ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
-        TrainingOrdering, TrainingRequest,
+        BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+        TrainingRequest, single_flight_store_bound_open,
     },
 };
 
@@ -332,14 +598,12 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 
     async fn get_or_insert_in_cache(
         &self,
-        _index_store: Arc<dyn IndexStore>,
+        index_store: Arc<dyn IndexStore>,
         _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        cache
-            .get_or_insert_unsized_with_key(ScalarIndexCacheKey, || load)
-            .await
+        single_flight_store_bound_open(index_store, cache, load).await
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
@@ -353,6 +617,70 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 mod tests {
     use super::*;
     use crate::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+    #[test]
+    fn test_sync_df_kill_switch_parser() {
+        for value in [None, Some(""), Some("1"), Some("on"), Some("false")] {
+            assert!(
+                sync_df_enabled_from_value(value),
+                "unexpected disable: {value:?}"
+            );
+        }
+        for value in [Some("0"), Some("off"), Some("OFF"), Some(" off ")] {
+            assert!(
+                !sync_df_enabled_from_value(value),
+                "unexpected enable: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prepared_query_from_parts_keeps_scorer_ineligible_for_reuse() {
+        let tokens = Arc::new(Tokens::new(
+            vec!["term".to_owned()],
+            crate::scalar::inverted::document_tokenizer::DocType::Text,
+        ));
+        let scorer = Arc::new(MemBM25Scorer::new(1, 1, HashMap::new()));
+        let prepared = PreparedBm25Query::from_parts(tokens, scorer.clone(), true);
+
+        assert!(Arc::ptr_eq(prepared.scorer(), &scorer));
+        assert!(prepared.reusable_scorer().is_none());
+        assert_eq!(Arc::strong_count(&scorer), 2);
+    }
+
+    #[test]
+    fn test_sync_df_merge_reports_checked_overflow_and_invalid_shape() {
+        let terms = vec!["term".to_string()];
+        for (stats, expected) in [
+            (
+                vec![(u64::MAX, 1, vec![1]), (1, 1, vec![1])],
+                "corpus token count overflows u64",
+            ),
+            (
+                vec![(1, usize::MAX, vec![1]), (1, 1, vec![1])],
+                "corpus document count overflows usize",
+            ),
+            (
+                vec![(1, 1, vec![usize::MAX]), (1, 1, vec![1])],
+                "document frequency for term 'term' overflows usize",
+            ),
+        ] {
+            let error = merge_loaded_bm25_stats(&terms, stats).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error: {error}"
+            );
+        }
+
+        let error = merge_loaded_bm25_stats(&terms, vec![(1, 1, Vec::new())]).unwrap_err();
+        assert!(matches!(error, lance_core::Error::Internal { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("document-frequency count is 0, expected 1"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn test_plugin_version_tracks_v3_capability_gate() {

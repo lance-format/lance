@@ -1161,7 +1161,7 @@ public class DirectoryNamespaceTest {
     // Count rows
     CountTableRowsRequest countReq =
         new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
-    long count = namespaceClient.countTableRows(countReq);
+    long count = namespaceClient.countTableRows(countReq).getCount();
     assertEquals(3, count);
   }
 
@@ -1183,7 +1183,7 @@ public class DirectoryNamespaceTest {
         new CountTableRowsRequest()
             .id(Arrays.asList("workspace", "test_table"))
             .predicate("age > 28");
-    long count = namespaceClient.countTableRows(countReq);
+    long count = namespaceClient.countTableRows(countReq).getCount();
     assertEquals(2, count); // Alice (30) and Charlie (35)
   }
 
@@ -1210,7 +1210,7 @@ public class DirectoryNamespaceTest {
     // Verify row count increased
     CountTableRowsRequest countReq =
         new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
-    long count = namespaceClient.countTableRows(countReq);
+    long count = namespaceClient.countTableRows(countReq).getCount();
     assertEquals(6, count);
   }
 
@@ -1233,7 +1233,7 @@ public class DirectoryNamespaceTest {
             .id(Arrays.asList("workspace", "test_table"))
             .k(10)
             .vector(new QueryTableRequestVector());
-    byte[] resultBytes = namespaceClient.queryTable(queryReq);
+    byte[] resultBytes = namespaceClient.queryTable(queryReq).getData();
     assertNotNull(resultBytes);
     assertTrue(resultBytes.length > 0);
   }

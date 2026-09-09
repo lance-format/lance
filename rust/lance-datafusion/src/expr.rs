@@ -129,6 +129,16 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
             DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => value.cast_to(ty).ok(),
+            DataType::Time32(TimeUnit::Second) => val.and_then(|v| {
+                i32::try_from(v)
+                    .ok()
+                    .map(|v| ScalarValue::Time32Second(Some(v)))
+            }),
+            DataType::Time32(TimeUnit::Millisecond) => val.and_then(|v| {
+                i32::try_from(v)
+                    .ok()
+                    .map(|v| ScalarValue::Time32Millisecond(Some(v)))
+            }),
             _ => None,
         },
         ScalarValue::UInt8(val) => match ty {
@@ -482,6 +492,28 @@ mod tests {
 
     #[test]
     fn test_temporal_coerce() {
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Int64(Some(5)),
+                &DataType::Time32(TimeUnit::Second),
+            ),
+            Some(ScalarValue::Time32Second(Some(5)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Int64(Some(5000)),
+                &DataType::Time32(TimeUnit::Millisecond),
+            ),
+            Some(ScalarValue::Time32Millisecond(Some(5000)))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Int64(Some(i64::MAX)),
+                &DataType::Time32(TimeUnit::Second),
+            ),
+            None
+        );
+
         // Conversion from timestamps in one resolution to timestamps in another resolution is allowed
         // s->s
         assert_eq!(

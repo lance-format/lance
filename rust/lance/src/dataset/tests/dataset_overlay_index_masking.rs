@@ -19,7 +19,9 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
-use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
+use lance_index::scalar::inverted::query::{
+    BooleanQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
+};
 use lance_index::scalar::inverted::{DocumentGranularity, InvertedIndexParams};
 use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
@@ -1032,6 +1034,76 @@ async fn test_fts_overlay_stale_drop_and_new_match(#[values(false, true)] stable
     );
 }
 
+#[tokio::test]
+async fn test_multimatch_shared_prefilter_preserves_field_overlay_masks() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("text_a", DataType::Utf8, false),
+        ArrowField::new("text_b", DataType::Utf8, false),
+    ]));
+    // Row 0 matches text_a, row 1 matches both fields before its overlay,
+    // and row 2 is a negative control.
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1, 2])),
+            Arc::new(StringArray::from(vec!["apple", "apple", "none"])),
+            Arc::new(StringArray::from(vec!["none", "apple", "none"])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    for column in ["text_a", "text_b"] {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+    // Only text_a is stale for row 1. text_b must retain its indexed match,
+    // while text_a's stale posting is blocked and re-evaluated separately.
+    let dataset = commit_overlay(
+        dataset,
+        "multimatch_text_a_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec!["none"]))],
+    )
+    .await;
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "apple".to_owned(),
+        vec!["text_a".to_owned(), "text_b".to_owned()],
+    )
+    .unwrap()
+    .into();
+    let mut scanner = dataset.scan();
+    scanner
+        .prefilter(true)
+        .use_scalar_index(false)
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .filter("id >= 0")
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1]);
+}
+
 /// A phrase query must drop stale indexed positions and re-evaluate the current
 /// overlay value on the flat phrase path.
 #[rstest]
@@ -1197,6 +1269,34 @@ async fn test_fts_overlay_row_level_masking_under_fast_search(
     assert_eq!(
         new_phrase_scan.try_into_batch().await.unwrap().num_rows(),
         0
+    );
+
+    let match_query = |terms: &str| {
+        MatchQuery::new(terms.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let compound_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("apple")),
+        (Occur::Should, match_query("pie")),
+    ])
+    .into();
+    let mut compound_scan = dataset.scan();
+    compound_scan
+        .full_text_search(FullTextSearchQuery::new_query(compound_query))
+        .unwrap();
+    compound_scan.project(&["id"]).unwrap();
+    compound_scan.fast_search();
+    compound_scan.limit(Some(10), None).unwrap();
+    let compound_plan = compound_scan.explain_plan(false).await.unwrap();
+    assert!(
+        !compound_plan.contains("CompoundFtsScorer"),
+        "overlay-stale rows must keep compound fast search on the masked fallback:\n{compound_plan}"
+    );
+    let compound_result = compound_scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        ids_from_batches(std::slice::from_ref(&compound_result)),
+        vec![0]
     );
 }
 

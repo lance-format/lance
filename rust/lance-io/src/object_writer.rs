@@ -27,7 +27,7 @@ use tokio::runtime::Handle;
 /// Start at 5MB.
 const INITIAL_UPLOAD_STEP: usize = 1024 * 1024 * 5;
 
-fn max_upload_parallelism() -> usize {
+pub(crate) fn max_upload_parallelism() -> usize {
     static MAX_UPLOAD_PARALLELISM: OnceLock<usize> = OnceLock::new();
     *MAX_UPLOAD_PARALLELISM.get_or_init(|| {
         std::env::var("LANCE_UPLOAD_CONCURRENCY")
@@ -51,7 +51,7 @@ fn clamp_initial_upload_size(raw: usize) -> (usize, bool) {
     (clamped, clamped != raw)
 }
 
-fn initial_upload_size() -> usize {
+pub(crate) fn initial_upload_size() -> usize {
     static LANCE_INITIAL_UPLOAD_SIZE: OnceLock<usize> = OnceLock::new();
     *LANCE_INITIAL_UPLOAD_SIZE.get_or_init(|| {
         let Some(raw) = std::env::var("LANCE_INITIAL_UPLOAD_SIZE")
@@ -228,6 +228,7 @@ impl UploadState {
         let this = std::mem::replace(self, Self::Done(WriteResult::default()));
         *self = match this {
             Self::Started(store) => {
+                tracing::Span::current().record("part_count", 1_u64);
                 let started_at = Instant::now();
                 let fut = async move {
                     let size = buffer.len();
@@ -262,6 +263,7 @@ impl UploadState {
                 part_idx,
             } => {
                 debug_assert!(futures.is_empty());
+                tracing::Span::current().record("part_count", part_idx as u64);
                 let started_at = Instant::now();
                 let fut = async move {
                     let res = upload.complete().await.map_err(|source| {

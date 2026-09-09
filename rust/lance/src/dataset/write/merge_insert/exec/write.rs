@@ -22,6 +22,7 @@ use datafusion::{
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{StreamExt, stream};
+use lance_arrow::RecordBatchExt;
 use lance_core::{Error, ROW_ADDR, ROW_ID};
 use lance_table::format::RowIdMeta;
 use roaring::RoaringTreemap;
@@ -32,8 +33,8 @@ use crate::dataset::write::merge_insert::inserted_rows::{
     KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
 };
 use crate::dataset::write::merge_insert::{
-    InsertedKeyTracker, MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
-    format_key_values_on_columns, resolve_target_bases,
+    InsertedKeyTracker, MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, canonical_source_schema,
+    create_duplicate_row_error, format_key_values_on_columns, resolve_target_bases,
 };
 use crate::{
     Dataset,
@@ -462,7 +463,8 @@ impl FullSchemaMergeInsertExec {
         // intended writer schema (which is `dataset.schema()`). Using name
         // lookup is also a strictly-safer choice for the full-schema path:
         // it turns an implicit positional assumption into an explicit
-        // name-based invariant.
+        // name-based invariant. The filtered batches are recursively projected
+        // to this schema below so nested children follow the same contract.
         let mut name_to_idx: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::with_capacity(input_schema.fields().len());
         for (idx, field) in input_schema.fields().iter().enumerate() {
@@ -485,8 +487,6 @@ impl FullSchemaMergeInsertExec {
         let dataset_arrow_schema: arrow_schema::Schema = self.dataset.schema().into();
         let dataset_fields = dataset_arrow_schema.fields();
         let mut data_column_indices: Vec<usize> = Vec::with_capacity(dataset_fields.len());
-        let mut output_fields: Vec<Arc<arrow_schema::Field>> =
-            Vec::with_capacity(dataset_fields.len());
         for dataset_field in dataset_fields {
             let idx = *name_to_idx
                 .get(dataset_field.name().as_str())
@@ -498,7 +498,6 @@ impl FullSchemaMergeInsertExec {
                     ))
                 })?;
             data_column_indices.push(idx);
-            output_fields.push(Arc::new(input_schema.field(idx).clone()));
         }
 
         if data_column_indices.is_empty() {
@@ -507,7 +506,16 @@ impl FullSchemaMergeInsertExec {
             ));
         }
 
-        let output_schema = Arc::new(Schema::new(output_fields));
+        let source_data_schema = Schema::new(
+            data_column_indices
+                .iter()
+                .map(|idx| input_schema.field(*idx).clone())
+                .collect::<Vec<_>>(),
+        );
+        let output_schema = Arc::new(
+            canonical_source_schema(&source_data_schema, &dataset_arrow_schema)
+                .map_err(datafusion::error::DataFusionError::from)?,
+        );
 
         Ok((
             input_schema,
@@ -585,13 +593,12 @@ impl FullSchemaMergeInsertExec {
         // Take only the rows we want to keep
         let filtered_batch = arrow_select::take::take_record_batch(batch, &indices)?;
 
-        // Project only the data columns
-        let output_columns: Vec<_> = data_column_indices
-            .iter()
-            .map(|&idx| filtered_batch.column(idx).clone())
-            .collect();
-
-        RecordBatch::try_new(output_schema, output_columns)
+        // First retain the source field layout, then recursively project it into
+        // the dataset layout. The latter is required for nested structs whose
+        // children were supplied in a different order.
+        let projected = filtered_batch.project(data_column_indices)?;
+        projected
+            .project_by_schema(output_schema.as_ref())
             .map_err(datafusion::error::DataFusionError::from)
     }
 

@@ -128,31 +128,35 @@ mod tests {
     use crate::array_encoding::physical::fixed_size_binary::FixedSizeBinaryDecoder;
     use crate::data::{DataBlock, FixedWidthDataBlock};
     use crate::decoder::PrimitivePageDecoder;
-    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
+    use crate::testing::{
+        TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
+    };
+    use rstest::rstest;
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_fixed_size_utf8_binary() {
-        let field = Field::new("", DataType::Utf8, false);
-        // This test only generates fixed size binary arrays anyway
-        check_basic_random(field).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_fixed_size_binary() {
-        let field = Field::new("", DataType::Binary, false);
-        check_basic_random(field).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_fixed_size_large_binary() {
-        let field = Field::new("", DataType::LargeBinary, true);
-        check_basic_random(field).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_fixed_size_large_utf8() {
-        let field = Field::new("", DataType::LargeUtf8, true);
-        check_basic_random(field).await;
+    async fn test_fixed_size_random(
+        #[values(
+            DataType::Utf8,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::LargeUtf8
+        )]
+        data_type: DataType,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let nullable = matches!(data_type, DataType::LargeBinary | DataType::LargeUtf8);
+        let field = Field::new("", data_type, nullable);
+        // This test only generates fixed-size binary arrays for Utf8 and Binary.
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[test_log::test(tokio::test)]

@@ -17,7 +17,7 @@ use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
 };
-use crate::frag_reuse::FragReuseIndex;
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
 use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
@@ -412,6 +412,26 @@ impl NGramIndex {
         dest_store: &dyn IndexStore,
         old_data_filters: &[Option<super::OldIndexDataFilter>],
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<CreatedIndex> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::merge_segments_with_remapper(
+            segment_stores,
+            new_data,
+            dest_store,
+            old_data_filters,
+            frag_reuse_index,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn merge_segments_with_remapper(
+        segment_stores: &[Arc<dyn IndexStore>],
+        new_data: Option<SendableRecordBatchStream>,
+        dest_store: &dyn IndexStore,
+        old_data_filters: &[Option<super::OldIndexDataFilter>],
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<CreatedIndex> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
         // Pure consolidation has no new rows, so skip `train` (and its
@@ -852,7 +872,7 @@ impl NGramIndexSpillState {
 
     fn remap_and_filter_rows(
         self,
-        frag_reuse_index: Option<&Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<&dyn RowIdRemapper>,
         filter: Option<&super::OldIndexDataFilter>,
     ) -> Self {
         if let Some(fri) = frag_reuse_index {
@@ -868,7 +888,7 @@ impl NGramIndexSpillState {
     /// `filter`. Used only under a pending deferred-remap compaction.
     fn remap_then_keep(
         self,
-        fri: &Arc<FragReuseIndex>,
+        fri: &dyn RowIdRemapper,
         filter: Option<&super::OldIndexDataFilter>,
     ) -> Self {
         let mut tokens = UInt32Builder::with_capacity(self.tokens.len());
@@ -1561,14 +1581,14 @@ impl NGramIndexBuilder {
 
     async fn open_segment_stream(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         filter: Option<super::OldIndexDataFilter>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<NGramIndexSpillState>> + Send>>> {
         let reader = store.open_index_file(POSTINGS_FILENAME).await?;
         let stream =
             Self::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)?.map(move |res| {
                 res.map(|state| {
-                    state.remap_and_filter_rows(frag_reuse_index.as_ref(), filter.as_ref())
+                    state.remap_and_filter_rows(frag_reuse_index.as_deref(), filter.as_ref())
                 })
             });
         Ok(Box::pin(stream))
@@ -1581,7 +1601,7 @@ impl NGramIndexBuilder {
         new_data_spills: Vec<usize>,
         segment_stores: &[Arc<dyn IndexStore>],
         old_data_filters: &[Option<super::OldIndexDataFilter>],
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         dest_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
         if old_data_filters.len() != segment_stores.len() {
@@ -2453,7 +2473,7 @@ mod tests {
         use uuid::Uuid;
 
         use super::NGramIndexSpillState;
-        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails};
+        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
         use crate::scalar::OldIndexDataFilter;
 
         let addr = |frag: u32, local: u32| ((frag as u64) << 32) | local as u64;
@@ -2471,14 +2491,14 @@ mod tests {
         // Compaction fused fragment 0 into fragment 2: row (0,0) survives at
         // (2,0), row (0,1) was deleted (maps to None). Row (1,0) isn't in the
         // map, so remap passes it through unchanged.
-        let fri = Arc::new(FragReuseIndex::new(
+        let fri = FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
             Uuid::new_v4(),
             vec![HashMap::from([
                 (addr(0, 0), Some(addr(2, 0))),
                 (addr(0, 1), None),
             ])],
             FragReuseIndexDetails { versions: vec![] },
-        ));
+        )));
 
         // After remap the live rows sit in fragments 2 and 1; fragment 1 is retired.
         let filter = OldIndexDataFilter::Fragments {

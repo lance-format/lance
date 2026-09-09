@@ -18,6 +18,7 @@ import org.lance.index.IndexParams;
 import org.lance.index.vector.HnswBuildParams;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
+import org.lance.index.vector.RQBuildParams;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.ApproxMode;
@@ -76,6 +77,11 @@ public class JNITest {
         IndexParams.builder()
             .setVectorIndexParams(VectorIndexParams.ivfFlat(10, DistanceType.L2))
             .build());
+  }
+
+  @Test
+  public void testRqBuildParamsDefaultNumBits() {
+    assertEquals((byte) 5, new RQBuildParams.Builder().build().getNumBits());
   }
 
   @Test

@@ -21,7 +21,8 @@ use crate::{
     format::pbfile,
     reader::{
         BufferDescriptor, CachedFileMetadata, FileMetadataIndex, FileMetadataProvider, FileReader,
-        FileReaderOptions, ProjectedFileReader, RawFileMetadata, ReadProjection, ReaderProjection,
+        FileReaderOptions, PreparedProjection, ProjectedFileReader, RawFileMetadata,
+        ReadProjection, ReaderProjection,
     },
     version::ConcreteFileVersion,
     writer::{FileWriter, FileWriterOptions},
@@ -72,6 +73,37 @@ pub(crate) fn finish_metadata(
         ConcreteFileVersion::V2_2 => v2_2::finish_metadata(metadata),
         ConcreteFileVersion::V2_3 => v2_3::finish_metadata(metadata),
     }
+}
+
+/// Validate that decoded metadata is a complete rectangular file for an exact
+/// grammar and return its normalized physical row count.
+pub(crate) fn validate_external_metadata(
+    version: ConcreteFileVersion,
+    schema: &Schema,
+    metadata: &CachedFileMetadata,
+) -> Result<u64> {
+    let projection = reader_projection_from_whole_schema(schema, version);
+    if projection.column_indices.len() != metadata.column_infos.len() {
+        return Err(Error::invalid_input(format!(
+            "schema requires {} physical columns but file metadata contains {}",
+            projection.column_indices.len(),
+            metadata.column_infos.len()
+        )));
+    }
+    FileReader::validate_projection(&projection, metadata)?;
+    for (expected_index, column) in metadata.column_infos.iter().enumerate() {
+        if column.index != expected_index as u32 {
+            return Err(Error::invalid_input(format!(
+                "physical column {} reports index {}",
+                expected_index, column.index
+            )));
+        }
+    }
+    let prepared = PreparedProjection {
+        column_infos: metadata.column_infos.clone(),
+        decoder_projection: projection,
+    };
+    read_projection(version)?.read_length(&prepared)
 }
 
 pub(crate) fn finish_metadata_index(index: FileMetadataIndex) -> Result<FileMetadataIndex> {

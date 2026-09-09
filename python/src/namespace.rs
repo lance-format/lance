@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
+use lance_namespace::compat::merge_insert_request_from_json;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAlterColumnsRequest, AlterTableBackfillColumnsRequest,
     AlterTableDropColumnsRequest, AlterTransactionRequest, AnalyzeTableQueryPlanRequest,
@@ -19,10 +20,9 @@ use lance_namespace::models::{
     DescribeTableVersionResponse, DescribeTransactionRequest, DropTableIndexRequest,
     ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableTagVersionRequest,
     InsertIntoTableRequest, ListTableIndicesRequest, ListTableTagsRequest,
-    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest,
-    MergeInsertIntoTableRequest, QueryTableRequest, RefreshMaterializedViewRequest,
-    RestoreTableRequest, UpdateTableRequest, UpdateTableSchemaMetadataRequest,
-    UpdateTableTagRequest,
+    ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, QueryTableRequest,
+    RefreshMaterializedViewRequest, RestoreTableRequest, UpdateTableRequest,
+    UpdateTableSchemaMetadataRequest, UpdateTableTagRequest,
 };
 use lance_namespace_impls::RestNamespaceBuilder;
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
@@ -460,7 +460,7 @@ impl PyDirectoryNamespace {
         request: &Bound<'_, PyAny>,
         request_data: &Bound<'_, PyBytes>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request: MergeInsertIntoTableRequest = depythonize(request)?;
+        let request = merge_insert_request_from_json(depythonize(request)?).infer_error()?;
         let data = Bytes::copy_from_slice(request_data.as_bytes());
         let response = crate::rt()
             .block_on(Some(py), self.inner.merge_insert_into_table(request, data))?
@@ -1160,7 +1160,7 @@ impl PyRestNamespace {
         request: &Bound<'_, PyAny>,
         request_data: &Bound<'_, PyBytes>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request: MergeInsertIntoTableRequest = depythonize(request)?;
+        let request = merge_insert_request_from_json(depythonize(request)?).infer_error()?;
         let data = Bytes::copy_from_slice(request_data.as_bytes());
         let response = crate::rt()
             .block_on(Some(py), self.inner.merge_insert_into_table(request, data))?

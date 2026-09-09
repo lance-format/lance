@@ -151,7 +151,7 @@ impl PyObjectStoreProvider {
     fn from_capsule(capsule: &Bound<'_, PyCapsule>) -> PyResult<Self> {
         // `pointer_checked(Some(name))` asks CPython for the pointer *and*
         // requires the capsule to carry exactly this name and a non-null
-        // pointer, so a foreign or mis-named capsule is rejected here rather
+        // pointer, so a foreign or misnamed capsule is rejected here rather
         // than dereferenced. (Passing `None` asks for a *nameless* capsule and
         // would reject every correctly-named one.)
         let ptr = capsule

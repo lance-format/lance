@@ -39,7 +39,7 @@ def train_ivf_model(
     sample_rate: int,
     max_iters: int,
     fragment_ids: Optional[list[int]] = None,
-) -> pa.Array: ...
+) -> pa.FixedSizeListArray: ...
 def train_pq_model(
     dataset,
     column: str,
@@ -48,10 +48,12 @@ def train_pq_model(
     distance_type: str,
     sample_rate: int,
     max_iters: int,
+    # Kept as the ``Array`` base type: callers pass ``IvfModel.centroids``,
+    # which the public ``IvfModel`` constructor accepts as a plain ``pa.Array``.
     ivf_model: pa.Array,
     fragment_ids: Optional[list[int]] = None,
     num_bits: int = 8,
-) -> pa.Array: ...
+) -> pa.FixedSizeListArray: ...
 def transform_vectors(
     dataset,
     column: str,
@@ -67,7 +69,7 @@ def transform_vectors(
 ): ...
 def build_rq_model(
     dimension: int,
-    num_bits: int = 1,
+    num_bits: int = 5,
     dtype: str = "float32",
 ) -> str: ...
 

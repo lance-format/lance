@@ -527,7 +527,8 @@ impl Fragment {
 
     /// Every Lance-format file this fragment references: the base data files
     /// plus the data file of each overlay. The fragment's other referenced
-    /// files (deletion files, external row-id files) are not in this format.
+    /// files are not in this format: a deletion file is `.arrow` or `.bin`, and
+    /// external row-id or row-version metadata is a raw byte range.
     ///
     /// Prefer this over `files`, which is the base data files only and so omits
     /// overlays.

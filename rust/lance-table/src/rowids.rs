@@ -32,7 +32,7 @@ use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 pub use serde::{read_row_ids, write_row_ids};
 
 use crate::utils::LanceIteratorExtension;
-use segment::U64Segment;
+use segment::{SegmentCursorState, U64Segment};
 use tracing::instrument;
 
 /// A sequence of row ids.
@@ -49,6 +49,125 @@ use tracing::instrument;
 /// We can make optimizations that assume uniqueness.
 #[derive(Debug, Clone, DeepSizeOf, PartialEq, Eq, Default)]
 pub struct RowIdSequence(Vec<U64Segment>);
+
+/// Stateful reader for selections that usually advance through a sequence.
+///
+/// Streaming readers reuse this cursor across record batches. If a later
+/// selection moves backwards then the cursor rewinds before continuing.
+#[derive(Debug, Default)]
+pub(crate) struct RowIdSequenceCursor {
+    segment_idx: usize,
+    rows_passed: usize,
+    segment_len: Option<usize>,
+    segment_cursor: SegmentCursorState,
+    last_index: Option<usize>,
+}
+
+impl RowIdSequenceCursor {
+    fn advance_segment(&mut self) {
+        self.rows_passed += self.segment_len.unwrap_or_default();
+        self.segment_idx += 1;
+        self.segment_len = None;
+        self.segment_cursor = SegmentCursorState::default();
+    }
+
+    fn get(&mut self, sequence: &RowIdSequence, index: usize) -> Option<u64> {
+        if index < self.rows_passed || self.last_index.is_some_and(|last| index < last) {
+            *self = Self::default();
+        }
+        self.last_index = Some(index);
+
+        loop {
+            let segment = sequence.0.get(self.segment_idx)?;
+            let segment_len = *self.segment_len.get_or_insert_with(|| segment.len());
+            let local_index = index - self.rows_passed;
+            if local_index < segment_len {
+                return self.segment_cursor.get(segment, local_index);
+            }
+            self.advance_segment();
+        }
+    }
+
+    fn extend_range(
+        &mut self,
+        sequence: &RowIdSequence,
+        selection: Range<usize>,
+        row_ids: &mut Vec<u64>,
+    ) {
+        if selection.is_empty() {
+            return;
+        }
+        if selection.start < self.rows_passed
+            || self.last_index.is_some_and(|last| selection.start < last)
+        {
+            *self = Self::default();
+        }
+        self.last_index = Some(selection.end - 1);
+
+        let mut index = selection.start;
+        while index < selection.end {
+            let Some(segment) = sequence.0.get(self.segment_idx) else {
+                break;
+            };
+            let segment_len = *self.segment_len.get_or_insert_with(|| segment.len());
+            let local_start = index - self.rows_passed;
+            if local_start >= segment_len {
+                self.advance_segment();
+                continue;
+            }
+
+            let count = (selection.end - index).min(segment_len - local_start);
+            let local_end = local_start + count;
+            self.segment_cursor
+                .extend_range(segment, local_start..local_end, row_ids);
+            index += count;
+            if local_end == segment_len {
+                self.advance_segment();
+            }
+        }
+    }
+
+    // Keep the sparse loop in `extend_range` unchanged. Sharing this loop with
+    // the dense decoder measurably slows sparse system-only scans.
+    fn extend_dense_range(
+        &mut self,
+        sequence: &RowIdSequence,
+        selection: Range<usize>,
+        row_ids: &mut Vec<u64>,
+    ) {
+        if selection.is_empty() {
+            return;
+        }
+        if selection.start < self.rows_passed
+            || self.last_index.is_some_and(|last| selection.start < last)
+        {
+            *self = Self::default();
+        }
+        self.last_index = Some(selection.end - 1);
+
+        let mut index = selection.start;
+        while index < selection.end {
+            let Some(segment) = sequence.0.get(self.segment_idx) else {
+                break;
+            };
+            let segment_len = *self.segment_len.get_or_insert_with(|| segment.len());
+            let local_start = index - self.rows_passed;
+            if local_start >= segment_len {
+                self.advance_segment();
+                continue;
+            }
+
+            let count = (selection.end - index).min(segment_len - local_start);
+            let local_end = local_start + count;
+            self.segment_cursor
+                .extend_dense_range(segment, local_start..local_end, row_ids);
+            index += count;
+            if local_end == segment_len {
+                self.advance_segment();
+            }
+        }
+    }
+}
 
 impl std::fmt::Display for RowIdSequence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -385,35 +504,71 @@ impl RowIdSequence {
         &'a self,
         selection: impl Iterator<Item = usize> + 'a,
     ) -> impl Iterator<Item = u64> + 'a {
-        let mut seg_iter = self.0.iter();
-        let mut cur_seg = seg_iter.next();
-        let mut rows_passed = 0;
-        let mut cur_seg_len = cur_seg.map(|seg| seg.len()).unwrap_or(0);
-        let mut cursor = cur_seg.map(|seg| seg.cursor());
-        let mut last_index = 0;
+        let mut cursor = RowIdSequenceCursor::default();
+        let mut last_index = None;
         selection.filter_map(move |index| {
-            if index < last_index {
+            if last_index.is_some_and(|last| index < last) {
                 panic!("Selection is not sorted");
             }
-            last_index = index;
-
-            cur_seg?;
-
-            while (index - rows_passed) >= cur_seg_len {
-                rows_passed += cur_seg_len;
-                cur_seg = seg_iter.next();
-                cur_seg_len = cur_seg?.len();
-                cursor = cur_seg.map(|seg| seg.cursor());
-            }
-
-            let value = cursor.as_mut().unwrap().get(index - rows_passed);
-            debug_assert!(
-                value.is_some(),
-                "segment reported {cur_seg_len} rows but has no value at {}",
-                index - rows_passed
-            );
-            value
+            last_index = Some(index);
+            cursor.get(self, index)
         })
+    }
+
+    pub(crate) fn cursor(&self) -> RowIdSequenceCursor {
+        RowIdSequenceCursor::default()
+    }
+
+    /// Choose the dense decoder once for a stream and reuse its cardinality.
+    ///
+    /// A stream uses one decoder for its lifetime, so multi-segment sequences
+    /// conservatively retain the sparse path. For a single bitmap segment, the
+    /// cardinality computed for the density decision seeds the cursor instead
+    /// of scanning the bitmap again on the first batch.
+    pub(crate) fn cursor_with_dense_range_expansion(&self) -> (RowIdSequenceCursor, bool) {
+        let mut cursor = self.cursor();
+        let [segment @ U64Segment::RangeWithBitmap { .. }] = self.0.as_slice() else {
+            return (cursor, false);
+        };
+        let segment_len = segment.len();
+        cursor.segment_len = Some(segment_len);
+        let use_dense_range_expansion = segment.use_dense_range_expansion(segment_len);
+        (cursor, use_dense_range_expansion)
+    }
+
+    /// Get a contiguous range of row ids while preserving scan state from a
+    /// previous call.
+    pub(crate) fn select_range_with_cursor(
+        &self,
+        cursor: &mut RowIdSequenceCursor,
+        selection: Range<usize>,
+    ) -> Vec<u64> {
+        let mut row_ids = Vec::with_capacity(selection.len());
+        cursor.extend_range(self, selection, &mut row_ids);
+        row_ids
+    }
+
+    /// Get a contiguous range from a sequence whose bitmap segments are dense.
+    pub(crate) fn select_dense_range_with_cursor(
+        &self,
+        cursor: &mut RowIdSequenceCursor,
+        selection: Range<usize>,
+    ) -> Vec<u64> {
+        let mut row_ids = Vec::with_capacity(selection.len());
+        cursor.extend_dense_range(self, selection, &mut row_ids);
+        row_ids
+    }
+
+    /// Get row ids while preserving scan state from a previous call.
+    ///
+    /// Decreasing offsets are supported by rewinding the cursor. This matters
+    /// for take requests, whose indices are not required to be sorted.
+    pub(crate) fn select_with_cursor<'a>(
+        &'a self,
+        cursor: &'a mut RowIdSequenceCursor,
+        selection: impl Iterator<Item = usize> + 'a,
+    ) -> impl Iterator<Item = u64> + 'a {
+        selection.filter_map(move |index| cursor.get(self, index))
     }
 
     /// Given a mask of row ids, calculate the offset ranges of the row ids that are present
@@ -1237,11 +1392,49 @@ mod test {
     fn test_selection() {
         let sequence = RowIdSequence(vec![
             U64Segment::Range(0..5),
-            U64Segment::Range(10..15),
-            U64Segment::Range(20..25),
+            U64Segment::RangeWithHoles {
+                range: 10..16,
+                holes: vec![12].into(),
+            },
+            U64Segment::RangeWithBitmap {
+                range: 20..28,
+                bitmap: [true, false, true, true, false, true, false, true]
+                    .as_slice()
+                    .into(),
+            },
+            U64Segment::SortedArray(vec![40, 42, 45].into()),
+            U64Segment::Array(vec![60, 50, 70].into()),
         ]);
+        let live = sequence.iter().collect::<Vec<_>>();
         let selection = sequence.select(vec![2, 4, 13, 14, 57].into_iter());
-        assert_eq!(selection.collect::<Vec<_>>(), vec![2, 4, 23, 24]);
+        assert_eq!(
+            selection.collect::<Vec<_>>(),
+            vec![live[2], live[4], live[13], live[14]]
+        );
+
+        for chunk_size in [1, 3, 7, 16] {
+            let mut cursor = sequence.cursor();
+            let mut chunked = Vec::new();
+            for start in (0..live.len()).step_by(chunk_size) {
+                let end = (start + chunk_size).min(live.len());
+                chunked.extend(sequence.select_range_with_cursor(&mut cursor, start..end));
+            }
+            assert_eq!(chunked, live);
+        }
+
+        let mut cursor = sequence.cursor();
+        assert_eq!(
+            sequence.select_range_with_cursor(&mut cursor, 6..19),
+            live[6..19]
+        );
+        assert_eq!(
+            sequence.select_range_with_cursor(&mut cursor, 1..8),
+            live[1..8]
+        );
+        assert_eq!(
+            sequence.select_range_with_cursor(&mut cursor, live.len() - 2..live.len() + 5),
+            live[live.len() - 2..]
+        );
     }
 
     #[test]
@@ -1268,6 +1461,62 @@ mod test {
         let got = sequence.select(picks.iter().copied()).collect::<Vec<_>>();
         let want: Vec<u64> = picks.iter().filter_map(|&i| live.get(i).copied()).collect();
         assert_eq!(got, want);
+
+        let mut cursor = sequence.cursor();
+        let mut chunked = Vec::new();
+        for range in [0..7, 7..30, 30..live.len()] {
+            chunked.extend(sequence.select_range_with_cursor(&mut cursor, range));
+        }
+        assert_eq!(chunked, live);
+        assert_eq!(
+            sequence.select_range_with_cursor(&mut cursor, 2..6),
+            live[2..6]
+        );
+    }
+
+    #[test]
+    fn test_dense_range_cursor_selection() {
+        let mut bitmap = Bitmap::new_full(40);
+        for hole in [3, 4, 17, 39] {
+            bitmap.clear(hole);
+        }
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithBitmap {
+            range: 100..140,
+            bitmap,
+        }]);
+        let expected = sequence.iter().collect::<Vec<_>>();
+        let (mut cursor, use_dense_range_expansion) = sequence.cursor_with_dense_range_expansion();
+        assert!(use_dense_range_expansion);
+        assert_eq!(cursor.segment_len, Some(expected.len()));
+
+        let mut actual = Vec::new();
+        for selection in [0..7, 7..8, 8..31, 31..expected.len() + 5] {
+            actual.extend(sequence.select_dense_range_with_cursor(&mut cursor, selection));
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(
+            sequence.select_dense_range_with_cursor(&mut cursor, 2..9),
+            expected[2..9]
+        );
+
+        let mut sparse_bitmap = Bitmap::new_empty(40);
+        for value in (0..40).step_by(2) {
+            sparse_bitmap.set(value);
+        }
+        let sparse = RowIdSequence(vec![U64Segment::RangeWithBitmap {
+            range: 0..40,
+            bitmap: sparse_bitmap,
+        }]);
+        let (sparse_cursor, use_dense_range_expansion) = sparse.cursor_with_dense_range_expansion();
+        assert!(!use_dense_range_expansion);
+        assert_eq!(sparse_cursor.segment_len, Some(20));
+
+        let mut multiple_segments = sequence.clone();
+        multiple_segments.extend(RowIdSequence::from(200..205));
+        let (multiple_cursor, use_dense_range_expansion) =
+            multiple_segments.cursor_with_dense_range_expansion();
+        assert!(!use_dense_range_expansion);
+        assert_eq!(multiple_cursor.segment_len, None);
     }
 
     #[test]
@@ -1301,6 +1550,25 @@ mod test {
         let got = sequence.select(picks.iter().copied()).collect::<Vec<_>>();
         let want: Vec<u64> = picks.iter().filter_map(|&i| live.get(i).copied()).collect();
         assert_eq!(got, want);
+
+        let tail_start = live.len() - 100_000;
+        let mut cursor = sequence.cursor();
+        assert_eq!(
+            sequence.select_range_with_cursor(&mut cursor, tail_start..live.len()),
+            live[tail_start..]
+        );
+
+        for chunk_size in [1, 7, 8, 9, 1_024, 4_097] {
+            let mut cursor = sequence.cursor();
+            let mut chunked = Vec::with_capacity(live.len() - tail_start);
+            let mut start = tail_start;
+            while start < live.len() {
+                let end = (start + chunk_size).min(live.len());
+                chunked.extend(sequence.select_range_with_cursor(&mut cursor, start..end));
+                start = end;
+            }
+            assert_eq!(chunked, live[tail_start..]);
+        }
     }
 
     #[test]

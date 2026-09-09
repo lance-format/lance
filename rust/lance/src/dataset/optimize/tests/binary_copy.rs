@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use arrow_array::{Decimal128Array, UInt64Array};
 
 const NON_LEGACY_VERSIONS: [LanceFileVersion; 4] = [
     LanceFileVersion::V2_0,
@@ -50,6 +51,82 @@ async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
     );
     let after = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn test_binary_copy_falls_back_for_non_schema_column_order() {
+    let decimal_type = DataType::Decimal128(38, 10);
+    let dataset_schema = Arc::new(Schema::new(vec![
+        Field::new("v_dec", decimal_type.clone(), true),
+        Field::new("v_u64", DataType::UInt64, true),
+    ]));
+    let write_params = WriteParams {
+        max_rows_per_file: 1,
+        data_storage_version: Some(LanceFileVersion::V2_3),
+        ..Default::default()
+    };
+    let test_dir = TempStrDir::default();
+    let empty_batch = RecordBatch::new_empty(dataset_schema.clone());
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(empty_batch)], dataset_schema),
+        &test_dir,
+        Some(write_params.clone()),
+    )
+    .await
+    .unwrap();
+
+    let decimal_values = Decimal128Array::from_iter_values([
+        201_000_000_000_000_000_000_000_i128,
+        202_000_000_000_000_000_000_000_i128,
+    ])
+    .with_precision_and_scale(38, 10)
+    .unwrap();
+    let swapped_schema = Arc::new(Schema::new(vec![
+        Field::new("v_u64", DataType::UInt64, true),
+        Field::new("v_dec", decimal_type, true),
+    ]));
+    let swapped_batch = RecordBatch::try_new(
+        swapped_schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![201, 202])),
+            Arc::new(decimal_values),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(swapped_batch)], swapped_schema),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+
+    let fragments: Vec<Fragment> = dataset
+        .get_fragments()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    assert_eq!(fragments.len(), 2);
+    for fragment in &fragments {
+        assert_eq!(fragment.files[0].fields.as_ref(), &[1, 0]);
+        assert_eq!(fragment.files[0].column_indices.as_ref(), &[0, 1]);
+    }
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 8,
+        compaction_mode: Some(CompactionMode::TryBinaryCopy),
+        ..Default::default()
+    };
+    assert!(!can_use_binary_copy(&dataset, &options, &fragments).await);
+    let before = dataset.scan().try_into_batch().await.unwrap();
+
+    compact_files(&mut dataset, options, None).await.unwrap();
+
+    let after = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(before, after);
+    let compacted_file = &dataset.manifest.fragments[0].files[0];
+    assert_eq!(compacted_file.fields.as_ref(), &[0, 1]);
+    assert_eq!(compacted_file.column_indices.as_ref(), &[0, 1]);
 }
 
 #[tokio::test]
@@ -253,11 +330,14 @@ async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
     assert_eq!(before_batch, after_batch);
 }
 
+#[rstest::rstest]
+#[case(LanceFileVersion::V2_0)]
+#[case(LanceFileVersion::V2_1)]
+#[case(LanceFileVersion::V2_2)]
+#[case(LanceFileVersion::V2_3)]
 #[tokio::test]
-async fn test_binary_copy_preserves_stable_row_ids() {
-    for version in NON_LEGACY_VERSIONS {
-        do_binary_copy_preserves_stable_row_ids(version).await;
-    }
+async fn test_binary_copy_preserves_stable_row_ids(#[case] version: LanceFileVersion) {
+    do_binary_copy_preserves_stable_row_ids(version).await;
 }
 
 async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
@@ -269,17 +349,18 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
         .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
 
     let mut dataset = Dataset::write(
-        data_gen.batch(4_000),
+        data_gen.batch(1_024),
         format!("memory://test/binary_copy_stable_row_ids_{}", version).as_str(),
         Some(WriteParams {
             enable_stable_row_ids: true,
             data_storage_version: Some(version),
-            max_rows_per_file: 500,
+            max_rows_per_file: 256,
             ..Default::default()
         }),
     )
     .await
     .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
 
     dataset
         .create_index(
@@ -344,7 +425,7 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
         .unwrap();
 
     let options = CompactionOptions {
-        target_rows_per_fragment: 2_000,
+        target_rows_per_fragment: 512,
         compaction_mode: Some(CompactionMode::ForceBinaryCopy),
         ..Default::default()
     };
@@ -386,11 +467,14 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
     assert_eq!(before, after);
 }
 
+#[rstest::rstest]
+#[case(LanceFileVersion::V2_0)]
+#[case(LanceFileVersion::V2_1)]
+#[case(LanceFileVersion::V2_2)]
+#[case(LanceFileVersion::V2_3)]
 #[tokio::test]
-async fn test_binary_copy_remaps_unstable_row_ids() {
-    for version in NON_LEGACY_VERSIONS {
-        do_binary_copy_remaps_unstable_row_ids(version).await;
-    }
+async fn test_binary_copy_remaps_unstable_row_ids(#[case] version: LanceFileVersion) {
+    do_binary_copy_remaps_unstable_row_ids(version).await;
 }
 
 async fn do_binary_copy_remaps_unstable_row_ids(version: LanceFileVersion) {
@@ -401,17 +485,18 @@ async fn do_binary_copy_remaps_unstable_row_ids(version: LanceFileVersion) {
         .col(Box::new(IncrementingInt32::new().named("i".to_owned())));
 
     let mut dataset = Dataset::write(
-        data_gen.batch(4_000),
-        "memory://test/binary_copy_no_stable",
+        data_gen.batch(1_024),
+        format!("memory://test/binary_copy_no_stable_{version}").as_str(),
         Some(WriteParams {
             enable_stable_row_ids: false,
             data_storage_version: Some(version),
-            max_rows_per_file: 500,
+            max_rows_per_file: 256,
             ..Default::default()
         }),
     )
     .await
     .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
 
     dataset
         .create_index(
@@ -463,7 +548,7 @@ async fn do_binary_copy_remaps_unstable_row_ids(version: LanceFileVersion) {
         .unwrap();
 
     let options = CompactionOptions {
-        target_rows_per_fragment: 2_000,
+        target_rows_per_fragment: 512,
         compaction_mode: Some(CompactionMode::ForceBinaryCopy),
         ..Default::default()
     };

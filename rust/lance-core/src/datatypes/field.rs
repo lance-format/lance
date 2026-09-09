@@ -30,7 +30,8 @@ use super::{
 };
 use crate::{
     Error, Result,
-    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD, BlobV2Layout},
+    utils::parse::str_is_truthy,
 };
 
 /// Use this config key in Arrow field metadata to indicate a column is a part of the primary key.
@@ -367,12 +368,22 @@ impl Field {
                 self_name
             ));
         }
-        let children_differences = explain_fields_difference(
-            &self.children,
-            &expected.children,
-            options,
-            Some(&self_name),
-        );
+        let children_differences =
+            if let Some(shared_child_count) = self.blob_v2_logical_shared_child_count(expected) {
+                explain_fields_difference(
+                    &self.children[..shared_child_count],
+                    &expected.children[..shared_child_count],
+                    options,
+                    Some(&self_name),
+                )
+            } else {
+                explain_fields_difference(
+                    &self.children,
+                    &expected.children,
+                    options,
+                    Some(&self_name),
+                )
+            };
         if !children_differences.is_empty() {
             let children_differences = format!(
                 "`{}` had mismatched children: {}",
@@ -410,10 +421,20 @@ impl Field {
     }
 
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
+        let children_match = self
+            .blob_v2_logical_shared_child_count(expected)
+            .map(|shared_child_count| {
+                compare_fields(
+                    &self.children[..shared_child_count],
+                    &expected.children[..shared_child_count],
+                    options,
+                )
+            })
+            .unwrap_or_else(|| compare_fields(&self.children, &expected.children, options));
         self.name == expected.name
             && self.logical_type == expected.logical_type
             && Self::compare_nullability(expected.nullable, self.nullable, options)
-            && compare_fields(&self.children, &expected.children, options)
+            && children_match
             && (!options.compare_field_ids || self.id == expected.id)
             && (!options.compare_dictionary || self.dictionary == expected.dictionary)
             && (!options.compare_metadata || self.metadata == expected.metadata)
@@ -543,6 +564,26 @@ impl Field {
             .map(|name| name == BLOB_V2_EXT_NAME)
             .unwrap_or(false)
             || self.is_blob_v2_descriptor()
+    }
+
+    fn blob_v2_layout(&self) -> Option<BlobV2Layout> {
+        if self.extension_name() != Some(BLOB_V2_EXT_NAME) {
+            return None;
+        }
+        let DataType::Struct(fields) = self.data_type() else {
+            return None;
+        };
+        BlobV2Layout::classify(&fields)
+    }
+
+    fn blob_v2_logical_shared_child_count(&self, other: &Self) -> Option<usize> {
+        if self.blob_v2_layout() == Some(BlobV2Layout::Logical)
+            && other.blob_v2_layout() == Some(BlobV2Layout::Logical)
+        {
+            Some(self.children.len().min(other.children.len()))
+        } else {
+            None
+        }
     }
 
     fn is_blob_v2_descriptor(&self) -> bool {
@@ -1080,7 +1121,7 @@ impl Field {
         PACKED_KEYS.iter().any(|key| {
             self.metadata
                 .get(*key)
-                .map(|value| value.eq_ignore_ascii_case("true"))
+                .map(|value| str_is_truthy(value))
                 .unwrap_or(false)
         })
     }
@@ -1187,7 +1228,7 @@ impl TryFrom<&ArrowField> for Field {
                 // Backward compatibility: use 0 for legacy boolean flag
                 metadata
                     .get(LANCE_UNENFORCED_PRIMARY_KEY)
-                    .filter(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes"))
+                    .filter(|s| str_is_truthy(s))
                     .map(|_| 0)
             });
         let unenforced_clustering_key_position = metadata
@@ -1274,6 +1315,101 @@ mod tests {
     use arrow_schema::{Fields, TimeUnit};
     use lance_arrow::BLOB_META_KEY;
     use std::collections::HashMap;
+
+    use crate::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_MINIMAL_FIELDS};
+
+    fn blob_v2_logical_field(children: Fields) -> Field {
+        ArrowField::new("blob", DataType::Struct(children), true)
+            .with_metadata(HashMap::from([(
+                ARROW_EXT_NAME_KEY.to_string(),
+                BLOB_V2_EXT_NAME.to_string(),
+            )]))
+            .try_into()
+            .unwrap()
+    }
+
+    #[test]
+    fn blob_v2_logical_shapes_are_compatible() {
+        let minimal = blob_v2_logical_field(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone());
+        let complete = blob_v2_logical_field(BLOB_V2_LOGICAL_FIELDS.clone());
+        let complete_required_range = blob_v2_logical_field(Fields::from(
+            BLOB_V2_LOGICAL_FIELDS
+                .iter()
+                .enumerate()
+                .map(|(index, field)| Arc::new(field.as_ref().clone().with_nullable(index < 2)))
+                .collect::<Vec<_>>(),
+        ));
+        let options = SchemaCompareOptions::default();
+
+        for complete_shape in [&complete, &complete_required_range] {
+            assert!(minimal.compare_with_options(complete_shape, &options));
+            assert!(complete_shape.compare_with_options(&minimal, &options));
+            assert_eq!(minimal.explain_difference(complete_shape, &options), None);
+            assert_eq!(complete_shape.explain_difference(&minimal, &options), None);
+        }
+
+        assert!(!complete.compare_with_options(&complete_required_range, &options));
+        let ignore_nullability = SchemaCompareOptions {
+            compare_nullability: NullabilityComparison::Ignore,
+            ..Default::default()
+        };
+        assert!(complete.compare_with_options(&complete_required_range, &ignore_nullability));
+
+        let complete_with_child_metadata = blob_v2_logical_field(Fields::from(
+            BLOB_V2_LOGICAL_FIELDS
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let field = if index == 0 {
+                        field.as_ref().clone().with_metadata(HashMap::from([(
+                            "source".to_string(),
+                            "test".to_string(),
+                        )]))
+                    } else {
+                        field.as_ref().clone()
+                    };
+                    Arc::new(field)
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let compare_metadata = SchemaCompareOptions {
+            compare_metadata: true,
+            ..Default::default()
+        };
+        assert!(!complete.compare_with_options(&complete_with_child_metadata, &compare_metadata));
+
+        let nested_minimal: Field = ArrowField::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![ArrowField::from(&minimal)])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        let nested_complete: Field = ArrowField::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![ArrowField::from(&complete)])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        assert!(nested_minimal.compare_with_options(&nested_complete, &options));
+        assert!(nested_complete.compare_with_options(&nested_minimal, &options));
+    }
+
+    #[test]
+    fn malformed_blob_v2_logical_shapes_remain_incompatible() {
+        let minimal = blob_v2_logical_field(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone());
+        let malformed = blob_v2_logical_field(Fields::from(vec![
+            ArrowField::new("data", DataType::LargeBinary, true),
+            ArrowField::new("uri", DataType::LargeUtf8, true),
+        ]));
+        let options = SchemaCompareOptions::default();
+
+        assert!(!minimal.compare_with_options(&malformed, &options));
+        assert!(!malformed.compare_with_options(&minimal, &options));
+        assert!(minimal.explain_difference(&malformed, &options).is_some());
+        assert!(malformed.explain_difference(&minimal, &options).is_some());
+    }
 
     #[test]
     fn arrow_field_to_field_metadata() {

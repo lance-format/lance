@@ -56,9 +56,11 @@ from lance_namespace import (
     ListTableVersionsRequest,
     ListTableVersionsResponse,
     NamespaceExistsRequest,
+    NamespaceExistsResponse,
     RegisterTableRequest,
     RegisterTableResponse,
     TableExistsRequest,
+    TableExistsResponse,
 )
 
 
@@ -86,7 +88,9 @@ class CustomNamespace(LanceNamespace):
     ) -> DescribeNamespaceResponse:
         return self._inner.describe_namespace(request)
 
-    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
+    def namespace_exists(
+        self, request: NamespaceExistsRequest
+    ) -> NamespaceExistsResponse:
         return self._inner.namespace_exists(request)
 
     def drop_namespace(self, request: DropNamespaceRequest) -> DropNamespaceResponse:
@@ -106,7 +110,7 @@ class CustomNamespace(LanceNamespace):
     def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
         return self._inner.describe_table(request)
 
-    def table_exists(self, request: TableExistsRequest) -> None:
+    def table_exists(self, request: TableExistsRequest) -> TableExistsResponse:
         return self._inner.table_exists(request)
 
     def drop_table(self, request: DropTableRequest) -> DropTableResponse:

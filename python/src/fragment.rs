@@ -21,7 +21,7 @@ use arrow_array::RecordBatchReader;
 use futures::TryFutureExt;
 use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
-use lance::dataset::scanner::ColumnOrdering;
+use lance::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
 use lance_core::datatypes::BlobHandling;
@@ -211,7 +211,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -225,6 +225,12 @@ impl FileFragment {
         batch_readahead: Option<usize>,
         blob_handling: Option<Bound<PyAny>>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
+        use_scalar_index: Option<bool>,
+        io_buffer_size: Option<u64>,
+        late_materialization: Option<Bound<PyAny>>,
+        include_deleted_rows: Option<bool>,
+        batch_size_bytes: Option<u64>,
+        strict_batch_size: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
 
@@ -292,6 +298,39 @@ impl FileFragment {
             scanner
                 .order_by(col_orderings)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(io_buffer_size) = io_buffer_size {
+            scanner.io_buffer_size(io_buffer_size);
+        }
+        if let Some(use_scalar_index) = use_scalar_index {
+            scanner.use_scalar_index(use_scalar_index);
+        }
+        if let Some(late_materialization) = late_materialization {
+            if let Ok(style_as_bool) = late_materialization.extract::<bool>() {
+                if style_as_bool {
+                    scanner.materialization_style(MaterializationStyle::AllLate);
+                } else {
+                    scanner.materialization_style(MaterializationStyle::AllEarly);
+                }
+            } else if let Ok(columns) = late_materialization.extract::<Vec<String>>() {
+                scanner.materialization_style(
+                    MaterializationStyle::all_early_except(&columns, self_.fragment.schema())
+                        .infer_error()?,
+                );
+            } else {
+                return Err(PyValueError::new_err(
+                    "late_materialization must be a bool or a list of strings",
+                ));
+            }
+        }
+        if let Some(batch_size_bytes) = batch_size_bytes {
+            scanner.batch_size_bytes(batch_size_bytes);
+        }
+        if let Some(true) = include_deleted_rows {
+            scanner.include_deleted_rows();
+        }
+        if let Some(strict_batch_size) = strict_batch_size {
+            scanner.strict_batch_size(strict_batch_size);
         }
         let scn = Arc::new(scanner);
         Ok(Scanner::new(scn))
