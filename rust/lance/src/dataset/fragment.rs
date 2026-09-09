@@ -5203,11 +5203,11 @@ mod tests {
             assert_eq!(i32_child(s, 1).values(), &[100, 200]);
         }
 
-        /// An overlay on a non-projected sibling leaf must be skipped and its file
-        /// never opened: overlay covers `s.b`, but the read projects only `s.a`.
+        /// An overlay on a non-projected sibling leaf contributes shared struct
+        /// validity, but its child value remains pruned from the result.
         #[rstest]
         #[tokio::test]
-        async fn test_overlay_nonprojected_sibling_skipped(
+        async fn test_overlay_nonprojected_sibling_value_pruned(
             #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
         ) {
             let (dataset, _) = create_struct_dataset(version).await;
@@ -5227,18 +5227,14 @@ mod tests {
                 version,
             )
             .await;
-            // Delete the overlay file: if projecting only `s.a` opened it, this fails.
-            dataset
-                .object_store
-                .delete(&Path::from("data/bov.lance"))
-                .await
-                .unwrap();
 
             let frag = dataset.get_fragment(0).unwrap();
             let a_only = dataset.schema().project_by_ids(&[2], true);
             let batch = frag.take(&[1, 2], &a_only).await.unwrap();
             let s = struct_col(&batch, "s");
-            // Only `a` is projected, unchanged base values.
+            // Only `a` is projected, so the sibling value remains absent and `a`
+            // retains its unchanged base values.
+            assert_eq!(s.num_columns(), 1);
             assert_eq!(i32_child(s, 0).values(), &[1, 2]);
         }
 
@@ -5347,6 +5343,13 @@ mod tests {
             let batch = frag.take(&[2], &full_schema(&dataset)).await.unwrap();
             let s = struct_col(&batch, "s");
             assert_eq!(i32_child(s, 0).values(), &[999]);
+            assert!(s.is_valid(0));
+
+            // Projecting only the older `b` value must still consult the newer
+            // `a` overlay for their shared parent validity.
+            let b_only = dataset.schema().project_by_ids(&[3], true);
+            let batch = frag.take(&[2], &b_only).await.unwrap();
+            let s = struct_col(&batch, "s");
             assert!(s.is_valid(0));
         }
 

@@ -284,7 +284,7 @@ fn assemble_overlay_column(
     interleave(&sources, &routing.indices).map_err(Error::from)
 }
 
-/// One overlay's contribution to one projected atomic field, with its file reader opened.
+/// One overlay's contribution to one relevant atomic field, with its file reader opened.
 #[derive(Debug, Clone)]
 struct LoadedAtomicFieldOverlay {
     /// Index of this overlay in the planner's newest-first file list. Lower is newer.
@@ -296,10 +296,11 @@ struct LoadedAtomicFieldOverlay {
     reader: Arc<dyn GenericFileReader>,
 }
 
-/// The overlays that apply to a single projected atomic field — a per-row field an overlay
-/// can replace as a unit (a primitive leaf, or a whole list/map field; structs are
-/// recursed through, not treated as atomic fields). Ordered newest-first, with readers opened
-/// and pruned to a specific read. Produced by [`resolve_overlays`] and consumed by
+/// The overlays that apply to a single relevant atomic field — either a projected
+/// value or an unprojected descendant that can supply projected struct validity.
+/// An atomic field is a primitive leaf or a whole list/map field; structs are
+/// recursed through. Ordered newest-first, with readers opened and pruned to a
+/// specific read. Produced by [`resolve_overlays`] and consumed by
 /// [`merge_overlay_batch`].
 #[derive(Debug, Clone)]
 pub struct LoadedAtomicField {
@@ -316,6 +317,10 @@ pub struct LoadedAtomicField {
     /// Projection of exactly the atomic field (its ancestor path pruned to the atomic
     /// field subtree), used to fetch the atomic field's values from the overlay file.
     fetch_projection: Arc<Schema>,
+    /// Whether this atomic field is part of the output projection. Unprojected
+    /// descendants are still loaded when they can supply a projected struct
+    /// ancestor's validity, but their values are not merged into the output.
+    is_value_projected: bool,
     overlays_newest_first: Vec<LoadedAtomicFieldOverlay>,
 }
 
@@ -338,12 +343,12 @@ type StructValidityMap = BTreeMap<(i32, Vec<i32>), StructValidityCandidates>;
 #[derive(Debug, Clone)]
 struct PlannedOverlayFile {
     data_file: DataFile,
-    /// The covered ∩ projected atomic fields to project when the file is opened, so a single
-    /// reader serves every atomic field the file contributes to.
+    /// The covered relevant atomic fields to project when the file is opened, so a
+    /// single reader serves every value or validity contribution from the file.
     open_projection: Arc<Schema>,
 }
 
-/// One overlay's contribution to one projected atomic field, before the file is opened.
+/// One overlay's contribution to one relevant atomic field, before the file is opened.
 #[derive(Debug, Clone)]
 struct PlannedAtomicFieldOverlay {
     /// Index into [`OverlayReadPlanner::files`] of the file that supplies the value.
@@ -351,14 +356,15 @@ struct PlannedAtomicFieldOverlay {
     coverage: Arc<RoaringBitmap>,
 }
 
-/// The overlays that apply to a single projected atomic field, ordered newest-first, before
-/// any file is opened.
+/// The overlays that apply to a single relevant atomic field, ordered newest-first,
+/// before any file is opened.
 #[derive(Debug, Clone)]
 struct PlannedAtomicField {
     top_field: Arc<Field>,
     ancestor_ids: Vec<i32>,
     struct_ancestor_ids: Vec<Vec<i32>>,
     fetch_projection: Arc<Schema>,
+    is_value_projected: bool,
     overlays_newest_first: Vec<PlannedAtomicFieldOverlay>,
 }
 
@@ -379,7 +385,7 @@ pub struct OverlayReadPlanner {
 }
 
 impl OverlayReadPlanner {
-    /// True when no projected atomic field has any overlay, so there is nothing to resolve.
+    /// True when no overlay affects any projected value or struct validity.
     pub fn is_empty(&self) -> bool {
         self.atomic_fields.is_empty()
     }
@@ -413,18 +419,46 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
         "overlays must be sorted newest-last (see sort_overlays_newest_last)"
     );
 
-    // The projection's atomic fields, and a leaf-id -> atomic-field-index map so an
+    // The relevant atomic fields, and a leaf-id -> atomic-field-index map so an
     // overlay's stored leaf ids resolve to the atomic field they belong to in O(1).
+    // Besides projected values, this includes unprojected descendants of projected
+    // struct ancestors because any of their overlays can supply those ancestors'
+    // shared validity.
     struct AtomicFieldInfo<'a> {
         top_field: &'a Field,
         ancestor_ids: Vec<i32>,
         struct_ancestor_ids: Vec<Vec<i32>>,
         atomic_field_id: i32,
+        is_value_projected: bool,
     }
+    let full_schema = fragment.schema();
     let mut atomic_field_infos: Vec<AtomicFieldInfo> = Vec::new();
     let mut leaf_to_atomic_field: HashMap<i32, usize> = HashMap::new();
-    for top in &projection.fields {
-        for atomic_field in enumerate_atomic_fields(top) {
+    for projected_top in &projection.fields {
+        let Some(full_top) = full_schema.field_by_id(projected_top.id) else {
+            // Synthetic/system fields cannot be targeted by data overlays.
+            continue;
+        };
+        let projected_atomic_fields = enumerate_atomic_fields(projected_top);
+        let projected_atomic_ids: BTreeSet<i32> = projected_atomic_fields
+            .iter()
+            .map(|atomic_field| atomic_field.field.id)
+            .collect();
+        let projected_struct_ancestor_ids: BTreeSet<Vec<i32>> = projected_atomic_fields
+            .iter()
+            .flat_map(|atomic_field| atomic_field.struct_ancestor_ids.iter().cloned())
+            .collect();
+
+        for atomic_field in enumerate_atomic_fields(full_top) {
+            let is_value_projected = projected_atomic_ids.contains(&atomic_field.field.id);
+            let struct_ancestor_ids: Vec<Vec<i32>> = atomic_field
+                .struct_ancestor_ids
+                .into_iter()
+                .filter(|path| projected_struct_ancestor_ids.contains(path))
+                .collect();
+            if !is_value_projected && struct_ancestor_ids.is_empty() {
+                continue;
+            }
             let idx = atomic_field_infos.len();
             let mut value_leaf_ids = Vec::new();
             collect_leaf_ids(atomic_field.field, &mut value_leaf_ids);
@@ -432,10 +466,11 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
                 leaf_to_atomic_field.insert(leaf, idx);
             }
             atomic_field_infos.push(AtomicFieldInfo {
-                top_field: top,
+                top_field: projected_top,
                 ancestor_ids: atomic_field.ancestor_ids,
-                struct_ancestor_ids: atomic_field.struct_ancestor_ids,
+                struct_ancestor_ids,
                 atomic_field_id: atomic_field.field.id,
+                is_value_projected,
             });
         }
     }
@@ -465,7 +500,7 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
             .collect();
         files.push(PlannedOverlayFile {
             data_file: overlay.data_file.clone(),
-            open_projection: Arc::new(projection.project_by_ids(&covered_ids, true)),
+            open_projection: Arc::new(full_schema.project_by_ids(&covered_ids, true)),
         });
         for (atomic_field_idx, field_pos) in covered {
             atomic_field_overlays[atomic_field_idx].push(PlannedAtomicFieldOverlay {
@@ -475,7 +510,7 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
         }
     }
 
-    // Emit one PlannedAtomicField per projected atomic field that has overlays, in
+    // Emit one PlannedAtomicField per relevant atomic field that has overlays, in
     // atomic field order.
     let mut atomic_fields = Vec::new();
     for (idx, info) in atomic_field_infos.iter().enumerate() {
@@ -487,7 +522,8 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
             top_field: Arc::new(info.top_field.clone()),
             ancestor_ids: info.ancestor_ids.clone(),
             struct_ancestor_ids: info.struct_ancestor_ids.clone(),
-            fetch_projection: Arc::new(projection.project_by_ids(&[info.atomic_field_id], true)),
+            fetch_projection: Arc::new(full_schema.project_by_ids(&[info.atomic_field_id], true)),
+            is_value_projected: info.is_value_projected,
             overlays_newest_first,
         });
     }
@@ -835,6 +871,7 @@ pub async fn resolve_overlays(
                 ancestor_ids: atomic_field.ancestor_ids.clone(),
                 struct_ancestor_ids: atomic_field.struct_ancestor_ids.clone(),
                 fetch_projection: atomic_field.fetch_projection.clone(),
+                is_value_projected: atomic_field.is_value_projected,
                 overlays_newest_first,
             });
         }
@@ -857,10 +894,11 @@ fn read_offsets_bitmap(offsets_in_frag: &[u32]) -> RoaringBitmap {
     bitmap
 }
 
-/// Resolve overlays for one base batch: route each projected atomic field against the batch's
-/// `offsets_in_frag`, fetch only the overlay values the batch needs (concurrently with
-/// the base read), assemble the merged atomic field, and splice it into its output column.
-/// AtomicFields with no covered rows, and columns with no plan, pass through.
+/// Resolve overlays for one base batch: route each relevant atomic field against the
+/// batch's `offsets_in_frag`, fetch only the overlay values the batch needs
+/// (concurrently with the base read), and collect projected struct validity. For a
+/// projected value, assemble the merged atomic field and splice it into its output
+/// column. Atomic fields with no covered rows, and columns with no plan, pass through.
 pub async fn merge_overlay_batch(
     base: ReadBatchFut,
     offsets_in_frag: &[u32],
@@ -916,6 +954,9 @@ pub async fn merge_overlay_batch(
             continue;
         };
         collect_struct_validity_candidates(plan, &routing, &fetched, &mut struct_validities)?;
+        if !plan.is_value_projected {
+            continue;
+        }
         let base_atomic_field = descend_by_ids(&columns[idx], &plan.top_field, &plan.ancestor_ids)?;
         let fetched_values: Vec<ArrayRef> = fetched
             .iter()
