@@ -31,11 +31,6 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 #[rstest::rstest]
-#[case::complete("complete")]
-#[case::missing_segment("missing")]
-#[case::unsupported_version("version")]
-#[case::unsupported_async_plugin("plugin")]
-#[rstest::rstest]
 #[case::default_search("default")]
 #[case::all_segments("all")]
 #[case::partial_selection("partial")]
@@ -117,6 +112,11 @@ async fn vector_fragment_search_requires_every_contributor(#[case] selection: &s
     );
 }
 
+#[rstest::rstest]
+#[case::complete("complete")]
+#[case::missing_segment("missing")]
+#[case::unsupported_version("version")]
+#[case::unsupported_async_plugin("plugin")]
 #[tokio::test]
 async fn destination_coverage_requires_every_contributing_segment(#[case] scenario: &str) {
     let mut dataset = fixture().await;
