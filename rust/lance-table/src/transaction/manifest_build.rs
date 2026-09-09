@@ -111,15 +111,6 @@ impl Transaction {
         // republish the referenced files as legacy-compatible.
         ensure_can_read_manifest(&manifest)?;
         ensure_can_write_manifest(&manifest)?;
-        // Restore bypasses build_manifest, so it needs the same maintenance boundary.
-        if (current_manifest.writer_feature_flags | manifest.writer_feature_flags)
-            & FLAG_FRAGMENT_REUSE_INDEX
-            != 0
-        {
-            return Err(Error::not_supported(
-                "Restoring tagged FRI history is not implemented. Please upgrade to a writer supporting tagged histories",
-            ));
-        }
         manifest.set_timestamp(config.timestamp_nanos);
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;

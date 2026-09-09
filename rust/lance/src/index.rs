@@ -3398,6 +3398,9 @@ impl DatasetIndexInternalExt for Dataset {
                 // affected segments; independent segments need no legacy remapper.
                 // Maintenance is rejected before entering the legacy write path.
                 return match frag_reuse_index_meta.index_version {
+                    // None means this legacy API cannot provide a reader for FRI index
+                    // version 1; it does not mean the dataset has no FRI.
+                    // Callers must not use this result to authorize index maintenance.
                     1 => Ok(None),
                     version => Err(Error::not_supported(format!(
                         "FRI index_version {version} is unsupported. Please upgrade to a newer version",
