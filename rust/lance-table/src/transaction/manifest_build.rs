@@ -24,6 +24,7 @@ use crate::io::{
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -421,16 +422,24 @@ impl Transaction {
             ));
         }
 
-        if config.migration_next_row_id.is_some() && !current_indices.is_empty() {
-            let names: Vec<&str> = current_indices
-                .iter()
-                .map(|idx| idx.name.as_str())
-                .collect();
+        // The fragment-reuse index is internal bookkeeping registered by
+        // compaction with deferred index remap, not something a user can
+        // meaningfully drop and recreate, so it must not gate the migration.
+        // It is dropped from the migrated manifest below, which is what makes
+        // ignoring it here safe. Every other index, including the MemWAL
+        // index, still blocks: only the fragment-reuse index is known to be
+        // discardable.
+        let blocking_indices: Vec<&str> = current_indices
+            .iter()
+            .filter(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
+            .map(|idx| idx.name.as_str())
+            .collect();
+        if config.migration_next_row_id.is_some() && !blocking_indices.is_empty() {
             return Err(Error::invalid_input(format!(
                 "Cannot migrate to stable row IDs while indexes exist on the dataset. \
                  Drop the following indexes first, then re-run the migration, and \
                  recreate them afterwards: {}",
-                names.join(", ")
+                blocking_indices.join(", ")
             )));
         }
         let mut reference_paths = match current_manifest {
@@ -491,6 +500,18 @@ impl Transaction {
             .unwrap_or(0);
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
+
+        // A fragment-reuse index maps old row *addresses* to new ones, and the
+        // read path attaches it to every index it opens without checking
+        // whether the dataset uses stable row ids. Carrying it past the
+        // migration would therefore rewrite freshly issued row ids as if they
+        // were addresses, and rows whose new id happens to fall in the old
+        // address range would disappear from indexed queries. Nothing needs it
+        // afterwards either, since compaction rejects deferred index remap on
+        // a stable-row-id dataset.
+        if config.migration_next_row_id.is_some() {
+            final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
+        }
 
         // Snapshot taken before the operation rewrites the list, so coverage can
         // be compared against what each logical index looked like going in. Only

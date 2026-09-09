@@ -9,6 +9,7 @@ use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::{IndexCriteria, IndexType, scalar::ScalarIndexParams};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
@@ -794,6 +795,144 @@ async fn test_migrate_to_stable_row_ids_basic() {
     // next_row_id should have advanced by the 5 newly appended rows.
     assert_eq!(dataset_after_append.manifest.next_row_id, 25);
 
+    dataset.validate().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_migrate_to_stable_row_ids_ignores_system_indices() {
+    // Compaction with deferred index remap registers the fragment-reuse
+    // system index (`__lance_frag_reuse`) for rewritten, indexed fragments.
+    // It is internal bookkeeping, not a user index the migration would
+    // invalidate, and the user may have already dropped every user index —
+    // the migration must not be gated on it.
+    let uri = "memory://migrate_system_idx";
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "values",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..10))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    dataset
+        .create_index(
+            &["values"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Drop the user index; only the bookkeeping system index remains.
+    let user_index_name = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|idx| idx.name.clone())
+        .find(|name| name != FRAG_REUSE_INDEX_NAME)
+        .expect("user index should exist after compaction");
+    dataset.drop_index(&user_index_name).await.unwrap();
+    let index_names: Vec<String> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|idx| idx.name.clone())
+        .collect();
+    assert_eq!(
+        index_names,
+        vec![FRAG_REUSE_INDEX_NAME.to_string()],
+        "precondition: only the fragment-reuse system index remains"
+    );
+
+    dataset.migrate_to_stable_row_ids().await.unwrap();
+    assert!(
+        dataset.manifest.uses_stable_row_ids(),
+        "migration must succeed with only the fragment-reuse index present"
+    );
+
+    // The migration must drop the fragment-reuse index rather than carry it
+    // forward. It maps old row addresses to new ones, and the read path
+    // attaches it to every index it opens, so a survivor would rewrite the
+    // freshly issued stable row ids as if they were addresses.
+    let remaining: Vec<String> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|idx| idx.name.clone())
+        .collect();
+    assert!(
+        remaining.is_empty(),
+        "migration must leave no indices behind, got {remaining:?}"
+    );
+
+    // An index built after the migration must return the row it covers. With
+    // the fragment-reuse index still attached this lookup finds nothing: the
+    // remapper rewrites row id 0 into the compacted fragment's address space,
+    // which no live row carries.
+    dataset
+        .create_index(
+            &["values"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let matched = dataset
+        .scan()
+        .filter("values = 0")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap()
+        .num_rows();
+    assert_eq!(
+        matched, 1,
+        "an index built after the migration must find the row it covers"
+    );
+
+    // Deleting enough rows to materialize a compaction task (the default
+    // materialize-deletions threshold is 10%) exercises the commit path once
+    // more on the migrated dataset.
+    dataset.delete("values >= 7").await.unwrap();
+    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert!(
+        metrics.fragments_removed > 0,
+        "precondition: the compaction must do real work, got metrics {metrics:?}"
+    );
     dataset.validate().await.unwrap();
 }
 
