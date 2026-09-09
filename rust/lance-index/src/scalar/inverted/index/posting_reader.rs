@@ -27,7 +27,7 @@ pub struct PostingListReader {
     /// queries do not decode the final posting block again.
     pub(super) modern_doc_id_validations: Option<Arc<[OnceCell<()>]>>,
     /// Skips per-token readiness checks once the whole immutable table is validated.
-    pub(super) modern_postings_validated: AtomicBool,
+    pub(super) modern_postings_validated: Arc<AtomicBool>,
     pub(super) modern_num_docs: Option<usize>,
 
     pub(super) index_cache: WeakLanceCache,
@@ -50,7 +50,7 @@ pub(super) enum PostingMetadata {
     /// `ensure_metadata_loaded`, and the stats path can also fetch a single
     /// token via `posting_len_for_token` without forcing the bulk load.
     V2 {
-        metadata: OnceCell<LoadedPostingMetadata>,
+        metadata: Arc<OnceCell<LoadedPostingMetadata>>,
     },
 }
 
@@ -148,7 +148,7 @@ impl PostingListReader {
             }
         } else {
             PostingMetadata::V2 {
-                metadata: OnceCell::new(),
+                metadata: Arc::new(OnceCell::new()),
             }
         };
 
@@ -171,9 +171,44 @@ impl PostingListReader {
             positions_layout,
             grouping,
             modern_doc_id_validations,
-            modern_postings_validated: AtomicBool::new(false),
+            modern_postings_validated: Arc::new(AtomicBool::new(false)),
             modern_num_docs: None,
             index_cache: WeakLanceCache::from(index_cache),
+        })
+    }
+
+    /// Reuse immutable posting state with a reader opened through the current store.
+    /// The caller must preserve the index cache namespace: these cells describe
+    /// one immutable posting file, not an arbitrary reader with the same schema.
+    pub(super) fn with_reader(&self, reader: Arc<dyn IndexReader>) -> Result<Self> {
+        let PostingMetadata::V2 { metadata } = &self.metadata else {
+            return Err(Error::not_supported(
+                "rebinding legacy FTS posting readers requires a full index load",
+            ));
+        };
+        if reader.num_rows() != self.reader.num_rows()
+            || reader.schema() != self.reader.schema()
+            || reader.schema().metadata != self.reader.schema().metadata
+        {
+            return Err(Error::index(
+                "FTS posting file changed while rebinding an immutable index",
+            ));
+        }
+        Ok(Self {
+            reader,
+            metadata: PostingMetadata::V2 {
+                metadata: metadata.clone(),
+            },
+            has_position: self.has_position,
+            has_impacts: self.has_impacts,
+            posting_tail_codec: self.posting_tail_codec,
+            block_size: self.block_size,
+            positions_layout: self.positions_layout,
+            grouping: self.grouping.clone(),
+            modern_doc_id_validations: self.modern_doc_id_validations.clone(),
+            modern_postings_validated: self.modern_postings_validated.clone(),
+            modern_num_docs: self.modern_num_docs,
+            index_cache: self.index_cache.clone(),
         })
     }
 
