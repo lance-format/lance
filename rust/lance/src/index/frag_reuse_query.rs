@@ -397,7 +397,7 @@ async fn load_ledger(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReu
         .index_details
         .as_ref()
         .ok_or_else(|| corrupt("missing FRI details"))?;
-    FragReuseLedger::decode_details(index.index_version, details, |file| async move {
+    FragReuseLedger::decode(index.index_version, details, |file| async move {
         let end = file
             .offset
             .checked_add(file.size)
@@ -747,6 +747,34 @@ mod tests {
         .await
         .unwrap();
         *dataset = dataset.checkout_version(location.version).await.unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case::inline(false)]
+    #[case::external(true)]
+    #[tokio::test]
+    async fn unknown_mapping_falls_back_to_scan(#[case] external: bool) {
+        let mut dataset = fixture().await;
+        let (mut transition, destinations) = prepare(&dataset).await;
+        transition.mapping = None;
+        let mut raw = transition.encode_to_vec();
+        raw.extend(field(17, b"future mapping"));
+        let fri = install(&mut dataset, field(2, &raw), destinations, external).await;
+        let mapping = QueryFragReuseIndex::open(&dataset, &fri).await.unwrap();
+        assert!(mapping.ledger.has_unsupported_transitions());
+        assert!(mapping.ledger.transitions().is_empty());
+        assert!(mapping.partitions.is_empty());
+
+        let mut scan = dataset.scan();
+        scan.filter("i = 2").unwrap();
+        assert!(
+            !scan
+                .explain_plan(false)
+                .await
+                .unwrap()
+                .contains("ScalarIndexQuery")
+        );
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
     }
 
     #[tokio::test]
@@ -1695,8 +1723,11 @@ mod tests {
         assert!(dataset.load_index_by_name("i_idx").await.unwrap().is_none());
         assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
     }
+    #[rstest::rstest]
+    #[case::complete(false)]
+    #[case::unknown_middle_mapping(true)]
     #[tokio::test]
-    async fn mixed_chain_keeps_independent_direct_coverage() {
+    async fn mixed_chain_keeps_independent_direct_coverage(#[case] unknown_middle: bool) {
         let digest = |id| FragmentDigest {
             id,
             physical_rows: 2,
@@ -1717,19 +1748,25 @@ mod tests {
                 )),
             }
         };
-        let content = InlineContent {
-            legacy_versions: vec![],
-            transitions: vec![ordered(2, 3), ordered(0, 1), ordered(1, 2)],
+        let mut content = Vec::new();
+        for mut transition in [ordered(2, 3), ordered(0, 1), ordered(1, 2)] {
+            let is_unknown = unknown_middle && transition.sources[0].id == 1;
+            if is_unknown {
+                transition.mapping = None;
+            }
+            let mut raw = transition.encode_to_vec();
+            if is_unknown {
+                raw.extend(field(17, b"future mapping"));
+            }
+            content.extend(field(2, &raw));
         }
-        .encode_to_vec();
         let details = prost_types::Any {
             type_url: "/lance.table.FragmentReuseIndexDetails".into(),
             value: field(1, &content),
         };
-        let ledger =
-            FragReuseLedger::decode_details(1, &details, |_| async { panic!("inline content") })
-                .await
-                .unwrap();
+        let ledger = FragReuseLedger::decode(1, &details, |_| async { panic!("inline content") })
+            .await
+            .unwrap();
         let mapping = Arc::new(QueryFragReuseIndex {
             live_fragments: RoaringBitmap::from_iter([3, 9]),
             ledger,
@@ -1741,8 +1778,8 @@ mod tests {
         assert_eq!(
             mapping.translate(&inputs).await.unwrap(),
             vec![
-                Some(RowAddress::new_from_parts(3, 1)),
-                Some(RowAddress::new_from_parts(3, 1)),
+                (!unknown_middle).then_some(RowAddress::new_from_parts(3, 1)),
+                (!unknown_middle).then_some(RowAddress::new_from_parts(3, 1)),
                 Some(RowAddress::new_from_parts(3, 1)),
                 Some(inputs[3]),
                 Some(inputs[4])
@@ -1750,7 +1787,10 @@ mod tests {
         );
         assert_eq!(
             mapping
-                .segment_coverage(&[RoaringBitmap::from_iter([0]), RoaringBitmap::from_iter([2])]),
+                .segment_coverage(&[RoaringBitmap::from_iter([0]), RoaringBitmap::from_iter([2])])
+                .into_iter()
+                .map(|coverage| coverage & &mapping.live_fragments)
+                .collect::<Vec<_>>(),
             vec![RoaringBitmap::new(), RoaringBitmap::from_iter([3])]
         );
     }
