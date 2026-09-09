@@ -204,7 +204,7 @@ impl InvertedIndex {
     /// Rebind a modern index within its immutable index/fragment-reuse cache
     /// namespace. Only reader-free state crosses the request boundary; all
     /// future posting and document I/O uses the supplied store and remapper.
-    pub(in super::super) async fn with_store(
+    pub(in super::super) fn with_store(
         &self,
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
@@ -212,31 +212,26 @@ impl InvertedIndex {
         if self.is_legacy() || self.partitions.iter().any(|part| part.is_legacy()) {
             return Ok(None);
         }
-        let partitions = stream::iter(self.partitions.clone().into_iter().enumerate().map(
-            |(priority, part)| {
-                let store = store.with_io_priority(priority as u64);
-                let frag_reuse_index = frag_reuse_index.clone();
-                async move {
-                    let Some(docs) = part.docs.modern() else {
-                        return Err(Error::internal("modern FTS partition has legacy documents"));
-                    };
-                    let reader = store.open_index_file(&posting_file_path(part.id)).await?;
-                    Ok(Arc::new(InvertedPartition {
-                        id: part.id,
-                        store: store.clone(),
-                        tokens: part.tokens.clone(),
-                        inverted_list: Arc::new(part.inverted_list.with_reader(reader)?),
-                        docs: PartitionDocumentStore::Modern(Arc::new(
-                            docs.with_store(store, frag_reuse_index),
-                        )),
-                        token_set_format: part.token_set_format,
-                    }))
-                }
-            },
-        ))
-        .buffered(store.io_parallelism().max(1))
-        .try_collect::<Vec<_>>()
-        .await?;
+        let mut partitions = Vec::with_capacity(self.partitions.len());
+        for (priority, part) in self.partitions.iter().enumerate() {
+            let store = store.with_io_priority(priority as u64);
+            let Some(docs) = part.docs.modern() else {
+                return Err(Error::internal("modern FTS partition has legacy documents"));
+            };
+            partitions.push(Arc::new(InvertedPartition {
+                id: part.id,
+                store: store.clone(),
+                tokens: part.tokens.clone(),
+                inverted_list: Arc::new(
+                    part.inverted_list
+                        .with_store(store.clone(), posting_file_path(part.id))?,
+                ),
+                docs: PartitionDocumentStore::Modern(Arc::new(
+                    docs.with_store(store, frag_reuse_index.clone()),
+                )),
+                token_set_format: part.token_set_format,
+            }));
+        }
         Ok(Some(Self {
             params: self.params.clone(),
             store,

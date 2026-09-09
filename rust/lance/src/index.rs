@@ -4087,6 +4087,10 @@ mod tests {
         assert!(result.fully_resident);
         assert_eq!(search_ids(dataset_b, "beta").await, vec![1, 4, 7]);
         assert!(wrapper_a.requests.lock().unwrap().is_empty());
+        assert!(
+            wrapper_b.requests.lock().unwrap().is_empty(),
+            "a new request must serve the prewarmed index without opening partition files"
+        );
 
         let scalar_cache = dataset.index_cache.for_index(&index_meta.uuid, None);
         let cached = scalar_cache

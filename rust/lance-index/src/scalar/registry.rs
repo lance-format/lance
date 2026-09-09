@@ -387,7 +387,28 @@ where
         return Ok(index.clone());
     }
 
-    if let Some(index) = entry.index_for_store(&index_store) {
+    let binding = entry.binding.load_full();
+    if index_store.is_same_storage_binding(binding.index_store.as_ref()) {
+        return Ok(binding.index.clone());
+    }
+
+    // Reader-free state can be rebound independently for each request. Do not
+    // let a slow or cancelled binding delay unrelated requests. Publish only
+    // if the source binding is still current, so a delayed caller cannot roll
+    // the cache back after another request has replaced it.
+    if let Some(index) = rebind(binding.index.clone()).await? {
+        let previous = entry.binding.compare_and_swap(
+            &binding,
+            Arc::new(StoreBoundScalarIndexBinding {
+                index_store: index_store.clone(),
+                index: index.clone(),
+            }),
+        );
+        if !Arc::ptr_eq(&previous, &binding)
+            && index_store.is_same_storage_binding(previous.index_store.as_ref())
+        {
+            return Ok(previous.index.clone());
+        }
         return Ok(index);
     }
 
@@ -401,13 +422,7 @@ where
     let load = take_scalar_index_load(&pending_load)?.ok_or_else(|| {
         lance_core::Error::internal("store-bound scalar index load has no retained result")
     })?;
-    // The namespace identifies immutable index contents. A plugin may reuse
-    // reader-free state, but must rebuild every storage-bound handle through
-    // the current store before publishing the replacement.
-    let index = match rebind(entry.index()).await? {
-        Some(index) => index,
-        None => load.await?,
-    };
+    let index = load.await?;
     entry.replace(index_store, index.clone());
     Ok(index)
 }
@@ -655,6 +670,59 @@ mod tests {
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&cached.index(), &index_b));
+    }
+
+    #[tokio::test]
+    async fn test_independent_scalar_rebinds_do_not_wait_for_each_other() {
+        let [(store_a, index_a), (store_b, index_b)] = empty_index_bindings().await;
+        let [(store_c, index_c), _] = empty_index_bindings().await;
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let entry = Arc::new(StoreBoundScalarIndexCacheEntry::new(store_a, index_a));
+        cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, entry.clone())
+            .await;
+        let started = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let slow_started = started.clone();
+        let slow_resume = resume.clone();
+        let slow_cache = cache.clone();
+        let slow_index = index_b.clone();
+        let slow = tokio::spawn(async move {
+            single_flight_store_bound_open(
+                store_b,
+                &slow_cache,
+                async { panic!("warm request must not reload metadata") }.boxed(),
+                |_| async move {
+                    slow_started.notify_one();
+                    slow_resume.notified().await;
+                    Ok(Some(slow_index))
+                },
+            )
+            .await
+        });
+        started.notified().await;
+        let fast_index = index_c.clone();
+        let fast = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            single_flight_store_bound_open(
+                store_c,
+                &cache,
+                async { panic!("warm request must not reload metadata") }.boxed(),
+                |_| async move { Ok(Some(fast_index)) },
+            ),
+        )
+        .await;
+        resume.notify_one();
+        let slow = slow.await.unwrap().unwrap();
+        let fast = fast
+            .expect("an independent request waited for another binding's rebind")
+            .unwrap();
+        assert!(Arc::ptr_eq(&slow, &index_b));
+        assert!(Arc::ptr_eq(&fast, &index_c));
+        assert!(
+            Arc::ptr_eq(&entry.index(), &index_c),
+            "a delayed rebind must not overwrite the newer cache binding"
+        );
     }
 
     #[tokio::test]

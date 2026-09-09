@@ -3,8 +3,85 @@
 
 use super::*;
 
+pub(super) struct PostingFileMetadata {
+    schema: lance_core::datatypes::Schema,
+    num_rows: usize,
+    file_size: Option<u64>,
+}
+
+/// A request's reader is opened only when decoded posting data is missing.
+/// Shared metadata never retains the reader or store that supplied it.
+pub(super) enum PostingReader {
+    Opened {
+        reader: Arc<dyn IndexReader>,
+        metadata: OnceLock<Arc<PostingFileMetadata>>,
+    },
+    Deferred {
+        metadata: Arc<PostingFileMetadata>,
+        store: Arc<dyn IndexStore>,
+        path: String,
+        reader: OnceCell<Arc<dyn IndexReader>>,
+    },
+}
+
+impl PostingReader {
+    fn with_store(&self, store: Arc<dyn IndexStore>, path: String) -> Self {
+        let metadata = match self {
+            Self::Opened { reader, metadata } => metadata
+                .get_or_init(|| {
+                    Arc::new(PostingFileMetadata {
+                        schema: reader.schema().clone(),
+                        num_rows: reader.num_rows(),
+                        file_size: reader.file_size_bytes(),
+                    })
+                })
+                .clone(),
+            Self::Deferred { metadata, .. } => metadata.clone(),
+        };
+        Self::Deferred {
+            metadata,
+            store,
+            path,
+            reader: OnceCell::new(),
+        }
+    }
+
+    pub(super) async fn get(&self) -> Result<&Arc<dyn IndexReader>> {
+        match self {
+            Self::Opened { reader, .. } => Ok(reader),
+            Self::Deferred { metadata, store, path, reader } => reader.get_or_try_init(|| async {
+                let opened = store.open_index_file(path).await?;
+                if opened.num_rows() != metadata.num_rows
+                    || opened.schema() != &metadata.schema
+                    || opened.schema().metadata != metadata.schema.metadata
+                {
+                    return Err(Error::index(format!(
+                        "FTS posting file {path} changed while reopening an immutable index: expected {} rows, got {}",
+                        metadata.num_rows, opened.num_rows()
+                    )));
+                }
+                Ok(opened)
+            }).await,
+        }
+    }
+
+    pub(super) fn num_rows(&self) -> usize {
+        match self {
+            Self::Opened { reader, .. } => reader.num_rows(),
+            Self::Deferred { metadata, .. } => metadata.num_rows,
+        }
+    }
+
+    pub(super) fn file_size_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Opened { reader, .. } => reader.file_size_bytes(),
+            Self::Deferred { metadata, .. } => metadata.file_size,
+        }
+    }
+}
+
 pub struct PostingListReader {
-    pub(super) reader: Arc<dyn IndexReader>,
+    pub(super) reader: PostingReader,
 
     /// Layout-specific metadata. V2 keeps its per-token max-score and
     /// length columns lazy so opening a partition doesn't drag O(num_tokens)
@@ -162,7 +239,10 @@ impl PostingListReader {
         });
 
         Ok(Self {
-            reader,
+            reader: PostingReader::Opened {
+                reader,
+                metadata: OnceLock::new(),
+            },
             metadata,
             has_position,
             has_impacts,
@@ -177,25 +257,17 @@ impl PostingListReader {
         })
     }
 
-    /// Reuse immutable posting state with a reader opened through the current store.
+    /// Reuse immutable posting state with deferred I/O through the current store.
     /// The caller must preserve the index cache namespace: these cells describe
     /// one immutable posting file, not an arbitrary reader with the same schema.
-    pub(super) fn with_reader(&self, reader: Arc<dyn IndexReader>) -> Result<Self> {
+    pub(super) fn with_store(&self, store: Arc<dyn IndexStore>, path: String) -> Result<Self> {
         let PostingMetadata::V2 { metadata } = &self.metadata else {
             return Err(Error::not_supported(
                 "rebinding legacy FTS posting readers requires a full index load",
             ));
         };
-        if reader.num_rows() != self.reader.num_rows()
-            || reader.schema() != self.reader.schema()
-            || reader.schema().metadata != self.reader.schema().metadata
-        {
-            return Err(Error::index(
-                "FTS posting file changed while rebinding an immutable index",
-            ));
-        }
         Ok(Self {
-            reader,
+            reader: self.reader.with_store(store, path),
             metadata: PostingMetadata::V2 {
                 metadata: metadata.clone(),
             },
@@ -367,6 +439,8 @@ impl PostingListReader {
                         let token_id = token_id as usize;
                         let batch = self
                             .reader
+                            .get()
+                            .await?
                             .read_range(token_id..token_id + 1, Some(&[MAX_SCORE_COL, LENGTH_COL]))
                             .await?;
                         let max_score = batch[MAX_SCORE_COL].as_primitive::<Float32Type>().value(0);
@@ -397,6 +471,8 @@ impl PostingListReader {
             .get_or_try_init(|| async {
                 let batch = self
                     .reader
+                    .get()
+                    .await?
                     .read_range(
                         0..self.reader.num_rows(),
                         Some(&[MAX_SCORE_COL, LENGTH_COL]),
@@ -448,6 +524,8 @@ impl PostingListReader {
             }
             let batch = self
                 .reader
+                .get()
+                .await?
                 .read_range(token_id..token_id + 1, Some(&columns))
                 .await?;
             Ok(batch)
@@ -472,6 +550,8 @@ impl PostingListReader {
         let offset = offsets[token_id];
         let batch = self
             .reader
+            .get()
+            .await?
             .read_range(offset..offset + length, Some(&columns))
             .await?;
         Ok(batch)
@@ -723,6 +803,8 @@ impl PostingListReader {
         }
         let batch = self
             .reader
+            .get()
+            .await?
             .read_range(start as usize..end as usize, Some(&columns))
             .await?;
         PostingListGroup::new_packed_with_block_size(

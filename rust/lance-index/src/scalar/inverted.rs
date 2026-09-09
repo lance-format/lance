@@ -611,7 +611,6 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
                 .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?;
             index
                 .with_store(rebind_store, frag_reuse_index)
-                .await
                 .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
         })
         .await

@@ -150,11 +150,7 @@ async fn test_prewarm_with_positions_populates_separate_position_cache() {
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
-    let index = index
-        .with_store(rebound_store, None)
-        .await
-        .unwrap()
-        .unwrap();
+    let index = index.with_store(rebound_store, None).unwrap().unwrap();
     assert!(index.prewarmed_query_state_ready(true));
 
     let inverted_list = &index.partitions[0].inverted_list;
