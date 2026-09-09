@@ -41,14 +41,18 @@ use roaring::RoaringBitmap;
 use snafu::Snafu;
 
 use lance_arrow::RecordBatchExt;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{
+    NullabilityComparison, Schema, Schema as LanceSchema, SchemaCompareOptions,
+};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ADDR};
 use lance_file::version::ConcreteFileVersion;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 
 use crate::Dataset;
-use crate::dataset::fragment::{FileFragment, discard_staged_file, relax_nullability};
+use crate::dataset::fragment::{
+    FileFragment, discard_staged_file, duplicate_field_path, relax_nullability,
+};
 use crate::dataset::transaction::DataOverlayGroup;
 use crate::dataset::versions;
 use crate::dataset::write::GenericWriter;
@@ -77,6 +81,20 @@ pub enum WriteOverlayError {
         "cannot overlay field '{name}' of fragment {fragment_id}: blob columns are not supported"
     ))]
     BlobField { fragment_id: u64, name: String },
+
+    /// Overlay resolution is per *atomic field*: a struct is recursed through
+    /// and only its leaves are replaced, so the merge rebuilds the base struct
+    /// with the base's own validity (`splice_by_ids` in the parent module).
+    /// A nullable struct's cell could therefore be covered without its NULL-ness
+    /// changing, in either direction, which is the opposite of what coverage
+    /// means. Refused until the read path can carry ancestor validity; see
+    /// <https://github.com/lance-format/lance/issues/9077>.
+    #[snafu(display(
+        "cannot overlay fragment {fragment_id} through nullable struct '{name}': replacing a \
+         struct cell's NULL-ness is not supported yet \
+         (https://github.com/lance-format/lance/issues/9077)"
+    ))]
+    NullableStructAncestor { fragment_id: u64, name: String },
 
     /// A batch arrived without the `_rowaddr` column naming the cells its values
     /// apply to.
@@ -149,10 +167,23 @@ pub enum WriteOverlayError {
     ))]
     UndeclaredColumn { fragment_id: u64, name: String },
 
-    /// A batch named the same column twice. Columns are matched to fields by
-    /// name, so a repeat has no single field to stage against.
+    /// A batch named the same column twice, at the top level or under a struct.
+    /// Columns and their children are matched to fields by name, so a repeat has
+    /// no single field to stage against and projection would silently keep the
+    /// first. `name` is the dotted path to the repeated name.
     #[snafu(display("overlay batch for fragment {fragment_id} has column '{name}' twice"))]
     DuplicateColumn { fragment_id: u64, name: String },
+
+    /// A batch's columns matched the overlay's fields by name but not by shape.
+    /// Projection descends by name and downcasts by the *target's* type, so a
+    /// mismatch below the top level would panic in the Arrow cast rather than
+    /// surface here. The whole tree is compared before projecting so it does
+    /// not. `source` names the field and the difference.
+    #[snafu(display(
+        "overlay batch for fragment {fragment_id} does not match the fields it was staged \
+         for: {source}"
+    ))]
+    BatchSchemaMismatch { fragment_id: u64, source: Error },
 
     /// Anything not overlay-specific: I/O, encoding, or values that do not match
     /// the field they are staged for.
@@ -175,7 +206,9 @@ impl From<WriteOverlayError> for Error {
             // and restate what the message already carries.
             WriteOverlayError::Other { source } => source,
             WriteOverlayError::SchemaMismatch { source, .. } => source,
-            WriteOverlayError::LegacyFileFormat { .. } | WriteOverlayError::BlobField { .. } => {
+            WriteOverlayError::LegacyFileFormat { .. }
+            | WriteOverlayError::BlobField { .. }
+            | WriteOverlayError::NullableStructAncestor { .. } => {
                 Self::not_supported(error.to_string())
             }
             caller_error => Self::invalid_input(caller_error.to_string()),
@@ -192,6 +225,23 @@ type Result<T> = std::result::Result<T, WriteOverlayError>;
 /// for `Operation::DataOverlay`. On an error of the caller's own,
 /// [`abort`](Self::abort) discards the staged file. If an error occurs during
 /// the call to [`finish`](Self::finish), the staged file is cleaned up automatically.
+///
+/// # The overlay is bound to the dataset version it was opened on
+///
+/// Coverage is addressed by physical offset, so a staged overlay only means
+/// what it says against the fragment layout it was staged over: `open` range-
+/// checks every address against that snapshot's `physical_rows`, and the read
+/// path resolves the offsets literally. The writer does not track a read
+/// version of its own — the caller commits one, and it must be the version of
+/// the `Dataset` this writer was opened on, not the latest version at commit
+/// time. That is what makes the conflict resolver replay the intervening
+/// commits and reject a concurrent `Rewrite`, `Merge`, or row-moving `Update`
+/// that moved the rows out from under these offsets. Committing a newer read
+/// version skips those checks and lands values on the wrong rows.
+///
+/// A caller staging several fragments, or several groups, commits them under
+/// one read version, so every writer in that batch must be opened on the same
+/// `Dataset` snapshot.
 pub struct OverlayWriter {
     dataset: Arc<Dataset>,
     fragment_id: u64,
@@ -234,6 +284,19 @@ impl OverlayWriter {
             return Err(WriteOverlayError::BlobField {
                 fragment_id,
                 name: blob.name.clone(),
+            });
+        }
+        // Only structs are recursed into by resolution, so only they can end up
+        // with a covered leaf under an un-covered parent. A list or map -- even
+        // of structs -- is an atomic field, replaced whole with its own
+        // validity, and a non-nullable struct has no validity to replace.
+        if let Some(parent) = schema
+            .fields_pre_order()
+            .find(|field| field.logical_type.is_struct() && field.nullable)
+        {
+            return Err(WriteOverlayError::NullableStructAncestor {
+                fragment_id,
+                name: parent.name.clone(),
             });
         }
 
@@ -327,6 +390,10 @@ impl OverlayWriter {
     /// and there is nothing to commit. The returned overlay's
     /// `committed_version` is a placeholder — the commit stamps the version it
     /// produces, and re-stamps it on a conflict retry.
+    ///
+    /// The group carries no read version. Commit it with the version of the
+    /// `Dataset` this writer was opened on; see the [type
+    /// documentation](Self) for why a later one is unsafe.
     pub async fn finish(mut self) -> Result<Option<DataOverlayGroup>> {
         let coverage_by_schema_field = std::mem::take(&mut self.coverage);
         if coverage_by_schema_field.iter().all(RoaringBitmap::is_empty) {
@@ -476,17 +543,26 @@ impl OverlayWriter {
     }
 
     /// The overlay-field positions this batch supplies, in schema order.
+    ///
+    /// Admits the batch before anything downcasts it: a duplicate name anywhere
+    /// in the tree, a column the overlay was not opened for, and any shape
+    /// difference against the fields it was opened for are all rejected here.
+    /// `write_batch` projects by name and Arrow's projection then downcasts to
+    /// the *target's* type, so a nested mismatch left to it would panic instead
+    /// of returning an error, and a duplicate child would be resolved to
+    /// whichever came first.
     fn validated_columns(&self, batch: &RecordBatch) -> Result<Vec<usize>> {
+        if let Some(duplicate) = duplicate_field_path(batch.schema_ref().fields(), "") {
+            return Err(WriteOverlayError::DuplicateColumn {
+                fragment_id: self.fragment_id,
+                name: duplicate,
+            });
+        }
+
         let mut present = HashSet::with_capacity(batch.num_columns());
         for field in batch.schema_ref().fields() {
             if field.name() == ROW_ADDR {
                 continue;
-            }
-            if !present.insert(field.name().clone()) {
-                return Err(WriteOverlayError::DuplicateColumn {
-                    fragment_id: self.fragment_id,
-                    name: field.name().clone(),
-                });
             }
             if !self
                 .schema
@@ -499,15 +575,56 @@ impl OverlayWriter {
                     name: field.name().clone(),
                 });
             }
+            present.insert(field.name().clone());
         }
-        Ok(self
+
+        let positions = self
             .schema
             .fields
             .iter()
             .enumerate()
             .filter(|(_, field)| present.contains(&field.name))
             .map(|(position, _)| position)
-            .collect())
+            .collect::<Vec<_>>();
+
+        // Compare the whole tree, not just the names checked above. A column is
+        // staged whole, so a struct must arrive with every child the overlay was
+        // opened for -- a partial struct would encode NULLs into the children it
+        // omitted while claiming coverage for them. Field order is the caller's
+        // to choose, and nullability is enforced by the writer against the data
+        // rather than against the declared schema.
+        let staged = ArrowSchema::new(
+            batch
+                .schema_ref()
+                .fields()
+                .iter()
+                .filter(|field| field.name() != ROW_ADDR)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let expected = ArrowSchema::new(
+            positions
+                .iter()
+                .map(|&position| self.arrow_fields[position].clone())
+                .collect::<Vec<_>>(),
+        );
+        LanceSchema::try_from(&staged)
+            .and_then(|staged| {
+                staged.check_compatible(
+                    &LanceSchema::try_from(&expected)?,
+                    &SchemaCompareOptions {
+                        compare_nullability: NullabilityComparison::Ignore,
+                        ignore_field_order: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .map_err(|source| WriteOverlayError::BatchSchemaMismatch {
+                fragment_id: self.fragment_id,
+                source,
+            })?;
+
+        Ok(positions)
     }
 }
 
@@ -689,9 +806,18 @@ mod tests {
         dataset.schema().field(name).unwrap().id
     }
 
+    /// Every V2 file version the dataset can be written at. 2.2 and 2.3 route
+    /// through the blob writer, which refuses `write_column` when it has a
+    /// sidecar to prepare; a blob-free schema must not get one, or no overlay
+    /// can be written at those versions at all.
+    #[rstest]
+    #[case::v2_0(LanceFileVersion::V2_0)]
+    #[case::v2_1(LanceFileVersion::V2_1)]
+    #[case::v2_2(LanceFileVersion::V2_2)]
+    #[case::v2_3(LanceFileVersion::V2_3)]
     #[tokio::test]
-    async fn test_overlay_overrides_covered_cells() {
-        let (_test_dir, dataset) = test_dataset().await;
+    async fn test_overlay_overrides_covered_cells(#[case] version: LanceFileVersion) {
+        let (_test_dir, dataset) = test_dataset_with(Some(version)).await;
         let mut writer = open_writer(&dataset, &[1]).await;
         writer
             .write_batch(&val_batch(&[1, 3], vec![Some(-1), Some(-3)]))
@@ -933,8 +1059,17 @@ mod tests {
             (ROW_ADDR, UInt64, addrs(0, &[0])),
             ("val", Utf8, vec![Some("not an int")])
         ).unwrap()],
-        |error| matches!(error, WriteOverlayError::Other { .. }),
+        |error| matches!(error, WriteOverlayError::BatchSchemaMismatch { .. }),
         "val"
+    )]
+    #[case::duplicate_row_addr(
+        vec![record_batch!(
+            (ROW_ADDR, UInt64, addrs(0, &[0])),
+            (ROW_ADDR, UInt64, addrs(0, &[1])),
+            ("val", Int32, vec![Some(-1)])
+        ).unwrap()],
+        |error| matches!(error, WriteOverlayError::DuplicateColumn { .. }),
+        "has column '_rowaddr' twice"
     )]
     #[tokio::test]
     async fn test_bad_batch_is_rejected(
@@ -1179,8 +1314,17 @@ mod tests {
         ]))
     }
 
-    #[tokio::test]
-    async fn test_struct_column_shares_its_coverage_with_its_children() {
+    /// One four-row fragment of `val` = 0..4 and `nested: struct<a: i32, b: i32>`
+    /// with `a` = 0..4 and `b` = a * 10.
+    ///
+    /// `nested` is non-nullable: an overlay through a *nullable* struct is
+    /// refused at open (see `test_nullable_struct_ancestor_is_rejected`), so a
+    /// nullable fixture could not reach the behavior these tests are about.
+    async fn nested_dataset() -> (TempDir, Arc<Dataset>) {
+        nested_dataset_with_nullable_struct(false).await
+    }
+
+    async fn nested_dataset_with_nullable_struct(nullable: bool) -> (TempDir, Arc<Dataset>) {
         let test_dir = tempdir().unwrap();
         let uri = test_dir.path().to_str().unwrap().to_string();
         let base = RecordBatch::try_from_iter_with_nullable(vec![
@@ -1188,13 +1332,45 @@ mod tests {
             (
                 "nested",
                 nested_array((0..4).collect(), (0..4).map(|v| v * 10).collect()),
-                true,
+                nullable,
             ),
         ])
         .unwrap();
         let arrow_schema = base.schema();
         let reader = RecordBatchIterator::new(vec![Ok(base)], arrow_schema);
         let dataset = Arc::new(Dataset::write(reader, &uri, None).await.unwrap());
+        (test_dir, dataset)
+    }
+
+    /// Resolution rebuilds a struct with the *base's* validity, so a covered
+    /// nullable struct cell would keep its old NULL-ness. Refused at open until
+    /// https://github.com/lance-format/lance/issues/9077 lands, rather than
+    /// silently writing an overlay the read path will not honor.
+    #[tokio::test]
+    async fn test_nullable_struct_ancestor_is_rejected() {
+        let (_test_dir, dataset) = nested_dataset_with_nullable_struct(true).await;
+        let schema = overlay_schema(&dataset, &[field_id(&dataset, "nested")]);
+        let Err(error) = dataset
+            .get_fragment(0)
+            .unwrap()
+            .write_overlay(&schema)
+            .await
+        else {
+            panic!("expected opening the overlay to fail");
+        };
+        let display = error.to_string();
+        assert!(display.contains("nullable struct 'nested'"), "{display}");
+        assert!(display.contains("issues/9077"), "{display}");
+        assert!(
+            matches!(error, WriteOverlayError::NullableStructAncestor { .. }),
+            "unexpected variant: {display}"
+        );
+        assert!(matches!(Error::from(error), Error::NotSupported { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_struct_column_shares_its_coverage_with_its_children() {
+        let (_test_dir, dataset) = nested_dataset().await;
 
         let val_id = field_id(&dataset, "val");
         let nested_id = field_id(&dataset, "nested");
@@ -1264,6 +1440,123 @@ mod tests {
         };
         assert_eq!((child(0)[2], child(1)[2]), (-7, -70));
         assert_eq!((child(0)[0], child(1)[0]), (0, 0));
+    }
+
+    /// A struct array of the given `(name, values)` children, in the order given.
+    fn struct_of(children: Vec<(&str, Vec<i32>)>) -> ArrayRef {
+        Arc::new(StructArray::from(
+            children
+                .into_iter()
+                .map(|(name, values)| {
+                    (
+                        Arc::new(ArrowField::new(name, DataType::Int32, true)),
+                        Arc::new(Int32Array::from(values)) as ArrayRef,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    /// Projection descends by name and downcasts to the *target's* type, so
+    /// every one of these reached an Arrow cast and panicked before the batch
+    /// was admitted against the whole field tree.
+    #[rstest]
+    #[case::struct_arrived_as_a_primitive(
+        vec![("nested", int32(vec![Some(99)]))],
+        "nested"
+    )]
+    #[case::struct_child_of_the_wrong_type(
+        vec![("nested", Arc::new(StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("a", DataType::Utf8, true)),
+                Arc::new(arrow_array::StringArray::from(vec![Some("x")])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("b", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            ),
+        ])) as ArrayRef)],
+        "a"
+    )]
+    #[case::struct_missing_a_child(
+        vec![("nested", struct_of(vec![("a", vec![1])]))],
+        "b"
+    )]
+    #[case::struct_with_an_extra_child(
+        vec![("nested", struct_of(vec![("a", vec![1]), ("b", vec![2]), ("c", vec![3])]))],
+        "c"
+    )]
+    #[tokio::test]
+    async fn test_malformed_nested_batch_is_rejected(
+        #[case] columns: Vec<(&str, ArrayRef)>,
+        #[case] message: &str,
+    ) {
+        let (_test_dir, dataset) = nested_dataset().await;
+        let nested_id = field_id(&dataset, "nested");
+        let mut writer = open_writer_on(&dataset, 0, &[nested_id]).await;
+
+        let error = writer
+            .write_batch(&batch(0, &[0], columns))
+            .await
+            .unwrap_err();
+        let display = error.to_string();
+        assert!(display.contains(message), "{display}");
+        assert!(
+            matches!(error, WriteOverlayError::BatchSchemaMismatch { .. }),
+            "unexpected variant: {display}"
+        );
+        writer.abort().await;
+    }
+
+    /// Duplicate siblings are invisible to a name-set comparison, and projection
+    /// would silently keep whichever came first.
+    #[tokio::test]
+    async fn test_duplicate_struct_child_is_rejected() {
+        let (_test_dir, dataset) = nested_dataset().await;
+        let nested_id = field_id(&dataset, "nested");
+        let mut writer = open_writer_on(&dataset, 0, &[nested_id]).await;
+
+        let duplicated = struct_of(vec![("a", vec![1]), ("a", vec![2]), ("b", vec![3])]);
+        let error = writer
+            .write_batch(&batch(0, &[0], vec![("nested", duplicated)]))
+            .await
+            .unwrap_err();
+        let display = error.to_string();
+        assert!(display.contains("'nested.a' twice"), "{display}");
+        assert!(
+            matches!(error, WriteOverlayError::DuplicateColumn { .. }),
+            "unexpected variant: {display}"
+        );
+        writer.abort().await;
+    }
+
+    /// The admission pass compares the tree, not the child order: a struct whose
+    /// children arrive reversed is projected back into the manifest's order
+    /// rather than landing under the wrong field ids.
+    #[tokio::test]
+    async fn test_struct_children_may_arrive_in_any_order() {
+        let (_test_dir, dataset) = nested_dataset().await;
+        let nested_id = field_id(&dataset, "nested");
+        let mut writer = open_writer_on(&dataset, 0, &[nested_id]).await;
+
+        let reversed = struct_of(vec![("b", vec![-70]), ("a", vec![-7])]);
+        writer
+            .write_batch(&batch(0, &[2], vec![("nested", reversed)]))
+            .await
+            .unwrap();
+        let group = writer.finish().await.unwrap().unwrap();
+
+        let dataset = commit(dataset, group).await;
+        let read_back = dataset
+            .scan()
+            .project(&["nested"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let nested = read_back["nested"].as_struct();
+        let child = |i: usize| nested.column(i).as_primitive::<Int32Type>().value(2);
+        assert_eq!((child(0), child(1)), (-7, -70));
     }
 
     #[tokio::test]

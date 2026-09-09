@@ -375,16 +375,28 @@ pub async fn open_writer(
             .await
         }
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
-            write::open_current_blob_v2_writer(
-                move |object_writer, schema, filename, base_id| {
-                    create_current_file_writer(version, object_writer, schema, filename, base_id)
-                },
-                object_store,
-                schema,
-                base_dir,
-                options,
-            )
-            .await
+            let create_file_writer = move |object_writer, schema, filename, base_id| {
+                create_current_file_writer(version, object_writer, schema, filename, base_id)
+            };
+            if schema.fields_pre_order().any(Field::is_blob_v2) {
+                write::open_current_blob_v2_writer(
+                    create_file_writer,
+                    object_store,
+                    schema,
+                    base_dir,
+                    options,
+                )
+                .await
+            } else {
+                write::open_current_writer(
+                    create_file_writer,
+                    object_store,
+                    schema,
+                    base_dir,
+                    options,
+                )
+                .await
+            }
         }
     }
 }

@@ -686,7 +686,7 @@ pub(crate) enum MetadataMode {
 /// The first path in `fields` that names a sibling twice. Projection picks
 /// children by name, so a duplicate makes that choice arbitrary, and the
 /// name-set comparison the schema check uses cannot see one at all.
-fn duplicate_field_path(fields: &ArrowFields, path: &str) -> Option<String> {
+pub(crate) fn duplicate_field_path(fields: &ArrowFields, path: &str) -> Option<String> {
     let mut seen = HashSet::new();
     for field in fields {
         let qualified = if path.is_empty() {
