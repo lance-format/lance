@@ -617,10 +617,7 @@ pub(crate) async fn cached_scalar_index_container(
     let index_cache = dataset
         .index_cache
         .for_index(uuid, frag_reuse_uuid.as_ref());
-    index_cache
-        .get_unsized_with_key(&ScalarIndexCacheKey)
-        .await
-        .map(|entry| entry.index())
+    index_cache.get_unsized_with_key(&ScalarIndexCacheKey).await
 }
 
 pub(crate) async fn infer_scalar_index_details(
