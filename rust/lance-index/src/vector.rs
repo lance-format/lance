@@ -41,8 +41,6 @@ pub mod transform;
 pub mod utils;
 pub mod v3;
 
-pub use ivf::norm_ranges::VectorNormRange;
-
 use super::pb;
 use crate::metrics::MetricsCollector;
 use crate::{Index, prefilter::PreFilter};
@@ -420,15 +418,6 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     fn ivf_model(&self) -> &IvfModel;
     fn quantizer(&self) -> Quantizer;
     fn partition_size(&self, part_id: usize) -> usize;
-
-    /// Descriptive L2 norm extrema of the partition's stored Float32 vectors.
-    ///
-    /// Returns `None` when the partition is empty or statistics are unavailable,
-    /// including indexes written before norm statistics were supported. These
-    /// f64 statistics are not certified bounds on native Float32 distances.
-    fn partition_norm_range(&self, _part_id: usize) -> Option<VectorNormRange> {
-        None
-    }
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);

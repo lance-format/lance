@@ -30,7 +30,6 @@ use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 use super::{quantizer::Quantizer, residual::compute_residual};
 
 pub mod builder;
-pub mod norm_ranges;
 pub mod shuffler;
 pub mod storage;
 mod transform;

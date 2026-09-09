@@ -55,9 +55,6 @@ use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::hnsw::HNSW;
-use lance_index::vector::ivf::norm_ranges::{
-    IvfNormRanges, NORM_RANGES_METADATA_KEY, VectorNormRange,
-};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{
@@ -116,7 +113,6 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     /// The index and aux files have independent row layouts, so we must store
     /// both to avoid using wrong row offsets during reconstruction.
     pub(crate) aux_ivf: IvfModel,
-    pub(crate) norm_ranges: Option<Arc<IvfNormRanges>>,
     pub(crate) distance_type: DistanceType,
     pub(crate) sub_index_metadata: Vec<String>,
     /// Parsed quantizer metadata — stored directly to avoid JSON re-parsing on
@@ -535,7 +531,6 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
             + self.uuid.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
             + self.aux_ivf.deep_size_of_children(context)
-            + self.norm_ranges.deep_size_of_children(context)
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.metadata.deep_size_of_children(context)
             + self
@@ -586,11 +581,10 @@ impl DeepSizeOf for IvfStateEntryBox {
 /// RAW_BLOB : IVF model protobuf
 /// RAW_BLOB : quantizer extra-metadata buffer (may be empty)
 /// RAW_BLOB : auxiliary IVF model protobuf
-/// RAW_BLOB : norm range JSON (empty when unavailable)
 /// ```
 impl CacheCodecImpl for IvfStateEntryBox {
     const TYPE_ID: &'static str = "lance.vector.ivf.IvfState";
-    const CURRENT_VERSION: u32 = 2;
+    const CURRENT_VERSION: u32 = 1;
 
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         self.0.serialize_state(w)
@@ -615,34 +609,16 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 lance_core::Error::io(format!("IvfIndexState aux IVF decode: {e}"))
             })?)?;
 
-        let norm_ranges_bytes = r.read_raw()?;
-        let norm_ranges_json = if norm_ranges_bytes.is_empty() {
-            None
-        } else {
-            Some(
-                std::str::from_utf8(&norm_ranges_bytes)
-                    .map_err(|e| Error::io(format!("IvfIndexState norm range UTF-8: {e}")))?,
-            )
-        };
         let distance_type = DistanceType::try_from(header.distance_type.as_str())?;
-        let norm_ranges = IvfNormRanges::from_json(
-            norm_ranges_json,
-            ivf.dimension(),
-            distance_type,
-            &aux_ivf.lengths,
-        )?
-        .map(Arc::new);
         let sub_index_type = SubIndexType::try_from(header.sub_index_type.as_str())?;
         let quantization_type = header.quantization_type.parse::<QuantizationType>()?;
 
         // Helper: parse Q::Metadata from the JSON+extra_bytes in the header,
         // then build an IvfStateEntryBox wrapping IvfIndexState<Q>.
-        #[allow(clippy::too_many_arguments)]
         fn make_entry<Q: Quantization + 'static>(
             header: IvfStateHeader,
             ivf: IvfModel,
             aux_ivf: IvfModel,
-            norm_ranges: Option<Arc<IvfNormRanges>>,
             extra_bytes: bytes::Bytes,
             distance_type: DistanceType,
             sub_index_type: SubIndexType,
@@ -663,7 +639,6 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 uuid: header.uuid,
                 ivf,
                 aux_ivf,
-                norm_ranges,
                 distance_type,
                 sub_index_metadata: header.sub_index_metadata,
                 metadata,
@@ -680,7 +655,6 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 header,
                 ivf,
                 aux_ivf,
-                norm_ranges,
                 extra_bytes,
                 distance_type,
                 sub_index_type,
@@ -690,7 +664,6 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 header,
                 ivf,
                 aux_ivf,
-                norm_ranges,
                 extra_bytes,
                 distance_type,
                 sub_index_type,
@@ -700,7 +673,6 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 header,
                 ivf,
                 aux_ivf,
-                norm_ranges,
                 extra_bytes,
                 distance_type,
                 sub_index_type,
@@ -710,7 +682,6 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 header,
                 ivf,
                 aux_ivf,
-                norm_ranges,
                 extra_bytes,
                 distance_type,
                 sub_index_type,
@@ -720,7 +691,6 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 header,
                 ivf,
                 aux_ivf,
-                norm_ranges,
                 extra_bytes,
                 distance_type,
                 sub_index_type,
@@ -755,12 +725,6 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
         w.write_raw(&ivf_bytes)?;
         w.write_raw(extra)?;
         w.write_raw(&aux_ivf_bytes)?;
-        let norm_ranges = self
-            .norm_ranges
-            .as_ref()
-            .map(|ranges| serde_json::to_vec(ranges.as_ref()))
-            .transpose()?;
-        w.write_raw(norm_ranges.as_deref().unwrap_or_default())?;
         Ok(())
     }
 
@@ -965,7 +929,6 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 
     /// Ivf model
     ivf: IvfModel,
-    norm_ranges: Option<Arc<IvfNormRanges>>,
 
     reader: FileReader,
     /// Narrowed read of the index file, when the sub-index declares that
@@ -1000,7 +963,6 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
         self.uri.deep_size_of_children(context)
             + self.index_path.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
-            + self.norm_ranges.deep_size_of_children(context)
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.storage.deep_size_of_children(context)
             + self.scratch_pool.deep_size_of_children(context)
@@ -1014,36 +976,6 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
-    fn validate_norm_range_storage(
-        ranges: Option<&IvfNormRanges>,
-        ivf: &IvfModel,
-        storage: &IvfQuantizationStorage<Q>,
-        distance_type: DistanceType,
-    ) -> Result<()> {
-        let Some(ranges) = ranges else {
-            return Ok(());
-        };
-        let schema = storage.schema();
-        let is_float32 = schema
-            .field_with_name(lance_index::vector::flat::storage::FLAT_COLUMN)
-            .is_ok_and(|field| {
-                matches!(field.data_type(), DataType::FixedSizeList(item, dimension)
-                if item.data_type() == &DataType::Float32 && *dimension as usize == ivf.dimension())
-            });
-        if S::name() != "FLAT"
-            || Q::quantization_type() != QuantizationType::Flat
-            || !is_float32
-            || storage.ivf().lengths.len() != ivf.num_partitions()
-            || storage.distance_type() != distance_type
-        {
-            return Err(Error::corrupt_file_named(
-                NORM_RANGES_METADATA_KEY,
-                "norm ranges require matching Float32 FLAT storage, metric, dimension and partition count",
-            ));
-        }
-        ranges.validate(ivf.dimension(), distance_type, &storage.ivf().lengths)
-    }
-
     fn read_projection(reader: &FileReader) -> Result<Option<ReaderProjection>> {
         S::read_columns()
             .map(|columns| {
@@ -1509,25 +1441,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let storage =
             IvfQuantizationStorage::try_new_with_remapper(storage_reader, frag_reuse_index).await?;
 
-        let norm_ranges = if S::name() == "FLAT" && Q::quantization_type() == QuantizationType::Flat
-        {
-            IvfNormRanges::from_json(
-                index_reader
-                    .schema()
-                    .metadata
-                    .get(NORM_RANGES_METADATA_KEY)
-                    .map(String::as_str),
-                ivf.dimension(),
-                distance_type,
-                &storage.ivf().lengths,
-            )?
-            .map(Arc::new)
-        } else {
-            None
-        };
-
-        Self::validate_norm_range_storage(norm_ranges.as_deref(), &ivf, &storage, distance_type)?;
-
         // Cache file metadata so reconstructions from IvfIndexState can skip
         // footer reads.
         file_metadata_cache
@@ -1564,7 +1477,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             use_residual_scratch,
             rq_search_cache,
             ivf,
-            norm_ranges,
             reader: index_reader,
             read_projection,
             storage,
@@ -1591,13 +1503,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         index_cache: LanceCache,
         io_parallelism: usize,
         rq_search_cache: Option<Arc<RabitSearchCache>>,
-        norm_ranges: Option<Arc<IvfNormRanges>>,
     ) -> Result<Self> {
         let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf, &storage));
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         let read_projection = Self::read_projection(&reader)?;
-        Self::validate_norm_range_storage(norm_ranges.as_deref(), &ivf, &storage, distance_type)?;
         Ok(Self {
             uri,
             index_path,
@@ -1607,7 +1517,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             use_residual_scratch,
             rq_search_cache,
             ivf,
-            norm_ranges,
             reader,
             read_projection,
             storage,
@@ -1910,7 +1819,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             uuid: self.uuid.to_string(),
             ivf: self.ivf.clone(),
             aux_ivf: self.storage.ivf().clone(),
-            norm_ranges: self.norm_ranges.clone(),
             distance_type: self.distance_type,
             sub_index_metadata: self.sub_index_metadata.clone(),
             metadata: self.storage.metadata().clone(),
@@ -2557,12 +2465,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         self.storage.quantizer().unwrap()
     }
 
-    fn partition_norm_range(&self, part_id: usize) -> Option<VectorNormRange> {
-        self.norm_ranges
-            .as_ref()
-            .and_then(|ranges| ranges.get(part_id))
-    }
-
     fn partition_size(&self, part_id: usize) -> usize {
         self.storage.partition_size(part_id)
     }
@@ -2649,7 +2551,6 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         index_cache,
         io_parallelism,
         rq_search_cache,
-        state.norm_ranges.clone(),
     )?;
     Ok(Arc::new(index))
 }
@@ -5060,131 +4961,6 @@ mod tests {
         );
     }
 
-    #[rstest]
-    #[case::l2(DistanceType::L2)]
-    #[case::cosine(DistanceType::Cosine)]
-    #[case::dot(DistanceType::Dot)]
-    #[tokio::test]
-    async fn test_merge_flat_segments_recomputes_norm_ranges_after_deletion(
-        #[case] metric: DistanceType,
-    ) {
-        // The merged partition spans two read batches. Its old source maximum
-        // is deleted, while its new extrema occur in the final short batch.
-        let mut vectors = [3.0_f32, 4.0].repeat(4097);
-        vectors.extend([300.0, 400.0, 1.0, 0.0, 5.0, 12.0, 8.0, 15.0]);
-        let vectors = Arc::new(
-            FixedSizeListArray::try_new_from_values(Float32Array::from(vectors), 2).unwrap(),
-        );
-        let ids = Arc::new(UInt64Array::from((0..4101).collect::<Vec<_>>()));
-        let batch =
-            RecordBatch::try_from_iter([("id", ids as ArrayRef), ("vector", vectors as ArrayRef)])
-                .unwrap();
-        let schema = batch.schema();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
-            "memory://",
-            Some(WriteParams {
-                max_rows_per_file: 4098,
-                enable_stable_row_ids: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(dataset.get_fragments().len(), 2);
-        let centroids = Arc::new(
-            FixedSizeListArray::try_new_from_values(
-                Float32Array::from(vec![1.0, 0.0, -1.0, 0.0, 0.0, -1.0]),
-                2,
-            )
-            .unwrap(),
-        );
-        let params = VectorIndexParams::with_ivf_flat_params(
-            metric,
-            IvfBuildParams::try_with_centroids(3, centroids).unwrap(),
-        );
-        let mut segments = Vec::new();
-        for fragment in dataset.get_fragments() {
-            segments.push(
-                dataset
-                    .create_index_builder(&["vector"], IndexType::Vector, &params)
-                    .name("norm_merge".to_owned())
-                    .fragments(vec![fragment.id() as u32])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap(),
-            );
-        }
-        dataset.delete("id = 4097").await.unwrap();
-        let merged = dataset
-            .merge_existing_index_segments(segments)
-            .await
-            .unwrap();
-        dataset
-            .commit_existing_index_segments("norm_merge", "vector", vec![merged])
-            .await
-            .unwrap();
-        let context = load_vector_index_context(&dataset, "vector", "norm_merge").await;
-        let index = context.ivf_flat();
-        assert_eq!(index.partition_size(0), 4100);
-        assert_eq!(index.partition_size(1), 0);
-        assert_eq!(index.partition_size(2), 0);
-        let range = index
-            .partition_norm_range(0)
-            .expect("merged FLAT must retain norm statistics");
-        if metric == DistanceType::Cosine {
-            assert!((range.min - 1.0).abs() < 1e-6);
-            assert!((range.max - 1.0).abs() < 1e-6);
-        } else {
-            assert_eq!(
-                range,
-                super::VectorNormRange {
-                    min: 1.0,
-                    max: 17.0
-                }
-            );
-        }
-        assert_eq!(index.partition_norm_range(1), None);
-        assert_eq!(index.partition_norm_range(2), None);
-        let metadata: serde_json::Value = serde_json::from_str(
-            index
-                .reader
-                .schema()
-                .metadata
-                .get(super::NORM_RANGES_METADATA_KEY)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            metadata["partition_lengths"],
-            serde_json::json!([4100, 0, 0])
-        );
-        assert_eq!(metadata["metric"], metric.to_string());
-        assert!(
-            !index
-                .storage
-                .reader()
-                .schema()
-                .metadata
-                .contains_key(super::NORM_RANGES_METADATA_KEY)
-        );
-        let query = Float32Array::from(vec![1.0, 0.0]);
-        let expected = ground_truth(&dataset, "vector", &query, 1, metric).await;
-        let found = dataset
-            .scan()
-            .nearest("vector", &query, 1)
-            .unwrap()
-            .nprobes(3)
-            .with_row_id()
-            .try_into_batch()
-            .await
-            .unwrap();
-        assert!(
-            expected.contains(&found[ROW_ID].as_primitive::<UInt64Type>().value(0)),
-            "merged FLAT recall must be 1.0"
-        );
-    }
-
     #[tokio::test]
     async fn test_merge_index_metadata_reports_progress() {
         const INDEX_NAME: &str = "vector_idx";
@@ -5808,149 +5584,6 @@ mod tests {
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params.clone(), nlist, recall_requirement).await;
         test_delete_all_rows(params).await;
-    }
-
-    #[rstest]
-    #[case::l2(DistanceType::L2)]
-    #[case::cosine(DistanceType::Cosine)]
-    #[case::dot(DistanceType::Dot)]
-    #[tokio::test]
-    async fn test_flat_norm_ranges_writer_and_cache_roundtrip(#[case] metric: DistanceType) {
-        let (batch, schema) = generate_clustered_batch(4, [0.0, 10.0]);
-        let query = batch["vector"].as_fixed_size_list().value(0);
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new(vec![Ok(batch)], schema),
-            "memory://",
-            Some(WriteParams {
-                max_rows_per_file: 4,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(dataset.get_fragments().len(), 2);
-        let centroids = build_centroids_for_offsets(&[0.0, 10.0, 100.0]);
-        let params = VectorIndexParams::with_ivf_flat_params(
-            metric,
-            IvfBuildParams::try_with_centroids(3, centroids).unwrap(),
-        );
-        dataset
-            .create_index(
-                &["vector"],
-                IndexType::Vector,
-                Some("norm_idx".to_owned()),
-                &params,
-                true,
-            )
-            .await
-            .unwrap();
-        let context = load_vector_index_context(&dataset, "vector", "norm_idx").await;
-        let index = context.ivf_flat();
-        let metadata = index
-            .reader
-            .schema()
-            .metadata
-            .get(super::NORM_RANGES_METADATA_KEY)
-            .unwrap();
-        assert!(
-            !index
-                .storage
-                .reader()
-                .schema()
-                .metadata
-                .contains_key(super::NORM_RANGES_METADATA_KEY)
-        );
-        let value: serde_json::Value = serde_json::from_str(metadata).unwrap();
-        assert_eq!(value["version"], 1);
-        assert_eq!(value["metric"], metric.to_string());
-        assert_eq!(
-            value["partition_lengths"],
-            serde_json::json!(index.storage.ivf().lengths)
-        );
-        for part in 0..3 {
-            let storage = index.load_partition_storage(part, None).await.unwrap();
-            if storage.len() == 0 {
-                assert_eq!(index.partition_norm_range(part), None);
-                continue;
-            }
-            let range = index.partition_norm_range(part).unwrap();
-            let mut norms = Vec::new();
-            for batch in storage.to_batches().unwrap() {
-                let vectors =
-                    batch[lance_index::vector::flat::storage::FLAT_COLUMN].as_fixed_size_list();
-                for row in 0..vectors.len() {
-                    let vector = vectors.value(row);
-                    let norm = vector
-                        .as_primitive::<Float32Type>()
-                        .values()
-                        .iter()
-                        .map(|&value| f64::from(value).powi(2))
-                        .sum::<f64>()
-                        .sqrt();
-                    norms.push(norm);
-                }
-            }
-            assert_eq!(
-                range.min,
-                norms.iter().copied().fold(f64::INFINITY, f64::min)
-            );
-            assert_eq!(range.max, norms.iter().copied().fold(0.0, f64::max));
-            if metric == DistanceType::Cosine {
-                assert!((range.min - 1.0).abs() < 1e-6);
-                assert!((range.max - 1.0).abs() < 1e-6);
-            }
-        }
-        let state = index.to_state_entry();
-        let mut bytes = Vec::new();
-        super::CacheCodecImpl::serialize(&state, &mut super::CacheEntryWriter::new(&mut bytes))
-            .unwrap();
-        let bytes = bytes::Bytes::from(bytes);
-        let decoded = <super::IvfStateEntryBox as super::CacheCodecImpl>::deserialize(
-            &mut super::CacheEntryReader::new(&bytes, 0, 2),
-        )
-        .unwrap();
-        let reconstructed = decoded
-            .0
-            .reconstruct(
-                dataset.object_store(None).await.unwrap(),
-                dataset.session().file_metadata_cache(),
-                LanceCache::with_capacity(1 << 20),
-                None,
-            )
-            .await
-            .unwrap();
-        for part in 0..4 {
-            assert_eq!(
-                reconstructed.partition_norm_range(part),
-                index.partition_norm_range(part)
-            );
-        }
-        assert!(index.norm_ranges.as_ref().unwrap().deep_size_of() > 0);
-
-        let mut wrong_ivf = index.ivf.clone();
-        wrong_ivf.centroids = Some(wrong_ivf.centroids.as_ref().unwrap().slice(0, 2));
-        let error = IvfFlatIndex::validate_norm_range_storage(
-            index.norm_ranges.as_deref(),
-            &wrong_ivf,
-            &index.storage,
-            metric,
-        )
-        .unwrap_err();
-        assert!(matches!(error, super::Error::CorruptFile { .. }));
-        assert!(error.to_string().contains("partition count"));
-
-        let expected = ground_truth(&dataset, "vector", query.as_ref(), 1, metric).await;
-        let found = dataset
-            .scan()
-            .nearest("vector", query.as_primitive::<Float32Type>(), 1)
-            .unwrap()
-            .nprobes(3)
-            .with_row_id()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let id = found[ROW_ID].as_primitive::<UInt64Type>().value(0);
-        assert!(expected.contains(&id), "exact FLAT recall must be 1.0");
     }
 
     #[rstest]
