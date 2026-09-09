@@ -90,6 +90,9 @@ pub(super) async fn load_indices(
             .into_iter()
             .zip(mapping.segment_coverage(&provenance))
         {
+            if coverage.is_empty() {
+                continue;
+            }
             let mut index = index.clone();
             index.fragment_bitmap = Some(coverage);
             result[position] = Some(index);
@@ -142,55 +145,79 @@ impl FragmentReuseIndex {
         })
     }
 
-    /// Coverage belongs to the logical index's union, but each contributing
-    /// segment must be probed. Direct destination coverage takes precedence.
+    /// Resolve each live fragment backwards to the nearest available index coverage.
+    /// A mapping requires complete source coverage; failure for one destination does
+    /// not discard another destination's coverage. Every contributing segment is retained.
     pub fn segment_coverage(&self, provenance: &[RoaringBitmap]) -> Vec<RoaringBitmap> {
-        let mut coverage = provenance.to_vec();
-        for transition in self.ledger.transitions() {
-            let sources: RoaringBitmap = transition.sources().iter().map(|f| f.id as u32).collect();
-            let destinations: RoaringBitmap = transition
-                .destinations()
-                .iter()
-                .map(|f| f.id as u32)
-                .collect();
-            let union = coverage
-                .iter()
-                .fold(RoaringBitmap::new(), |mut union, bitmap| {
-                    union |= bitmap;
-                    union
-                });
-            let mapped = if sources.is_subset(&union) {
-                destinations.clone()
-            } else {
-                RoaringBitmap::new()
-            };
-            let direct = &union & &destinations;
-            for bitmap in &mut coverage {
-                let contributes = !bitmap.is_disjoint(&sources);
-                *bitmap -= &sources;
-                if contributes {
-                    *bitmap |= &mapped - &direct;
-                }
+        let mut direct: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (segment, bitmap) in provenance.iter().enumerate() {
+            for fragment in bitmap {
+                direct.entry(fragment).or_default().push(segment);
             }
         }
-        for bitmap in &mut coverage {
-            *bitmap &= self.live_fragments.as_ref();
+        // None records an uncovered fragment; shared ancestors are resolved only once.
+        let mut resolved: HashMap<u32, Option<Vec<usize>>> = HashMap::new();
+        let mut coverage = vec![RoaringBitmap::new(); provenance.len()];
+        for destination in self.live_fragments.iter() {
+            let mut pending = vec![(destination, false)];
+            while let Some((fragment, expanded)) = pending.pop() {
+                if resolved.contains_key(&fragment) {
+                    continue;
+                }
+                if let Some(segments) = direct.get(&fragment) {
+                    resolved.insert(fragment, Some(segments.clone()));
+                    continue;
+                }
+                let Some(producer) = self.ledger.producer(fragment) else {
+                    resolved.insert(fragment, None);
+                    continue;
+                };
+                let transition = &self.ledger.transitions()[producer];
+                if !expanded {
+                    pending.push((fragment, true));
+                    pending.extend(
+                        transition
+                            .sources()
+                            .iter()
+                            .map(|source| (source.id as u32, false)),
+                    );
+                    continue;
+                }
+                let mut segments = Vec::new();
+                let complete = transition.sources().iter().all(|source| {
+                    if let Some(Some(contributors)) = resolved.get(&(source.id as u32)) {
+                        segments.extend_from_slice(contributors);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if complete {
+                    segments.sort_unstable();
+                    segments.dedup();
+                    resolved.insert(fragment, Some(segments));
+                } else {
+                    resolved.insert(fragment, None);
+                }
+            }
+            if let Some(Some(segments)) = resolved.get(&destination) {
+                for &segment in segments {
+                    coverage[segment].insert(destination);
+                }
+            }
         }
         coverage
     }
 
-    /// Translate a batch through supported lineage, stopping at live fragments.
+    /// Remap physical row IDs through supported lineage, stopping at live fragments.
     /// Missing or deleted paths produce `None`. Input order and duplicates are preserved.
-    pub async fn translate(
-        self: &Arc<Self>,
-        addresses: &[RowAddress],
-    ) -> Result<Vec<Option<RowAddress>>> {
-        let mut result = Vec::with_capacity(addresses.len());
-        for batch in addresses.chunks(64 * 1024) {
+    pub async fn remap_row_ids(self: &Arc<Self>, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        let mut result = Vec::with_capacity(row_ids.len());
+        for batch in row_ids.chunks(64 * 1024) {
             let mut output: Vec<_> = batch.iter().copied().map(Some).collect();
             let mut pending: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
             for (position, address) in output.iter_mut().enumerate() {
-                let current = batch[position];
+                let current = RowAddress::from(batch[position]);
                 if self.live_fragments.contains(current.fragment_id()) {
                     continue;
                 }
@@ -204,7 +231,7 @@ impl FragmentReuseIndex {
                 let rows: Vec<_> = positions
                     .iter()
                     .map(|&position| {
-                        output[position].map(u64::from).ok_or_else(|| {
+                        output[position].ok_or_else(|| {
                             Error::internal("deleted address queued for FRI translation")
                         })
                     })
@@ -216,9 +243,9 @@ impl FragmentReuseIndex {
                     ));
                 }
                 for (position, address) in positions.into_iter().zip(rows) {
-                    let address = address.map(RowAddress::from);
                     output[position] = address;
                     if let Some(current) = address {
+                        let current = RowAddress::from(current);
                         if self.live_fragments.contains(current.fragment_id()) {
                             continue;
                         }
@@ -590,8 +617,6 @@ mod tests {
     #[case::cleanup("cleanup")]
     #[case::shallow_clone("shallow")]
     #[case::deep_clone("deep")]
-    #[case::restore_legacy("restore_legacy")]
-    #[case::restore_tagged("restore_tagged")]
     #[tokio::test]
     async fn unsupported_maintenance_preserves_snapshot(#[case] operation: &str) {
         let mut dataset = fixture().await;
@@ -632,14 +657,6 @@ mod tests {
                 .shallow_clone("memory://fri-shallow", version, None)
                 .await
                 .unwrap_err(),
-            "restore_legacy" => dataset
-                .checkout_version(1)
-                .await
-                .unwrap()
-                .restore()
-                .await
-                .unwrap_err(),
-            "restore_tagged" => dataset.restore().await.unwrap_err(),
             "deep" => dataset
                 .deep_clone("memory://fri-deep", version, None)
                 .await
@@ -658,6 +675,88 @@ mod tests {
             Some(&fri)
         );
         assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
+    }
+
+    #[rstest::rstest]
+    #[case::inline(false)]
+    #[case::external(true)]
+    #[tokio::test]
+    async fn restore_preserves_snapshot_and_mapping_references(#[case] external: bool) {
+        let mut dataset = fixture().await;
+        let legacy = dataset.clone();
+        let (transition, destinations) = prepare(&dataset).await;
+        let source = u64::from(RowAddress::new_from_parts(
+            transition.sources[0].id as u32,
+            0,
+        ));
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        let fri = install(&mut dataset, content, destinations, external).await;
+        let indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        persist_fixture(&mut dataset, indices).await;
+        let tagged = dataset.clone();
+        let expected_mapping = FragmentReuseIndex::open(&tagged, &fri)
+            .await
+            .unwrap()
+            .remap_row_ids(&[source])
+            .await
+            .unwrap();
+        let mut latest = tagged.manifest.version;
+        // Restore old data, then restore tagged data from the now-legacy latest snapshot.
+        for mut target in [legacy, tagged] {
+            let fragments = target.manifest.fragments.clone();
+            let expected_indices = lance_table::io::manifest::read_manifest_indexes(
+                &target.object_store,
+                &target.manifest_location,
+                &target.manifest,
+            )
+            .await
+            .unwrap();
+            target.restore().await.unwrap();
+            latest += 1;
+            assert_eq!(target.manifest.version, latest);
+            assert_eq!(target.manifest.fragments, fragments);
+            let restored_indices = lance_table::io::manifest::read_manifest_indexes(
+                &target.object_store,
+                &target.manifest_location,
+                &target.manifest,
+            )
+            .await
+            .unwrap();
+            assert_eq!(restored_indices, expected_indices);
+            let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+            assert_ne!(target.manifest.reader_feature_flags & flag, 0);
+            assert_ne!(target.manifest.writer_feature_flags & flag, 0);
+            assert_eq!(target.count_rows(None).await.unwrap(), 8);
+            for value in 0..8 {
+                assert_eq!(
+                    target
+                        .count_rows(Some(format!("i = {value}")))
+                        .await
+                        .unwrap(),
+                    1
+                );
+            }
+            if let Some(restored_fri) = restored_indices.iter().find(|index| index.uuid == fri.uuid)
+            {
+                assert_eq!(
+                    FragmentReuseIndex::open(&target, restored_fri)
+                        .await
+                        .unwrap()
+                        .remap_row_ids(&[source])
+                        .await
+                        .unwrap(),
+                    expected_mapping
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -764,14 +863,21 @@ mod tests {
             vec![[10, 11].into_iter().collect()]
         );
         let result = reader
-            .translate(&[
-                RowAddress::new_from_parts(0, 0),
-                RowAddress::new_from_parts(10, 0),
+            .remap_row_ids(&[
+                u64::from(RowAddress::new_from_parts(0, 0)),
+                u64::from(RowAddress::new_from_parts(10, 0)),
             ])
             .await
             .unwrap();
-        assert!(result[0].is_some_and(|a| dataset.fragment_bitmap.contains(a.fragment_id())));
-        assert_eq!(result[1], Some(RowAddress::new_from_parts(10, 0)));
+        assert!(result[0].is_some_and(|a| {
+            dataset
+                .fragment_bitmap
+                .contains(RowAddress::from(a).fragment_id())
+        }));
+        assert_eq!(
+            result[1],
+            Some(u64::from(RowAddress::new_from_parts(10, 0)))
+        );
         assert!(
             dataset
                 .load_indices()
@@ -843,8 +949,8 @@ mod tests {
         assert!(Arc::ptr_eq(&first.ledger, &concurrent.ledger));
         assert!(Arc::ptr_eq(&first.readers[0], &concurrent.readers[0]));
         let before = dataset.index_cache.size_bytes().await;
-        let source = RowAddress::new_from_parts(0, 0);
-        let expected = first.translate(&[source]).await.unwrap();
+        let source = u64::from(RowAddress::new_from_parts(0, 0));
+        let expected = first.remap_row_ids(&[source]).await.unwrap();
         assert!(
             dataset.index_cache.size_bytes().await > before,
             "lazy counts must be charged to the cache"
@@ -878,13 +984,13 @@ mod tests {
         let added = (&*dataset.fragment_bitmap - &*previous.fragment_bitmap)
             .min()
             .unwrap();
-        let added = RowAddress::new_from_parts(added, 0);
-        assert_eq!(first.translate(&[added]).await.unwrap(), vec![None]);
+        let added = u64::from(RowAddress::new_from_parts(added, 0));
+        assert_eq!(first.remap_row_ids(&[added]).await.unwrap(), vec![None]);
         assert_eq!(
-            current.translate(&[added]).await.unwrap(),
+            current.remap_row_ids(&[added]).await.unwrap(),
             vec![Some(added)]
         );
-        assert_eq!(current.translate(&[source]).await.unwrap(), expected);
+        assert_eq!(current.remap_row_ids(&[source]).await.unwrap(), expected);
     }
 
     #[rstest::rstest]
@@ -922,8 +1028,8 @@ mod tests {
         .encode_to_vec();
         let fri = install(&mut dataset, content, destinations, false).await;
         let first = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
-        let old_address = RowAddress::new_from_parts(900, 0);
-        let expected = first.translate(&[old_address]).await.unwrap();
+        let old_address = u64::from(RowAddress::new_from_parts(900, 0));
+        let expected = first.remap_row_ids(&[old_address]).await.unwrap();
         assert!(expected[0].is_some());
 
         let mut replacement = fri.clone();
@@ -963,10 +1069,10 @@ mod tests {
             assert!(Arc::ptr_eq(&first.readers[0], &current.readers[0]));
         }
         assert_eq!(
-            current.translate(&[old_address]).await.unwrap(),
+            current.remap_row_ids(&[old_address]).await.unwrap(),
             if prune { vec![None] } else { expected.clone() }
         );
-        assert_eq!(first.translate(&[old_address]).await.unwrap(), expected);
+        assert_eq!(first.remap_row_ids(&[old_address]).await.unwrap(), expected);
     }
 
     #[tokio::test]
@@ -985,9 +1091,9 @@ mod tests {
         let second = FragmentReuseIndex::open(&rebound, &fri).await.unwrap();
         assert!(Arc::ptr_eq(&first.ledger, &second.ledger));
         assert!(!Arc::ptr_eq(&first.readers[0], &second.readers[0]));
-        let source = RowAddress::new_from_parts(0, 0);
-        let original = first.translate(&[source]).await.unwrap();
-        assert_eq!(second.translate(&[source]).await.unwrap(), original);
+        let source = u64::from(RowAddress::new_from_parts(0, 0));
+        let original = first.remap_row_ids(&[source]).await.unwrap();
+        assert_eq!(second.remap_row_ids(&[source]).await.unwrap(), original);
 
         partition.sources.reverse();
         let content = InlineContent {
@@ -1003,8 +1109,8 @@ mod tests {
         }));
         let changed = FragmentReuseIndex::open(&dataset, &changed).await.unwrap();
         assert!(!Arc::ptr_eq(&first.readers[0], &changed.readers[0]));
-        assert_ne!(changed.translate(&[source]).await.unwrap(), original);
-        assert_eq!(first.translate(&[source]).await.unwrap(), original);
+        assert_ne!(changed.remap_row_ids(&[source]).await.unwrap(), original);
+        assert_eq!(first.remap_row_ids(&[source]).await.unwrap(), original);
     }
 
     #[tokio::test]
@@ -1174,10 +1280,10 @@ mod tests {
         );
         let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
 
-        let current = RowAddress::new_from_parts(0, 0);
+        let current = u64::from(RowAddress::new_from_parts(0, 0));
         assert_eq!(
             mapping
-                .translate(&[current, RowAddress::new_from_parts(999, 0)])
+                .remap_row_ids(&[current, u64::from(RowAddress::new_from_parts(999, 0))])
                 .await
                 .unwrap(),
             vec![Some(current), None]
@@ -1187,6 +1293,75 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
+    }
+
+    #[rstest::rstest]
+    #[case::nearest_coverage(vec![vec![0], vec![1], vec![2, 3]], vec![vec![], vec![], vec![4, 5]])]
+    #[case::mixed_depths(vec![vec![0], vec![1], vec![2]], vec![vec![4, 5], vec![4, 5], vec![4, 5]])]
+    #[case::independent_destination(vec![vec![0], vec![4]], vec![vec![], vec![4]])]
+    #[case::direct_and_derived(vec![vec![0], vec![1], vec![4]], vec![vec![5], vec![5], vec![4]])]
+    #[tokio::test]
+    async fn coverage_resolves_each_destination_independently(
+        #[case] provenance: Vec<Vec<u32>>,
+        #[case] expected: Vec<Vec<u32>>,
+    ) {
+        // A,B -> C,D -> E,F. Each destination contains one row. Coverage is
+        // conservative for each mapping and requires both source fragments.
+        let transitions = [(vec![0, 1], vec![2, 3]), (vec![2, 3], vec![4, 5])]
+            .into_iter()
+            .map(|(sources, destinations)| {
+                let mut changed_row_addrs = Vec::new();
+                roaring::RoaringTreemap::from_iter(
+                    sources
+                        .iter()
+                        .map(|&source| u64::from(RowAddress::new_from_parts(source, 0))),
+                )
+                .serialize_into(&mut changed_row_addrs)
+                .unwrap();
+                let digest = |id: u32| FragmentDigest {
+                    id: u64::from(id),
+                    physical_rows: 1,
+                    num_deleted_rows: 0,
+                };
+                Transition {
+                    sources: sources.into_iter().map(digest).collect(),
+                    destinations: destinations.into_iter().map(digest).collect(),
+                    mapping: Some(transition::Mapping::OrderedCompaction(
+                        pb::fragment_reuse_index_details::OrderedCompaction { changed_row_addrs },
+                    )),
+                }
+            })
+            .collect();
+        let details = prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: field(
+                1,
+                &InlineContent {
+                    legacy_versions: vec![],
+                    transitions,
+                }
+                .encode_to_vec(),
+            ),
+        };
+        let ledger = FragReuseLedger::decode(1, &details, |_| async { panic!("inline history") })
+            .await
+            .unwrap();
+        let reader = FragmentReuseIndex {
+            ledger: Arc::new(ledger),
+            live_fragments: Arc::new(RoaringBitmap::from_iter([4, 5])),
+            // Coverage must never load mapping payloads.
+            readers: vec![],
+        };
+        let bitmaps = |values: Vec<Vec<u32>>| {
+            values
+                .into_iter()
+                .map(RoaringBitmap::from_iter)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            reader.segment_coverage(&bitmaps(provenance)),
+            bitmaps(expected)
+        );
     }
 
     #[rstest::rstest]
@@ -1247,13 +1422,13 @@ mod tests {
                 .collect(),
             ledger: Arc::new(ledger),
         });
-        let inputs = [0, 1, 2, 3, 9].map(|f| RowAddress::new_from_parts(f, 1));
+        let inputs = [0, 1, 2, 3, 9].map(|f| u64::from(RowAddress::new_from_parts(f, 1)));
         assert_eq!(
-            mapping.translate(&inputs).await.unwrap(),
+            mapping.remap_row_ids(&inputs).await.unwrap(),
             vec![
-                (!unknown_middle).then_some(RowAddress::new_from_parts(3, 1)),
-                (!unknown_middle).then_some(RowAddress::new_from_parts(3, 1)),
-                Some(RowAddress::new_from_parts(3, 1)),
+                (!unknown_middle).then_some(u64::from(RowAddress::new_from_parts(3, 1))),
+                (!unknown_middle).then_some(u64::from(RowAddress::new_from_parts(3, 1))),
+                Some(u64::from(RowAddress::new_from_parts(3, 1))),
                 Some(inputs[3]),
                 Some(inputs[4])
             ]
@@ -1282,7 +1457,7 @@ mod tests {
         let fri = install(&mut dataset, content, destinations, false).await;
         let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
         let error = mapping
-            .translate(&[RowAddress::new_from_parts(0, 0)])
+            .remap_row_ids(&[u64::from(RowAddress::new_from_parts(0, 0))])
             .await
             .unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }));
