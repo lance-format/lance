@@ -755,11 +755,11 @@ mod tests {
         .unwrap();
         assert!(Arc::ptr_eq(&first.ledger, &concurrent.ledger));
         assert!(Arc::ptr_eq(&first.readers[0], &concurrent.readers[0]));
-        let before = dataset.index_cache.size().await;
+        let before = dataset.index_cache.size_bytes().await;
         let source = RowAddress::new_from_parts(0, 0);
         let expected = first.translate(&[source]).await.unwrap();
         assert!(
-            dataset.index_cache.size().await > before,
+            dataset.index_cache.size_bytes().await > before,
             "lazy counts must be charged to the cache"
         );
         let previous = dataset.clone();
