@@ -10,6 +10,7 @@ pub mod blob;
 pub mod bloomfilter;
 pub mod cpu;
 pub mod deletion;
+pub mod fragment_reuse;
 pub mod futures;
 pub mod hash;
 pub mod io_stats;
