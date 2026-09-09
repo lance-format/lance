@@ -74,6 +74,7 @@ impl Transition {
 #[derive(Debug)]
 pub struct FragReuseLedger {
     transitions: Vec<Transition>,
+    consumers: HashMap<u32, usize>,
 }
 
 impl FragReuseLedger {
@@ -137,7 +138,26 @@ impl FragReuseLedger {
             }
         }
         let transitions = order_lineage(transitions)?;
-        Ok(Self { transitions })
+        let consumers = transitions
+            .iter()
+            .enumerate()
+            .flat_map(|(position, transition)| {
+                transition
+                    .sources()
+                    .iter()
+                    .map(move |source| (source.id as u32, position))
+            })
+            .collect();
+        Ok(Self {
+            transitions,
+            consumers,
+        })
+    }
+
+    /// Find the transition consuming a fragment in expected constant time.
+    /// The returned position indexes [`Self::transitions`]. Unaffected fragments return `None`.
+    pub fn consumer(&self, fragment_id: u32) -> Option<usize> {
+        self.consumers.get(&fragment_id).copied()
     }
 
     /// Rewrites ordered so every producer precedes its consumers.
@@ -148,7 +168,8 @@ impl FragReuseLedger {
 
 impl DeepSizeOf for FragReuseLedger {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.transitions.capacity() * std::mem::size_of::<Transition>()
+        self.consumers.deep_size_of_children(context)
+            + self.transitions.capacity() * std::mem::size_of::<Transition>()
             + self
                 .transitions
                 .iter()
@@ -449,6 +470,13 @@ mod tests {
         .encode_to_vec()
         .into();
         let ledger = FragReuseLedger::decode(1, content).unwrap();
+        for (position, transition) in ledger.transitions().iter().enumerate() {
+            for source in transition.sources() {
+                assert_eq!(ledger.consumer(source.id as u32), Some(position));
+            }
+        }
+        assert_eq!(ledger.consumer(u32::MAX), None);
+
         assert_eq!(ledger.transitions().len(), 2);
         let Mapping::OrderedCompaction(remap) = ledger.transitions()[0].mapping() else {
             unreachable!()
