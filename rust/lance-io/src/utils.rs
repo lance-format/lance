@@ -131,7 +131,20 @@ pub fn read_version(bytes: &Bytes) -> Result<(u16, u16)> {
 
 /// Read protobuf from a buffer.
 pub fn read_message_from_buf<M: Message + Default>(buf: &Bytes) -> Result<M> {
+    if buf.len() < 4 {
+        return Err(Error::io(format!(
+            "buffer too short for message length prefix: {}",
+            buf.len()
+        )));
+    }
     let msg_len = LittleEndian::read_u32(buf) as usize;
+    if msg_len > buf.len() - 4 {
+        return Err(Error::io(format!(
+            "message length {} exceeds buffer length {}",
+            msg_len,
+            buf.len()
+        )));
+    }
     Ok(M::decode(&buf[4..4 + msg_len])?)
 }
 
@@ -246,7 +259,9 @@ mod tests {
         object_store::{DEFAULT_DOWNLOAD_RETRY_COUNT, ObjectStore},
         object_writer::ObjectWriter,
         traits::{ProtoStruct, WriteExt, Writer},
-        utils::{METADATA_READ_CHUNK_SIZE, read_range_in_chunks, read_struct},
+        utils::{
+            METADATA_READ_CHUNK_SIZE, read_message_from_buf, read_range_in_chunks, read_struct,
+        },
     };
 
     // Bytes is a prost::Message, since we don't have any .proto files in this crate we
@@ -392,5 +407,18 @@ mod tests {
 
         assert_eq!(copied, 3);
         assert_eq!(store.read_one_all(&dst).await.unwrap().as_ref(), b"cde");
+    }
+
+    #[test]
+    fn test_read_message_from_buf_rejects_malformed_length_prefix() {
+        let too_short = Bytes::from_static(&[1, 2, 3]);
+        let err = read_message_from_buf::<Bytes>(&too_short).unwrap_err();
+        assert!(matches!(err, Error::IO { .. }), "got: {err:?}");
+        assert!(err.to_string().contains("length prefix"), "got: {err}");
+
+        let oversized = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 10, 20]);
+        let err = read_message_from_buf::<Bytes>(&oversized).unwrap_err();
+        assert!(matches!(err, Error::IO { .. }), "got: {err:?}");
+        assert!(err.to_string().contains("exceeds buffer"), "got: {err}");
     }
 }
