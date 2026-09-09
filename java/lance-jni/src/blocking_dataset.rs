@@ -70,7 +70,10 @@ pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
 impl FromJObjectWithEnv<BasePath> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<BasePath> {
-        let id = env.get_u32_from_method(self, "getId")?;
+        let java_id = env.call_method(self, "getId", "()I", &[])?.i()?;
+        let id = u32::try_from(java_id).map_err(|_| {
+            Error::input_error(format!("BasePath.id must be non-negative, got {java_id}"))
+        })?;
         let name = env.get_optional_string_from_method(self, "getName")?;
         let path = env.get_string_from_method(self, "getPath")?;
         let is_dataset_root = env.get_boolean_from_method(self, "isDatasetRoot")?;
@@ -80,6 +83,37 @@ impl FromJObjectWithEnv<BasePath> for JObject<'_> {
             path,
             is_dataset_root,
         })
+    }
+}
+
+impl IntoJava for &BasePath {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let id = i32::try_from(self.id).map_err(|_| {
+            Error::runtime_error(format!("Base path id {} exceeds Java int range", self.id))
+        })?;
+        let name = match self.name.as_ref() {
+            Some(name) => env.new_string(name)?.into(),
+            None => JObject::null(),
+        };
+        let name = env
+            .call_static_method(
+                "java/util/Optional",
+                "ofNullable",
+                "(Ljava/lang/Object;)Ljava/util/Optional;",
+                &[JValue::Object(&name)],
+            )?
+            .l()?;
+        let path = env.new_string(&self.path)?;
+        Ok(env.new_object(
+            "org/lance/BasePath",
+            "(ILjava/util/Optional;Ljava/lang/String;Z)V",
+            &[
+                JValue::Int(id),
+                JValue::Object(&name),
+                JValue::Object(&path),
+                JValue::Bool(self.is_dataset_root.into()),
+            ],
+        )?)
     }
 }
 
@@ -1814,6 +1848,33 @@ fn inner_get_fragments<'local>(
         .map(|f| f.metadata().clone())
         .collect::<Vec<Fragment>>();
     export_vec(env, &fragments)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetBasePaths<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(env, inner_get_base_paths(&mut env, jdataset))
+}
+
+fn inner_get_base_paths<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+) -> Result<JObject<'local>> {
+    let mut base_paths = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset
+            .inner
+            .manifest()
+            .base_paths
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    base_paths.sort_by_key(|base_path| base_path.id);
+    export_vec(env, &base_paths)
 }
 
 #[unsafe(no_mangle)]

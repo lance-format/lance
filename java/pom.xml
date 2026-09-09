@@ -7,7 +7,7 @@
     <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>12.0.0-beta.11</version>
+    <version>12.0.0-beta.15</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -490,6 +490,9 @@
                             <forkNode
                                 implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
                             <useSystemClassLoader>false</useSystemClassLoader>
+                            <environmentVariables>
+                                <LANCE_LANGUAGE_MODEL_HOME>${project.basedir}/src/test/resources/language_models</LANCE_LANGUAGE_MODEL_HOME>
+                            </environmentVariables>
                         </configuration>
                     </plugin>
                 </plugins>

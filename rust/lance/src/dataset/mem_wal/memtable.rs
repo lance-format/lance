@@ -80,6 +80,10 @@ pub struct MemTable {
 
     /// Primary key bloom filter for staleness detection.
     pk_bloom_filter: Sbbf,
+    /// Decoded size of the primary-key columns across every batch appended so
+    /// far. Accumulated here because [`Self::update_bloom_filter`] already has
+    /// the key columns in hand.
+    pk_bytes: usize,
     /// Primary key field IDs (for bloom filter updates).
     pk_field_ids: Vec<i32>,
 
@@ -255,6 +259,7 @@ impl MemTable {
             generation,
             pk_bloom_filter,
             pk_field_ids,
+            pk_bytes: 0,
             // Initialize with an empty IndexStore so the visibility cursor has
             // a stable Arc shared between the scanner (via `indexes_arc()`)
             // and the WAL flush handler. Replaced via `set_indexes_arc` if
@@ -576,6 +581,12 @@ impl MemTable {
             bloom.insert_hash(hash);
         }
 
+        // Per column, not per row: the loop above is what costs something here.
+        self.pk_bytes += pk_columns
+            .iter()
+            .map(|column| batch_store::StoredBatch::estimate_array_size(&column.to_data()))
+            .sum::<usize>();
+
         Ok(())
     }
 
@@ -700,6 +711,11 @@ impl MemTable {
     }
 
     /// Get total row count.
+    /// Decoded size of the primary-key columns this memtable holds.
+    pub fn pk_bytes(&self) -> usize {
+        self.pk_bytes
+    }
+
     pub fn row_count(&self) -> usize {
         self.batch_store.total_rows()
     }

@@ -3566,6 +3566,7 @@ mod tests {
             reader,
             &test_dir,
             Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
                 max_rows_per_file: 1,
                 ..Default::default()
             }),
@@ -4381,38 +4382,52 @@ mod tests {
 
     /// Regression test for https://github.com/lance-format/lance/issues/8076
     ///
-    /// A zone map or bloom filter index reports matches as physical row addresses, so
+    /// Zone map, bloom filter, and FM indices report matches as physical row addresses, so
     /// compaction invalidates it even under stable row ids. Reusing it for the rewritten
     /// fragments made a filtered scan fail with an internal error (a fragment referenced
     /// by the index no longer existed) or, once translation tolerated that, silently drop
     /// every match.
     #[rstest]
-    #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap)]
-    #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter)]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i > 0", 199)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
+    #[case::fm(
+        BuiltinIndexType::Fm,
+        IndexType::Fm,
+        "text",
+        "contains(text, 'needle')",
+        100
+    )]
     #[tokio::test]
     async fn test_addr_domain_index_after_compaction_with_stable_row_ids(
         #[case] builtin: BuiltinIndexType,
         #[case] index_type: IndexType,
+        #[case] indexed_column: &str,
+        #[case] query: &str,
+        #[case] expected_rows: usize,
     ) {
-        let mut data_gen =
-            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
-        let mut dataset = Dataset::write(
-            data_gen.batch(200),
-            "memory://test/table",
-            Some(WriteParams {
-                enable_stable_row_ids: true,
-                max_rows_per_file: 100, // 2 fragments, so compaction has something to merge
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["needle", "haystack"]),
+            )
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(100),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 100,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
 
         dataset
             .create_index(
-                &["i"],
+                &[indexed_column],
                 index_type,
-                None,
+                Some("addr_idx".to_string()),
                 &ScalarIndexParams::for_builtin(builtin),
                 false,
             )
@@ -4432,7 +4447,7 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .find(|index| index.fields == vec![0])
+            .find(|index| index.name == "addr_idx")
             .expect("index must survive compaction")
             .clone();
         assert!(
@@ -4445,9 +4460,9 @@ mod tests {
         // Every fragment therefore falls back to a full scan, and the filter is answered
         // in full.
         let mut scanner = dataset.scan();
-        scanner.filter("i > 0").unwrap();
+        scanner.filter(query).unwrap();
         let matched = scanner.try_into_batch().await.unwrap();
-        assert_eq!(matched.num_rows(), 199);
+        assert_eq!(matched.num_rows(), expected_rows);
     }
 
     // Regression test for https://github.com/lancedb/lance/issues/6161

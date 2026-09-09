@@ -10,6 +10,7 @@ use arrow_schema::SchemaRef;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
@@ -42,6 +43,39 @@ use super::graph::OrderedFloat;
 use super::graph::OrderedNode;
 use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::{ApproxMode, DISTANCE_TYPE_KEY};
+
+async fn spawn_prewarm_materialization<R, F>(materialize: F) -> Result<R>
+where
+    R: Send + 'static,
+    F: FnOnce() -> Result<R> + Send + 'static,
+{
+    // `spawn_cpu` work is non-cancellable. If the caller-owned cache loader is
+    // dropped, this pure CPU tail may finish, but its result is dropped with
+    // this future and therefore cannot be inserted into the cache. A later
+    // cache lookup remains responsible for retrying the load.
+    spawn_cpu(materialize).await
+}
+
+fn compact_prewarm_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    let schema = batches
+        .first()
+        .ok_or_else(|| Error::internal("prewarm partition has no storage batches"))?
+        .schema();
+    if batches.len() == 1 {
+        let batch = batches.into_iter().next().ok_or_else(|| {
+            Error::internal("prewarm partition storage batch unexpectedly missing")
+        })?;
+        if batch.num_rows() == 0 {
+            Ok(batch)
+        } else {
+            Ok(batch.shrink_to_fit()?)
+        }
+    } else {
+        // Concatenation allocates compact output buffers already; do not
+        // deep-copy them a second time with `shrink_to_fit`.
+        Ok(concat_batches(&schema, batches.iter())?)
+    }
+}
 
 /// <section class="warning">
 ///  Internal API
@@ -703,12 +737,81 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             self.frag_reuse_index.clone(),
         )
     }
+
+    /// Materialize a compact partition for the parallel prewarm path.
+    ///
+    /// The input may be a slice of a larger contiguous read. Deep-copying its
+    /// visible rows before constructing storage prevents a cached partition
+    /// from retaining the entire prewarm window's Arrow buffers.
+    #[doc(hidden)]
+    pub async fn materialize_partition_for_prewarm(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Q::Storage>
+    where
+        Q::Metadata: 'static,
+        Q::Storage: 'static,
+    {
+        let metadata = self.metadata.clone();
+        let distance_type = self.distance_type;
+        let frag_reuse_index = self.frag_reuse_index.clone();
+        spawn_prewarm_materialization(move || {
+            let batch = compact_prewarm_batches(batches)?;
+            Q::Storage::try_from_batch_with_remapper(
+                batch,
+                &metadata,
+                distance_type,
+                frag_reuse_index,
+            )
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryScratchCapacity, QueryScratchPool};
+    use super::{
+        QueryScratchCapacity, QueryScratchPool, compact_prewarm_batches,
+        spawn_prewarm_materialization,
+    };
+    use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
     use lance_core::deepsize::DeepSizeOf;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_prewarm_materialization_uses_cpu_pool() {
+        let thread_name =
+            spawn_prewarm_materialization(|| Ok(std::thread::current().name().map(str::to_owned)))
+                .await
+                .unwrap();
+        assert_eq!(thread_name.as_deref(), Some("lance-cpu"));
+    }
+
+    #[test]
+    fn test_prewarm_storage_batches_own_compact_buffers() {
+        let parent = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(UInt64Array::from_iter_values(0..100)) as ArrayRef,
+        )])
+        .unwrap();
+        let parent_array = parent
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let parent_ptr = parent_array.values().as_ptr();
+        let parent_size = parent_array.get_array_memory_size();
+
+        let compact = compact_prewarm_batches(vec![parent.slice(10, 10)]).unwrap();
+        let compact_array = compact
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_ne!(compact_array.values().as_ptr(), parent_ptr);
+        assert!(compact_array.get_array_memory_size() < parent_size);
+        assert_eq!(compact_array.values(), &(10..20).collect::<Vec<_>>());
+    }
 
     #[test]
     fn test_query_scratch_pool_reuses_buffers() {

@@ -50,6 +50,7 @@ use lance_index::scalar::inverted::{
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
+use lance_index::scalar::registry::StoreBoundScalarIndexCacheEntry;
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndex};
 use lance_index::{FtsPrewarmOptions, PrewarmOptions};
 use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
@@ -2804,7 +2805,7 @@ async fn test_partial_compound_hybrid_prunes_same_path_different_base_rewrite() 
         .create(&replacement_path)
         .await
         .unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -5310,7 +5311,11 @@ impl SingleScalarContainerCacheBackend {
     }
 
     fn rejects_scalar_container(entry: &CacheEntry, codec: Option<&CacheCodec>) -> bool {
-        codec.is_none() && entry.as_ref().is::<Arc<dyn ScalarIndex>>()
+        // Whole-container entries are stored as Arc<dyn ScalarIndex> by custom plugin
+        // paths and as StoreBoundScalarIndexCacheEntry by the default cache path.
+        codec.is_none()
+            && (entry.as_ref().is::<Arc<dyn ScalarIndex>>()
+                || entry.as_ref().is::<Arc<StoreBoundScalarIndexCacheEntry>>())
     }
 }
 

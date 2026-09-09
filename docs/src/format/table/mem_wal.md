@@ -145,6 +145,29 @@ _mem_wal/{shard_id}/{random8}_gen_{i}/
 If a flush attempt fails, a retry writes a different directory instead of reusing a partially written one.
 The shard manifest records the successful directory name in the SSTable's `path`.
 
+### SSTable Accounting
+
+Alongside `generation` and `path`, a shard manifest entry may record what the
+SSTable holds, as the writer's MemTable accounted for it at flush:
+
+- `in_memory_bytes`: payload size of the rows, summed over the MemTable's
+  buffers as the window each one holds.
+- `physical_rows`: rows held, counting the older duplicates of a primary key
+  that the generation's deletion vector masks. A scan applying the deletion
+  vector yields fewer.
+- `primary_key_bytes`: total payload size of the primary-key columns over every
+  row in `physical_rows`. Not a per-row size, which varies for a
+  variable-length key.
+
+All three are estimates of payload, not bounds on what reading the SSTable
+costs: they exclude the per-array structure a reader materializes, and
+`primary_key_bytes` is not the size of any encoded form of the key. A consumer
+budgeting memory from them adds its own headroom.
+
+All three are optional. An entry written before they existed records none of
+them, and a reader must not treat an absent value as zero; `primary_key_bytes`
+is also absent on a table with no primary key.
+
 The SSTable directory is a standard Lance dataset written with the base table's data storage version.
 Each SSTable is written as one fragment.
 Additional MemWAL sidecars may be present:
