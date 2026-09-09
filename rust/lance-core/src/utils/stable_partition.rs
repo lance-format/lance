@@ -315,8 +315,8 @@ impl CountsMatrix {
 }
 
 impl DeepSizeOf for CountsMatrix {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.cumulative.deep_size_of_children(context)
+    fn deep_size_of_children(&self, _: &mut Context) -> usize {
+        self.cumulative.capacity() * std::mem::size_of::<u32>()
     }
 }
 
