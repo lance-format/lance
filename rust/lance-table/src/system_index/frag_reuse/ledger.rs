@@ -75,6 +75,7 @@ impl Transition {
 pub struct FragReuseLedger {
     transitions: Vec<Transition>,
     consumers: HashMap<u32, usize>,
+    producers: HashMap<u32, usize>,
 }
 
 impl FragReuseLedger {
@@ -148,9 +149,20 @@ impl FragReuseLedger {
                     .map(move |source| (source.id as u32, position))
             })
             .collect();
+        let producers = transitions
+            .iter()
+            .enumerate()
+            .flat_map(|(position, transition)| {
+                transition
+                    .destinations()
+                    .iter()
+                    .map(move |destination| (destination.id as u32, position))
+            })
+            .collect();
         Ok(Self {
             transitions,
             consumers,
+            producers,
         })
     }
 
@@ -158,6 +170,12 @@ impl FragReuseLedger {
     /// The returned position indexes [`Self::transitions`]. Unaffected fragments return `None`.
     pub fn consumer(&self, fragment_id: u32) -> Option<usize> {
         self.consumers.get(&fragment_id).copied()
+    }
+
+    /// Whether a fragment occurs anywhere in the retained lineage.
+    /// Destination coverage can still describe an index storing source addresses.
+    pub fn contains_fragment(&self, fragment_id: u32) -> bool {
+        self.consumers.contains_key(&fragment_id) || self.producers.contains_key(&fragment_id)
     }
 
     /// Rewrites ordered so every producer precedes its consumers.
@@ -169,6 +187,7 @@ impl FragReuseLedger {
 impl DeepSizeOf for FragReuseLedger {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.consumers.deep_size_of_children(context)
+            + self.producers.deep_size_of_children(context)
             + self.transitions.capacity() * std::mem::size_of::<Transition>()
             + self
                 .transitions
@@ -476,6 +495,12 @@ mod tests {
             }
         }
         assert_eq!(ledger.consumer(u32::MAX), None);
+        assert!(!ledger.contains_fragment(u32::MAX));
+        for transition in ledger.transitions() {
+            for destination in transition.destinations() {
+                assert!(ledger.contains_fragment(destination.id as u32));
+            }
+        }
 
         assert_eq!(ledger.transitions().len(), 2);
         let Mapping::OrderedCompaction(remap) = ledger.transitions()[0].mapping() else {
