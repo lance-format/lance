@@ -50,7 +50,6 @@ use lance_index::scalar::inverted::{
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
-use lance_index::scalar::registry::StoreBoundScalarIndexCacheEntry;
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndex};
 use lance_index::{FtsPrewarmOptions, PrewarmOptions};
 use lance_index::{IndexType, scalar::ScalarIndexParams, vector::DIST_COL};
@@ -5462,11 +5461,7 @@ impl SingleScalarContainerCacheBackend {
     }
 
     fn rejects_scalar_container(entry: &CacheEntry, codec: Option<&CacheCodec>) -> bool {
-        // Whole-container entries are stored as Arc<dyn ScalarIndex> by custom plugin
-        // paths and as StoreBoundScalarIndexCacheEntry by the default cache path.
-        codec.is_none()
-            && (entry.as_ref().is::<Arc<dyn ScalarIndex>>()
-                || entry.as_ref().is::<Arc<StoreBoundScalarIndexCacheEntry>>())
+        codec.is_none() && entry.as_ref().is::<Arc<dyn ScalarIndex>>()
     }
 }
 
