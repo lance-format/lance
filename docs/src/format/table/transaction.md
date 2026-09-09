@@ -763,3 +763,15 @@ The reader follows a validation and synchronization protocol:
    - If canonical materialization cannot be established, or an observed size differs, return an error
 
 This protocol ensures that datasets using external manifest stores remain portable: copying the dataset directory preserves all data without requiring the external store.
+
+## Appending FRI Transitions
+
+`append_fri_transitions` (field 116) appends tagged transitions to the latest
+fragment reuse history. Its `transitions` field lists only the new mappings;
+it never carries the existing history. Committing this operation requires the
+tagged history capability (`FLAG_FRAGMENT_REUSE_INDEX`) and FRI
+`index_version` 1; the appended transitions must satisfy the lineage
+invariants in
+[FRI index versions](../index/system/frag_reuse.md#fri-index-versions).
+Atomic composition with `rewrite` is deferred to a future transaction
+revision.
