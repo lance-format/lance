@@ -95,6 +95,7 @@ async fn destination_coverage_requires_every_contributing_segment(#[case] scenar
             indices[second].index_details = Some(Arc::new(
                 prost_types::Any::from_msg(&lance_index::pb::FmIndexDetails::default()).unwrap(),
             ));
+            assert!(crate::index::index_is_usable(&indices[second]));
         }
         "complete" => {}
         _ => unreachable!(),
