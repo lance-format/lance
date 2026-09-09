@@ -4,9 +4,12 @@
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::{collections::HashMap, pin::Pin};
+use std::{
+    collections::{BTreeMap, HashMap},
+    pin::Pin,
+};
 
-use arrow::array::{AsArray as _, PrimitiveBuilder, UInt32Builder, UInt64Builder};
+use arrow::array::{AsArray as _, PrimitiveBuilder, UInt64Builder};
 use arrow::compute::sort_to_indices;
 use arrow::datatypes::{self};
 use arrow::datatypes::{Float16Type, Float64Type, UInt8Type, UInt64Type};
@@ -113,8 +116,11 @@ const REASSIGN_SAMPLE_SIZE: usize = 512;
 /// that unsampled rows would still leave.
 const REASSIGN_MARGIN: f32 = 0.05;
 /// Bytes of quantized rows one join pass may keep in memory until the merge
-/// writes them out. Undersized partitions that do not fit wait for the next
-/// optimize, so joining every one of them at once cannot exhaust memory.
+/// writes them out. The planner estimates it from the quantizer's output
+/// width to pick the join set, and the join measures what it actually retains
+/// and stops early when it is reached; undersized partitions that do not fit
+/// wait for the next optimize, so joining every one of them at once cannot
+/// exhaust memory.
 const JOIN_BYTES_BUDGET: usize = 512 * 1024 * 1024;
 
 /// Number of partitions the split partitions' rows now belong to.
@@ -1115,6 +1121,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     Arc::new(self.existing_indices.clone()),
                     Some(PartitionAdjustment::Join {
                         kept_partitions: results.kept_partitions,
+                        reindexed_row_ids: results.reindexed_row_ids,
                     }),
                 )
             } else {
@@ -1174,9 +1181,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             _ => (false, None),
                         };
                         let partition = match partition_adjustment.as_ref() {
-                            Some(PartitionAdjustment::Join { kept_partitions }) => {
-                                kept_partitions[partition]
-                            }
+                            Some(PartitionAdjustment::Join {
+                                kept_partitions, ..
+                            }) => kept_partitions[partition],
                             _ => partition,
                         };
 
@@ -1211,30 +1218,30 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         }
 
                         spawn_cpu(move || {
-                            // Apply assign_batch for join operations (splits no
-                            // longer use assign_batches)
-                            if let Some((assign_batch, deleted_row_ids)) = assign_batch {
-                                if !deleted_row_ids.is_empty() {
-                                    let deleted_row_ids = HashSet::<u64>::from_iter(
-                                        deleted_row_ids.values().iter().copied(),
-                                    );
-                                    for batch in batches.iter_mut() {
-                                        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                                        let mask =
-                                            BooleanArray::from_iter(row_ids.iter().map(|row_id| {
-                                                row_id.map(|row_id| {
-                                                    !deleted_row_ids.contains(&row_id)
-                                                })
-                                            }));
-                                        *batch = arrow::compute::filter_record_batch(batch, &mask)?;
-                                    }
+                            // A join reindexes whole logical rows: their old
+                            // entries leave every partition before the assign
+                            // batches add the new ones.
+                            if let Some(PartitionAdjustment::Join {
+                                reindexed_row_ids, ..
+                            }) = partition_adjustment.as_ref()
+                                && !reindexed_row_ids.is_empty()
+                            {
+                                for batch in batches.iter_mut() {
+                                    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                                    let mask =
+                                        BooleanArray::from_iter(row_ids.iter().map(|row_id| {
+                                            row_id
+                                                .map(|row_id| !reindexed_row_ids.contains(&row_id))
+                                        }));
+                                    *batch = arrow::compute::filter_record_batch(batch, &mask)?;
                                 }
-
-                                if assign_batch.num_rows() > 0 {
-                                    // Drop PART_ID column from assign_batch to match schema of existing batches
-                                    let assign_batch = assign_batch.drop_column(PART_ID_COLUMN)?;
-                                    batches.push(assign_batch);
-                                }
+                            }
+                            if let Some(assign_batch) = assign_batch
+                                && assign_batch.num_rows() > 0
+                            {
+                                // Drop PART_ID column from assign_batch to match schema of existing batches
+                                let assign_batch = assign_batch.drop_column(PART_ID_COLUMN)?;
+                                batches.push(assign_batch);
                             }
 
                             let num_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
@@ -1919,29 +1926,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(batches)
     }
 
-    /// The raw vectors of every logical row with an entry in a partition,
-    /// flattened to one row id per vector, plus how many entries of each row the
-    /// partition held (a multivector row's vectors can be spread over several
-    /// partitions, and the dataset returns all of them).
-    async fn load_partition_raw_vectors(&self, part_idx: usize) -> Result<Option<PartitionRows>> {
+    /// The raw vectors of the logical rows `row_ids`, flattened to one row id
+    /// per vector (a multivector row contributes every one of its vectors).
+    async fn load_raw_vectors(
+        &self,
+        row_ids: &[u64],
+    ) -> Result<Option<(UInt64Array, FixedSizeListArray)>> {
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
-                "dataset not set before split partition",
+                "dataset not set before loading raw vectors",
             ));
         };
-
-        let mut row_ids = self.partition_row_ids(part_idx).await?;
-        if !row_ids.is_sorted() {
-            row_ids.sort();
-        }
-        let mut entries_per_row: HashMap<u64, usize> = HashMap::new();
-        for &row_id in &row_ids {
-            *entries_per_row.entry(row_id).or_default() += 1;
-        }
-        // dedup is needed if it's multivector
-        row_ids.dedup();
-
-        let batches = Self::take_vectors(dataset, &self.column, &self.store, &row_ids).await?;
+        let batches = Self::take_vectors(dataset, &self.column, &self.store, row_ids).await?;
         if batches.is_empty() {
             return Ok(None);
         }
@@ -1959,35 +1955,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             )))?
             .as_fixed_size_list()
             .clone();
-        Ok(Some(PartitionRows {
-            row_ids,
-            vectors,
-            entries_per_row,
-        }))
-    }
-
-    /// This partition's centroid followed by its `REASSIGN_RANGE` nearest
-    /// neighbors in the old model, for [`vectors_held_by_partition`].
-    fn provenance_centroids(&self, ivf: &IvfModel, part_idx: usize) -> Result<FixedSizeListArray> {
-        let c0 = ivf
-            .centroid(part_idx)
-            .ok_or(Error::invalid_input("original centroid not found"))?;
-        let (neighbor_ids, _) = select_reassign_candidates_impl(
-            self.distance_type,
-            ivf,
-            part_idx,
-            &c0,
-            &HashSet::new(),
-        )?;
-        let ids = UInt32Array::from_iter_values(
-            std::iter::once(part_idx as u32).chain(neighbor_ids.values().iter().copied()),
-        );
-        let centroids = ivf
-            .centroids_array()
-            .ok_or_else(|| Error::invalid_input("IVF model has no centroids"))?;
-        Ok(arrow::compute::take(centroids, &ids, None)?
-            .as_fixed_size_list()
-            .clone())
+        Ok(Some((row_ids, vectors)))
     }
 
     /// Rows per partition that split and join thresholds are derived from: the
@@ -2002,27 +1970,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(index_type.target_partition_size())
     }
 
-    /// Bytes one reassigned row occupies while a join runs: its row id, its
-    /// partition id and its code (the raw vector for a flat index).
+    /// Bytes one reindexed row occupies while a join runs: the quantizer's
+    /// output columns (its code and, for RaBitQ, the factor and extra-code
+    /// columns) plus the row id and the partition id.
     fn join_bytes_per_row(&self) -> Result<usize> {
         let Some(quantizer) = self.quantizer.as_ref() else {
             return Err(Error::invalid_input(
                 "quantizer not set before planning partition joins",
             ));
         };
-        let code_bytes = match Q::quantization_type() {
-            QuantizationType::Flat => {
-                let Some(dataset) = self.dataset.as_ref() else {
-                    return Err(Error::invalid_input(
-                        "dataset not set before planning partition joins",
-                    ));
-                };
-                let (_, element_type) = get_vector_type(dataset.schema(), &self.column)?;
-                quantizer.code_dim() * element_type.primitive_width().unwrap_or(size_of::<f32>())
-            }
-            _ => quantizer.code_dim(),
-        };
-        Ok(code_bytes + size_of::<u64>() + size_of::<u32>())
+        let fields: Vec<Field> = std::iter::once(quantizer.field())
+            .chain(quantizer.extra_fields())
+            .collect();
+        retained_bytes_per_row(&fields)
     }
 
     /// Decide which partitions to split and which to join away, from the
@@ -2526,12 +2486,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(Some(centroids))
     }
 
-    /// Join undersized partitions away in one pass: their centroids are removed
-    /// and every one of their vectors is reassigned to the nearest remaining
-    /// partition with room below `split_threshold` (given `partition_sizes`),
-    /// among the `REASSIGN_RANGE` nearest neighbors of its old centroid first.
-    /// Partitions are loaded one at a time and their rows quantized right away,
-    /// so only one partition's raw vectors are in memory at once.
+    /// Join undersized partitions away in one pass. Every logical row with an
+    /// entry in a joined partition is reindexed once: all of its vectors go to
+    /// their nearest surviving partition with room below `split_threshold`
+    /// (given `partition_sizes`), the `REASSIGN_RANGE` nearest neighbors of
+    /// the old centroid first, and its old entries are dropped from every
+    /// partition through `reindexed_row_ids`. That conserves both the count
+    /// and the identity of a multivector row's vectors wherever they were.
+    /// Partitions are loaded one at a time and their rows quantized right
+    /// away, so only one partition's raw vectors are in memory at once, and
+    /// the pass stops joining once the quantized rows it retains reach
+    /// `JOIN_BYTES_BUDGET`; the remaining planned joins wait for the next
+    /// optimize.
     async fn join_partitions(
         &self,
         partitions: &[usize],
@@ -2539,21 +2505,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         partition_sizes: &[usize],
         split_threshold: usize,
     ) -> Result<JoinResult> {
-        let removed: HashSet<usize> = partitions.iter().copied().collect();
-        let kept_partitions: Vec<usize> = (0..ivf.num_partitions())
-            .filter(|partition| !removed.contains(partition))
-            .collect();
-        let centroids = ivf.centroids_array().unwrap();
-        let kept_ids = UInt32Array::from(
-            kept_partitions
-                .iter()
-                .map(|partition| *partition as u32)
-                .collect::<Vec<_>>(),
-        );
-        let new_centroids = arrow::compute::take(centroids, &kept_ids, None)?
-            .as_fixed_size_list()
-            .clone();
-
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input(
                 "dataset not set before joining partitions",
@@ -2565,46 +2516,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .map(|&size| split_threshold.saturating_sub(size))
             .collect();
         let (_, element_type) = get_vector_type(dataset.schema(), &self.column)?;
-        let assign_batches = match element_type {
+        let execution = match element_type {
             DataType::Float16 => {
-                self.join_partitions_impl::<Float16Type>(
-                    partitions,
-                    &kept_partitions,
-                    ivf,
-                    &new_centroids,
-                    &mut room,
-                )
-                .await?
+                self.join_partitions_impl::<Float16Type>(partitions, ivf, &mut room)
+                    .await?
             }
             DataType::Float32 => {
-                self.join_partitions_impl::<Float32Type>(
-                    partitions,
-                    &kept_partitions,
-                    ivf,
-                    &new_centroids,
-                    &mut room,
-                )
-                .await?
+                self.join_partitions_impl::<Float32Type>(partitions, ivf, &mut room)
+                    .await?
             }
             DataType::Float64 => {
-                self.join_partitions_impl::<Float64Type>(
-                    partitions,
-                    &kept_partitions,
-                    ivf,
-                    &new_centroids,
-                    &mut room,
-                )
-                .await?
+                self.join_partitions_impl::<Float64Type>(partitions, ivf, &mut room)
+                    .await?
             }
             DataType::UInt8 => {
-                self.join_partitions_impl::<UInt8Type>(
-                    partitions,
-                    &kept_partitions,
-                    ivf,
-                    &new_centroids,
-                    &mut room,
-                )
-                .await?
+                self.join_partitions_impl::<UInt8Type>(partitions, ivf, &mut room)
+                    .await?
             }
             dt => {
                 return Err(Error::invalid_input(format!(
@@ -2613,94 +2540,99 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 )));
             }
         };
+        if execution.joined.len() < partitions.len() {
+            log::info!(
+                "joined {} of {} planned partitions; the retained rows reached the {} byte budget",
+                execution.joined.len(),
+                partitions.len(),
+                JOIN_BYTES_BUDGET
+            );
+        }
 
+        let joined: HashSet<usize> = execution.joined.iter().copied().collect();
+        let kept_partitions: Vec<usize> = (0..ivf.num_partitions())
+            .filter(|partition| !joined.contains(partition))
+            .collect();
+        let centroids = ivf
+            .centroids_array()
+            .ok_or_else(|| Error::invalid_input("IVF model has no centroids"))?;
+        let kept_ids = UInt32Array::from_iter_values(
+            kept_partitions.iter().map(|&partition| partition as u32),
+        );
+        let new_centroids = arrow::compute::take(centroids, &kept_ids, None)?
+            .as_fixed_size_list()
+            .clone();
+        let mut assigned = execution.assigned;
+        let assign_batches = kept_partitions
+            .iter()
+            .map(|old| -> Result<Option<RecordBatch>> {
+                let Some(mut batches) = assigned.remove(old) else {
+                    return Ok(None);
+                };
+                Ok(Some(match batches.len() {
+                    1 => batches.pop().unwrap(),
+                    _ => arrow::compute::concat_batches(&batches[0].schema(), &batches)?,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(JoinResult {
             assign_batches,
             new_centroids,
             kept_partitions,
+            reindexed_row_ids: Arc::new(execution.reindexed_row_ids),
         })
     }
 
     async fn join_partitions_impl<T: ArrowPrimitiveType>(
         &self,
         partitions: &[usize],
-        kept_partitions: &[usize],
         ivf: &IvfModel,
-        new_centroids: &FixedSizeListArray,
         room: &mut [usize],
-    ) -> Result<Vec<Option<(RecordBatch, UInt64Array)>>>
+    ) -> Result<JoinExecution>
     where
         T::Native: Dot + L2 + Normalize,
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
+        // Rows go to partitions the plan keeps. If the budget stops the pass
+        // early the remaining planned partitions stay as well; they just
+        // receive nothing.
         let removed: HashSet<usize> = partitions.iter().copied().collect();
-        // old partition id -> output partition id
-        let mut output_partition = vec![None; ivf.num_partitions()];
-        for (output, &old) in kept_partitions.iter().enumerate() {
-            output_partition[old] = Some(output);
-        }
+        let old_centroids = ivf
+            .centroids_array()
+            .ok_or_else(|| Error::invalid_input("IVF model has no centroids"))?;
+        let (transformer, vector_field) = self.assign_transformer(old_centroids)?;
 
-        let (transformer, vector_field) = self.assign_transformer(new_centroids)?;
-
-        let mut assigned: Vec<Vec<RecordBatch>> = vec![Vec::new(); kept_partitions.len()];
+        let mut execution = JoinExecution::default();
+        let mut retained_bytes = 0usize;
         for &part_idx in partitions {
-            let Some(PartitionRows {
-                row_ids,
-                vectors,
-                entries_per_row,
-            }) = self.load_partition_raw_vectors(part_idx).await?
-            else {
+            if !execution.joined.is_empty() && retained_bytes >= JOIN_BYTES_BUDGET {
+                break;
+            }
+            let mut row_ids = self.partition_row_ids(part_idx).await?;
+            row_ids.sort_unstable();
+            row_ids.dedup();
+            // A row that straddles two joined partitions is reindexed by the first.
+            row_ids.retain(|row_id| !execution.reindexed_row_ids.contains(row_id));
+            execution.joined.push(part_idx);
+            execution.reindexed_row_ids.extend(row_ids.iter().copied());
+            let Some((row_ids, vectors)) = self.load_raw_vectors(&row_ids).await? else {
                 continue;
             };
             assert_eq!(row_ids.len(), vectors.len());
             let c0 = ivf
                 .centroid(part_idx)
                 .ok_or(Error::invalid_input("original centroid not found"))?;
-            let (reassign_part_ids, reassign_part_centroids) =
+            let (window_ids, window_centroids) =
                 self.select_reassign_candidates(ivf, part_idx, &c0, &removed)?;
 
-            // Only the vectors this partition held move; the rest of a
-            // multivector row stays where it is, so entries are conserved and
-            // the room and byte accounting see the same units as the planner.
-            let mut provenance_centroids = None;
-            let mut held = Vec::with_capacity(row_ids.len());
-            let mut start = 0;
-            while start < row_ids.len() {
-                let row_id = row_ids.value(start);
-                let mut end = start + 1;
-                while end < row_ids.len() && row_ids.value(end) == row_id {
-                    end += 1;
-                }
-                let count = entries_per_row.get(&row_id).copied().unwrap_or(0);
-                if end - start <= count {
-                    held.extend(start..end);
-                } else {
-                    let centroids = match &provenance_centroids {
-                        Some(centroids) => centroids,
-                        None => {
-                            provenance_centroids.insert(self.provenance_centroids(ivf, part_idx)?)
-                        }
-                    };
-                    held.extend(vectors_held_by_partition::<T>(
-                        self.distance_type,
-                        &vectors,
-                        start..end,
-                        centroids,
-                        count,
-                    )?);
-                }
-                start = end;
-            }
-
-            let mut assign_ops = vec![Vec::new(); kept_partitions.len()];
+            let mut assign_ops: BTreeMap<u32, Vec<AssignOp>> = BTreeMap::new();
             let mut overflowed = 0usize;
-            for i in held {
-                let row_id = row_ids.value(i);
+            for i in 0..row_ids.len() {
                 let (target, had_room) = choose_join_destination(
                     self.distance_type,
                     vectors.value(i).as_primitive::<T>(),
-                    &reassign_part_ids,
-                    &reassign_part_centroids,
+                    &window_ids,
+                    &window_centroids,
                     ivf,
                     &removed,
                     room,
@@ -2710,38 +2642,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 } else {
                     overflowed += 1;
                 }
-                let output = output_partition[target as usize].ok_or_else(|| {
-                    Error::internal(format!(
-                        "partition {target} is being joined away but was selected to receive vectors of partition {part_idx}"
-                    ))
-                })?;
-                assign_ops[output].push(AssignOp::Add((row_id, vectors.value(i))));
+                assign_ops
+                    .entry(target)
+                    .or_default()
+                    .push(AssignOp::Add((row_ids.value(i), vectors.value(i))));
             }
             if overflowed > 0 {
                 log::warn!(
                     "{overflowed} rows of joined partition {part_idx} found no partition below the split threshold and went to the nearest full one"
                 );
             }
-            let batches = Self::build_assign_batch::<T>(&transformer, &vector_field, &assign_ops)?;
-            for (output, batch) in batches.into_iter().enumerate() {
-                if let Some(batch) = batch {
-                    assigned[output].push(batch);
-                }
+            // Quantize now, under the old centroid numbering (a code depends on
+            // the centroid, not on its index), so only this partition's raw
+            // vectors are in memory and the retained size is what it will be.
+            for (target, ops) in assign_ops {
+                let batch =
+                    Self::build_assign_batch::<T>(&transformer, &vector_field, target, &ops)?;
+                retained_bytes = retained_bytes.saturating_add(batch.get_array_memory_size());
+                execution
+                    .assigned
+                    .entry(target as usize)
+                    .or_default()
+                    .push(batch);
             }
         }
-
-        let empty_deleted = UInt64Array::from(Vec::<u64>::new());
-        assigned
-            .into_iter()
-            .map(|mut batches| {
-                let batch = match batches.len() {
-                    0 => return Ok(None),
-                    1 => batches.pop().unwrap(),
-                    _ => arrow::compute::concat_batches(&batches[0].schema(), &batches)?,
-                };
-                Ok(Some((batch, empty_deleted.clone())))
-            })
-            .collect()
+        Ok(execution)
     }
 
     /// The IVF + quantizer transform that turns reassigned rows into index rows
@@ -2787,35 +2712,28 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok((transformer, vector_field))
     }
 
-    /// Quantize the rows of `assign_ops` into one batch per output partition,
-    /// `None` where a partition receives no rows.
+    /// Quantize `ops`, all bound for partition `part_id` of the transformer's
+    /// centroids, into one index batch.
     fn build_assign_batch<T: ArrowPrimitiveType>(
         transformer: &IvfTransformer,
         vector_field: &Field,
-        assign_ops: &[Vec<AssignOp>],
-    ) -> Result<Vec<Option<RecordBatch>>> {
+        part_id: u32,
+        ops: &[AssignOp],
+    ) -> Result<RecordBatch> {
         let dimension = infer_vector_dim(vector_field.data_type())?;
-        let num_rows: usize = assign_ops.iter().map(|ops| ops.len()).sum();
+        let num_rows = ops.len();
 
         // build the input batch with schema | row_id | vector | part_id |
         let mut row_ids_builder = UInt64Builder::with_capacity(num_rows);
         let mut vector_builder = PrimitiveBuilder::<T>::with_capacity(num_rows * dimension);
-        let mut part_ids_builder = UInt32Builder::with_capacity(num_rows);
-
-        let mut counts = Vec::with_capacity(assign_ops.len());
-        for (part_idx, ops) in assign_ops.iter().enumerate() {
-            for AssignOp::Add((row_id, vector)) in ops {
-                row_ids_builder.append_value(*row_id);
-                vector_builder.append_array(vector.as_primitive::<T>());
-                part_ids_builder.append_value(part_idx as u32);
-            }
-            counts.push(ops.len());
+        for AssignOp::Add((row_id, vector)) in ops {
+            row_ids_builder.append_value(*row_id);
+            vector_builder.append_array(vector.as_primitive::<T>());
         }
-
         let row_ids = row_ids_builder.finish();
         let vector =
             FixedSizeListArray::try_new_from_values(vector_builder.finish(), dimension as i32)?;
-        let part_ids = part_ids_builder.finish();
+        let part_ids = UInt32Array::from(vec![part_id; num_rows]);
         let schema = arrow_schema::Schema::new(vec![
             ROW_ID_FIELD.clone(),
             vector_field.clone(),
@@ -2825,19 +2743,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             Arc::new(schema),
             vec![Arc::new(row_ids), Arc::new(vector), Arc::new(part_ids)],
         )?;
-        let batch = transformer.transform(&batch)?;
-
-        let mut results = Vec::with_capacity(assign_ops.len());
-        let mut offset = 0;
-        for count in counts {
-            if count == 0 {
-                results.push(None);
-            } else {
-                results.push(Some(batch.slice(offset, count)));
-                offset += count;
-            }
-        }
-        Ok(results)
+        transformer.transform(&batch)
     }
 
     async fn partition_row_ids(&self, part_idx: usize) -> Result<Vec<u64>> {
@@ -2975,9 +2881,9 @@ fn plan_partition_adjustment(
                 continue;
             }
             let num_rows = partition_sizes[partition];
+            let row_bytes = num_rows.saturating_mul(join_bytes_per_row);
             if joins.len() == max_joins
-                || (!joins.is_empty()
-                    && joined_bytes + num_rows * join_bytes_per_row > JOIN_BYTES_BUDGET)
+                || (!joins.is_empty() && joined_bytes.saturating_add(row_bytes) > JOIN_BYTES_BUDGET)
             {
                 break 'rounds;
             }
@@ -2997,7 +2903,7 @@ fn plan_partition_adjustment(
             projected_sizes[destination] += projected_sizes[partition];
             projected_sizes[partition] = 0;
             removed[partition] = true;
-            joined_bytes += num_rows * join_bytes_per_row;
+            joined_bytes = joined_bytes.saturating_add(row_bytes);
             joins.push(partition);
             progress = true;
         }
@@ -3039,39 +2945,6 @@ fn nearest_surviving_neighbor(
     let nearest = ids.first().map(|&id| id as usize);
     *cache = Some(ids);
     Ok(nearest)
-}
-
-/// Which `count` of a multivector row's `vectors[range]` a partition held.
-/// The index placed every vector with its nearest centroid, so they are the
-/// ones for which this centroid (first in `provenance_centroids`) beats the
-/// nearest neighbors (the rest) by the largest margin.
-fn vectors_held_by_partition<T: ArrowPrimitiveType>(
-    distance_type: DistanceType,
-    vectors: &FixedSizeListArray,
-    range: std::ops::Range<usize>,
-    provenance_centroids: &FixedSizeListArray,
-    count: usize,
-) -> Result<Vec<usize>>
-where
-    T::Native: Dot + L2 + Normalize,
-{
-    let mut margins = Vec::with_capacity(range.len());
-    for i in range {
-        let dists = distance_type.arrow_batch_func()(
-            vectors.value(i).as_primitive::<T>(),
-            provenance_centroids,
-        )?;
-        let own = dists.value(0);
-        let nearest_neighbor = dists.values()[1..]
-            .iter()
-            .copied()
-            .fold(f32::INFINITY, f32::min);
-        margins.push((own - nearest_neighbor, i));
-    }
-    margins.sort_by(|(a, i), (b, j)| a.total_cmp(b).then(i.cmp(j)));
-    let mut held: Vec<usize> = margins.into_iter().take(count).map(|(_, i)| i).collect();
-    held.sort_unstable();
-    Ok(held)
 }
 
 /// The candidate nearest to `vector` among those `accept` allows.
@@ -3186,12 +3059,36 @@ fn select_reassign_candidates_impl(
     ))
 }
 
-/// The rows of one partition, flattened to one row id per vector, with the
-/// number of entries the partition held for each row.
-struct PartitionRows {
-    row_ids: UInt64Array,
-    vectors: FixedSizeListArray,
-    entries_per_row: HashMap<u64, usize>,
+/// What a join pass produced, in old partition ids.
+#[derive(Default)]
+struct JoinExecution {
+    /// Quantized rows per destination partition.
+    assigned: HashMap<usize, Vec<RecordBatch>>,
+    /// Partitions actually joined away, in plan order.
+    joined: Vec<usize>,
+    /// Logical rows whose vectors were all reindexed.
+    reindexed_row_ids: HashSet<u64>,
+}
+
+/// Bytes per row of an index batch with these quantizer output `fields`, plus
+/// the row id and the partition id.
+fn retained_bytes_per_row(fields: &[Field]) -> Result<usize> {
+    fn width(data_type: &DataType) -> Result<usize> {
+        match data_type {
+            DataType::FixedSizeList(inner, len) => {
+                Ok(width(inner.data_type())?.saturating_mul(usize::try_from(*len).unwrap_or(0)))
+            }
+            DataType::Boolean => Ok(1),
+            other => other.primitive_width().ok_or_else(|| {
+                Error::invalid_input(format!("cannot size a {other} column for the join budget"))
+            }),
+        }
+    }
+    fields
+        .iter()
+        .try_fold(size_of::<u64>() + size_of::<u32>(), |bytes, field| {
+            Ok(bytes.saturating_add(width(field.data_type())?))
+        })
 }
 
 /// What one optimize pass does to the partitions, from the sizes it saw.
@@ -3202,10 +3099,12 @@ struct PartitionAdjustmentPlan {
 }
 
 struct JoinResult {
-    assign_batches: Vec<Option<(RecordBatch, UInt64Array)>>,
+    assign_batches: Vec<Option<RecordBatch>>,
     new_centroids: FixedSizeListArray,
     /// Old ids of the partitions that survive, in output order.
     kept_partitions: Vec<usize>,
+    /// Logical rows the join reindexed; their old entries leave every partition.
+    reindexed_row_ids: Arc<HashSet<u64>>,
 }
 
 struct SplitResult {
@@ -3228,8 +3127,12 @@ enum PartitionAdjustment {
         split_shuffle_reader: Arc<dyn ShuffleReader>,
     },
     /// Join partitions away; `kept_partitions[i]` is the old id of output
-    /// partition `i`.
-    Join { kept_partitions: Vec<usize> },
+    /// partition `i`, and every entry of a row in `reindexed_row_ids` is
+    /// dropped from the existing partitions before the assign batches are added.
+    Join {
+        kept_partitions: Vec<usize>,
+        reindexed_row_ids: Arc<HashSet<u64>>,
+    },
 }
 
 impl std::fmt::Debug for PartitionAdjustment {
@@ -3242,9 +3145,13 @@ impl std::fmt::Debug for PartitionAdjustment {
                 .debug_struct("Split")
                 .field("affected_partitions", affected_partitions)
                 .finish(),
-            Self::Join { kept_partitions } => f
+            Self::Join {
+                kept_partitions,
+                reindexed_row_ids,
+            } => f
                 .debug_struct("Join")
                 .field("kept_partitions", &kept_partitions.len())
+                .field("reindexed_rows", &reindexed_row_ids.len())
                 .finish(),
         }
     }
@@ -4190,6 +4097,31 @@ mod tests {
         let (_, joins) =
             plan_partition_adjustment(&ivf, DistanceType::L2, &[66; 4], 4096, 1).unwrap();
         assert_eq!(joins.len(), 3, "{joins:?}");
+    }
+
+    #[test]
+    fn retained_bytes_per_row_counts_every_quantizer_column() {
+        // The columns RaBitQ emits for an 8-dimensional 5-bit index: one
+        // binary-code byte, five f32 factors and 32 extra-code bytes, plus the
+        // row id and the partition id.
+        let u8_list = |name: &str, len: i32| {
+            Field::new(
+                name,
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt8, true)), len),
+                true,
+            )
+        };
+        let f32_field = |name: &str| Field::new(name, DataType::Float32, true);
+        let fields = vec![
+            u8_list("code", 1),
+            f32_field("add"),
+            f32_field("scale"),
+            f32_field("error"),
+            u8_list("ex_code", 32),
+            f32_field("ex_add"),
+            f32_field("ex_scale"),
+        ];
+        assert_eq!(retained_bytes_per_row(&fields).unwrap(), 65);
     }
 
     #[test]
