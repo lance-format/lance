@@ -7,7 +7,7 @@
 //! update version for each row in a Lance dataset, enabling efficient
 //! cross-version diff operations.
 
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use lance_core::Error;
 use lance_core::Result;
@@ -59,6 +59,136 @@ pub struct RowDatasetVersionSequence {
     pub runs: Vec<RowDatasetVersionRun>,
 }
 
+/// A reusable cursor for reading ranges from a version sequence in one pass.
+///
+/// The cursor caches the current run length. Readers normally request adjacent
+/// batches, so this avoids rebuilding all run offsets and rescanning the run
+/// prefix for every batch. A backwards selection lazily builds a run-offset
+/// index. Once built, non-adjacent selections use it in either direction.
+#[derive(Debug, Default)]
+pub(crate) struct RowDatasetVersionCursor {
+    run_index: usize,
+    offset_in_run: usize,
+    position: usize,
+    run_len: Option<usize>,
+    run_offsets: Option<Vec<usize>>,
+    indexed_total_len: usize,
+    #[cfg(test)]
+    indexed_seek_count: usize,
+}
+
+impl RowDatasetVersionCursor {
+    fn seek_indexed(
+        &mut self,
+        sequence: &RowDatasetVersionSequence,
+        position: usize,
+    ) -> Result<()> {
+        if self.run_offsets.is_none() {
+            let mut total_len = 0;
+            let run_offsets = sequence
+                .runs
+                .iter()
+                .map(|run| {
+                    let offset = total_len;
+                    total_len += run.len();
+                    offset
+                })
+                .collect();
+            self.run_offsets = Some(run_offsets);
+            self.indexed_total_len = total_len;
+        }
+
+        if position >= self.indexed_total_len {
+            return Err(Error::internal(format!(
+                "version column position {} out of range (total_len={})",
+                position, self.indexed_total_len
+            )));
+        }
+
+        let run_offsets = self.run_offsets.as_ref().unwrap();
+        let mut run_index = match run_offsets.binary_search(&position) {
+            Ok(run_index) => run_index,
+            Err(run_index) => run_index - 1,
+        };
+        while run_index + 1 < run_offsets.len() && run_offsets[run_index + 1] <= position {
+            run_index += 1;
+        }
+        self.run_index = run_index;
+        self.offset_in_run = position - run_offsets[run_index];
+        self.position = position;
+        self.run_len = None;
+        #[cfg(test)]
+        {
+            self.indexed_seek_count += 1;
+        }
+        Ok(())
+    }
+
+    fn current_run<'a>(
+        &mut self,
+        sequence: &'a RowDatasetVersionSequence,
+    ) -> Option<(&'a RowDatasetVersionRun, usize)> {
+        loop {
+            let run = sequence.runs.get(self.run_index)?;
+            let run_len = *self.run_len.get_or_insert_with(|| match &run.span {
+                // Version runs are normally positional ranges. Keep this hot
+                // path local instead of using the general segment length path.
+                U64Segment::Range(range) => (range.end - range.start) as usize,
+                span => span.len(),
+            });
+            if self.offset_in_run < run_len {
+                return Some((run, run_len));
+            }
+            self.run_index += 1;
+            self.offset_in_run = 0;
+            self.run_len = None;
+        }
+    }
+
+    /// Append the versions in `selection` to `versions`.
+    pub(crate) fn extend_range(
+        &mut self,
+        sequence: &RowDatasetVersionSequence,
+        selection: Range<usize>,
+        versions: &mut Vec<u64>,
+    ) -> Result<()> {
+        if selection.is_empty() {
+            return Ok(());
+        }
+        if selection.start < self.position
+            || (self.run_offsets.is_some() && selection.start != self.position)
+        {
+            self.seek_indexed(sequence, selection.start)?;
+        }
+
+        while self.position < selection.start {
+            let Some((_, run_len)) = self.current_run(sequence) else {
+                return Err(Error::internal(format!(
+                    "version column position {} out of range (total_len={})",
+                    selection.start, self.position
+                )));
+            };
+            let advance = (selection.start - self.position).min(run_len - self.offset_in_run);
+            self.offset_in_run += advance;
+            self.position += advance;
+        }
+
+        while self.position < selection.end {
+            let Some((run, run_len)) = self.current_run(sequence) else {
+                return Err(Error::internal(format!(
+                    "version column position {} out of range (total_len={})",
+                    self.position, self.position
+                )));
+            };
+            let count = (selection.end - self.position).min(run_len - self.offset_in_run);
+            versions.extend(std::iter::repeat_n(run.version(), count));
+            self.offset_in_run += count;
+            self.position += count;
+        }
+        Ok(())
+    }
+}
+
 impl RowDatasetVersionSequence {
     /// Create a new empty version sequence
     pub fn new() -> Self {
@@ -90,6 +220,11 @@ impl RowDatasetVersionSequence {
     /// Returns a forward iterator over versions, expanding runs lazily.
     pub fn versions(&self) -> VersionsIter<'_> {
         VersionsIter::new(&self.runs)
+    }
+
+    /// Create a reusable cursor for sequential range reads.
+    pub(crate) fn cursor(&self) -> RowDatasetVersionCursor {
+        RowDatasetVersionCursor::default()
     }
 
     /// Random access: get the version at global row position `index`.
@@ -709,5 +844,143 @@ mod tests {
         assert_eq!(seq.get_version_for_row_id(&rows, 12), Some(9));
         assert_eq!(seq.get_version_for_row_id(&rows, 13), Some(9));
         assert_eq!(seq.get_version_for_row_id(&rows, 99), None);
+    }
+
+    #[test]
+    fn test_version_cursor_ranges_gaps_and_rewind() {
+        let seq = RowDatasetVersionSequence {
+            runs: vec![
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..3),
+                    version: 10,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(3..3),
+                    version: 99,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(3..5),
+                    version: 20,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(5..9),
+                    version: 30,
+                },
+            ],
+        };
+        let expected = [10, 10, 10, 20, 20, 30, 30, 30, 30];
+        let mut cursor = seq.cursor();
+        let mut actual = Vec::new();
+
+        cursor.extend_range(&seq, 0..2, &mut actual).unwrap();
+        cursor.extend_range(&seq, 2..5, &mut actual).unwrap();
+        cursor.extend_range(&seq, 7..9, &mut actual).unwrap();
+        assert_eq!(actual, [10, 10, 10, 20, 20, 30, 30]);
+
+        actual.clear();
+        cursor.extend_range(&seq, 1..6, &mut actual).unwrap();
+        assert_eq!(actual, expected[1..6]);
+
+        cursor.extend_range(&seq, 6..6, &mut actual).unwrap();
+        assert_eq!(actual, expected[1..6]);
+    }
+
+    #[test]
+    fn test_version_cursor_descending_ranges_use_indexed_seek() {
+        const RUNS: usize = 10_000;
+        let seq = RowDatasetVersionSequence {
+            runs: (0..RUNS)
+                .map(|position| RowDatasetVersionRun {
+                    span: U64Segment::Range(position as u64..position as u64 + 1),
+                    version: position as u64,
+                })
+                .collect(),
+        };
+        let mut cursor = seq.cursor();
+        let mut actual = Vec::with_capacity(RUNS);
+
+        for position in (0..RUNS).rev() {
+            cursor
+                .extend_range(&seq, position..position + 1, &mut actual)
+                .unwrap();
+        }
+
+        assert_eq!(actual, (0..RUNS as u64).rev().collect::<Vec<_>>());
+        assert_eq!(cursor.run_offsets.as_ref().unwrap().len(), RUNS);
+    }
+
+    #[test]
+    fn test_version_cursor_alternating_ranges_use_indexed_seek_both_directions() {
+        const RUNS: usize = 10_000;
+        let seq = RowDatasetVersionSequence {
+            runs: (0..RUNS)
+                .map(|position| RowDatasetVersionRun {
+                    span: U64Segment::Range(position as u64..position as u64 + 1),
+                    version: position as u64,
+                })
+                .collect(),
+        };
+        let mut cursor = seq.cursor();
+        let mut actual = Vec::with_capacity(RUNS);
+
+        for selection_index in 0..RUNS {
+            let position = if selection_index % 2 == 0 {
+                RUNS - 1
+            } else {
+                0
+            };
+            cursor
+                .extend_range(&seq, position..position + 1, &mut actual)
+                .unwrap();
+        }
+
+        let expected = (0..RUNS)
+            .map(|selection_index| {
+                if selection_index % 2 == 0 {
+                    (RUNS - 1) as u64
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(cursor.run_offsets.as_ref().unwrap().len(), RUNS);
+        assert_eq!(cursor.indexed_seek_count, RUNS - 1);
+    }
+
+    #[test]
+    fn test_version_cursor_reports_out_of_bounds() {
+        let seq = RowDatasetVersionSequence::from_uniform_row_count(4, 7);
+        let mut cursor = seq.cursor();
+        let mut actual = Vec::new();
+        let error = cursor.extend_range(&seq, 4..5, &mut actual).unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("position 4 out of range (total_len=4)")
+        );
+        assert!(actual.is_empty());
+    }
+
+    #[test]
+    fn test_version_cursor_non_range_span() {
+        let non_range_span = U64Segment::from_slice(&[0, 2, 4, 6, 8]);
+        assert!(!matches!(non_range_span, U64Segment::Range(_)));
+        let seq = RowDatasetVersionSequence {
+            runs: vec![
+                RowDatasetVersionRun {
+                    span: non_range_span,
+                    version: 4,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..3),
+                    version: 8,
+                },
+            ],
+        };
+        let mut actual = Vec::new();
+        seq.cursor().extend_range(&seq, 0..8, &mut actual).unwrap();
+        assert_eq!(actual, [4, 4, 4, 4, 4, 8, 8, 8]);
     }
 }

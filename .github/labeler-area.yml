@@ -29,22 +29,40 @@ A-encoding:
           - "rust/lance-io/**"
           - "rust/lance-file/**"
 
-# On-disk format: the proto definitions and the format spec docs. Format docs
+# On-disk format: persisted proto definitions and the format spec docs. Keep the
+# explicit proto lists here in sync. Execution-plan schemas (ann,
+# filtered_read, and table_identifier) are intentionally excluded. Format docs
 # are excluded from A-docs (see below) so format changes get A-format only.
 A-format:
   - changed-files:
       - any-glob-to-any-file:
-          - "protos/**"
+          - "protos/encodings_v2_0.proto"
+          - "protos/encodings_v2_1.proto"
+          - "protos/file.proto"
+          - "protos/file2.proto"
+          - "protos/index.proto"
+          - "protos/index_old.proto"
+          - "protos/rowids.proto"
+          - "protos/table.proto"
+          - "protos/transaction.proto"
           - "docs/src/format/**"
 
 # Drives the format-spec vote gate (.github/workflows/format-vote-gate.yml):
-# any change to the proto definitions or the spec docs requires a PMC vote.
-# Scoped to *.proto (not e.g. protos/AGENTS.md) since only the IDL and spec are
-# the format. A PMC member waives a trivial edit with the `format-waived` label.
+# any change to persisted proto definitions or the spec docs requires a PMC
+# vote. Execution-only wire schemas such as filtered_read.proto are not format
+# changes. A PMC member waives a trivial edit with the `format-waived` label.
 format-change:
   - changed-files:
       - any-glob-to-any-file:
-          - "protos/**/*.proto"
+          - "protos/encodings_v2_0.proto"
+          - "protos/encodings_v2_1.proto"
+          - "protos/file.proto"
+          - "protos/file2.proto"
+          - "protos/index.proto"
+          - "protos/index_old.proto"
+          - "protos/rowids.proto"
+          - "protos/table.proto"
+          - "protos/transaction.proto"
           - "docs/src/format/**"
 
 # Lockfiles are intentionally not excluded: a pure dependency bump gets both

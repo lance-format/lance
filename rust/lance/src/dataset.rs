@@ -69,6 +69,8 @@ pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
+mod data_file;
+mod data_file_part;
 pub mod delta;
 pub mod files;
 pub mod fragment;
@@ -113,6 +115,9 @@ pub mod updater;
 mod utils;
 pub(crate) mod versions;
 pub mod write;
+
+pub use data_file::DataFileTarget;
+pub use data_file_part::DataFilePart;
 
 pub(crate) use take::row_offsets_to_row_addresses;
 
@@ -832,17 +837,19 @@ impl Dataset {
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let transaction: Transaction =
-                lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
-
-            let metadata_cache = session.metadata_cache.for_dataset(uri);
-            let metadata_key = TransactionKey {
-                version: manifest_location.version,
-                e_tag: manifest_location.e_tag.as_deref(),
-            };
-            metadata_cache
-                .insert_with_key(&metadata_key, Arc::new(transaction))
-                .await;
+            if let (Some(transaction), Some(e_tag)) = (
+                decode_inline_transaction(message_data, manifest_location.version),
+                manifest_location.e_tag.as_deref(),
+            ) {
+                let metadata_cache = session.metadata_cache.for_dataset(uri);
+                let metadata_key = TransactionKey {
+                    version: manifest_location.version,
+                    e_tag: Some(e_tag),
+                };
+                metadata_cache
+                    .insert_with_key(&metadata_key, Arc::new(transaction))
+                    .await;
+            }
         }
 
         populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
@@ -1243,9 +1250,14 @@ impl Dataset {
     /// If there was no transaction file written for this version of the dataset
     /// then this will return None.
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
+        let Some(e_tag) = self.manifest_location.e_tag.as_deref() else {
+            return self
+                .read_transaction_from_storage(&self.manifest, &self.manifest_location)
+                .await;
+        };
         let transaction_key = TransactionKey {
             version: self.manifest.version,
-            e_tag: self.manifest_location.e_tag.as_deref(),
+            e_tag: Some(e_tag),
         };
         if let Some(transaction) = self.metadata_cache.get_with_key(&transaction_key).await {
             return Ok(Some((*transaction).clone()));
@@ -3017,7 +3029,7 @@ impl Dataset {
             let mut live_ids = Vec::with_capacity(ids.len());
             let mut addresses = Vec::with_capacity(ids.len());
             for id in ids {
-                if let Some(address) = row_id_index.get(*id) {
+                if let Some(address) = row_id_index.get(*id)? {
                     live_ids.push(*id);
                     addresses.push(u64::from(address));
                 }
@@ -3570,39 +3582,44 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
             // `checkout_manifest` below, but `tx_key` (borrowing the e-tag)
             // is still alive at the `insert_with_key` call after that move.
             let location_e_tag = location.e_tag.clone();
-            let tx_key = TransactionKey {
+            let tx_key = location_e_tag.as_deref().map(|e_tag| TransactionKey {
                 version: manifest.version,
-                e_tag: location_e_tag.as_deref(),
+                e_tag: Some(e_tag),
+            });
+            let cached = match tx_key.as_ref() {
+                Some(tx_key) => dataset.metadata_cache.get_with_key(tx_key).await,
+                None => None,
             };
-            let transaction =
-                if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
-                    cached
-                } else {
-                    let dataset_version = Dataset::checkout_manifest(
-                        dataset.object_store.clone(),
-                        dataset.base.clone(),
-                        dataset.uri.clone(),
-                        manifest_copy.clone(),
-                        location,
-                        dataset.session(),
-                        dataset.commit_handler.clone(),
-                        dataset.file_reader_options.clone(),
-                        dataset.store_params.as_deref().cloned(),
-                        dataset.base_store_params.clone(),
-                    )?;
-                    let loaded =
-                        Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
-                            Error::internal(format!(
-                                "Dataset version {} does not have a transaction file",
-                                manifest_copy.version
-                            ))
-                        })?);
+            let transaction = if let Some(cached) = cached {
+                cached
+            } else {
+                let dataset_version = Dataset::checkout_manifest(
+                    dataset.object_store.clone(),
+                    dataset.base.clone(),
+                    dataset.uri.clone(),
+                    manifest_copy.clone(),
+                    location,
+                    dataset.session(),
+                    dataset.commit_handler.clone(),
+                    dataset.file_reader_options.clone(),
+                    dataset.store_params.as_deref().cloned(),
+                    dataset.base_store_params.clone(),
+                )?;
+                let loaded =
+                    Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
+                        Error::internal(format!(
+                            "Dataset version {} does not have a transaction file",
+                            manifest_copy.version
+                        ))
+                    })?);
+                if let Some(tx_key) = tx_key.as_ref() {
                     dataset
                         .metadata_cache
-                        .insert_with_key(&tx_key, loaded.clone())
+                        .insert_with_key(tx_key, loaded.clone())
                         .await;
-                    loaded
-                };
+                }
+                loaded
+            };
             Ok((manifest.version, transaction))
         })
         .try_buffer_unordered(io_parallelism / 2);
@@ -4113,6 +4130,31 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
+        }
+    }
+}
+
+/// Decode an inline transaction section for opportunistic caching.
+///
+/// Returns `None` instead of failing when the transaction cannot be decoded:
+/// the section may have been written by a newer version of Lance with an
+/// operation type this version does not know, and that must not prevent
+/// opening the dataset. Paths that need the transaction contents surface the
+/// error at their call sites instead.
+fn decode_inline_transaction(message_data: &[u8], version: u64) -> Option<Transaction> {
+    match lance_table::format::pb::Transaction::decode(message_data)
+        .map_err(Error::from)
+        .and_then(Transaction::try_from)
+    {
+        Ok(transaction) => Some(transaction),
+        Err(err) => {
+            log::warn!(
+                "Failed to decode the inline transaction of version {}; \
+                 it may have been written by a newer version of Lance: {}",
+                version,
+                err
+            );
+            None
         }
     }
 }

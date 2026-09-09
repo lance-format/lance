@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import json
 import logging
 import os
 import platform
@@ -1191,10 +1192,10 @@ def test_create_ivf_rq_index():
         "vector",
         index_type="IVF_RQ",
         num_partitions=4,
-        num_bits=1,
     )
     assert ds.describe_indices()[0].field_names == ["vector"]
     stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["sub_index"]["num_bits"] == 5
     assert stats["indices"][0]["sub_index"]["packed"] is True
 
     with pytest.raises(
@@ -1232,6 +1233,13 @@ def test_create_ivf_rq_index():
     assert res.num_rows == 10
     assert res["_distance"].to_numpy().min() == 0.0
     assert res["_distance"].to_numpy().max() == 0.0
+
+
+def test_build_rq_model_default_num_bits():
+    from lance.lance import indices
+
+    model = json.loads(indices.build_rq_model(dimension=8))
+    assert model["num_bits"] == 5
 
 
 def test_create_ivf_rq_skip_transpose():
@@ -2133,6 +2141,76 @@ def test_optimize_indices(indexed_dataset):
     assert stats["num_indices"] == 2
 
 
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_segment_ownership_filter_precedes_partition_topk(
+    tmp_path, enable_stable_row_ids
+):
+    ndim = 4
+
+    def table(ids, value):
+        vectors = np.full((len(ids), ndim), value, dtype=np.float32)
+        return pa.table(
+            {
+                "id": pa.array(ids, type=pa.int64()),
+                "vector": pa.FixedSizeListArray.from_arrays(
+                    pa.array(vectors.reshape(-1), type=pa.float32()), ndim
+                ),
+            }
+        )
+
+    dataset = lance.write_dataset(
+        table(range(20), 1.0),
+        tmp_path,
+        mode="create",
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    dataset = lance.write_dataset(
+        table(range(100, 120), 0.0), dataset.uri, mode="append"
+    )
+    dataset = dataset.create_index(
+        "vector", index_type="IVF_FLAT", metric="l2", num_partitions=1
+    )
+
+    fragment = dataset.get_fragment(1)
+    row_ids = fragment.to_table(columns=["id"], with_row_id=True)["_rowid"].to_pylist()
+    update_data = pa.table(
+        {
+            "_rowid": pa.array(row_ids, type=pa.uint64()),
+            "vector": pa.array(
+                [[10.0] * ndim] * len(row_ids), type=pa.list_(pa.float32(), ndim)
+            ),
+        }
+    )
+    updated_fragment, fields_modified = fragment.update_columns(update_data)
+    dataset = lance.LanceDataset.commit(
+        dataset.uri,
+        lance.LanceOperation.Update(
+            updated_fragments=[updated_fragment], fields_modified=fields_modified
+        ),
+        read_version=dataset.version,
+    )
+    dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    dataset = lance.dataset(dataset.uri)
+
+    def assert_current_nearest_rows():
+        result = dataset.to_table(
+            columns=["id"],
+            nearest={
+                "column": "vector",
+                "q": np.zeros(ndim, dtype=np.float32),
+                "k": 5,
+            },
+        )
+
+        assert all(row_id < 20 for row_id in result["id"].to_pylist())
+        assert result["_distance"].to_pylist() == pytest.approx([4.0] * 5)
+
+    assert_current_nearest_rows()
+    dataset.optimize.optimize_indices(num_indices_to_merge=2)
+    dataset = lance.dataset(dataset.uri)
+    assert_current_nearest_rows()
+
+
 def test_no_stale_duplicate_after_partial_column_update(tmp_path):
     # Regression test: updating an indexed vector column in place (via the
     # low-level fragment.update_columns API + LanceOperation.Update) and then
@@ -2235,29 +2313,48 @@ def test_no_stale_duplicate_after_partial_column_update(tmp_path):
     assert res["id"].is_unique, f"duplicate ids in result: {res['id'].tolist()}"
 
 
-@pytest.mark.skip(reason="retrain is deprecated")
-def test_retrain_indices(indexed_dataset):
-    data = create_table()
-    indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
+@pytest.mark.parametrize("retrain", [None, False, True])
+def test_retrain_indices(tmp_path, retrain):
+    rng = np.random.default_rng(42)
+    ndim = 16
+    initial_vectors = rng.standard_normal((64, ndim), dtype=np.float32)
+    appended_vectors = rng.standard_normal((64, ndim), dtype=np.float32) + 100
+    old_centroid = np.full((1, ndim), -1000, dtype=np.float32)
+
+    indexed_dataset = lance.write_dataset(vec_to_table(initial_vectors), tmp_path)
+    indexed_dataset = indexed_dataset.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=1,
+        ivf_centroids=old_centroid,
+        index_file_version=IndexFileVersion.V3,
+    )
+    indexed_dataset = lance.write_dataset(
+        vec_to_table(appended_vectors), indexed_dataset.uri, mode="append"
+    )
+
     stats = indexed_dataset.stats.index_stats("vector_idx")
     assert stats["num_indices"] == 1
 
     indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
     stats = indexed_dataset.stats.index_stats("vector_idx")
     assert stats["num_indices"] == 2
+    assert all(
+        index["centroids"] == old_centroid.tolist() for index in stats["indices"]
+    )
 
+    kwargs = {} if retrain is None else {"retrain": retrain}
+    indexed_dataset.optimize.optimize_indices(**kwargs)
     stats = indexed_dataset.stats.index_stats("vector_idx")
-    centroids = stats["indices"][0]["centroids"]
-    delta_centroids = stats["indices"][1]["centroids"]
-    assert centroids == delta_centroids
-
-    indexed_dataset.optimize.optimize_indices(retrain=True)
-    new_centroids = indexed_dataset.stats.index_stats("vector_idx")["indices"][0][
-        "centroids"
-    ]
-    stats = indexed_dataset.stats.index_stats("vector_idx")
-    assert stats["num_indices"] == 1
-    assert centroids != new_centroids
+    centroids = [index["centroids"] for index in stats["indices"]]
+    if retrain:
+        expected_centroid = np.concatenate([initial_vectors, appended_vectors]).mean(
+            axis=0
+        )
+        assert stats["num_indices"] == 1
+        assert np.allclose(centroids[0][0], expected_centroid)
+    else:
+        assert all(centroid == old_centroid.tolist() for centroid in centroids)
 
 
 def test_no_include_deleted_rows(indexed_dataset):

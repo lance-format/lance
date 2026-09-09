@@ -1837,12 +1837,9 @@ impl ScalarIndexExpr {
                 search.exact_sargable_query_key()
             }
             Self::Not(inner) => match inner.as_ref() {
-                Self::Query(search)
-                    if matches!(
-                        search.exact_sargable_query(),
-                        Some(SargableQuery::Equals(value)) if !value.is_null()
-                    ) =>
-                {
+                // `NOT (predicate)` is NULL wherever the predicate is, so it
+                // cannot match a NULL row either, and `IS NOT NULL` adds nothing.
+                Self::Query(search) if search.is_null_intolerant_sargable_query() => {
                     search.exact_sargable_query_key()
                 }
                 _ => None,
@@ -5047,6 +5044,25 @@ mod tests {
                 if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
                     if matches!(search.sargable_query(), Some(SargableQuery::Equals(value))
                         if *value == ScalarValue::Int64(Some(5))))
+        ));
+    }
+
+    #[test]
+    fn test_optimize_parser_removes_is_not_null_from_not_in_list() {
+        let index_info = int64_index_info("BTree", false);
+
+        // The signed-zero rewrite turns `x != 0.0` into this shape, and it is just
+        // as null-intolerant as `x != 5`.
+        let leaves =
+            optimize_parsed_scalar_filter("x IS NOT NULL AND x NOT IN (1, 2)", &index_info);
+
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Not(inner)
+                if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
+                    if matches!(search.sargable_query(), Some(SargableQuery::IsIn(values))
+                        if values.len() == 2))
         ));
     }
 

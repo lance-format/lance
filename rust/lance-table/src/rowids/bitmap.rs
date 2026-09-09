@@ -10,7 +10,7 @@ pub struct Bitmap {
 }
 
 /// Set bits in `data`, counted a word at a time.
-fn count_ones(data: &[u8]) -> usize {
+pub(super) fn count_ones(data: &[u8]) -> usize {
     let mut words = data.chunks_exact(8);
     let full: usize = words
         .by_ref()
@@ -37,7 +37,7 @@ impl std::fmt::Debug for Bitmap {
 impl Bitmap {
     pub fn new_empty(len: usize) -> Self {
         let data = vec![0; len.div_ceil(8)];
-        Self { data, len }
+        Self::from_parts(data, len)
     }
 
     pub fn new_full(len: usize) -> Self {
@@ -52,7 +52,20 @@ impl Bitmap {
                 *last_byte &= !(1 << i);
             }
         }
+        Self::from_parts(data, len)
+    }
+
+    pub(crate) fn from_parts(data: Vec<u8>, len: usize) -> Self {
         Self { data, len }
+    }
+
+    #[inline]
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.data
     }
 
     pub fn set(&mut self, i: usize) {
@@ -212,6 +225,18 @@ mod tests {
             }
             assert_eq!(bitmap.count_ones(), len.div_ceil(3), "len {len}");
         }
+    }
+
+    #[test]
+    fn test_count_ones_tracks_direct_data_mutation() {
+        let mut bitmap = Bitmap::new_empty(16);
+        assert_eq!(bitmap.count_ones(), 0);
+
+        bitmap.data[0] = 0b1010_0101;
+        assert_eq!(bitmap.count_ones(), 4);
+
+        bitmap.data[1] = 0xff;
+        assert_eq!(bitmap.count_ones(), 12);
     }
 
     #[test]

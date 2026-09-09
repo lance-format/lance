@@ -1342,8 +1342,9 @@ where
             .as_any()
             .downcast_ref::<T::ArrayType>()
             .ok_or(Error::InvalidArgumentError(format!(
-                "Unsupported data type {:?}",
-                to.values().data_type()
+                "`to` values have data type {}, expected {} to match `from`",
+                to.values().data_type(),
+                from.data_type()
             )))?;
     let dists = cosine_distance_batch(from.as_slice(), to_values.as_slice(), dimension);
 
@@ -1382,7 +1383,7 @@ pub fn cosine_distance_arrow_batch(
             &to.convert_to_floating_point()?,
         ),
         _ => Err(Error::InvalidArgumentError(format!(
-            "Unsupported data type {:?}",
+            "`from` has unsupported data type {}",
             from.data_type()
         ))),
     }

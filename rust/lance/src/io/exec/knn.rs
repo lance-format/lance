@@ -56,7 +56,7 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
-use lance_select::RowAddrMask;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use tokio::sync::Notify;
@@ -1566,6 +1566,81 @@ struct LatePartitionSearchControl {
     seg_mask: Option<Arc<RowAddrMask>>,
 }
 
+/// A query prefilter restricted to the fragments owned by one physical index segment.
+///
+/// The shared dataset prefilter covers the union of every segment.  When an in-place
+/// update removes a fragment from an older segment's metadata, this additional mask
+/// keeps that segment's stale physical rows out of its local top-k.
+struct SegmentPreFilter {
+    base: Arc<DatasetPreFilter>,
+    ownership_mask: Arc<RowAddrMask>,
+    final_mask: Mutex<Option<Arc<RowAddrMask>>>,
+}
+
+impl SegmentPreFilter {
+    fn new(base: Arc<DatasetPreFilter>, ownership_mask: Arc<RowAddrMask>) -> Self {
+        Self {
+            base,
+            ownership_mask,
+            final_mask: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PreFilter for SegmentPreFilter {
+    async fn wait_for_ready(&self) -> Result<()> {
+        self.base.wait_for_ready().await?;
+        let mut final_mask = self.final_mask.lock().unwrap();
+        final_mask.get_or_insert_with(|| {
+            Arc::new(self.base.mask().as_ref().clone() & self.ownership_mask.as_ref().clone())
+        });
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn needs_partition_row_ids(&self) -> bool {
+        self.base.is_empty()
+    }
+
+    fn is_empty_for(&self, rows: &RowAddrTreeMap) -> bool {
+        self.base.is_empty() && self.ownership_mask.selects_all(rows)
+    }
+
+    fn mask(&self) -> Arc<RowAddrMask> {
+        self.final_mask
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("mask called without call to wait_for_ready")
+            .clone()
+    }
+
+    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        self.mask().selected_indices(row_ids)
+    }
+}
+
+async fn prefilter_for_segment(
+    dataset: Arc<Dataset>,
+    index: &IndexMetadata,
+    base: Arc<DatasetPreFilter>,
+) -> Result<Arc<dyn PreFilter>> {
+    let Some(owned_fragments) = index.fragment_bitmap.clone() else {
+        return Ok(base);
+    };
+    let Some(ownership_mask) =
+        DatasetPreFilter::create_restricted_deletion_mask(dataset, owned_fragments)
+    else {
+        return Ok(base);
+    };
+    let ownership_mask = ownership_mask.await?;
+    Ok(Arc::new(SegmentPreFilter::new(base, ownership_mask)))
+}
+
 impl PartitionSearchControl for LatePartitionSearchControl {
     fn should_stop(&self) -> bool {
         self.state.num_results_found.load(Ordering::Relaxed) >= self.max_results
@@ -1659,7 +1734,7 @@ impl ANNIvfSubIndexExec {
         index: Arc<dyn VectorIndex>,
         query: Query,
         part_id: usize,
-        pre_filter: Arc<DatasetPreFilter>,
+        pre_filter: Arc<dyn PreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         seg_mask: Option<Arc<RowAddrMask>>,
     ) -> DataFusionResult<RecordBatch> {
@@ -1701,7 +1776,8 @@ impl ANNIvfSubIndexExec {
         query: Query,
         partitions: Arc<UInt32Array>,
         q_c_dists: Arc<Float32Array>,
-        prefilter: Arc<DatasetPreFilter>,
+        prefilter: Arc<dyn PreFilter>,
+        global_prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
         target_partitions: usize,
@@ -1739,7 +1815,7 @@ impl ANNIvfSubIndexExec {
 
             // We know the prefilter should be ready at this point so we shouldn't
             // need to call wait_for_ready
-            let prefilter_mask = prefilter.mask();
+            let prefilter_mask = global_prefilter.mask();
 
             let max_results = prefilter_mask.max_len().map(|x| x as usize);
 
@@ -1879,7 +1955,7 @@ impl ANNIvfSubIndexExec {
         query: Query,
         partitions: Arc<UInt32Array>,
         q_c_dists: Arc<Float32Array>,
-        prefilter: Arc<DatasetPreFilter>,
+        prefilter: Arc<dyn PreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
         target_partitions: usize,
@@ -2116,6 +2192,13 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             }
             Arc::new(pf)
         };
+        let indices_by_uuid = Arc::new(
+            indices
+                .iter()
+                .cloned()
+                .map(|index| (index.uuid, index))
+                .collect::<HashMap<_, _>>(),
+        );
 
         let state = Arc::new(ANNIvfEarlySearchResults::new(indices.len(), query.k));
 
@@ -2127,12 +2210,24 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let column = column.clone();
                     let metrics = metrics.clone();
                     let pre_filter = pre_filter.clone();
+                    let indices_by_uuid = indices_by_uuid.clone();
                     let state = state.clone();
                     let segment_bitmaps = segment_bitmaps.clone();
                     let mut query = query.clone();
                     let pruned_nprobes = early_pruning(q_c_dists.values(), query.k);
                     adjust_probes(&mut query, pruned_nprobes);
                     async move {
+                        let index_metadata = indices_by_uuid.get(&index_uuid).ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "ANNSubIndexExec: input referenced unknown index segment {index_uuid}"
+                            ))
+                        })?;
+                        let segment_pre_filter = prefilter_for_segment(
+                            ds.clone(),
+                            index_metadata,
+                            pre_filter.clone(),
+                        )
+                        .await?;
                         let raw_index = ds
                             .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
                             .await?;
@@ -2165,7 +2260,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             query.clone(),
                             part_ids.clone(),
                             q_c_dists.clone(),
-                            pre_filter.clone(),
+                            segment_pre_filter.clone(),
                             metrics.clone(),
                             state.clone(),
                             target_partitions,
@@ -2176,6 +2271,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             query,
                             part_ids,
                             q_c_dists,
+                            segment_pre_filter,
                             pre_filter,
                             metrics,
                             state,
@@ -2455,8 +2551,8 @@ mod tests {
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
     use arrow::datatypes::Float32Type;
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
-        StructArray,
+        ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator,
+        RecordBatchReader, StringArray, StructArray,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use async_trait::async_trait;
@@ -2999,6 +3095,105 @@ mod tests {
         prefilter
     }
 
+    #[tokio::test]
+    async fn test_append_only_deltas_keep_empty_prefilter_fast_path() {
+        let first = lance_datagen::gen_batch()
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(4)),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+        let first_schema = first.schema();
+        let mut dataset = Dataset::write(first, "memory://", None).await.unwrap();
+        let first_version = dataset.manifest.version;
+        let first_fragments = dataset.fragment_bitmap.as_ref().clone();
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        let second = lance_datagen::gen_batch()
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(4)),
+            )
+            .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+        assert_eq!(second.schema(), first_schema);
+        dataset.append(second, None).await.unwrap();
+        let appended_fragments = dataset.fragment_bitmap.as_ref() - &first_fragments;
+        let dataset = Arc::new(dataset);
+        let old_segment = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![field_id],
+            covering_fields: vec![],
+            name: "vector_idx".to_string(),
+            dataset_version: first_version,
+            fragment_bitmap: Some(first_fragments.clone()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let new_segment = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![field_id],
+            covering_fields: vec![],
+            name: "vector_idx".to_string(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(appended_fragments.clone()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        assert!(
+            !appended_fragments.is_empty(),
+            "the append fixture must create at least one new fragment"
+        );
+        let base = Arc::new(DatasetPreFilter::new(
+            dataset.clone(),
+            &[old_segment.clone(), new_segment.clone()],
+            None,
+        ));
+        base.wait_for_ready().await.unwrap();
+        assert!(base.is_empty(), "the combined delta coverage is unfiltered");
+        let segment_prefilter = prefilter_for_segment(dataset.clone(), &old_segment, base)
+            .await
+            .unwrap();
+        segment_prefilter.wait_for_ready().await.unwrap();
+
+        assert!(
+            !segment_prefilter.is_empty(),
+            "the segment ownership restriction is not globally empty"
+        );
+        assert!(segment_prefilter.needs_partition_row_ids());
+        let old_partition_rows = first_fragments
+            .iter()
+            .flat_map(|fragment_id| {
+                (0..20_u64).map(move |offset| (u64::from(fragment_id) << 32) | offset)
+            })
+            .collect::<RowAddrTreeMap>();
+        assert!(
+            segment_prefilter.is_empty_for(&old_partition_rows),
+            "an append-only segment must preserve the unfiltered partition fast path"
+        );
+
+        let appended_fragment_id = appended_fragments.iter().next().unwrap();
+        let mut rows_with_unowned_entry = old_partition_rows;
+        rows_with_unowned_entry.insert(u64::from(appended_fragment_id) << 32);
+        assert!(!segment_prefilter.is_empty_for(&rows_with_unowned_entry));
+
+        let ordinary_base = Arc::new(
+            DatasetPreFilter::new(dataset, &[old_segment, new_segment], None)
+                .with_overlay_block(RowAddrMask::allow_nothing()),
+        );
+        let ordinary_segment =
+            SegmentPreFilter::new(ordinary_base, Arc::new(RowAddrMask::all_rows()));
+        assert!(
+            !ordinary_segment.needs_partition_row_ids(),
+            "a user filter cannot take the no-filter fast path, so partition coverage is unused"
+        );
+    }
+
     fn prepared_metrics() -> Arc<AnnIndexMetrics> {
         Arc::new(AnnIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0))
     }
@@ -3200,12 +3395,14 @@ mod tests {
             .unwrap(),
         );
 
+        let prefilter = empty_prefilter().await;
         let batches = ANNIvfSubIndexExec::late_search(
             index,
             query,
             Arc::new(UInt32Array::from(vec![0, 1, 2])),
             Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3])),
-            empty_prefilter().await,
+            prefilter.clone(),
+            prefilter,
             prepared_metrics(),
             state.clone(),
             usize::MAX,
@@ -3313,12 +3510,14 @@ mod tests {
             "unowned rows must not take up the initial result budget"
         );
 
+        let prefilter = empty_prefilter().await;
         let late = ANNIvfSubIndexExec::late_search(
             index,
             query,
             partitions,
             q_c_dists,
-            empty_prefilter().await,
+            prefilter.clone(),
+            prefilter,
             prepared_metrics(),
             state.clone(),
             usize::MAX,
@@ -3390,12 +3589,14 @@ mod tests {
         .await
         .unwrap();
 
+        let prefilter = empty_prefilter().await;
         let late = ANNIvfSubIndexExec::late_search(
             index,
             query,
             partitions,
             q_c_dists,
-            empty_prefilter().await,
+            prefilter.clone(),
+            prefilter,
             prepared_metrics(),
             state.clone(),
             usize::MAX,
@@ -3428,6 +3629,7 @@ mod tests {
             Arc::new(UInt32Array::from(vec![0])),
             Arc::new(Float32Array::from(vec![0.1])),
             prefilter.clone(),
+            prefilter.clone(),
             prepared_metrics(),
             state.clone(),
             usize::MAX,
@@ -3445,6 +3647,7 @@ mod tests {
             query_b,
             Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
             Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3, 0.4])),
+            prefilter.clone(),
             prefilter,
             prepared_metrics(),
             state,

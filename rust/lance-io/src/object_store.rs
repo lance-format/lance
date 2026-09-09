@@ -880,13 +880,16 @@ impl ObjectStore {
                     .await
                 }
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
-                self.inner.clone(),
-                path.clone(),
-                self.block_size,
-                None,
-                self.download_retry_count,
-            )?)),
+            _ => Ok(Box::new(
+                CloudObjectReader::new(
+                    self.inner.clone(),
+                    path.clone(),
+                    self.block_size,
+                    None,
+                    self.download_retry_count,
+                )?
+                .with_io_parallelism(self.io_parallelism()),
+            )),
         }
     }
 
@@ -942,13 +945,16 @@ impl ObjectStore {
                     .await
                 }
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
-                self.inner.clone(),
-                path.clone(),
-                self.block_size,
-                Some(known_size),
-                self.download_retry_count,
-            )?)),
+            _ => Ok(Box::new(
+                CloudObjectReader::new(
+                    self.inner.clone(),
+                    path.clone(),
+                    self.block_size,
+                    Some(known_size),
+                    self.download_retry_count,
+                )?
+                .with_io_parallelism(self.io_parallelism()),
+            )),
         }
     }
 
@@ -1918,11 +1924,16 @@ mod tests {
         assert!(!store.exists(&path).await.unwrap());
     }
 
-    #[test]
-    fn test_io_parallelism_clamped_to_nonzero() {
+    #[tokio::test]
+    async fn test_io_parallelism_clamped_to_nonzero() {
         // `io_parallelism()` feeds `buffered`/`buffer_unordered` windows; a value of 0 makes those
         // streams never poll, hanging callers (e.g. a metadata-only `count_rows`). It must clamp.
         let store = ObjectStore::local();
+        // Readers opened by the store must advertise the store's normalized
+        // effective parallelism, not the hardcoded cloud default.
+        let mem_store = ObjectStore::memory();
+        let path = Path::from("/io_parallelism_probe");
+        mem_store.put(&path, b"x").await.unwrap();
 
         // SAFETY: process-global env var, set and restored within this test. `io_parallelism()`
         // only reads it, and a concurrent reader observes a valid clamped value, never 0.
@@ -1932,12 +1943,31 @@ mod tests {
             1,
             "LANCE_IO_THREADS=0 must clamp to 1"
         );
+        assert_eq!(
+            mem_store.open(&path).await.unwrap().io_parallelism(),
+            1,
+            "an opened reader must report the store's clamped parallelism"
+        );
 
         unsafe { std::env::set_var("LANCE_IO_THREADS", "8") };
         assert_eq!(
             store.io_parallelism(),
             8,
             "a positive override must pass through unchanged"
+        );
+        assert_eq!(
+            mem_store.open(&path).await.unwrap().io_parallelism(),
+            8,
+            "an opened reader must honor the configured request limit"
+        );
+        assert_eq!(
+            mem_store
+                .open_with_size(&path, 1024 * 1024)
+                .await
+                .unwrap()
+                .io_parallelism(),
+            8,
+            "a sized reader must honor the configured request limit"
         );
 
         unsafe { std::env::remove_var("LANCE_IO_THREADS") };

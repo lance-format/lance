@@ -25,7 +25,9 @@ use lance_file::reader::FileReaderOptions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
 pub use lance_index::IndexParams;
-use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndex, FragReuseIndexHandle};
+use lance_index::frag_reuse::{
+    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME,
+};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexHandle};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
@@ -1037,7 +1039,7 @@ impl<'a> FragReuseIndexCacheKey<'a> {
 }
 
 impl CacheKey for FragReuseIndexCacheKey<'_> {
-    type ValueType = FragReuseIndex;
+    type ValueType = CompactFragReuseIndex;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -1973,12 +1975,7 @@ impl DatasetIndexExt for Dataset {
         };
 
         let mut merged_segment = if all_vector {
-            crate::index::vector::ivf::merge_segments(
-                self.object_store.as_ref(),
-                &self.indices_dir(),
-                source_segments,
-            )
-            .await?
+            crate::index::vector::ivf::merge_segments(self, source_segments).await?
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
         } else if all_fmindex {
@@ -2552,7 +2549,7 @@ async fn index_statistics_frag_reuse(ds: &Dataset) -> Result<String> {
         .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?
         .expect("FragmentReuse index does not exist");
-    serialize_index_statistics(&FragReuseIndexHandle(index).statistics()?)
+    serialize_index_statistics(&CompactFragReuseIndexHandle(index).statistics()?)
 }
 
 async fn index_statistics_mem_wal(ds: &Dataset) -> Result<String> {
@@ -2890,7 +2887,7 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn open_frag_reuse_index(
         &self,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Option<Arc<FragReuseIndex>>>;
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>>;
 
     /// Opens the MemWAL index
     async fn open_mem_wal_index(
@@ -2947,7 +2944,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key).await {
-            return Ok(Arc::new(FragReuseIndexHandle(index)).as_index());
+            return Ok(Arc::new(CompactFragReuseIndexHandle(index)).as_index());
         }
 
         // Sometimes we want to open an index and we don't care if it is a scalar or vector index.
@@ -3351,7 +3348,7 @@ impl DatasetIndexInternalExt for Dataset {
     async fn open_frag_reuse_index(
         &self,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Option<Arc<FragReuseIndex>>> {
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
         if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
             let frag_reuse_key = FragReuseIndexKey {
@@ -3754,17 +3751,19 @@ mod tests {
         FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema};
-    use futures::stream::TryStreamExt;
+    use futures::{future::try_join_all, stream::TryStreamExt};
     use lance_arrow::*;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
+    use lance_index::metrics::LocalMetricsCollector;
     use lance_index::pbold::{BTreeIndexDetails, InvertedIndexDetails};
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
     use lance_index::scalar::inverted::{
         INVERTED_INDEX_VERSION_V1, INVERTED_INDEX_VERSION_V2, INVERTED_INDEX_VERSION_V3,
     };
+    use lance_index::scalar::registry::ScalarIndexCacheKey;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -3774,12 +3773,19 @@ mod tests {
         kmeans::{KMeansParams, train_kmeans},
         sq::builder::SQBuildParams,
     };
-    use lance_io::{assert_io_eq, assert_io_lt, utils::tracking_store::IoStats};
+    use lance_io::{
+        assert_io_eq, assert_io_lt,
+        object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor},
+        utils::tracking_store::IoStats,
+    };
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_testing::datagen::generate_random_array;
     use object_store::ObjectStoreExt;
     use rstest::rstest;
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::atomic::Ordering,
+    };
 
     async fn write_vector_segment_metadata(
         dataset: &Dataset,
@@ -3815,6 +3821,213 @@ mod tests {
                 size_bytes: payload.len() as u64,
             }]),
         }
+    }
+
+    #[tokio::test]
+    async fn test_scalar_cache_uses_current_object_store() {
+        async fn search_ids(dataset: &Dataset, term: &str) -> Vec<i32> {
+            let result = dataset
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new(term.to_owned()))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+            ids.sort_unstable();
+            ids
+        }
+
+        // Rotated credentials require distinct ObjectStore instances to read the same data.
+        // `memory://` creates an isolated in-memory backend for each instance, so this test needs
+        // a filesystem-backed URI.
+        let test_dir = TempStrDir::default();
+        let batches = vec![
+            arrow_array::record_batch!(
+                ("id", Int32, [0, 1, 2, 3]),
+                (
+                    "text",
+                    Utf8,
+                    [
+                        "alpha common",
+                        "beta common",
+                        "gamma common",
+                        "alpha common"
+                    ]
+                )
+            )
+            .unwrap(),
+            arrow_array::record_batch!(
+                ("id", Int32, [4, 5, 6, 7]),
+                (
+                    "text",
+                    Utf8,
+                    ["beta common", "gamma common", "alpha common", "beta common"]
+                )
+            )
+            .unwrap(),
+        ];
+        let schema = batches[0].schema();
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_group: 4,
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("credential_rotation_fts".to_owned()),
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let index_meta = dataset
+            .load_indices_by_name("credential_rotation_fts")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let session = Arc::new(Session::default());
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+
+        let store_params_a = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    "credential_generation".to_owned(),
+                    "secret-generation-a".to_owned(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+        let (store_a, _) = ObjectStore::from_uri_and_params(
+            dataset.session().store_registry(),
+            dataset.uri(),
+            &store_params_a,
+        )
+        .await
+        .unwrap();
+        let dataset_a = dataset.with_object_store(store_a.clone(), Some(store_params_a));
+
+        let store_params_b = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    "credential_generation".to_owned(),
+                    "secret-generation-b".to_owned(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+        let (store_b, _) = ObjectStore::from_uri_and_params(
+            dataset.session().store_registry(),
+            dataset.uri(),
+            &store_params_b,
+        )
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&store_a, &store_b));
+        let dataset_b = dataset.with_object_store(store_b.clone(), Some(store_params_b));
+        let index_path_fragment = format!("_indices/{}", index_meta.uuid);
+
+        let _ = store_a.io_stats_incremental();
+        let _ = store_b.io_stats_incremental();
+        assert_eq!(search_ids(&dataset_a, "alpha").await, vec![0, 3, 6]);
+        let first_store_stats = store_a.io_stats_incremental();
+        assert!(
+            first_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "the first query should read the FTS index through store A: {first_store_stats:#?}"
+        );
+        let _ = store_b.io_stats_incremental();
+
+        assert_eq!(search_ids(&dataset_a, "alpha").await, vec![0, 3, 6]);
+        let warm_store_stats = store_a.io_stats_incremental();
+        assert!(
+            !warm_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "the same store binding should reuse the live scalar index: {warm_store_stats:#?}"
+        );
+
+        let rotation_metrics = LocalMetricsCollector::default();
+        let opened = try_join_all(
+            (0..8)
+                .map(|_| dataset_b.open_scalar_index("text", &index_meta.uuid, &rotation_metrics)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened.len(), 8);
+        assert_eq!(
+            rotation_metrics.index_loads.load(Ordering::Relaxed),
+            1,
+            "concurrent opens after rotation should coalesce onto one store-B load"
+        );
+
+        assert_eq!(search_ids(&dataset_b, "beta").await, vec![1, 4, 7]);
+        let old_store_stats = store_a.io_stats_incremental();
+        let new_store_stats = store_b.io_stats_incremental();
+        assert!(
+            !old_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "the second dataset must not use the scalar index bound to store A: {old_store_stats:#?}"
+        );
+        assert!(
+            new_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "the second dataset should read the scalar index through store B: {new_store_stats:#?}"
+        );
+
+        let scalar_cache = dataset.index_cache.for_index(&index_meta.uuid, None);
+        assert!(
+            scalar_cache
+                .get_unsized_with_key(&ScalarIndexCacheKey)
+                .await
+                .is_some(),
+            "the live scalar index should be cached with store B's binding"
+        );
+
+        let _ = store_a.io_stats_incremental();
+        let _ = store_b.io_stats_incremental();
+        assert_eq!(search_ids(&dataset_a, "gamma").await, vec![2, 5]);
+        let reopened_store_stats = store_a.io_stats_incremental();
+        let untouched_store_stats = store_b.io_stats_incremental();
+        assert!(
+            reopened_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "re-querying dataset A should replace store B's binding and read through store A: {reopened_store_stats:#?}"
+        );
+        assert!(
+            !untouched_store_stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
+            "re-querying dataset A must not use store B: {untouched_store_stats:#?}"
+        );
     }
 
     fn list_io_stats(stats: &IoStats) -> IoStats {
@@ -5901,7 +6114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remap_empty() {
+    async fn test_remap_empty_chain() {
         let data = gen_batch()
             .col("int", array::step::<Int32Type>())
             .col(
@@ -5918,10 +6131,18 @@ mod tests {
             .unwrap();
 
         let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
-        let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
+        let row_count = dataset.count_all_rows().await.unwrap();
+        let first_half = (0..row_count / 2)
             .map(|i| (i as u64, None))
             .collect::<HashMap<_, _>>();
-        let new_uuid = remap_index(&dataset, &index_uuid, &RowAddrRemap::direct(remap_to_empty))
+        let second_half = (row_count / 2..row_count)
+            .map(|i| (i as u64, None))
+            .collect::<HashMap<_, _>>();
+        let remap_to_empty = RowAddrRemap::chained([
+            RowAddrRemap::direct(first_half),
+            RowAddrRemap::direct(second_half),
+        ]);
+        let new_uuid = remap_index(&dataset, &index_uuid, &remap_to_empty)
             .await
             .unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));

@@ -51,7 +51,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::progress::noop_progress;
+use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
@@ -59,7 +59,7 @@ use lance_namespace::LanceNamespace;
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::IntoFuture;
 use std::iter::empty;
 use std::sync::Arc;
@@ -70,7 +70,10 @@ pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
 impl FromJObjectWithEnv<BasePath> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<BasePath> {
-        let id = env.get_u32_from_method(self, "getId")?;
+        let java_id = env.call_method(self, "getId", "()I", &[])?.i()?;
+        let id = u32::try_from(java_id).map_err(|_| {
+            Error::input_error(format!("BasePath.id must be non-negative, got {java_id}"))
+        })?;
         let name = env.get_optional_string_from_method(self, "getName")?;
         let path = env.get_string_from_method(self, "getPath")?;
         let is_dataset_root = env.get_boolean_from_method(self, "isDatasetRoot")?;
@@ -80,6 +83,37 @@ impl FromJObjectWithEnv<BasePath> for JObject<'_> {
             path,
             is_dataset_root,
         })
+    }
+}
+
+impl IntoJava for &BasePath {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        let id = i32::try_from(self.id).map_err(|_| {
+            Error::runtime_error(format!("Base path id {} exceeds Java int range", self.id))
+        })?;
+        let name = match self.name.as_ref() {
+            Some(name) => env.new_string(name)?.into(),
+            None => JObject::null(),
+        };
+        let name = env
+            .call_static_method(
+                "java/util/Optional",
+                "ofNullable",
+                "(Ljava/lang/Object;)Ljava/util/Optional;",
+                &[JValue::Object(&name)],
+            )?
+            .l()?;
+        let path = env.new_string(&self.path)?;
+        Ok(env.new_object(
+            "org/lance/BasePath",
+            "(ILjava/util/Optional;Ljava/lang/String;Z)V",
+            &[
+                JValue::Int(id),
+                JValue::Object(&name),
+                JValue::Object(&path),
+                JValue::Bool(self.is_dataset_root.into()),
+            ],
+        )?)
     }
 }
 
@@ -1029,7 +1063,74 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex<'local>(
             fragments_jobj,
             index_uuid_jobj,
             arrow_stream_addr_jobj,
+            None,
         )
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndexWithProgress<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject<'local>,
+    columns_jobj: JObject<'local>, // List<String>
+    index_type_code_jobj: jint,
+    name_jobj: JObject<'local>,              // Optional<String>
+    params_jobj: JObject<'local>,            // IndexParams
+    replace_jobj: jboolean,                  // replace
+    train_jobj: jboolean,                    // train
+    fragments_jobj: JObject<'local>,         // List<Integer>
+    index_uuid_jobj: JObject<'local>,        // String
+    arrow_stream_addr_jobj: JObject<'local>, // Optional<Long>
+    progress_jobj: JObject<'local>,          // IndexBuildProgress
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_create_index_with_progress(
+            &mut env,
+            java_dataset,
+            columns_jobj,
+            index_type_code_jobj,
+            name_jobj,
+            params_jobj,
+            replace_jobj,
+            train_jobj,
+            fragments_jobj,
+            index_uuid_jobj,
+            arrow_stream_addr_jobj,
+            progress_jobj,
+        )
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_create_index_with_progress<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject<'local>,
+    columns_jobj: JObject<'local>,
+    index_type_code_jobj: jint,
+    name_jobj: JObject<'local>,
+    params_jobj: JObject<'local>,
+    replace_jobj: jboolean,
+    train_jobj: jboolean,
+    fragments_jobj: JObject<'local>,
+    index_uuid_jobj: JObject<'local>,
+    arrow_stream_addr_jobj: JObject<'local>,
+    progress_jobj: JObject<'local>,
+) -> Result<JObject<'local>> {
+    let progress = Arc::new(JavaIndexBuildProgress::new(env, &progress_jobj)?);
+    inner_create_index(
+        env,
+        java_dataset,
+        columns_jobj,
+        index_type_code_jobj,
+        name_jobj,
+        params_jobj,
+        replace_jobj,
+        train_jobj,
+        fragments_jobj,
+        index_uuid_jobj,
+        arrow_stream_addr_jobj,
+        Some(progress),
     )
 }
 
@@ -1046,6 +1147,7 @@ fn inner_create_index<'local>(
     fragments_jobj: JObject<'local>,         // Optional<List<String>>
     index_uuid_jobj: JObject<'local>,        // Optional<String>
     arrow_stream_addr_jobj: JObject<'local>, // Optional<Long>
+    progress: Option<Arc<dyn IndexBuildProgress>>,
 ) -> Result<JObject<'local>> {
     let columns = env.get_strings(&columns_jobj)?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
@@ -1118,42 +1220,143 @@ fn inner_create_index<'local>(
 
     let params = params_result?;
 
-    // Execute index creation in a block to ensure dataset_guard is dropped
-    // before we call into_java (which needs to borrow env again)
-    let index_metadata = {
-        let mut dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    let index_metadata = match progress {
+        Some(progress) => {
+            // Progress callbacks may re-enter read-only methods on this Dataset. Clone the Dataset
+            // and release the native field guard before the long-running build so those callbacks
+            // do not deadlock on the field mutex.
+            let mut working_dataset = {
+                let dataset_guard = unsafe {
+                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                }?;
+                dataset_guard.inner.clone()
+            };
+            let initial_version = working_dataset.version().version;
+            let index_metadata = execute_create_index(
+                &mut working_dataset,
+                &columns_slice,
+                index_type,
+                params.as_ref(),
+                replace,
+                train,
+                name,
+                fragment_ids,
+                index_uuid,
+                batch_reader,
+                Some(progress),
+                skip_commit,
+            )
+            .inspect_err(|_| {
+                // A committed build may fail while materializing its return metadata. The clone
+                // has already observed the durable commit, so publish it before propagating.
+                if should_publish_working_dataset_on_error(
+                    skip_commit,
+                    initial_version,
+                    working_dataset.version().version,
+                ) {
+                    match unsafe {
+                        env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                    } {
+                        Ok(mut dataset_guard) => {
+                            dataset_guard.inner = working_dataset.clone();
+                        }
+                        Err(publish_error) => {
+                            log::warn!(
+                                "Failed to publish committed dataset version {} after create-index failure: {}",
+                                working_dataset.version().version,
+                                publish_error
+                            );
+                        }
+                    }
+                }
+            })?;
 
-        let mut index_builder = dataset_guard
-            .inner
-            .create_index_builder(&columns_slice, index_type, params.as_ref())
-            .replace(replace)
-            .train(train);
-
-        if let Some(name) = name {
-            index_builder = index_builder.name(name);
+            if !skip_commit {
+                let mut dataset_guard = unsafe {
+                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                }?;
+                dataset_guard.inner = working_dataset;
+            }
+            index_metadata
         }
-
-        if let Some(fragment_ids) = fragment_ids {
-            index_builder = index_builder.fragments(fragment_ids);
-        }
-
-        if let Some(index_uuid) = index_uuid {
-            index_builder = index_builder.index_uuid(index_uuid);
-        }
-
-        if let Some(reader) = batch_reader {
-            index_builder = index_builder.preprocessed_data(Box::new(reader));
-        }
-
-        if skip_commit {
-            block_on(index_builder.execute_uncommitted())?
-        } else {
-            block_on(index_builder.into_future())?
+        None => {
+            // Preserve the existing no-progress path, including its native-field locking behavior.
+            let mut dataset_guard = unsafe {
+                env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+            }?;
+            execute_create_index(
+                &mut dataset_guard.inner,
+                &columns_slice,
+                index_type,
+                params.as_ref(),
+                replace,
+                train,
+                name,
+                fragment_ids,
+                index_uuid,
+                batch_reader,
+                None,
+                skip_commit,
+            )?
         }
     };
 
     (&index_metadata).into_java(env)
+}
+
+fn should_publish_working_dataset_on_error(
+    skip_commit: bool,
+    initial_version: u64,
+    current_version: u64,
+) -> bool {
+    !skip_commit && current_version != initial_version
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_create_index(
+    dataset: &mut Dataset,
+    columns: &[&str],
+    index_type: IndexType,
+    params: &dyn IndexParams,
+    replace: bool,
+    train: bool,
+    name: Option<String>,
+    fragment_ids: Option<Vec<u32>>,
+    index_uuid: Option<Uuid>,
+    batch_reader: Option<ArrowArrayStreamReader>,
+    progress: Option<Arc<dyn IndexBuildProgress>>,
+    skip_commit: bool,
+) -> Result<IndexMetadata> {
+    let mut index_builder = dataset
+        .create_index_builder(columns, index_type, params)
+        .replace(replace)
+        .train(train);
+
+    if let Some(name) = name {
+        index_builder = index_builder.name(name);
+    }
+
+    if let Some(fragment_ids) = fragment_ids {
+        index_builder = index_builder.fragments(fragment_ids);
+    }
+
+    if let Some(index_uuid) = index_uuid {
+        index_builder = index_builder.index_uuid(index_uuid);
+    }
+
+    if let Some(reader) = batch_reader {
+        index_builder = index_builder.preprocessed_data(Box::new(reader));
+    }
+
+    if let Some(progress) = progress {
+        index_builder = index_builder.progress(progress);
+    }
+
+    if skip_commit {
+        Ok(block_on(index_builder.execute_uncommitted())?)
+    } else {
+        Ok(block_on(index_builder.into_future())?)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1645,6 +1848,33 @@ fn inner_get_fragments<'local>(
         .map(|f| f.metadata().clone())
         .collect::<Vec<Fragment>>();
     export_vec(env, &fragments)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetBasePaths<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(env, inner_get_base_paths(&mut env, jdataset))
+}
+
+fn inner_get_base_paths<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+) -> Result<JObject<'local>> {
+    let mut base_paths = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset
+            .inner
+            .manifest()
+            .base_paths
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    base_paths.sort_by_key(|base_path| base_path.id);
+    export_vec(env, &base_paths)
 }
 
 #[unsafe(no_mangle)]
@@ -3464,6 +3694,14 @@ fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<Cle
 
     let before_version = env.get_optional_u64_from_method(jpolicy, "getBeforeVersion")?;
 
+    let versions = env.get_optional_from_method(jpolicy, "getVersions", |env, list_obj| {
+        let mut versions = HashSet::new();
+        for version in env.get_longs(&list_obj)? {
+            versions.insert(version as u64);
+        }
+        Ok(versions)
+    })?;
+
     let delete_unverified = env
         .get_optional_from_method(jpolicy, "getDeleteUnverified", |env, obj| {
             Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
@@ -3487,6 +3725,7 @@ fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<Cle
     Ok(CleanupPolicy {
         before_timestamp,
         before_version,
+        versions,
         delete_unverified,
         error_if_tagged_old_versions,
         clean_referenced_branches,
@@ -4047,4 +4286,24 @@ fn inner_get_zonemap_stats<'local>(
     }
 
     Ok(array_list)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_publish_working_dataset_on_error;
+
+    #[test]
+    fn post_commit_failure_publishes_advanced_dataset() {
+        assert!(should_publish_working_dataset_on_error(false, 1, 2));
+    }
+
+    #[test]
+    fn pre_commit_failure_keeps_original_dataset() {
+        assert!(!should_publish_working_dataset_on_error(false, 1, 1));
+    }
+
+    #[test]
+    fn uncommitted_failure_keeps_original_dataset() {
+        assert!(!should_publish_working_dataset_on_error(true, 1, 2));
+    }
 }

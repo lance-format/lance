@@ -319,7 +319,7 @@ fn train_pq_model<'py>(
 /// from lance.lance import indices
 ///
 /// # Mint one model and broadcast `model` to every worker.
-/// model = indices.build_rq_model(dimension=128, num_bits=1)
+/// model = indices.build_rq_model(dimension=128, num_bits=5)
 /// seg = ds.create_index_uncommitted(
 ///     column="vector",
 ///     index_type="IVF_RQ",
@@ -330,7 +330,7 @@ fn train_pq_model<'py>(
 /// )
 /// ```
 #[pyfunction]
-#[pyo3(signature = (dimension, num_bits=1, dtype="float32"))]
+#[pyo3(signature = (dimension, num_bits=5, dtype="float32"))]
 pub fn build_rq_model(dimension: usize, num_bits: u8, dtype: &str) -> PyResult<String> {
     use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
     use lance_index::vector::bq::RQRotationType;

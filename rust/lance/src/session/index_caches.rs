@@ -14,7 +14,7 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
-use lance_index::frag_reuse::FragReuseIndex;
+use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
@@ -97,7 +97,7 @@ pub struct FragReuseIndexKey<'a> {
 }
 
 impl CacheKey for FragReuseIndexKey<'_> {
-    type ValueType = FragReuseIndex;
+    type ValueType = CompactFragReuseIndex;
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("frag_reuse/{}", self.uuid))

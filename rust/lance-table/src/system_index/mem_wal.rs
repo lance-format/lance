@@ -33,6 +33,38 @@ pub type ShardId = Uuid;
 pub struct SsTable {
     pub generation: u64,
     pub path: String,
+    /// Payload size of the rows, as the writer's MemTable accounted for them.
+    ///
+    /// An estimate of the payload, not a bound on what reading the SSTable
+    /// costs: it excludes the per-array structure a reader materializes, so a
+    /// consumer budgeting memory from it must add its own headroom.
+    ///
+    /// `None` on an SSTable written before these fields existed, which a reader
+    /// must carry as unmeasured rather than as zero. The same applies to the two
+    /// below.
+    pub in_memory_bytes: Option<u64>,
+    /// Rows held, counting the older duplicates of a primary key that the
+    /// generation's deletion vector masks.
+    pub physical_rows: Option<u64>,
+    /// Total payload size of the primary-key columns over every row in
+    /// [`Self::physical_rows`] -- not a per-row size, which varies for a
+    /// variable-length key. Carries the same estimate caveat as
+    /// [`Self::in_memory_bytes`], and is also `None` on a table with no primary
+    /// key.
+    pub primary_key_bytes: Option<u64>,
+}
+
+impl SsTable {
+    /// An SSTable whose contents were not measured at flush.
+    pub fn unmeasured(generation: u64, path: String) -> Self {
+        Self {
+            generation,
+            path,
+            in_memory_bytes: None,
+            physical_rows: None,
+            primary_key_bytes: None,
+        }
+    }
 }
 
 impl From<&SsTable> for pb::SsTable {
@@ -40,6 +72,9 @@ impl From<&SsTable> for pb::SsTable {
         Self {
             generation: sstable.generation,
             path: sstable.path.clone(),
+            in_memory_bytes: sstable.in_memory_bytes,
+            physical_rows: sstable.physical_rows,
+            primary_key_bytes: sstable.primary_key_bytes,
         }
     }
 }
@@ -49,6 +84,9 @@ impl From<pb::SsTable> for SsTable {
         Self {
             generation: sstable.generation,
             path: sstable.path,
+            in_memory_bytes: sstable.in_memory_bytes,
+            physical_rows: sstable.physical_rows,
+            primary_key_bytes: sstable.primary_key_bytes,
         }
     }
 }
@@ -574,4 +612,46 @@ pub fn new_mem_wal_index_meta(
         // Memory WAL index is inline (no files)
         files: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An SSTable written before the size fields existed decodes as
+    /// unmeasured, not as zero. A reader that saw zero would treat a full
+    /// generation as costing nothing.
+    #[test]
+    fn an_sstable_without_the_size_fields_decodes_as_unmeasured() {
+        let legacy = pb::SsTable {
+            generation: 7,
+            path: "aaa_gen_7".to_string(),
+            in_memory_bytes: None,
+            physical_rows: None,
+            primary_key_bytes: None,
+        };
+        let decoded = SsTable::from(legacy);
+        assert_eq!(decoded.generation, 7);
+        assert_eq!(decoded.in_memory_bytes, None);
+        assert_eq!(decoded.physical_rows, None);
+        assert_eq!(decoded.primary_key_bytes, None);
+    }
+
+    /// All three survive the round trip, so a reader sees what the flush
+    /// measured rather than a default.
+    #[test]
+    fn the_recorded_size_survives_the_round_trip() {
+        let recorded = SsTable {
+            generation: 7,
+            path: "aaa_gen_7".to_string(),
+            in_memory_bytes: Some(4_096),
+            physical_rows: Some(10),
+            primary_key_bytes: Some(80),
+        };
+        let encoded = pb::SsTable::from(&recorded);
+        assert_eq!(encoded.in_memory_bytes, Some(4_096));
+        assert_eq!(encoded.physical_rows, Some(10));
+        assert_eq!(encoded.primary_key_bytes, Some(80));
+        assert_eq!(SsTable::from(encoded), recorded);
+    }
 }

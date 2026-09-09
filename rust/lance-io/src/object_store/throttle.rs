@@ -1189,8 +1189,13 @@ mod tests {
                 .with_window_duration(std::time::Duration::from_millis(1)),
         );
         config.max_retries = 1;
-        config.min_backoff_ms = 0;
-        config.max_backoff_ms = 0;
+        // The AIMD window is only evaluated when an outcome is recorded after the
+        // window has elapsed, so the retry backoff must outlast `window_duration`.
+        // With a zero backoff the two attempts against this in-memory lister can
+        // finish inside the first window (observed on Windows), leaving the rate
+        // untouched.
+        config.min_backoff_ms = 5;
+        config.max_backoff_ms = 5;
         let throttled =
             AimdThrottledStore::new(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>, config)
                 .unwrap();

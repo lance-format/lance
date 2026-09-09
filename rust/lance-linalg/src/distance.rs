@@ -51,6 +51,9 @@ fn assert_batch_layout(vector_len: usize, batch_len: usize, dimension: usize) {
     );
 }
 
+/// Largest number of maximal u8 product terms whose sum fits in a u32.
+const U8_U32_ACCUMULATOR_MAX_LEN: usize = u32::MAX as usize / (u8::MAX as usize * u8::MAX as usize);
+
 /// Number of distances computed per call into a runtime-selected batch kernel.
 ///
 /// Keeping a small output buffer amortizes the `#[target_feature]` call while
@@ -497,10 +500,13 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::types::{Float16Type, Float32Type, Int8Type};
-    use arrow_array::{Float32Array, Int8Array, ListArray, PrimitiveArray, UInt8Array};
+    use arrow_array::{
+        Float32Array, Float64Array, Int8Array, Int32Array, ListArray, PrimitiveArray, UInt8Array,
+    };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::Field;
     use half::f16;
+    use lance_arrow::FixedSizeListArrayExt;
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -519,6 +525,41 @@ mod tests {
             std::is_x86_feature_detected!("avx512vpopcntdq"),
         )
         .expect("write x86 runtime feature report");
+    }
+
+    #[test]
+    fn test_arrow_batch_type_errors_identify_the_argument() {
+        let float32_targets =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 2.0]), 2).unwrap();
+        let unsupported_query = Int32Array::from(vec![1, 2]);
+
+        for distance_type in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+            let error =
+                distance_type.arrow_batch_func()(&unsupported_query, &float32_targets).unwrap_err();
+            assert!(
+                matches!(error, ArrowError::InvalidArgumentError(_)),
+                "{distance_type} returned a different error variant: {error}"
+            );
+        }
+
+        let unsupported_from_error =
+            cosine_distance_arrow_batch(&unsupported_query, &float32_targets).unwrap_err();
+        assert!(
+            matches!(&unsupported_from_error, ArrowError::InvalidArgumentError(message)
+                if message == "`from` has unsupported data type Int32"),
+            "unexpected unsupported `from` error: {unsupported_from_error}"
+        );
+
+        let float32_query = Float32Array::from(vec![1.0, 2.0]);
+        let float64_targets =
+            FixedSizeListArray::try_new_from_values(Float64Array::from(vec![1.0, 2.0]), 2).unwrap();
+        let mismatched_to_error =
+            cosine_distance_arrow_batch(&float32_query, &float64_targets).unwrap_err();
+        assert!(
+            matches!(&mismatched_to_error, ArrowError::InvalidArgumentError(message)
+                if message == "`to` values have data type Float64, expected Float32 to match `from`"),
+            "unexpected mismatched `to` error: {mismatched_to_error}"
+        );
     }
 
     /// Build `List<FixedSizeList<T, dim>>` rows from flattened sub-vector values.

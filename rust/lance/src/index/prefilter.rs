@@ -197,44 +197,45 @@ impl DatasetPreFilter {
 
         let dataset_clone = dataset.clone();
         let restrict_for_load = restrict_to.clone();
+        let load = move || async move {
+            let row_ids_and_deletions =
+                load_row_ids_and_deletions(&dataset_clone, restrict_for_load.as_ref()).await?;
+
+            // The process of computing the final mask is CPU-bound, so we spawn it
+            // on a blocking thread.
+            let allow_list = spawn_cpu(move || {
+                Result::Ok(row_ids_and_deletions.into_iter().fold(
+                    RowAddrTreeMap::new(),
+                    |mut allow_list, (row_ids, deletion_vector)| {
+                        let seq = if let Some(deletion_vector) = deletion_vector {
+                            let mut row_ids = row_ids.as_ref().clone();
+                            row_ids.mask(deletion_vector.to_sorted_iter()).unwrap();
+                            Cow::<RowIdSequence>::Owned(row_ids)
+                        } else {
+                            Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
+                        };
+                        let treemap = RowAddrTreeMap::from(seq.as_ref());
+                        allow_list |= treemap;
+                        allow_list
+                    },
+                ))
+            })
+            .await?;
+
+            Ok(RowAddrMask::from_allowed(allow_list))
+        };
+        let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() else {
+            return load().await.map(Arc::new);
+        };
         let key = crate::session::caches::RowAddrMaskKey {
             version: dataset.manifest().version,
             restrict_hash,
-            e_tag: dataset.manifest_location.e_tag.as_deref(),
+            e_tag: Some(e_tag),
         };
         dataset
             .metadata_cache
             .as_ref()
-            .get_or_insert_with_key(key, move || {
-                async move {
-                    let row_ids_and_deletions =
-                        load_row_ids_and_deletions(&dataset_clone, restrict_for_load.as_ref())
-                            .await?;
-
-                    // The process of computing the final mask is CPU-bound, so we spawn it
-                    // on a blocking thread.
-                    let allow_list = spawn_cpu(move || {
-                        Result::Ok(row_ids_and_deletions.into_iter().fold(
-                            RowAddrTreeMap::new(),
-                            |mut allow_list, (row_ids, deletion_vector)| {
-                                let seq = if let Some(deletion_vector) = deletion_vector {
-                                    let mut row_ids = row_ids.as_ref().clone();
-                                    row_ids.mask(deletion_vector.to_sorted_iter()).unwrap();
-                                    Cow::<RowIdSequence>::Owned(row_ids)
-                                } else {
-                                    Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
-                                };
-                                let treemap = RowAddrTreeMap::from(seq.as_ref());
-                                allow_list |= treemap;
-                                allow_list
-                            },
-                        ))
-                    })
-                    .await?;
-
-                    Ok(RowAddrMask::from_allowed(allow_list))
-                }
-            })
+            .get_or_insert_with_key(key, load)
             .await
     }
 
@@ -632,6 +633,26 @@ mod test {
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
         assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(3)); // There were three rows left over;
+    }
+
+    #[tokio::test]
+    async fn test_row_addr_mask_cache_bypassed_without_etag() {
+        let datasets = test_datasets(true).await;
+        let mut dataset = (*datasets.deletions_no_missing_frags).clone();
+        dataset.manifest_location.e_tag = None;
+        let dataset = Arc::new(dataset);
+
+        let first = DatasetPreFilter::do_create_deletion_mask_row_id(dataset.clone(), None)
+            .await
+            .unwrap();
+        let second = DatasetPreFilter::do_create_deletion_mask_row_id(dataset, None)
+            .await
+            .unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "row-address masks without an e-tag must not be shared"
+        );
     }
 
     // Regression test for issue #6877.

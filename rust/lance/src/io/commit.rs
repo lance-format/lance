@@ -44,6 +44,7 @@ use lance_table::io::commit::{
 };
 use lance_table::io::manifest::read_manifest;
 use rand::{Rng, rng};
+use roaring::RoaringBitmap;
 
 use super::ObjectStore;
 use crate::Dataset;
@@ -603,13 +604,15 @@ async fn record_new_dataset_commit(
     manifest: &Manifest,
     location: &ManifestLocation,
 ) {
-    let tx_key = crate::session::caches::TransactionKey {
-        version: manifest.version,
-        e_tag: location.e_tag.as_deref(),
-    };
-    metadata_cache
-        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-        .await;
+    if let Some(e_tag) = location.e_tag.as_deref() {
+        let tx_key = crate::session::caches::TransactionKey {
+            version: manifest.version,
+            e_tag: Some(e_tag),
+        };
+        metadata_cache
+            .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+            .await;
+    }
 
     let manifest_key = crate::session::caches::ManifestKey {
         version: location.version,
@@ -956,9 +959,12 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
         if !index_is_usable(index) {
             continue;
         }
+        // Also true when the bitmap is missing entirely, so the failure path below
+        // pairs it with `is_some` to mean "written before the 0.8.15 fix".
+        let bitmap_missing_or_legacy =
+            must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref());
         if needs_recalculating.contains(&index.name)
-            || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
-                && !is_system_index(index)
+            || bitmap_missing_or_legacy && !is_system_index(index)
         {
             // A covered index still has exactly one keyed field; the trailing
             // `covering_fields` are carried, not keyed, so counting them
@@ -971,14 +977,49 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
             );
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::internal(format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0])))?;
             // We need to calculate the fragments covered by the index
-            let idx = dataset
-                .open_generic_index(&idx_field.name, &index.uuid, &NoOpMetricsCollector)
-                .await?;
-            let recalculated = idx.calculate_included_frags().await?;
-            if index.fragment_bitmap.as_ref() != Some(&recalculated) {
-                recovered_coverage.push(index.name.clone());
+            let recalculated = async {
+                let idx = dataset
+                    .open_generic_index(&idx_field.name, &index.uuid, &NoOpMetricsCollector)
+                    .await?;
+                idx.calculate_included_frags().await
             }
-            index.fragment_bitmap = Some(recalculated);
+            .await;
+            match recalculated {
+                Ok(fragment_bitmap) => {
+                    if index.fragment_bitmap.as_ref() != Some(&fragment_bitmap) {
+                        recovered_coverage.push(index.name.clone());
+                    }
+                    index.fragment_bitmap = Some(fragment_bitmap);
+                }
+                Err(e) => {
+                    // Recalculating means opening the index, and failing here fails
+                    // every commit the dataset takes, since migration runs on all of
+                    // them. A missing bitmap and overlapping segment bitmaps are both
+                    // re-derived from the index metadata, so they ask again on their
+                    // own; the pre-0.8.15 trigger reads the previous manifest's writer
+                    // version, which this commit replaces with the current one, and a
+                    // bitmap left in place would look migrated from here on.
+                    let repair_ends_with_this_commit =
+                        index.fragment_bitmap.is_some() && bitmap_missing_or_legacy;
+                    log::warn!(
+                        "Could not recalculate the fragment bitmap for index {} (uuid: {}): {}. {}",
+                        index.name,
+                        index.uuid,
+                        e,
+                        if repair_ends_with_this_commit {
+                            "Dropping its coverage to unknown so a build that can open the index recalculates it."
+                        } else {
+                            "Leaving the repair to a build that can open the index."
+                        }
+                    );
+                    if repair_ends_with_this_commit {
+                        index.fragment_bitmap = None;
+                        // Derivation ran before this and may have credited a
+                        // catch-up position off the bitmap being dropped here.
+                        recovered_coverage.push(index.name.clone());
+                    }
+                }
+            }
         }
         // We can't reliably recalculate the index type for label_list and bitmap indices and so we can't migrate this field.
         // However, we still log for visibility and to help potentially diagnose issues in the future if we grow to rely on the field.
@@ -1035,17 +1076,28 @@ pub(crate) struct BadFragmentBitmapError {
 pub(crate) fn detect_overlapping_fragments(
     indices: &[IndexMetadata],
 ) -> std::result::Result<(), BadFragmentBitmapError> {
-    let index_names: HashSet<&str> = indices.iter().map(|i| i.name.as_str()).collect();
+    let mut bitmaps_by_name: HashMap<&str, Vec<&RoaringBitmap>> = HashMap::new();
+    for index in indices {
+        if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
+            bitmaps_by_name
+                .entry(index.name.as_str())
+                .or_default()
+                .push(fragment_bitmap);
+        }
+    }
     let mut bad_indices = Vec::new(); // (index_name, overlapping_fragments)
-    for name in index_names {
+    for (name, fragment_bitmaps) in bitmaps_by_name {
+        // A single segment (the common case) cannot overlap with itself, so
+        // skip it before hashing every fragment id it covers.
+        if fragment_bitmaps.len() < 2 {
+            continue;
+        }
         let mut seen_fragment_ids = HashSet::new();
         let mut overlap = Vec::new();
-        for index in indices.iter().filter(|i| i.name == name) {
-            if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
-                for fragment in fragment_bitmap {
-                    if !seen_fragment_ids.insert(fragment) {
-                        overlap.push(fragment);
-                    }
+        for fragment_bitmap in fragment_bitmaps {
+            for fragment in fragment_bitmap {
+                if !seen_fragment_ids.insert(fragment) {
+                    overlap.push(fragment);
                 }
             }
         }
@@ -1295,14 +1347,16 @@ async fn record_successful_commit(
     indices: Vec<IndexMetadata>,
     skip_auto_cleanup: bool,
 ) {
-    let tx_key = crate::session::caches::TransactionKey {
-        version: manifest.version,
-        e_tag: location.e_tag.as_deref(),
-    };
-    dataset
-        .metadata_cache
-        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-        .await;
+    if let Some(e_tag) = location.e_tag.as_deref() {
+        let tx_key = crate::session::caches::TransactionKey {
+            version: manifest.version,
+            e_tag: Some(e_tag),
+        };
+        dataset
+            .metadata_cache
+            .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+            .await;
+    }
 
     let manifest_key = crate::session::caches::ManifestKey {
         version: location.version,
@@ -1943,6 +1997,117 @@ mod tests {
         }
 
         assert!(dataset.checkout_version(4).await.is_err());
+    }
+
+    /// Every commit runs `migrate_indices`, and recalculating a missing
+    /// `fragment_bitmap` there means opening the index. An index this build
+    /// cannot open must not take the write path down with it: the dataset would
+    /// be unwritable, not merely unreadable, and every later commit would fail
+    /// the same way.
+    #[tokio::test]
+    async fn test_commit_survives_an_index_it_cannot_open() {
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use lance_table::io::manifest::read_manifest_indexes;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let reader = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("payload", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // The readable companion is what makes the difference visible: with a
+        // single index, "carried through the one it cannot open" and "stopped
+        // recalculating altogether" answer every assertion below the same way.
+        let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        for column in ["id", "payload"] {
+            dataset
+                .create_index_builder(&[column], IndexType::BTree, &btree_params)
+                .name(format!("{column}_idx"))
+                .await
+                .unwrap();
+        }
+
+        let broken = dataset.load_index_by_name("id_idx").await.unwrap().unwrap();
+        dataset
+            .object_store
+            .remove_dir_all(dataset.indices_dir().join(broken.uuid.to_string()))
+            .await
+            .unwrap();
+
+        // Reopened so the fixture is judged on what is on disk rather than on
+        // what this process still holds from building the index.
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        assert!(
+            dataset
+                .open_generic_index("id", &broken.uuid, &NoOpMetricsCollector)
+                .await
+                .is_err(),
+            "the fixture is supposed to leave an index this build cannot open"
+        );
+
+        // Migration recalculates a bitmap that is missing, and no current writer
+        // emits one - untrained indices get an empty bitmap, not none at all - so
+        // the state an old manifest arrives in is set here by hand.
+        let indices = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let without_bitmaps = indices
+            .iter()
+            .map(|index| IndexMetadata {
+                fragment_bitmap: None,
+                ..index.clone()
+            })
+            .collect::<Vec<_>>();
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: without_bitmaps,
+                removed_indices: indices,
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        // And an unrelated commit after it, since the missing bitmap is now what
+        // the manifest holds and migration retries on every commit.
+        dataset.delete("false").await.unwrap();
+
+        let migrated = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let coverage = |name: &str| {
+            migrated
+                .iter()
+                .find(|index| index.name == name)
+                .unwrap_or_else(|| panic!("no index named {name} in the manifest"))
+                .fragment_bitmap
+                .as_ref()
+                .map(|bitmap| bitmap.iter().collect::<Vec<_>>())
+        };
+        assert_eq!(
+            coverage("id_idx"),
+            None,
+            "an index that cannot be opened must report unknown coverage"
+        );
+        assert_eq!(
+            coverage("payload_idx"),
+            Some(vec![0]),
+            "an index that opens must still have its coverage recalculated"
+        );
     }
 
     #[tokio::test]
@@ -3011,6 +3176,64 @@ mod tests {
         assert!(msg.contains("must have a valid column index"), "{msg}");
     }
 
+    #[test]
+    fn test_check_column_indices_rejects_after_dedup() {
+        let mut struct_field = Field::try_from(ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new("x", DataType::Int32, false)].into()),
+            false,
+        ))
+        .unwrap();
+        struct_field.set_id(-1, &mut 0);
+
+        let schema = Schema {
+            fields: vec![struct_field],
+            metadata: Default::default(),
+        };
+
+        // struct=-1, leaf=0: valid layout; clones share the same Arcs.
+        let shared_file = DataFile::new(
+            "shared.lance",
+            vec![0, 1],
+            vec![-1, 0],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        // Wrongly gives the struct a real column index.
+        let bad_file = DataFile::new(
+            "bad.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
+        let make_fragment = |id: u64, file: DataFile| Fragment {
+            id,
+            files: vec![file],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(100),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![
+                make_fragment(0, shared_file.clone()),
+                make_fragment(1, shared_file),
+                make_fragment(2, bad_file),
+            ]),
+            DataStorageFormat::new(LanceFileVersion::V2_1.resolve()),
+            HashMap::new(),
+        );
+        let msg = check_column_indices(&manifest).unwrap_err().to_string();
+        assert!(msg.contains("Non-leaf field"), "{msg}");
+        assert!(msg.contains("bad.lance"), "{msg}");
+    }
+
     /// Reproduces the debug-only panic `migrate_indices`'s fragment-bitmap
     /// recalculation guard used to contain: a legal covered index
     /// (`fields=[a,b]`, `covering_fields=[b]`) has `fields.len() == 2`, which
@@ -3066,5 +3289,42 @@ mod tests {
             recomputed[0].fragment_bitmap.is_some(),
             "migrate_indices should have recalculated the fragment bitmap for the covered index"
         );
+    }
+
+    fn index_segment(name: &str, fragment_bitmap: Option<RoaringBitmap>) -> IndexMetadata {
+        IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
+
+    #[test]
+    fn test_detect_overlapping_fragments() {
+        let indices = vec![
+            index_segment("idx_a", Some(RoaringBitmap::from_iter(0..5))),
+            index_segment("idx_a", Some(RoaringBitmap::from_iter([3, 4, 10]))),
+            index_segment("idx_a", None),
+            index_segment("idx_b", Some(RoaringBitmap::from_iter(0..5))),
+        ];
+        let err = detect_overlapping_fragments(&indices).unwrap_err();
+        assert_eq!(err.bad_indices.len(), 1);
+        let (name, overlapping) = &err.bad_indices[0];
+        assert_eq!(name, "idx_a");
+        assert_eq!(overlapping, &vec![3, 4]);
+
+        let disjoint = vec![
+            index_segment("idx_a", Some(RoaringBitmap::from_iter(0..5))),
+            index_segment("idx_a", Some(RoaringBitmap::from_iter(5..10))),
+        ];
+        assert!(detect_overlapping_fragments(&disjoint).is_ok());
     }
 }

@@ -95,6 +95,8 @@ fn deserialize_roaring(bytes: &[u8], path: &Path) -> Result<RoaringBitmap> {
 }
 
 fn serialize_roaring(bitmap: &RoaringBitmap) -> Vec<u8> {
+    let mut bitmap = bitmap.clone();
+    bitmap.optimize();
     let mut bytes = Vec::with_capacity(bitmap.serialized_size());
     // Writing to a Vec is infallible.
     bitmap.serialize_into(&mut bytes).unwrap();
@@ -352,6 +354,34 @@ mod tests {
         };
         let err = DataOverlayFile::try_from(no_data_file).unwrap_err();
         assert!(err.to_string().contains("missing its data_file"), "{err}");
+    }
+
+    #[test]
+    fn test_coverage_bitmap_serialized_run_optimized() {
+        let bitmap = RoaringBitmap::from_sorted_iter(0..1_000_000).unwrap();
+        let unoptimized_size = bitmap.serialized_size();
+
+        let overlay = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![3], None),
+            coverage: OverlayCoverage::dense(bitmap.clone()),
+            committed_version: 1,
+        };
+
+        let proto = pb::DataOverlayFile::from(&overlay);
+        let Some(pb::data_overlay_file::Coverage::SharedOffsetBitmap(bytes)) = &proto.coverage
+        else {
+            panic!("dense coverage must serialize as a shared offset bitmap");
+        };
+        assert!(
+            bytes.len() < unoptimized_size / 100,
+            "expected run-optimized coverage ({} bytes) to be <1% of the \
+             unoptimized serialization ({} bytes)",
+            bytes.len(),
+            unoptimized_size
+        );
+
+        let recovered = DataOverlayFile::try_from(proto).unwrap();
+        assert_eq!(recovered.coverage, OverlayCoverage::dense(bitmap));
     }
 
     #[test]

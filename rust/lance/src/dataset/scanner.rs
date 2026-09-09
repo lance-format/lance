@@ -1117,6 +1117,9 @@ pub struct Scanner {
     /// Number of bytes to allow to queue up in the I/O buffer
     io_buffer_size: Option<u64>,
 
+    /// Total bytes reserved by asynchronously materialized blob v2 batches
+    materialization_readahead_bytes: Option<u64>,
+
     limit: Option<i64>,
     offset: Option<i64>,
 
@@ -1399,6 +1402,7 @@ impl Scanner {
             batch_readahead: get_num_compute_intensive_cpus(),
             fragment_readahead: None,
             io_buffer_size: None,
+            materialization_readahead_bytes: None,
             limit: None,
             offset: None,
             ordering: None,
@@ -1764,6 +1768,27 @@ impl Scanner {
     ///
     pub fn io_buffer_size(&mut self, size: u64) -> &mut Self {
         self.io_buffer_size = Some(size);
+        self
+    }
+
+    /// Set the memory budget for asynchronous blob v2 materialization.
+    ///
+    /// Blob descriptors are decoded before their payloads are fetched. When this
+    /// budget is set, payload materialization may run ahead while the aggregate
+    /// descriptor arrays, output offsets, and payload bytes awaiting ordered
+    /// emission stay within `size`. Admission follows output order, and each
+    /// reservation is retained until its batch is emitted. A single oversized
+    /// batch is admitted when no other materialization is reserved, which
+    /// guarantees forward progress. External descriptors without a stored size
+    /// resolve the complete object length before admission.
+    ///
+    /// This budget is separate from [`Self::io_buffer_size`], which controls the
+    /// storage I/O scheduler, and [`Self::batch_size_bytes`], which targets the
+    /// size of individual decoded batches. If this setting is not provided,
+    /// Blob v2 materialization has no independent memory bound. A size of zero
+    /// is rejected when the scan plan is built.
+    pub fn materialization_readahead_bytes(&mut self, size: u64) -> &mut Self {
+        self.materialization_readahead_bytes = Some(size);
         self
     }
 
@@ -2846,6 +2871,12 @@ impl Scanner {
             ));
         }
 
+        if self.materialization_readahead_bytes == Some(0) {
+            return Err(Error::invalid_input_source(
+                "materialization_readahead_bytes must be greater than 0, got 0".into(),
+            ));
+        }
+
         if let Some(batch_size) = self.batch_size {
             validate_batch_size(batch_size)?;
         }
@@ -3464,6 +3495,11 @@ impl Scanner {
 
         if let Some(io_buffer_size_bytes) = self.io_buffer_size {
             read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
+        }
+
+        if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
+            read_options =
+                read_options.with_materialization_readahead_bytes(materialization_readahead_bytes);
         }
 
         if self.fast_search && filter_plan.has_index_query() {
@@ -6196,6 +6232,7 @@ impl Scanner {
             batch_readahead: self.batch_readahead,
             fragment_readahead: self.fragment_readahead,
             io_buffer_size: self.get_io_buffer_size(),
+            materialization_readahead_bytes: self.materialization_readahead_bytes,
             with_row_id,
             with_row_address,
             with_row_last_updated_at_version,
@@ -6850,6 +6887,22 @@ impl Scanner {
             }
             if let Some(fragments) = &self.fragments {
                 read_options = read_options.with_fragments(Arc::new(fragments.clone()));
+            }
+            read_options = read_options.with_threading_mode(
+                FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
+            );
+            if let Some(file_reader_options) = self.resolved_file_reader_options() {
+                read_options = read_options.with_file_reader_options(file_reader_options);
+            }
+            if let Some(fragment_readahead) = self.fragment_readahead {
+                read_options = read_options.with_fragment_readahead(fragment_readahead);
+            }
+            if let Some(io_buffer_size_bytes) = self.io_buffer_size {
+                read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
+            }
+            if let Some(materialization_readahead_bytes) = self.materialization_readahead_bytes {
+                read_options = read_options
+                    .with_materialization_readahead_bytes(materialization_readahead_bytes);
             }
             return Ok(Arc::new(FilteredReadExec::try_new(
                 self.dataset.clone(),
@@ -11837,6 +11890,82 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_fm_index_with_stable_row_ids() {
+        let batch = arrow_array::record_batch!(
+            (
+                "text",
+                Utf8,
+                [
+                    "alpha",
+                    "needle in first",
+                    "beta",
+                    "first needle suffix",
+                    "delta",
+                    "needle in second",
+                    "epsilon",
+                    "second needle suffix"
+                ]
+            ),
+            ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let write_params = WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://test_fm_index_with_stable_row_ids",
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm);
+        dataset
+            .create_index(&["text"], IndexType::Fm, None, &params, true)
+            .await
+            .unwrap();
+
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter("contains(text, 'needle')").unwrap();
+        let indexed_plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(
+            indexed_plan.contains("ScalarIndexQuery") && indexed_plan.contains("Fm"),
+            "expected the FM index in the plan, got:\n{indexed_plan}"
+        );
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+        let unindexed = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter("contains(text, 'needle')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let indexed_ids = indexed["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let unindexed_ids = unindexed["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(unindexed_ids, BTreeSet::from([1, 3, 5, 7]));
+        assert_eq!(indexed_ids, unindexed_ids);
+    }
+
+    #[tokio::test]
     async fn test_ngram_regex_index_scan() {
         use arrow::array::AsArray;
 
@@ -13358,7 +13487,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "memory://test",
             Some(WriteParams {
                 commit_handler: Some(Arc::new(RenameCommitHandler)),
-                data_storage_version: Some(LanceFileVersion::Stable),
+                data_storage_version: Some(LanceFileVersion::V2_1),
                 ..Default::default()
             }),
         )
@@ -13446,7 +13575,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "memory://test",
             Some(WriteParams {
                 commit_handler: Some(Arc::new(RenameCommitHandler)),
-                data_storage_version: Some(LanceFileVersion::Stable),
+                data_storage_version: Some(LanceFileVersion::V2_1),
                 ..Default::default()
             }),
         )
@@ -16001,6 +16130,43 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let filtered = find_filtered_read(plan.as_ref())
             .expect("expected a FilteredReadExec in the scan plan");
         assert_eq!(filtered.options().io_buffer_size_bytes, Some(7777));
+    }
+
+    #[tokio::test]
+    async fn test_materialization_readahead_bytes_propagated() {
+        let data = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(data, "memory://test_materialization_readahead_bytes", None)
+            .await
+            .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner.materialization_readahead_bytes(7777);
+        let plan = scanner.create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert_eq!(
+            filtered.options().materialization_readahead_bytes,
+            Some(7777)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zero_materialization_readahead_bytes_rejected() {
+        let data = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(data, "memory://test_zero_materialization_budget", None)
+            .await
+            .unwrap();
+        let mut scanner = dataset.scan();
+        scanner.materialization_readahead_bytes(0);
+        let err = scanner.create_plan().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("materialization_readahead_bytes must be greater than 0")
+        );
     }
 
     #[tokio::test]

@@ -103,7 +103,8 @@ pub struct TransactionKey<'a> {
     /// history at 1, so a long-lived session's cache can otherwise return the
     /// previous incarnation's transaction for a version number the new
     /// incarnation now also holds. The e-tag disambiguates generations the
-    /// same way [`ManifestKey::e_tag`] does.
+    /// same way [`ManifestKey::e_tag`] does. Callers without one must bypass
+    /// the shared transaction cache.
     pub e_tag: Option<&'a str>,
 }
 
@@ -182,7 +183,8 @@ pub struct RowAddrMaskKey<'a> {
     /// for different subsets must not poison each other's cache entry.
     pub restrict_hash: Option<u64>,
     /// See [`TransactionKey::e_tag`]: disambiguates a same-URI drop/recreate
-    /// generation collision on `version`.
+    /// generation collision on `version`. Callers without one must bypass the
+    /// shared row-address-mask cache.
     pub e_tag: Option<&'a str>,
 }
 
@@ -224,8 +226,12 @@ impl CacheKey for RowAddrMaskKey<'_> {
 #[derive(Debug)]
 pub struct RowIdIndexKey<'a> {
     pub version: u64,
-    /// See [`TransactionKey::e_tag`]: disambiguates a same-URI drop/recreate
-    /// generation collision on `version`.
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1, so a long-lived session's cache can otherwise return the
+    /// previous incarnation's index for a version number the new incarnation
+    /// now also holds. The e-tag disambiguates generations the same way
+    /// [`ManifestKey::e_tag`] does. Callers without one must not share the
+    /// cached index at all (see `get_row_id_index`).
     pub e_tag: Option<&'a str>,
 }
 

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::signed_zero::{normalize_zero_comparisons, rewrite_signed_zero_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
@@ -1060,7 +1061,24 @@ impl Planner {
 
         // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
+
+        // Fold each comparison's own operands and rewrite it before anything above
+        // it folds. `simplify` folds an operand and everything above it in one
+        // pass, so a fully constant predicate whose zero appears only as a result
+        // of folding never presents a zero literal to the rewrite:
+        // `-1.0 * 0.0 < (1.0 - 1.0)` answered `true` where IEEE says false, and a
+        // wrapper such as `IS TRUE` or a `CAST` did the same to the comparison's
+        // own result.
+        let expr = normalize_zero_comparisons(expr, &|operand| simplifier.simplify(operand))?;
+
+        // Again after simplify, which is what expands `BETWEEN` into two
+        // comparisons and folds the casts `coerce` inserts, so those forms only
+        // become visible on this pass.
+        //
+        // Running the rewrite more than once is safe because its output is a fixed
+        // point of `optimize_expr`; `optimizing_twice_changes_nothing` pins that.
         let expr = simplifier.simplify(expr)?;
+        let expr = rewrite_signed_zero_comparisons(expr)?;
 
         Ok(expr)
     }

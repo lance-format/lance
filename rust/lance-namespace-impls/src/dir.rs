@@ -30,7 +30,10 @@ use lance_index::scalar::{
     BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
 };
 use lance_index::vector::{
-    bq::RQBuildParams, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+    bq::{RABIT_MAX_NUM_BITS, RABIT_MIN_NUM_BITS, RQBuildParams, validate_supported_rq_num_bits},
+    hnsw::builder::HnswBuildParams,
+    ivf::IvfBuildParams,
+    pq::PQBuildParams,
     sq::builder::SQBuildParams,
 };
 use lance_index::{IndexType, is_system_index};
@@ -49,6 +52,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
 use crate::context::DynamicContextProvider;
+use crate::merge_insert_on_columns;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
@@ -2454,14 +2458,30 @@ impl DirectoryNamespace {
                     SQBuildParams::default(),
                 ),
             },
-            IndexType::IvfRq => DirectoryIndexParams::Vector {
-                index_type,
-                params: VectorIndexParams::with_ivf_rq_params(
-                    Self::parse_metric_type(request.distance_type.as_deref())?,
-                    IvfBuildParams::default(),
-                    RQBuildParams::default(),
-                ),
-            },
+            IndexType::IvfRq => {
+                let rq_params = if let Some(requested_num_bits) = request.num_bits {
+                    let invalid_num_bits = || NamespaceError::InvalidInput {
+                        message: format!(
+                            "IVF_RQ num_bits must be in {}..={}, got {}",
+                            RABIT_MIN_NUM_BITS, RABIT_MAX_NUM_BITS, requested_num_bits
+                        ),
+                    };
+                    let num_bits =
+                        u8::try_from(requested_num_bits).map_err(|_| invalid_num_bits())?;
+                    validate_supported_rq_num_bits(num_bits).map_err(|_| invalid_num_bits())?;
+                    RQBuildParams::new(num_bits)
+                } else {
+                    RQBuildParams::default()
+                };
+                DirectoryIndexParams::Vector {
+                    index_type,
+                    params: VectorIndexParams::with_ivf_rq_params(
+                        Self::parse_metric_type(request.distance_type.as_deref())?,
+                        IvfBuildParams::default(),
+                        rq_params,
+                    ),
+                }
+            }
             IndexType::IvfHnswFlat => DirectoryIndexParams::Vector {
                 index_type,
                 params: VectorIndexParams::ivf_hnsw(
@@ -5096,11 +5116,7 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<MergeInsertIntoTableResponse> {
         self.record_op("merge_insert_into_table");
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let on = request.on.as_ref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "'on' field is required for merge_insert_into_table".to_string(),
-            })
-        })?;
+        let on = merge_insert_on_columns(request.on.as_deref(), "merge_insert_into_table")?;
 
         let table_has_manifests = self.table_uri_has_actual_manifests(&table_uri).await?;
         let (reader, num_rows) =
@@ -5126,8 +5142,8 @@ impl LanceNamespace for DirectoryNamespace {
                 .await?,
         );
 
-        let mut merge_builder = MergeInsertBuilder::try_new(dataset.clone(), vec![on.clone()])
-            .map_err(|e| {
+        let mut merge_builder =
+            MergeInsertBuilder::try_new(dataset.clone(), on.to_vec()).map_err(|e| {
                 lance_core::Error::from(NamespaceError::InvalidInput {
                     message: format!("Failed to create merge_insert_into_table builder: {}", e),
                 })
@@ -6105,6 +6121,55 @@ fn build_engine_match_query(
 mod tests {
     use super::*;
     use arrow_ipc::reader::{FileReader, StreamReader};
+    use lance::index::vector::StageParams;
+    use rstest::rstest;
+
+    fn build_ivf_rq_num_bits(num_bits: Option<i32>) -> Result<u8> {
+        let mut request = CreateTableIndexRequest::new("vector".to_string(), "IVF_RQ".to_string());
+        request.num_bits = num_bits;
+
+        let DirectoryIndexParams::Vector {
+            index_type: IndexType::IvfRq,
+            params,
+        } = DirectoryNamespace::build_index_params(&request)?
+        else {
+            panic!("expected IVF_RQ vector index params");
+        };
+        match params.stages.as_slice() {
+            [StageParams::Ivf(_), StageParams::RQ(rq)] => Ok(rq.num_bits),
+            stages => panic!("expected IVF and RQ stages, got {stages:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::omitted(None, 5)]
+    #[case::explicit_one(Some(1), 1)]
+    #[case::explicit_max(Some(9), 9)]
+    fn test_build_index_params_ivf_rq_num_bits(
+        #[case] requested: Option<i32>,
+        #[case] expected: u8,
+    ) {
+        assert_eq!(build_ivf_rq_num_bits(requested).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::negative(-1)]
+    #[case::zero(0)]
+    #[case::above_max(10)]
+    #[case::conversion_overflow(i32::MAX)]
+    fn test_build_index_params_rejects_invalid_ivf_rq_num_bits(#[case] requested: i32) {
+        let error = build_ivf_rq_num_bits(Some(requested))
+            .expect_err("invalid IVF_RQ num_bits should fail");
+        let message = error.to_string();
+
+        assert_eq!(mutation_error_code(error), ErrorCode::InvalidInput);
+        assert!(
+            message.contains(&format!(
+                "IVF_RQ num_bits must be in 1..=9, got {requested}"
+            )),
+            "unexpected error message: {message}"
+        );
+    }
 
     #[test]
     fn test_build_engine_fts_query_match() {
@@ -11316,7 +11381,7 @@ mod tests {
 
         let mut merge_req = MergeInsertIntoTableRequest::new();
         merge_req.id = Some(vec!["test_table".to_string()]);
-        merge_req.on = Some("id".to_string());
+        merge_req.on = Some(vec!["id".to_string()]);
         let response = namespace
             .merge_insert_into_table(
                 merge_req,
@@ -11367,7 +11432,7 @@ mod tests {
 
         let mut merge_req = MergeInsertIntoTableRequest::new();
         merge_req.id = Some(vec!["test_table".to_string()]);
-        merge_req.on = Some("id".to_string());
+        merge_req.on = Some(vec!["id".to_string()]);
         let response = namespace
             .merge_insert_into_table(
                 merge_req,
@@ -11392,6 +11457,244 @@ mod tests {
         assert_eq!(
             namespace.list_tables(list_req).await.unwrap().tables,
             vec!["test_table".to_string()]
+        );
+    }
+
+    /// `(region, id, value)` rows, for merge inserts keyed on `region` + `id`.
+    ///
+    /// `region` is nullable so tests can cover a NULL in one half of the key.
+    fn create_composite_key_ipc_data(rows: &[(Option<&str>, i32, &str)]) -> Vec<u8> {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter(
+                    rows.iter().map(|(region, _, _)| *region),
+                )),
+                Arc::new(Int32Array::from_iter_values(
+                    rows.iter().map(|(_, id, _)| *id),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    rows.iter().map(|(_, _, value)| *value),
+                )),
+            ],
+        )
+        .unwrap();
+        create_ipc_data_from_batches(schema, vec![batch])
+    }
+
+    /// `test_table`'s rows as `(region, id, value)`, sorted for a stable comparison.
+    async fn read_composite_key_rows(root: &str) -> Vec<(Option<String>, i32, String)> {
+        use arrow::array::Array;
+
+        let dataset = Dataset::open(&format!("{}/test_table.lance", root))
+            .await
+            .unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let regions = batch["region"]
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let ids = batch["id"]
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        let values = batch["value"]
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        let mut rows: Vec<_> = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    regions
+                        .is_valid(row)
+                        .then(|| regions.value(row).to_string()),
+                    ids.value(row),
+                    values.value(row).to_string(),
+                )
+            })
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_matches_on_every_column_of_a_composite_key() {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let seed = create_composite_key_ipc_data(&[
+            (Some("us"), 1, "a"),
+            (Some("us"), 2, "b"),
+            (Some("eu"), 1, "c"),
+        ]);
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        namespace
+            .merge_insert_into_table(merge_req, bytes::Bytes::from(seed))
+            .await
+            .unwrap();
+
+        // ("us", 1) matches an existing row; ("eu", 2) matches nothing even though a row
+        // with region "eu" and a row with id 2 both exist.
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        merge_req.when_matched_update_all = Some(true);
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[
+                    (Some("us"), 1, "updated"),
+                    (Some("eu"), 2, "inserted"),
+                ])),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.num_updated_rows, Some(1));
+        assert_eq!(response.num_inserted_rows, Some(1));
+
+        assert_eq!(
+            read_composite_key_rows(temp_path).await,
+            vec![
+                // ("eu", 1) keeps its value: matching on `id` alone would have clobbered it.
+                (Some("eu".into()), 1, "c".into()),
+                (Some("eu".into()), 2, "inserted".into()),
+                (Some("us".into()), 1, "updated".into()),
+                (Some("us".into()), 2, "b".into()),
+            ]
+        );
+    }
+
+    /// Core switches NULL join semantics on the arity of the match key
+    /// (`merge_insert.rs`, `NullEquality`): a single-column key treats NULL as equal to
+    /// NULL, while a composite key uses standard SQL equality, under which it is not. So
+    /// adding a second key column changes whether NULL-keyed rows match at all.
+    #[tokio::test]
+    async fn test_merge_insert_composite_key_never_matches_a_null_key_column() {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[
+                    (None, 1, "seeded"),
+                    (Some("us"), 1, "us-seeded"),
+                ])),
+            )
+            .await
+            .unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = Some(vec!["region".to_string(), "id".to_string()]);
+        merge_req.when_matched_update_all = Some(true);
+        let response = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[(None, 1, "not-a-match")])),
+            )
+            .await
+            .unwrap();
+
+        // The incoming row is byte-identical to the seeded one, and still does not match.
+        assert_eq!(response.num_updated_rows, Some(0));
+        assert_eq!(response.num_inserted_rows, Some(1));
+
+        assert_eq!(
+            read_composite_key_rows(temp_path).await,
+            vec![
+                (None, 1, "not-a-match".into()),
+                (None, 1, "seeded".into()),
+                (Some("us".into()), 1, "us-seeded".into()),
+            ]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing(None, "'on' field is required")]
+    #[case::empty(Some(vec![]), "must name at least one column")]
+    #[case::duplicate(
+        Some(vec!["region".to_string(), "region".to_string()]),
+        "names column 'region' more than once"
+    )]
+    #[tokio::test]
+    async fn test_merge_insert_rejects_an_invalid_on_key(
+        #[case] on: Option<Vec<String>>,
+        #[case] expected_message: &str,
+    ) {
+        use lance_namespace::models::{DeclareTableRequest, MergeInsertIntoTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        namespace.declare_table(declare_req).await.unwrap();
+
+        let mut merge_req = MergeInsertIntoTableRequest::new();
+        merge_req.id = Some(vec!["test_table".to_string()]);
+        merge_req.on = on;
+        let error = namespace
+            .merge_insert_into_table(
+                merge_req,
+                bytes::Bytes::from(create_composite_key_ipc_data(&[(Some("us"), 1, "a")])),
+            )
+            .await
+            .unwrap_err();
+
+        let lance_core::Error::Namespace { source, .. } = &error else {
+            panic!("expected a Namespace error, got: {}", error);
+        };
+        let ns_err = source
+            .downcast_ref::<NamespaceError>()
+            .expect("expected a NamespaceError source");
+        assert_eq!(ns_err.code(), lance_namespace::ErrorCode::InvalidInput);
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error message: {error}"
         );
     }
 

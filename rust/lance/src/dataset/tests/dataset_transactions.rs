@@ -225,6 +225,35 @@ async fn test_session_store_registry() {
     assert_eq!(registry.active_stores().len(), 0);
 }
 
+#[test]
+fn test_decode_inline_transaction_tolerates_unknown_operations() {
+    use crate::dataset::decode_inline_transaction;
+    use lance_table::format::pb;
+    use prost::Message;
+
+    // A transaction written by a newer version of Lance may carry an operation
+    // this version cannot decode; prost surfaces it as a missing oneof. This
+    // must not fail (it would prevent opening the dataset), only skip caching.
+    let unknown_operation = pb::Transaction {
+        read_version: 1,
+        uuid: "test".to_string(),
+        ..Default::default()
+    };
+    assert!(decode_inline_transaction(&unknown_operation.encode_to_vec(), 42).is_none());
+
+    // Corrupt bytes are likewise tolerated.
+    assert!(decode_inline_transaction(&[0xff, 0xff, 0xff], 42).is_none());
+
+    // A decodable transaction is returned.
+    let known = pb::Transaction::from(&Transaction::new(
+        1,
+        Operation::Append { fragments: vec![] },
+        None,
+    ));
+    let decoded = decode_inline_transaction(&known.encode_to_vec(), 42).unwrap();
+    assert!(matches!(decoded.operation, Operation::Append { .. }));
+}
+
 #[tokio::test]
 async fn test_migrate_v2_manifest_paths() {
     let test_uri = TempStrDir::default();
@@ -1718,7 +1747,7 @@ async fn test_transaction_cache_does_not_survive_drop_recreate_same_uri() {
             session: Some(session),
             ..Default::default()
         };
-        let dataset = Dataset::write(
+        let mut dataset = Dataset::write(
             RecordBatchIterator::new([Ok(batch)], schema),
             uri,
             Some(write_params),
@@ -1726,6 +1755,7 @@ async fn test_transaction_cache_does_not_survive_drop_recreate_same_uri() {
         .await
         .unwrap();
         assert_eq!(dataset.version().version, 1);
+        dataset.manifest_location.e_tag = None;
         dataset.read_transaction().await.unwrap().unwrap().uuid
     }
 
@@ -1753,12 +1783,13 @@ async fn test_transaction_cache_does_not_survive_drop_recreate_same_uri() {
         "the recreated dataset should commit a new transaction"
     );
 
-    let reopened = DatasetBuilder::from_uri(test_uri)
+    let mut reopened = DatasetBuilder::from_uri(test_uri)
         .with_session(qn_session)
         .load()
         .await
         .unwrap();
     assert_eq!(reopened.version().version, 1);
+    reopened.manifest_location.e_tag = None;
     let cached_uuid = reopened.read_transaction().await.unwrap().unwrap().uuid;
     assert_eq!(
         cached_uuid, second_uuid,

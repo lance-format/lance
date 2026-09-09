@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::OpsMetrics;
+use crate::merge_insert_on_columns;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1011,14 +1012,13 @@ impl LanceNamespace for RestNamespace {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
 
-        let on = request.on.as_deref().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "'on' field is required for merge insert".to_string(),
-            })
-        })?;
+        let on = merge_insert_on_columns(request.on.as_deref(), "merge_insert_into_table")?;
 
         let path = format!("/v1/table/{}/merge_insert", encoded_id);
-        let mut query = vec![("delimiter", self.delimiter.as_str()), ("on", on)];
+        // The `on` query parameter uses `style: form, explode: true`, so a composite key
+        // repeats the parameter once per column.
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        query.extend(on.iter().map(|column| ("on", column.as_str())));
 
         let when_matched_update_all_str;
         if let Some(v) = request.when_matched_update_all {

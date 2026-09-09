@@ -643,9 +643,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         Generate the execution plan for the merge insert operation.
 
-        This method creates the execution plan that would be used for the given
-        source schema and returns it as a formatted string for debugging and
-        analysis purposes.
+        This reports the plan a *streaming* source of the given schema would run.
+        It takes a schema rather than data, so it cannot know how ``execute`` would
+        wrap the source; see the note under the example.
 
         Parameters
         ----------
@@ -686,6 +686,13 @@ class MergeInsertBuilder(_MergeInsertBuilder):
                   ProjectionExec: expr=[..., true as __merge_source_sentinel]
                     StreamingTableExec: partition_sizes=1, ...
         <BLANKLINE>
+
+        This is always the streaming shape. `explain_plan` receives a schema rather
+        than data, so it cannot know how `execute` would wrap the source, and the
+        wrapping affects the plan. Use `analyze_plan`, which receives the real
+        source, when that matters. Note that `analyze_plan` runs the merge to
+        collect metrics and may write data files, whereas `explain_plan` writes
+        nothing.
 
         >>> # Or with explicit schema
         >>> source_schema = pa.schema([
@@ -761,11 +768,19 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             MergeInsert: elapsed=..., on=[id], ..., metrics=[..., bytes_written=..., ...]
               CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
                 ProjectionExec: elapsed=..., expr=[...], metrics=[...]
-                  HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
-                    LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
-                    RepartitionExec: ...
+                  RepartitionExec: ...
+                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Left, ...
                       ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
-                        StreamingTableExec: ..., metrics=[]
+                        DataSourceExec: ..., metrics=[]
+                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
+
+        The reported plan follows how the source was passed. `new_data` above is a
+        `pa.Table`, so it is wrapped in an in-memory table that reports exact
+        statistics, while a `pa.RecordBatchReader` reports none. DataFusion chooses
+        which side of the join to collect from those statistics and from the two
+        sides' sizes, so the same merge can plan differently depending on which one
+        you hand it. Use `explain_plan` only for the streaming shape: it takes a
+        schema rather than data, so it cannot know how the source would be wrapped.
 
         The two key parts of the plan analysis are LanceRead and MergeInsert.
         LanceRead scans join keys and columns in conditions. MergeInsert writes
@@ -786,6 +801,13 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - requests: number of storage requests made
         """  # noqa: E501
         reader = _coerce_reader(data_obj, schema)
+
+        # Route exactly as execute() does, so the reported plan is the one that
+        # would run. A materialized source reports exact statistics where a stream
+        # reports none, which can change which side of the join is collected.
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).analyze_plan_batches(reader)
+
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
     def mark_sstables_as_compacted(
@@ -2485,6 +2507,52 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["limit"] = num_rows
         return self.scanner(**kwargs).to_table()
 
+    def slice(
+        self,
+        start: int,
+        end: int,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+    ) -> pa.Table:
+        """Select a contiguous range of rows by position.
+
+        Equivalent to ``dataset.take(list(range(start, end)))``, but pushed
+        down as an offset/limit scan instead of a materialized index list.
+
+        Parameters
+        ----------
+        start : int
+            The index of the first row to include (inclusive). Must be
+            non-negative.
+        end : int
+            The index to stop before (exclusive). Must be greater than or
+            equal to ``start``.
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
+
+        Returns
+        -------
+        table : pyarrow.Table
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> tbl = pa.table({"id": range(100)})
+        >>> dataset = lance.write_dataset(tbl, "memory://slice_dataset")
+        >>> dataset.slice(10, 20)
+        pyarrow.Table
+        id: int64
+        ----
+        id: [[10,11,12,13,14,15,16,17,18,19]]
+        """
+        if start < 0:
+            raise ValueError(f"start must be non-negative, got {start}")
+        if end < start:
+            raise ValueError(f"end ({end}) must be >= start ({start})")
+        return self.scanner(offset=start, limit=end - start, columns=columns).to_table()
+
     def count_rows(
         self, filter: Optional[Union[str, pa.compute.Expression]] = None, **kwargs
     ) -> int:
@@ -3199,6 +3267,7 @@ class LanceDataset(pa.dataset.Dataset):
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -3244,8 +3313,13 @@ class LanceDataset(pa.dataset.Dataset):
             deletions run at full speed. Set this to a positive integer to avoid
             hitting object store request rate limits (e.g. S3 HTTP 503 SlowDown).
             For example, ``delete_rate_limit=100`` limits to 100 operations/second.
+
+        versions: list[int], optional
+            Clean up only the specified dataset versions. The current version is
+            never removed, and tagged versions are still protected by
+            ``error_if_tagged_old_versions``.
         """
-        if older_than is None and retain_versions is None:
+        if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
 
         return self._ds.cleanup_old_versions(
@@ -3254,6 +3328,7 @@ class LanceDataset(pa.dataset.Dataset):
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
+            versions,
         )
 
     def explain_cleanup_old_versions(
@@ -3264,6 +3339,7 @@ class LanceDataset(pa.dataset.Dataset):
         delete_unverified: bool = False,
         error_if_tagged_old_versions: bool = True,
         delete_rate_limit: Optional[int] = None,
+        versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
     ) -> CleanupExplanation:
@@ -3291,6 +3367,9 @@ class LanceDataset(pa.dataset.Dataset):
             Accepted for parity with :meth:`cleanup_old_versions`; no deletes are
             issued by explain.
 
+        versions: list[int], optional
+            Explain cleanup only for the specified dataset versions.
+
         include_files: bool, default False
             If `True`, include candidate files in the explanation up to
             ``max_files`` entries. Aggregate stats always include all candidates.
@@ -3299,7 +3378,7 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum number of candidate files to include when ``include_files``
             is `True`.
         """
-        if older_than is None and retain_versions is None:
+        if older_than is None and retain_versions is None and versions is None:
             older_than = timedelta(days=14)
         if max_files <= 0:
             raise ValueError("max_files must be positive")
@@ -3310,6 +3389,7 @@ class LanceDataset(pa.dataset.Dataset):
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
+            versions,
             include_files,
             max_files,
         )
@@ -3646,6 +3726,7 @@ class LanceDataset(pa.dataset.Dataset):
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
+            * "ngram": produces character N-grams for substring search.
             * "icu": ICU dictionary-based Unicode word segmentation.
             * "icu/split": ICU segmentation with simple-style delimiter splitting.
         language: str, default "English"
@@ -3657,10 +3738,10 @@ class LanceDataset(pa.dataset.Dataset):
         lower_case: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert all
             text to lowercase.
-        stem: bool, default True
+        stem: bool, default True (False for the "ngram" tokenizer)
             This is for the ``INVERTED`` index. If True, the index will stem the
             tokens.
-        remove_stop_words: bool, default True
+        remove_stop_words: bool, default True (False for the "ngram" tokenizer)
             This is for the ``INVERTED`` index. If True, the index will remove
             stop words.
         custom_stop_words: Optional[List[str]], default None
@@ -4294,7 +4375,7 @@ class LanceDataset(pa.dataset.Dataset):
         Optional parameters for `IVF_RQ`:
 
             - num_bits
-                The number of bits for RQ (Rabit Quantization). Default is 1.
+                The number of bits for RQ (Rabit Quantization). Default is 5.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
@@ -4398,7 +4479,7 @@ class LanceDataset(pa.dataset.Dataset):
     def create_index_uncommitted(
         self,
         column: Union[str, List[str]],
-        index_type: str,
+        index_type: Union[str, IndexConfig],
         name: Optional[str] = None,
         metric: str = "L2",
         replace: bool = False,
@@ -7446,10 +7527,10 @@ class DatasetOptimizer:
         an expensive unindexed search on the new data.  As the amount of new
         unindexed data grows this can have an impact on search latency.
         This function will add the new data to existing indexes, restoring the
-        performance.  This function does not retrain the index, it only assigns
-        the new data to existing partitions.  This means an update is much quicker
-        than retraining the entire index but may have less accuracy (especially
-        if the new data exhibits new patterns, concepts, or trends)
+        performance. By default, this function does not retrain the index, it only
+        assigns the new data to existing partitions. This means an update is much
+        quicker than retraining the entire index but may have less accuracy
+        (especially if the new data exhibits new patterns, concepts, or trends)
 
         Parameters
         ----------
@@ -7459,7 +7540,7 @@ class DatasetOptimizer:
         index_names: List[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
-        retrain: bool, default False, deprecated
+        retrain: bool, default False
             Whether to retrain the whole index.
             If true, the index will be retrained based on the current data,
             `num_indices_to_merge` will be ignored,
@@ -7467,7 +7548,7 @@ class DatasetOptimizer:
 
             This is useful when the data distribution has changed significantly,
             and we want to retrain the index to improve the search quality.
-            This would be faster than re-create the index from scratch.
+            This rebuilds the index from the source data and may be expensive.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

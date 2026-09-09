@@ -6,7 +6,7 @@
 //! whose coverage may not line up with any single file -- the case a computed
 //! column reaches once compaction folds it into a shared base file.
 
-use std::{ops::Range, sync::Arc};
+use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow_array::types::{Int32Type, UInt64Type};
@@ -138,6 +138,50 @@ async fn declare_all_null(dataset: &mut Dataset, name: &str) {
         .add_columns(NewColumnTransform::AllNulls(arrow), None, None)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_compact_metadata_only_all_null_dictionary() {
+    let batch = batch_of(
+        vec![ArrowField::new("id", DataType::Int32, false)],
+        vec![ints(vec![1, 2])],
+    );
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            max_rows_per_file: 1,
+            enable_stable_row_ids: false,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let dictionary_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "category",
+                dictionary_type.clone(),
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch["category"].data_type(), &dictionary_type);
+    assert_eq!(batch["category"].null_count(), 2);
 }
 
 /// Stage `values` for an existing `column` of one fragment.
@@ -991,376 +1035,6 @@ async fn test_discards_staged_artifacts_on_stream_error() {
         before,
         "a stream error must not leave staged artifacts behind"
     );
-}
-
-#[tokio::test]
-async fn test_column_slices_multi_column_concat_and_serialization() {
-    let batch = arrow_array::record_batch!(
-        ("id", Int32, [0, 1, 2, 3, 4, 5]),
-        ("value", Int32, [10, 11, 12, 13, 14, 15])
-    )
-    .unwrap();
-    let dataset = dataset_of(batch, Some(LanceFileVersion::V2_1)).await;
-    let fragment = only_fragment(&dataset);
-    let schema = dataset.schema().clone();
-    let first = fragment
-        .write_columns_slice(
-            0..3,
-            stream::iter([Ok(arrow_array::record_batch!(
-                ("id", Int32, [100, 101, 102]),
-                ("value", Int32, [200, 201, 202])
-            )
-            .unwrap())]),
-            &schema,
-        )
-        .await
-        .unwrap();
-    let encoded = first.to_bytes().unwrap();
-    let round_trip = crate::dataset::fragment::ColumnSlice::from_bytes(&encoded).unwrap();
-    assert_eq!(round_trip.fragment_id(), fragment.id() as u64);
-    assert_eq!(round_trip.source_read_version(), dataset.version_id());
-    assert_eq!(round_trip.rows(), 0..3);
-    assert_eq!(round_trip.target_field_ids(), schema.field_ids());
-    let mut unsupported_version = encoded;
-    unsupported_version[4..6].copy_from_slice(&2u16.to_le_bytes());
-    let error =
-        crate::dataset::fragment::ColumnSlice::from_bytes(&unsupported_version).unwrap_err();
-    assert!(error.to_string().contains("format version 2"), "{error}");
-
-    let second = fragment
-        .write_columns_slice(
-            3..6,
-            stream::iter([Ok(arrow_array::record_batch!(
-                ("id", Int32, [103, 104, 105]),
-                ("value", Int32, [203, 204, 205])
-            )
-            .unwrap())]),
-            &schema,
-        )
-        .await
-        .unwrap();
-    let first_path = first.data_file().path.clone();
-    let second_path = second.data_file().path.clone();
-    let replacement = fragment
-        .concat_column_slices(vec![second, round_trip])
-        .await
-        .unwrap();
-    assert_ne!(replacement.1.path, first_path);
-    assert_ne!(replacement.1.path, second_path);
-
-    let batch = commit(&dataset, vec![replacement])
-        .await
-        .unwrap()
-        .scan()
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert_eq!(
-        batch["id"].as_primitive::<Int32Type>().values(),
-        &[100, 101, 102, 103, 104, 105]
-    );
-    assert_eq!(
-        batch["value"].as_primitive::<Int32Type>().values(),
-        &[200, 201, 202, 203, 204, 205]
-    );
-}
-
-#[tokio::test]
-async fn test_complete_column_slice_reuses_staged_file() {
-    let dataset = id_dataset_of(4, 1024).await;
-    let fragment = only_fragment(&dataset);
-    let schema = dataset.schema().clone();
-    let slice = fragment
-        .write_columns_slice(
-            0..4,
-            stream::iter([Ok(arrow_array::record_batch!((
-                "id",
-                Int32,
-                [11, 12, 13, 14]
-            ))
-            .unwrap())]),
-            &schema,
-        )
-        .await
-        .unwrap();
-    let staged_path = slice.data_file().path.clone();
-    let replacement = fragment.concat_column_slices(vec![slice]).await.unwrap();
-    assert_eq!(replacement.1.path, staged_path);
-    assert!(
-        dataset
-            .object_store
-            .exists(&dataset.data_dir().join(staged_path.as_str()))
-            .await
-            .unwrap()
-    );
-}
-
-#[tokio::test]
-async fn test_column_slice_unsupported_concat_falls_back_to_reencode() {
-    use bytes::Bytes;
-
-    let dataset = id_dataset_of(4, 1024).await;
-    let fragment = only_fragment(&dataset);
-    let schema = dataset.schema().clone();
-    let ordinary_first = fragment
-        .write_columns_slice(
-            0..2,
-            stream::iter([Ok(
-                arrow_array::record_batch!(("id", Int32, [10, 11])).unwrap()
-            )]),
-            &schema,
-        )
-        .await
-        .unwrap();
-    let second = fragment
-        .write_columns_slice(
-            2..4,
-            stream::iter([Ok(
-                arrow_array::record_batch!(("id", Int32, [12, 13])).unwrap()
-            )]),
-            &schema,
-        )
-        .await
-        .unwrap();
-
-    // Replace the first slice's ordinary file with an equivalent valid file
-    // carrying an extra global buffer. concat_files must classify that layout
-    // as Unsupported so the fragment adapter exercises its ordered fallback.
-    let filename = "slice-with-extra-global-buffer.lance";
-    let output_path = dataset.data_dir().join(filename);
-    let mut writer = lance_file::versions::create_writer(
-        lance_file::version::ConcreteFileVersion::V2_1,
-        dataset.object_store.create(&output_path).await.unwrap(),
-        schema.clone(),
-        lance_file::writer::FileWriterOptions::default(),
-    )
-    .unwrap();
-    writer
-        .write_batch(&arrow_array::record_batch!(("id", Int32, [10, 11])).unwrap())
-        .await
-        .unwrap();
-    writer
-        .add_global_buffer(Bytes::from_static(b"unsupported"))
-        .await
-        .unwrap();
-    let summary = writer.finish().await.unwrap();
-
-    let mut encoded = ordinary_first.to_bytes().unwrap();
-    let mut wire: serde_json::Value = serde_json::from_slice(&encoded[6..]).unwrap();
-    wire["data_file"]["path"] = filename.into();
-    wire["data_file"]["file_size_bytes"] = summary.size_bytes.into();
-    encoded.truncate(6);
-    encoded.extend(serde_json::to_vec(&wire).unwrap());
-    let first = crate::dataset::fragment::ColumnSlice::from_bytes(&encoded).unwrap();
-    let input_paths = [
-        first.data_file().path.clone(),
-        second.data_file().path.clone(),
-    ];
-    let replacement = fragment
-        .concat_column_slices(vec![first, second])
-        .await
-        .unwrap();
-    assert!(!input_paths.contains(&replacement.1.path));
-    for input_path in &input_paths {
-        assert!(
-            dataset
-                .object_store
-                .exists(&dataset.data_dir().join(input_path.as_str()))
-                .await
-                .unwrap()
-        );
-    }
-    let dataset = commit(&dataset, vec![replacement]).await.unwrap();
-    dataset.validate().await.unwrap();
-    assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
-}
-
-#[tokio::test]
-async fn test_blob_column_slices_fall_back_to_reencode() {
-    use crate::blob::{BlobArrayBuilder, blob_field};
-    use lance_core::datatypes::BlobHandling;
-
-    let arrow_schema = Arc::new(ArrowSchema::new(vec![blob_field("blob", true)]));
-    let blobs = |values: [&[u8]; 2]| {
-        let mut builder = BlobArrayBuilder::new(values.len());
-        for value in values {
-            builder.push_bytes(value).unwrap();
-        }
-        RecordBatch::try_new(arrow_schema.clone(), vec![builder.finish().unwrap()]).unwrap()
-    };
-    let dataset = dataset_of(
-        blobs([b"original-0", b"original-1"]),
-        Some(LanceFileVersion::V2_2),
-    )
-    .await;
-    let fragment = only_fragment(&dataset);
-    let schema = dataset.schema().clone();
-    let first = fragment
-        .write_columns_slice(
-            0..1,
-            stream::iter([Ok(blobs([b"replacement-0", b"unused"]).slice(0, 1))]),
-            &schema,
-        )
-        .await
-        .unwrap();
-    let second = fragment
-        .write_columns_slice(
-            1..2,
-            stream::iter([Ok(blobs([b"replacement-1", b"unused"]).slice(0, 1))]),
-            &schema,
-        )
-        .await
-        .unwrap();
-
-    let replacement = fragment
-        .concat_column_slices(vec![second, first])
-        .await
-        .unwrap();
-    let dataset = commit(&dataset, vec![replacement]).await.unwrap();
-    dataset.validate().await.unwrap();
-    let mut scanner = dataset.scan();
-    scanner.blob_handling(BlobHandling::AllBinary);
-    let batch = scanner.try_into_batch().await.unwrap();
-    let values = batch["blob"].as_binary::<i64>();
-    assert_eq!(values.value(0), b"replacement-0");
-    assert_eq!(values.value(1), b"replacement-1");
-}
-
-#[tokio::test]
-async fn test_column_slice_rejects_gap_overlap_duplicate_and_mixed_fields() {
-    let batch = arrow_array::record_batch!(
-        ("id", Int32, [0, 1, 2, 3]),
-        ("value", Int32, [10, 11, 12, 13])
-    )
-    .unwrap();
-    let dataset = dataset_of(batch, Some(LanceFileVersion::V2_1)).await;
-    let fragment = only_fragment(&dataset);
-    let id_schema = declared_schema(&dataset, "id");
-    let value_schema = declared_schema(&dataset, "value");
-    let write = |rows: Range<u64>, values: Vec<i32>, schema: LanceSchema, name: &'static str| {
-        let fragment = fragment.clone();
-        async move {
-            fragment
-                .write_columns_slice(
-                    rows,
-                    stream::iter([Ok(batch_of(
-                        vec![ArrowField::new(name, DataType::Int32, false)],
-                        vec![ints(values)],
-                    ))]),
-                    &schema,
-                )
-                .await
-                .unwrap()
-        }
-    };
-    let first = write(0..2, vec![1, 2], id_schema.clone(), "id").await;
-    let gap = write(3..4, vec![4], id_schema.clone(), "id").await;
-    let error = fragment
-        .concat_column_slices(vec![first.clone(), gap])
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("gap"), "{error}");
-
-    let overlap = write(1..4, vec![2, 3, 4], id_schema.clone(), "id").await;
-    let error = fragment
-        .concat_column_slices(vec![first.clone(), overlap])
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("overlap"), "{error}");
-
-    let error = fragment
-        .concat_column_slices(vec![first.clone(), first.clone()])
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("duplicates"), "{error}");
-
-    let value = write(2..4, vec![12, 13], value_schema, "value").await;
-    let error = fragment
-        .concat_column_slices(vec![first, value])
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("targets fields"), "{error}");
-}
-
-#[tokio::test]
-async fn test_column_slice_rejects_mixed_snapshot_and_wrong_row_count() {
-    let mut dataset = id_dataset_of(4, 1024).await;
-    let schema = dataset.schema().clone();
-    let old_fragment = only_fragment(&dataset);
-    let old_slice = old_fragment
-        .write_columns_slice(
-            0..2,
-            stream::iter([Ok(
-                arrow_array::record_batch!(("id", Int32, [10, 11])).unwrap()
-            )]),
-            &schema,
-        )
-        .await
-        .unwrap();
-
-    let error = old_fragment
-        .write_columns_slice(
-            2..4,
-            stream::iter([Ok(arrow_array::record_batch!(("id", Int32, [12])).unwrap())]),
-            &schema,
-        )
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("has 1 rows"), "{error}");
-
-    dataset.delete("id = 1").await.unwrap();
-    let current_fragment = only_fragment(&dataset);
-    let current_slice = current_fragment
-        .write_columns_slice(
-            2..4,
-            stream::iter([Ok(
-                arrow_array::record_batch!(("id", Int32, [12, 13])).unwrap()
-            )]),
-            &schema,
-        )
-        .await
-        .unwrap();
-    let error = current_fragment
-        .concat_column_slices(vec![old_slice, current_slice])
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("dataset version"), "{error}");
-}
-
-#[tokio::test]
-async fn test_column_slice_missing_input_is_error_and_preserves_other_inputs() {
-    let dataset = id_dataset_of(4, 1024).await;
-    let fragment = only_fragment(&dataset);
-    let schema = dataset.schema().clone();
-    let first = fragment
-        .write_columns_slice(
-            0..2,
-            stream::iter([Ok(
-                arrow_array::record_batch!(("id", Int32, [10, 11])).unwrap()
-            )]),
-            &schema,
-        )
-        .await
-        .unwrap();
-    let second = fragment
-        .write_columns_slice(
-            2..4,
-            stream::iter([Ok(
-                arrow_array::record_batch!(("id", Int32, [12, 13])).unwrap()
-            )]),
-            &schema,
-        )
-        .await
-        .unwrap();
-    let first_path = dataset.data_dir().join(first.data_file().path.as_str());
-    let second_path = dataset.data_dir().join(second.data_file().path.as_str());
-    dataset.object_store.delete(&first_path).await.unwrap();
-
-    fragment
-        .concat_column_slices(vec![first, second])
-        .await
-        .unwrap_err();
-    assert!(dataset.object_store.exists(&second_path).await.unwrap());
 }
 
 #[tokio::test]

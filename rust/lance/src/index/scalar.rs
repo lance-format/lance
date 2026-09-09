@@ -39,7 +39,7 @@ use lance_core::datatypes::Field;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
-use lance_index::frag_reuse::FragReuseIndexHandle;
+use lance_index::frag_reuse::CompactFragReuseIndexHandle;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pb::VectorIndexDetails;
 use lance_index::pbold::{
@@ -578,8 +578,8 @@ pub async fn open_scalar_index(
         .index_cache
         .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
-    let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> =
-        frag_reuse_index.map(|f| Arc::new(FragReuseIndexHandle(f)) as Arc<dyn RowIdRemapper>);
+    let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> = frag_reuse_index
+        .map(|f| Arc::new(CompactFragReuseIndexHandle(f)) as Arc<dyn RowIdRemapper>);
 
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
@@ -617,7 +617,10 @@ pub(crate) async fn cached_scalar_index_container(
     let index_cache = dataset
         .index_cache
         .for_index(uuid, frag_reuse_uuid.as_ref());
-    index_cache.get_unsized_with_key(&ScalarIndexCacheKey).await
+    index_cache
+        .get_unsized_with_key(&ScalarIndexCacheKey)
+        .await
+        .map(|entry| entry.index())
 }
 
 pub(crate) async fn infer_scalar_index_details(

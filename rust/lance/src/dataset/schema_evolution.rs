@@ -28,7 +28,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
 #[cfg(test)]
 use lance_file::version::ConcreteFileVersion;
-use lance_table::format::Fragment;
+use lance_table::format::{Fragment, overlay::TOMBSTONE_FIELD_ID};
 
 pub mod optimize;
 
@@ -851,52 +851,99 @@ pub(super) async fn alter_columns(
         )
     } else {
         // Otherwise, we need to re-write the relevant fields.
-        let read_columns = cast_fields
+        let field_order = dataset
+            .schema()
+            .fields_pre_order()
+            .enumerate()
+            .map(|(position, field)| (field.id, position))
+            .collect::<HashMap<_, _>>();
+        let mut ordered_cast_fields = cast_fields
             .iter()
-            .map(|(old, _new)| {
-                let parts = dataset.schema().field_ancestry_by_id(old.id).unwrap();
-                let part_names = parts.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
-                part_names.join(".")
+            .map(|(old, new)| {
+                let position = field_order.get(&old.id).copied().ok_or_else(|| {
+                    Error::internal(format!(
+                        "Could not find field id {} for column {} while casting",
+                        old.id, old.name
+                    ))
+                })?;
+                Ok((position, old, new))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
+        ordered_cast_fields.sort_by_key(|(position, _, _)| *position);
 
-        let new_ids = cast_fields
+        let read_columns = ordered_cast_fields
             .iter()
-            .map(|(_old, new)| new.id)
+            .map(|(_, old, _)| dataset.schema().field_path_minimal(old.id))
+            .collect::<Result<Vec<_>>>()?;
+
+        let new_ids = ordered_cast_fields
+            .iter()
+            .map(|(_, _, new)| new.id)
             .collect::<Vec<_>>();
         // This schema contains the exact field ids we want to write the new fields with.
         let new_col_schema = new_schema.project_by_ids(&new_ids, true);
+        let output_schema = Arc::new(ArrowSchema::from(&new_col_schema));
 
         // A cast rewrites the column under a new field id, so data staged
-        // against the pre-cast schema omits that id and its rows read as null.
-        // Withhold the assertion when any recast field is non-nullable, at any
-        // depth: a nested field sits under parent values stale rows do supply.
-        let cast_touches_required = cast_fields.iter().any(|(_old, new)| !new.nullable);
+        // against the pre-cast schema omits that id. A required recast field
+        // reads as unmasked null. Even when a nested field is nullable, a
+        // required top-level ancestor cannot safely synthesize the missing
+        // child, following the same rule as `merge_introduces_required_field`.
+        let cast_touches_required = cast_fields.iter().try_fold(
+            false,
+            |touches_required, (_old, new)| -> Result<bool> {
+                if touches_required || !new.nullable {
+                    return Ok(true);
+                }
+                let top_level = new_schema
+                    .field_ancestry_by_id(new.id)
+                    .and_then(|ancestry| ancestry.first().copied())
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "Could not find field id {} for column {} while determining cast nullability",
+                            new.id, new.name
+                        ))
+                    })?;
+                Ok(!top_level.nullable)
+            },
+        )?;
 
         let mapper = move |batch: &RecordBatch| {
-            let mut fields = Vec::with_capacity(cast_fields.len());
-            let mut columns = Vec::with_capacity(batch.num_columns());
-            for (old, new) in &cast_fields {
-                let old_column = batch[&old.name].clone();
-                let new_column = cast_with_options(
-                    &old_column,
-                    &new.data_type(),
-                    // Safe: false means it will error if the cast is lossy.
-                    &CastOptions {
-                        safe: false,
-                        ..Default::default()
-                    },
-                )?;
-                columns.push(new_column);
-                fields.push(Arc::new(ArrowField::from(new)));
+            if batch.num_columns() != output_schema.fields().len() {
+                return Err(Error::internal(format!(
+                    "Expected {} columns while casting dataset fields, got {}",
+                    output_schema.fields().len(),
+                    batch.num_columns()
+                )));
             }
-            let schema = Arc::new(ArrowSchema::new(fields));
-            Ok(RecordBatch::try_new(schema, columns)?)
+
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(output_schema.fields())
+                .map(|(old_column, new_field)| {
+                    cast_with_options(
+                        old_column,
+                        new_field.data_type(),
+                        // Safe: false means it will error if the cast is lossy.
+                        &CastOptions {
+                            safe: false,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
         };
         let mapper = Box::new(mapper);
 
+        let source_fragments = dataset.get_fragments();
+        let original_file_counts = source_fragments
+            .iter()
+            .map(|fragment| (fragment.id() as u64, fragment.metadata.files.len()))
+            .collect::<HashMap<_, _>>();
         let result = add_columns_impl(
-            &dataset.get_fragments(),
+            &source_fragments,
             Some(read_columns),
             mapper,
             None,
@@ -912,14 +959,43 @@ pub(super) async fn alter_columns(
             .fragments
             .into_iter()
             .map(|mut frag| {
+                let original_file_count =
+                    original_file_counts.get(&frag.id).copied().ok_or_else(|| {
+                        Error::internal(format!(
+                            "Could not find source fragment {} after casting columns",
+                            frag.id
+                        ))
+                    })?;
+                let rewritten_field_ids = frag
+                    .files
+                    .iter()
+                    .skip(original_file_count)
+                    .flat_map(|file| file.fields.iter().copied())
+                    .collect::<HashSet<_>>();
+                // V1 files record struct ancestor ids, so a child rewrite also
+                // supersedes those ancestor entries in the original file.
+                for file in frag.files.iter_mut().take(original_file_count) {
+                    file.fields = file
+                        .fields
+                        .iter()
+                        .map(|field_id| {
+                            if rewritten_field_ids.contains(field_id) {
+                                TOMBSTONE_FIELD_ID
+                            } else {
+                                *field_id
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
+                }
                 frag.files.retain(|f| {
                     f.fields
                         .iter()
                         .any(|field| schema_field_ids.contains(field))
                 });
-                frag
+                Ok(frag)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
 
         Transaction::new(
             dataset.manifest.version,
@@ -1305,16 +1381,90 @@ mod test {
         Ok(())
     }
 
+    /// Regression test: when an entire read batch has been deleted, the updater
+    /// yields a 0-row batch and the deleted rows must still be restored, because
+    /// every data file in a fragment has to keep the same physical row count.
+    ///
+    /// A single fragment holds 150 rows and 50 consecutive rows are deleted. Read
+    /// with batch_size=50 the deleted run lines up exactly with one read batch,
+    /// which therefore arrives empty. The run is placed at the start, in the
+    /// middle, and at the end because the restorer treats those positions
+    /// differently: a deleted run that trails a live batch is greedily appended to
+    /// it, while a run starting at row 0 has no preceding batch to absorb it.
+    #[rstest]
+    #[case::leading("i < 50", (50..150).collect::<Vec<i32>>())]
+    #[case::middle("i >= 50 AND i < 100", (0..50).chain(100..150).collect::<Vec<i32>>())]
+    #[case::trailing("i >= 100", (0..100).collect::<Vec<i32>>())]
     #[tokio::test]
-    async fn test_add_columns_with_fully_deleted_batch() -> Result<()> {
-        // Regression test: when an entire read batch has been deleted, the
-        // updater yields a 0-row batch. The inner loop then never runs and
-        // `batches` stays empty, so `concat_batches(&batches[0]..)` used to
-        // panic with "index out of bounds: the len is 0 but the index is 0".
-        //
-        // A single fragment holds 105 rows; deleting the trailing 5 rows means
-        // that, when read with batch_size=50, the third batch [100..105) is
-        // fully filtered out and produces an empty batch.
+    async fn test_add_columns_with_fully_deleted_batch(
+        #[case] delete_predicate: &str,
+        #[case] expected_live_ids: Vec<i32>,
+        #[values(true, false)] new_column_nullable: bool,
+    ) -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..150))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 200, // keep all rows in a single fragment
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        dataset.delete(delete_predicate).await?;
+        assert_eq!(dataset.count_rows(None).await?, 100);
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "j",
+            DataType::Int32,
+            new_column_nullable,
+        )]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..100))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
+
+        // Read with batch_size=50 so the deleted rows form a full empty batch.
+        dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, Some(50))
+            .await?;
+        dataset.validate().await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), 100);
+        assert_eq!(
+            data.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(expected_live_ids)
+        );
+        assert_eq!(
+            data.column_by_name("j").unwrap().as_ref(),
+            &Int32Array::from_iter_values(0..100)
+        );
+
+        Ok(())
+    }
+
+    /// A legacy fragment whose trailing row group is entirely deleted cannot defer its
+    /// blanks: that batch reaches `add_blanks` with no live row to copy, so the update
+    /// is refused rather than writing a data file short of the deleted rows. Deferring
+    /// is what a v2 fragment does instead, which
+    /// `test_add_columns_with_fully_deleted_batch`'s trailing case covers.
+    #[tokio::test]
+    async fn test_add_columns_legacy_trailing_deleted_batch_errors() -> Result<()> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
             DataType::Int32,
@@ -1332,20 +1482,22 @@ mod test {
             reader,
             test_uri,
             Some(WriteParams {
-                max_rows_per_file: 200, // keep all rows in a single fragment
+                max_rows_per_file: 200,
+                max_rows_per_group: 50,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
         .await?;
 
-        // Delete the entire trailing batch [100..105).
+        // The last row group is [100, 105); deleting all of it leaves a trailing read
+        // batch with no live rows, which legacy files cannot defer past.
         dataset.delete("i >= 100").await?;
-        assert_eq!(dataset.count_rows(None).await?, 100);
 
         let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "j",
             DataType::Int32,
-            false,
+            true,
         )]));
         let new_batch = RecordBatch::try_new(
             new_schema.clone(),
@@ -1353,16 +1505,21 @@ mod test {
         )?;
         let reader = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
 
-        // Read with batch_size=50 so the deleted trailing rows form a full empty batch.
-        dataset
-            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, Some(50))
-            .await?;
+        let err = dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, None)
+            .await
+            .unwrap_err();
 
-        let data = dataset.scan().try_into_batch().await?;
-        assert_eq!(data.num_rows(), 100);
-        assert_eq!(
-            data.column_by_name("j").unwrap().as_ref(),
-            &Int32Array::from_iter_values(0..100)
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported, got {err:?}"
+        );
+        // Match add_blanks' own wording, not the shared "run compaction" tail: the
+        // stream-ended error in Updater::next carries that tail too, and this case
+        // fails before the stream ever runs out.
+        assert!(
+            err.to_string().contains("missing too many rows in merge"),
+            "expected the add_blanks rejection, got: {err}"
         );
 
         Ok(())
@@ -3205,6 +3362,114 @@ mod test {
         )?;
         let actual_data = dataset.scan().try_into_batch().await?;
         assert_eq!(actual_data, expected_data);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_cast_columns_reversed_order(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use arrow_array::Int64Array;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )?;
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.fragments().len(), 2);
+
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new("b".into()).cast_to(DataType::Int64),
+                ColumnAlteration::new("a".into()).cast_to(DataType::Int64),
+            ])
+            .await?;
+        dataset.validate().await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data["a"].as_ref(), &Int64Array::from(vec![1, 2]));
+        assert_eq!(data["b"].as_ref(), &Int64Array::from(vec![10, 20]));
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_cast_nested_column(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use arrow_array::{Int64Array, cast::AsArray};
+
+        let child_field = Arc::new(ArrowField::new("c", DataType::Int32, false));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![child_field.clone()])),
+            false,
+        )]));
+        let struct_array = StructArray::try_new(
+            ArrowFields::from(vec![child_field]),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            None,
+        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array)])?;
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.fragments().len(), 2);
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b.c".into()).cast_to(DataType::Int64)])
+            .await?;
+        dataset.validate().await?;
+
+        let expected_schema = ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "c",
+                DataType::Int64,
+                false,
+            )])),
+            false,
+        )]);
+        assert_eq!(&ArrowSchema::from(dataset.schema()), &expected_schema);
+
+        let data = dataset.scan().try_into_batch().await?;
+        let struct_array = data["b"].as_struct();
+        assert_eq!(
+            struct_array.column_by_name("c").unwrap().as_ref(),
+            &Int64Array::from(vec![1, 2, 3])
+        );
 
         Ok(())
     }

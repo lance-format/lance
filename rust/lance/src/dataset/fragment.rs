@@ -15,14 +15,14 @@ use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::types::UInt64Type;
 use arrow_array::{
-    Array, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array, new_null_array,
+    Array, RecordBatch, RecordBatchOptions, RecordBatchReader, StructArray, UInt32Array,
+    UInt64Array, new_null_array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::{BoxFuture, try_join_all};
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, join, stream};
-use lance_arrow::json::{convert_json_columns, has_json_fields, is_arrow_json_field};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{
     BlobHandling, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
@@ -61,7 +61,6 @@ use lance_table::utils::stream::{
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
-use serde::{Deserialize, Serialize};
 
 use self::write::FragmentCreateBuilder;
 
@@ -71,12 +70,12 @@ use super::scanner::Scanner;
 
 use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
-use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::{
     OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
 };
+use crate::dataset::utils::SchemaAdapter;
 use crate::io::deletion::read_dataset_deletion_file;
 
 /// Result of [`FileFragment::update_columns_with_offsets`]: updated fragment metadata, modified field ids,
@@ -97,98 +96,6 @@ pub struct FileFragment {
     dataset: Arc<Dataset>,
 
     pub(super) metadata: Fragment,
-}
-
-const COLUMN_SLICE_MAGIC: &[u8; 4] = b"LCSL";
-const COLUMN_SLICE_FORMAT_VERSION: u16 = 1;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ColumnSliceWire {
-    fragment_id: u64,
-    source_read_version: u64,
-    rows: Range<u64>,
-    physical_row_count: u64,
-    target_field_ids: Vec<i32>,
-    data_file: DataFile,
-}
-
-/// An immutable completed data file for one physical-row interval of existing columns.
-///
-/// A column slice contains only validation and storage facts. It is not a task,
-/// writer, retry record, or retention handle. Use [`Self::to_bytes`] and
-/// [`Self::from_bytes`] to transfer it between processes running compatible
-/// Lance versions.
-///
-/// ```
-/// # use lance::{dataset::fragment::ColumnSlice, Result};
-/// # fn transfer(slice: &ColumnSlice) -> Result<()> {
-/// let encoded = slice.to_bytes()?;
-/// let restored = ColumnSlice::from_bytes(&encoded)?;
-/// assert_eq!(restored.rows(), slice.rows());
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Debug, Clone)]
-pub struct ColumnSlice(ColumnSliceWire);
-
-impl ColumnSlice {
-    /// Fragment ID this slice was computed for.
-    pub fn fragment_id(&self) -> u64 {
-        self.0.fragment_id
-    }
-
-    /// Dataset version read by the fragment that staged this slice.
-    pub fn source_read_version(&self) -> u64 {
-        self.0.source_read_version
-    }
-
-    /// Fragment-local half-open physical row interval represented by the file.
-    pub fn rows(&self) -> Range<u64> {
-        self.0.rows.clone()
-    }
-
-    /// Ordered IDs of the complete top-level fields stored in the file.
-    pub fn target_field_ids(&self) -> &[i32] {
-        &self.0.target_field_ids
-    }
-
-    /// The completed staged Lance data file.
-    pub fn data_file(&self) -> &DataFile {
-        &self.0.data_file
-    }
-
-    /// Serialize this value with an explicit format tag.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let payload = serde_json::to_vec(&self.0)?;
-        let mut encoded = Vec::with_capacity(COLUMN_SLICE_MAGIC.len() + 2 + payload.len());
-        encoded.extend_from_slice(COLUMN_SLICE_MAGIC);
-        encoded.extend_from_slice(&COLUMN_SLICE_FORMAT_VERSION.to_le_bytes());
-        encoded.extend_from_slice(&payload);
-        Ok(encoded)
-    }
-
-    /// Deserialize a value produced by [`Self::to_bytes`].
-    pub fn from_bytes(encoded: &[u8]) -> Result<Self> {
-        if encoded.len() < COLUMN_SLICE_MAGIC.len() + 2 {
-            return Err(Error::invalid_input(
-                "ColumnSlice bytes are shorter than the format header",
-            ));
-        }
-        if &encoded[..COLUMN_SLICE_MAGIC.len()] != COLUMN_SLICE_MAGIC {
-            return Err(Error::invalid_input("ColumnSlice bytes have invalid magic"));
-        }
-        let version = u16::from_le_bytes([
-            encoded[COLUMN_SLICE_MAGIC.len()],
-            encoded[COLUMN_SLICE_MAGIC.len() + 1],
-        ]);
-        if version != COLUMN_SLICE_FORMAT_VERSION {
-            return Err(Error::not_supported(format!(
-                "ColumnSlice format version {version} is not supported; expected {COLUMN_SLICE_FORMAT_VERSION}"
-            )));
-        }
-        let wire = serde_json::from_slice(&encoded[COLUMN_SLICE_MAGIC.len() + 2..])?;
-        Ok(Self(wire))
-    }
 }
 
 const DEFAULT_BATCH_READ_SIZE: u32 = 1024;
@@ -839,70 +746,6 @@ fn relax_nullability(field: &ArrowField) -> ArrowField {
         other => other.clone(),
     };
     ArrowField::new(field.name(), data_type, true).with_metadata(field.metadata().clone())
-}
-
-/// Build the projection shape from the requested schema while preserving a
-/// blob leaf's accepted logical/prepared representation from the staged batch.
-fn staged_projection_field(staged: &ArrowField, requested: &ArrowField) -> ArrowField {
-    if crate::blob::blob_v2_layout(staged).is_some() {
-        return relax_nullability(staged);
-    }
-
-    let data_type = match (staged.data_type(), requested.data_type()) {
-        (DataType::Struct(staged_children), DataType::Struct(requested_children)) => {
-            DataType::Struct(
-                requested_children
-                    .iter()
-                    .map(|requested_child| {
-                        let staged_child = staged_children
-                            .iter()
-                            .find(|field| field.name() == requested_child.name())
-                            .expect("compatible struct contains every requested child");
-                        Arc::new(staged_projection_field(staged_child, requested_child))
-                    })
-                    .collect(),
-            )
-        }
-        (DataType::List(staged_item), DataType::List(requested_item)) => DataType::List(Arc::new(
-            staged_projection_field(staged_item, requested_item),
-        )),
-        (DataType::LargeList(staged_item), DataType::LargeList(requested_item)) => {
-            DataType::LargeList(Arc::new(staged_projection_field(
-                staged_item,
-                requested_item,
-            )))
-        }
-        (
-            DataType::FixedSizeList(staged_item, _),
-            DataType::FixedSizeList(requested_item, width),
-        ) => DataType::FixedSizeList(
-            Arc::new(staged_projection_field(staged_item, requested_item)),
-            *width,
-        ),
-        (DataType::Map(staged_entries, _), DataType::Map(requested_entries, sorted)) => {
-            match (staged_entries.data_type(), requested_entries.data_type()) {
-                (DataType::Struct(staged_kv), DataType::Struct(requested_kv))
-                    if staged_kv.len() == 2 && requested_kv.len() == 2 =>
-                {
-                    let key = Arc::new(
-                        staged_projection_field(&staged_kv[0], &requested_kv[0])
-                            .with_nullable(false),
-                    );
-                    let value = Arc::new(staged_projection_field(&staged_kv[1], &requested_kv[1]));
-                    let entries = ArrowField::new(
-                        requested_entries.name(),
-                        DataType::Struct(vec![key, value].into()),
-                        false,
-                    )
-                    .with_metadata(requested_entries.metadata().clone());
-                    DataType::Map(Arc::new(entries), *sorted)
-                }
-                _ => requested.data_type().clone(),
-            }
-        }
-        _ => requested.data_type().clone(),
-    };
-    ArrowField::new(requested.name(), data_type, true).with_metadata(requested.metadata().clone())
 }
 
 impl FileFragment {
@@ -1852,8 +1695,9 @@ impl FileFragment {
     ///
     /// Unlike logical range reads, offsets address the immutable rows stored in
     /// the fragment's files. Deleted positions remain present with their stored
-    /// column values. This is the matching read primitive for preparing input to
-    /// [`Self::write_columns_slice`].
+    /// column values. Callers can stream the batches into
+    /// [`Dataset::write_data_file_part`](super::Dataset::write_data_file_part)
+    /// when independently computing a physical-row part.
     ///
     /// ```
     /// # use lance::{dataset::fragment::FileFragment, Result};
@@ -2314,17 +2158,10 @@ impl FileFragment {
             None
         };
         // Hash join: rows matched on the right-hand stream rewrite columns; track physical offsets via `_rowaddr`.
-        // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary) in the right stream
-        // so they match the physical storage format read from the fragment's left batch.
-        let right_stream: Box<dyn RecordBatchReader + Send> = if right_schema
-            .fields()
-            .iter()
-            .any(|f| is_arrow_json_field(f) || has_json_fields(f))
-        {
-            Box::new(JsonConvertingReader::new(right_stream))
-        } else {
-            right_stream
-        };
+        // Convert the right stream from its logical form (Arrow JSON, view types)
+        // to the physical form stored on disk so it matches the fragment's left batch.
+        let right_stream =
+            SchemaAdapter::new(right_schema.clone()).to_physical_reader(right_stream);
         let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
         let mut matched_offsets = RoaringBitmap::new();
         let frag_id_u32 = u32::try_from(self.metadata.id).map_err(|_| {
@@ -2475,35 +2312,11 @@ impl FileFragment {
     /// Callers should take care to set the read version correctly. If this is
     /// not done then multiple replacements to the same field will not be
     /// detected as a conflict.
-    ///
-    /// ```
-    /// # use arrow_array::RecordBatch;
-    /// # use futures::stream;
-    /// # use lance::{dataset::fragment::FileFragment, Result};
-    /// # use lance_core::datatypes::Schema;
-    /// # async fn stage(
-    /// #     fragment: &FileFragment,
-    /// #     batch: RecordBatch,
-    /// #     schema: &Schema,
-    /// # ) -> Result<()> {
-    /// let replacement = fragment
-    ///     .write_columns(stream::iter([Ok(batch)]), schema)
-    ///     .await?;
-    /// # let _ = replacement;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn write_columns(
         &self,
         data: impl Stream<Item = Result<RecordBatch>> + Send,
         schema: &Schema,
     ) -> Result<super::transaction::DataReplacementGroup> {
-        if schema.fields.is_empty() {
-            return Err(Error::invalid_input(format!(
-                "write_columns requires at least one target field for fragment {}",
-                self.id()
-            )));
-        }
         let expected_rows = self.physical_rows().await? as u64;
 
         // Readers take everything but the field id from the manifest, so a
@@ -2570,8 +2383,17 @@ impl FileFragment {
         }
         let writer_schema = Schema {
             fields: writer_fields,
-            metadata: dataset_schema.metadata.clone(),
+            metadata: schema.metadata.clone(),
         };
+        let batch_schema = ArrowSchema::from(&writer_schema);
+        let projection_schema = ArrowSchema::new(
+            batch_schema
+                .fields()
+                .iter()
+                .map(|field| relax_nullability(field))
+                .collect::<Vec<_>>(),
+        );
+
         let file_version = self
             .dataset
             .manifest
@@ -2627,9 +2449,8 @@ impl FileFragment {
                     return Err(self.schema_mismatch(format!("column '{duplicate}' appears twice")));
                 }
                 LanceSchema::try_from(batch.schema_ref().as_ref())
-                    .and_then(|staged| prepared_to_logical_blob_schema(&staged))
-                    .and_then(|normalized_staged| {
-                        normalized_staged.check_compatible(
+                    .and_then(|staged| {
+                        staged.check_compatible(
                             &writer_schema,
                             &SchemaCompareOptions {
                                 compare_nullability: NullabilityComparison::Ignore,
@@ -2639,20 +2460,6 @@ impl FileFragment {
                         )
                     })
                     .map_err(|mismatch| self.schema_mismatch(mismatch))?;
-                let batch_schema = batch.schema();
-                let requested_schema = ArrowSchema::from(&writer_schema);
-                let projection_schema = ArrowSchema::new(
-                    requested_schema
-                        .fields()
-                        .iter()
-                        .map(|field| {
-                            let (_, staged_field) = batch_schema
-                                .column_with_name(field.name())
-                                .expect("compatible schema contains every requested field");
-                            staged_projection_field(staged_field, field)
-                        })
-                        .collect::<Vec<_>>(),
-                );
                 let batch = batch
                     .project_by_schema(&projection_schema)
                     .map_err(|err| self.schema_mismatch(err))?;
@@ -2682,346 +2489,6 @@ impl FileFragment {
                 drop(writer);
                 self.discard_staged_file(&staged_path).await;
                 Err(err)
-            }
-        }
-    }
-
-    /// Stage existing top-level columns for one fragment-local physical interval.
-    ///
-    /// `rows` is half-open and addresses the fragment before applying its
-    /// deletion vector. `data` must contain exactly `rows.end - rows.start`
-    /// rows, including values for deleted positions. The returned immutable
-    /// [`ColumnSlice`] owns no lifecycle policy for its staged file.
-    ///
-    /// ```no_run
-    /// # use arrow_array::RecordBatch;
-    /// # use lance::dataset::fragment::FileFragment;
-    /// # use lance_core::{Result, datatypes::Schema};
-    /// # async fn stage(
-    /// #     fragment: &FileFragment,
-    /// #     batch: RecordBatch,
-    /// #     schema: &Schema,
-    /// # ) -> Result<()> {
-    /// let rows = 0..batch.num_rows() as u64;
-    /// let slice = fragment
-    ///     .write_columns_slice(rows, futures::stream::iter([Ok(batch)]), schema)
-    ///     .await?;
-    /// let replacement = fragment.concat_column_slices(vec![slice]).await?;
-    /// // Commit `replacement` with the dataset version used to open `fragment`.
-    /// # let _ = replacement;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn write_columns_slice(
-        &self,
-        rows: Range<u64>,
-        data: impl Stream<Item = Result<RecordBatch>> + Send,
-        schema: &Schema,
-    ) -> Result<ColumnSlice> {
-        let physical_rows = self.physical_rows().await? as u64;
-        if rows.start >= rows.end {
-            return Err(Error::invalid_input(format!(
-                "column slice rows must be non-empty, got {}..{} for fragment {}",
-                rows.start,
-                rows.end,
-                self.id()
-            )));
-        }
-        if rows.end > physical_rows {
-            return Err(Error::invalid_input(format!(
-                "column slice rows {}..{} exceed fragment {} physical row count {}",
-                rows.start,
-                rows.end,
-                self.id(),
-                physical_rows
-            )));
-        }
-
-        // Reuse the complete-column writer with a fragment view whose physical
-        // length is exactly this interval. This changes only row-count
-        // validation; the dataset snapshot, schema, writer policy, and output
-        // location remain identical to the source fragment.
-        let mut slice_metadata = self.metadata.clone();
-        slice_metadata.physical_rows =
-            Some(usize::try_from(rows.end - rows.start).map_err(|_| {
-                Error::invalid_input(format!(
-                    "column slice row count {} does not fit on this platform",
-                    rows.end - rows.start
-                ))
-            })?);
-        let slice_fragment = Self::new(self.dataset.clone(), slice_metadata);
-        let super::transaction::DataReplacementGroup(_, data_file) =
-            slice_fragment.write_columns(data, schema).await?;
-        Ok(ColumnSlice(ColumnSliceWire {
-            fragment_id: self.id() as u64,
-            source_read_version: self.dataset.version_id(),
-            rows: rows.clone(),
-            physical_row_count: rows.end - rows.start,
-            target_field_ids: schema.fields.iter().map(|field| field.id).collect(),
-            data_file,
-        }))
-    }
-
-    async fn encoded_concat_input(
-        &self,
-        data_file: &DataFile,
-        expected_num_rows: u64,
-    ) -> Result<lance_file::concat::EncodedFileInput> {
-        let object_store = self.dataset.object_store_for_data_file(data_file).await?;
-        let full_path = self
-            .dataset
-            .data_file_dir(data_file)?
-            .join(data_file.path.as_str());
-        let scan_scheduler = ScanScheduler::new(
-            object_store.clone(),
-            SchedulerConfig::max_bandwidth(&object_store),
-        );
-        let file_scheduler = scan_scheduler
-            .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
-            .await?;
-        Ok(lance_file::concat::EncodedFileInput::new(file_scheduler)
-            .with_expected_num_rows(expected_num_rows))
-    }
-
-    async fn decode_column_slices(
-        &self,
-        slices: &[ColumnSlice],
-        schema: &Schema,
-    ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
-        let mut streams = Vec::with_capacity(slices.len());
-        for slice in slices {
-            let mut metadata = Fragment::new(self.id() as u64);
-            metadata.files.push(slice.0.data_file.clone());
-            metadata.physical_rows =
-                Some(usize::try_from(slice.0.physical_row_count).map_err(|_| {
-                    Error::invalid_input(format!(
-                        "column slice row count {} does not fit on this platform",
-                        slice.0.physical_row_count
-                    ))
-                })?);
-
-            // Blob descriptors resolve inline payloads through the fragment's
-            // published DataFile. Give the ordinary scan path a snapshot whose
-            // fragment points at this immutable staged file, so the same blob
-            // materialization used by compaction also works for fallback.
-            let mut staged_dataset = self.dataset.as_ref().clone();
-            let mut staged_manifest = self.dataset.manifest.as_ref().clone();
-            staged_manifest.fragments = Arc::new(vec![metadata.clone()]);
-            staged_manifest.reader_feature_flags &=
-                !lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
-            staged_manifest.writer_feature_flags &=
-                !lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
-            staged_dataset.manifest = Arc::new(staged_manifest);
-            let staged_dataset = Arc::new(staged_dataset);
-            let fragment = Self::new(staged_dataset.clone(), metadata);
-            let mut scanner = fragment.scan();
-            let columns = schema
-                .fields
-                .iter()
-                .map(|field| field.name.as_str())
-                .collect::<Vec<_>>();
-            scanner.project(&columns)?.with_row_address();
-            let stream = scanner.try_into_stream().await?;
-            let rewrite_plan = Arc::new(super::optimize::BlobV2BatchRewritePlan::try_new(
-                schema,
-                stream.schema().as_ref(),
-                false,
-            )?);
-            streams.push(
-                stream
-                    .then(move |batch_result| {
-                        let staged_dataset = staged_dataset.clone();
-                        let rewrite_plan = rewrite_plan.clone();
-                        async move {
-                            rewrite_plan
-                                .transform_batch(&staged_dataset, batch_result?)
-                                .await
-                        }
-                    })
-                    .boxed(),
-            );
-        }
-        Ok(stream::iter(streams).flatten().boxed())
-    }
-
-    /// Combine a complete set of column slices into one publishable replacement.
-    ///
-    /// Slices are sorted by physical start and must come from this exact
-    /// fragment snapshot, name identical ordered top-level fields, and cover
-    /// `[0, physical_rows)` without gaps, overlaps, or duplicates. The method
-    /// re-reads every staged file's real metadata. Compatible files are copied
-    /// with [`lance_file::concat::concat_files`]; unsupported layouts fall back
-    /// to ordered decode/re-encode. Input slice files are never deleted.
-    ///
-    /// ```
-    /// # use lance::{dataset::fragment::{ColumnSlice, FileFragment}, Result};
-    /// # async fn assemble(fragment: &FileFragment, slices: Vec<ColumnSlice>) -> Result<()> {
-    /// let replacement = fragment.concat_column_slices(slices).await?;
-    /// # let _ = replacement;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn concat_column_slices(
-        &self,
-        mut slices: Vec<ColumnSlice>,
-    ) -> Result<super::transaction::DataReplacementGroup> {
-        if slices.is_empty() {
-            return Err(Error::invalid_input(format!(
-                "concat_column_slices requires at least one slice for fragment {}",
-                self.id()
-            )));
-        }
-        slices.sort_by_key(|slice| slice.0.rows.start);
-
-        let source_read_version = self.dataset.version_id();
-        let target_field_ids = slices[0].0.target_field_ids.clone();
-        if target_field_ids.is_empty() {
-            return Err(Error::invalid_input(
-                "column slices must name at least one target field",
-            ));
-        }
-        let mut seen_fields = HashSet::with_capacity(target_field_ids.len());
-        let mut target_fields = Vec::with_capacity(target_field_ids.len());
-        for field_id in &target_field_ids {
-            if !seen_fields.insert(*field_id) {
-                return Err(Error::invalid_input(format!(
-                    "column slices name target field id {field_id} more than once"
-                )));
-            }
-            let Some(field) = self
-                .dataset
-                .schema()
-                .fields
-                .iter()
-                .find(|field| field.id == *field_id)
-            else {
-                return Err(Error::invalid_input(format!(
-                    "column slices name field id {field_id} that is not a top-level dataset field"
-                )));
-            };
-            target_fields.push(field.clone());
-        }
-        let target_schema = Schema {
-            fields: target_fields,
-            metadata: self.dataset.schema().metadata.clone(),
-        };
-
-        let physical_rows = self.physical_rows().await? as u64;
-        let mut expected_start = 0u64;
-        for (slice_index, slice) in slices.iter().enumerate() {
-            if slice.0.fragment_id != self.id() as u64 {
-                return Err(Error::invalid_input(format!(
-                    "column slice {slice_index} belongs to fragment {}, expected {}",
-                    slice.0.fragment_id,
-                    self.id()
-                )));
-            }
-            if slice.0.source_read_version != source_read_version {
-                return Err(Error::invalid_input(format!(
-                    "column slice {slice_index} was read from dataset version {}, expected {}",
-                    slice.0.source_read_version, source_read_version
-                )));
-            }
-            if slice.0.target_field_ids != target_field_ids {
-                return Err(Error::invalid_input(format!(
-                    "column slice {slice_index} targets fields {:?}, expected {:?}",
-                    slice.0.target_field_ids, target_field_ids
-                )));
-            }
-            if slice.0.rows.end <= slice.0.rows.start
-                || slice.0.physical_row_count != slice.0.rows.end - slice.0.rows.start
-            {
-                return Err(Error::invalid_input(format!(
-                    "column slice {slice_index} has inconsistent interval {}..{} and physical row count {}",
-                    slice.0.rows.start, slice.0.rows.end, slice.0.physical_row_count
-                )));
-            }
-            if slice.0.rows.start > expected_start {
-                return Err(Error::invalid_input(format!(
-                    "column slices have a gap {}..{} before slice {slice_index}",
-                    expected_start, slice.0.rows.start
-                )));
-            }
-            if slice.0.rows.start < expected_start {
-                return Err(Error::invalid_input(format!(
-                    "column slice {slice_index} starts at {} before prior coverage ends at {}; overlaps and duplicates are not allowed",
-                    slice.0.rows.start, expected_start
-                )));
-            }
-            expected_start = slice.0.rows.end;
-        }
-        if expected_start != physical_rows {
-            return Err(Error::invalid_input(format!(
-                "column slices cover 0..{expected_start}, but fragment {} has {physical_rows} physical rows",
-                self.id()
-            )));
-        }
-
-        let mut inputs = Vec::with_capacity(slices.len());
-        for slice in &slices {
-            inputs.push(
-                self.encoded_concat_input(&slice.0.data_file, slice.0.physical_row_count)
-                    .await?,
-            );
-        }
-
-        let file_version = self
-            .dataset
-            .manifest
-            .data_storage_format
-            .lance_file_format();
-        let target = lance_file::concat::FileConcatTarget::new(
-            file_version,
-            Arc::new(target_schema.clone()),
-        );
-        let filename = format!("{}.lance", write::generate_random_filename());
-        let output_path = self.dataset.data_dir().join(filename.as_str());
-        let object_store = self.dataset.object_store.clone();
-        let concat_result = lance_file::concat::concat_files(
-            &target,
-            &inputs,
-            move || async move { object_store.create(&output_path).await },
-            lance_file::concat::FileConcatOptions::default(),
-        )
-        .await?;
-
-        match concat_result {
-            lance_file::concat::FileConcatResult::Written(output) => {
-                let (fields, column_indices) =
-                    file_versions::data_file_columns(file_version, &target_schema);
-                let data_file = DataFile::new(
-                    filename,
-                    fields,
-                    column_indices,
-                    file_version,
-                    std::num::NonZeroU64::new(output.size_bytes),
-                    None,
-                );
-                Ok(super::transaction::DataReplacementGroup(
-                    self.id() as u64,
-                    data_file,
-                ))
-            }
-            lance_file::concat::FileConcatResult::Reused(input_index, output) => {
-                let source = &slices[input_index].0.data_file;
-                let (fields, column_indices) =
-                    file_versions::data_file_columns(file_version, &target_schema);
-                let data_file = DataFile::new(
-                    source.path.clone(),
-                    fields,
-                    column_indices,
-                    file_version,
-                    std::num::NonZeroU64::new(output.size_bytes),
-                    source.base_id,
-                );
-                Ok(super::transaction::DataReplacementGroup(
-                    self.id() as u64,
-                    data_file,
-                ))
-            }
-            lance_file::concat::FileConcatResult::Unsupported(_) => {
-                let decoded = self.decode_column_slices(&slices, &target_schema).await?;
-                self.write_columns(decoded, &target_schema).await
             }
         }
     }
@@ -3759,13 +3226,29 @@ impl FragmentReader {
         //
         // We could potentially delete the support for no-columns in the wrap function or
         // we can delete this path once we migrate away from any support of v1.
-        let merged = if self.num_system_cols() == self.output_schema.fields.len() {
+        let system_columns_only = self.num_system_cols() == self.output_schema.fields.len();
+        let merged = if system_columns_only {
             let selected_rows = params.to_offsets_total(total_num_rows).len();
+            let empty_schema = Arc::new(ArrowSchema::empty());
+            let full_batch = RecordBatch::try_new_with_options(
+                empty_schema.clone(),
+                Vec::new(),
+                &RecordBatchOptions::new().with_row_count(Some(batch_size as usize)),
+            )?;
             let tasks = (0..selected_rows)
                 .step_by(batch_size as usize)
                 .map(move |offset| {
                     let num_rows = (batch_size as usize).min(selected_rows - offset);
-                    let batch = RecordBatch::from(StructArray::new_empty_fields(num_rows, None));
+                    let batch = if num_rows == batch_size as usize {
+                        full_batch.clone()
+                    } else {
+                        RecordBatch::try_new_with_options(
+                            empty_schema.clone(),
+                            Vec::new(),
+                            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+                        )
+                        .expect("an empty schema accepts an explicit row count")
+                    };
                     ReadBatchTask {
                         task: std::future::ready(Ok(batch)).boxed(),
                         num_rows: num_rows as u32,
@@ -3822,9 +3305,14 @@ impl FragmentReader {
                     let output_schema = output_schema.clone();
                     batch_fut
                         .map(move |batch| {
-                            batch?
-                                .project_by_schema(&output_schema)
-                                .map_err(Error::from)
+                            let batch = batch?;
+                            if system_columns_only
+                                && batch.schema().as_ref() == output_schema.as_ref()
+                            {
+                                Ok(batch)
+                            } else {
+                                batch.project_by_schema(&output_schema).map_err(Error::from)
+                            }
                         })
                         .boxed()
                 })
@@ -3941,13 +3429,28 @@ impl FragmentReader {
             num_requested_rows += range.end - range.start;
         }
 
-        let merged_stream = if self.num_system_cols() == self.output_schema.fields.len() {
+        let system_columns_only = self.num_system_cols() == self.output_schema.fields.len();
+        let merged_stream = if system_columns_only {
+            let empty_schema = Arc::new(ArrowSchema::empty());
+            let full_batch = RecordBatch::try_new_with_options(
+                empty_schema.clone(),
+                Vec::new(),
+                &RecordBatchOptions::new().with_row_count(Some(batch_size as usize)),
+            )?;
             let tasks = (0..num_requested_rows)
                 .step_by(batch_size as usize)
                 .map(move |offset| {
                     let num_rows = (batch_size as u64).min(num_requested_rows - offset);
-                    let batch =
-                        RecordBatch::from(StructArray::new_empty_fields(num_rows as usize, None));
+                    let batch = if num_rows == batch_size as u64 {
+                        full_batch.clone()
+                    } else {
+                        RecordBatch::try_new_with_options(
+                            empty_schema.clone(),
+                            Vec::new(),
+                            &RecordBatchOptions::new().with_row_count(Some(num_rows as usize)),
+                        )
+                        .expect("an empty schema accepts an explicit row count")
+                    };
                     ReadBatchTask {
                         task: std::future::ready(Ok(batch)).boxed(),
                         num_rows: num_rows as u32,
@@ -3997,9 +3500,14 @@ impl FragmentReader {
                     let output_schema = output_schema.clone();
                     batch_fut
                         .map(move |batch| {
-                            batch?
-                                .project_by_schema(&output_schema)
-                                .map_err(Error::from)
+                            let batch = batch?;
+                            if system_columns_only
+                                && batch.schema().as_ref() == output_schema.as_ref()
+                            {
+                                Ok(batch)
+                            } else {
+                                batch.project_by_schema(&output_schema).map_err(Error::from)
+                            }
                         })
                         .boxed()
                 })
@@ -4086,62 +3594,10 @@ impl FragmentReader {
     }
 }
 
-/// A wrapper around a `RecordBatchReader` that converts Arrow JSON columns
-/// (Utf8/LargeUtf8 with `arrow.json` extension) to Lance JSON columns
-/// (LargeBinary with `lance.json` extension / JSONB format).
-///
-/// This is needed when user-provided data contains Arrow JSON fields but the
-/// dataset stores them in Lance's JSONB binary format.
-struct JsonConvertingReader {
-    inner: Box<dyn RecordBatchReader + Send>,
-    schema: arrow_schema::SchemaRef,
-}
-
-impl JsonConvertingReader {
-    fn new(inner: Box<dyn RecordBatchReader + Send>) -> Self {
-        use lance_arrow::json::arrow_json_to_lance_json;
-
-        // Build the converted schema (Arrow JSON fields → Lance JSON fields)
-        let orig_schema = inner.schema();
-        let new_fields: Vec<arrow_schema::FieldRef> = orig_schema
-            .fields()
-            .iter()
-            .map(|f| {
-                if is_arrow_json_field(f) || has_json_fields(f) {
-                    Arc::new(arrow_json_to_lance_json(f))
-                } else {
-                    Arc::clone(f)
-                }
-            })
-            .collect();
-        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
-            new_fields,
-            orig_schema.metadata().clone(),
-        ));
-
-        Self { inner, schema }
-    }
-}
-
-impl Iterator for JsonConvertingReader {
-    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next()
-            .map(|result| result.and_then(|batch| convert_json_columns(&batch)))
-    }
-}
-
-impl RecordBatchReader for JsonConvertingReader {
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        self.schema.clone()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use arrow_arith::numeric::mul;
+    use arrow_array::cast::AsArray;
     use arrow_array::{
         ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatchIterator, StringArray,
     };
@@ -6293,6 +5749,175 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_mixed_payload_and_system_columns_preserve_schema_and_order() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, false),
+            ArrowField::new("s", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..23)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..23).map(|value| format!("s-{value}")),
+                )),
+            ],
+        )
+        .unwrap();
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::Stable),
+            enable_stable_row_ids: true,
+            max_rows_per_file: 23,
+            max_rows_per_group: 7,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            test_dir.as_ref(),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+        let fragment = dataset.get_fragment(0).unwrap();
+        let projection = fragment.schema().project(&["s", "i"]).unwrap();
+        let reader = fragment
+            .open(
+                &projection,
+                FragReadConfig::default()
+                    .with_row_id(true)
+                    .with_row_address(true)
+                    .with_row_last_updated_at_version(true)
+                    .with_row_created_at_version(true),
+            )
+            .await
+            .unwrap();
+
+        let ranges: Arc<[Range<u64>]> = Arc::from([2..6, 10..13]);
+        let batches = reader
+            .read_ranges(ranges, 3)
+            .await
+            .unwrap()
+            .buffered(3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 7);
+        assert!(
+            batches
+                .windows(2)
+                .all(|pair| pair[0].schema().as_ref() == pair[1].schema().as_ref())
+        );
+        let expected_fields = [
+            "s",
+            "i",
+            ROW_ID,
+            ROW_ADDR,
+            lance_core::ROW_LAST_UPDATED_AT_VERSION,
+            lance_core::ROW_CREATED_AT_VERSION,
+        ];
+        assert_eq!(
+            batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            expected_fields
+        );
+
+        let selected_offsets = [2_u64, 3, 4, 5, 10, 11, 12];
+        let actual_row_ids = batches
+            .iter()
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
+            .copied()
+            .collect::<Vec<_>>();
+        let actual_row_addrs = batches
+            .iter()
+            .flat_map(|batch| batch[ROW_ADDR].as_primitive::<UInt64Type>().values())
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(actual_row_ids, selected_offsets);
+        assert_eq!(actual_row_addrs, selected_offsets);
+        for version_column in [
+            lance_core::ROW_LAST_UPDATED_AT_VERSION,
+            lance_core::ROW_CREATED_AT_VERSION,
+        ] {
+            assert!(batches.iter().all(|batch| {
+                batch[version_column]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .all(|version| *version == 1)
+            }));
+        }
+
+        let range_batches = reader
+            .read_range(1..8, 3)
+            .await
+            .unwrap()
+            .buffered(3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            range_batches
+                .iter()
+                .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
+                .copied()
+                .collect::<Vec<_>>(),
+            (1..8).collect::<Vec<_>>()
+        );
+        assert_eq!(range_batches.last().unwrap().num_rows(), 1);
+
+        let empty_projection = fragment.schema().project::<&str>(&[]).unwrap();
+        let system_reader = fragment
+            .open(
+                &empty_projection,
+                FragReadConfig::default()
+                    .with_row_id(true)
+                    .with_row_address(true),
+            )
+            .await
+            .unwrap();
+        let system_batches = system_reader
+            .read_all(7)
+            .await
+            .unwrap()
+            .buffered(4)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            system_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [7, 7, 7, 2]
+        );
+        assert!(
+            system_batches
+                .windows(2)
+                .all(|pair| Arc::ptr_eq(&pair[0].schema(), &pair[1].schema()))
+        );
+
+        let system_ranges: Arc<[Range<u64>]> = Arc::from([2..6, 10..13]);
+        let system_range_batches = system_reader
+            .read_ranges(system_ranges, 3)
+            .await
+            .unwrap()
+            .buffered(3)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            system_range_batches
+                .windows(2)
+                .all(|pair| Arc::ptr_eq(&pair[0].schema(), &pair[1].schema()))
+        );
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_fragment_take_range_deletions(
@@ -6799,6 +6424,82 @@ mod tests {
             .unwrap();
             assert_eq!(batches[1], expected_batch);
         }
+    }
+
+    /// A deletion vector naming a row the fragment does not have leaves the restorer
+    /// with rows it can never account for, so `Updater::next` has to refuse at the end
+    /// of the stream rather than let a data file short of those rows be written.
+    ///
+    /// `write_deletions` rejects an over-long vector, so the file is written directly
+    /// to get a fragment into this state.
+    #[tokio::test]
+    async fn test_updater_rejects_deletion_vector_past_end_of_fragment() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = create_dataset(test_uri, LanceFileVersion::Stable).await;
+
+        // Point a fragment's deletion file at a row it does not have. 200 rows are
+        // spread over several 40-row fragments, so 10_000 is past the end of any of
+        // them. Pick a fragment whose id is not zero, so the assertion below cannot
+        // pass on a message that dropped the id entirely.
+        let deletion_vector: DeletionVector = [10_000].into_iter().collect();
+        let fragment_index = 1;
+        let fragment_id = dataset.manifest.fragments[fragment_index].id;
+        assert_ne!(fragment_id, 0, "need a non-zero fragment id");
+        let deletion_file = write_deletion_file(
+            &dataset.base,
+            fragment_id,
+            dataset.version().version,
+            &deletion_vector,
+            dataset.object_store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let mut fragments = dataset.manifest.fragments.as_ref().clone();
+        fragments[fragment_index].deletion_file = deletion_file;
+        let mut manifest = dataset.manifest.as_ref().clone();
+        manifest.fragments = Arc::new(fragments);
+        dataset.manifest = Arc::new(manifest);
+
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "double_i",
+            DataType::Int32,
+            true,
+        )]));
+        let fragment = dataset.get_fragment(fragment_id as usize).unwrap();
+        let mut updater = fragment
+            .updater(Some(&["i"]), None, None, None)
+            .await
+            .unwrap();
+
+        // Every live row is handed back, so the loop only ends when next() gives up.
+        let err = loop {
+            match updater.next().await {
+                Ok(Some(batch)) => {
+                    let input_col = batch.column_by_name("i").unwrap();
+                    let result_col = mul(input_col, &Int32Array::new_scalar(2)).unwrap();
+                    let batch = RecordBatch::try_new(
+                        new_schema.clone(),
+                        vec![Arc::new(result_col) as ArrayRef],
+                    )
+                    .unwrap();
+                    updater.update(batch).await.unwrap();
+                }
+                Ok(None) => panic!("expected next() to refuse the unaccounted-for row"),
+                Err(err) => break err,
+            }
+        };
+
+        assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("unaccounted for"),
+            "expected the stream-ended wording, got: {message}"
+        );
+        assert!(
+            message.contains(&format!("fragment {fragment_id}")),
+            "message should name the fragment: {message}"
+        );
     }
 
     #[rstest]
@@ -7379,13 +7080,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_columns_with_json_extension_type() {
-        use arrow_array::UInt64Array;
+        use arrow_array::{StringViewArray, UInt64Array};
         use lance_arrow::ARROW_EXT_NAME_KEY;
         use lance_arrow::json::ARROW_JSON_EXT_NAME;
         use lance_core::ROW_ID;
         use std::collections::HashMap;
 
-        // Create a dataset with an Arrow JSON extension column
+        // Create a dataset with an Arrow JSON extension column and a Utf8View
+        // column. Both are logical types that Lance stores in a different
+        // physical form (JSONB LargeBinary / Utf8), so the update path must
+        // convert the right-hand stream to match.
         let test_dir = TempStrDir::default();
         let mut json_metadata = HashMap::new();
         json_metadata.insert(
@@ -7396,6 +7100,7 @@ mod tests {
             ArrowField::new("id", DataType::Int64, false),
             ArrowField::new("name", DataType::Utf8, true),
             ArrowField::new("meta", DataType::Utf8, true).with_metadata(json_metadata.clone()),
+            ArrowField::new("desc", DataType::Utf8View, true),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -7409,6 +7114,7 @@ mod tests {
                     r#"{"x":4}"#,
                     r#"{"x":5}"#,
                 ])),
+                Arc::new(StringViewArray::from(vec!["d1", "d2", "d3", "d4", "d5"])),
             ],
         )
         .unwrap();
@@ -7417,11 +7123,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Build the right stream with Arrow JSON column (Utf8 + arrow.json extension)
-        // Only update rows with row_id 1 and 3
+        // Build the right stream with an Arrow JSON column (Utf8 + arrow.json
+        // extension) and a Utf8View column. Only update rows with row_id 1 and 3.
         let update_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(ROW_ID, DataType::UInt64, false),
             ArrowField::new("meta", DataType::Utf8, true).with_metadata(json_metadata),
+            ArrowField::new("desc", DataType::Utf8View, true),
         ]));
         let update_batch = RecordBatch::try_new(
             update_schema.clone(),
@@ -7431,6 +7138,7 @@ mod tests {
                     r#"{"updated":true,"id":2}"#,
                     r#"{"updated":true,"id":4}"#,
                 ])),
+                Arc::new(StringViewArray::from(vec!["d2-new", "d4-new"])),
             ],
         )
         .unwrap();
@@ -7439,9 +7147,10 @@ mod tests {
             update_schema,
         ));
 
-        // Perform update_columns - this should NOT fail with type mismatch
-        // Previously this would error with:
+        // Perform update_columns - this should NOT fail with a type mismatch.
+        // Previously the JSON column would error with:
         //   "It is not possible to interleave arrays of different data types (Utf8 and LargeBinary)"
+        // and the view column would likewise mismatch (Utf8View vs stored Utf8).
         let mut fragment = dataset.get_fragment(0).unwrap();
         let (updated_fragment, fields_modified) = fragment
             .update_columns(right_stream, ROW_ID, ROW_ID)

@@ -8,7 +8,7 @@ use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
-    frag_reuse::FragReuseIndex,
+    frag_reuse::CompactFragReuseIndex,
     metrics::NoOpMetricsCollector,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
@@ -162,7 +162,7 @@ pub fn split_segment_coverage<'a>(
 }
 
 pub fn fragment_reuse_affects_segments<'a>(
-    frag_reuse_index: &FragReuseIndex,
+    frag_reuse_index: &CompactFragReuseIndex,
     segments: impl IntoIterator<Item = &'a IndexMetadata>,
 ) -> bool {
     segments.into_iter().any(|segment| {
@@ -174,7 +174,7 @@ pub fn fragment_reuse_affects_segments<'a>(
 }
 
 pub fn fragment_reuse_affects_segment(
-    frag_reuse_index: &FragReuseIndex,
+    frag_reuse_index: &CompactFragReuseIndex,
     coverage: &RoaringBitmap,
     dataset_version: u64,
 ) -> bool {
@@ -1418,10 +1418,10 @@ mod tests {
             base_id: None,
             files: None,
         };
-        let frag_reuse_index = FragReuseIndex {
-            uuid: Uuid::new_v4(),
-            row_id_maps: vec![],
-            details: FragReuseIndexDetails {
+        let frag_reuse_index = CompactFragReuseIndex::from_row_id_maps(
+            Uuid::new_v4(),
+            vec![],
+            FragReuseIndexDetails {
                 versions: vec![FragReuseVersion {
                     dataset_version: 5,
                     groups: vec![FragReuseGroup {
@@ -1439,7 +1439,7 @@ mod tests {
                     }],
                 }],
             },
-        };
+        );
 
         assert!(fragment_reuse_affects_segments(
             &frag_reuse_index,
@@ -2742,6 +2742,139 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results[0].num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_vector_merge_filters_stable_row_id_replacements() {
+        const DIMENSION: usize = 4;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIMENSION as i32,
+                ),
+                false,
+            ),
+        ]));
+        let initial_values = (0..40)
+            .flat_map(|row| [if row < 20 { 1.0 } else { 0.0 }; DIMENSION])
+            .collect::<Vec<_>>();
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..40)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        arrow_array::Float32Array::from(initial_values),
+                        DIMENSION as i32,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let replacements = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(20..40)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        arrow_array::Float32Array::from(vec![10.0; 20 * DIMENSION]),
+                        DIMENSION as i32,
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap();
+        let (dataset, stats) = merge_job
+            .execute(reader_to_stream(Box::new(RecordBatchIterator::new(
+                [Ok(replacements)],
+                schema,
+            ))))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_updated_rows, 20);
+
+        let mut dataset = dataset.as_ref().clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap();
+        assert_eq!(logical_index.num_segments(), 1);
+        assert_eq!(
+            logical_index
+                .num_rows_per_segment()
+                .into_iter()
+                .map(|(_, rows)| rows)
+                .sum::<u64>(),
+            40,
+            "the merged index must contain one current copy of every stable row id"
+        );
+
+        let query = arrow_array::Float32Array::from(vec![0.0; DIMENSION]);
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .nprobes(1)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = result["id"].as_primitive::<arrow::datatypes::Int32Type>();
+        assert!(
+            ids.values().iter().all(|id| *id < 20),
+            "stale pre-update vectors must not survive the optimize merge: {ids:?}"
+        );
     }
 
     #[tokio::test]

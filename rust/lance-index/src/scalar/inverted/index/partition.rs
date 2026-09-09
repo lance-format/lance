@@ -1495,6 +1495,15 @@ impl InvertedPartition {
         chunk_tokens_override: Option<usize>,
         max_list_children_override: Option<u64>,
     ) -> Result<(InnerBuilder, usize)> {
+        // Legacy per-document positions require singleton reads to protect Arrow's
+        // List<i32> offsets. Cap overlap so remote latency is hidden without
+        // multiplying retained decoded posting buffers by the store's full limit.
+        const MAX_LEGACY_POSITION_MERGE_CONCURRENCY: usize = 8;
+
+        let legacy_position_concurrency = self
+            .store
+            .io_parallelism()
+            .clamp(1, MAX_LEGACY_POSITION_MERGE_CONCURRENCY);
         let mut builder = InnerBuilder::new_with_posting_tail_codec_and_block_size(
             self.id,
             self.inverted_list.has_positions(),
@@ -1514,6 +1523,7 @@ impl InvertedPartition {
                 self.inverted_list.has_positions(),
                 chunk_tokens_override,
                 max_list_children_override,
+                legacy_position_concurrency,
                 |posting_list| {
                     builder
                         .posting_lists
