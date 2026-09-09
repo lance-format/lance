@@ -3026,20 +3026,21 @@ mod tests {
     #[tokio::test]
     async fn test_acorn_fallback_reports_both_traversals() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
-        const STEP: usize = 5;
+        const TOTAL: usize = 4096;
+        const STEP: usize = 9;
         let fsl = FixedSizeListArray::try_new_from_values(
             generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
             DIM as i32,
         )
         .unwrap();
         let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
-        // A low degree fragments the mask-passing subgraph, which is what
-        // starves the ACORN frontier in the first place; `MIN_HNSW_M` is as low
-        // as the builder allows. How many passing nodes end up unreachable is a
-        // property of the graph, and insertion runs in parallel, so build on a
-        // single-threaded pool: with the level RNG already seeded that makes the
-        // graph reproducible and keeps the fallback from being a coin flip.
+        // ACORN scores only mask-passing nodes and bridges through masked ones
+        // on a budget of `ACORN_BRIDGE_BUDGET_FACTOR * ef`, so a thin mask
+        // starves it: at one row in `STEP` the budget runs out with a handful
+        // of passing nodes still unreached, and `MIN_HNSW_M` keeps the degree
+        // low enough for that to bite. Insertion runs in parallel, so build on
+        // a single-threaded pool: with the level RNG already seeded that makes
+        // the graph reproducible and keeps the fallback from being a coin flip.
         let hnsw = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
@@ -3060,7 +3061,7 @@ mod tests {
         // above the flat-scan threshold, so the query is dispatched to ACORN
         assert!((TOTAL * 10 / 100..TOTAL).contains(&remained));
         // `k.min(remained) == remained` demands every passing node, which the
-        // fragmented traversal cannot reach in full, so the fallback fires
+        // starved frontier cannot deliver in full, so the fallback fires
         let k = remained;
         let params = HnswQueryParams {
             ef: k,
