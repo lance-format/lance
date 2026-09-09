@@ -29,6 +29,10 @@ use crate::blob::prepared_to_logical_blob_schema;
 /// field IDs, metadata, and loaded dictionary values. The caller owns checkpoint
 /// state and must keep every use associated with the same dataset and resolved base;
 /// Lance does not validate that association across [`Dataset`] instances.
+/// Checkpoints must come from trusted application state. Deserialization does not
+/// prove artifact ownership or establish whether a target has been committed.
+/// Callers must fence stale workers and never resume writes or assembly for a
+/// committed target; only staging cleanup via [`Self::finish`] remains valid.
 ///
 /// ```
 /// # use lance::dataset::DataFileTarget;
@@ -154,6 +158,10 @@ impl DataFileTarget {
     /// This also removes incomplete parts. Missing files are OK; storage failures
     /// may leave partial cleanup and can be retried. Use the same dataset and
     /// resolved base as the original write. This does not commit the target.
+    /// All Blob payloads in the target's namespace are retained, including those
+    /// from failed or unused retry leases. Ordinary dataset GC also retains these
+    /// payloads while the parent data file is referenced; this operation does not
+    /// perform per-Blob reachability collection.
     ///
     /// ```
     /// # use lance::{Dataset, dataset::DataFileTarget};

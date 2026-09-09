@@ -256,6 +256,9 @@ impl Dataset {
     /// caller owns cleanup of all durable part, Blob, and final-file objects.
     /// The caller must also assemble the target through the same dataset and
     /// resolved base used to write managed Blob payloads.
+    /// The target must still be uncommitted and have no concurrent assembler.
+    /// Assembly can overwrite a previous uncommitted output for the same target;
+    /// it does not check current or historical manifests for references.
     ///
     /// To replace a fragment's columns, wrap the returned file in a
     /// [`DataReplacementGroup`](super::transaction::DataReplacementGroup).
