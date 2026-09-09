@@ -1369,6 +1369,7 @@ impl TakeOperation {
                 _ => {}
             }
         } else if let Expr::InList(in_expr) = expr
+            && !in_expr.negated
             && let Expr::Column(col) = in_expr.expr.as_ref()
             && let Some(u64s) = Self::extract_u64_list(&in_expr.list)
         {
@@ -15651,6 +15652,17 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_eq!(batch.num_rows(), 0);
     }
 
+    #[rstest]
+    #[case::row_id(ROW_ID)]
+    #[case::row_address(ROW_ADDR)]
+    #[case::row_offset(ROW_OFFSET)]
+    fn test_filter_to_take_rejects_negated_in_list(#[case] column: &str) {
+        let values = (0_u64..10).map(lit).collect();
+        let expression = col(column).in_list(values, true);
+
+        assert!(TakeOperation::try_from_expr(&expression).is_none());
+    }
+
     #[tokio::test]
     async fn test_filter_to_take() {
         let mut ds = lance_datagen::gen_batch()
@@ -15759,6 +15771,18 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         check("_rowid IN (52, 51, 50, 17)", &[17, 50, 51, 52]).await;
         check("_rowaddr IN (52, 51, 50, 17)", &[17, 50, 51, 52]).await;
         check("_rowoffset IN (52, 51, 50, 17)", &[17, 50, 51, 52]).await;
+
+        let expected_not_in = (10..190).chain(210..300).collect::<Vec<_>>();
+        check_no_opt(
+            "_rowid NOT IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)",
+            &expected_not_in,
+        )
+        .await;
+        check_no_opt(
+            "_rowaddr NOT IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)",
+            &expected_not_in,
+        )
+        .await;
 
         // Taking _rowid / _rowaddr of deleted row
 
