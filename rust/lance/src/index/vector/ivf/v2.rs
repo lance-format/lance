@@ -9,6 +9,7 @@ use std::{
     any::Any,
     borrow::Cow,
     collections::{BinaryHeap, HashMap},
+    ops::Range,
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -25,9 +26,10 @@ use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
-use futures::{StreamExt, TryFutureExt};
+use futures::stream::FuturesUnordered;
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
@@ -42,7 +44,7 @@ use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_index::cache_pb::IvfStateHeader;
 use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle};
-use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
+use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::VectorIndexCacheEntry;
@@ -160,6 +162,289 @@ pub(crate) static STREAMING_SEARCH_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|
     );
     batch_size
 });
+
+const IVF_PREWARM_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PREWARM_WINDOW_SIZE_BYTES";
+/// Default encoded-byte target of one prewarm read window.
+///
+/// Measured on one 1B-row IVF_RQ 1-bit segment (147 GB) read from S3 on
+/// r8i.8xlarge with 192 GiB of index cache: 16 MiB windows filled the cache at
+/// 500-526 MB/s regardless of how many windows were in flight (30, 128 or 512)
+/// or of `LANCE_IO_THREADS` (64, 256, 1024), while 64 MiB windows reached
+/// 935 MB/s with the same peak RSS (+1 GB) because the reader issues fewer,
+/// larger object-store requests (3.96 MB vs 2.47 MB average).
+const DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartitionWindow {
+    partitions: Range<usize>,
+    estimated_encoded_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PrewarmFileLayout<'a> {
+    ivf: &'a IvfModel,
+    encoded_bytes: u64,
+    num_rows: u64,
+}
+
+fn parse_prewarm_window_size_bytes(value: Option<&str>) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES);
+    };
+    let size = value.parse::<u64>().map_err(|error| {
+        Error::invalid_input(format!(
+            "{IVF_PREWARM_WINDOW_SIZE_ENV} must be a positive byte count, got {value:?}: {error}"
+        ))
+    })?;
+    if size == 0 {
+        return Err(Error::invalid_input(format!(
+            "{IVF_PREWARM_WINDOW_SIZE_ENV} must be a positive byte count, got {value:?}"
+        )));
+    }
+    Ok(size)
+}
+
+fn prewarm_window_size_bytes() -> Result<u64> {
+    let value = std::env::var(IVF_PREWARM_WINDOW_SIZE_ENV).ok();
+    parse_prewarm_window_size_bytes(value.as_deref())
+}
+
+fn estimate_encoded_bytes(num_data_bytes: u64, num_rows: u64, row_count: usize) -> u64 {
+    if row_count == 0 || num_rows == 0 || num_data_bytes == 0 {
+        return 0;
+    }
+    let numerator = u128::from(num_data_bytes) * row_count as u128;
+    numerator
+        .div_ceil(u128::from(num_rows))
+        .min(u64::MAX as u128) as u64
+}
+
+/// Plan adjacent partition windows by a metadata-estimated encoded-I/O target.
+///
+/// The target is measured in bytes, not partition count. It is not a hard
+/// decoded-memory cap: compression/page skew can make a window larger, and a
+/// single oversized partition is deliberately admitted as a singleton.
+fn plan_partition_windows(
+    index: PrewarmFileLayout<'_>,
+    storage: PrewarmFileLayout<'_>,
+    target_bytes: u64,
+    max_partitions: usize,
+) -> Result<Vec<PartitionWindow>> {
+    if target_bytes == 0 {
+        return Err(Error::invalid_input(
+            "IVF prewarm window target must be positive",
+        ));
+    }
+    if index.ivf.num_partitions() != storage.ivf.num_partitions() {
+        return Err(Error::index(format!(
+            "IVF index has {} partitions but auxiliary storage has {}",
+            index.ivf.num_partitions(),
+            storage.ivf.num_partitions()
+        )));
+    }
+    if max_partitions == 0 {
+        return Err(Error::invalid_input(
+            "IVF prewarm window partition cap must be positive",
+        ));
+    }
+
+    let mut windows = Vec::new();
+    let mut start = 0;
+    let mut window_bytes = 0_u64;
+    for partition_id in 0..index.ivf.num_partitions() {
+        let partition_bytes = estimate_encoded_bytes(
+            index.encoded_bytes,
+            index.num_rows,
+            index.ivf.partition_size(partition_id),
+        )
+        .checked_add(estimate_encoded_bytes(
+            storage.encoded_bytes,
+            storage.num_rows,
+            storage.ivf.partition_size(partition_id),
+        ))
+        .ok_or_else(|| Error::index("IVF prewarm partition byte estimate overflowed u64"))?;
+
+        let exceeds_target = window_bytes
+            .checked_add(partition_bytes)
+            .is_none_or(|bytes| bytes > target_bytes);
+        let is_discontinuous = partition_id > start
+            && (index.ivf.row_range(partition_id - 1).end
+                != index.ivf.row_range(partition_id).start
+                || storage.ivf.row_range(partition_id - 1).end
+                    != storage.ivf.row_range(partition_id).start);
+        let reached_partition_cap = partition_id - start >= max_partitions;
+        if partition_id > start && (exceeds_target || is_discontinuous || reached_partition_cap) {
+            windows.push(PartitionWindow {
+                partitions: start..partition_id,
+                estimated_encoded_bytes: window_bytes,
+            });
+            start = partition_id;
+            window_bytes = 0;
+        }
+        window_bytes = window_bytes
+            .checked_add(partition_bytes)
+            .ok_or_else(|| Error::index("IVF prewarm window byte estimate overflowed u64"))?;
+        if window_bytes > target_bytes {
+            windows.push(PartitionWindow {
+                partitions: start..partition_id + 1,
+                estimated_encoded_bytes: window_bytes,
+            });
+            start = partition_id + 1;
+            window_bytes = 0;
+        }
+    }
+    if start < index.ivf.num_partitions() {
+        windows.push(PartitionWindow {
+            partitions: start..index.ivf.num_partitions(),
+            estimated_encoded_bytes: window_bytes,
+        });
+    }
+    Ok(windows)
+}
+
+fn split_window_batches(
+    schema: &arrow_schema::SchemaRef,
+    partition_lengths: &[usize],
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<Vec<RecordBatch>>> {
+    let expected_rows = partition_lengths
+        .iter()
+        .try_fold(0_usize, |total, length| {
+            total
+                .checked_add(*length)
+                .ok_or_else(|| Error::index("IVF prewarm window row count overflowed usize"))
+        })?;
+    let actual_rows = batches.iter().try_fold(0_usize, |total, batch| {
+        total
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| Error::index("IVF prewarm decoded row count overflowed usize"))
+    })?;
+    if actual_rows != expected_rows {
+        return Err(Error::index(format!(
+            "IVF prewarm window decoded {actual_rows} rows, expected {expected_rows}"
+        )));
+    }
+
+    let mut output = Vec::with_capacity(partition_lengths.len());
+    let mut batch_id = 0;
+    let mut batch_offset = 0;
+    for &partition_length in partition_lengths {
+        if partition_length == 0 {
+            output.push(vec![RecordBatch::new_empty(schema.clone())]);
+            continue;
+        }
+        let mut remaining = partition_length;
+        let mut slices = Vec::new();
+        while remaining > 0 {
+            let batch = batches.get(batch_id).ok_or_else(|| {
+                Error::index("IVF prewarm window ended before its partition boundary")
+            })?;
+            let available = batch.num_rows() - batch_offset;
+            let slice_length = available.min(remaining);
+            slices.push(batch.slice(batch_offset, slice_length));
+            batch_offset += slice_length;
+            remaining -= slice_length;
+            if batch_offset == batch.num_rows() {
+                batch_id += 1;
+                batch_offset = 0;
+            }
+        }
+        output.push(slices);
+    }
+    Ok(output)
+}
+
+fn compact_partition_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    let schema = batches
+        .first()
+        .ok_or_else(|| Error::internal("IVF prewarm partition has no decoded batches"))?
+        .schema();
+    if batches.len() == 1 {
+        let batch = batches
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::internal("IVF prewarm partition batch unexpectedly missing"))?;
+        if batch.num_rows() == 0 {
+            Ok(batch)
+        } else {
+            Ok(batch.shrink_to_fit()?)
+        }
+    } else {
+        Ok(concat_batches(&schema, batches.iter())?)
+    }
+}
+
+struct PartitionPrewarmBatches {
+    index: Vec<RecordBatch>,
+    storage: Vec<RecordBatch>,
+}
+
+async fn read_partition_window_batches(
+    reader: &FileReader,
+    projection: Option<&ReaderProjection>,
+    schema: &arrow_schema::SchemaRef,
+    ivf: &IvfModel,
+    partitions: Range<usize>,
+    io_stats: Option<IoStats>,
+) -> Result<Vec<Vec<RecordBatch>>> {
+    if partitions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let partition_lengths = if reader.num_rows() == 0 {
+        vec![0; partitions.len()]
+    } else {
+        partitions
+            .clone()
+            .map(|partition_id| ivf.partition_size(partition_id))
+            .collect::<Vec<_>>()
+    };
+    let row_start = if reader.num_rows() == 0 {
+        0
+    } else {
+        ivf.row_range(partitions.start).start
+    };
+    let row_end = if reader.num_rows() == 0 {
+        0
+    } else {
+        ivf.row_range(partitions.end - 1).end
+    };
+    let batches = if row_start == row_end {
+        Vec::new()
+    } else {
+        let reader = match &io_stats {
+            Some(io_stats) => Cow::Owned(reader.with_io_stats(io_stats.recorder())),
+            None => Cow::Borrowed(reader),
+        };
+        let params = ReadBatchParams::Range(row_start..row_end);
+        let stream = match projection {
+            Some(projection) => {
+                reader
+                    .read_stream_projected(
+                        params,
+                        u32::MAX,
+                        1,
+                        projection.clone(),
+                        FilterExpression::no_filter(),
+                    )
+                    .await?
+            }
+            None => {
+                reader
+                    .read_stream(params, u32::MAX, 1, FilterExpression::no_filter())
+                    .await?
+            }
+        };
+        stream.try_collect::<Vec<_>>().await?
+    };
+    split_window_batches(schema, &partition_lengths, batches)
+}
+
+/// Number of prewarm windows kept in flight. Raising this beyond the CPU pool
+/// size measured no throughput gain (see `DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES`);
+/// the window size is the lever.
+fn prewarm_parallelism(io_parallelism: usize, cpu_parallelism: usize) -> usize {
+    io_parallelism.max(1).min(cpu_parallelism.max(1))
+}
 
 struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
     query: Query,
@@ -1358,6 +1643,152 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(PartitionEntry::new(idx, storage))
     }
 
+    async fn materialize_prewarm_partition(
+        &self,
+        partition_id: usize,
+        batches: PartitionPrewarmBatches,
+    ) -> Result<PartitionEntry<S, Q>>
+    where
+        Q::Metadata: 'static,
+        Q::Storage: 'static,
+    {
+        let sub_index_metadata = self.sub_index_metadata[partition_id].clone();
+        if batches.index.iter().all(|batch| batch.num_rows() == 0) {
+            // IVF-Flat/RQ stores no per-partition sub-index rows. Keep this
+            // trivial construction inline instead of dispatching one CPU task
+            // per partition (hundreds of thousands on large indexes).
+            let batch = compact_partition_batches(batches.index)?
+                .add_metadata(S::metadata_key().to_owned(), sub_index_metadata)?;
+            let index = S::load(batch)?;
+            let storage = self
+                .storage
+                .materialize_partition_for_prewarm(batches.storage)
+                .await?;
+            return Ok(PartitionEntry::new(index, storage));
+        }
+        let index = spawn_cpu(move || {
+            let batch = compact_partition_batches(batches.index)?
+                .add_metadata(S::metadata_key().to_owned(), sub_index_metadata)?;
+            S::load(batch)
+        });
+        let storage = self
+            .storage
+            .materialize_partition_for_prewarm(batches.storage);
+        let (index, storage) = tokio::try_join!(index, storage)?;
+        Ok(PartitionEntry::new(index, storage))
+    }
+
+    async fn prewarm_partition_window(&self, partitions: Range<usize>) -> Result<()>
+    where
+        Q::Metadata: 'static,
+        Q::Storage: 'static,
+    {
+        let index_schema = Arc::new(match &self.read_projection {
+            Some(projection) => projection.schema.as_ref().into(),
+            None => self.reader.schema().as_ref().into(),
+        });
+        let storage_schema = Arc::new(self.storage.reader().schema().as_ref().into());
+        let mut partition_id = partitions.start;
+        while partition_id < partitions.end {
+            let leader_key = IVFPartitionKey::<S, Q>::new(partition_id);
+            if self.index_cache.get_with_key(&leader_key).await.is_some() {
+                partition_id += 1;
+                continue;
+            }
+
+            // Stop at a cached hole. This prevents a warm partition from being
+            // included in a larger contiguous read merely because later
+            // partitions are cold.
+            let mut run_end = partition_id + 1;
+            while run_end < partitions.end {
+                let key = IVFPartitionKey::<S, Q>::new(run_end);
+                if self.index_cache.get_with_key(&key).await.is_some() {
+                    break;
+                }
+                run_end += 1;
+            }
+            let run = partition_id..run_end;
+            let (_, was_cached) = self
+                .index_cache
+                .get_or_insert_with_key_hit(leader_key, || async {
+                    let (index_batches, storage_batches) = tokio::try_join!(
+                        read_partition_window_batches(
+                            &self.reader,
+                            self.read_projection.as_ref(),
+                            &index_schema,
+                            &self.ivf,
+                            run.clone(),
+                            None,
+                        ),
+                        read_partition_window_batches(
+                            self.storage.reader(),
+                            None,
+                            &storage_schema,
+                            self.storage.ivf(),
+                            run.clone(),
+                            None,
+                        )
+                    )?;
+                    if index_batches.len() != run.len() || storage_batches.len() != run.len() {
+                        return Err(Error::internal(format!(
+                            "IVF prewarm run {:?} produced {} index and {} storage partitions",
+                            run,
+                            index_batches.len(),
+                            storage_batches.len()
+                        )));
+                    }
+
+                    let mut payloads = index_batches
+                        .into_iter()
+                        .zip(storage_batches)
+                        .map(|(index, storage)| PartitionPrewarmBatches { index, storage });
+                    let leader_batches = payloads.next().ok_or_else(|| {
+                        Error::internal(format!(
+                            "IVF prewarm run {:?} did not produce its leader partition",
+                            run
+                        ))
+                    })?;
+                    let mut follower_loads = FuturesUnordered::new();
+                    for (offset, batches) in payloads.enumerate() {
+                        let follower_id = run.start + offset + 1;
+                        follower_loads.push(async move {
+                            let key = IVFPartitionKey::<S, Q>::new(follower_id);
+                            self.index_cache
+                                .get_or_insert_with_key(key, || async move {
+                                    self.materialize_prewarm_partition(follower_id, batches)
+                                        .await
+                                })
+                                .await
+                                .map(|_| ())
+                        });
+                    }
+                    let mut first_error = None;
+                    while let Some(result) = follower_loads.next().await {
+                        if let Err(error) = result
+                            && first_error.is_none()
+                        {
+                            first_error = Some(error);
+                        }
+                    }
+                    if let Some(error) = first_error {
+                        return Err(error);
+                    }
+                    self.materialize_prewarm_partition(partition_id, leader_batches)
+                        .await
+                })
+                .await?;
+            partition_id = if was_cached {
+                // A query or another prewarm owned this key. It may not have
+                // populated the remainder of our planned window, so resume at
+                // the next partition instead of skipping the full run.
+                partition_id + 1
+            } else {
+                run_end
+            };
+        }
+        Ok(())
+    }
+
     pub async fn load_partition_storage(
         &self,
         partition_id: usize,
@@ -1411,13 +1842,49 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     }
 
     async fn prewarm(&self) -> Result<()> {
-        futures::stream::iter(0..self.ivf.num_partitions())
+        let cpu_parallelism = get_num_compute_intensive_cpus();
+        let target_bytes = prewarm_window_size_bytes()?;
+        let parallelism = prewarm_parallelism(self.io_parallelism, cpu_parallelism);
+        let max_partitions = cpu_parallelism.saturating_mul(2).max(1);
+        let windows = plan_partition_windows(
+            PrewarmFileLayout {
+                ivf: &self.ivf,
+                encoded_bytes: self.reader.metadata().num_data_bytes,
+                num_rows: self.reader.num_rows(),
+            },
+            PrewarmFileLayout {
+                ivf: self.storage.ivf(),
+                encoded_bytes: self.storage.reader().metadata().num_data_bytes,
+                num_rows: self.storage.reader().num_rows(),
+            },
+            target_bytes,
+            max_partitions,
+        )?;
+        let planned_bytes: u64 = windows.iter().map(|w| w.estimated_encoded_bytes).sum();
+        info!(
+            uuid = %self.uuid,
+            windows = windows.len(),
+            planned_bytes,
+            window_bytes = target_bytes,
+            parallelism,
+            io_parallelism = self.io_parallelism,
+            "prewarming IVF partitions in byte windows"
+        );
+        let started = std::time::Instant::now();
+        stream::iter(windows)
             .map(Ok)
-            .try_for_each_concurrent(Some(self.io_parallelism), |part_id| {
-                self.load_partition(part_id, true, &NoOpMetricsCollector)
-                    .map_ok(|_| ())
+            .try_for_each_concurrent(Some(parallelism), |window| async move {
+                self.prewarm_partition_window(window.partitions).await
             })
-            .await
+            .await?;
+        let elapsed = started.elapsed();
+        info!(
+            uuid = %self.uuid,
+            elapsed_ms = elapsed.as_millis() as u64,
+            planned_mb_per_s = planned_bytes as f64 / 1e6 / elapsed.as_secs_f64().max(1e-9),
+            "prewarmed IVF partitions"
+        );
+        Ok(())
     }
 
     fn index_type(&self) -> IndexType {
@@ -2117,6 +2584,7 @@ mod tests {
         storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RabitQuantizationMetadata, RabitQueryEstimator},
         transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
     };
+    use lance_index::vector::ivf::storage::IvfModel;
     use lance_index::vector::storage::VectorStore;
     use lance_index::vector::v3::subindex::IvfSubIndex;
 
@@ -2191,6 +2659,162 @@ mod tests {
     const LIGHTWEIGHT_PQ_SUB_VECTORS: usize = 4;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
+
+    #[test]
+    fn test_prewarm_parallelism_is_bounded_by_io_and_cpu() {
+        assert_eq!(super::prewarm_parallelism(8, 4), 4);
+        assert_eq!(super::prewarm_parallelism(2, 4), 2);
+        assert_eq!(super::prewarm_parallelism(0, 0), 1);
+    }
+
+    #[test]
+    fn test_prewarm_window_size_config() {
+        assert_eq!(
+            super::parse_prewarm_window_size_bytes(None).unwrap(),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            super::parse_prewarm_window_size_bytes(Some("1048576")).unwrap(),
+            1_048_576
+        );
+        for value in ["0", "not-a-byte-count"] {
+            let error = super::parse_prewarm_window_size_bytes(Some(value)).unwrap_err();
+            assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(message.contains("LANCE_IVF_PREWARM_WINDOW_SIZE_BYTES"));
+            assert!(message.contains(value));
+        }
+    }
+
+    fn ivf_with_lengths(lengths: &[u32]) -> IvfModel {
+        let mut ivf = IvfModel::empty();
+        for &length in lengths {
+            ivf.add_partition(length);
+        }
+        ivf
+    }
+
+    fn prewarm_layout(
+        ivf: &IvfModel,
+        encoded_bytes: u64,
+        num_rows: u64,
+    ) -> super::PrewarmFileLayout<'_> {
+        super::PrewarmFileLayout {
+            ivf,
+            encoded_bytes,
+            num_rows,
+        }
+    }
+
+    #[test]
+    fn test_plan_prewarm_windows_uses_combined_encoded_bytes() {
+        let ivf = ivf_with_lengths(&[2, 0, 4, 20, 0, 2]);
+        let windows = super::plan_partition_windows(
+            prewarm_layout(&ivf, 112, 28),
+            prewarm_layout(&ivf, 168, 28),
+            50,
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(
+            windows,
+            vec![
+                super::PartitionWindow {
+                    partitions: 0..2,
+                    estimated_encoded_bytes: 20,
+                },
+                super::PartitionWindow {
+                    partitions: 2..3,
+                    estimated_encoded_bytes: 40,
+                },
+                super::PartitionWindow {
+                    partitions: 3..4,
+                    estimated_encoded_bytes: 200,
+                },
+                super::PartitionWindow {
+                    partitions: 4..6,
+                    estimated_encoded_bytes: 20,
+                },
+            ]
+        );
+        assert_eq!(windows.first().unwrap().partitions.start, 0);
+        assert_eq!(windows.last().unwrap().partitions.end, ivf.num_partitions());
+        for pair in windows.windows(2) {
+            assert_eq!(pair[0].partitions.end, pair[1].partitions.start);
+        }
+    }
+
+    #[test]
+    fn test_plan_prewarm_windows_caps_empty_partitions_and_splits_gaps() {
+        let empty_ivf = ivf_with_lengths(&[0, 0, 0, 0, 0]);
+        let windows = super::plan_partition_windows(
+            prewarm_layout(&empty_ivf, 0, 0),
+            prewarm_layout(&empty_ivf, 0, 0),
+            1024,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.partitions.clone())
+                .collect::<Vec<_>>(),
+            vec![0..2, 2..4, 4..5]
+        );
+
+        let index_ivf = ivf_with_lengths(&[2, 2, 2]);
+        let mut storage_ivf = IvfModel::empty();
+        storage_ivf.add_partition_with_offset(0, 2);
+        storage_ivf.add_partition_with_offset(20, 2);
+        storage_ivf.add_partition_with_offset(22, 2);
+        let windows = super::plan_partition_windows(
+            prewarm_layout(&index_ivf, 6, 6),
+            prewarm_layout(&storage_ivf, 6, 6),
+            1024,
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.partitions.clone())
+                .collect::<Vec<_>>(),
+            vec![0..1, 1..3]
+        );
+    }
+
+    #[test]
+    fn test_split_prewarm_window_compacts_partition_buffers() {
+        let parent = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(UInt64Array::from_iter_values(0..100)) as ArrayRef,
+        )])
+        .unwrap();
+        let parent_ptr = parent["value"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .as_ptr();
+        let parent_size = parent["value"].get_array_memory_size();
+        let mut partitions =
+            super::split_window_batches(&parent.schema(), &[10, 0, 90], vec![parent]).unwrap();
+
+        let shared_ptr = partitions[0][0]["value"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .as_ptr();
+        assert_eq!(shared_ptr, parent_ptr);
+        let compact = super::compact_partition_batches(partitions.remove(0)).unwrap();
+        let compact_ptr = compact["value"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .as_ptr();
+        assert_ne!(compact_ptr, parent_ptr);
+        assert_lt!(compact["value"].get_array_memory_size(), parent_size);
+        assert_eq!(compact.num_rows(), 10);
+        assert_eq!(partitions[0][0].num_rows(), 0);
+        assert_eq!(partitions[1][0].num_rows(), 90);
+    }
 
     struct PartitionCoverageTestFilter {
         needs_partition_rows: bool,
@@ -7099,8 +7723,19 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::ivf_pq(VectorIndexParams::with_ivf_pq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(4),
+        PQBuildParams::new(4, 4),
+    ))]
+    #[case::ivf_rq(VectorIndexParams::with_ivf_rq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(4),
+        RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+    ))]
     #[tokio::test]
-    async fn test_prewarm_ivf_pq() {
+    async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         use lance_io::assert_io_eq;
 
         const INDEX_NAME: &str = "my_idx";
@@ -7108,11 +7743,6 @@ mod tests {
         let test_uri = test_dir.as_str();
         let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
-        let params = VectorIndexParams::with_ivf_pq_params(
-            DistanceType::L2,
-            IvfBuildParams::new(4),
-            PQBuildParams::new(4, 4),
-        );
         dataset
             .create_index(
                 &["vector"],
@@ -7140,8 +7770,18 @@ mod tests {
         // Reset IO stats after index creation.
         dataset.object_store.as_ref().io_stats_incremental();
 
-        // Prewarm should perform IO to load all index deltas into cache.
-        dataset.prewarm_index(INDEX_NAME).await.unwrap();
+        // Concurrent prewarms should single-flight each partition through the
+        // cache loader and leave a complete warm cache for both callers.
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(
+                dataset.prewarm_index(INDEX_NAME),
+                dataset.prewarm_index(INDEX_NAME)
+            )
+        })
+        .await
+        .expect("concurrent prewarms deadlocked");
+        first.unwrap();
+        second.unwrap();
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert!(
             stats.read_iops > 0,

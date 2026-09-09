@@ -1440,7 +1440,7 @@ impl CleanupPolicyBuilder {
                 "retain_versions must be greater than 0, got {n}"
             )));
         }
-        let versions = dataset.versions().await?;
+        let versions = dataset.version_refs().await?;
         self.policy.before_version = if versions.len() <= n {
             Some(versions[0].version)
         } else {
@@ -3589,6 +3589,26 @@ mod tests {
                 .contains("retain_versions must be greater than 0, got 0"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn retain_n_versions_does_not_read_manifests() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&dataset, 2)
+            .await
+            .unwrap()
+            .build();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+
+        assert_eq!(policy.before_version, Some(2));
+        assert_eq!(io_stats.read_bytes, 0);
     }
 
     #[tokio::test]

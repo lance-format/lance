@@ -5,7 +5,7 @@ use arrow_array::RecordBatch;
 use bytes::Bytes;
 use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use lance_arrow::{
     ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
     BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
@@ -17,11 +17,16 @@ use lance_core::utils::tracing::{
 };
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_datafusion::utils::StreamingWriteSource;
+use lance_file::concat::{
+    FileConcatOptions, FileConcatReason, FileConcatResult, FileConcatTarget,
+    concat_data_file_parts as concat_parts,
+};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_file::versions::v1::writer::{
     FileWriter as V1FileWriter, ManifestProvider as V1ManifestProvider,
 };
 use lance_file::writer::{self as current_writer};
+use lance_file::{versions as file_versions, writer::FileWriterOptions};
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
 };
@@ -33,7 +38,8 @@ use object_store::path::Path;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::num::NonZero;
+use std::num::{NonZero, NonZeroU64};
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
@@ -49,12 +55,12 @@ use crate::index::DatasetIndexExt;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::session::Session;
 
-use super::DATA_DIR;
 use super::fragment::write::generate_random_filename;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 use super::versions;
+use super::{DATA_DIR, DataFilePart, DataFileTarget};
 
 mod commit;
 pub mod delete;
@@ -67,6 +73,280 @@ pub use super::progress::{WriteProgressFn, WriteStats};
 pub use commit::{CommitBuilder, DEFAULT_COMMIT_TIMEOUT};
 pub use delete::{DeleteBuilder, DeleteResult, UncommittedDelete};
 pub use insert::InsertBuilder;
+
+impl Dataset {
+    pub(super) fn validate_data_file_target(&self, target: &DataFileTarget) -> Result<()> {
+        let dataset_version = self.manifest.data_storage_format.lance_file_format();
+        if target.version != dataset_version {
+            return Err(Error::invalid_input(format!(
+                "DataFileTarget.version is {}, but dataset version {} uses {}",
+                target.version,
+                self.version_id(),
+                dataset_version
+            )));
+        }
+        self.data_file_dir_for_base(target.base_id)?;
+
+        if target.schema.metadata != self.schema().metadata {
+            return Err(Error::invalid_input(
+                "DataFileTarget.schema metadata differs from the dataset schema metadata",
+            ));
+        }
+        for target_field in &target.schema.fields {
+            let Some(dataset_field) = self
+                .schema()
+                .fields
+                .iter()
+                .find(|field| field.id == target_field.id)
+            else {
+                return Err(Error::invalid_input(format!(
+                    "DataFileTarget.schema field ID {} is not a top-level dataset field",
+                    target_field.id
+                )));
+            };
+            if dataset_field != target_field {
+                return Err(Error::invalid_input(format!(
+                    "DataFileTarget.schema field ID {} differs from the current dataset field",
+                    target_field.id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Encode one managed part and return its serializable description.
+    ///
+    /// Lance generates a unique staging name in the target's base. Managed Blob
+    /// payloads are written directly beneath the sidecar directory selected by the final
+    /// target using IDs from `blob_ids`; every non-empty logical Inline value is
+    /// spilled to Packed or Dedicated storage so final concatenation never copies
+    /// Blob payload bytes.
+    /// Every use of `target` must refer to the same dataset and resolved base;
+    /// associating a target with that storage context is the caller's
+    /// responsibility.
+    /// Persist the target before writing. A failed write may leave files; after
+    /// stopping all users of the target, [`DataFileTarget::cleanup`] can
+    /// remove them without a completed part description. Retries must use fresh,
+    /// disjoint Blob ID ranges, including ranges from failed writes. Staging
+    /// `.part` files are only explicitly cleaned; ordinary dataset GC rules still
+    /// apply to uncommitted Blob sidecars and must be coordinated with checkpoints.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::RecordBatch;
+    /// use futures::stream;
+    /// use lance::{Dataset, dataset::DataFileTarget};
+    ///
+    /// # async fn write_part(
+    /// #     dataset: &Dataset,
+    /// #     target: &DataFileTarget,
+    /// #     batch: RecordBatch,
+    /// # ) -> lance_core::Result<()> {
+    /// let part = dataset
+    ///     .write_data_file_part(target, None, stream::iter([Ok(batch)]))
+    ///     .await?;
+    /// // Serialize part into the caller's checkpoint.
+    /// # let _ = part;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write_data_file_part(
+        &self,
+        target: &DataFileTarget,
+        blob_ids: Option<Range<u32>>,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+    ) -> Result<DataFilePart> {
+        self.validate_data_file_target(target)?;
+        validate_blob_v2_write_schema(target.schema.as_ref())?;
+        let part_blob_ids = blob_ids.clone();
+        let has_blob = target
+            .schema
+            .fields_pre_order()
+            .any(|field| field.is_blob_v2());
+        if has_blob && blob_ids.is_none() {
+            return Err(Error::invalid_input(
+                "write_data_file_part requires a non-empty Blob ID range for a schema containing Blob v2 fields",
+            ));
+        }
+
+        let mut preprocessor = if let Some(blob_ids) = blob_ids {
+            let data_dir = self.data_file_dir_for_base(target.base_id)?;
+            let object_store = self.object_store(target.base_id).await?;
+            let external_base_resolver = blob_v2_external_base_resolver(
+                Some(self),
+                &WriteParams::default(),
+                target.schema.as_ref(),
+            )
+            .await?;
+            Some(
+                BlobPreprocessor::new(
+                    object_store.as_ref().clone(),
+                    data_dir,
+                    target.data_file_key().to_string(),
+                    target.schema.as_ref(),
+                    external_base_resolver,
+                    false,
+                    ExternalBlobMode::Reference,
+                    self.session().store_registry(),
+                    self.store_params().cloned().unwrap_or_default(),
+                    None,
+                )?
+                .with_part_blob_ids(blob_ids)?,
+            )
+        } else {
+            None
+        };
+
+        let file_name = format!("{}.part", generate_random_filename());
+        let path = target
+            .parts_dir(&self.data_file_dir_for_base(target.base_id)?)
+            .join(file_name.as_str());
+        let store = self.object_store(target.base_id).await?;
+        let mut writer = file_versions::create_writer(
+            target.version,
+            store.create(&path).await?,
+            target.schema.as_ref().clone(),
+            FileWriterOptions::default(),
+        )?;
+        let mut data = Box::pin(data);
+        let write_result = async {
+            while let Some(batch) = data.next().await {
+                let batch = batch?;
+                if let Some(preprocessor) = preprocessor.as_mut() {
+                    let batch = preprocessor.preprocess_batch(&batch).await?;
+                    writer.write_batch(&batch).await?;
+                } else {
+                    writer.write_batch(&batch).await?;
+                }
+            }
+            if let Some(preprocessor) = preprocessor.as_mut() {
+                preprocessor.finish().await?;
+            }
+            writer.finish().await
+        }
+        .await;
+
+        match write_result {
+            Ok(summary) => Ok(DataFilePart {
+                target_file_name: target.file_name.clone(),
+                base_id: target.base_id,
+                file_name,
+                blob_ids: part_blob_ids,
+                num_rows: summary.num_rows,
+                size_bytes: NonZeroU64::new(summary.size_bytes)
+                    .ok_or_else(|| Error::internal("completed part has zero file size"))?,
+            }),
+            Err(error) => {
+                writer.abort().await;
+                if let Some(preprocessor) = preprocessor.as_mut() {
+                    preprocessor.abort();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Reopen, validate, and concatenate parts into the final data file.
+    ///
+    /// Part order is the final physical row order. The operation copies
+    /// encoded page buffers and regenerates metadata and the footer; incompatible
+    /// inputs fail without a decode/re-encode fallback or dataset commit. The
+    /// caller owns cleanup of all durable part, Blob, and final-file objects.
+    /// The caller must also assemble the target through the same dataset and
+    /// resolved base used to write managed Blob payloads.
+    /// The target must still be uncommitted and have no concurrent assembler.
+    /// Assembly can overwrite a previous uncommitted output for the same target;
+    /// it does not check current or historical manifests for references.
+    ///
+    /// To replace a fragment's columns, wrap the returned file in a
+    /// [`DataReplacementGroup`](super::transaction::DataReplacementGroup).
+    /// The caller must check that the ordered parts cover the fragment's physical
+    /// rows exactly, including deleted rows; this operation does not check
+    /// fragment coverage or commit the replacement.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use lance::{Dataset, dataset::{DataFilePart, DataFileTarget}};
+    ///
+    /// # async fn concat(
+    /// #     dataset: &Dataset,
+    /// #     target: &DataFileTarget,
+    /// #     ordered_parts: &[DataFilePart],
+    /// # ) -> lance_core::Result<()> {
+    /// let data_file = dataset.concat_data_file_parts(target, ordered_parts).await?;
+    /// // The caller decides when and how to commit `data_file`.
+    /// # let _ = data_file;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn concat_data_file_parts(
+        &self,
+        target: &DataFileTarget,
+        ordered_parts: &[DataFilePart],
+    ) -> Result<DataFile> {
+        let opened = DataFilePart::open_all(self, target, ordered_parts).await?;
+        let data_dir = self.data_file_dir_for_base(target.base_id)?;
+        let output_path = target.object_path(&data_dir);
+        let object_store = self.object_store(target.base_id).await?;
+        let mut concat_target = FileConcatTarget::new(target.version, target.schema.clone());
+        if let Some(blob_target_id) = target.blob_target_id() {
+            concat_target = concat_target.with_blob_target_id(blob_target_id);
+        }
+        let result = concat_parts(
+            &concat_target,
+            &opened,
+            {
+                let object_store = object_store.clone();
+                let output_path = output_path.clone();
+                move || async move { object_store.create(&output_path).await }
+            },
+            FileConcatOptions::default(),
+        )
+        .await;
+
+        let output = match result {
+            Ok(FileConcatResult::Written(output)) => output,
+            Ok(FileConcatResult::Reused(_, _)) => {
+                return Err(Error::internal(
+                    "data-file part concatenation unexpectedly reused an input".to_string(),
+                ));
+            }
+            Ok(FileConcatResult::Unsupported(reason)) => {
+                let message = format!(
+                    "parts cannot be concatenated into target {:?}: {reason}",
+                    target.file_name
+                );
+                return Err(match reason {
+                    FileConcatReason::VersionMismatch { actual, .. } => {
+                        let (major, minor) = actual.to_standard_footer_numbers();
+                        Error::version_conflict(message, major, minor)
+                    }
+                    FileConcatReason::SchemaMismatch { .. } => Error::schema_mismatch(message),
+                    FileConcatReason::LegacyVersion
+                    | FileConcatReason::ColumnLayoutMismatch { .. }
+                    | FileConcatReason::ColumnEncodingMismatch { .. }
+                    | FileConcatReason::ColumnBuffers { .. }
+                    | FileConcatReason::ExtraGlobalBuffers { .. }
+                    | FileConcatReason::BlobColumns => Error::not_supported(message),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let (fields, column_indices) =
+            file_versions::data_file_columns(target.version, target.schema.as_ref());
+        Ok(DataFile::new(
+            target.file_name.clone(),
+            fields,
+            column_indices,
+            target.version,
+            NonZeroU64::new(output.size_bytes),
+            target.base_id,
+        ))
+    }
+}
 
 /// The destination to write data to.
 #[derive(Debug, Clone)]

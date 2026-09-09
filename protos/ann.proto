@@ -9,17 +9,19 @@ import "table_identifier.proto";
 import "table.proto";
 import "index.proto";
 
-// Query-time approximation mode for vector search.
-//
-// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
-// Other index types ignore this setting.
+/* Query-time approximation mode for vector search.
+ *
+ * This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
+ * Other index types ignore this setting.
+ */
 enum VectorApproxMode {
   // Use all RQ bits for query-time scoring with u8-quantized lookup tables.
   Normal = 0;
   // Use only one RQ bit for query-time scoring, even for multi-bit indexes.
   Fast = 1;
-  // Use all RQ bits for query-time scoring with u16-quantized lookup tables
-  // to reduce estimator quantization error.
+  /* Use all RQ bits for query-time scoring with u16-quantized lookup tables
+   * to reduce estimator quantization error.
+   */
   Accurate = 2;
 }
 
@@ -40,17 +42,19 @@ message VectorQueryProto {
   bool use_index = 11;
   optional float dist_q_c = 12;
   optional int32 query_parallelism = 13;
-  // Query-time approximation mode. Currently only affects RQ-quantized vector
-  // indexes, such as IVF_RQ. Other index types ignore this setting.
+  /* Query-time approximation mode. Currently only affects RQ-quantized vector
+   * indexes, such as IVF_RQ. Other index types ignore this setting.
+   */
   VectorApproxMode approx_mode = 14;
 }
 
-// Serializable form of ANNIvfSubIndexExec — the IVF sub-index search node.
-//
-// The prefilter child ExecutionPlan is serialized by DataFusion's codec
-// automatically via children() / with_new_children(). The prefilter_type
-// field tells the decoder which PreFilterSource variant to use when
-// reconstructing from the deserialized child inputs.
+/* Serializable form of ANNIvfSubIndexExec — the IVF sub-index search node.
+ *
+ * The prefilter child ExecutionPlan is serialized by DataFusion's codec
+ * automatically via children() / with_new_children(). The prefilter_type
+ * field tells the decoder which PreFilterSource variant to use when
+ * reconstructing from the deserialized child inputs.
+ */
 message ANNIvfSubIndexExecProto {
   enum PreFilterType {
     NONE = 0;
