@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::tests::{field, fixture, fixture_with_index, install, persist_fixture, prepare};
+use super::tests::{fixture, fixture_with_index, install, persist_fixture, prepare};
 use super::*;
 use crate::dataset::WriteParams;
 use crate::index::frag_reuse_remapping::vector_supports_batch_remapping;
