@@ -699,6 +699,23 @@ impl InvertedPartition {
         index_cache: &LanceCache,
         token_set_format: TokenSetFormat,
     ) -> Result<Self> {
+        Self::load_with_remapping(
+            store,
+            id,
+            frag_reuse_index.map(RowIdRemapping::InMemory),
+            index_cache,
+            token_set_format,
+        )
+        .await
+    }
+
+    pub(crate) async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        id: u64,
+        frag_reuse_index: Option<RowIdRemapping>,
+        index_cache: &LanceCache,
+        token_set_format: TokenSetFormat,
+    ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file, token_set_format).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;

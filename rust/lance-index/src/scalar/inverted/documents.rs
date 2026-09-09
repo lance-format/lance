@@ -7,6 +7,7 @@
 //! keeps that identity separate from dataset-version row addresses so scoring
 //! never has to infer which value a numeric slot represents.
 
+use lance_index_core::remapping::RowIdRemapping;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -744,6 +745,39 @@ impl DeepSizeOf for VersionAddressProjection {
 }
 
 impl VersionAddressProjection {
+    async fn with_remapping(
+        raw: &UInt64Array,
+        num_docs: usize,
+        remapping: Option<&RowIdRemapping>,
+        path: &str,
+    ) -> Result<Arc<Self>> {
+        let Some(remapping @ RowIdRemapping::External(_)) = remapping else {
+            return Ok(Arc::new(Self::try_new(
+                raw,
+                num_docs,
+                remapping.map(RowIdRemapping::synchronous).transpose()?,
+                path,
+            )?));
+        };
+        let mut projection = Self::try_new(raw, num_docs, None, path)?;
+        let mut addresses = Vec::with_capacity(raw.len());
+        let mut live_docs = RoaringBitmap::new();
+        for ids in raw.values().chunks(64 * 1024) {
+            for address in remapping.remap_row_ids(ids).await? {
+                let doc_id = addresses.len() as u32;
+                if let Some(address) = address {
+                    live_docs.insert(doc_id);
+                    addresses.push(address);
+                } else {
+                    addresses.push(0);
+                }
+            }
+        }
+        projection.addresses = AddressValues::Owned(Arc::new(addresses));
+        projection.live_docs = Some(live_docs);
+        Ok(Arc::new(projection))
+    }
+
     fn try_new(
         raw: &UInt64Array,
         expected_num_docs: usize,
@@ -1091,7 +1125,7 @@ pub(super) struct PartitionDocuments {
     coordinate_rank: usize,
     persisted_total_tokens: Option<u64>,
     quantized_scoring: bool,
-    remapper: Option<Arc<dyn RowIdRemapper>>,
+    remapper: Option<RowIdRemapping>,
     lengths: OnceCell<Arc<DocLengths>>,
     projection: OnceCell<Arc<VersionAddressProjection>>,
     shared_addresses: ArcSwapWeak<UInt64Array>,
@@ -1234,7 +1268,7 @@ impl PartitionDocuments {
         partition_id: u64,
         index_cache: WeakLanceCache,
         reader: &dyn IndexReader,
-        remapper: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<RowIdRemapping>,
         quantized_scoring: bool,
     ) -> Result<Self> {
         let num_docs = reader.num_rows();
@@ -1440,12 +1474,13 @@ impl PartitionDocuments {
         let projection = self
             .projection
             .get_or_try_init(|| async {
-                Result::Ok(Arc::new(VersionAddressProjection::try_new(
+                VersionAddressProjection::with_remapping(
                     row_ids.as_ref(),
                     self.num_docs,
-                    self.remapper.as_deref(),
+                    self.remapper.as_ref(),
                     &self.path,
-                )?))
+                )
+                .await
             })
             .await
             .cloned()?;
@@ -1809,7 +1844,7 @@ impl PartitionDocuments {
 
     /// Materialize the build-side table for rewrite/update operations.
     pub(crate) async fn load_build_docset(&self) -> Result<DocSet> {
-        DocSet::load(self.reader().await?, false, self.remapper.clone()).await
+        DocSet::load_with_remapping(self.reader().await?, false, self.remapper.clone()).await
     }
 
     pub(crate) async fn prewarm(&self) -> Result<()> {
@@ -1829,12 +1864,13 @@ impl PartitionDocuments {
                             format!("{ROW_ID} contains null values"),
                         ));
                     }
-                    let projection = Arc::new(VersionAddressProjection::try_new(
+                    let projection = VersionAddressProjection::with_remapping(
                         row_ids.as_ref(),
                         self.num_docs,
-                        self.remapper.as_deref(),
+                        self.remapper.as_ref(),
                         &self.path,
-                    )?);
+                    )
+                    .await?;
                     let cached_row_ids = Arc::new(CachedDocRowIds {
                         row_ids: row_ids.clone(),
                     });
@@ -2209,7 +2245,7 @@ mod tests {
         store: Arc<dyn IndexStore>,
         path: &str,
         index_cache: &LanceCache,
-        remapper: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<RowIdRemapping>,
     ) -> Result<PartitionDocuments> {
         let reader = store.open_index_file(path).await?;
         PartitionDocuments::try_new(

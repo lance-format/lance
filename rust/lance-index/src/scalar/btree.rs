@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowIdRemapping;
 use std::{
     any::Any,
     cmp::Ordering,
@@ -1417,7 +1418,7 @@ impl BTreeIndexState {
         &self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        frag_reuse_index: Option<RowIdRemapping>,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let index = BTreeIndex::try_from_serialized(
             self.lookup_batch.clone(),
@@ -1551,7 +1552,7 @@ pub struct BTreeIndex {
     /// - The local page_idx is calculated: `142 - 100 = 42`.
     /// - The system now knows to read page `42` from the file `part_2_page_file.lance`.
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
-    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    frag_reuse_index: Option<RowIdRemapping>,
 }
 
 impl DeepSizeOf for BTreeIndex {
@@ -1572,7 +1573,7 @@ impl BTreeIndex {
         index_cache: WeakLanceCache,
         batch_size: u64,
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        frag_reuse_index: Option<RowIdRemapping>,
     ) -> Self {
         Self {
             page_lookup,
@@ -1678,8 +1679,9 @@ impl BTreeIndex {
             .read_record_batch(page_number as u64, self.batch_size)
             .await?;
         if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
-            serialized_page =
-                frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
+            serialized_page = frag_reuse_index_ref
+                .remap_row_ids_record_batch(serialized_page, 1)
+                .await?;
         }
         FlatIndex::try_new(serialized_page)
     }
@@ -1736,7 +1738,7 @@ impl BTreeIndex {
         index_cache: &LanceCache,
         batch_size: u64,
         ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        frag_reuse_index: Option<RowIdRemapping>,
     ) -> Result<Self> {
         let data_type = data.column(0).data_type().clone();
         let page_lookup = Arc::new(BTreeLookup::try_new(data)?);
@@ -1754,7 +1756,7 @@ impl BTreeIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        frag_reuse_index: Option<RowIdRemapping>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let (page_lookup_file, standalone_partition_page_file) =
@@ -1990,12 +1992,12 @@ fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
 
 fn remap_row_ids(
     stream: SendableRecordBatchStream,
-    frag_reuse_index: Arc<dyn RowIdRemapper>,
+    frag_reuse_index: RowIdRemapping,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
-    let remapped = stream.map(move |batch_result| {
-        let batch = batch_result?;
-        Ok(frag_reuse_index.remap_row_ids_record_batch(batch, 1)?)
+    let remapped = stream.and_then(move |batch| {
+        let remapper = frag_reuse_index.clone();
+        async move { Ok(remapper.remap_row_ids_record_batch(batch, 1).await?) }
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
 }
@@ -3358,7 +3360,26 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(BTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+        Ok(BTreeIndex::load(
+            index_store,
+            frag_reuse_index.map(RowIdRemapping::InMemory),
+            cache,
+        )
+        .await? as Arc<dyn ScalarIndex>)
+    }
+
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        remapping: Option<RowIdRemapping>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(BTreeIndex::load(index_store, remapping, cache).await?)
     }
 
     async fn get_from_cache(
@@ -3373,7 +3394,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         Ok(Some(state.reconstruct(
             index_store,
             cache,
-            frag_reuse_index,
+            frag_reuse_index.map(RowIdRemapping::InMemory),
         )?))
     }
 
@@ -3402,7 +3423,13 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
             BTreeIndexStateKey,
             load,
             BTreeIndexState::from_index,
-            move |state| state.reconstruct(index_store, cache, frag_reuse_index),
+            move |state| {
+                state.reconstruct(
+                    index_store,
+                    cache,
+                    frag_reuse_index.map(RowIdRemapping::InMemory),
+                )
+            },
         )
         .await
     }
@@ -3411,6 +3438,7 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 #[cfg(test)]
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use lance_index_core::remapping::RowIdRemapping;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
 
@@ -6494,7 +6522,7 @@ mod tests {
             .reconstruct(
                 test_store.clone(),
                 &LanceCache::no_cache(),
-                Some(frag_reuse_index),
+                Some(RowIdRemapping::InMemory(frag_reuse_index)),
             )
             .unwrap();
 

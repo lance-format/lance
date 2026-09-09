@@ -19,6 +19,7 @@ use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
 use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
+use lance_index_core::remapping::RowIdRemapping;
 // Re-export training types that were previously defined here
 pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
@@ -163,6 +164,33 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// Whether this plugin can await batch row-ID translation while loading its data.
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        false
+    }
+
+    /// Load with a shared remapper, preserving the existing synchronous plugin API.
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        remapping: Option<RowIdRemapping>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let legacy = match remapping {
+            None => None,
+            Some(RowIdRemapping::InMemory(remapper)) => Some(remapper),
+            Some(RowIdRemapping::External(_)) => {
+                return Err(lance_core::Error::not_supported(format!(
+                    "{} does not support asynchronous row-ID remapping",
+                    self.name()
+                )));
+            }
+        };
+        self.load_index(index_store, index_details, legacy, cache)
+            .await
+    }
 
     /// Look up a previously-opened index in the cache.
     ///
@@ -348,7 +376,8 @@ where
     from_state(state)
 }
 
-pub(crate) async fn single_flight_store_bound_open(
+/// Coalesce index loading while keeping the cached index bound to its storage.
+pub async fn single_flight_store_bound_open(
     index_store: Arc<dyn IndexStore>,
     cache: &LanceCache,
     load: ScalarIndexLoad<'_>,
