@@ -692,13 +692,8 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                lance_table::io::commit::CommitError::OtherError(Error::CorruptFile { .. })
-            ),
-            "{error}"
-        );
+        let error = Error::from(error);
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
         assert!(
             error
                 .to_string()
@@ -711,7 +706,7 @@ mod tests {
     async fn clone_without_fri_flag_does_not_read_index_metadata() {
         let dataset = fixture().await;
         let mut location = dataset.manifest_location.clone();
-        location.path = dataset.base.child("missing.manifest");
+        location.path = dataset.base.clone().join("missing.manifest");
         lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
             &dataset.object_store,
             &location,
