@@ -9,7 +9,9 @@ use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Result};
-use lance_index::{IndexCriteria, IndexType, scalar::ScalarIndexParams};
+use lance_index::{
+    IndexCriteria, IndexType, frag_reuse::FRAG_REUSE_INDEX_NAME, scalar::ScalarIndexParams,
+};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::read_row_ids;
@@ -929,12 +931,33 @@ async fn test_migrate_to_stable_row_ids_blocked_by_index() {
         "error should name the blocking index, got: {err}"
     );
 
-    // After dropping the index the migration succeeds.
+    // Deferred compaction registers an internal fragment-reuse index alongside
+    // the user index.
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 20,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    // After dropping the user index, the fragment-reuse index alone must not
+    // block migration.
     dataset.drop_index("my_btree").await.unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1);
+    assert_eq!(indices[0].name, FRAG_REUSE_INDEX_NAME);
+
     dataset.migrate_to_stable_row_ids().await.unwrap();
     assert!(dataset.manifest.uses_stable_row_ids());
+    assert!(dataset.load_indices().await.unwrap().is_empty());
 
-    // Re-create the index and verify it works correctly.
+    // Re-create the index and verify that row ID zero is not incorrectly
+    // remapped through the obsolete fragment-reuse index.
     dataset
         .create_index(
             &["id"],
@@ -948,7 +971,7 @@ async fn test_migrate_to_stable_row_ids_blocked_by_index() {
 
     let results = dataset
         .scan()
-        .filter("id = 15")
+        .filter("id = 0")
         .unwrap()
         .try_into_batch()
         .await
@@ -956,7 +979,7 @@ async fn test_migrate_to_stable_row_ids_blocked_by_index() {
 
     assert_eq!(results.num_rows(), 1);
     let id_col = results["id"].as_any().downcast_ref::<Int64Array>().unwrap();
-    assert_eq!(id_col.value(0), 15);
+    assert_eq!(id_col.value(0), 0);
 }
 
 /// The migration numbers from the mark it is handed, so any manifest carrying a

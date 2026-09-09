@@ -24,6 +24,7 @@ use crate::io::{
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -421,17 +422,20 @@ impl Transaction {
             ));
         }
 
-        if config.migration_next_row_id.is_some() && !current_indices.is_empty() {
+        if config.migration_next_row_id.is_some() {
             let names: Vec<&str> = current_indices
                 .iter()
+                .filter(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
                 .map(|idx| idx.name.as_str())
                 .collect();
-            return Err(Error::invalid_input(format!(
-                "Cannot migrate to stable row IDs while indexes exist on the dataset. \
-                 Drop the following indexes first, then re-run the migration, and \
-                 recreate them afterwards: {}",
-                names.join(", ")
-            )));
+            if !names.is_empty() {
+                return Err(Error::invalid_input(format!(
+                    "Cannot migrate to stable row IDs while indexes exist on the dataset. \
+                     Drop the following indexes first, then re-run the migration, and \
+                     recreate them afterwards: {}",
+                    names.join(", ")
+                )));
+            }
         }
         let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
@@ -491,6 +495,11 @@ impl Transaction {
             .unwrap_or(0);
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
+        if config.migration_next_row_id.is_some() {
+            // The fragment-reuse index remaps physical row addresses from before
+            // migration, so it cannot apply after those rows receive stable IDs.
+            final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
+        }
 
         // Snapshot taken before the operation rewrites the list, so coverage can
         // be compared against what each logical index looked like going in. Only
