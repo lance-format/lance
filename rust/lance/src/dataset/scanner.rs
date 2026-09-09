@@ -1243,6 +1243,25 @@ pub enum TakeOperation {
     RowOffsets(Vec<u64>),
 }
 
+#[derive(Debug)]
+struct TakeSelection {
+    operation: TakeOperation,
+    is_exclusion: bool,
+}
+
+impl TakeSelection {
+    fn merge(self, other: Self) -> Option<Self> {
+        // Uniting exclusions requires intersecting their block lists, not concatenating them.
+        if self.is_exclusion || other.is_exclusion {
+            return None;
+        }
+        self.operation.merge(other.operation).map(|operation| Self {
+            operation,
+            is_exclusion: false,
+        })
+    }
+}
+
 impl TakeOperation {
     fn extract_u64_list(list: &[Expr]) -> Option<Vec<u64>> {
         let mut u64s = Vec::with_capacity(list.len());
@@ -1285,19 +1304,22 @@ impl TakeOperation {
     ///  - `_rowid = 10`
     ///  - `_rowid = 10 OR _rowid = 20 OR _rowid = 30`
     ///  - `_rowid IN (10, 20, 30)`
+    ///  - `_rowid NOT IN (10, 20, 30)`
     ///  - `_rowaddr = 10`
     ///  - `_rowaddr = 10 OR _rowaddr = 20 OR _rowaddr = 30`
     ///  - `_rowaddr IN (10, 20, 30)`
+    ///  - `_rowaddr NOT IN (10, 20, 30)`
     ///  - `_rowoffset = 10`
     ///  - `_rowoffset = 10 OR _rowoffset = 20 OR _rowoffset = 30`
     ///  - `_rowoffset IN (10, 20, 30)`
+    ///  - `_rowoffset NOT IN (10, 20, 30)`
     ///
     /// The _rowid / _rowaddr / _rowoffset determine if we are taking by row id, address, or offset.
     ///
     /// If a take expression is combined with some other filter via an AND then the remainder will be
     /// returned as well.  For example, `_rowid = 10` will return (take_op, None) and
     /// `_rowid = 10 AND x > 70` will return (take_op, Some(x > 70)).
-    fn try_from_expr(expr: &Expr) -> Option<(Self, Option<Expr>)> {
+    fn try_from_expr(expr: &Expr) -> Option<(TakeSelection, Option<Expr>)> {
         if let Expr::BinaryExpr(binary) = expr {
             match binary.op {
                 datafusion_expr::Operator::And => {
@@ -1341,13 +1363,22 @@ impl TakeOperation {
                         && let Some(ScalarValue::UInt64(Some(val))) =
                             safe_coerce_scalar(lit, &DataType::UInt64)
                     {
-                        if col.name == ROW_ID {
-                            return Some((Self::RowIds(vec![val]), None));
+                        let operation = if col.name == ROW_ID {
+                            Self::RowIds(vec![val])
                         } else if col.name == ROW_ADDR {
-                            return Some((Self::RowAddrs(vec![val]), None));
+                            Self::RowAddrs(vec![val])
                         } else if col.name == ROW_OFFSET {
-                            return Some((Self::RowOffsets(vec![val]), None));
-                        }
+                            Self::RowOffsets(vec![val])
+                        } else {
+                            return None;
+                        };
+                        return Some((
+                            TakeSelection {
+                                operation,
+                                is_exclusion: false,
+                            },
+                            None,
+                        ));
                     }
                 }
                 datafusion_expr::Operator::Or => {
@@ -1363,23 +1394,31 @@ impl TakeOperation {
                             // which would give us (_rowid = 10 OR _rowid = 20) AND x > 70
                             return None;
                         }
-                        return left.0.merge(right.0).map(|op| (op, None));
+                        return left.0.merge(right.0).map(|selection| (selection, None));
                     }
                 }
                 _ => {}
             }
         } else if let Expr::InList(in_expr) = expr
-            && !in_expr.negated
             && let Expr::Column(col) = in_expr.expr.as_ref()
             && let Some(u64s) = Self::extract_u64_list(&in_expr.list)
         {
-            if col.name == ROW_ID {
-                return Some((Self::RowIds(u64s), None));
+            let operation = if col.name == ROW_ID {
+                Self::RowIds(u64s)
             } else if col.name == ROW_ADDR {
-                return Some((Self::RowAddrs(u64s), None));
+                Self::RowAddrs(u64s)
             } else if col.name == ROW_OFFSET {
-                return Some((Self::RowOffsets(u64s), None));
-            }
+                Self::RowOffsets(u64s)
+            } else {
+                return None;
+            };
+            return Some((
+                TakeSelection {
+                    operation,
+                    is_exclusion: in_expr.negated,
+                },
+                None,
+            ));
         }
         None
     }
@@ -3657,29 +3696,33 @@ impl Scanner {
         Ok(Arc::new(OneShotExec::new(stream)))
     }
 
-    async fn row_addrs_as_take_input(&self, row_addrs: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn live_row_addrs_as_row_ids(&self, row_addrs: Vec<u64>) -> Result<RowAddrTreeMap> {
         let row_ids =
             live_row_addrs_to_row_ids(&self.dataset, row_addrs.into_iter().map(Some)).await?;
-        self.row_ids_as_take_input(RowAddrTreeMap::from_iter(row_ids.into_iter().flatten()))
+        Ok(RowAddrTreeMap::from_iter(row_ids.into_iter().flatten()))
     }
 
-    async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn take_source(&self, take_selection: TakeSelection) -> Result<Arc<dyn ExecutionPlan>> {
         // We generally assume that late materialization does not make sense for take operations
         // so we can just use the physical projection
         let projection = self.projection_plan.physical_projection.clone();
 
-        let input = match take_op {
-            TakeOperation::RowIds(ids) => {
-                self.row_ids_as_take_input(RowAddrTreeMap::from_iter(ids))
-            }
-            TakeOperation::RowAddrs(addrs) => self.row_addrs_as_take_input(addrs).await,
+        let row_ids = match take_selection.operation {
+            TakeOperation::RowIds(ids) => RowAddrTreeMap::from_iter(ids),
+            TakeOperation::RowAddrs(addrs) => self.live_row_addrs_as_row_ids(addrs).await?,
             TakeOperation::RowOffsets(offsets) => {
                 let mut addrs =
                     row_offsets_to_row_addresses(&self.dataset.get_fragments(), &offsets).await?;
                 addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
-                self.row_addrs_as_take_input(addrs).await
+                self.live_row_addrs_as_row_ids(addrs).await?
             }
-        }?;
+        };
+        let row_mask = if take_selection.is_exclusion {
+            RowAddrMask::from_block(row_ids)
+        } else {
+            RowAddrMask::from_allowed(row_ids)
+        };
+        let input = self.mask_as_take_input(row_mask)?;
 
         let mut filtered_read_options = FilteredReadOptions::new(projection);
         if let Some(fragment) = self.fragments.as_ref() {
@@ -15656,11 +15699,20 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     #[case::row_id(ROW_ID)]
     #[case::row_address(ROW_ADDR)]
     #[case::row_offset(ROW_OFFSET)]
-    fn test_filter_to_take_rejects_negated_in_list(#[case] column: &str) {
-        let values = (0_u64..10).map(lit).collect();
+    fn test_filter_to_take_negated_in_list(#[case] column: &str) {
+        let expected_values = (0_u64..10).collect::<Vec<_>>();
+        let values = expected_values.iter().copied().map(lit).collect();
         let expression = col(column).in_list(values, true);
 
-        assert!(TakeOperation::try_from_expr(&expression).is_none());
+        let (take_selection, remainder) = TakeOperation::try_from_expr(&expression).unwrap();
+        assert!(take_selection.is_exclusion);
+        assert!(remainder.is_none());
+        let actual_values = match take_selection.operation {
+            TakeOperation::RowIds(values)
+            | TakeOperation::RowAddrs(values)
+            | TakeOperation::RowOffsets(values) => values,
+        };
+        assert_eq!(actual_values, expected_values);
     }
 
     #[tokio::test]
@@ -15773,13 +15825,18 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         check("_rowoffset IN (52, 51, 50, 17)", &[17, 50, 51, 52]).await;
 
         let expected_not_in = (10..190).chain(210..300).collect::<Vec<_>>();
-        check_no_opt(
+        check(
             "_rowid NOT IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)",
             &expected_not_in,
         )
         .await;
-        check_no_opt(
+        check(
             "_rowaddr NOT IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)",
+            &expected_not_in,
+        )
+        .await;
+        check(
+            "_rowoffset NOT IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)",
             &expected_not_in,
         )
         .await;
