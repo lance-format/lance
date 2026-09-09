@@ -763,9 +763,3 @@ The reader follows a validation and synchronization protocol:
    - If canonical materialization cannot be established, or an observed size differs, return an error
 
 This protocol ensures that datasets using external manifest stores remain portable: copying the dataset directory preserves all data without requiring the external store.
-
-## Appending FRI transitions
-
-`append_fri_transitions` (field 116) is an independent transaction operation.
-Its `AppendFragmentReuseTransitions.transitions` field lists new mappings to
-append to the latest FRI history; it does not contain the existing history.
