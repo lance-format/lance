@@ -3318,6 +3318,19 @@ impl Dataset {
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
         ensure_can_write_manifest(&src_ds.manifest)?;
+        let indices = read_manifest_indexes(
+            &src_ds.object_store,
+            &src_ds.manifest_location,
+            &src_ds.manifest,
+        )
+        .await?;
+        if indices.iter().any(|index| {
+            index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME && index.index_version != 0
+        }) {
+            return Err(Error::not_supported(
+                "Cloning tagged FRI requires row-map reference relocation, which is not implemented",
+            ));
+        }
         let src_paths = src_ds.collect_paths().await?;
 
         // Prepare target object store and base path

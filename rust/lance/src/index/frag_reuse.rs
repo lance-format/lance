@@ -40,11 +40,36 @@ pub(super) async fn open_row_id_remapping(
         }));
     }
     let mapping = super::frag_reuse_query::QueryFragReuseIndex::open(dataset, fri).await?;
+    // Resolve provenance here, before query coverage is rewritten. Callers may
+    // hold metadata returned by load_indices and cannot supply this distinction.
+    let stored = super::load_all_indices(dataset).await?;
+    let source = stored
+        .iter()
+        .find(|entry| entry.uuid == index.uuid)
+        .ok_or_else(|| {
+            Error::not_supported(format!(
+                "FRI remapping requires committed segment metadata for {}",
+                index.uuid
+            ))
+        })?;
+    if !mapping.needs_translation(source.fragment_bitmap.as_ref()) {
+        let identity =
+            CompactFragReuseIndex::try_new(fri.uuid, FragReuseIndexDetails { versions: vec![] })?;
+        return Ok(Some((
+            fri.uuid,
+            RowIdRemapping::InMemory(Arc::new(CompactFragReuseIndexHandle(Arc::new(identity)))),
+        )));
+    }
     let coverage = indices
         .iter()
         .find(|entry| entry.uuid == index.uuid)
         .and_then(|entry| entry.fragment_bitmap.clone())
-        .unwrap_or_default()
+        .ok_or_else(|| {
+            Error::not_supported(format!(
+                "FRI query coverage is unavailable for segment {}",
+                index.uuid
+            ))
+        })?
         & dataset.fragment_bitmap.as_ref();
     Ok(Some((
         fri.uuid,

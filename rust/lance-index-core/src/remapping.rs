@@ -3,9 +3,9 @@
 
 //! Shared row-ID translation at asynchronous index loading boundaries.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use arrow_array::{RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
+use arrow_array::{Array, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -52,18 +52,51 @@ impl RowIdRemapping {
         }
     }
 
-    /// Prepare a synchronous remapper for the supplied batch before CPU-only decoding.
+    /// Translate only the address column, leaving encoded columns in their original layout.
     ///
-    /// In-memory mappings are returned directly. External mappings materialize only
-    /// this batch; IDs outside the batch are left unchanged by the returned remapper.
-    pub async fn prepare(&self, row_ids: &[u64]) -> Result<Arc<dyn RowIdRemapper>> {
+    /// The returned synchronous remapper removes tombstone slots during the
+    /// consumer's layout-aware decoding. No per-row lookup table is retained.
+    pub async fn remap_row_ids_preserving_layout(
+        &self,
+        batch: RecordBatch,
+        row_id_idx: usize,
+    ) -> Result<(RecordBatch, Arc<dyn RowIdRemapper>)> {
         if let Self::InMemory(remapper) = self {
-            return Ok(remapper.clone());
+            return Ok((batch, remapper.clone()));
         }
-        let mapped = self.remap_row_ids(row_ids).await?;
-        Ok(Arc::new(PreparedRowIdRemapper(
-            row_ids.iter().copied().zip(mapped).collect(),
-        )))
+        let ids = batch
+            .columns()
+            .get(row_id_idx)
+            .and_then(|array| array.as_primitive_opt::<UInt64Type>())
+            .ok_or_else(|| {
+                Error::invalid_input(format!("row-ID column {row_id_idx} must have type UInt64"))
+            })?;
+        let tombstone = lance_core::utils::address::RowAddress::TOMBSTONE_ROW;
+        let mut translated = Vec::with_capacity(ids.len());
+        for start in (0..ids.len()).step_by(64 * 1024) {
+            let end = (start + 64 * 1024).min(ids.len());
+            let inputs: Vec<_> = (start..end)
+                .map(|position| {
+                    if ids.is_null(position) {
+                        tombstone
+                    } else {
+                        ids.value(position)
+                    }
+                })
+                .collect();
+            let mapped = self.remap_row_ids(&inputs).await?;
+            translated.extend(mapped.into_iter().enumerate().map(|(offset, id)| {
+                if ids.is_null(start + offset) {
+                    tombstone
+                } else {
+                    id.unwrap_or(tombstone)
+                }
+            }));
+        }
+        let mut columns = batch.columns().to_vec();
+        columns[row_id_idx] = Arc::new(UInt64Array::from(translated));
+        let batch = RecordBatch::try_new(batch.schema(), columns)?;
+        Ok((batch, Arc::new(TombstoneRowIdRemapper)))
     }
 
     /// Translate row IDs in input order, preserving duplicates and deleted positions.
@@ -74,15 +107,19 @@ impl RowIdRemapping {
                 .map(|id| remapper.remap_row_id(*id))
                 .collect()),
             Self::External(remapper) => {
-                let mapped = remapper.remap_row_ids(row_ids).await?;
-                if mapped.len() != row_ids.len() {
-                    return Err(Error::internal(format!(
-                        "row-ID remapper returned {} results for {} inputs",
-                        mapped.len(),
-                        row_ids.len()
-                    )));
+                let mut result = Vec::with_capacity(row_ids.len());
+                for batch in row_ids.chunks(64 * 1024) {
+                    let mapped = remapper.remap_row_ids(batch).await?;
+                    if mapped.len() != batch.len() {
+                        return Err(Error::internal(format!(
+                            "row-ID remapper returned {} results for {} inputs",
+                            mapped.len(),
+                            batch.len()
+                        )));
+                    }
+                    result.extend(mapped);
                 }
-                Ok(mapped)
+                Ok(result)
             }
         }
     }
@@ -96,19 +133,10 @@ impl RowIdRemapping {
         if let Self::InMemory(remapper) = self {
             return remapper.remap_row_ids_record_batch(batch, row_id_idx);
         }
-        let ids = batch
-            .columns()
-            .get(row_id_idx)
-            .and_then(|array| array.as_primitive_opt::<UInt64Type>())
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "row-ID column {row_id_idx} must exist and have type UInt64"
-                ))
-            })?;
-        let inputs = ids.iter().flatten().collect::<Vec<_>>();
-        self.prepare(&inputs)
-            .await?
-            .remap_row_ids_record_batch(batch, row_id_idx)
+        let (batch, remapper) = self
+            .remap_row_ids_preserving_layout(batch, row_id_idx)
+            .await?;
+        remapper.remap_row_ids_record_batch(batch, row_id_idx)
     }
 
     /// Translate an explicit physical row selection, dropping deleted addresses.
@@ -152,25 +180,16 @@ impl RowIdRemapping {
 }
 
 #[derive(Debug)]
-struct PreparedRowIdRemapper(HashMap<u64, Option<u64>>);
+struct TombstoneRowIdRemapper;
 
-impl RowIdRemapper for PreparedRowIdRemapper {
+impl RowIdRemapper for TombstoneRowIdRemapper {
     fn remap_row_id(&self, row_id: u64) -> Option<u64> {
-        self.0.get(&row_id).copied().unwrap_or(Some(row_id))
+        (row_id != lance_core::utils::address::RowAddress::TOMBSTONE_ROW).then_some(row_id)
     }
 
     fn remap_row_addrs_tree_map(&self, rows: &RowAddrTreeMap) -> RowAddrTreeMap {
         let mut result = rows.clone();
-        for old in self.0.keys() {
-            result.remove(*old);
-        }
-        for (old, new) in &self.0 {
-            if rows.contains(*old)
-                && let Some(new) = new
-            {
-                result.insert(*new);
-            }
-        }
+        result.remove(lance_core::utils::address::RowAddress::TOMBSTONE_ROW);
         result
     }
 
@@ -220,10 +239,10 @@ mod tests {
 
     #[derive(Debug)]
     struct ExternalMapping(AtomicUsize);
-
     #[async_trait]
     impl BatchRowIdRemapper for ExternalMapping {
         async fn remap_row_ids(&self, ids: &[u64]) -> Result<Vec<Option<u64>>> {
+            assert!(ids.len() <= 65536);
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(ids
                 .iter()
@@ -236,62 +255,58 @@ mod tests {
                 .collect())
         }
     }
-
     #[test]
-    fn batch_preparation_preserves_positions_and_existing_decoder_semantics() {
+    fn external_remapping_bounds_batches_and_preserves_layout() {
         block_on(async {
             let external = Arc::new(ExternalMapping(AtomicUsize::new(0)));
             let remapping = RowIdRemapping::External(external.clone());
             let batch = record_batch!(
-                ("value", Int32, [10, 30, 50, 11, 99]),
-                ("ids", UInt64, [Some(1), Some(3), Some(5), Some(1), None]),
-                ("extra", Boolean, [true, false, true, false, true])
+                ("id", UInt64, [Some(1), Some(3), None, Some(5)]),
+                ("value", Int32, [10, 30, 40, 50])
             )
             .unwrap();
-            let mapped = remapping
-                .remap_row_ids_record_batch(batch, 1)
+            let translated = remapping
+                .remap_row_ids_record_batch(batch, 0)
                 .await
                 .unwrap();
             assert_eq!(
-                mapped,
+                translated,
                 record_batch!(
-                    ("value", Int32, [10, 50, 11]),
-                    ("ids", UInt64, [Some(5), Some(1), Some(5)]),
-                    ("extra", Boolean, [true, true, false])
+                    ("id", UInt64, [Some(5), Some(1)]),
+                    ("value", Int32, [10, 50])
                 )
                 .unwrap()
             );
-            assert_eq!(external.0.load(Ordering::Relaxed), 1);
-
-            let prepared = remapping.prepare(&[1, 3, 5]).await.unwrap();
-            assert_eq!(prepared.remap_row_id(3), None);
-            assert_eq!(prepared.remap_row_id(99), Some(99));
-            let selected = RowAddrTreeMap::from_iter([1, 3, 5]);
+            let batch = RecordBatch::try_from_iter([(
+                "id",
+                Arc::new(UInt64Array::from(vec![1; 65537])) as arrow_array::ArrayRef,
+            )])
+            .unwrap();
+            let (batch, remapper) = remapping
+                .remap_row_ids_preserving_layout(batch, 0)
+                .await
+                .unwrap();
+            assert_eq!(batch.num_rows(), 65537);
+            assert_eq!(external.0.load(Ordering::Relaxed), 3);
+            assert_eq!(remapper.remap_row_id(5), Some(5));
             assert_eq!(
-                prepared.remap_row_addrs_tree_map(&selected),
-                RowAddrTreeMap::from_iter([1, 5])
+                remapper.remap_row_id(lance_core::utils::address::RowAddress::TOMBSTONE_ROW),
+                None
             );
-            assert_eq!(
-                prepared.remap_row_ids_roaring_tree_map(&RoaringTreemap::from_iter([1, 3, 5])),
-                RoaringTreemap::from_iter([1, 5])
-            );
-            assert_eq!(external.0.load(Ordering::Relaxed), 2);
         });
     }
-
     #[test]
-    fn in_memory_preparation_keeps_the_existing_remapper() {
+    fn in_memory_keeps_the_existing_remapper() {
         block_on(async {
-            let original: Arc<dyn RowIdRemapper> =
-                Arc::new(PreparedRowIdRemapper(HashMap::from([(1, Some(5))])));
+            let original: Arc<dyn RowIdRemapper> = Arc::new(TombstoneRowIdRemapper);
             let remapping = RowIdRemapping::InMemory(original.clone());
-            let prepared = remapping.prepare(&[1]).await.unwrap();
-            assert!(Arc::ptr_eq(&original, &prepared));
-            let rows = RowAddrTreeMap::from_iter([1, 2]);
-            assert_eq!(
-                remapping.remap_row_addrs_tree_map(&rows).await.unwrap(),
-                original.remap_row_addrs_tree_map(&rows)
-            );
+            let batch = record_batch!(("id", UInt64, [1])).unwrap();
+            let (unchanged, remapper) = remapping
+                .remap_row_ids_preserving_layout(batch.clone(), 0)
+                .await
+                .unwrap();
+            assert_eq!(unchanged, batch);
+            assert!(Arc::ptr_eq(&original, &remapper));
         });
     }
 }

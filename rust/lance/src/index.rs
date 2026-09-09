@@ -2604,7 +2604,7 @@ async fn index_statistics_frag_reuse(ds: &Dataset) -> Result<String> {
     let index = ds
         .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?
-        .expect("FragmentReuse index does not exist");
+        .ok_or_else(|| Error::not_supported("FRI statistics require a supported legacy history"))?;
     serialize_index_statistics(&CompactFragReuseIndexHandle(index).statistics()?)
 }
 
@@ -3121,7 +3121,17 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(cached.0.clone());
         }
 
-        let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
+        // Only legacy vector file readers consume the V1 handle. A tagged
+        // history is handled by the shared remapper above, including identity.
+        let has_tagged_history = load_all_indices(self)
+            .await?
+            .iter()
+            .any(|index| index.name == FRAG_REUSE_INDEX_NAME && index.index_version != 0);
+        let frag_reuse_index = if has_tagged_history {
+            None
+        } else {
+            self.open_frag_reuse_index(metrics).await?
+        };
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir
             .clone()
@@ -3437,7 +3447,9 @@ impl DatasetIndexInternalExt for Dataset {
     ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
         if let Some(frag_reuse_index_meta) = self.load_index_by_name(FRAG_REUSE_INDEX_NAME).await? {
             if frag_reuse_index_meta.index_version != 0 {
-                return Ok(None);
+                return Err(Error::not_supported(
+                    "This operation requires legacy FRI; tagged history maintenance requires an upgraded writer",
+                ));
             }
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
             let frag_reuse_key = FragReuseIndexKey {

@@ -424,11 +424,17 @@ impl DocSet {
         remapping: Option<RowIdRemapping>,
     ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-        let frag_reuse_index = match remapping {
-            Some(remapping) => Some(remapping.prepare(row_id_col.values()).await?),
-            None => None,
+        let (batch, frag_reuse_index) = match remapping {
+            Some(remapping) => {
+                let row_id_idx = batch.schema().index_of(ROW_ID)?;
+                let (batch, remapper) = remapping
+                    .remap_row_ids_preserving_layout(batch, row_id_idx)
+                    .await?;
+                (batch, Some(remapper))
+            }
+            None => (batch, None),
         };
+        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
         let mut doc_indices = Vec::new();
         for rank in 0.. {

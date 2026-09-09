@@ -5,7 +5,7 @@
 
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
-use arrow_array::{ArrayRef, RecordBatch, cast::AsArray};
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
@@ -703,17 +703,14 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let schema = Arc::new(self.reader.schema().as_ref().into());
             concat_batches(&schema, batches.iter())?
         };
-        let remapper = match &self.frag_reuse_index {
-            None => None,
-            Some(RowIdRemapping::InMemory(remapper)) => Some(remapper.clone()),
+        let (batch, remapper) = match &self.frag_reuse_index {
+            None => (batch, None),
             Some(remapping) => {
-                let ids = batch
-                    .column_by_name(lance_core::ROW_ID)
-                    .and_then(|array| array.as_primitive_opt::<arrow_array::types::UInt64Type>())
-                    .ok_or_else(|| {
-                        Error::invalid_input("vector storage must contain a UInt64 row-ID column")
-                    })?;
-                Some(remapping.prepare(ids.values()).await?)
+                let row_id_idx = batch.schema().index_of(ROW_ID)?;
+                let (batch, remapper) = remapping
+                    .remap_row_ids_preserving_layout(batch, row_id_idx)
+                    .await?;
+                (batch, Some(remapper))
             }
         };
         Q::Storage::try_from_batch_with_remapper(

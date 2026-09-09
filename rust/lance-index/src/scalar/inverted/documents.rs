@@ -745,6 +745,39 @@ impl DeepSizeOf for VersionAddressProjection {
 }
 
 impl VersionAddressProjection {
+    async fn with_remapping(
+        raw: &UInt64Array,
+        num_docs: usize,
+        remapping: Option<&RowIdRemapping>,
+        path: &str,
+    ) -> Result<Arc<Self>> {
+        let Some(remapping @ RowIdRemapping::External(_)) = remapping else {
+            return Ok(Arc::new(Self::try_new(
+                raw,
+                num_docs,
+                remapping.map(RowIdRemapping::synchronous).transpose()?,
+                path,
+            )?));
+        };
+        let mut projection = Self::try_new(raw, num_docs, None, path)?;
+        let mut addresses = Vec::with_capacity(raw.len());
+        let mut live_docs = RoaringBitmap::new();
+        for ids in raw.values().chunks(64 * 1024) {
+            for address in remapping.remap_row_ids(ids).await? {
+                let doc_id = addresses.len() as u32;
+                if let Some(address) = address {
+                    live_docs.insert(doc_id);
+                    addresses.push(address);
+                } else {
+                    addresses.push(0);
+                }
+            }
+        }
+        projection.addresses = AddressValues::Owned(Arc::new(addresses));
+        projection.live_docs = Some(live_docs);
+        Ok(Arc::new(projection))
+    }
+
     fn try_new(
         raw: &UInt64Array,
         expected_num_docs: usize,
@@ -1441,16 +1474,13 @@ impl PartitionDocuments {
         let projection = self
             .projection
             .get_or_try_init(|| async {
-                let remapper = match &self.remapper {
-                    Some(remapping) => Some(remapping.prepare(row_ids.values()).await?),
-                    None => None,
-                };
-                Result::Ok(Arc::new(VersionAddressProjection::try_new(
+                VersionAddressProjection::with_remapping(
                     row_ids.as_ref(),
                     self.num_docs,
-                    remapper.as_deref(),
+                    self.remapper.as_ref(),
                     &self.path,
-                )?))
+                )
+                .await
             })
             .await
             .cloned()?;
@@ -1834,16 +1864,13 @@ impl PartitionDocuments {
                             format!("{ROW_ID} contains null values"),
                         ));
                     }
-                    let remapper = match &self.remapper {
-                        Some(remapping) => Some(remapping.prepare(row_ids.values()).await?),
-                        None => None,
-                    };
-                    let projection = Arc::new(VersionAddressProjection::try_new(
+                    let projection = VersionAddressProjection::with_remapping(
                         row_ids.as_ref(),
                         self.num_docs,
-                        remapper.as_deref(),
+                        self.remapper.as_ref(),
                         &self.path,
-                    )?);
+                    )
+                    .await?;
                     let cached_row_ids = Arc::new(CachedDocRowIds {
                         row_ids: row_ids.clone(),
                     });

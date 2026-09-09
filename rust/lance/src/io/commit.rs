@@ -386,6 +386,19 @@ async fn do_commit_new_dataset(
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
+        let indices = lance_table::io::manifest::read_manifest_indexes(
+            source_store,
+            &source_manifest_location,
+            &source_manifest,
+        )
+        .await?;
+        if indices.iter().any(|index| {
+            index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME && index.index_version != 0
+        }) {
+            return Err(Error::not_supported(
+                "Cloning tagged FRI requires row-map reference relocation, which is not implemented",
+            ));
+        }
         Some((source_store, source_manifest_location, source_manifest))
     } else {
         None

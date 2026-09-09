@@ -11,8 +11,9 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_STABLE_ROW_IDS,
+    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
+    inherit_sticky_feature_flags,
 };
 use crate::format::overlay::TOMBSTONE_FIELD_ID;
 use crate::format::{
@@ -24,6 +25,7 @@ use crate::io::{
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -410,6 +412,19 @@ impl Transaction {
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        if current_indices
+            .iter()
+            .any(|index| index.name == FRAG_REUSE_INDEX_NAME && index.index_version != 0)
+            && !matches!(
+                self.operation,
+                Operation::Append { .. } | Operation::ReserveFragments { .. }
+            )
+        {
+            return Err(Error::not_supported(
+                "Tagged FRI history maintenance is not implemented for this operation; upgrade to a writer supporting tagged histories",
+            ));
+        }
+
         if config.use_stable_row_ids
             && config.migration_next_row_id.is_none()
             && current_manifest
@@ -1518,6 +1533,13 @@ impl Transaction {
             manifest.next_row_id = next_row_id;
         }
 
+        if final_indices
+            .iter()
+            .any(|index| index.name == FRAG_REUSE_INDEX_NAME && index.index_version != 0)
+        {
+            manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        }
         Ok((manifest, final_indices))
     }
 
