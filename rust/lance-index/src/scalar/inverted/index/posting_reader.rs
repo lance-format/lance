@@ -247,6 +247,39 @@ impl PostingListReader {
         }
     }
 
+    /// Return a posting-list length only when its metadata is already resident.
+    ///
+    /// Legacy offsets are loaded with the schema. Modern lengths remain absent
+    /// until an explicit bulk metadata load, so this probe never starts I/O or
+    /// relies on the scoring path's stronger [`Self::posting_len`] contract.
+    pub(crate) fn loaded_posting_len(&self, token_id: u32) -> Option<usize> {
+        let token_id = token_id as usize;
+        match &self.metadata {
+            PostingMetadata::LegacyV1 { offsets, .. } => {
+                let offset = offsets.get(token_id).copied()?;
+                let next_offset = offsets
+                    .get(token_id.checked_add(1)?)
+                    .copied()
+                    .unwrap_or(self.reader.num_rows());
+                next_offset.checked_sub(offset)
+            }
+            PostingMetadata::V2 { metadata } => metadata
+                .get()?
+                .lengths
+                .get(token_id)
+                .copied()
+                .map(|length| length as usize),
+        }
+    }
+
+    /// Whether every posting length can be read synchronously without I/O.
+    pub(crate) fn posting_lengths_loaded(&self) -> bool {
+        match &self.metadata {
+            PostingMetadata::LegacyV1 { .. } => true,
+            PostingMetadata::V2 { metadata } => self.is_empty() || metadata.get().is_some(),
+        }
+    }
+
     /// Async access to a single token's posting list length. For v2
     /// indexes this reads one row of posting metadata if the bulk metadata has
     /// not been loaded yet, and never triggers the bulk load itself. The stats

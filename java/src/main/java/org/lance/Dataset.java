@@ -1537,6 +1537,21 @@ public class Dataset implements Closeable {
   private native List<FragmentMetadata> getFragmentsNative();
 
   /**
+   * Returns the storage bases registered by the current manifest.
+   *
+   * <p>Files without a base id resolve against this dataset's own URI. Files with a base id resolve
+   * against the matching entry in this list.
+   */
+  public List<BasePath> getBasePaths() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetBasePaths();
+    }
+  }
+
+  private native List<BasePath> nativeGetBasePaths();
+
+  /**
    * Get per-fragment statistics for all fragments in this dataset version.
    *
    * <p>Unlike {@link #getFragments()}, this is a metadata-only bulk operation: no per-fragment Java

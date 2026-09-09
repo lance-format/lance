@@ -616,9 +616,12 @@ pub async fn open_scalar_index(
     });
 
     if is_tagged {
-        index_cache
-            .get_or_insert_unsized_with_key(ScalarIndexCacheKey, || load)
-            .await
+        lance_index::scalar::registry::single_flight_store_bound_open(
+            index_store,
+            &index_cache,
+            load,
+        )
+        .await
     } else {
         plugin
             .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
@@ -642,7 +645,10 @@ pub(crate) async fn cached_scalar_index_container(
     } else {
         index_cache
     };
-    index_cache.get_unsized_with_key(&ScalarIndexCacheKey).await
+    index_cache
+        .get_unsized_with_key(&ScalarIndexCacheKey)
+        .await
+        .map(|entry| entry.index())
 }
 
 pub(crate) async fn infer_scalar_index_details(

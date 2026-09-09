@@ -175,6 +175,13 @@ public class MultiBaseTest {
     assertNotNull(ds);
     assertEquals(primary, ds.uri());
     assertEquals(500, ds.countRows());
+    assertEquals(2, ds.getBasePaths().size());
+    assertEquals(
+        Arrays.asList("base1", "base2"),
+        ds.getBasePaths().stream()
+            .map(base -> base.getName().orElseThrow(AssertionError::new))
+            .sorted()
+            .collect(Collectors.toList()));
   }
 
   @Test

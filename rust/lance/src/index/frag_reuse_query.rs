@@ -1471,8 +1471,13 @@ mod tests {
         assert_eq!(dataset.count_rows(Some("id = 0".into())).await.unwrap(), 1);
     }
 
+    #[rstest::rstest]
+    #[case::lazy(false)]
+    #[case::prewarmed(true)]
     #[tokio::test]
-    async fn vector_partition_uses_shared_remapping_and_cached_reconstruction() {
+    async fn vector_partition_uses_shared_remapping_and_cached_reconstruction(
+        #[case] prewarm: bool,
+    ) {
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
             .col(
@@ -1524,6 +1529,9 @@ mod tests {
                 .values()
                 .all(|partition| partition.reader.get().is_none())
         );
+        if prewarm {
+            dataset.prewarm_index("vector_idx").await.unwrap();
+        }
         for _ in 0..2 {
             let mut scan = dataset.scan();
             scan.nearest("vector", query, 1).unwrap();

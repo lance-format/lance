@@ -57,6 +57,36 @@ public class DeletionFile implements Serializable {
     return Optional.ofNullable(baseId);
   }
 
+  /**
+   * Returns the deletion file path relative to its dataset-root base.
+   *
+   * @param fragmentId fragment that owns this deletion file
+   */
+  public String getRelativePath(long fragmentId) {
+    if (fragmentId < 0) {
+      throw new IllegalArgumentException("fragmentId must be non-negative");
+    }
+    String suffix;
+    switch (fileType) {
+      case ARRAY:
+        suffix = "arrow";
+        break;
+      case BITMAP:
+        suffix = "bin";
+        break;
+      default:
+        throw new IllegalStateException("Unsupported deletion file type: " + fileType);
+    }
+    return "_deletions/"
+        + fragmentId
+        + "-"
+        + readVersion
+        + "-"
+        + Long.toUnsignedString(id)
+        + "."
+        + suffix;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;

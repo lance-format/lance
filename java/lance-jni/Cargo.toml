@@ -1,6 +1,6 @@
 [package]
 name = "lance-jni"
-version = "12.0.0-beta.11"
+version = "12.0.0-beta.15"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.91"
@@ -27,7 +27,7 @@ lance = { path = "../../rust/lance", features = ["substrait", "metrics"] }
 lance-datafusion = { path = "../../rust/lance-datafusion" }
 lance-encoding = { path = "../../rust/lance-encoding" }
 lance-linalg = { path = "../../rust/lance-linalg" }
-lance-index = { path = "../../rust/lance-index" }
+lance-index = { path = "../../rust/lance-index", features = ["tokenizer-jieba", "tokenizer-lindera"] }
 lance-io = { path = "../../rust/lance-io", features = ["metrics"] }
 lance-namespace = { path = "../../rust/lance-namespace" }
 lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = ["rest", "rest-adapter", "dir-goosefs"] }
