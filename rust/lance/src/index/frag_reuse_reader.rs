@@ -237,14 +237,17 @@ async fn load_ledger(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
     use crate::session::index_caches::IndexMetadataKey;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::Int32Type;
     use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array, cast::AsArray};
+    use lance_core::cache::LanceCache;
     use lance_index::IndexType;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::frag_reuse::row_map::{RowMapWriter, SourceRows};
+    use lance_index::scalar::IndexStore;
     use lance_index::scalar::ScalarIndexParams;
     use lance_table::format::pb::fragment_reuse_index_details::{
         FragmentDigest, InlineContent, StablePartition, Transition, transition,
@@ -709,5 +712,373 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    #[rstest::rstest]
+    #[case::inline(false)]
+    #[case::external(true)]
+    #[tokio::test]
+    async fn unknown_mapping_falls_back_to_scan(#[case] external: bool) {
+        let mut dataset = fixture().await;
+        let (mut transition, destinations) = prepare(&dataset).await;
+        transition.mapping = None;
+        let mut raw = transition.encode_to_vec();
+        raw.extend(field(17, b"future mapping"));
+        let fri = install(&mut dataset, field(2, &raw), destinations, external).await;
+        let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
+        assert!(mapping.ledger.has_unsupported_transitions());
+        assert!(mapping.ledger.transitions().is_empty());
+
+        let mut scan = dataset.scan();
+        scan.filter("i = 2").unwrap();
+        assert!(
+            !scan
+                .explain_plan(false)
+                .await
+                .unwrap()
+                .contains("ScalarIndexQuery")
+        );
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn unrelated_fm_index_loads_with_tagged_history() {
+        let batch = arrow_array::record_batch!(("text", Utf8, ["alpha", "beta"])).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Fm,
+                Some("text_idx".into()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let transition = Transition {
+            sources: vec![FragmentDigest {
+                id: 900,
+                physical_rows: 1,
+                num_deleted_rows: 0,
+            }],
+            destinations: vec![FragmentDigest {
+                id: 901,
+                physical_rows: 1,
+                num_deleted_rows: 0,
+            }],
+            mapping: Some(transition::Mapping::StablePartition(StablePartition {
+                map_id: Uuid::new_v4().to_string(),
+                map_size_bytes: 100,
+                base_id: None,
+            })),
+        };
+        let fragments = dataset.manifest.fragments.as_ref().clone();
+        let fri = install(
+            &mut dataset,
+            InlineContent {
+                legacy_versions: vec![],
+                transitions: vec![transition],
+            }
+            .encode_to_vec(),
+            fragments,
+            false,
+        )
+        .await;
+        let index = dataset
+            .load_index_by_name("text_idx")
+            .await
+            .unwrap()
+            .unwrap();
+        crate::index::scalar::open_scalar_index(
+            &dataset,
+            "text",
+            &index,
+            &lance_index::metrics::NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dataset
+                .count_rows(Some("contains(text, 'alpha')".into()))
+                .await
+                .unwrap(),
+            1
+        );
+        let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
+
+        let current = RowAddress::new_from_parts(0, 0);
+        assert_eq!(
+            mapping
+                .translate(&[current, RowAddress::new_from_parts(999, 0)])
+                .await
+                .unwrap(),
+            vec![Some(current), None]
+        );
+        let error = dataset
+            .index_statistics(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+    }
+
+    #[rstest::rstest]
+    #[case::complete(false)]
+    #[case::unknown_middle_mapping(true)]
+    #[tokio::test]
+    async fn mixed_chain_keeps_independent_direct_coverage(#[case] unknown_middle: bool) {
+        let digest = |id| FragmentDigest {
+            id,
+            physical_rows: 2,
+            num_deleted_rows: 0,
+        };
+        let ordered = |source, destination| {
+            let bitmap = roaring::RoaringTreemap::from_iter([
+                u64::from(RowAddress::new_from_parts(source, 0)),
+                u64::from(RowAddress::new_from_parts(source, 1)),
+            ]);
+            let mut changed_row_addrs = Vec::new();
+            bitmap.serialize_into(&mut changed_row_addrs).unwrap();
+            Transition {
+                sources: vec![digest(u64::from(source))],
+                destinations: vec![digest(destination)],
+                mapping: Some(transition::Mapping::OrderedCompaction(
+                    pb::fragment_reuse_index_details::OrderedCompaction { changed_row_addrs },
+                )),
+            }
+        };
+        let mut content = Vec::new();
+        for mut transition in [ordered(2, 3), ordered(0, 1), ordered(1, 2)] {
+            let is_unknown = unknown_middle && transition.sources[0].id == 1;
+            if is_unknown {
+                transition.mapping = None;
+            }
+            let mut raw = transition.encode_to_vec();
+            if is_unknown {
+                raw.extend(field(17, b"future mapping"));
+            }
+            content.extend(field(2, &raw));
+        }
+        let details = prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: field(1, &content),
+        };
+        let ledger = FragReuseLedger::decode(1, &details, |_| async { panic!("inline content") })
+            .await
+            .unwrap();
+        let mapping = Arc::new(FragmentReuseIndex {
+            live_fragments: RoaringBitmap::from_iter([3, 9]),
+            readers: ledger
+                .transitions()
+                .iter()
+                .map(|t| {
+                    let Mapping::OrderedCompaction(remap) = t.mapping() else {
+                        unreachable!()
+                    };
+                    Arc::new(OrderedCompactionMapping::new(
+                        remap.clone(),
+                        t.sources().iter().map(|f| f.id as u32).collect(),
+                        t.destinations().iter().map(|f| f.id as u32).collect(),
+                    )) as Arc<dyn MappingReader>
+                })
+                .collect(),
+            ledger,
+        });
+        let inputs = [0, 1, 2, 3, 9].map(|f| RowAddress::new_from_parts(f, 1));
+        assert_eq!(
+            mapping.translate(&inputs).await.unwrap(),
+            vec![
+                (!unknown_middle).then_some(RowAddress::new_from_parts(3, 1)),
+                (!unknown_middle).then_some(RowAddress::new_from_parts(3, 1)),
+                Some(RowAddress::new_from_parts(3, 1)),
+                Some(inputs[3]),
+                Some(inputs[4])
+            ]
+        );
+        assert_eq!(
+            mapping
+                .segment_coverage(&[RoaringBitmap::from_iter([0]), RoaringBitmap::from_iter([2])])
+                .into_iter()
+                .map(|coverage| coverage & &mapping.live_fragments)
+                .collect::<Vec<_>>(),
+            vec![RoaringBitmap::new(), RoaringBitmap::from_iter([3])]
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_counts_are_errors_instead_of_scan_fallback() {
+        let mut dataset = fixture().await;
+        let (mut transition, destinations) = prepare(&dataset).await;
+        transition.destinations[0].physical_rows -= 1;
+        transition.destinations[1].physical_rows += 1;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        let fri = install(&mut dataset, content, destinations, false).await;
+        let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
+        let error = mapping
+            .translate(&[RowAddress::new_from_parts(0, 0)])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("row-map total differs"));
+    }
+
+    #[rstest::rstest]
+    #[case::inline(false)]
+    #[case::external(true)]
+    #[tokio::test]
+    async fn append_carries_future_fri_without_interpreting_it(#[case] external: bool) {
+        let mut dataset = fixture().await;
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let mut transition = Transition {
+            sources: vec![FragmentDigest {
+                id: 900,
+                physical_rows: 1,
+                num_deleted_rows: 0,
+            }],
+            destinations: vec![FragmentDigest {
+                id: 901,
+                physical_rows: 1,
+                num_deleted_rows: 0,
+            }],
+            mapping: None,
+        }
+        .encode_to_vec();
+        transition.extend(field(17, b"opaque future mapping reference"));
+        let content = field(2, &transition);
+        let uuid = Uuid::new_v4();
+        let details_path = dataset
+            .indices_dir()
+            .join(uuid.to_string())
+            .join("details.binpb");
+        let details = if external {
+            let mut writer = dataset.object_store.create(&details_path).await.unwrap();
+            writer.write_all(&content).await.unwrap();
+            writer.shutdown().await.unwrap();
+            field(
+                2,
+                &pb::ExternalFile {
+                    path: "details.binpb".into(),
+                    offset: 0,
+                    size: content.len() as u64,
+                }
+                .encode_to_vec(),
+            )
+        } else {
+            field(1, &content)
+        };
+        let fri = IndexMetadata {
+            uuid,
+            fields: vec![],
+            covering_fields: vec![],
+            name: FRAG_REUSE_INDEX_NAME.into(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([901])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                value: details,
+            })),
+            index_version: 2,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![fri.clone()],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let version = dataset.manifest.version;
+        let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
+        assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
+        let error = dataset
+            .apply_commit(
+                Transaction::new(
+                    version,
+                    Operation::Rewrite {
+                        groups: vec![],
+                        rewritten_indices: vec![],
+                        frag_reuse_index: None,
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("Tagged FRI"));
+        let error = dataset
+            .shallow_clone("memory://fri-shallow", version, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("relocation"));
+        let error = dataset
+            .deep_clone("memory://fri-deep", version, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("relocation"));
+        let error = crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("Upgrade"));
+        assert_eq!(dataset.manifest.version, version);
+
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, version + 1);
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
+        assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
+
+        let indices = lance_table::io::manifest::read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        assert_eq!(indices.iter().find(|index| index.uuid == uuid), Some(&fri));
+        if external {
+            let bytes = dataset
+                .object_store
+                .open(&details_path)
+                .await
+                .unwrap()
+                .get_range(0..content.len())
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), content);
+        }
     }
 }
