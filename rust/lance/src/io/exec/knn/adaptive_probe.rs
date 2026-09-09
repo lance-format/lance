@@ -29,18 +29,57 @@ const MARGIN_ENV: &str = "LANCE_AUTO_PROBE_MARGIN";
 const MIN_INITIAL_NPROBES_ENV: &str = "LANCE_AUTO_MIN_INITIAL_NPROBES";
 const MAX_INITIAL_NPROBES_ENV: &str = "LANCE_AUTO_MAX_INITIAL_NPROBES";
 
+#[derive(Debug)]
+struct NormCompletionCandidate {
+    position: usize,
+    lower_bound: f64,
+    rows: usize,
+}
+
+/// A fixed eligible set, consumed in radial-bound order with fresh kth feedback.
+#[derive(Debug)]
+pub(super) struct NormCompletionPlan {
+    candidates: Vec<NormCompletionCandidate>,
+    cursor: usize,
+    remaining_rows: usize,
+}
+
+impl NormCompletionPlan {
+    /// Plan one complete batch at the current threshold. Never skip an expensive
+    /// partition to consume a smaller later one, or split a partition's rows.
+    pub(super) fn next_batch(&mut self, kth_distance: f32) -> Vec<usize> {
+        let mut positions = Vec::with_capacity(8);
+        while positions.len() < 8 && self.cursor < self.candidates.len() {
+            let candidate = &self.candidates[self.cursor];
+            if !kth_distance.is_finite()
+                || candidate.lower_bound > f64::from(kth_distance)
+                || candidate.rows > self.remaining_rows
+            {
+                self.cursor = self.candidates.len();
+                break;
+            }
+            self.remaining_rows -= candidate.rows;
+            positions.push(candidate.position);
+            self.cursor += 1;
+        }
+        positions
+    }
+}
+
 /// Supplement an Auto prefix when norm ranges identify an affordable remainder.
 ///
 /// These descriptive f64 ranges do not certify native f32 pruning. The rule only
 /// adds candidates to exact FLAT search; it never replaces the initial results.
-/// The extra budget is the initial prefix's nominal posting rows, independently
-/// for each segment. Explicit probe limits keep their existing bounded behavior.
-pub(super) fn radial_completion_positions(
+/// Eligibility requires the whole qualifying remainder to fit the initial
+/// prefix's nominal rows and to exclude at least one nonempty partition. Actual
+/// extra work is limited to one tenth of those rows per segment, in batches of
+/// at most eight partitions. Explicit probe limits bypass completion.
+pub(super) fn radial_completion_plan(
     query: &Query,
     index: &dyn VectorIndex,
     partitions: &UInt32Array,
     kth_distance: f32,
-) -> Option<Vec<usize>> {
+) -> Option<NormCompletionPlan> {
     if query.maximum_nprobes.is_some()
         || !kth_distance.is_finite()
         || query.key.data_type() != &DataType::Float32
@@ -98,13 +137,15 @@ fn affordable_norm_completion(
     kth_distance: f32,
     initial_rows: usize,
     candidates: impl Iterator<Item = (usize, usize, Option<VectorNormRange>)>,
-) -> Option<Vec<usize>> {
+) -> Option<NormCompletionPlan> {
     let mut extra_rows = 0usize;
     let mut selected = Vec::new();
+    let mut nonempty = 0usize;
     for (position, rows, range) in candidates {
         if rows == 0 {
             continue;
         }
+        nonempty += 1;
         let range = range?;
         let lower_bound = match metric {
             DistanceType::L2 | DistanceType::Cosine => {
@@ -122,14 +163,30 @@ fn affordable_norm_completion(
         if lower_bound <= f64::from(kth_distance) {
             extra_rows = extra_rows.checked_add(rows)?;
             if extra_rows > initial_rows {
-                // The whole eligible remainder must fit; choosing a prefix here
-                // would introduce another uncalibrated partition budget.
+                // Preserve the original whole-remainder eligibility gate even
+                // though the progressive execution budget is smaller.
                 return None;
             }
-            selected.push(position);
+            selected.push(NormCompletionCandidate {
+                position,
+                lower_bound,
+                rows,
+            });
         }
     }
-    Some(selected)
+    if selected.len() == nonempty {
+        return None;
+    }
+    selected.sort_unstable_by(|a, b| {
+        a.lower_bound
+            .total_cmp(&b.lower_bound)
+            .then(a.position.cmp(&b.position))
+    });
+    Some(NormCompletionPlan {
+        candidates: selected,
+        cursor: 0,
+        remaining_rows: initial_rows / 10,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -335,60 +392,110 @@ mod tests {
     use std::sync::Arc;
 
     #[rstest]
-    #[case::l2(DistanceType::L2, 1.0, 4.0)]
-    #[case::cosine(DistanceType::Cosine, 1.0, 2.0)]
-    #[case::dot(DistanceType::Dot, 1.0, -2.0)]
+    #[case::l2(DistanceType::L2, 4.0, 10.0)]
+    #[case::cosine(DistanceType::Cosine, 2.0, 10.0)]
+    #[case::dot(DistanceType::Dot, -2.0, 0.0)]
     fn test_norm_completion_keeps_boundary_candidates(
         #[case] metric: DistanceType,
-        #[case] query_norm: f64,
         #[case] threshold: f32,
+        #[case] pruned_norm: f64,
     ) {
         let range = Some(VectorNormRange { min: 3.0, max: 3.0 });
-        assert_eq!(
-            affordable_norm_completion(
-                query_norm,
-                metric,
-                threshold,
-                7,
-                [(5, 0, None), (6, 7, range)].into_iter(),
-            ),
-            Some(vec![6]),
-        );
+        let pruned = Some(VectorNormRange {
+            min: pruned_norm,
+            max: pruned_norm,
+        });
+        let mut plan = affordable_norm_completion(
+            1.0,
+            metric,
+            threshold,
+            70,
+            [(5, 0, None), (6, 7, range), (7, 1, pruned)].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(plan.next_batch(threshold), vec![6]);
+        assert!(plan.next_batch(threshold).is_empty());
     }
 
     #[test]
-    fn test_norm_completion_requires_the_whole_remainder_to_fit() {
+    fn test_norm_completion_requires_whole_remainder_and_pruning_information() {
         let range = Some(VectorNormRange { min: 1.0, max: 2.0 });
-        assert_eq!(
-            affordable_norm_completion(
-                0.0,
-                DistanceType::L2,
-                4.0,
-                10,
-                [(1, 6, range), (2, 5, range)].into_iter(),
-            ),
-            None,
-        );
-        assert_eq!(
-            affordable_norm_completion(
-                0.0,
-                DistanceType::L2,
-                4.0,
-                10,
-                [(1, 6, range), (2, 5, None)].into_iter(),
-            ),
-            None,
-        );
-        assert_eq!(
-            affordable_norm_completion(
-                0.0,
-                DistanceType::L2,
-                0.5,
-                10,
-                [(1, 6, range), (2, 5, range)].into_iter(),
-            ),
-            Some(vec![]),
-        );
+        for candidates in [
+            vec![(1, 6, range), (2, 5, range)],
+            vec![(1, 6, range), (2, 5, None)],
+            vec![(1, 1, range), (2, 0, None)],
+        ] {
+            assert!(
+                affordable_norm_completion(0.0, DistanceType::L2, 4.0, 10, candidates.into_iter())
+                    .is_none()
+            );
+        }
+        let mut plan = affordable_norm_completion(
+            0.0,
+            DistanceType::L2,
+            0.5,
+            10,
+            [(1, 6, range), (2, 5, range)].into_iter(),
+        )
+        .unwrap();
+        assert!(plan.next_batch(0.5).is_empty());
+    }
+
+    #[test]
+    fn test_norm_completion_budget_stops_without_skipping_whole_partitions() {
+        let range = |norm| {
+            Some(VectorNormRange {
+                min: norm,
+                max: norm,
+            })
+        };
+        let mut plan = affordable_norm_completion(
+            0.0,
+            DistanceType::L2,
+            10.0,
+            1000,
+            [
+                (0, 60, range(1.0)),
+                (1, 50, range(2.0)),
+                (2, 1, range(3.0)),
+                (3, 1, range(100.0)),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(plan.next_batch(10.0), vec![0]);
+        assert!(plan.next_batch(10.0).is_empty());
+        assert_eq!(plan.remaining_rows, 40);
+        let mut rounded = affordable_norm_completion(
+            0.0,
+            DistanceType::L2,
+            10.0,
+            19,
+            [(0, 2, range(1.0)), (1, 1, range(100.0))].into_iter(),
+        )
+        .unwrap();
+        assert!(rounded.next_batch(10.0).is_empty()); // floor(19/10)=1
+    }
+
+    #[test]
+    fn test_norm_completion_batch_limit_stable_ties_and_updated_kth() {
+        let range = |norm| {
+            Some(VectorNormRange {
+                min: norm,
+                max: norm,
+            })
+        };
+        let mut candidates = (0..9)
+            .rev()
+            .map(|position| (position, 1, range(1.0)))
+            .collect::<Vec<_>>();
+        candidates.extend([(9, 1, range(2.0)), (10, 1, range(100.0))]);
+        let mut plan =
+            affordable_norm_completion(0.0, DistanceType::L2, 10.0, 1000, candidates.into_iter())
+                .unwrap();
+        assert_eq!(plan.next_batch(10.0), (0..8).collect::<Vec<_>>());
+        assert_eq!(plan.next_batch(1.0), vec![8]);
+        assert!(plan.next_batch(1.0).is_empty());
     }
 
     fn query() -> Query {

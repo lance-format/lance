@@ -77,7 +77,7 @@ use super::utils::{
 
 mod adaptive_probe;
 
-use adaptive_probe::{AutoProbeConfig, radial_completion_positions};
+use adaptive_probe::{AutoProbeConfig, radial_completion_plan};
 
 pub const QUERY_INDEX_COL: &str = "query_index";
 
@@ -1513,7 +1513,7 @@ impl DisplayAs for ANNIvfSubIndexExec {
 struct ANNIvfEarlySearchResults {
     k: usize,
     initial_ids: Mutex<Vec<u64>>,
-    initial_distances: Mutex<Vec<f32>>,
+    best_distances: Mutex<Vec<f32>>,
     num_results_found: AtomicUsize,
     deltas_remaining: AtomicUsize,
     all_deltas_done: Notify,
@@ -1525,7 +1525,7 @@ impl ANNIvfEarlySearchResults {
         Self {
             k,
             initial_ids: Mutex::new(Vec::with_capacity(k)),
-            initial_distances: Mutex::new(Vec::with_capacity(k)),
+            best_distances: Mutex::new(Vec::with_capacity(k)),
             num_results_found: AtomicUsize::new(0),
             deltas_remaining: AtomicUsize::new(deltas_remaining),
             all_deltas_done: Notify::new(),
@@ -1545,7 +1545,11 @@ impl ANNIvfEarlySearchResults {
                 .take(ids_to_record),
         );
         drop(initial_ids);
-        let Ok(mut distances) = self.initial_distances.lock() else {
+        self.record_best_distances(batch);
+    }
+
+    fn record_best_distances(&self, batch: &RecordBatch) {
+        let Ok(mut distances) = self.best_distances.lock() else {
             // An unavailable optional summary disables completion; the initial
             // search results are still returned through their original stream.
             return;
@@ -1566,7 +1570,7 @@ impl ANNIvfEarlySearchResults {
     }
 
     fn kth_distance(&self) -> Option<f32> {
-        let distances = self.initial_distances.lock().ok()?;
+        let distances = self.best_distances.lock().ok()?;
         (distances.len() == self.k)
             .then(|| distances.iter().copied().max_by(f32::total_cmp))
             .flatten()
@@ -1841,61 +1845,83 @@ impl ANNIvfSubIndexExec {
             }
 
             if found_so_far >= query.k {
-                let Some(positions) = state.kth_distance().and_then(|kth| {
-                    radial_completion_positions(&query, index.as_ref(), &partitions, kth)
+                let Some(plan) = state.kth_distance().and_then(|kth| {
+                    radial_completion_plan(&query, index.as_ref(), &partitions, kth)
                 }) else {
                     return futures::stream::empty().boxed();
                 };
-                if positions.is_empty() {
-                    return futures::stream::empty().boxed();
-                }
-                let completion_partitions = Arc::new(UInt32Array::from(
-                    positions
-                        .iter()
-                        .map(|&position| partitions.value(position))
-                        .collect::<Vec<_>>(),
-                ));
-                let completion_distances = Arc::new(Float32Array::from(
-                    positions
-                        .iter()
-                        .map(|&position| q_c_dists.value(position))
-                        .collect::<Vec<_>>(),
-                ));
-                metrics.partitions_searched.add(positions.len());
-                return stream::once(async move {
-                    let count = completion_partitions.len();
-                    let prefilter: Arc<dyn PreFilter> = prefilter;
-                    let index_metrics: Arc<dyn MetricsCollector> =
-                        Arc::new(metrics.index_metrics.clone());
-                    // Preserve the FLAT global heap path for the supplemental
-                    // batch. The outer top-k merges it with the initial results.
-                    let stream = index
-                        .search_partitions(
-                            query,
-                            completion_partitions,
-                            completion_distances,
-                            0,
-                            count,
-                            prefilter,
-                            None,
-                            index_metrics,
-                        )
-                        .await
-                        .map_err(|error| {
-                            DataFusionError::Execution(format!(
-                                "Failed to search norm-range candidates: {error}"
-                            ))
-                        })?;
-                    Ok::<_, DataFusionError>(Self::instrument_sequential_partition_stream(
-                        stream.boxed(),
-                        metrics,
-                        state,
-                        false,
-                        false,
-                        seg_mask,
-                    ))
-                })
-                .try_flatten()
+                return stream::try_unfold(
+                    (
+                        plan,
+                        None::<stream::BoxStream<'static, DataFusionResult<RecordBatch>>>,
+                    ),
+                    move |(mut plan, mut current)| {
+                        let index = index.clone();
+                        let query = query.clone();
+                        let partitions = partitions.clone();
+                        let q_c_dists = q_c_dists.clone();
+                        let prefilter = prefilter.clone();
+                        let metrics = metrics.clone();
+                        let state = state.clone();
+                        let seg_mask = seg_mask.clone();
+                        async move {
+                            loop {
+                                if let Some(stream) = current.as_mut()
+                                    && let Some(batch) = stream.next().await
+                                {
+                                    let batch = restrict_to_segment(batch?, seg_mask.as_deref())?;
+                                    metrics.baseline_metrics.record_output(batch.num_rows());
+                                    state.record_best_distances(&batch);
+                                    return Ok(Some((batch, (plan, current))));
+                                }
+                                let Some(kth) = state.kth_distance() else {
+                                    return Ok(None);
+                                };
+                                let positions = plan.next_batch(kth);
+                                if positions.is_empty() {
+                                    return Ok(None);
+                                }
+                                let count = positions.len();
+                                let completion_partitions = Arc::new(UInt32Array::from(
+                                    positions
+                                        .iter()
+                                        .map(|&position| partitions.value(position))
+                                        .collect::<Vec<_>>(),
+                                ));
+                                let completion_distances = Arc::new(Float32Array::from(
+                                    positions
+                                        .iter()
+                                        .map(|&position| q_c_dists.value(position))
+                                        .collect::<Vec<_>>(),
+                                ));
+                                metrics.partitions_searched.add(count);
+                                let index_metrics: Arc<dyn MetricsCollector> =
+                                    Arc::new(metrics.index_metrics.clone());
+                                // Drain every record batch before planning another batch.
+                                // control=None preserves the FLAT bulk-heap fast path.
+                                let next = index
+                                    .clone()
+                                    .search_partitions(
+                                        query.clone(),
+                                        completion_partitions,
+                                        completion_distances,
+                                        0,
+                                        count,
+                                        prefilter.clone(),
+                                        None,
+                                        index_metrics,
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        DataFusionError::Execution(format!(
+                                            "Failed to search norm-range candidates: {error}"
+                                        ))
+                                    })?;
+                                current = Some(next.boxed());
+                            }
+                        }
+                    },
+                )
                 .boxed();
             }
 
@@ -1963,41 +1989,44 @@ impl ANNIvfSubIndexExec {
                 effective_query_parallelism(&query, index.as_ref(), target_partitions);
             if query_parallelism <= 1 {
                 return stream::once(async move {
-                    let prefilter: Arc<dyn PreFilter> = prefilter;
-                    let index_metrics: Arc<dyn MetricsCollector> =
-                        Arc::new(metrics.index_metrics.clone());
-                    let stream = index
-                        .search_partitions(
-                            query,
-                            partitions,
-                            q_c_dists,
-                            min_nprobes,
-                            max_nprobes,
-                            prefilter,
-                            Some(Arc::new(LatePartitionSearchControl {
-                                state: state.clone(),
-                                max_results,
-                                seg_mask: seg_mask.clone(),
-                            })),
-                            index_metrics,
-                        )
-                        .await
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!("Failed to search partitions: {e}"))
-                        })?;
-                    Ok::<stream::BoxStream<'static, DataFusionResult<RecordBatch>>, DataFusionError>(
-                        Self::instrument_sequential_partition_stream(
+                        let prefilter: Arc<dyn PreFilter> = prefilter;
+                        let index_metrics: Arc<dyn MetricsCollector> =
+                            Arc::new(metrics.index_metrics.clone());
+                        let stream = index
+                            .search_partitions(
+                                query,
+                                partitions,
+                                q_c_dists,
+                                min_nprobes,
+                                max_nprobes,
+                                prefilter,
+                                Some(Arc::new(LatePartitionSearchControl {
+                                    state: state.clone(),
+                                    max_results,
+                                    seg_mask: seg_mask.clone(),
+                                })),
+                                index_metrics,
+                            )
+                            .await
+                            .map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to search partitions: {e}"
+                                ))
+                            })?;
+                        Ok::<
+                            stream::BoxStream<'static, DataFusionResult<RecordBatch>>,
+                            DataFusionError,
+                        >(Self::instrument_sequential_partition_stream(
                             stream.boxed(),
                             metrics,
                             state,
                             false,
                             true,
                             seg_mask,
-                        ),
-                    )
-                })
-                .try_flatten()
-                .boxed();
+                        ))
+                    })
+                    .try_flatten()
+                    .boxed();
             }
 
             futures::stream::iter(min_nprobes..max_nprobes)
@@ -2731,7 +2760,10 @@ mod tests {
         /// The rows each partition returns, indexed by partition id.
         row_ids: Vec<Vec<u64>>,
         /// Optional complete norm statistics for completion-specific fixtures.
-        norm_stats: Option<(lance_index::vector::ivf::storage::IvfModel, VectorNormRange)>,
+        norm_stats: Option<(
+            lance_index::vector::ivf::storage::IvfModel,
+            Vec<VectorNormRange>,
+        )>,
     }
 
     #[async_trait]
@@ -3095,7 +3127,9 @@ mod tests {
 
         fn partition_norm_range(&self, part_id: usize) -> Option<VectorNormRange> {
             self.row_ids.get(part_id)?;
-            self.norm_stats.as_ref().map(|(_, range)| *range)
+            self.norm_stats
+                .as_ref()
+                .and_then(|(_, ranges)| ranges.get(part_id).copied())
         }
 
         fn quantizer(&self) -> lance_index::vector::quantizer::Quantizer {
@@ -3681,7 +3715,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_segment_owning_nothing_skips_affordable_norm_completion() {
-        let old_rows = vec![vec![21, 22, 23], vec![24], vec![25], vec![26]];
+        let old_rows = vec![(21..51).collect(), vec![51], vec![52], vec![53], vec![54]];
         let mut ivf = lance_index::vector::ivf::storage::IvfModel::empty();
         for rows in &old_rows {
             ivf.add_partition(rows.len() as u32);
@@ -3693,12 +3727,21 @@ mod tests {
             searched_partitions: old_searched.clone(),
             search_threads: Arc::new(Mutex::new(Vec::new())),
             row_ids: old_rows,
-            norm_stats: Some((ivf, VectorNormRange { min: 0.0, max: 1.0 })),
+            norm_stats: Some((
+                ivf,
+                vec![VectorNormRange { min: 0.0, max: 1.0 }; 4]
+                    .into_iter()
+                    .chain([VectorNormRange {
+                        min: 100.0,
+                        max: 100.0,
+                    }])
+                    .collect(),
+            )),
         });
         let (new_index, _, new_searched, _) = prepared_index_multi(vec![vec![31, 32, 33, 34]]);
         let old_mask = Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::new()));
-        let old_parts = Arc::new(UInt32Array::from(vec![0, 1, 2, 3]));
-        let old_distances = Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3, 0.4]));
+        let old_parts = Arc::new(UInt32Array::from(vec![0, 1, 2, 3, 4]));
+        let old_distances = Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3, 0.4, 100.0]));
         let new_parts = Arc::new(UInt32Array::from(vec![0]));
         let new_distances = Arc::new(Float32Array::from(vec![0.1]));
         let mut query = base_query();
@@ -3741,10 +3784,12 @@ mod tests {
             .unwrap();
         }
         // The sibling supplied all four valid rows. Without the ownership exit,
-        // the old segment's three remaining rows fit its nominal three-row budget.
+        // three eligible rows fit 10% of the old segment's thirty initial rows;
+        // a fourth nonempty remainder has a pruned norm range.
         assert_eq!(state.kth_distance(), Some(1.5));
         assert_eq!(
-            radial_completion_positions(&query, old_index.as_ref(), &old_parts, 1.5),
+            radial_completion_plan(&query, old_index.as_ref(), &old_parts, 1.5)
+                .map(|mut plan| plan.next_batch(1.5)),
             Some(vec![1, 2, 3])
         );
         let old_late = ANNIvfSubIndexExec::late_search(
@@ -3792,6 +3837,105 @@ mod tests {
         );
         assert_eq!(*new_searched.lock().unwrap(), vec![0]);
         assert_eq!(old_metrics.partitions_searched.value(), 1);
+    }
+
+    #[rstest]
+    #[case::tightened_kth(false)]
+    #[case::masked_results_do_not_tighten(true)]
+    #[tokio::test]
+    async fn test_norm_completion_drains_batches_and_updates_filtered_kth(
+        #[case] mask_first_batch: bool,
+    ) {
+        let mut row_ids = vec![(0..100).collect::<Vec<_>>()];
+        row_ids.extend((1..=10).map(|part| vec![100 + part]));
+        let mut ivf = lance_index::vector::ivf::storage::IvfModel::empty();
+        for rows in &row_ids {
+            ivf.add_partition(rows.len() as u32);
+        }
+        let mut ranges = vec![
+            VectorNormRange {
+                min: 0.0,
+                max: 100.0
+            };
+            11
+        ];
+        ranges[9] = VectorNormRange {
+            min: 48.0_f64.sqrt(),
+            max: 48.0_f64.sqrt(),
+        };
+        ranges[10] = VectorNormRange {
+            min: 100.0,
+            max: 100.0,
+        };
+        let searched = Arc::new(Mutex::new(Vec::new()));
+        let index: Arc<dyn VectorIndex> = Arc::new(PreparedThreadCapturingIndex {
+            prepared_partitions: Arc::new(Mutex::new(Vec::new())),
+            searched_partitions: searched.clone(),
+            search_threads: Arc::new(Mutex::new(Vec::new())),
+            row_ids,
+            norm_stats: Some((ivf, ranges)),
+        });
+        let mask = mask_first_batch.then(|| {
+            let rows: RowAddrTreeMap = (0..100).chain([109]).collect();
+            Arc::new(RowAddrMask::from_allowed(rows))
+        });
+        let parts = Arc::new(UInt32Array::from((0..11).collect::<Vec<_>>()));
+        let distances = Arc::new(Float32Array::from(vec![0.0; 11]));
+        let mut query = base_query();
+        query.k = 100;
+        query.minimum_nprobes = 1;
+        query.query_parallelism = 1;
+        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
+        let prefilter = empty_prefilter().await;
+        let metrics = prepared_metrics();
+        ANNIvfSubIndexExec::initial_search(
+            index.clone(),
+            query.clone(),
+            parts.clone(),
+            distances.clone(),
+            prefilter.clone(),
+            metrics.clone(),
+            state.clone(),
+            usize::MAX,
+            mask.clone(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        assert_eq!(state.kth_distance(), Some(49.5));
+        let result = ANNIvfSubIndexExec::late_search(
+            index,
+            query,
+            parts,
+            distances,
+            prefilter.clone(),
+            prefilter,
+            metrics.clone(),
+            state.clone(),
+            usize::MAX,
+            mask,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        // The prepared mock yields one RecordBatch per partition. All eight
+        // scheduled partitions must be drained even as their results lower T.
+        let expected_parts = if mask_first_batch { 10 } else { 9 };
+        assert_eq!(
+            *searched.lock().unwrap(),
+            (0..expected_parts).collect::<Vec<_>>()
+        );
+        assert_eq!(metrics.partitions_searched.value(), expected_parts);
+        assert_eq!(result.len(), expected_parts - 1);
+        assert_eq!(
+            result.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            if mask_first_batch { 1 } else { 8 }
+        );
+        assert_eq!(
+            state.kth_distance(),
+            Some(if mask_first_batch { 49.0 } else { 45.5 })
+        );
+        assert_eq!(state.initial_ids.lock().unwrap().len(), 100);
     }
 
     #[tokio::test]
@@ -4403,8 +4547,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case::single_fragment(100)]
-    #[case::multiple_fragments(7)]
+    #[case::single_fragment(1000)]
+    #[case::multiple_fragments(64)]
     #[tokio::test]
     async fn test_auto_completes_affordable_norm_range_candidates(#[case] rows_per_file: usize) {
         // Nearby centroids can summarize distant points. The seventh cluster's
@@ -4414,10 +4558,14 @@ mod tests {
         for part in 1..=6 {
             let x = part as f32 / 10.0;
             centers.extend([x, 0.0]);
-            values.extend([x, 10.0, x, -10.0]);
+            for _ in 0..10 {
+                values.extend([x, 10.0, x, -10.0]);
+            }
         }
         centers.extend([2.0, 0.0]);
         values.extend([2.0, 0.1, 2.0, -0.1]);
+        centers.extend([100.0, 0.0]);
+        values.extend([100.0, 100.0, 100.0, -100.0]);
         let vectors = Arc::new(
             FixedSizeListArray::try_new_from_values(Float32Array::from(values), 2).unwrap(),
         );
@@ -4439,7 +4587,7 @@ mod tests {
         );
         let params = VectorIndexParams::with_ivf_flat_params(
             MetricType::L2,
-            IvfBuildParams::try_with_centroids(7, centers).unwrap(),
+            IvfBuildParams::try_with_centroids(8, centers).unwrap(),
         );
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
