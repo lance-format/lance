@@ -24,6 +24,7 @@ use lance_table::format::pb;
 use lance_table::format::pb::fragment_reuse_index_details::{
     FragmentDigest, InlineContent, StablePartition, Transition, transition,
 };
+use lance_table::system_index::frag_reuse::ledger::Mapping;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
