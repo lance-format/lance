@@ -64,19 +64,29 @@ pub async fn vector_supports_batch_remapping(
 pub(super) struct QueryRowIdRemapper {
     mapping: Arc<FragmentReuseIndex>,
     coverage: RoaringBitmap,
+    excluded_fragments: RoaringBitmap,
 }
 
 impl std::fmt::Debug for QueryRowIdRemapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueryRowIdRemapper")
             .field("coverage", &self.coverage)
+            .field("excluded_fragments", &self.excluded_fragments)
             .finish_non_exhaustive()
     }
 }
 
 impl QueryRowIdRemapper {
-    pub(crate) fn new(mapping: Arc<FragmentReuseIndex>, coverage: RoaringBitmap) -> Self {
-        Self { mapping, coverage }
+    pub(crate) fn new(
+        mapping: Arc<FragmentReuseIndex>,
+        coverage: RoaringBitmap,
+        excluded_fragments: RoaringBitmap,
+    ) -> Self {
+        Self {
+            mapping,
+            coverage,
+            excluded_fragments,
+        }
     }
 }
 
@@ -85,7 +95,7 @@ impl lance_index::scalar::BatchRowIdRemapper for QueryRowIdRemapper {
     async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
         Ok(self
             .mapping
-            .remap_row_ids(row_ids)
+            .remap_row_ids_excluding(row_ids, &self.excluded_fragments)
             .await?
             .into_iter()
             .map(|address| {

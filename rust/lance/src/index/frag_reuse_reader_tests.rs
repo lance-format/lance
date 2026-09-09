@@ -34,6 +34,7 @@ use uuid::Uuid;
 #[case::default_search("default")]
 #[case::all_segments("all")]
 #[case::partial_selection("partial")]
+#[case::reconverged("reconverged")]
 #[tokio::test]
 async fn vector_fragment_search_requires_every_contributor(
     #[case] selection: &str,
@@ -89,8 +90,92 @@ async fn vector_fragment_search_requires_every_contributor(
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
+    if selection == "reconverged" {
+        // Prefer the new C segment while old A/B segments still provide D.
+        // After C,D -> E their row sets must remain disjoint within E.
+        let c = dataset.fragments()[0].id as u32;
+        let direct = CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+            .name("vector_idx".into())
+            .replace(true)
+            .fragments(vec![c])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let mut indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        indices.push(direct);
+        let sources: Vec<_> = dataset
+            .fragments()
+            .iter()
+            .map(|fragment| FragmentDigest {
+                id: fragment.id,
+                physical_rows: fragment.physical_rows.unwrap() as u64,
+                num_deleted_rows: 0,
+            })
+            .collect();
+        let mut changed_row_addrs = Vec::new();
+        roaring::RoaringTreemap::from_iter(sources.iter().flat_map(|source| {
+            (0..source.physical_rows).map(move |offset| {
+                u64::from(RowAddress::new_from_parts(source.id as u32, offset as u32))
+            })
+        }))
+        .serialize_into(&mut changed_row_addrs)
+        .unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let rewrite = crate::dataset::InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&WriteParams {
+                mode: crate::dataset::WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![batch])
+            .await
+            .unwrap();
+        let lance_table::transaction::Operation::Append { mut fragments } = rewrite.operation
+        else {
+            panic!("expected append fixture");
+        };
+        assert_eq!(fragments.len(), 1);
+        fragments[0].id = 20;
+        let fri = indices
+            .iter_mut()
+            .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+            .unwrap();
+        let mut details = pb::FragmentReuseIndexDetails::decode(
+            fri.index_details.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        let Some(pb::fragment_reuse_index_details::Content::Inline(content)) = &mut details.content
+        else {
+            panic!("expected inline fixture");
+        };
+        content.transitions.push(Transition {
+            sources,
+            destinations: vec![FragmentDigest {
+                id: 20,
+                physical_rows: 8,
+                num_deleted_rows: 0,
+            }],
+            mapping: Some(transition::Mapping::OrderedCompaction(
+                pb::fragment_reuse_index_details::OrderedCompaction { changed_row_addrs },
+            )),
+        });
+        fri.uuid = Uuid::new_v4();
+        fri.fragment_bitmap = Some(RoaringBitmap::from_iter([20]));
+        fri.index_details = Some(Arc::new(prost_types::Any::from_msg(&details).unwrap()));
+        Arc::make_mut(&mut dataset.manifest).fragments = fragments.into();
+        persist_fixture(&mut dataset, indices).await;
+    }
+
     let mut scan = dataset.scan();
-    scan.nearest("vector", query, 1).unwrap();
+    let expected_rows = if selection == "reconverged" && !filtered_destination {
+        8
+    } else {
+        1
+    };
+    scan.nearest("vector", query, expected_rows).unwrap();
     if filtered_destination {
         scan.with_fragments(vec![dataset.fragments()[0].clone()]);
         scan.filter("i = 6").unwrap();
@@ -105,13 +190,18 @@ async fn vector_fragment_search_requires_every_contributor(
         "partial" => {
             scan.with_index_segments(vec![ids[0]]).unwrap();
         }
-        "default" => {}
+        "default" | "reconverged" => {}
         _ => unreachable!(),
     }
     let plan = scan.explain_plan(false).await.unwrap();
     assert_eq!(plan.contains("ANN"), selection != "partial", "{plan}");
     let result = scan.try_into_batch().await.unwrap();
-    assert_eq!(result.num_rows(), 1);
+    assert_eq!(result.num_rows(), expected_rows);
+    if expected_rows == 8 {
+        let mut values = result["i"].as_primitive::<Int32Type>().values().to_vec();
+        values.sort_unstable();
+        assert_eq!(values, (0..8).collect::<Vec<_>>(), "{plan}");
+    }
     // IVF_FLAT with one partition is exact: the nearest row must come from Y,
     // including when explicit selection of X requires a flat fallback.
     assert_eq!(

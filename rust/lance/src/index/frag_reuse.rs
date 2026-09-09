@@ -14,6 +14,7 @@ use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineConte
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use prost::Message;
 use roaring::RoaringBitmap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -71,10 +72,30 @@ pub(super) async fn open_row_id_remapping(
             ))
         })?
         & dataset.fragment_bitmap.as_ref();
+    // Other selected segments own their direct coverage. Drop paths entering
+    // those fragments before later mappings can merge them with our contribution.
+    let selected: HashSet<_> = indices
+        .iter()
+        .filter(|entry| entry.name == index.name)
+        .map(|entry| entry.uuid)
+        .collect();
+    let mut excluded_fragments = RoaringBitmap::new();
+    for sibling in stored.iter().filter(|entry| selected.contains(&entry.uuid)) {
+        if let Some(bitmap) = &sibling.fragment_bitmap {
+            excluded_fragments |= bitmap;
+        }
+    }
+    if let Some(bitmap) = &source.fragment_bitmap {
+        excluded_fragments -= bitmap;
+    }
     Ok(Some((
         fri.uuid,
         RowIdRemapping::External(Arc::new(
-            super::frag_reuse_remapping::QueryRowIdRemapper::new(mapping, coverage),
+            super::frag_reuse_remapping::QueryRowIdRemapper::new(
+                mapping,
+                coverage,
+                excluded_fragments,
+            ),
         )),
     )))
 }
