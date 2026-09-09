@@ -1,293 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::tests::{field, fixture, fixture_with_index, install, persist_fixture, prepare};
 use super::*;
-use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+use crate::dataset::WriteParams;
 use crate::index::frag_reuse_remapping::vector_supports_batch_remapping;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::session::index_caches::IndexMetadataKey;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 use arrow_array::types::Int32Type;
-use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array, cast::AsArray};
+use arrow_array::{RecordBatch, RecordBatchIterator, cast::AsArray};
 #[cfg(feature = "geo")]
 use geo_types::line_string;
 #[cfg(feature = "geo")]
 use geoarrow_array::{GeoArrowArray, builder::LineStringBuilder};
 #[cfg(feature = "geo")]
 use geoarrow_schema::{Dimension, LineStringType};
-use lance_core::cache::LanceCache;
 use lance_index::IndexType;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-use lance_index::frag_reuse::row_map::{RowMapWriter, SourceRows};
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::IndexStore;
 use lance_index::scalar::ScalarIndexParams;
+use lance_table::format::pb;
 use lance_table::format::pb::fragment_reuse_index_details::{
     FragmentDigest, InlineContent, StablePartition, Transition, transition,
 };
-use lance_table::format::{Fragment, pb};
-use lance_table::transaction::{Operation, Transaction};
 use prost::Message;
-use prost::encoding::WireType;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
-
-async fn fixture() -> Dataset {
-    fixture_with_index(IndexType::BTree).await
-}
-
-async fn fixture_with_index(index_type: IndexType) -> Dataset {
-    let mut dataset = lance_datagen::gen_batch()
-        .col("i", lance_datagen::array::step::<Int32Type>())
-        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
-        .await
-        .unwrap();
-    if index_type != IndexType::BTree {
-        dataset
-            .create_index(
-                &["i"],
-                index_type,
-                Some("i_idx".into()),
-                &ScalarIndexParams::default(),
-                true,
-            )
-            .await
-            .unwrap();
-        return dataset;
-    }
-    let batch = dataset
-        .scan()
-        .with_row_id()
-        .project_with_transform(&[("value", "i")])
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
-    let params = ScalarIndexParams::default();
-    let index = crate::index::create::CreateIndexBuilder::new(
-        &mut dataset,
-        &["i"],
-        IndexType::BTree,
-        &params,
-    )
-    .name("i_idx".into())
-    .preprocessed_data(Box::new(reader))
-    .execute_uncommitted()
-    .await
-    .unwrap();
-    dataset
-        .apply_commit(
-            Transaction::new(
-                dataset.manifest.version,
-                Operation::CreateIndex {
-                    new_indices: vec![index],
-                    removed_indices: vec![],
-                },
-                None,
-            ),
-            &Default::default(),
-            &Default::default(),
-        )
-        .await
-        .unwrap();
-    dataset
-}
-
-async fn prepare(dataset: &Dataset) -> (Transition, Vec<Fragment>) {
-    let batch = dataset.scan().try_into_batch().await.unwrap();
-    let values = batch["i"].as_primitive::<Int32Type>();
-    let labels: Vec<_> = values.iter().map(|v| (v.unwrap() % 2) as u16).collect();
-    let mut destinations = Vec::new();
-    for label in 0..2 {
-        let positions = UInt32Array::from(
-            labels
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &l)| (l == label).then_some(i as u32))
-                .collect::<Vec<_>>(),
-        );
-        let batch = RecordBatch::try_new(
-            batch.schema(),
-            batch
-                .columns()
-                .iter()
-                .map(|column| arrow::compute::take(column, &positions, None).unwrap())
-                .collect(),
-        )
-        .unwrap();
-        let transaction = InsertBuilder::new(Arc::new(dataset.clone()))
-            .with_params(&WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            })
-            .execute_uncommitted(vec![batch])
-            .await
-            .unwrap();
-        let Operation::Append { fragments } = transaction.operation else {
-            unreachable!()
-        };
-        destinations.extend(fragments);
-    }
-    for (i, fragment) in destinations.iter_mut().enumerate() {
-        fragment.id = 10 + i as u64;
-    }
-    let mut source_rows = Vec::new();
-    let mut sources = Vec::new();
-    for fragment in dataset.fragments().iter() {
-        let deleted: Option<RoaringBitmap> = dataset
-            .get_fragment(fragment.id as usize)
-            .unwrap()
-            .get_deletion_vector()
-            .await
-            .unwrap()
-            .map(|v| v.iter().collect());
-        let rows = fragment.physical_rows.unwrap() as u64;
-        sources.push(FragmentDigest {
-            id: fragment.id,
-            physical_rows: rows,
-            num_deleted_rows: deleted.as_ref().map_or(0, |d| d.len()),
-        });
-        source_rows.push(SourceRows {
-            physical_rows: rows,
-            deleted,
-        });
-    }
-    let id = Uuid::new_v4();
-    let store = LanceIndexStore::with_format_version(
-        dataset.object_store.clone(),
-        dataset.base.clone().join("_fri").join(id.to_string()),
-        Arc::new(LanceCache::with_capacity(1024 * 1024)),
-        lance_file::version::ConcreteFileVersion::V2_1,
-    );
-    let writer = store
-        .new_index_file(MAPPING_FILE, RowMapWriter::schema())
-        .await
-        .unwrap();
-    let mut writer = RowMapWriter::try_new_with_block_rows(writer, source_rows, 2, 3).unwrap();
-    writer.append_labels(&labels).await.unwrap();
-    let (file, _) = writer.finish().await.unwrap();
-    let transition = Transition {
-        sources,
-        destinations: destinations
-            .iter()
-            .map(|f| FragmentDigest {
-                id: f.id,
-                physical_rows: f.physical_rows.unwrap() as u64,
-                num_deleted_rows: 0,
-            })
-            .collect(),
-        mapping: Some(transition::Mapping::StablePartition(StablePartition {
-            map_id: id.to_string(),
-            map_size_bytes: file.size_bytes,
-            base_id: None,
-        })),
-    };
-    (transition, destinations)
-}
-
-fn field(tag: u32, bytes: &[u8]) -> Vec<u8> {
-    let mut output = Vec::new();
-    prost::encoding::encode_key(tag, WireType::LengthDelimited, &mut output);
-    prost::encoding::encode_varint(bytes.len() as u64, &mut output);
-    output.extend_from_slice(bytes);
-    output
-}
-
-// Assemble a reader snapshot directly. Publishing rewrites and their FRI
-// deltas atomically belongs to the writer PR, not this test helper.
-async fn install(
-    dataset: &mut Dataset,
-    content: Vec<u8>,
-    destinations: Vec<Fragment>,
-    external: bool,
-) -> IndexMetadata {
-    let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
-    let uuid = Uuid::new_v4();
-    let details = if external {
-        let path = dataset
-            .indices_dir()
-            .join(uuid.to_string())
-            .join("details.binpb");
-        let mut writer = dataset.object_store.create(&path).await.unwrap();
-        writer.write_all(&content).await.unwrap();
-        writer.shutdown().await.unwrap();
-        field(
-            2,
-            &pb::ExternalFile {
-                path: "details.binpb".into(),
-                offset: 0,
-                size: content.len() as u64,
-            }
-            .encode_to_vec(),
-        )
-    } else {
-        field(1, &content)
-    };
-    let fri = IndexMetadata {
-        uuid,
-        fields: vec![],
-        covering_fields: vec![],
-        name: FRAG_REUSE_INDEX_NAME.into(),
-        dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(destinations.iter().map(|f| f.id as u32).collect()),
-        index_details: Some(Arc::new(prost_types::Any {
-            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-            value: details,
-        })),
-        index_version: 1,
-        created_at: None,
-        base_id: None,
-        files: None,
-    };
-    indices.push(fri.clone());
-    let manifest = Arc::make_mut(&mut dataset.manifest);
-    manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
-    manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
-    Arc::make_mut(&mut dataset.manifest).fragments = destinations.into();
-    dataset.fragment_bitmap = Arc::new(
-        dataset
-            .manifest
-            .fragments
-            .iter()
-            .map(|f| f.id as u32)
-            .collect(),
-    );
-    let key = IndexMetadataKey {
-        version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
-    };
-    dataset
-        .index_cache
-        .insert_with_key(&key, Arc::new(indices))
-        .await;
-    fri
-}
-
-// Maintenance and clone reopen the manifest instead of using the query cache.
-// Persist the assembled fixture without requiring the future rewrite writer.
-async fn persist_fixture(dataset: &mut Dataset, indices: Vec<IndexMetadata>) {
-    let mut manifest = dataset.manifest.as_ref().clone();
-    manifest.version += 1;
-    manifest.update_max_fragment_id();
-    manifest.transaction_file = None;
-    manifest.transaction_section = None;
-    let location = crate::dataset::write_manifest_file(
-        &dataset.object_store,
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
-        &mut manifest,
-        Some(indices),
-        &crate::dataset::ManifestWriteConfig::default(),
-        dataset.manifest_location.naming_scheme,
-        None,
-        false,
-    )
-    .await
-    .unwrap();
-    *dataset = dataset.checkout_version(location.version).await.unwrap();
-}
 
 #[tokio::test]
 async fn projected_coverage_does_not_skip_address_translation() {
