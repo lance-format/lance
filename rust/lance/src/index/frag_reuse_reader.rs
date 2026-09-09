@@ -198,6 +198,19 @@ impl FragmentReuseIndex {
     /// Remap physical row IDs through supported lineage, stopping at live fragments.
     /// Missing or deleted paths produce `None`. Input order and duplicates are preserved.
     pub async fn remap_row_ids(self: &Arc<Self>, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        self.remap_row_ids_excluding(row_ids, &RoaringBitmap::new())
+            .await
+    }
+
+    /// Drop paths that enter fragments supplied by other selected index segments.
+    /// Check after each mapping, not only at live destinations: branches may reconverge.
+    /// Starting addresses are not excluded because legacy metadata can already describe
+    /// projected coverage rather than the original addresses stored in an index.
+    pub(super) async fn remap_row_ids_excluding(
+        self: &Arc<Self>,
+        row_ids: &[u64],
+        excluded_fragments: &RoaringBitmap,
+    ) -> Result<Vec<Option<u64>>> {
         let mut result = Vec::with_capacity(row_ids.len());
         for batch in row_ids.chunks(64 * 1024) {
             let mut output: Vec<_> = batch.iter().copied().map(Some).collect();
@@ -229,6 +242,9 @@ impl FragmentReuseIndex {
                     ));
                 }
                 for (position, address) in positions.into_iter().zip(rows) {
+                    let address = address.filter(|row_id| {
+                        !excluded_fragments.contains(RowAddress::from(*row_id).fragment_id())
+                    });
                     output[position] = address;
                     if let Some(current) = address {
                         let current = RowAddress::from(current);
@@ -1409,6 +1425,19 @@ mod tests {
             ledger: Arc::new(ledger),
         });
         let inputs = [0, 1, 2, 3, 9].map(|f| u64::from(RowAddress::new_from_parts(f, 1)));
+        assert_eq!(
+            mapping
+                .remap_row_ids_excluding(&inputs, &RoaringBitmap::from_iter([2]))
+                .await
+                .unwrap(),
+            vec![
+                None,
+                None,
+                Some(u64::from(RowAddress::new_from_parts(3, 1))),
+                Some(inputs[3]),
+                Some(inputs[4])
+            ],
+        );
         assert_eq!(
             mapping.remap_row_ids(&inputs).await.unwrap(),
             vec![
