@@ -408,7 +408,13 @@ impl IndexStore for LanceIndexStore {
 
     fn is_same_storage_binding(&self, other: &dyn IndexStore) -> bool {
         other.as_any().downcast_ref::<Self>().is_some_and(|other| {
-            Arc::ptr_eq(&self.object_store, &other.object_store)
+            // Compare the object store's logical identity, not the Arc pointer.
+            // `store_prefix` uniquely identifies the underlying store (scheme,
+            // bucket/account, and any wrapping), so two stores reopened for the
+            // same location share it even when they are distinct Arc instances.
+            // An `Arc::ptr_eq` here would treat every reopen as a new binding and
+            // defeat the cache whenever a fresh store is constructed per access.
+            self.object_store.store_prefix == other.object_store.store_prefix
                 && self.index_dir == other.index_dir
         })
     }
@@ -596,6 +602,40 @@ mod tests {
             128 * 1024 * 1024,
         ));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
+    }
+
+    // A store reopened for the same location (a distinct Arc, e.g. constructed
+    // per access) must still count as the same storage binding, so the scalar
+    // index cache is reused rather than reloaded on every access.
+    #[tokio::test]
+    async fn test_same_storage_binding_ignores_arc_identity() {
+        let tempdir = TempDir::default();
+        let uri = tempdir.obj_path();
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(1024));
+
+        let open = |uri: &object_store::path::Path| {
+            let (object_store, path) = ObjectStore::from_uri(uri.as_ref())
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+            LanceIndexStore::new(object_store, path, cache.clone())
+        };
+
+        let first = open(&uri);
+        let second = open(&uri);
+        assert!(
+            !Arc::ptr_eq(&first.object_store, &second.object_store),
+            "test precondition: the two stores should be distinct Arc instances"
+        );
+        assert!(
+            first.is_same_storage_binding(&second),
+            "stores reopened for the same location must share a storage binding"
+        );
+
+        // A different location must not match.
+        let other_dir = TempDir::default();
+        let other = open(&other_dir.obj_path());
+        assert!(!first.is_same_storage_binding(&other));
     }
 
     #[tokio::test]
