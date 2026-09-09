@@ -19,7 +19,7 @@
 //!         content: Some(pb::fragment_reuse_index_details::Content::Inline(Default::default())),
 //!     }.encode_to_vec(),
 //! };
-//! let ledger = FragReuseLedger::decode_details(1, &details, |_| async {
+//! let ledger = FragReuseLedger::decode(1, &details, |_| async {
 //!     Err(lance_core::Error::not_supported("external content is unavailable"))
 //! }).await?;
 //! assert!(ledger.transitions().is_empty());
@@ -77,12 +77,13 @@ impl Transition {
     }
 }
 
-/// Validated history in fragment-lineage order, independent of serialization order.
+/// Supported transitions in fragment-lineage order, independent of serialization order.
 #[derive(Debug)]
 pub struct FragReuseLedger {
     transitions: Vec<Transition>,
     consumers: HashMap<u32, usize>,
     producers: HashMap<u32, usize>,
+    has_unsupported_transitions: bool,
 }
 
 impl FragReuseLedger {
@@ -90,7 +91,7 @@ impl FragReuseLedger {
     /// The callback reads the exact byte range described by the external reference;
     /// it is never used for inline history or stable-partition row maps.
     /// Index versions 0 and 1 are supported. Unsupported versions require an upgrade.
-    pub async fn decode_details<F, Fut>(
+    pub async fn decode<F, Fut>(
         index_version: i32,
         details: &prost_types::Any,
         read_external: F,
@@ -137,15 +138,16 @@ impl FragReuseLedger {
             }
             bytes
         };
-        Self::decode(index_version, content)
+        Self::decode_content(index_version, content)
     }
 
     // Each legacy group owns a compaction remap. Address resolution follows its
     // fragment lineage, rather than searching every group in a legacy version.
-    fn decode(index_version: i32, content: Bytes) -> Result<Self> {
+    fn decode_content(index_version: i32, content: Bytes) -> Result<Self> {
         validate_index_version(index_version)?;
         let mut remaining = content;
         let mut transitions = Vec::new();
+        let mut has_unsupported_transitions = false;
         while remaining.has_remaining() {
             let (tag, payload) = next_field(&mut remaining)?;
             match tag {
@@ -171,6 +173,7 @@ impl FragReuseLedger {
                     let raw = require_message(tag, payload)?;
                     let mut fields = raw.clone();
                     let mut has_mapping = false;
+                    let mut has_unknown_fields = false;
                     while fields.has_remaining() {
                         let (tag, payload) = next_field(&mut fields)?;
                         if matches!(tag, ORDERED_COMPACTION_FIELD | STABLE_PARTITION_FIELD) {
@@ -181,7 +184,15 @@ impl FragReuseLedger {
                                 ));
                             }
                             has_mapping = true;
+                        } else if !matches!(tag, 1 | 2) {
+                            has_unknown_fields = true;
                         }
+                    }
+                    if has_unknown_fields {
+                        // The field number does not tell us whether this is metadata
+                        // or a mapping. Neither is safe to partially interpret.
+                        has_unsupported_transitions = true;
+                        continue;
                     }
                     if !has_mapping {
                         return Err(corrupt("transition has no mapping"));
@@ -218,7 +229,15 @@ impl FragReuseLedger {
             transitions,
             consumers,
             producers,
+            has_unsupported_transitions,
         })
+    }
+
+    /// Whether decoding omitted transitions this implementation cannot interpret.
+    /// Such a ledger is insufficient for maintenance; carrying the original
+    /// serialized details forward without interpreting them is still possible.
+    pub fn has_unsupported_transitions(&self) -> bool {
+        self.has_unsupported_transitions
     }
 
     /// Find the transition consuming a fragment in expected constant time.
@@ -557,7 +576,7 @@ mod tests {
         }
         .encode_to_vec()
         .into();
-        let ledger = FragReuseLedger::decode(1, content).unwrap();
+        let ledger = FragReuseLedger::decode_content(1, content).unwrap();
         for (position, transition) in ledger.transitions().iter().enumerate() {
             for source in transition.sources() {
                 assert_eq!(ledger.consumer(source.id as u32), Some(position));
@@ -572,6 +591,7 @@ mod tests {
         }
 
         assert_eq!(ledger.transitions().len(), 2);
+        assert!(!ledger.has_unsupported_transitions());
         let Mapping::OrderedCompaction(remap) = ledger.transitions()[0].mapping() else {
             unreachable!()
         };
@@ -588,18 +608,34 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_metadata_is_not_a_mapping() {
+    fn unknown_fields_do_not_partially_apply_a_known_mapping() {
         let mut raw = partition(1, 2).encode_to_vec();
         message_field(17, b"future metadata", &mut raw);
         prost::encoding::encode_key(7, WireType::Varint, &mut raw);
         prost::encoding::encode_varint(100, &mut raw);
         let mut content = Vec::new();
         message_field(2, &raw, &mut content);
-        let ledger = FragReuseLedger::decode(1, content.into()).unwrap();
-        assert!(matches!(
-            ledger.transitions()[0].mapping(),
-            Mapping::StablePartition(_)
-        ));
+        let ledger = FragReuseLedger::decode_content(1, content.into()).unwrap();
+        assert!(ledger.transitions().is_empty());
+        assert!(ledger.has_unsupported_transitions());
+    }
+
+    #[test]
+    fn unknown_mapping_is_omitted_without_discarding_supported_transitions() {
+        let mut unknown = partition(2, 3);
+        unknown.mapping = None;
+        let mut raw = unknown.encode_to_vec();
+        message_field(17, b"future mapping", &mut raw);
+        let mut content =
+            history(vec![partition(3, 4), partition(1, 2), partition(10, 11)]).to_vec();
+        message_field(2, &raw, &mut content);
+        let ledger = FragReuseLedger::decode_content(1, content.into()).unwrap();
+        assert!(ledger.has_unsupported_transitions());
+        assert_eq!(ledger.transitions().len(), 3);
+        assert!(ledger.consumer(1).is_some());
+        assert_eq!(ledger.consumer(2), None);
+        assert!(ledger.consumer(3).is_some());
+        assert!(ledger.consumer(10).is_some());
     }
 
     #[rstest]
@@ -608,7 +644,10 @@ mod tests {
     #[case::cycle(vec![partition(1, 2), partition(2, 1)], "cycle")]
     #[case::self_cycle(vec![partition(1, 1)], "cycle")]
     fn rejects_invalid_lineage(#[case] transitions: Vec<pb::Transition>, #[case] message: &str) {
-        assert_corrupt(FragReuseLedger::decode(1, history(transitions)), message);
+        assert_corrupt(
+            FragReuseLedger::decode_content(1, history(transitions)),
+            message,
+        );
     }
 
     #[test]
@@ -621,7 +660,7 @@ mod tests {
             vec![digest(4, 3, 0)],
             &[address(3, 1), address(2, 0), address(2, 1)],
         );
-        let ledger = FragReuseLedger::decode(1, history(vec![second, first])).unwrap();
+        let ledger = FragReuseLedger::decode_content(1, history(vec![second, first])).unwrap();
         assert_eq!(ledger.transitions()[0].sources()[0].id, 1);
         assert_eq!(ledger.transitions()[1].sources()[0].id, 3);
         let Mapping::OrderedCompaction(remap) = ledger.transitions()[1].mapping() else {
@@ -646,7 +685,7 @@ mod tests {
         }
         let mut content = Vec::new();
         message_field(2, &raw, &mut content);
-        assert_corrupt(FragReuseLedger::decode(1, content.into()), message);
+        assert_corrupt(FragReuseLedger::decode_content(1, content.into()), message);
     }
 
     #[rstest]
@@ -655,7 +694,7 @@ mod tests {
     #[case::wrong_mapping_wire(vec![0x12, 2, 0x20, 0], "length-delimited")]
     #[case::invalid_key(vec![0], "invalid tag")]
     fn rejects_malformed_wire(#[case] content: Vec<u8>, #[case] message: &str) {
-        assert_corrupt(FragReuseLedger::decode(1, content.into()), message);
+        assert_corrupt(FragReuseLedger::decode_content(1, content.into()), message);
     }
 
     #[rstest]
@@ -667,7 +706,7 @@ mod tests {
         let mut transition = partition(1, 2);
         transition.sources = vec![source];
         assert_corrupt(
-            FragReuseLedger::decode(1, history(vec![transition])),
+            FragReuseLedger::decode_content(1, history(vec![transition])),
             message,
         );
     }
@@ -677,7 +716,7 @@ mod tests {
         let mut second = partition(2, 3);
         second.sources[0] = digest(2, 3, 1);
         assert_corrupt(
-            FragReuseLedger::decode(1, history(vec![partition(1, 2), second])),
+            FragReuseLedger::decode_content(1, history(vec![partition(1, 2), second])),
             "inconsistent physical_rows",
         );
     }
@@ -690,7 +729,7 @@ mod tests {
             &[address(1, 2)],
         );
         assert_corrupt(
-            FragReuseLedger::decode(1, history(vec![transition])),
+            FragReuseLedger::decode_content(1, history(vec![transition])),
             "outside",
         );
         let transition = ordered(
@@ -699,7 +738,7 @@ mod tests {
             &[address(9, 0)],
         );
         assert_corrupt(
-            FragReuseLedger::decode(1, history(vec![transition])),
+            FragReuseLedger::decode_content(1, history(vec![transition])),
             "survivors",
         );
         let mut transition = partition(1, 2);
@@ -708,7 +747,7 @@ mod tests {
         };
         reference.map_id = "../escape".into();
         assert_corrupt(
-            FragReuseLedger::decode(1, history(vec![transition])),
+            FragReuseLedger::decode_content(1, history(vec![transition])),
             "map_id",
         );
     }
@@ -716,7 +755,7 @@ mod tests {
     #[test]
     fn all_deleted_source_has_no_destinations() {
         let transition = ordered(vec![digest(1, 2, 2)], vec![], &[]);
-        let ledger = FragReuseLedger::decode(1, history(vec![transition])).unwrap();
+        let ledger = FragReuseLedger::decode_content(1, history(vec![transition])).unwrap();
         let Mapping::OrderedCompaction(remap) = ledger.transitions()[0].mapping() else {
             unreachable!()
         };
@@ -726,16 +765,16 @@ mod tests {
     #[test]
     fn version_gate() {
         assert!(
-            FragReuseLedger::decode(0, Bytes::new())
+            FragReuseLedger::decode_content(0, Bytes::new())
                 .unwrap()
                 .transitions()
                 .is_empty()
         );
-        let error = FragReuseLedger::decode(2, Bytes::new()).unwrap_err();
+        let error = FragReuseLedger::decode_content(2, Bytes::new()).unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("index_version 2"));
         assert_corrupt(
-            FragReuseLedger::decode(0, history(vec![partition(1, 2)])),
+            FragReuseLedger::decode_content(0, history(vec![partition(1, 2)])),
             "index_version 1",
         );
     }
@@ -801,7 +840,7 @@ mod tests {
             type_url: "/lance.table.FragmentReuseIndexDetails".into(),
             value: envelope,
         };
-        let ledger = FragReuseLedger::decode_details(1, &any, |actual| async move {
+        let ledger = FragReuseLedger::decode(1, &any, |actual| async move {
             assert!(external);
             assert_eq!(actual, file);
             Ok(content.into())
@@ -836,7 +875,8 @@ mod tests {
     #[test]
     fn independent_transitions_keep_serialized_order() {
         let ledger =
-            FragReuseLedger::decode(1, history(vec![partition(10, 11), partition(1, 2)])).unwrap();
+            FragReuseLedger::decode_content(1, history(vec![partition(10, 11), partition(1, 2)]))
+                .unwrap();
         assert_eq!(
             ledger
                 .transitions()
@@ -859,7 +899,7 @@ mod tests {
             type_url: "/lance.table.FragmentReuseIndexDetails".into(),
             value,
         };
-        let result = FragReuseLedger::decode_details(1, &any, |_| async {
+        let result = FragReuseLedger::decode(1, &any, |_| async {
             panic!("invalid envelope must not read external content")
         })
         .await;
@@ -868,7 +908,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_gate_precedes_envelope_and_io() {
-        let error = FragReuseLedger::decode_details(2, &prost_types::Any::default(), |_| async {
+        let error = FragReuseLedger::decode(2, &prost_types::Any::default(), |_| async {
             panic!("unsupported version must not read external content")
         })
         .await
@@ -897,7 +937,7 @@ mod tests {
             type_url: "/lance.table.FragmentReuseIndexDetails".into(),
             value,
         };
-        let result = FragReuseLedger::decode_details(1, &details, |_| async move {
+        let result = FragReuseLedger::decode(1, &details, |_| async move {
             assert_ne!(offset, u64::MAX, "overflow must be rejected before IO");
             Ok(Bytes::from_static(&[0]))
         })
@@ -908,13 +948,13 @@ mod tests {
     proptest::proptest! {
         #[test]
         fn arbitrary_inline_bytes_do_not_panic(raw in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
-            let _ = FragReuseLedger::decode(1, raw.into());
+            let _ = FragReuseLedger::decode_content(1, raw.into());
         }
 
         #[test]
         fn arbitrary_envelopes_do_not_panic(raw in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
             let any = prost_types::Any { type_url: "/lance.table.FragmentReuseIndexDetails".into(), value: raw };
-            let _ = futures::executor::block_on(FragReuseLedger::decode_details(1, &any, |_| async {
+            let _ = futures::executor::block_on(FragReuseLedger::decode(1, &any, |_| async {
                 Err(Error::not_supported("no external data in parser property test"))
             }));
         }
