@@ -368,6 +368,152 @@ async fn prepared_results(
 }
 
 #[tokio::test]
+async fn test_sync_df_requires_all_segments_and_preserves_scorer_bits() {
+    let first_dir = TempObjDir::default();
+    let first_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        first_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    write_pair_partition(
+        &first_store,
+        0,
+        &[("alpha", "beta", 100), ("alpha", "gamma", 101)],
+    )
+    .await;
+    write_test_metadata(&first_store, vec![0], InvertedIndexParams::default()).await;
+    let first_cache = Arc::new(LanceCache::with_capacity(4096));
+    let first = InvertedIndex::load(first_store, None, first_cache.as_ref())
+        .await
+        .unwrap();
+
+    let second_dir = TempObjDir::default();
+    let second_store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        second_dir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    write_pair_partition(&second_store, 0, &[("alpha", "beta", 200)]).await;
+    write_test_metadata(&second_store, vec![0], InvertedIndexParams::default()).await;
+    let second_cache = Arc::new(LanceCache::with_capacity(4096));
+    let second = InvertedIndex::load(second_store, None, second_cache.as_ref())
+        .await
+        .unwrap();
+
+    let indices = vec![first.clone(), second.clone()];
+    let terms = vec!["alpha".to_string(), "beta".to_string()];
+    assert!(
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(
+            &indices, &terms, false
+        )
+        .unwrap()
+        .is_none(),
+        "the kill switch must return before any readiness-dependent work"
+    );
+    assert!(first.corpus_stats.get().is_none());
+    assert!(second.corpus_stats.get().is_none());
+    assert!(
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(&indices, &terms, true)
+            .unwrap()
+            .is_none(),
+        "non-prewarmed segments must use the asynchronous path"
+    );
+
+    first
+        .prewarm_with_options(&FtsPrewarmOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(&indices, &terms, true)
+            .unwrap()
+            .is_none(),
+        "one ready and one cold segment must fall back as one query"
+    );
+
+    second.aggregate_corpus_stats().await.unwrap();
+    assert!(second.corpus_stats.get().is_some());
+    assert!(!second.partitions[0].inverted_list.posting_lengths_loaded());
+    assert!(
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(&indices, &terms, true)
+            .unwrap()
+            .is_none(),
+        "loaded corpus stats with stale posting metadata must still fall back atomically"
+    );
+
+    second
+        .prewarm_with_options(&FtsPrewarmOptions::default())
+        .await
+        .unwrap();
+    let fast =
+        crate::scalar::inverted::bm25_scorer_from_loaded_stats_with_enabled(&indices, &terms, true)
+            .unwrap()
+            .unwrap();
+    let mut async_stats = Vec::with_capacity(indices.len());
+    for index in &indices {
+        async_stats.push(index.bm25_stats_for_terms(&terms, None).await.unwrap());
+    }
+    let slow = crate::scalar::inverted::merge_loaded_bm25_stats(&terms, async_stats)
+        .unwrap()
+        .unwrap();
+    assert_eq!(fast.total_tokens, slow.total_tokens);
+    assert_eq!(fast.num_docs, slow.num_docs);
+    assert_eq!(fast.token_docs, slow.token_docs);
+    assert_eq!(fast.total_tokens, 6);
+    assert_eq!(fast.num_docs, 3);
+    assert_eq!(
+        fast.token_docs,
+        HashMap::from([("alpha".to_string(), 3), ("beta".to_string(), 2)])
+    );
+    for term in &terms {
+        assert_eq!(
+            fast.query_weight(term).to_bits(),
+            slow.query_weight(term).to_bits(),
+            "query weight changed for {term}"
+        );
+    }
+    for (frequency, doc_tokens) in [(1, 1), (1, 2), (3, 7)] {
+        assert_eq!(
+            fast.doc_weight(frequency, doc_tokens).to_bits(),
+            slow.doc_weight(frequency, doc_tokens).to_bits()
+        );
+    }
+
+    let tokens = Arc::new(Tokens::new(
+        vec!["alpha".to_string(), "beta".to_string()],
+        DocType::Text,
+    ));
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+    let fast_prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            &indices,
+            tokens.as_ref().clone(),
+            params.as_ref(),
+            None,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(fast_prepared.scorer().token_docs, fast.token_docs);
+    let slow_prepared = Arc::new(
+        crate::scalar::inverted::prepare_bm25_query(
+            &indices,
+            tokens.as_ref().clone(),
+            params.as_ref(),
+            None,
+            Some(slow),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        prepared_results(&indices, fast_prepared, params.clone()).await,
+        prepared_results(&indices, slow_prepared, params).await,
+        "the synchronous scorer must preserve final score bits"
+    );
+}
+
+#[tokio::test]
 async fn test_canonical_fuzzy_rewrite_is_independent_of_segment_and_partition_shape() {
     let documents = [
         ("alpha", "beta", 100),

@@ -70,6 +70,7 @@ pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
 mod data_file;
+mod data_file_part;
 pub mod delta;
 pub mod files;
 pub mod fragment;
@@ -115,7 +116,8 @@ mod utils;
 pub(crate) mod versions;
 pub mod write;
 
-pub use data_file::{DataFilePart, DataFileTarget};
+pub use data_file::DataFileTarget;
+pub use data_file_part::DataFilePart;
 
 pub(crate) use take::row_offsets_to_row_addresses;
 

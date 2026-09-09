@@ -983,6 +983,22 @@ impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {
         match e {
+            // DataFusion wraps an error to attach end-user context and source
+            // spans (`Diagnostic`), a description of what was running
+            // (`Context`), or to report several failures at once
+            // (`Collection`). All three are display-transparent, so the
+            // category has to come from the error underneath; classifying the
+            // wrapper itself reports a malformed query as an internal failure.
+            datafusion_common::DataFusionError::Diagnostic(_, inner)
+            | datafusion_common::DataFusionError::Context(_, inner) => Self::from(*inner),
+            datafusion_common::DataFusionError::Collection(errors) => {
+                match errors.into_iter().next() {
+                    // `Collection` reports the first error's message, so take
+                    // its category too.
+                    Some(first) => Self::from(first),
+                    None => Self::execution("DataFusion returned an empty error collection"),
+                }
+            }
             datafusion_common::DataFusionError::SQL(..)
             | datafusion_common::DataFusionError::Plan(..)
             | datafusion_common::DataFusionError::Configuration(..)
@@ -998,11 +1014,16 @@ impl From<datafusion_common::DataFusionError> for Error {
                 // DataFusion shares an error across consumers (e.g. a join's
                 // build-side error fanned out to every probe partition) behind an
                 // `Arc`. If we are the sole owner we can recurse for full fidelity;
-                // otherwise the inner error can't be moved out, so we preserve its
-                // message under the execution category (its concrete type is lost).
+                // otherwise re-wrap in `Shared` so the concrete error type is still
+                // reachable via `Error::source` / `downcast_ref`.
                 match std::sync::Arc::try_unwrap(shared) {
                     Ok(inner) => Self::from(inner),
-                    Err(shared) => Self::execution(shared.to_string()),
+                    Err(shared) => {
+                        let rewrapped = datafusion_common::DataFusionError::Shared(shared);
+                        Self::External {
+                            source: box_error(rewrapped),
+                        }
+                    }
                 }
             }
             datafusion_common::DataFusionError::External(source) => {
@@ -1382,6 +1403,86 @@ mod test {
         }
     }
 
+    /// DataFusion wraps errors to attach end-user context (`Diagnostic`), a
+    /// description of what was running (`Context`), or to report several at
+    /// once (`Collection`). All three are display-transparent, so a wrapped
+    /// user error looks exactly like an unwrapped one but would be classified
+    /// as an internal failure if the conversion matched on the wrapper.
+    #[cfg(feature = "datafusion")]
+    #[rstest::rstest]
+    #[case::diagnostic(|inner| datafusion_common::DataFusionError::Diagnostic(
+        Box::new(datafusion_common::Diagnostic::new_error("invalid function", None)),
+        Box::new(inner),
+    ))]
+    #[case::context(|inner| datafusion_common::DataFusionError::Context(
+        "type_coercion".to_string(),
+        Box::new(inner),
+    ))]
+    #[case::collection(|inner| datafusion_common::DataFusionError::Collection(vec![inner]))]
+    #[case::nested(|inner| datafusion_common::DataFusionError::Diagnostic(
+        Box::new(datafusion_common::Diagnostic::new_error("invalid function", None)),
+        Box::new(datafusion_common::DataFusionError::Context(
+            "type_coercion".to_string(),
+            Box::new(inner),
+        )),
+    ))]
+    fn test_datafusion_wrapped_plan_error_is_invalid_input(
+        #[case] wrap: fn(datafusion_common::DataFusionError) -> datafusion_common::DataFusionError,
+    ) {
+        let df_err = wrap(datafusion_common::DataFusionError::Plan(
+            "Invalid function 'no_such_function'".to_string(),
+        ));
+        let lance_err = Error::from(df_err);
+
+        assert!(
+            matches!(lance_err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {lance_err:?}"
+        );
+        assert!(
+            lance_err.to_string().contains("no_such_function"),
+            "expected the function name to survive, got: {lance_err}"
+        );
+    }
+
+    /// Unwrapping must classify by the inner error rather than assume the
+    /// wrapper always hides a user error.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_datafusion_wrapped_internal_error_is_not_invalid_input() {
+        let df_err = datafusion_common::DataFusionError::Context(
+            "while running".to_string(),
+            Box::new(datafusion_common::DataFusionError::Internal(
+                "invariant violated".to_string(),
+            )),
+        );
+
+        assert!(
+            matches!(Error::from(df_err), Error::IO { .. }),
+            "an internal DataFusion failure must not be reported as user input"
+        );
+    }
+
+    /// A Lance error that round-trips through DataFusion keeps its own
+    /// category even when DataFusion wraps it on the way back.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_wrapped_external_lance_error_keeps_its_category() {
+        let df_err = datafusion_common::DataFusionError::Context(
+            "while scanning".to_string(),
+            Box::new(datafusion_common::DataFusionError::from(Error::io(
+                "object store unavailable",
+            ))),
+        );
+
+        match Error::from(df_err) {
+            Error::IO { source, .. } => assert!(
+                source.to_string().contains("object store unavailable"),
+                "expected the original message, got: {source}"
+            ),
+            other => panic!("expected the original IO error, got {other:?}"),
+        }
+    }
+
     #[cfg(feature = "datafusion")]
     #[test]
     fn test_datafusion_external_error_conversion() {
@@ -1469,6 +1570,42 @@ mod test {
             }
             _ => panic!("Expected InvalidInput variant, got {:?}", recovered),
         }
+    }
+
+    /// Test that a typed error survives a multiply-owned `DataFusionError::Shared`.
+    ///
+    /// When DataFusion fans one error out to multiple consumers via `Arc`, we
+    /// cannot move the inner error out.  The typed source must still be
+    /// reachable after conversion to `lance_core::Error`.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_datafusion_shared_multi_owner_preserves_type() {
+        let custom_err = MyCustomError {
+            code: 42,
+            message: "shared typed error".to_string(),
+        };
+        let marker = datafusion_common::DataFusionError::External(Box::new(custom_err));
+        // Put it in an Arc and keep a second owner so try_unwrap fails.
+        let arc = std::sync::Arc::new(marker);
+        let _arc2 = arc.clone();
+        let shared = datafusion_common::DataFusionError::Shared(arc);
+
+        let lance_err: Error = shared.into();
+
+        // The concrete error must be discoverable via source chain.
+        let mut found = false;
+        let mut src: Option<&dyn std::error::Error> = Some(&lance_err);
+        while let Some(e) = src {
+            if e.downcast_ref::<MyCustomError>().is_some() {
+                found = true;
+                break;
+            }
+            src = e.source();
+        }
+        assert!(
+            found,
+            "MyCustomError not found in source chain: {lance_err:?}"
+        );
     }
 
     #[test]
