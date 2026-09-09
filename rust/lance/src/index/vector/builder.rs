@@ -36,6 +36,9 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
+use lance_index::vector::ivf::norm_ranges::{
+    IvfNormRanges, NORM_RANGES_METADATA_KEY, VectorNormRange,
+};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -1575,6 +1578,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut storage_ivf = IvfModel::empty();
         let mut index_ivf = IvfModel::new(ivf.centroids.clone().unwrap(), ivf.loss);
         let mut partition_index_metadata = Vec::with_capacity(ivf.num_partitions());
+        let mut norm_ranges = (is_flat
+            && S::name() == "FLAT"
+            && self.distance_type != DistanceType::Hamming
+            && ivf
+                .centroids
+                .as_ref()
+                .is_some_and(|centroids| centroids.value_type() == DataType::Float32))
+        .then(|| Vec::with_capacity(ivf.num_partitions()));
 
         let num_partitions = ivf.num_partitions();
         let mut ordered_results = OrderedPartitionResults::new(num_partitions);
@@ -1601,6 +1612,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     storage_ivf.add_partition(0);
                     index_ivf.add_partition(0);
                     partition_index_metadata.push(String::new());
+                    if let Some(ranges) = &mut norm_ranges {
+                        ranges.push(None);
+                    }
 
                     continue;
                 };
@@ -1608,8 +1622,32 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
                 if storage.len() == 0 {
                     storage_ivf.add_partition(0);
+                    if let Some(ranges) = &mut norm_ranges {
+                        ranges.push(None);
+                    }
                 } else {
                     for mut batch in storage.to_batches()? {
+                        if let Some(ranges) = &mut norm_ranges {
+                            let vectors = batch
+                                .column_by_name(lance_index::vector::flat::storage::FLAT_COLUMN)
+                                .and_then(|column| column.as_fixed_size_list_opt())
+                                .ok_or_else(|| {
+                                    Error::index("FLAT storage has no fixed-size vector column")
+                                })?;
+                            if vectors.value_type() != DataType::Float32 {
+                                norm_ranges = None;
+                            } else {
+                                let vectors = vectors.clone();
+                                // Statistics describe the actual stored vectors after all
+                                // transforms/remaps, not a training sample or old metadata.
+                                ranges.push(
+                                    spawn_cpu(move || {
+                                        Ok::<_, Error>(VectorNormRange::from_vectors(&vectors))
+                                    })
+                                    .await?,
+                                );
+                            }
+                        }
                         if is_pq
                             && !self.transpose_codes
                             && batch.num_rows() > 0
@@ -1785,6 +1823,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             S::metadata_key(),
             serde_json::to_string(&partition_index_metadata)?,
         );
+        if let Some(ranges) = norm_ranges {
+            let metadata = IvfNormRanges::new(
+                ivf.dimension(),
+                self.distance_type,
+                storage_ivf.lengths.clone(),
+                ranges,
+            )?;
+            index_writer
+                .add_schema_metadata(NORM_RANGES_METADATA_KEY, serde_json::to_string(&metadata)?);
+        }
 
         let storage_summary = storage_writer.finish().await?;
         let index_summary = index_writer.finish().await?;

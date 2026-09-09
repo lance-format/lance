@@ -1135,6 +1135,7 @@ mod tests {
             uuid: "test-uuid-1234".to_string(),
             ivf: ivf.clone(),
             aux_ivf: ivf,
+            norm_ranges: None,
             distance_type: DistanceType::L2,
             sub_index_metadata: vec!["meta1".to_string()],
             metadata: lance_index::vector::flat::index::FlatMetadata { dim: 2 },

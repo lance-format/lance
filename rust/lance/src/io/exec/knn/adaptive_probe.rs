@@ -17,13 +17,120 @@
 
 use std::env;
 
+use arrow_array::{Array, UInt32Array, cast::AsArray};
+use arrow_schema::DataType;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use lance_index::vector::Query;
+use lance_index::vector::{
+    Query, VectorIndex, VectorNormRange, quantizer::QuantizationType, v3::subindex::SubIndexType,
+};
 use lance_linalg::distance::DistanceType;
 
 const MARGIN_ENV: &str = "LANCE_AUTO_PROBE_MARGIN";
 const MIN_INITIAL_NPROBES_ENV: &str = "LANCE_AUTO_MIN_INITIAL_NPROBES";
 const MAX_INITIAL_NPROBES_ENV: &str = "LANCE_AUTO_MAX_INITIAL_NPROBES";
+
+/// Supplement an Auto prefix when norm ranges identify an affordable remainder.
+///
+/// These descriptive f64 ranges do not certify native f32 pruning. The rule only
+/// adds candidates to exact FLAT search; it never replaces the initial results.
+/// The extra budget is the initial prefix's nominal posting rows, independently
+/// for each segment. Explicit probe limits keep their existing bounded behavior.
+pub(super) fn radial_completion_positions(
+    query: &Query,
+    index: &dyn VectorIndex,
+    partitions: &UInt32Array,
+    kth_distance: f32,
+) -> Option<Vec<usize>> {
+    if query.maximum_nprobes.is_some()
+        || !kth_distance.is_finite()
+        || query.key.data_type() != &DataType::Float32
+        || query.key.null_count() != 0
+        || partitions
+            .values()
+            .iter()
+            .all(|&part| index.partition_norm_range(part as usize).is_none())
+    {
+        return None;
+    }
+    if !matches!(
+        index.sub_index_type(),
+        (SubIndexType::Flat, QuantizationType::Flat)
+    ) || partitions.len() != index.ivf_model().num_partitions()
+    {
+        return None;
+    }
+    let norm = query
+        .key
+        .as_primitive::<arrow_array::types::Float32Type>()
+        .values()
+        .iter()
+        .map(|&value| f64::from(value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() {
+        return None;
+    }
+    let initial = query.minimum_nprobes.min(partitions.len());
+    let initial_rows = partitions.values()[..initial]
+        .iter()
+        .try_fold(0usize, |rows, &part| {
+            rows.checked_add(index.partition_size(part as usize))
+        })?;
+    affordable_norm_completion(
+        norm,
+        index.metric_type(),
+        kth_distance,
+        initial_rows,
+        (initial..partitions.len()).map(|position| {
+            let part = partitions.value(position) as usize;
+            (
+                position,
+                index.partition_size(part),
+                index.partition_norm_range(part),
+            )
+        }),
+    )
+}
+
+fn affordable_norm_completion(
+    norm: f64,
+    metric: DistanceType,
+    kth_distance: f32,
+    initial_rows: usize,
+    candidates: impl Iterator<Item = (usize, usize, Option<VectorNormRange>)>,
+) -> Option<Vec<usize>> {
+    let mut extra_rows = 0usize;
+    let mut selected = Vec::new();
+    for (position, rows, range) in candidates {
+        if rows == 0 {
+            continue;
+        }
+        let range = range?;
+        let lower_bound = match metric {
+            DistanceType::L2 | DistanceType::Cosine => {
+                let gap = (range.min - norm).max(norm - range.max).max(0.0);
+                let squared = gap * gap;
+                if metric == DistanceType::Cosine {
+                    squared * 0.5
+                } else {
+                    squared
+                }
+            }
+            DistanceType::Dot => 1.0 - norm * range.max,
+            DistanceType::Hamming => return None,
+        };
+        if lower_bound <= f64::from(kth_distance) {
+            extra_rows = extra_rows.checked_add(rows)?;
+            if extra_rows > initial_rows {
+                // The whole eligible remainder must fit; choosing a prefix here
+                // would introduce another uncalibrated partition budget.
+                return None;
+            }
+            selected.push(position);
+        }
+    }
+    Some(selected)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct AutoProbeConfig {
@@ -226,6 +333,63 @@ mod tests {
     use arrow_array::Float32Array;
     use rstest::rstest;
     use std::sync::Arc;
+
+    #[rstest]
+    #[case::l2(DistanceType::L2, 1.0, 4.0)]
+    #[case::cosine(DistanceType::Cosine, 1.0, 2.0)]
+    #[case::dot(DistanceType::Dot, 1.0, -2.0)]
+    fn test_norm_completion_keeps_boundary_candidates(
+        #[case] metric: DistanceType,
+        #[case] query_norm: f64,
+        #[case] threshold: f32,
+    ) {
+        let range = Some(VectorNormRange { min: 3.0, max: 3.0 });
+        assert_eq!(
+            affordable_norm_completion(
+                query_norm,
+                metric,
+                threshold,
+                7,
+                [(5, 0, None), (6, 7, range)].into_iter(),
+            ),
+            Some(vec![6]),
+        );
+    }
+
+    #[test]
+    fn test_norm_completion_requires_the_whole_remainder_to_fit() {
+        let range = Some(VectorNormRange { min: 1.0, max: 2.0 });
+        assert_eq!(
+            affordable_norm_completion(
+                0.0,
+                DistanceType::L2,
+                4.0,
+                10,
+                [(1, 6, range), (2, 5, range)].into_iter(),
+            ),
+            None,
+        );
+        assert_eq!(
+            affordable_norm_completion(
+                0.0,
+                DistanceType::L2,
+                4.0,
+                10,
+                [(1, 6, range), (2, 5, None)].into_iter(),
+            ),
+            None,
+        );
+        assert_eq!(
+            affordable_norm_completion(
+                0.0,
+                DistanceType::L2,
+                0.5,
+                10,
+                [(1, 6, range), (2, 5, range)].into_iter(),
+            ),
+            Some(vec![]),
+        );
+    }
 
     fn query() -> Query {
         Query {
