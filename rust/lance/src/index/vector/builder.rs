@@ -1048,7 +1048,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             no_partition_adjustment()
         } else {
             let target_partition_size = self.effective_target_partition_size()?;
-            let (splits, joins) = Self::check_partition_adjustment(
+            let PartitionAdjustmentPlan {
+                splits,
+                joins,
+                partition_sizes,
+            } = Self::check_partition_adjustment(
                 ivf,
                 self.distance_type,
                 reader.as_ref(),
@@ -1091,7 +1095,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     target_partition_size,
                     self.existing_indices.len()
                 );
-                let results = self.join_partitions(&joins, ivf).boxed().await?;
+                let results = self
+                    .join_partitions(
+                        &joins,
+                        ivf,
+                        &partition_sizes,
+                        MAX_PARTITION_SIZE_FACTOR * target_partition_size,
+                    )
+                    .boxed()
+                    .await?;
                 let Some(ivf) = self.ivf.as_mut() else {
                     return Err(Error::invalid_input(
                         "IVF model not set before joining partitions",
@@ -1991,7 +2003,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         existing_indices: &[ExistingIndex],
         target_partition_size: usize,
         join_bytes_per_row: usize,
-    ) -> Result<(Vec<PartitionSplit>, Vec<usize>)> {
+    ) -> Result<PartitionAdjustmentPlan> {
         let mut partition_sizes = Vec::with_capacity(ivf.num_partitions());
         for partition in 0..ivf.num_partitions() {
             let mut num_rows = reader.partition_size(partition)?;
@@ -2000,13 +2012,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
             partition_sizes.push(num_rows);
         }
-        plan_partition_adjustment(
+        let (splits, joins) = plan_partition_adjustment(
             ivf,
             distance_type,
             &partition_sizes,
             target_partition_size,
             join_bytes_per_row,
-        )
+        )?;
+        Ok(PartitionAdjustmentPlan {
+            splits,
+            joins,
+            partition_sizes,
+        })
     }
 
     /// Split oversized partitions using a streaming approach.
@@ -2479,10 +2496,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     /// Join undersized partitions away in one pass: their centroids are removed
     /// and every one of their vectors is reassigned to the nearest remaining
-    /// partition among the `REASSIGN_RANGE` nearest neighbors of its old centroid.
+    /// partition among the `REASSIGN_RANGE` nearest neighbors of its old centroid
+    /// that still has room below `split_threshold`, given `partition_sizes`.
     /// Partitions are loaded one at a time and their rows quantized right away,
     /// so only one partition's raw vectors are in memory at once.
-    async fn join_partitions(&self, partitions: &[usize], ivf: &IvfModel) -> Result<JoinResult> {
+    async fn join_partitions(
+        &self,
+        partitions: &[usize],
+        ivf: &IvfModel,
+        partition_sizes: &[usize],
+        split_threshold: usize,
+    ) -> Result<JoinResult> {
         let removed: HashSet<usize> = partitions.iter().copied().collect();
         let kept_partitions: Vec<usize> = (0..ivf.num_partitions())
             .filter(|partition| !removed.contains(partition))
@@ -2503,6 +2527,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 "dataset not set before joining partitions",
             ));
         };
+        // Rows each partition can still take before it reaches the split threshold.
+        let mut room: Vec<usize> = partition_sizes
+            .iter()
+            .map(|&size| split_threshold.saturating_sub(size))
+            .collect();
         let (_, element_type) = get_vector_type(dataset.schema(), &self.column)?;
         let assign_batches = match element_type {
             DataType::Float16 => {
@@ -2511,6 +2540,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     &kept_partitions,
                     ivf,
                     &new_centroids,
+                    &mut room,
                 )
                 .await?
             }
@@ -2520,6 +2550,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     &kept_partitions,
                     ivf,
                     &new_centroids,
+                    &mut room,
                 )
                 .await?
             }
@@ -2529,6 +2560,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     &kept_partitions,
                     ivf,
                     &new_centroids,
+                    &mut room,
                 )
                 .await?
             }
@@ -2538,6 +2570,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     &kept_partitions,
                     ivf,
                     &new_centroids,
+                    &mut room,
                 )
                 .await?
             }
@@ -2562,6 +2595,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         kept_partitions: &[usize],
         ivf: &IvfModel,
         new_centroids: &FixedSizeListArray,
+        room: &mut [usize],
     ) -> Result<Vec<Option<(RecordBatch, UInt64Array)>>>
     where
         T::Native: Dot + L2 + Normalize,
@@ -2589,23 +2623,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 self.select_reassign_candidates(ivf, part_idx, &c0, &removed)?;
 
             let mut assign_ops = vec![Vec::new(); kept_partitions.len()];
+            let mut overflowed = 0usize;
             for (i, &row_id) in row_ids.values().iter().enumerate() {
-                let ReassignPartition::ReassignCandidate(target) = self.reassign_vectors(
+                let (target, had_room) = reassign_with_room(
+                    self.distance_type,
                     vectors.value(i).as_primitive::<T>(),
-                    None,
                     &reassign_part_ids,
                     &reassign_part_centroids,
-                )?
-                else {
-                    log::warn!("this is a bug, the vector is not reassigned");
-                    continue;
-                };
+                    room,
+                )?;
+                if had_room {
+                    room[target as usize] -= 1;
+                } else {
+                    overflowed += 1;
+                }
                 let output = output_partition[target as usize].ok_or_else(|| {
                     Error::internal(format!(
                         "partition {target} is being joined away but was selected to receive vectors of partition {part_idx}"
                     ))
                 })?;
                 assign_ops[output].push(AssignOp::Add((row_id, vectors.value(i))));
+            }
+            if overflowed > 0 {
+                log::warn!(
+                    "{overflowed} rows of joined partition {part_idx} found no neighbor below the split threshold and went to the nearest full one"
+                );
             }
             let batches = Self::build_assign_batch::<T>(&transformer, &vector_field, &assign_ops)?;
             for (output, batch) in batches.into_iter().enumerate() {
@@ -2785,60 +2827,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     ) -> Result<(UInt32Array, FixedSizeListArray)> {
         select_reassign_candidates_impl(self.distance_type, ivf, part_idx, c0, excluded)
     }
-    // assign a vector to the closest partition among:
-    // 1. the 2 new centroids
-    // 2. the closest REASSIGN_RANGE partitions from the original centroid
-    fn reassign_vectors<T: ArrowPrimitiveType>(
-        &self,
-        vector: &PrimitiveArray<T>,
-        // the dists to the 2 new centroids
-        split_centroids_dists: Option<(f32, f32)>,
-        reassign_candidate_ids: &UInt32Array,
-        reassign_candidate_centroids: &FixedSizeListArray,
-    ) -> Result<ReassignPartition> {
-        Self::reassign_vectors_impl(
-            self.distance_type,
-            vector,
-            split_centroids_dists,
-            reassign_candidate_ids,
-            reassign_candidate_centroids,
-        )
-    }
-
-    fn reassign_vectors_impl<T: ArrowPrimitiveType>(
-        distance_type: DistanceType,
-        vector: &PrimitiveArray<T>,
-        split_centroids_dists: Option<(f32, f32)>,
-        reassign_candidate_ids: &UInt32Array,
-        reassign_candidate_centroids: &FixedSizeListArray,
-    ) -> Result<ReassignPartition> {
-        let dists = distance_type.arrow_batch_func()(vector, reassign_candidate_centroids)?;
-        let min_dist_idx = dists
-            .values()
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(i, _)| i);
-        let min_dist = min_dist_idx
-            .map(|idx| dists.value(idx))
-            .unwrap_or(f32::INFINITY);
-        match split_centroids_dists {
-            Some((d1, d2)) => {
-                if min_dist <= d1 && min_dist <= d2 {
-                    Ok(ReassignPartition::ReassignCandidate(
-                        reassign_candidate_ids.value(min_dist_idx.unwrap()),
-                    ))
-                } else if d1 <= d2 {
-                    Ok(ReassignPartition::NewCentroid1)
-                } else {
-                    Ok(ReassignPartition::NewCentroid2)
-                }
-            }
-            None => Ok(ReassignPartition::ReassignCandidate(
-                reassign_candidate_ids.value(min_dist_idx.unwrap()),
-            )),
-        }
-    }
 }
 
 /// Split every partition above `MAX_PARTITION_SIZE_FACTOR` times the target
@@ -2847,14 +2835,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 /// partitions below `MIN_PARTITION_SIZE_PERCENT` of the target, smallest first,
 /// within two limits:
 ///
-/// * A joined partition's rows go to the nearest surviving centroid, so each
+/// * A joined partition's rows go to its nearest surviving neighbor, so each
 ///   candidate is projected onto that destination and skipped when the
 ///   destination would end up above the split threshold. Without that, many
 ///   small partitions around one survivor would rebuild the very oversized
 ///   partition the split threshold exists to prevent. A destination that is
-///   still undersized may be joined away in a later round, its received rows
-///   re-projected onto their new nearest survivor, so a handful of tiny
-///   partitions converges to one instead of stopping at pairs.
+///   still undersized may be joined away in a later round, taking the rows
+///   projected onto it along, so a handful of tiny partitions converges to one
+///   instead of stopping at pairs. The projection is an estimate: the join
+///   itself places every row in its nearest neighbor with room below the
+///   threshold ([`reassign_with_room`]).
 /// * The joined rows fit in `JOIN_BYTES_BUDGET` at `join_bytes_per_row`, since
 ///   they stay in memory until the merge writes them out. The rest wait for
 ///   the next optimize.
@@ -2884,27 +2874,12 @@ fn plan_partition_adjustment(
         return Ok((splits, Vec::new()));
     }
 
-    let centroids = ivf
-        .centroids_array()
-        .ok_or_else(|| Error::invalid_input("IVF model has no centroids to plan joins"))?;
-    let nearest_survivor = |partition: usize, removed: &[bool]| -> Result<Option<usize>> {
-        let c0 = ivf
-            .centroid(partition)
-            .ok_or(Error::invalid_input("original centroid not found"))?;
-        let dists = distance_type.arrow_batch_func()(&c0, centroids)?;
-        Ok(dists
-            .values()
-            .iter()
-            .enumerate()
-            .filter(|&(other, _)| other != partition && !removed[other])
-            .min_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(other, _)| other))
-    };
-
-    // Sizes once the joins so far are applied, and which joined partitions'
-    // rows each survivor is projected to hold.
+    // Sizes once the joins so far are applied. A joined partition's rows are
+    // projected onto its nearest surviving neighbor, and the rows projected
+    // onto it move on with it: an estimate, since the join itself sends every
+    // row to its own nearest neighbor with room below the split threshold.
     let mut projected_sizes = partition_sizes.to_vec();
-    let mut contributors: Vec<Vec<usize>> = vec![Vec::new(); num_partitions];
+    let mut neighbors: Vec<Option<Vec<u32>>> = vec![None; num_partitions];
     let mut removed = vec![false; num_partitions];
     let mut joined_bytes = 0usize;
     let mut joins = Vec::new();
@@ -2925,35 +2900,22 @@ fn plan_partition_adjustment(
             {
                 break 'rounds;
             }
-            // Its own rows and those projected onto it each go to their nearest
-            // surviving centroid; every such destination must stay below the
-            // split threshold.
-            removed[partition] = true;
-            let mut moves = Vec::with_capacity(contributors[partition].len() + 1);
-            for &source in std::iter::once(&partition).chain(contributors[partition].iter()) {
-                match nearest_survivor(source, &removed)? {
-                    Some(destination) => moves.push((source, destination)),
-                    None => break,
-                }
-            }
-            let mut increments: HashMap<usize, usize> = HashMap::new();
-            for &(source, destination) in &moves {
-                *increments.entry(destination).or_default() += partition_sizes[source];
-            }
-            let fits = moves.len() == contributors[partition].len() + 1
-                && increments.iter().all(|(&destination, &rows)| {
-                    projected_sizes[destination] + rows <= split_threshold
-                });
-            if !fits {
-                removed[partition] = false;
+            let Some(destination) = nearest_surviving_neighbor(
+                ivf,
+                distance_type,
+                partition,
+                &removed,
+                &mut neighbors[partition],
+            )?
+            else {
+                continue;
+            };
+            if projected_sizes[destination] + projected_sizes[partition] > split_threshold {
                 continue;
             }
-            for (source, destination) in moves {
-                projected_sizes[destination] += partition_sizes[source];
-                contributors[destination].push(source);
-            }
+            projected_sizes[destination] += projected_sizes[partition];
             projected_sizes[partition] = 0;
-            contributors[partition].clear();
+            removed[partition] = true;
             joined_bytes += num_rows * join_bytes_per_row;
             joins.push(partition);
             progress = true;
@@ -2964,6 +2926,69 @@ fn plan_partition_adjustment(
     }
     joins.sort_unstable();
     Ok((splits, joins))
+}
+
+/// The nearest partition to `partition` that is not joined away. `cache` holds
+/// its `REASSIGN_RANGE` nearest neighbors from the last lookup and is refetched
+/// past the removed partitions only once every cached one is gone, so a chain
+/// of joins does not recompute the distances to every centroid at each step.
+fn nearest_surviving_neighbor(
+    ivf: &IvfModel,
+    distance_type: DistanceType,
+    partition: usize,
+    removed: &[bool],
+    cache: &mut Option<Vec<u32>>,
+) -> Result<Option<usize>> {
+    if let Some(ids) = cache
+        && let Some(&id) = ids.iter().find(|&&id| !removed[id as usize])
+    {
+        return Ok(Some(id as usize));
+    }
+    let c0 = ivf
+        .centroid(partition)
+        .ok_or(Error::invalid_input("original centroid not found"))?;
+    let excluded: HashSet<usize> = removed
+        .iter()
+        .enumerate()
+        .filter(|(_, gone)| **gone)
+        .map(|(other, _)| other)
+        .collect();
+    let (ids, _) = select_reassign_candidates_impl(distance_type, ivf, partition, &c0, &excluded)?;
+    let ids = ids.values().to_vec();
+    let nearest = ids.first().map(|&id| id as usize);
+    *cache = Some(ids);
+    Ok(nearest)
+}
+
+/// The candidate partition nearest to `vector` among those with `room` for
+/// another row, so a join cannot push a partition above the split threshold.
+/// Only when every candidate is full does the row go to the nearest one.
+fn reassign_with_room<T: ArrowPrimitiveType>(
+    distance_type: DistanceType,
+    vector: &PrimitiveArray<T>,
+    candidate_ids: &UInt32Array,
+    candidate_centroids: &FixedSizeListArray,
+    room: &[usize],
+) -> Result<(u32, bool)>
+where
+    T::Native: Dot + L2 + Normalize,
+{
+    let dists = distance_type.arrow_batch_func()(vector, candidate_centroids)?;
+    let nearest = |with_room: bool| {
+        dists
+            .values()
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| !with_room || room[candidate_ids.value(i) as usize] > 0)
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| candidate_ids.value(i))
+    };
+    if let Some(target) = nearest(true) {
+        return Ok((target, true));
+    }
+    let target = nearest(false)
+        .ok_or_else(|| Error::internal("a joined partition has no neighbor to receive its rows"))?;
+    Ok((target, false))
 }
 
 /// The nearest `REASSIGN_RANGE` partitions to `c0`, skipping `part_idx` itself and
@@ -2997,6 +3022,13 @@ fn select_reassign_candidates_impl(
     ))
 }
 
+/// What one optimize pass does to the partitions, from the sizes it saw.
+struct PartitionAdjustmentPlan {
+    splits: Vec<PartitionSplit>,
+    joins: Vec<usize>,
+    partition_sizes: Vec<usize>,
+}
+
 struct JoinResult {
     assign_batches: Vec<Option<(RecordBatch, UInt64Array)>>,
     new_centroids: FixedSizeListArray,
@@ -3013,13 +3045,6 @@ struct SplitResult {
 #[derive(Debug, Clone)]
 enum AssignOp {
     Add((u64, ArrayRef)),
-}
-
-#[derive(Debug, Copy, Clone)]
-enum ReassignPartition {
-    NewCentroid1,
-    NewCentroid2,
-    ReassignCandidate(u32),
 }
 
 enum PartitionAdjustment {
@@ -3849,6 +3874,98 @@ mod tests {
             projected.iter().all(|&rows| rows <= 400),
             "a join destination exceeds the split threshold: {projected:?}"
         );
+    }
+
+    #[test]
+    fn plan_partition_adjustment_handles_a_chain_of_empty_partitions_quickly() {
+        // Every partition is empty and each one's nearest neighbor is the next:
+        // one long chain of joins, which must not recompute the distances to
+        // every centroid at each step.
+        const NUM_PARTITIONS: usize = 512;
+        let positions: Vec<f32> = (0..NUM_PARTITIONS).map(|i| i as f32).collect();
+        let ivf = ivf_on_a_line(&positions);
+        let started = std::time::Instant::now();
+        let (_, joins) =
+            plan_partition_adjustment(&ivf, DistanceType::L2, &[0; NUM_PARTITIONS], 4096, 1)
+                .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(joins.len(), NUM_PARTITIONS - 1);
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    #[test]
+    fn reassign_with_room_spills_to_the_next_neighbor() {
+        // Rows at 4.0 are nearest to the centroid at 10.0, which has room for
+        // ten more; the rest go to the centroid at -9.0.
+        let candidate_ids = UInt32Array::from(vec![1_u32, 2]);
+        let candidate_centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![-9.0_f32, 10.0]), 1)
+                .unwrap();
+        let mut room = vec![0, 300, 10];
+        let vector = Float32Array::from(vec![4.0_f32]);
+        let mut targets = vec![0usize; 3];
+        for _ in 0..24 {
+            let (target, had_room) = reassign_with_room(
+                DistanceType::L2,
+                &vector,
+                &candidate_ids,
+                &candidate_centroids,
+                &room,
+            )
+            .unwrap();
+            assert!(had_room);
+            room[target as usize] -= 1;
+            targets[target as usize] += 1;
+        }
+        assert_eq!(targets, vec![0, 14, 10]);
+        // With every candidate full the nearest one takes the row anyway.
+        let (target, had_room) = reassign_with_room(
+            DistanceType::L2,
+            &vector,
+            &candidate_ids,
+            &candidate_centroids,
+            &[0, 0, 0],
+        )
+        .unwrap();
+        assert_eq!((target, had_room), (2, false));
+    }
+
+    #[tokio::test]
+    async fn optimize_join_keeps_every_destination_below_the_split_threshold() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::optimize::OptimizeOptions;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        // The 24 rows of the partition at 0 sit at 4.0, nearer to the 390-row
+        // partition at 10 than to the 100-row one at -9. Only ten fit below the
+        // split threshold of 400; the other fourteen must go to -9.
+        let mut dataset = write_clusters(uri, &[(24, 4.0), (100, -9.0), (390, 10.0)]).await;
+        let params = ivf_flat_at_centers(&[0.0, -9.0, 10.0], Some(100));
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut dataset = append_cluster(dataset, 1, -9.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let optimized = open_single_segment(&dataset).await;
+        let ivf = optimized.ivf_model();
+        let mut sizes: Vec<usize> = (0..ivf.num_partitions())
+            .map(|p| optimized.partition_size(p))
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![115, 400]);
     }
 
     #[test]
