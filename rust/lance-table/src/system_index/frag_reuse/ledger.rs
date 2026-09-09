@@ -464,6 +464,9 @@ fn order_lineage(transitions: Vec<Transition>) -> Result<Vec<Transition>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::system_index::frag_reuse::{
+        CompactFragReuseIndex, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
+    };
     use rstest::rstest;
 
     fn digest(id: u64, rows: u64, deleted: u64) -> pb::FragmentDigest {
@@ -741,9 +744,6 @@ mod tests {
     #[case::external(true)]
     #[tokio::test]
     async fn legacy_writer_round_trip_and_remap_equivalence(#[case] external: bool) {
-        use crate::system_index::frag_reuse::{
-            CompactFragReuseIndex, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
-        };
         let group = |sources, destinations, addresses: &[u64]| {
             let transition = ordered(sources, destinations, addresses);
             let Some(transition::Mapping::OrderedCompaction(mapping)) = transition.mapping else {
@@ -852,6 +852,7 @@ mod tests {
     #[case::duplicate(vec![0x0a, 0, 0x0a, 0], "multiple FRI content")]
     #[case::conflicting(vec![0x0a, 0, 0x12, 0], "multiple FRI content")]
     #[case::truncated(vec![0x0a, 10, 0], "exceeds remaining")]
+    #[case::oversized(vec![0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01], "exceeds remaining")]
     #[tokio::test]
     async fn rejects_invalid_envelope(#[case] value: Vec<u8>, #[case] message: &str) {
         let any = prost_types::Any {
@@ -874,6 +875,34 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("Please upgrade"));
+    }
+
+    #[rstest]
+    #[case::overflow(u64::MAX, 1, "range overflow")]
+    #[case::short_read(0, 2, "size mismatch")]
+    #[tokio::test]
+    async fn rejects_invalid_external_range(
+        #[case] offset: u64,
+        #[case] size: u64,
+        #[case] message: &str,
+    ) {
+        let file = crate::format::pb::ExternalFile {
+            path: "details.binpb".into(),
+            offset,
+            size,
+        };
+        let mut value = Vec::new();
+        message_field(2, &file.encode_to_vec(), &mut value);
+        let details = prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value,
+        };
+        let result = FragReuseLedger::decode_details(1, &details, |_| async move {
+            assert_ne!(offset, u64::MAX, "overflow must be rejected before IO");
+            Ok(Bytes::from_static(&[0]))
+        })
+        .await;
+        assert_corrupt(result, message);
     }
 
     proptest::proptest! {
