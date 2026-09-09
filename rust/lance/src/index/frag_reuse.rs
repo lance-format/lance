@@ -2,13 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::DatasetIndexExt;
 use lance_core::Error;
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseGroup,
     FragReuseIndexDetails, FragReuseVersion,
 };
-use lance_index::scalar::MetricsCollector;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
@@ -17,33 +16,6 @@ use roaring::RoaringBitmap;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
-
-/// Keep legacy loading for independent segments while tagged consumers are not installed.
-/// This is a query boundary; maintenance still rejects tagged FRI in its existing entry point.
-pub(super) async fn open_legacy_query_remapper(
-    dataset: &Dataset,
-    index: &IndexMetadata,
-    metrics: &dyn MetricsCollector,
-) -> lance_core::Result<Option<Arc<CompactFragReuseIndex>>> {
-    let indices = super::load_all_indices(dataset).await?;
-    if let Some(fri) = indices
-        .iter()
-        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME && entry.index_version != 0)
-    {
-        let reader = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
-        let stored = indices
-            .iter()
-            .find(|entry| entry.uuid == index.uuid)
-            .ok_or_else(|| Error::not_supported("FRI requires committed segment metadata"))?;
-        if reader.may_need_translation(stored.fragment_bitmap.as_ref()) {
-            return Err(Error::not_supported(
-                "This index requires tagged FRI translation; upgrade to a client with index consumer support",
-            ));
-        }
-        return Ok(None);
-    }
-    dataset.open_frag_reuse_index(metrics).await
-}
 
 /// Load fragment reuse index details from index metadata
 pub async fn load_frag_reuse_index_details(

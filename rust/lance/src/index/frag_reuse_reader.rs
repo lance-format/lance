@@ -30,6 +30,51 @@ fn check_reader_path() -> Result<()> {
     Ok(())
 }
 
+/// Plan version-1 histories separately from the unchanged legacy index path.
+pub(super) async fn load_indices(
+    dataset: &Dataset,
+    fri: &IndexMetadata,
+    indices: &[IndexMetadata],
+) -> Result<Arc<Vec<IndexMetadata>>> {
+    let mapping = FragmentReuseIndex::open(dataset, fri).await?;
+    let mut supported = Vec::with_capacity(indices.len());
+    for index in indices {
+        if !super::index_is_usable(index) {
+            continue;
+        }
+        if index.name != lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME
+            && mapping.may_need_translation(index.fragment_bitmap.as_ref())
+        {
+            // The consumer integration is a separate layer. Until then,
+            // affected segments must scan even when coverage is derivable.
+            continue;
+        }
+        supported.push(index.clone());
+    }
+    let mut indices = supported;
+    let mut groups: HashMap<String, Vec<(usize, RoaringBitmap)>> = HashMap::new();
+    for (position, index) in indices.iter().enumerate() {
+        if index.name != lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME
+            && let Some(bitmap) = &index.fragment_bitmap
+        {
+            groups
+                .entry(index.name.clone())
+                .or_default()
+                .push((position, bitmap.clone()));
+        }
+    }
+    for members in groups.into_values() {
+        let (positions, provenance): (Vec<_>, Vec<_>) = members.into_iter().unzip();
+        for (position, coverage) in positions
+            .into_iter()
+            .zip(mapping.segment_coverage(&provenance))
+        {
+            indices[position].fragment_bitmap = Some(coverage);
+        }
+    }
+    Ok(Arc::new(indices))
+}
+
 /// A validated FRI graph whose mapping payloads are opened only when needed.
 pub struct FragmentReuseIndex {
     ledger: FragReuseLedger,
@@ -710,6 +755,74 @@ mod tests {
                         .unwrap()
                         .is_some()
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn historical_version_zero_reuses_legacy_reader_after_append() {
+        LEGACY_READER_ONLY
+            .scope((), async {
+                let dir = crate::utils::test::copy_test_data_to_tmp(
+                    "fri_straddle_pre_6610/fri_straddle_dataset",
+                )
+                .unwrap();
+                let uri = dir.std_path().to_str().unwrap();
+                let mut dataset = Dataset::open(uri).await.unwrap();
+                let metrics = lance_index::metrics::NoOpMetricsCollector;
+                let original = dataset
+                    .open_frag_reuse_index(&metrics)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let cached = dataset
+                    .open_frag_reuse_index(&metrics)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(Arc::ptr_eq(&original, &cached));
+                let old_snapshot = dataset.clone();
+                let old_rows = dataset.count_rows(None).await.unwrap();
+                let batch = dataset
+                    .scan()
+                    .limit(Some(1), None)
+                    .unwrap()
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+                dataset
+                    .append(
+                        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let current = dataset
+                    .open_frag_reuse_index(&metrics)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(Arc::ptr_eq(&original, &current));
+                let reopened = Dataset::open(uri).await.unwrap();
+                for snapshot in [&old_snapshot, &dataset, &reopened] {
+                    let indices = snapshot.load_indices().await.unwrap();
+                    let fri = indices
+                        .iter()
+                        .find(|i| i.name == FRAG_REUSE_INDEX_NAME)
+                        .unwrap();
+                    assert_eq!(fri.index_version, 0);
+                    assert_eq!(snapshot.manifest.reader_feature_flags & 512, 0);
+                    assert_eq!(snapshot.manifest.writer_feature_flags & 512, 0);
+                    assert!(
+                        snapshot
+                            .open_frag_reuse_index(&metrics)
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                assert_eq!(old_snapshot.count_rows(None).await.unwrap(), old_rows);
+                assert_eq!(reopened.count_rows(None).await.unwrap(), old_rows + 1);
             })
             .await;
     }
