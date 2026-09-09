@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{
+    ChildStats, ChildrenPropertiesMode, ReplaceChildrenOptions, StatisticsArgs,
+};
 use std::sync::Arc;
 
 use datafusion::{catalog::Session, execution::TaskContext, logical_expr::Expr};
@@ -62,6 +67,12 @@ impl LanceFilterExec {
 }
 
 impl ExecutionPlan for LanceFilterExec {
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        self.filter.apply_expressions(f)
+    }
     fn name(&self) -> &str {
         "LanceFilterExec"
     }
@@ -78,20 +89,31 @@ impl ExecutionPlan for LanceFilterExec {
         self.filter.maintains_input_order()
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        options: ReplaceChildrenOptions,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Rewrap the result in a LanceFilterExec to preserve the logical expression
-        let new_filter_plan = self.filter.clone().with_new_children(children)?;
+        let new_filter_plan = self.filter.clone().replace_children(children, options)?;
         let new_filter = new_filter_plan
             .downcast_ref::<FilterExec>()
-            .expect("FilterExec::with_new_children should return FilterExec")
+            .expect("FilterExec::replace_children should return FilterExec")
             .clone();
         Ok(Arc::new(Self {
             expr: self.expr.clone(),
             filter: Arc::new(new_filter),
         }))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -106,8 +128,16 @@ impl ExecutionPlan for LanceFilterExec {
         self.filter.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        self.filter.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        self.filter.child_stats_requests(partition)
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        self.filter.statistics_from_inputs(input_stats, args)
     }
 
     fn cardinality_effect(&self) -> datafusion_physical_plan::execution_plan::CardinalityEffect {

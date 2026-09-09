@@ -3,6 +3,9 @@
 
 //! MemTableScanExec - Full table scan with MVCC visibility filtering.
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions, StatisticsArgs};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -185,6 +188,12 @@ impl DisplayAs for MemTableScanExec {
 }
 
 impl ExecutionPlan for MemTableScanExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "MemTableScanExec"
     }
@@ -197,9 +206,10 @@ impl ExecutionPlan for MemTableScanExec {
         vec![]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if !children.is_empty() {
             return Err(datafusion::error::DataFusionError::Internal(
@@ -207,6 +217,16 @@ impl ExecutionPlan for MemTableScanExec {
             ));
         }
         Ok(self)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -330,7 +350,11 @@ impl ExecutionPlan for MemTableScanExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
         // Report statistics as Absent to avoid DataFusion analysis bugs
         // with selectivity calculation on in-memory tables.
         Ok(Arc::new(Statistics {
@@ -358,6 +382,7 @@ mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::physical_plan::StatisticsContext;
     use futures::TryStreamExt;
 
     fn create_test_schema() -> Arc<Schema> {
@@ -479,7 +504,9 @@ mod tests {
         // max_readable=1 means positions 0 and 1 are visible
         let exec = MemTableScanExec::new(batch_store, 2, None, schema, false);
 
-        let stats = exec.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
+            .unwrap();
         // Statistics are Absent to avoid DataFusion analysis bugs
         assert_eq!(stats.num_rows, Precision::Absent);
     }

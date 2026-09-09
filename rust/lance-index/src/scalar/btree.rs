@@ -51,6 +51,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
 };
@@ -1697,6 +1698,7 @@ impl BTreeIndex {
             &query.to_expr(BTREE_VALUES_COLUMN.to_string()),
             &df_schema,
             &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
         )?)
     }
 

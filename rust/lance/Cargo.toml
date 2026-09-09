@@ -138,7 +138,11 @@ parquet = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 
 [features]
-default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
+# TODO: restore "geo" once geoarrow-array/geoarrow-schema and geodatafusion publish
+# releases built on arrow 59 / DataFusion 55. geoarrow 0.8 pins arrow ^58 and
+# geodatafusion 0.5 pins datafusion ^54 (https://github.com/geoarrow/geoarrow-rs,
+# https://github.com/datafusion-contrib/geodatafusion).
+default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs"]
 backtrace = ["lance-core/backtrace"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion

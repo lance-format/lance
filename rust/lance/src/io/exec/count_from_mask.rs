@@ -19,6 +19,10 @@
 //! support; the others (mask-to-answer, zone-aware, dimension-keyed) each
 //! need additional plumbing — see the corresponding design issue.
 
+use datafusion::common::Statistics;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions, StatisticsArgs};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -391,6 +395,12 @@ impl CountFromMaskExec {
 }
 
 impl ExecutionPlan for CountFromMaskExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "CountFromMaskExec"
     }
@@ -406,9 +416,10 @@ impl ExecutionPlan for CountFromMaskExec {
         }
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let prefilter_input = match children.len() {
             0 => None,
@@ -429,6 +440,16 @@ impl ExecutionPlan for CountFromMaskExec {
             properties: self.properties.clone(),
             metrics: self.metrics.clone(),
         }))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -456,9 +477,10 @@ impl ExecutionPlan for CountFromMaskExec {
         )))
     }
 
-    fn partition_statistics(
+    fn statistics_from_inputs(
         &self,
-        _partition: Option<usize>,
+        _input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
     ) -> datafusion::error::Result<Arc<datafusion::physical_plan::Statistics>> {
         Ok(Arc::new(datafusion::physical_plan::Statistics {
             num_rows: datafusion::common::stats::Precision::Exact(1),

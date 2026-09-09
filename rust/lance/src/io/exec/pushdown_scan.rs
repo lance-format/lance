@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -156,6 +159,12 @@ impl LancePushdownScanExec {
 }
 
 impl ExecutionPlan for LancePushdownScanExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "LancePushdownScanExec"
     }
@@ -168,9 +177,10 @@ impl ExecutionPlan for LancePushdownScanExec {
         vec![]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         if !children.is_empty() {
             Err(DataFusionError::Internal(
@@ -179,6 +189,16 @@ impl ExecutionPlan for LancePushdownScanExec {
         } else {
             Ok(self)
         }
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

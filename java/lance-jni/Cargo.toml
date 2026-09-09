@@ -34,11 +34,11 @@ lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = 
 lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
 lance-table = { path = "../../rust/lance-table" }
-arrow = { version = "58.0.0", features = ["ffi"] }
-arrow-array = "58.0.0"
-arrow-schema = "58.0.0"
-datafusion = { version = "54.0.0", default-features = false }
-datafusion-common = "54.0.0"
+arrow = { version = "59.3.0", features = ["ffi"] }
+arrow-array = "59.3.0"
+arrow-schema = "59.3.0"
+datafusion = { version = "55.0.0", default-features = false }
+datafusion-common = "55.0.0"
 object_store = { version = "0.13.2" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",

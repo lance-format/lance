@@ -3,6 +3,11 @@
 
 //! Utilities for working with datafusion execution plans
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{
+    ChildStats, ChildrenPropertiesMode, ReplaceChildrenOptions, StatisticsArgs,
+};
 use std::{
     collections::HashMap,
     fmt::{self, Formatter},
@@ -39,6 +44,7 @@ use datafusion::{
     },
 };
 use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metrics::MetricType};
+use datafusion_common::config::ConfigNonZeroUsize;
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
@@ -152,6 +158,12 @@ impl DisplayAs for OneShotExec {
 }
 
 impl ExecutionPlan for OneShotExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "OneShotExec"
     }
@@ -164,9 +176,10 @@ impl ExecutionPlan for OneShotExec {
         vec![]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         // OneShotExec has no children, so this should only be called with an empty vector
         if !children.is_empty() {
@@ -175,6 +188,16 @@ impl ExecutionPlan for OneShotExec {
             ));
         }
         Ok(self)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -239,6 +262,12 @@ impl std::fmt::Debug for TracedExec {
     }
 }
 impl ExecutionPlan for TracedExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "TracedExec"
     }
@@ -251,15 +280,26 @@ impl ExecutionPlan for TracedExec {
         vec![&self.input]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(Self {
             input: children[0].clone(),
             properties: self.properties.clone(),
             span: self.span.clone(),
         }))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -465,13 +505,14 @@ pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
 fn get_task_context(
     session_ctx: &SessionContext,
     options: &LanceExecutionOptions,
-) -> Arc<TaskContext> {
+) -> datafusion_common::Result<Arc<TaskContext>> {
     let mut state = session_ctx.state();
     if let Some(batch_size) = options.batch_size.as_ref() {
-        state.config_mut().options_mut().execution.batch_size = *batch_size;
+        state.config_mut().options_mut().execution.batch_size =
+            ConfigNonZeroUsize::try_new(*batch_size)?;
     }
 
-    state.task_ctx()
+    Ok(state.task_ctx())
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -708,7 +749,7 @@ pub fn execute_plan(
         Arc::new(CoalescePartitionsExec::new(plan))
     };
 
-    let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
+    let stream = plan.execute(0, get_task_context(&session_ctx, &options)?)?;
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
@@ -745,17 +786,17 @@ pub async fn analyze_plan_with_context(
 
     let schema = plan.schema();
     // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
-    let analyze = Arc::new(AnalyzeExec::new(
-        true,
-        true,
-        vec![MetricType::Summary],
-        None,
-        plan,
-        schema,
-    ));
+    let analyze = Arc::new(
+        AnalyzeExec::builder(true, true, plan, schema)
+            .with_metric_types(vec![MetricType::Summary])
+            .build(),
+    );
 
     let session_ctx = get_session_context(&options);
-    let task_context = task_context.unwrap_or_else(|| get_task_context(&session_ctx, &options));
+    let task_context = match task_context {
+        Some(task_context) => task_context,
+        None => get_task_context(&session_ctx, &options)?,
+    };
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);
     let mut stream = analyze
         .execute(0, task_context)
@@ -1043,6 +1084,12 @@ impl DisplayAs for StrictBatchSizeExec {
 }
 
 impl ExecutionPlan for StrictBatchSizeExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "StrictBatchSizeExec"
     }
@@ -1055,14 +1102,25 @@ impl ExecutionPlan for StrictBatchSizeExec {
         vec![&self.input]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(Self {
             input: children[0].clone(),
             batch_size: self.batch_size,
         }))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -1084,11 +1142,16 @@ impl ExecutionPlan for StrictBatchSizeExec {
         vec![false]
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
+        input_stats: &[std::sync::Arc<Statistics>],
+        _args: &StatisticsArgs,
     ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        Ok(std::sync::Arc::clone(&input_stats[0]))
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -1145,6 +1208,12 @@ impl DisplayAs for HardCapBatchSizeExec {
 }
 
 impl ExecutionPlan for HardCapBatchSizeExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "HardCapBatchSizeExec"
     }
@@ -1157,14 +1226,25 @@ impl ExecutionPlan for HardCapBatchSizeExec {
         vec![&self.input]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(Self {
             input: children[0].clone(),
             max_bytes: self.max_bytes,
         }))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -1207,11 +1287,16 @@ impl ExecutionPlan for HardCapBatchSizeExec {
         vec![false]
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
+        input_stats: &[std::sync::Arc<Statistics>],
+        _args: &StatisticsArgs,
     ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        Ok(std::sync::Arc::clone(&input_stats[0]))
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -1399,6 +1484,14 @@ mod tests {
     }
 
     impl ExecutionPlan for NeedsExtensionExec {
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> datafusion_common::Result<TreeNodeRecursion>,
+        ) -> datafusion_common::Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
         fn name(&self) -> &str {
             "NeedsExtensionExec"
         }
@@ -1408,11 +1501,22 @@ mod tests {
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
-        fn with_new_children(
+        fn replace_children(
             self: Arc<Self>,
             _children: Vec<Arc<dyn ExecutionPlan>>,
+            _options: ReplaceChildrenOptions,
         ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
             Ok(self)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+            self.replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
         }
         fn execute(
             &self,

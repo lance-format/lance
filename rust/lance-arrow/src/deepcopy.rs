@@ -103,7 +103,11 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
         DataType::Boolean => 0,
         _ => data.offset(),
     };
-    mutable.extend(0, start, start + data.len());
+    // Copy from start to start+len (the visible slice). The range is taken from
+    // an already valid `ArrayData`, so the copied offsets cannot overflow.
+    mutable
+        .try_extend(0, start, start + data.len())
+        .expect("slice range comes from a valid ArrayData");
 
     // Freeze into immutable ArrayData
     mutable.freeze()

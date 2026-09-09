@@ -504,7 +504,7 @@ impl LsmFtsSearchPlanner {
             // task per input partition (one per union arm) via `spawn_buffered`,
             // so each arm's per-arm CPU (posting decode, BM25) runs on its own
             // task without an extra repartition.
-            Arc::new(UnionExec::new(per_source_plans))
+            UnionExec::try_new(per_source_plans)?
         };
 
         let score_idx = merged.schema().index_of(SCORE_COLUMN).map_err(|_| {

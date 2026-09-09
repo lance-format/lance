@@ -5,6 +5,9 @@
 //!
 //! Used in point lookup queries to stop searching after finding the first match.
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -106,6 +109,12 @@ impl DisplayAs for CoalesceFirstExec {
 }
 
 impl ExecutionPlan for CoalesceFirstExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
     fn name(&self) -> &str {
         "CoalesceFirstExec"
     }
@@ -122,11 +131,22 @@ impl ExecutionPlan for CoalesceFirstExec {
         self.inputs.iter().collect()
     }
 
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(children)))
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(children)))
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(

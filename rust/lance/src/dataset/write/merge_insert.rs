@@ -39,6 +39,7 @@ pub(super) const MERGE_SOURCE_SENTINEL: &str = "__merge_source_sentinel";
 pub mod inserted_rows;
 
 use assign_action::merge_insert_action;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use inserted_rows::KeyExistenceFilter;
 
 use super::cleanup_data_fragments;
@@ -1564,7 +1565,10 @@ impl MergeInsertJob {
                                 as Arc<dyn ExecutionPlan>
                         })
                         .collect();
-                    let new_node = node.with_new_children(new_children)?;
+                    let new_node = node.replace_children(
+                        new_children,
+                        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                    )?;
                     Ok(Transformed::yes(new_node))
                 } else {
                     Ok(Transformed::no(node))
@@ -2463,11 +2467,7 @@ impl MergeInsertJob {
 
         // Execute the plan
         // Assert that we have exactly one partition since we're designed for single-partition execution
-        let partition_count = match plan.properties().output_partitioning() {
-            datafusion_physical_expr::Partitioning::RoundRobinBatch(n) => *n,
-            datafusion_physical_expr::Partitioning::Hash(_, n) => *n,
-            datafusion_physical_expr::Partitioning::UnknownPartitioning(n) => *n,
-        };
+        let partition_count = plan.properties().output_partitioning().partition_count();
 
         if partition_count != 1 {
             return Err(Error::invalid_input(format!(
@@ -3752,6 +3752,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
+    use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{FutureExt, StreamExt, TryStreamExt, future::try_join_all};
     use lance_arrow::FixedSizeListArrayExt;
@@ -6453,7 +6454,10 @@ mod tests {
         );
 
         let rebuilt = plan
-            .with_new_children(vec![dummy_input.clone()])
+            .replace_children(
+                vec![dummy_input.clone()],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .expect("with_new_children must accept exactly one child");
         let rebuilt_rendered = format!("{}", displayable(rebuilt.as_ref()).indent(false));
         assert!(
@@ -14765,7 +14769,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     }
 
     fn collect_exact_row_counts(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
-        if let Ok(stats) = plan.partition_statistics(None)
+        if let Ok(stats) = StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new())
             && let datafusion::common::stats::Precision::Exact(n) = stats.num_rows
         {
             out.push(n);
