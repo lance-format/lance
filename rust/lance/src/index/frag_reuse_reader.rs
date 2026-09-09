@@ -5,17 +5,15 @@
 
 use crate::Dataset;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::fragment_reuse::{MappingReader, OrderedCompactionMapping};
 use lance_core::{Error, Result};
-use lance_index::frag_reuse::stable_partition::{
-    FragmentLayout, MAPPING_FILE, StablePartitionMapping,
-};
-use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
-use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
+use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
 use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+mod cache;
+use cache::CachedMapping;
 
 #[cfg(test)]
 tokio::task_local! {
@@ -90,9 +88,9 @@ pub(super) async fn load_indices(
 
 /// A validated FRI graph whose mapping payloads are opened only when needed.
 pub struct FragmentReuseIndex {
-    ledger: FragReuseLedger,
-    live_fragments: RoaringBitmap,
-    readers: Vec<Arc<dyn MappingReader>>,
+    ledger: Arc<FragReuseLedger>,
+    live_fragments: Arc<RoaringBitmap>,
+    readers: Vec<Arc<CachedMapping>>,
 }
 
 impl FragmentReuseIndex {
@@ -100,61 +98,14 @@ impl FragmentReuseIndex {
     pub async fn open(dataset: &Dataset, index: &IndexMetadata) -> Result<Arc<Self>> {
         #[cfg(test)]
         check_reader_path()?;
-        let ledger = load_ledger(dataset, index).await?;
-        let mut readers: Vec<Arc<dyn MappingReader>> =
-            Vec::with_capacity(ledger.transitions().len());
+        let ledger = cache::open_ledger(dataset, index).await?;
+        let mut readers = Vec::with_capacity(ledger.transitions().len());
         for transition in ledger.transitions() {
-            let reader: Arc<dyn MappingReader> = match transition.mapping() {
-                Mapping::OrderedCompaction(remap) => Arc::new(OrderedCompactionMapping::new(
-                    remap.clone(),
-                    transition.sources().iter().map(|f| f.id as u32).collect(),
-                    transition
-                        .destinations()
-                        .iter()
-                        .map(|f| f.id as u32)
-                        .collect(),
-                )),
-                Mapping::StablePartition(reference) => {
-                    let base = match reference.base_id {
-                        None => dataset.base.clone(),
-                        Some(id) => dataset
-                            .manifest
-                            .base_paths
-                            .get(&id)
-                            .ok_or_else(|| {
-                                corrupt(format!(
-                                    "mapping {} references missing base {id}",
-                                    reference.map_id
-                                ))
-                            })?
-                            .extract_path(dataset.session.store_registry())?,
-                    };
-                    let directory = base.join("_fri").join(reference.map_id.as_str());
-                    let cache = dataset.metadata_cache.file_metadata_cache(&directory);
-                    let store = LanceIndexStore::new(
-                        dataset.object_store(reference.base_id).await?,
-                        directory,
-                        Arc::new(cache),
-                    )
-                    .with_file_sizes(HashMap::from([(
-                        MAPPING_FILE.to_string(),
-                        reference.map_size_bytes,
-                    )]));
-                    let layout = |fragments: &[lance_table::format::pb::fragment_reuse_index_details::FragmentDigest]| {
-                        fragments.iter().map(|f| FragmentLayout { id: f.id as u32, physical_rows: f.physical_rows }).collect()
-                    };
-                    Arc::new(StablePartitionMapping::try_new(
-                        Arc::new(store),
-                        layout(transition.sources()),
-                        layout(transition.destinations()),
-                    )?)
-                }
-            };
-            readers.push(reader);
+            readers.push(cache::open_mapping(dataset, transition).await?);
         }
         Ok(Arc::new(Self {
             ledger,
-            live_fragments: dataset.fragment_bitmap.as_ref().clone(),
+            live_fragments: dataset.fragment_bitmap.clone(),
             readers,
         }))
     }
@@ -174,7 +125,7 @@ impl FragmentReuseIndex {
     /// segment must be probed. Direct destination coverage takes precedence.
     pub fn segment_coverage(&self, provenance: &[RoaringBitmap]) -> Vec<RoaringBitmap> {
         let mut coverage = provenance.to_vec();
-        for (transition, reader) in self.ledger.transitions().iter().zip(&self.readers) {
+        for transition in self.ledger.transitions() {
             let sources: RoaringBitmap = transition.sources().iter().map(|f| f.id as u32).collect();
             let destinations: RoaringBitmap = transition
                 .destinations()
@@ -187,7 +138,11 @@ impl FragmentReuseIndex {
                     union |= bitmap;
                     union
                 });
-            let mapped = reader.coverage(&union);
+            let mapped = if sources.is_subset(&union) {
+                destinations.clone()
+            } else {
+                RoaringBitmap::new()
+            };
             let direct = &union & &destinations;
             for bitmap in &mut coverage {
                 let contributes = !bitmap.is_disjoint(&sources);
@@ -198,7 +153,7 @@ impl FragmentReuseIndex {
             }
         }
         for bitmap in &mut coverage {
-            *bitmap &= &self.live_fragments;
+            *bitmap &= self.live_fragments.as_ref();
         }
         coverage
     }
@@ -228,18 +183,19 @@ impl FragmentReuseIndex {
                 let rows: Vec<_> = positions
                     .iter()
                     .map(|&position| {
-                        output[position].ok_or_else(|| {
+                        output[position].map(u64::from).ok_or_else(|| {
                             Error::internal("deleted address queued for FRI translation")
                         })
                     })
                     .collect::<Result<_>>()?;
-                let rows = self.readers[index].translate(&rows).await?;
+                let rows = self.readers[index].remap_row_ids(&rows).await?;
                 if rows.len() != positions.len() {
                     return Err(Error::internal(
                         "mapping reader changed translation batch length",
                     ));
                 }
                 for (position, address) in positions.into_iter().zip(rows) {
+                    let address = address.map(RowAddress::from);
                     output[position] = address;
                     if let Some(current) = address {
                         if self.live_fragments.contains(current.fragment_id()) {
@@ -302,15 +258,19 @@ mod tests {
     use arrow_array::types::Int32Type;
     use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array, cast::AsArray};
     use lance_core::cache::LanceCache;
+    use lance_core::utils::fragment_reuse::OrderedCompactionMapping;
     use lance_index::IndexType;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::frag_reuse::row_map::{RowMapWriter, SourceRows};
+    use lance_index::frag_reuse::stable_partition::MAPPING_FILE;
     use lance_index::scalar::IndexStore;
     use lance_index::scalar::ScalarIndexParams;
+    use lance_index::scalar::lance_format::LanceIndexStore;
     use lance_table::format::pb::fragment_reuse_index_details::{
         FragmentDigest, InlineContent, StablePartition, Transition, transition,
     };
     use lance_table::format::{Fragment, pb};
+    use lance_table::system_index::frag_reuse::ledger::Mapping;
     use lance_table::transaction::{Operation, Transaction};
     use prost::Message;
     use prost::encoding::WireType;
@@ -773,6 +733,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshots_share_history_without_sharing_live_fragments() {
+        let mut dataset = fixture().await;
+        let (transition, destinations) = prepare(&dataset).await;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec();
+        let fri = install(&mut dataset, content, destinations, false).await;
+        let indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        persist_fixture(&mut dataset, indices).await;
+        let (first, concurrent) = futures::try_join!(
+            FragmentReuseIndex::open(&dataset, &fri),
+            FragmentReuseIndex::open(&dataset, &fri),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&first.ledger, &concurrent.ledger));
+        assert!(Arc::ptr_eq(&first.readers[0], &concurrent.readers[0]));
+        let before = dataset.index_cache.size().await;
+        let source = RowAddress::new_from_parts(0, 0);
+        let expected = first.translate(&[source]).await.unwrap();
+        assert!(
+            dataset.index_cache.size().await > before,
+            "lazy counts must be charged to the cache"
+        );
+        let previous = dataset.clone();
+        let batch = dataset
+            .scan()
+            .limit(Some(1), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let current = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
+        assert!(Arc::ptr_eq(&first.ledger, &current.ledger));
+        assert!(Arc::ptr_eq(&first.readers[0], &current.readers[0]));
+        assert!(Arc::ptr_eq(
+            &first.live_fragments,
+            &previous.fragment_bitmap
+        ));
+        assert!(Arc::ptr_eq(
+            &current.live_fragments,
+            &dataset.fragment_bitmap
+        ));
+        let added = (&*dataset.fragment_bitmap - &*previous.fragment_bitmap)
+            .min()
+            .unwrap();
+        let added = RowAddress::new_from_parts(added, 0);
+        assert_eq!(first.translate(&[added]).await.unwrap(), vec![None]);
+        assert_eq!(
+            current.translate(&[added]).await.unwrap(),
+            vec![Some(added)]
+        );
+        assert_eq!(current.translate(&[source]).await.unwrap(), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::same_mappings(false)]
+    #[case::pruned_history(true)]
+    #[tokio::test]
+    async fn new_ledger_reuses_retained_mappings(#[case] prune: bool) {
+        let mut dataset = fixture().await;
+        let (partition, destinations) = prepare(&dataset).await;
+        let mut changed_row_addrs = Vec::new();
+        roaring::RoaringTreemap::from_iter(
+            (0..4).map(|row| u64::from(RowAddress::new_from_parts(900, row))),
+        )
+        .serialize_into(&mut changed_row_addrs)
+        .unwrap();
+        let ordered = Transition {
+            sources: vec![FragmentDigest {
+                id: 900,
+                physical_rows: 4,
+                num_deleted_rows: 0,
+            }],
+            destinations: vec![FragmentDigest {
+                id: 0,
+                physical_rows: 4,
+                num_deleted_rows: 0,
+            }],
+            mapping: Some(transition::Mapping::OrderedCompaction(
+                pb::fragment_reuse_index_details::OrderedCompaction { changed_row_addrs },
+            )),
+        };
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![ordered.clone(), partition.clone()],
+        }
+        .encode_to_vec();
+        let fri = install(&mut dataset, content, destinations, false).await;
+        let first = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
+        let old_address = RowAddress::new_from_parts(900, 0);
+        let expected = first.translate(&[old_address]).await.unwrap();
+        assert!(expected[0].is_some());
+
+        let mut replacement = fri.clone();
+        replacement.uuid = Uuid::new_v4();
+        let retained = if prune {
+            vec![partition]
+        } else {
+            vec![ordered, partition]
+        };
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: retained,
+        }
+        .encode_to_vec();
+        replacement.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: field(1, &content),
+        }));
+        let mut indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        *indices.iter_mut().find(|i| i.uuid == fri.uuid).unwrap() = replacement.clone();
+        // Model a committed pruned ledger; implementing cleanup is the writer PR's job.
+        persist_fixture(&mut dataset, indices).await;
+        let current = FragmentReuseIndex::open(&dataset, &replacement)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first.ledger, &current.ledger));
+        let retained_partition = usize::from(!prune);
+        assert!(Arc::ptr_eq(
+            &first.readers[1],
+            &current.readers[retained_partition]
+        ));
+        if !prune {
+            assert!(Arc::ptr_eq(&first.readers[0], &current.readers[0]));
+        }
+        assert_eq!(
+            current.translate(&[old_address]).await.unwrap(),
+            if prune { vec![None] } else { expected.clone() }
+        );
+        assert_eq!(first.translate(&[old_address]).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn mapping_cache_isolates_layout_and_storage_binding() {
+        let mut dataset = fixture().await;
+        let (mut partition, destinations) = prepare(&dataset).await;
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![partition.clone()],
+        }
+        .encode_to_vec();
+        let fri = install(&mut dataset, content, destinations, false).await;
+        let first = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
+        let mut rebound = dataset.clone();
+        rebound.object_store = Arc::new(dataset.object_store.as_ref().clone());
+        let second = FragmentReuseIndex::open(&rebound, &fri).await.unwrap();
+        assert!(Arc::ptr_eq(&first.ledger, &second.ledger));
+        assert!(!Arc::ptr_eq(&first.readers[0], &second.readers[0]));
+        let source = RowAddress::new_from_parts(0, 0);
+        let original = first.translate(&[source]).await.unwrap();
+        assert_eq!(second.translate(&[source]).await.unwrap(), original);
+
+        partition.sources.reverse();
+        let content = InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![partition],
+        }
+        .encode_to_vec();
+        let mut changed = fri.clone();
+        changed.uuid = Uuid::new_v4();
+        changed.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: field(1, &content),
+        }));
+        let changed = FragmentReuseIndex::open(&dataset, &changed).await.unwrap();
+        assert!(!Arc::ptr_eq(&first.readers[0], &changed.readers[0]));
+        assert_ne!(changed.translate(&[source]).await.unwrap(), original);
+        assert_eq!(first.translate(&[source]).await.unwrap(), original);
+    }
+
+    #[tokio::test]
     async fn historical_version_zero_reuses_legacy_reader_after_append() {
         LEGACY_READER_ONLY
             .scope((), async {
@@ -998,7 +1146,7 @@ mod tests {
             .await
             .unwrap();
         let mapping = Arc::new(FragmentReuseIndex {
-            live_fragments: RoaringBitmap::from_iter([3, 9]),
+            live_fragments: Arc::new(RoaringBitmap::from_iter([3, 9])),
             readers: ledger
                 .transitions()
                 .iter()
@@ -1006,14 +1154,10 @@ mod tests {
                     let Mapping::OrderedCompaction(remap) = t.mapping() else {
                         unreachable!()
                     };
-                    Arc::new(OrderedCompactionMapping::new(
-                        remap.clone(),
-                        t.sources().iter().map(|f| f.id as u32).collect(),
-                        t.destinations().iter().map(|f| f.id as u32).collect(),
-                    )) as Arc<dyn MappingReader>
+                    CachedMapping::uncached(Arc::new(OrderedCompactionMapping::new(remap.clone())))
                 })
                 .collect(),
-            ledger,
+            ledger: Arc::new(ledger),
         });
         let inputs = [0, 1, 2, 3, 9].map(|f| RowAddress::new_from_parts(f, 1));
         assert_eq!(
@@ -1030,7 +1174,7 @@ mod tests {
             mapping
                 .segment_coverage(&[RoaringBitmap::from_iter([0]), RoaringBitmap::from_iter([2])])
                 .into_iter()
-                .map(|coverage| coverage & &mapping.live_fragments)
+                .map(|coverage| coverage & mapping.live_fragments.as_ref())
                 .collect::<Vec<_>>(),
             vec![RoaringBitmap::new(), RoaringBitmap::from_iter([3])]
         );

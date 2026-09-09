@@ -6,6 +6,7 @@
 use super::row_map::RowMapReader;
 use crate::scalar::IndexStore;
 use async_trait::async_trait;
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::fragment_reuse::MappingReader;
 use lance_core::{Error, Result};
@@ -27,21 +28,18 @@ pub struct FragmentLayout {
 }
 
 /// A mapping reader that opens labels only when addresses need translation.
-/// Coverage uses fragment metadata and never opens the external file.
 pub struct StablePartitionMapping {
     store: Arc<dyn IndexStore>,
     reader: OnceCell<RowMapReader>,
     sources: HashMap<u32, (u64, u64)>,
-    source_fragments: RoaringBitmap,
     destinations: Vec<FragmentLayout>,
-    destination_fragments: RoaringBitmap,
     total_rows: u64,
 }
 
 impl std::fmt::Debug for StablePartitionMapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StablePartitionMapping")
-            .field("sources", &self.source_fragments)
+            .field("sources", &self.sources)
             .field("destinations", &self.destinations)
             .finish_non_exhaustive()
     }
@@ -86,29 +84,32 @@ impl StablePartitionMapping {
         Ok(Self {
             store,
             reader: OnceCell::new(),
-            source_fragments: offsets.keys().copied().collect(),
             sources: offsets,
             destinations,
-            destination_fragments,
             total_rows,
         })
     }
 }
 
+impl DeepSizeOf for StablePartitionMapping {
+    fn deep_size_of_children(&self, _: &mut Context) -> usize {
+        self.sources.capacity() * (std::mem::size_of::<(u32, (u64, u64))>() + 1)
+            + self.destinations.capacity() * std::mem::size_of::<FragmentLayout>()
+            + self
+                .reader
+                .get()
+                .map_or(0, |reader| reader.counts().deep_size_of())
+        // The IndexStore and file metadata belong to the session's metadata cache.
+    }
+}
+
 #[async_trait]
 impl MappingReader for StablePartitionMapping {
-    fn coverage(&self, covered_sources: &RoaringBitmap) -> RoaringBitmap {
-        if self.source_fragments.is_subset(covered_sources) {
-            self.destination_fragments.clone()
-        } else {
-            RoaringBitmap::new()
-        }
-    }
-
-    async fn translate(&self, addresses: &[RowAddress]) -> Result<Vec<Option<RowAddress>>> {
-        let mut output = vec![None; addresses.len()];
-        let mut requests = Vec::with_capacity(addresses.len());
-        for (position, address) in addresses.iter().enumerate() {
+    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        let mut output = vec![None; row_ids.len()];
+        let mut requests = Vec::with_capacity(row_ids.len());
+        for (position, &row_id) in row_ids.iter().enumerate() {
+            let address = RowAddress::from(row_id);
             let &(base, rows) = self.sources.get(&address.fragment_id()).ok_or_else(|| {
                 Error::invalid_input(format!(
                     "address {address} is outside stable-partition sources"
@@ -173,10 +174,13 @@ impl MappingReader for StablePartitionMapping {
                     *counter = counter
                         .checked_add(1)
                         .ok_or_else(|| corrupt("row-map count overflow"))?;
-                    Some(RowAddress::new_from_parts(
-                        self.destinations[label as usize].id,
-                        destination_offset,
-                    ))
+                    Some(
+                        RowAddress::new_from_parts(
+                            self.destinations[label as usize].id,
+                            destination_offset,
+                        )
+                        .into(),
+                    )
                 } else {
                     None
                 };
@@ -215,7 +219,7 @@ mod tests {
     use lance_io::object_store::ObjectStore;
 
     #[tokio::test]
-    async fn mapping_coverage_and_lazy_translation() {
+    async fn mapping_single_and_batch_translation_are_lazy() {
         let directory = TempDir::default();
         let (object_store, path) = ObjectStore::from_uri(directory.obj_path().as_ref())
             .await
@@ -241,14 +245,9 @@ mod tests {
         ];
         let mapping =
             StablePartitionMapping::try_new(store.clone(), vec![source], destinations).unwrap();
-        assert_eq!(
-            mapping.coverage(&[1].into_iter().collect()),
-            [2, 3].into_iter().collect()
-        );
-        assert!(mapping.coverage(&RoaringBitmap::new()).is_empty());
-        assert!(mapping.translate(&[]).await.unwrap().is_empty());
+        assert!(mapping.remap_row_ids(&[]).await.unwrap().is_empty());
         assert!(mapping.reader.get().is_none());
-        // No file exists until after the metadata-only operations above.
+        // Empty input must not open the file.
         let writer = store
             .new_index_file(MAPPING_FILE, RowMapWriter::schema())
             .await
@@ -265,10 +264,10 @@ mod tests {
         .unwrap();
         writer.append_labels(&[1, 0, 1, 0]).await.unwrap();
         writer.finish().await.unwrap();
-        let addr = RowAddress::new_from_parts;
+        let addr = |fragment, offset| u64::from(RowAddress::new_from_parts(fragment, offset));
         assert_eq!(
             mapping
-                .translate(&[addr(1, 4), addr(1, 1), addr(1, 0), addr(1, 0), addr(1, 2)])
+                .remap_row_ids(&[addr(1, 4), addr(1, 1), addr(1, 0), addr(1, 0), addr(1, 2)])
                 .await
                 .unwrap(),
             vec![
@@ -280,12 +279,22 @@ mod tests {
             ]
         );
         assert!(mapping.reader.get().is_some());
-        let error = mapping.translate(&[addr(9, 0)]).await.unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains("outside stable-partition sources")
+        assert_eq!(
+            mapping.remap_row_id(addr(1, 4)).await.unwrap(),
+            Some(addr(2, 1))
         );
+        assert_eq!(mapping.remap_row_id(addr(1, 1)).await.unwrap(), None);
+        for (row_id, message) in [
+            (addr(9, 0), "outside stable-partition sources"),
+            (addr(1, 5), "exceeds source length"),
+        ] {
+            for error in [
+                mapping.remap_row_id(row_id).await.unwrap_err(),
+                mapping.remap_row_ids(&[row_id]).await.unwrap_err(),
+            ] {
+                assert!(matches!(error, Error::InvalidInput { .. }));
+                assert!(error.to_string().contains(message));
+            }
+        }
     }
 }
