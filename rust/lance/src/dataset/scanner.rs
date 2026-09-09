@@ -2110,9 +2110,15 @@ impl Scanner {
         self
     }
 
+    /// Set the beam width used when searching an HNSW graph.
+    ///
+    /// Defaults to `1.5 * k * refine_factor`, floored at
+    /// [`lance_index::vector::hnsw::builder::DEFAULT_MIN_EF`].
     pub fn ef(&mut self, ef: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.ef = Some(ef);
+        } else {
+            log::warn!("ef is not set because nearest has not been called yet");
         }
         self
     }
