@@ -49,6 +49,7 @@ async fn destination_coverage_requires_every_contributing_segment(#[case] scenar
         segments.push(
             CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
                 .name("i_idx".into())
+                .replace(true)
                 .fragments(vec![*fragment])
                 .execute_uncommitted()
                 .await
