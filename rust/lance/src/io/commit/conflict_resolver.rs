@@ -178,7 +178,7 @@ impl<'a> TransactionRebase<'a> {
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
             }
-            Operation::DataReplacement { replacements } => {
+            Operation::DataReplacement { replacements, .. } => {
                 let modified_fragment_ids =
                     replacements.iter().map(|r| r.0).collect::<HashSet<_>>();
                 let initial_fragments =
@@ -886,7 +886,7 @@ impl<'a> TransactionRebase<'a> {
                     }
                 }
                 Operation::UpdateConfig { .. } => Ok(()),
-                Operation::DataReplacement { replacements } => {
+                Operation::DataReplacement { replacements, .. } => {
                     // A data replacement only conflicts if it is updating a field the
                     // index depends on -- whether keyed on or merely carried, since
                     // `fields` lists both (see `IndexMetadata::covering_fields`).
@@ -1006,7 +1006,7 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::DataReplacement { replacements } => {
+                Operation::DataReplacement { replacements, .. } => {
                     // These conflict if the rewrite touches any of the fragments being replaced.
                     for replacement in replacements {
                         for group in groups {
@@ -1208,16 +1208,38 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        if let Operation::DataReplacement { replacements } = &self.transaction.operation {
+        if let Operation::DataReplacement {
+            replacements,
+            source_fields,
+            ..
+        } = &self.transaction.operation
+        {
+            let changes_a_source =
+                |fields: &[i32]| fields.iter().any(|f| *f >= 0 && source_fields.contains(f));
             match &other_transaction.operation {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::ReserveFragments { .. }
+                | Operation::UpdateBases { .. } => Ok(()),
                 // Both a column replacement and an overlay preserve physical row
                 // addresses; the overlay is newer and wins its covered cells.
-                | Operation::DataOverlay { .. }
-                | Operation::UpdateBases { .. } => Ok(()),
+                Operation::DataOverlay { groups } => {
+                    for replacement in replacements {
+                        for group in groups.iter().filter(|g| g.fragment_id == replacement.0) {
+                            if group
+                                .overlays
+                                .iter()
+                                .any(|overlay| changes_a_source(&overlay.data_file.fields))
+                            {
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
+                            }
+                        }
+                    }
+                    Ok(())
+                }
                 Operation::Project { schema, .. } => {
                     // A project operation can drop fields.  If the project
                     // dropped a field this operation was replacing then
@@ -1233,6 +1255,15 @@ impl<'a> TransactionRebase<'a> {
                                 ));
                             }
                         }
+                    }
+                    // A dropped source field is unrecoverable, like a dropped one.
+                    if source_fields
+                        .iter()
+                        .any(|f| *f >= 0 && schema.field_by_id(*f).is_none())
+                    {
+                        return Err(
+                            self.incompatible_conflict_err(other_transaction, other_version)
+                        );
                     }
                     Ok(())
                 }
@@ -1290,7 +1321,10 @@ impl<'a> TransactionRebase<'a> {
                             .fields
                             .iter()
                             .any(|f| *f >= 0 && fields_modified.contains(&(*f as u32)));
-                        if moved_rows || field_rewritten {
+                        let source_rewritten = source_fields
+                            .iter()
+                            .any(|f| *f >= 0 && fields_modified.contains(&(*f as u32)));
+                        if moved_rows || field_rewritten || source_rewritten {
                             return Err(
                                 self.retryable_conflict_err(other_transaction, other_version)
                             );
@@ -1339,8 +1373,11 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::DataReplacement {
                     replacements: other_replacements,
+                    source_fields: other_source_fields,
+                    ..
                 } => {
-                    // These conflict if there is overlap in fragment id && fields.
+                    // Conflict on a shared fragment when the written fields overlap,
+                    // or either side wrote a field the other computed from.
                     for replacement in replacements {
                         for other_replacement in other_replacements {
                             if replacement.0 != other_replacement.0 {
@@ -1352,6 +1389,17 @@ impl<'a> TransactionRebase<'a> {
                                     return Err(self
                                         .retryable_conflict_err(other_transaction, other_version));
                                 }
+                            }
+                            if changes_a_source(&other_replacement.1.fields)
+                                || replacement
+                                    .1
+                                    .fields
+                                    .iter()
+                                    .any(|f| *f >= 0 && other_source_fields.contains(f))
+                            {
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
                             }
                         }
                     }
@@ -1396,8 +1444,33 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }
             | Operation::Clone { .. }
-            | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. } => Ok(()),
+            // Overlaying a field the earlier replacement computed from stales it.
+            Operation::DataReplacement {
+                replacements,
+                source_fields,
+                ..
+            } => {
+                let Operation::DataOverlay { groups } = &self.transaction.operation else {
+                    return Err(wrong_operation_err(&self.transaction.operation));
+                };
+                for replacement in replacements {
+                    for group in groups.iter().filter(|g| g.fragment_id == replacement.0) {
+                        if group.overlays.iter().any(|overlay| {
+                            overlay
+                                .data_file
+                                .fields
+                                .iter()
+                                .any(|f| *f >= 0 && source_fields.contains(f))
+                        }) {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
             // A concurrent Delete only tombstones rows via a deletion vector,
             // which preserves physical offsets; the overlay value for a deleted
             // offset is simply inert. Conflict only if the whole overlaid
@@ -3657,6 +3730,8 @@ mod tests {
                         1,
                         DataFile::new_legacy_from_fields("r.lance", vec![0], None),
                     )],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Compatible,
             ),
@@ -4025,6 +4100,8 @@ mod tests {
                 "replacement",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, file())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
             ),
             (
@@ -4988,7 +5065,7 @@ mod tests {
                     .map(|f| f.id)
                     .chain(removed_fragment_ids.iter().copied()),
             ),
-            Operation::DataReplacement { replacements } => {
+            Operation::DataReplacement { replacements, .. } => {
                 Box::new(replacements.iter().map(|r| r.0))
             }
             Operation::DataOverlay { groups } => Box::new(groups.iter().map(|g| g.fragment_id)),
@@ -4998,6 +5075,7 @@ mod tests {
     #[tokio::test]
     async fn test_conflicts_data_replacement() {
         use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
+        use lance_table::format::overlay::DataOverlayFile;
 
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -5009,14 +5087,54 @@ mod tests {
         let data_file_frag1_fields01 =
             DataFile::new_legacy_from_fields("path1_01", vec![0, 1], None);
 
+        // Our replacement of fragment 0, computed from field 2.
+        let computed_from_2 = || Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+            source_fields: vec![2],
+            replaced_offsets: None,
+        };
+        let rewrite_of = |fragment: u64, field: u32| Operation::Update {
+            updated_fragments: vec![Fragment::new(fragment)],
+            removed_fragment_ids: vec![],
+            new_fragments: vec![],
+            fields_modified: vec![field],
+            compacted_sstables: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(RewriteColumns),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        let replacement_of = |fragment: u64, field: i32| Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(
+                fragment,
+                DataFile::new_legacy_from_fields("other.lance", vec![field], None),
+            )],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
+        };
+        let overlay_of = |fragment: u64, field: i32| Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id: fragment,
+                overlays: vec![DataOverlayFile {
+                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![field], None),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                    committed_version: 0,
+                }],
+            }],
+        };
+
         let cases = vec![
             (
                 "Different fragments",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(1, data_file_frag1_fields01)],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Compatible,
             ),
@@ -5024,9 +5142,13 @@ mod tests {
                 "Same fragment, different fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields23)],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Compatible,
             ),
@@ -5034,9 +5156,13 @@ mod tests {
                 "Same fragment, same fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Retryable,
             ),
@@ -5044,12 +5170,16 @@ mod tests {
                 "Same fragment, overlapping fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(
                         0,
                         DataFile::new_legacy_from_fields("path0_12", vec![1, 2], None),
                     )],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Retryable,
             ),
@@ -5057,6 +5187,8 @@ mod tests {
                 "DataReplacement vs Rewrite on same fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::Rewrite {
                     groups: vec![RewriteGroup {
@@ -5072,6 +5204,8 @@ mod tests {
                 "DataReplacement vs Rewrite on different fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::Rewrite {
                     groups: vec![RewriteGroup {
@@ -5083,6 +5217,84 @@ mod tests {
                 },
                 Compatible,
             ),
+            // A replacement declares the fields its values were computed from.
+            // Changing one on a replaced fragment conflicts; elsewhere it does not.
+            (
+                "source field rewritten, same fragment",
+                computed_from_2(),
+                rewrite_of(0, 2),
+                Retryable,
+            ),
+            (
+                "source field rewritten, other fragment",
+                computed_from_2(),
+                rewrite_of(1, 2),
+                Compatible,
+            ),
+            (
+                "source field replaced, same fragment",
+                computed_from_2(),
+                replacement_of(0, 2),
+                Retryable,
+            ),
+            (
+                "source field replaced, other fragment",
+                computed_from_2(),
+                replacement_of(1, 2),
+                Compatible,
+            ),
+            (
+                "source field overlaid, same fragment",
+                computed_from_2(),
+                overlay_of(0, 2),
+                Retryable,
+            ),
+            (
+                "unrelated field overlaid, same fragment",
+                computed_from_2(),
+                overlay_of(0, 3),
+                Compatible,
+            ),
+            // The same dependency in the other commit order.
+            (
+                "source field replaced after computed, same fragment",
+                replacement_of(0, 2),
+                computed_from_2(),
+                Retryable,
+            ),
+            (
+                "unrelated field replaced after computed, same fragment",
+                replacement_of(0, 3),
+                computed_from_2(),
+                Compatible,
+            ),
+            (
+                "source field replaced after computed, other fragment",
+                replacement_of(1, 2),
+                computed_from_2(),
+                Compatible,
+            ),
+            (
+                "source field overlaid after computed, same fragment",
+                overlay_of(0, 2),
+                computed_from_2(),
+                Retryable,
+            ),
+            (
+                "unrelated field overlaid after computed, same fragment",
+                overlay_of(0, 3),
+                computed_from_2(),
+                Compatible,
+            ),
+            (
+                "source field dropped",
+                computed_from_2(),
+                Operation::Project {
+                    schema: lance_core::datatypes::Schema::default(),
+                    preserves_nullability: true,
+                },
+                NotCompatible,
+            ),
             // A concurrent Update/Delete only invalidates our positional file when it
             // removes our target fragment outright, or (a horizontal update) rewrites
             // one of our fields. A deletion-vector-only change stays aligned.
@@ -5090,6 +5302,8 @@ mod tests {
                 "DataReplacement vs Update (RewriteColumns) on a different field",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -5109,6 +5323,8 @@ mod tests {
                 "DataReplacement vs Update (RewriteColumns) with inserts on a different field",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -5127,6 +5343,8 @@ mod tests {
                 "DataReplacement vs Update (RewriteColumns) that rewrote one of our fields",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -5145,6 +5363,8 @@ mod tests {
                 "DataReplacement vs Update (RewriteRows) that moved our rows",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(0)],
@@ -5163,6 +5383,8 @@ mod tests {
                 "DataReplacement vs Update that removed our fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![],
@@ -5181,6 +5403,8 @@ mod tests {
                 "DataReplacement vs Update (RewriteRows) that moved a different fragment's rows",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::Update {
                     updated_fragments: vec![Fragment::new(1)],
@@ -5199,6 +5423,8 @@ mod tests {
                 "DataReplacement vs Delete (deletion-vector only) on same fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::Delete {
                     deleted_fragment_ids: vec![],
@@ -5211,6 +5437,8 @@ mod tests {
                 "DataReplacement vs Delete that removes the fragment",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01.clone())],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::Delete {
                     deleted_fragment_ids: vec![0],
@@ -5224,6 +5452,8 @@ mod tests {
                 "DataReplacement vs Merge",
                 Operation::DataReplacement {
                     replacements: vec![DataReplacementGroup(0, data_file_frag0_fields01)],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Operation::Merge {
                     fragments: vec![Fragment::new(0)],
@@ -5264,6 +5494,8 @@ mod tests {
                         0,
                         DataFile::new_legacy_from_fields("path0_3", vec![3], None),
                     )],
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
                 },
                 Retryable,
             ),

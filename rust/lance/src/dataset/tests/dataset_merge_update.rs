@@ -690,6 +690,8 @@ async fn test_datafile_replacement() {
         WriteDestination::Dataset(dataset.clone()),
         Operation::DataReplacement {
             replacements: vec![],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(1),
         None,
@@ -719,6 +721,8 @@ async fn test_datafile_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(3),
         None,
@@ -773,6 +777,8 @@ async fn test_datafile_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(4),
         None,
@@ -890,6 +896,8 @@ async fn test_datafile_partial_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(3),
         None,
@@ -951,6 +959,8 @@ async fn test_datafile_partial_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(4),
         None,
@@ -1056,6 +1066,8 @@ async fn test_datafile_replacement_error() {
         WriteDestination::Dataset(Arc::new(dataset.clone())),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         // read at the current version (after the Merge above)
         Some(dataset.manifest.version),
@@ -2621,6 +2633,8 @@ async fn test_data_replacement_advances_row_lineage() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(read_version),
         None,
@@ -2730,6 +2744,8 @@ async fn test_data_replacement_invalidates_index_bitmap() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(read_version),
         None,
@@ -3014,6 +3030,8 @@ async fn test_data_replacement_populates_invalidated_bitmap() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(read_version),
         None,
@@ -3133,6 +3151,8 @@ async fn test_fts_stale_entries_after_data_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(1, new_data_file)],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(read_version),
         None,
@@ -3273,6 +3293,8 @@ async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(1, replacement_file)],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(read_version),
         None,
@@ -3444,6 +3466,8 @@ async fn test_vector_index_after_data_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(frag1_id, new_data_file)],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(read_version),
         None,

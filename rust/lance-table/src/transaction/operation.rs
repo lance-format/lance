@@ -107,6 +107,12 @@ pub enum Operation {
     /// with a new column A, the operation is not allowed.
     DataReplacement {
         replacements: Vec<DataReplacementGroup>,
+        /// Field ids the values were computed from, distinct from the fields
+        /// written. A concurrent change to one on a replaced fragment conflicts.
+        source_fields: Vec<i32>,
+        /// Rows whose values changed, for row-level `last_updated` stamping.
+        /// `None` stamps every row.
+        replaced_offsets: Option<UpdatedFragmentOffsets>,
     },
     /// Attach overlay files to fragments, supplying new values for a subset of
     /// `(physical offset, field)` cells without rewriting the fragments' base

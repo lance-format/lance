@@ -93,6 +93,8 @@ async fn commit(dataset: &Dataset, replacement: DataReplacementGroup) -> Result<
         WriteDestination::Dataset(Arc::new(dataset.clone())),
         Operation::DataReplacement {
             replacements: vec![replacement],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(dataset.version_id()),
         None,

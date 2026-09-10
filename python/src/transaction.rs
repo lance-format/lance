@@ -514,7 +514,11 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
             "DataReplacement" => {
                 let replacements = extract_vec(&ob.getattr("replacements")?)?;
 
-                let op = Operation::DataReplacement { replacements };
+                let op = Operation::DataReplacement {
+                    replacements,
+                    source_fields: Vec::new(),
+                    replaced_offsets: None,
+                };
 
                 Ok(Self(op))
             }
@@ -681,7 +685,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     updated_fragment_offsets,
                 ))
             }
-            Operation::DataReplacement { replacements } => {
+            Operation::DataReplacement { replacements, .. } => {
                 let replacements = export_vec(py, replacements.as_slice())?;
                 let cls = namespace
                     .getattr("DataReplacement")

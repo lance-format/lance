@@ -2976,6 +2976,8 @@ async fn test_partial_compound_hybrid_prunes_same_path_different_base_rewrite() 
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(1, replacement_file)],
+            source_fields: Vec::new(),
+            replaced_offsets: None,
         },
         Some(read_version),
         None,

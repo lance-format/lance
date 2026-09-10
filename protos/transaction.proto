@@ -365,6 +365,12 @@ message Transaction {
   // An operation that replaces the data in a region of the table with new data.
   message DataReplacement {
     repeated DataReplacementGroup replacements = 1;
+    /* Field ids the values were computed from; a concurrent change to one on a
+     * replaced fragment conflicts. Empty declares no dependencies. */
+    repeated int32 source_fields = 2;
+    /* Rows whose values changed, as RoaringBitmap bytes, for last_updated
+     * stamping. Absent stamps every row. */
+    map<uint64, bytes> replaced_offset_bitmaps = 3;
   }
 
   /* Overlay files to append to a single fragment, in order (the last entry is
