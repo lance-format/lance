@@ -545,7 +545,7 @@ async fn aggregate_fts_prewarm_results(
             .and_then(|index| index.as_any().downcast_ref::<InvertedIndex>());
         let container_resident = cached_inverted.is_some();
         let container_matches_prewarmed = match (prewarmed_inverted, cached_inverted) {
-            (Some(prewarmed), Some(cached)) => std::ptr::addr_eq(prewarmed, cached),
+            (Some(prewarmed), Some(cached)) => prewarmed.shares_prewarm_state(cached),
             _ => false,
         };
 
@@ -3754,6 +3754,7 @@ mod tests {
     use futures::{future::try_join_all, stream::TryStreamExt};
     use lance_arrow::*;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_datagen::gen_batch;
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
     use lance_index::metrics::LocalMetricsCollector;
@@ -3775,7 +3776,9 @@ mod tests {
     };
     use lance_io::{
         assert_io_eq, assert_io_lt,
-        object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor},
+        object_store::{
+            ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
+        },
         utils::tracking_store::IoStats,
     };
     use lance_linalg::distance::{DistanceType, MetricType};
@@ -3784,7 +3787,10 @@ mod tests {
     use rstest::rstest;
     use std::{
         collections::{HashMap, HashSet},
-        sync::atomic::Ordering,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
     async fn write_vector_segment_metadata(
@@ -3823,8 +3829,67 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RequestIndexStoreWrapper {
+        policy: Arc<Mutex<ProxyObjectStorePolicy>>,
+        revoked: Arc<AtomicBool>,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RequestIndexStoreWrapper {
+        fn new(index_path: String) -> Self {
+            let revoked = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut policy = ProxyObjectStorePolicy::new();
+            let policy_revoked = revoked.clone();
+            let policy_requests = requests.clone();
+            policy.set_before_policy(
+                "observe_index_reads",
+                Arc::new(move |method, path| {
+                    if path.as_ref().contains(&index_path) {
+                        policy_requests.lock().unwrap().push(method.to_owned());
+                        if policy_revoked.load(Ordering::Relaxed) {
+                            return Err(object_store::Error::Generic {
+                                store: "RequestIndexStoreWrapper",
+                                source: "request credentials have been revoked".into(),
+                            }
+                            .into());
+                        }
+                    }
+                    Ok(())
+                }),
+            );
+            Self {
+                policy: Arc::new(Mutex::new(policy)),
+                revoked,
+                requests,
+            }
+        }
+    }
+
+    impl WrappingObjectStore for RequestIndexStoreWrapper {
+        fn wrap(
+            &self,
+            _storage_prefix: &str,
+            original: Arc<dyn object_store::ObjectStore>,
+        ) -> Arc<dyn object_store::ObjectStore> {
+            Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
+        }
+
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            None
+        }
+    }
+
+    #[rstest]
+    #[case::credential_stores(false)]
+    #[case::request_wrappers(true)]
     #[tokio::test]
-    async fn test_scalar_cache_uses_current_object_store() {
+    async fn test_scalar_cache_uses_current_object_store(#[case] request_wrappers: bool) {
         async fn search_ids(dataset: &Dataset, term: &str) -> Vec<i32> {
             let result = dataset
                 .scan()
@@ -3907,67 +3972,76 @@ mod tests {
             .await
             .unwrap();
 
-        let store_params_a = ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                HashMap::from([(
-                    "credential_generation".to_owned(),
-                    "secret-generation-a".to_owned(),
-                )]),
-            ))),
-            ..Default::default()
-        };
-        let (store_a, _) = ObjectStore::from_uri_and_params(
-            dataset.session().store_registry(),
-            dataset.uri(),
-            &store_params_a,
-        )
-        .await
-        .unwrap();
-        let dataset_a = dataset.with_object_store(store_a.clone(), Some(store_params_a));
-
-        let store_params_b = ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                HashMap::from([(
-                    "credential_generation".to_owned(),
-                    "secret-generation-b".to_owned(),
-                )]),
-            ))),
-            ..Default::default()
-        };
-        let (store_b, _) = ObjectStore::from_uri_and_params(
-            dataset.session().store_registry(),
-            dataset.uri(),
-            &store_params_b,
-        )
-        .await
-        .unwrap();
-        assert!(!Arc::ptr_eq(&store_a, &store_b));
-        let dataset_b = dataset.with_object_store(store_b.clone(), Some(store_params_b));
         let index_path_fragment = format!("_indices/{}", index_meta.uuid);
+        let wrapper_a = Arc::new(RequestIndexStoreWrapper::new(index_path_fragment.clone()));
+        let wrapper_b = Arc::new(RequestIndexStoreWrapper::new(index_path_fragment));
+        let mut requests = Vec::with_capacity(2);
+        for (generation, wrapper) in [("a", &wrapper_a), ("b", &wrapper_b)] {
+            let request = if request_wrappers {
+                dataset
+                    .with_object_store_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>])
+            } else {
+                let store_params = ObjectStoreParams {
+                    storage_options_accessor: Some(Arc::new(
+                        StorageOptionsAccessor::with_static_options(HashMap::from([(
+                            "credential_generation".to_owned(),
+                            format!("secret-generation-{generation}"),
+                        )])),
+                    )),
+                    object_store_wrapper: Some(wrapper.clone()),
+                    ..Default::default()
+                };
+                let (store, _) = ObjectStore::from_uri_and_params(
+                    dataset.session().store_registry(),
+                    dataset.uri(),
+                    &store_params,
+                )
+                .await
+                .unwrap();
+                dataset.with_object_store(store, Some(store_params))
+            };
+            requests.push(request);
+        }
+        let dataset_a = &requests[0];
+        let dataset_b = &requests[1];
+        assert!(!Arc::ptr_eq(
+            &dataset_a.object_store,
+            &dataset_b.object_store
+        ));
+        assert!(!Arc::ptr_eq(
+            &dataset_a.object_store.inner,
+            &dataset_b.object_store.inner
+        ));
 
-        let _ = store_a.io_stats_incremental();
-        let _ = store_b.io_stats_incremental();
-        assert_eq!(search_ids(&dataset_a, "alpha").await, vec![0, 3, 6]);
-        let first_store_stats = store_a.io_stats_incremental();
+        let initial_metrics = LocalMetricsCollector::default();
+        let initial = dataset_a
+            .open_scalar_index("text", &index_meta.uuid, &initial_metrics)
+            .await
+            .unwrap();
+        assert_eq!(initial_metrics.index_loads.load(Ordering::Relaxed), 1);
+        initial.prewarm().await.unwrap();
+        assert_eq!(search_ids(dataset_a, "alpha").await, vec![0, 3, 6]);
         assert!(
-            first_store_stats
-                .requests
-                .iter()
-                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
-            "the first query should read the FTS index through store A: {first_store_stats:#?}"
+            !wrapper_a.requests.lock().unwrap().is_empty(),
+            "the first request must read the FTS index through store A"
         );
-        let _ = store_b.io_stats_incremental();
+        wrapper_a.requests.lock().unwrap().clear();
+        wrapper_b.requests.lock().unwrap().clear();
 
-        assert_eq!(search_ids(&dataset_a, "alpha").await, vec![0, 3, 6]);
-        let warm_store_stats = store_a.io_stats_incremental();
+        let same_binding_metrics = LocalMetricsCollector::default();
+        let same_binding = dataset_a
+            .open_scalar_index("text", &index_meta.uuid, &same_binding_metrics)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&initial, &same_binding));
+        assert_eq!(same_binding_metrics.index_loads.load(Ordering::Relaxed), 0);
+        assert_eq!(search_ids(dataset_a, "alpha").await, vec![0, 3, 6]);
         assert!(
-            !warm_store_stats
-                .requests
-                .iter()
-                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
-            "the same store binding should reuse the live scalar index: {warm_store_stats:#?}"
+            wrapper_a.requests.lock().unwrap().is_empty(),
+            "the same store binding should reuse the prewarmed scalar index"
         );
 
+        wrapper_a.revoked.store(true, Ordering::Relaxed);
         let rotation_metrics = LocalMetricsCollector::default();
         let opened = try_join_all(
             (0..8)
@@ -3976,58 +4050,147 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(opened.len(), 8);
+        assert!(opened.iter().all(|index| Arc::ptr_eq(index, &opened[0])));
+        assert!(!Arc::ptr_eq(&initial, &opened[0]));
         assert_eq!(
             rotation_metrics.index_loads.load(Ordering::Relaxed),
-            1,
-            "concurrent opens after rotation should coalesce onto one store-B load"
-        );
-
-        assert_eq!(search_ids(&dataset_b, "beta").await, vec![1, 4, 7]);
-        let old_store_stats = store_a.io_stats_incremental();
-        let new_store_stats = store_b.io_stats_incremental();
-        assert!(
-            !old_store_stats
-                .requests
-                .iter()
-                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
-            "the second dataset must not use the scalar index bound to store A: {old_store_stats:#?}"
+            0,
+            "concurrent opens after rotation should reuse metadata without a full index load"
         );
         assert!(
-            new_store_stats
-                .requests
-                .iter()
-                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
-            "the second dataset should read the scalar index through store B: {new_store_stats:#?}"
+            opened[0]
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .unwrap()
+                .prewarm_residency_result(false)
+                .await
+                .fully_resident,
+            "request B must retain the prewarmed query state before another prewarm"
+        );
+        // A request can rebind the cached shell between prewarming and the
+        // final residency check. B still owns the runtime state prepared by A.
+        let result = aggregate_fts_prewarm_results(
+            dataset_a,
+            vec![OpenedSegmentPrewarmResult {
+                index_uuid: index_meta.uuid,
+                partition_count: initial
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .unwrap()
+                    .partition_count(),
+                index: initial.clone(),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.fully_resident);
+        assert_eq!(search_ids(dataset_b, "beta").await, vec![1, 4, 7]);
+        assert!(wrapper_a.requests.lock().unwrap().is_empty());
+        assert!(
+            wrapper_b.requests.lock().unwrap().is_empty(),
+            "a new request must serve the prewarmed index without opening partition files"
         );
 
         let scalar_cache = dataset.index_cache.for_index(&index_meta.uuid, None);
+        let cached = scalar_cache
+            .get_unsized_with_key(&ScalarIndexCacheKey)
+            .await
+            .expect("the live scalar index should be cached with store B's binding");
+        assert!(Arc::ptr_eq(&cached.index(), &opened[0]));
+
+        // Evict decoded values while retaining the live shell. A fully warm query
+        // cannot prove that cache misses use the current request's credentials.
+        scalar_cache.clear().await;
+        scalar_cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, cached.clone())
+            .await;
+        wrapper_b.requests.lock().unwrap().clear();
+        assert_eq!(search_ids(dataset_b, "beta").await, vec![1, 4, 7]);
         assert!(
-            scalar_cache
-                .get_unsized_with_key(&ScalarIndexCacheKey)
-                .await
-                .is_some(),
-            "the live scalar index should be cached with store B's binding"
+            wrapper_a.requests.lock().unwrap().is_empty(),
+            "request B must not issue index I/O through revoked store A"
+        );
+        assert!(
+            wrapper_b
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|method| matches!(method.as_str(), "get_opts" | "get_ranges")),
+            "request B must read uncached index data through store B"
         );
 
-        let _ = store_a.io_stats_incremental();
-        let _ = store_b.io_stats_incremental();
-        assert_eq!(search_ids(&dataset_a, "gamma").await, vec![2, 5]);
-        let reopened_store_stats = store_a.io_stats_incremental();
-        let untouched_store_stats = store_b.io_stats_incremental();
+        scalar_cache.clear().await;
+        scalar_cache
+            .insert_unsized_with_key(&ScalarIndexCacheKey, cached)
+            .await;
+        wrapper_a.revoked.store(false, Ordering::Relaxed);
+        wrapper_b.revoked.store(true, Ordering::Relaxed);
+        wrapper_a.requests.lock().unwrap().clear();
+        wrapper_b.requests.lock().unwrap().clear();
+        assert_eq!(search_ids(dataset_a, "gamma").await, vec![2, 5]);
         assert!(
-            reopened_store_stats
+            wrapper_a
                 .requests
+                .lock()
+                .unwrap()
                 .iter()
-                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
-            "re-querying dataset A should replace store B's binding and read through store A: {reopened_store_stats:#?}"
+                .any(|method| matches!(method.as_str(), "get_opts" | "get_ranges")),
+            "re-querying dataset A must read uncached index data through store A"
         );
         assert!(
-            !untouched_store_stats
-                .requests
-                .iter()
-                .any(|request| request.path.as_ref().contains(&index_path_fragment)),
-            "re-querying dataset A must not use store B: {untouched_store_stats:#?}"
+            wrapper_b.requests.lock().unwrap().is_empty(),
+            "re-querying dataset A must not issue index I/O through revoked store B"
         );
+    }
+
+    #[tokio::test]
+    async fn test_request_wrappers_reload_legacy_fts_fixture() {
+        let test_dir = copy_test_data_to_tmp("0.27.0/legacy_fts_index").unwrap();
+        let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let uuid = indices[0].uuid;
+
+        for _ in 0..2 {
+            let wrapper = Arc::new(RequestIndexStoreWrapper::new(format!("_indices/{uuid}")));
+            let request = dataset
+                .with_object_store_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+            let metrics = LocalMetricsCollector::default();
+            let index = request
+                .open_scalar_index("text", &uuid, &metrics)
+                .await
+                .unwrap();
+            assert!(
+                index
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .unwrap()
+                    .is_legacy()
+            );
+            assert_eq!(
+                metrics.index_loads.load(Ordering::Relaxed),
+                1,
+                "legacy readers must still be reloaded through each request's store"
+            );
+            let result = request
+                .scan()
+                .project(&["text"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new("happy".to_owned()))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(result.num_rows(), 1);
+            assert_eq!(
+                result["text"].as_string::<i32>().value(0),
+                "frodo was a happy puppy"
+            );
+            assert!(!wrapper.requests.lock().unwrap().is_empty());
+            wrapper.revoked.store(true, Ordering::Relaxed);
+        }
     }
 
     fn list_io_stats(stats: &IoStats) -> IoStats {
@@ -5455,6 +5618,34 @@ mod tests {
         )
         .await;
         assert_eq!(phrase_ids, (0..300).step_by(3).collect::<Vec<_>>());
+
+        for _ in 0..2 {
+            let wrapper = Arc::new(RequestIndexStoreWrapper::new(format!(
+                "_indices/{}",
+                indices[0].uuid
+            )));
+            let request = dataset
+                .with_object_store_wrappers([wrapper.clone() as Arc<dyn WrappingObjectStore>]);
+            assert_eq!(
+                search_ids(
+                    &request,
+                    FullTextSearchQuery::new("compatibility".to_owned())
+                )
+                .await,
+                match_ids
+            );
+            let phrase =
+                PhraseQuery::new("lance database".to_owned()).with_column(Some("text".to_owned()));
+            assert_eq!(
+                search_ids(
+                    &request,
+                    FullTextSearchQuery::new_query(FtsQuery::Phrase(phrase))
+                )
+                .await,
+                phrase_ids
+            );
+            wrapper.revoked.store(true, Ordering::Relaxed);
+        }
     }
 
     #[rstest]

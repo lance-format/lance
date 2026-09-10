@@ -2202,6 +2202,157 @@ async fn test_dataset_planner_defers_auto_fuzziness_for_partial_indices() {
     }
 }
 
+#[rstest]
+#[case::empty(0)]
+#[case::underfilled(5)]
+#[case::high_hits(544)]
+#[tokio::test]
+async fn test_root_match_and_modern_bulk(
+    #[values(4, 16)] num_terms: usize,
+    #[case] expected_matches: usize,
+) {
+    const NUM_DOCS: usize = 544;
+    const ROWS_PER_FRAGMENT: usize = NUM_DOCS / 2;
+    const DOC_LENGTH: usize = 64;
+    const LIMIT: usize = 10;
+    const TERMS: [&str; 16] = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+    ];
+    let terms = &TERMS[..num_terms];
+    let is_high_hits = expected_matches == NUM_DOCS;
+    let matching_rows = [
+        0,
+        ROWS_PER_FRAGMENT - 1,
+        ROWS_PER_FRAGMENT,
+        NUM_DOCS - 2,
+        NUM_DOCS - 1,
+    ];
+    let frequencies = (0..NUM_DOCS)
+        .map(|row| {
+            let is_match = is_high_hits || (expected_matches == 5 && matching_rows.contains(&row));
+            (0..num_terms)
+                .map(|term| {
+                    if !is_match && row % num_terms == term {
+                        0_usize
+                    } else if is_high_hits && row >= NUM_DOCS - LIMIT {
+                        2
+                    } else {
+                        1
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let documents = frequencies
+        .iter()
+        .map(|frequencies| {
+            let mut tokens = terms
+                .iter()
+                .zip(frequencies)
+                .flat_map(|(&term, &frequency)| std::iter::repeat_n(term, frequency))
+                .collect::<Vec<_>>();
+            assert!(tokens.len() <= DOC_LENGTH);
+            tokens.resize(DOC_LENGTH, "padding");
+            tokens.join(" ")
+        })
+        .collect::<Vec<_>>();
+    let batch = arrow_array::record_batch!(
+        ("text", Utf8, documents),
+        ("id", UInt64, (0..NUM_DOCS as u64).collect::<Vec<_>>())
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: ROWS_PER_FRAGMENT,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let params = InvertedIndexParams::default()
+        .with_position(false)
+        .stem(false)
+        .remove_stop_words(false)
+        .block_size(256)
+        .unwrap()
+        .format_version(InvertedListFormatVersion::V3);
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    let row_mapping = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .with_row_id()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = row_mapping["id"].as_primitive::<UInt64Type>();
+    let row_ids = row_mapping[ROW_ID].as_primitive::<UInt64Type>();
+
+    // Every document has the same exactly representable byte-norm length.
+    // Compute BM25 independently from the fixture's corpus-wide term counts.
+    let weights = (0..num_terms)
+        .map(|term| {
+            let document_frequency = frequencies.iter().filter(|row| row[term] > 0).count() as f32;
+            ((NUM_DOCS as f32 - document_frequency + 0.5) / (document_frequency + 0.5) + 1.0).ln()
+        })
+        .collect::<Vec<_>>();
+    let mut expected = ids
+        .values()
+        .iter()
+        .zip(row_ids.values())
+        .filter_map(|(&id, &row_id)| {
+            let frequencies = &frequencies[id as usize];
+            if frequencies.contains(&0) {
+                return None;
+            }
+            let score = weights
+                .iter()
+                .zip(frequencies)
+                .fold(0.0_f32, |sum, (&weight, &freq)| {
+                    let freq = freq as f32;
+                    sum + weight * ((1.2_f32 + 1.0) * freq / (freq + 1.2))
+                });
+            Some((row_id, score))
+        })
+        .collect::<Vec<_>>();
+    let rank = |left: &(u64, f32), right: &(u64, f32)| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    };
+    expected.sort_unstable_by(rank);
+    assert_eq!(expected.len(), expected_matches);
+    if is_high_hits {
+        assert!(expected[LIMIT - 1].1 > expected[LIMIT].1);
+    }
+    expected.truncate(LIMIT);
+
+    let query: FtsQuery = MatchQuery::new(terms.join(" "))
+        .with_column(Some("text".to_owned()))
+        .with_operator(Operator::And)
+        .with_fuzziness(Some(0))
+        .into();
+    let plan = compound_fts_plan(&dataset, query.clone(), LIMIT).await;
+    assert!(plan.contains("MatchQuery: column=text"), "{plan}");
+    assert!(
+        !plan.contains("FlatMatchQuery") && !plan.contains("CompoundFtsScorer"),
+        "{plan}"
+    );
+    let mut actual = compound_fts_results(&dataset, query, Some(LIMIT as i64)).await;
+    actual.sort_unstable_by(rank);
+    assert_eq!(scored_row_bits(&actual), scored_row_bits(&expected));
+}
+
 #[tokio::test]
 async fn test_field_local_match_wand_exactness_certificates() {
     let mut dataset = write_cross_column_compound_dataset().await;

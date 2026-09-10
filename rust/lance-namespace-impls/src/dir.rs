@@ -6767,6 +6767,7 @@ mod tests {
                 Some(ListBehavior::EmptyListing) => Ok(ListResult {
                     common_prefixes: Vec::new(),
                     objects: Vec::new(),
+                    extensions: Default::default(),
                 }),
                 // Mirrors the object_store retry-exhaustion message shape for an
                 // Azure ServerBusy response, which is what the incident produced.
