@@ -6,6 +6,8 @@ The NPZ query file contains Float32 arrays ``full`` and ``coarse`` and UInt64
 ``rowids`` identifying the in-corpus query rows. Recall excludes each query row
 before candidate selection. A separate unfiltered workload measures latency only.
 No dataset or index is created or changed. All indices must cover the snapshot.
+Both indexed columns also run same-column refinement with the same nprobes and
+factor as cross-column refinement; unrefined paths remain as separate baselines.
 
 Run from python/ with an optimized extension already installed:
     uv run --no-sync python python/benchmarks/cross_column_refinement_dataset.py \
@@ -47,6 +49,16 @@ def configurations(pairs):
     for probes, factor in pairs:
         paths.extend(
             {
+                "name": f"{space}_refine_p{probes}_f{factor}",
+                "kind": "same",
+                "space": space,
+                "nprobes": probes,
+                "factor": factor,
+            }
+            for space in ("full", "coarse")
+        )
+        paths.extend(
+            {
                 "name": f"{kind}_p{probes}_f{factor}",
                 "kind": kind,
                 "space": "coarse",
@@ -58,7 +70,7 @@ def configurations(pairs):
     return paths
 
 
-def execute(ds, queries, segments, args, config, qi, exclude_self):
+def make_scanner(ds, queries, segments, args, config, qi, exclude_self):
     space = config["space"]
     kind = config["kind"]
     nearest = {
@@ -80,15 +92,23 @@ def execute(ds, queries, segments, args, config, qi, exclude_self):
         )
     elif kind == "numpy":
         nearest["k"] *= config["factor"]
-    table = ds.scanner(
+    elif kind == "same":
+        nearest["refine_factor"] = config["factor"]
+    return ds.scanner(
         columns=[args.full_column, "_distance"] if kind == "numpy" else ["_distance"],
         with_row_id=True,
         nearest=nearest,
         index_segments=segments[space] if kind != "exact" else None,
         filter=f"_rowid != {int(queries['rowids'][qi])}" if exclude_self else None,
         prefilter=True,
+    )
+
+
+def execute(ds, queries, segments, args, config, qi, exclude_self):
+    table = make_scanner(
+        ds, queries, segments, args, config, qi, exclude_self
     ).to_table()
-    if kind != "numpy":
+    if config["kind"] != "numpy":
         return table
     array = table[args.full_column].combine_chunks()
     vectors = array.values.to_numpy().reshape(len(array), array.type.list_size)
@@ -187,6 +207,12 @@ def run(args):
         "configurations": configs,
         "index_segments": segments,
         "index_bytes": index_bytes,
+        "plans": {
+            config["name"]: make_scanner(
+                ds, queries, segments, args, config, 0, True
+            ).explain_plan()
+            for config in configs
+        },
         "workloads": {},
     }
     for exclude_self in (True, False):
