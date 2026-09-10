@@ -191,13 +191,13 @@ counts matrix and the requested label blocks.
 When indexing or index remapping cannot keep up with compaction or reclustering,
 FRI allows fragment rewrites to proceed while retaining existing indices.
 Each rewrite that defers index remapping records its mapping: a reuse version
-in FRI index version 0, or transitions in index version 1. A transition must
-reference only fragments that are already committed. The rewrite and its
-mapping may be published in separate commits: until the mapping lands, the
-destination fragments are not covered by any index and are served by scanning,
-so correctness never depends on the mapping being present. Atomic composition
-of a rewrite with its transition is deferred to a future composite transaction
-mechanism.
+in FRI index version 0, or transitions in index version 1. A rewrite normally
+publishes its mapping atomically, replacing the FRI entry in the same commit.
+A transition may also be appended in a separate, later commit
+(`append_fri_transitions`); it must reference only fragments committed no
+later than itself, and until it lands the destination fragments are not
+covered by any index and are served by scanning, so correctness never depends
+on the mapping being present.
 
 Once all dependent indices have caught up, the corresponding history can be
 trimmed. Cleanup must retain intermediate transitions still needed to translate

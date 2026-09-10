@@ -773,5 +773,6 @@ tagged history capability (`FLAG_FRAGMENT_REUSE_INDEX`) and FRI
 `index_version` 1; the appended transitions must satisfy the lineage
 invariants in
 [FRI index versions](../index/system/frag_reuse.md#fri-index-versions).
-Atomic composition with `rewrite` is deferred to a future transaction
-revision.
+A rewrite normally publishes its transitions atomically by replacing the
+FRI entry in its own commit; this operation appends transitions after the
+fact, for mappings produced separately from the rewrite that they describe.
