@@ -20,7 +20,6 @@ use std::{
     collections::{BinaryHeap, HashMap},
     fmt::Debug,
     future::Future,
-    ops::Range,
     pin::Pin,
     sync::{
         Arc, Mutex, MutexGuard,
@@ -38,7 +37,7 @@ use super::{
     SchedulerStateEvent, emit_scheduler_state_event,
 };
 
-type RunFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send>> + Send>;
+type RunFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>>> + Send>> + Send>;
 
 /// The state of an I/O task
 ///
@@ -62,11 +61,11 @@ enum TaskState {
     },
     Running {
         backpressure_reservation: BackpressureReservation,
-        inner: Pin<Box<dyn Future<Output = Result<Bytes>> + Send>>,
+        inner: Pin<Box<dyn Future<Output = Result<Vec<Bytes>>> + Send>>,
     },
     Finished {
         backpressure_reservation: BackpressureReservation,
-        data: Result<Bytes>,
+        data: Result<Vec<Bytes>>,
     },
 }
 
@@ -127,6 +126,8 @@ struct IoTask {
     id: u64,
     /// The number of bytes to read
     num_bytes: u64,
+    /// The number of physical ranges in this task.
+    num_iops: u64,
     /// The priority of the task, lower values are higher priority
     priority: u128,
     /// The current state of the task
@@ -221,7 +222,7 @@ impl IoTask {
         }
     }
 
-    fn consume(self) -> Result<(Result<Bytes>, BackpressureReservation)> {
+    fn consume(self) -> Result<(Result<Vec<Bytes>>, BackpressureReservation)> {
         let TaskState::Finished {
             data,
             backpressure_reservation,
@@ -480,14 +481,20 @@ impl IoQueueState {
             .tasks
             .values()
             .filter(|task| matches!(task.state, TaskState::Running { .. }))
-            .count() as u64;
+            .map(|task| task.num_iops)
+            .sum();
 
         Some(SchedulerStateEvent {
             queue_kind: "lite",
             io_capacity: 0,
             iops_available: 0,
             active_iops,
-            pending_iops: self.pending_tasks.len() as u64,
+            pending_iops: self
+                .pending_tasks
+                .iter()
+                .filter_map(|entry| self.tasks.get(&entry.task_id))
+                .map(|task| task.num_iops)
+                .sum(),
             pending_bytes,
             bytes_available: backpressure.bytes_available,
             bytes_reserved: backpressure.max_bytes as i64 - backpressure.bytes_available,
@@ -571,14 +578,15 @@ impl IoQueue {
 
     pub(super) fn submit(
         self: Arc<Self>,
-        range: Range<u64>,
+        num_bytes: u64,
+        num_iops: u64,
         priority: u128,
         run_fn: RunFn,
         bypass_backpressure: bool,
     ) -> Result<TaskHandle> {
         log::trace!(
-            "Submitting I/O task with range {:?}, priority {:?}",
-            range,
+            "Submitting I/O task with {} bytes, priority {:?}",
+            num_bytes,
             priority
         );
         let mut state = self.state.lock().unwrap();
@@ -587,7 +595,8 @@ impl IoQueue {
 
         let task = IoTask {
             id: task_id,
-            num_bytes: range.end - range.start,
+            num_bytes,
+            num_iops,
             priority,
             bypass_backpressure,
             state: TaskState::Initial {
@@ -642,7 +651,7 @@ impl IoQueue {
         result
     }
 
-    fn poll(&self, task_id: u64, cx: &mut Context<'_>) -> Poll<Result<Bytes>> {
+    fn poll(&self, task_id: u64, cx: &mut Context<'_>) -> Poll<Result<Vec<Bytes>>> {
         let mut state = self.state.lock().unwrap();
         let Some(task) = state.tasks.get_mut(&task_id) else {
             // This should never happen and indicates a bug
@@ -704,7 +713,7 @@ pub(super) struct TaskHandle {
 }
 
 impl Future for TaskHandle {
-    type Output = Result<Bytes>;
+    type Output = Result<Vec<Bytes>>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.queue.poll(self.task_id, cx)
     }
@@ -736,7 +745,7 @@ mod tests {
             |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
                 Box::new(move || {
                     order.lock().unwrap().push(prio);
-                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                    Box::pin(async move { Ok(vec![rx.await.unwrap()]) })
                 })
             };
 
@@ -746,7 +755,8 @@ mod tests {
         let blocker = queue
             .clone()
             .submit(
-                0..10,
+                10,
+                1,
                 0,
                 make_run_fn(0, blocker_rx, start_order.clone()),
                 false,
@@ -759,7 +769,8 @@ mod tests {
         let h30 = queue
             .clone()
             .submit(
-                0..10,
+                10,
+                1,
                 30,
                 make_run_fn(30, rx_30, start_order.clone()),
                 false,
@@ -770,7 +781,8 @@ mod tests {
         let h10 = queue
             .clone()
             .submit(
-                0..10,
+                10,
+                1,
                 10,
                 make_run_fn(10, rx_10, start_order.clone()),
                 false,
@@ -781,7 +793,8 @@ mod tests {
         let h50 = queue
             .clone()
             .submit(
-                0..10,
+                10,
+                1,
                 50,
                 make_run_fn(50, rx_50, start_order.clone()),
                 false,
@@ -792,7 +805,8 @@ mod tests {
         let h20 = queue
             .clone()
             .submit(
-                0..10,
+                10,
+                1,
                 20,
                 make_run_fn(20, rx_20, start_order.clone()),
                 false,
@@ -839,24 +853,24 @@ mod tests {
             |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
                 Box::new(move || {
                     order.lock().unwrap().push(prio);
-                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                    Box::pin(async move { Ok(vec![rx.await.unwrap()]) })
                 })
             };
 
         let (tx0, rx0) = oneshot::channel();
         let h0 = queue
             .clone()
-            .submit(0..10, 0, make_run_fn(0, rx0, start_order.clone()), false)
+            .submit(10, 1, 0, make_run_fn(0, rx0, start_order.clone()), false)
             .unwrap();
         let (tx1, rx1) = oneshot::channel();
         let h1 = queue
             .clone()
-            .submit(0..10, 1, make_run_fn(1, rx1, start_order.clone()), false)
+            .submit(10, 1, 1, make_run_fn(1, rx1, start_order.clone()), false)
             .unwrap();
         let (tx2, rx2) = oneshot::channel();
         let h2 = queue
             .clone()
-            .submit(0..10, 2, make_run_fn(2, rx2, start_order.clone()), false)
+            .submit(10, 1, 2, make_run_fn(2, rx2, start_order.clone()), false)
             .unwrap();
 
         // All three tasks start immediately — no backpressure budget check when max_bytes=0.
@@ -881,7 +895,7 @@ mod tests {
             |prio: u128, rx: oneshot::Receiver<Bytes>, order: Arc<Mutex<Vec<u128>>>| -> RunFn {
                 Box::new(move || {
                     order.lock().unwrap().push(prio);
-                    Box::pin(async move { Ok(rx.await.unwrap()) })
+                    Box::pin(async move { Ok(vec![rx.await.unwrap()]) })
                 })
             };
 
@@ -890,7 +904,8 @@ mod tests {
         let blocker = queue
             .clone()
             .submit(
-                0..10,
+                10,
+                1,
                 0,
                 make_run_fn(0, blocker_rx, start_order.clone()),
                 false,
@@ -902,7 +917,8 @@ mod tests {
         let normal = queue
             .clone()
             .submit(
-                0..10,
+                10,
+                1,
                 1,
                 make_run_fn(1, normal_rx, start_order.clone()),
                 false,
@@ -914,7 +930,8 @@ mod tests {
         let bypass = queue
             .clone()
             .submit(
-                0..10,
+                10,
+                1,
                 2,
                 make_run_fn(2, bypass_rx, start_order.clone()),
                 true,

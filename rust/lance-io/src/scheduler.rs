@@ -158,7 +158,7 @@ impl IoQueueState {
                 || task.bypass_backpressure
                 || task.priority <= self.priorities_in_flight.min_in_flight()
         });
-        let head_task_blocked_by_iops = head_task.map(|_| self.iops_avail == 0);
+        let head_task_blocked_by_iops = head_task.map(|task| self.iops_avail < task.num_iops());
         let head_task_blocked_by_bytes = head_task.map(|task| {
             let bypasses_bytes = self.no_backpressure
                 || task.bypass_backpressure
@@ -177,7 +177,11 @@ impl IoQueueState {
             io_capacity: u64::from(self.io_capacity),
             iops_available: u64::from(self.iops_avail),
             active_iops: u64::from(self.io_capacity.saturating_sub(self.iops_avail)),
-            pending_iops: self.pending_requests.len() as u64,
+            pending_iops: self
+                .pending_requests
+                .iter()
+                .map(|task| u64::from(task.num_iops()))
+                .sum(),
             pending_bytes,
             bytes_available: self.bytes_avail,
             bytes_reserved: self.io_buffer_size as i64 - self.bytes_avail,
@@ -229,7 +233,7 @@ impl IoQueueState {
     }
 
     fn can_deliver_without_warning(&self, task: &IoTask) -> bool {
-        if self.iops_avail == 0 {
+        if self.iops_avail < task.num_iops() {
             false
         } else if self.no_backpressure
             || task.bypass_backpressure
@@ -250,7 +254,7 @@ impl IoQueueState {
         if self.can_deliver(task) {
             let skip_bytes_accounting = self.no_backpressure || task.bypass_backpressure;
             self.priorities_in_flight.push(task.priority);
-            self.iops_avail -= 1;
+            self.iops_avail -= task.num_iops();
             if !skip_bytes_accounting {
                 self.bytes_avail -= task.num_bytes() as i64;
                 if self.bytes_avail < 0 {
@@ -261,7 +265,9 @@ impl IoQueueState {
                     );
                 }
             }
-            Some(self.pending_requests.pop().unwrap())
+            let mut task = self.pending_requests.pop().unwrap();
+            task.is_admitted = true;
+            Some(task)
         } else {
             None
         }
@@ -326,10 +332,10 @@ impl IoQueue {
         }
     }
 
-    fn on_iop_complete(&self) {
+    fn on_iop_complete(&self, num_iops: u32) {
         let event = {
             let mut state = self.state.lock().unwrap();
-            state.iops_avail += 1;
+            state.iops_avail += num_iops;
             state.scheduler_state_event()
         };
         emit_scheduler_state_event(event, &self.stats);
@@ -377,6 +383,7 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     data_buffers: Vec<Bytes>,
     num_bytes: u64,
     priority: u128,
+    // One priority reservation per admitted batch, regardless of range count.
     num_reqs: usize,
     num_delivered: usize,
     err: Option<Error>,
@@ -392,7 +399,6 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
         when_done: F,
         num_data_buffers: u32,
         priority: u128,
-        num_reqs: usize,
         bypass_backpressure: bool,
         io_queue: Arc<IoQueue>,
     ) -> Self {
@@ -401,7 +407,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
             data_buffers: vec![Bytes::default(); num_data_buffers as usize],
             num_bytes: 0,
             priority,
-            num_reqs,
+            num_reqs: 0,
             num_delivered: 0,
             err: None,
             bypass_backpressure,
@@ -452,7 +458,9 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
 struct DataChunk {
     task_idx: usize,
     num_bytes: u64,
-    data: Result<Bytes>,
+    num_ranges: usize,
+    is_admitted: bool,
+    data: Result<Vec<Bytes>>,
 }
 
 trait DataSink: Send {
@@ -462,11 +470,16 @@ trait DataSink: Send {
 impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
     // Called by worker tasks to add data to the MutableBatch
     fn deliver_data(&mut self, data: DataChunk) {
-        self.num_bytes += data.num_bytes;
-        self.num_delivered += 1;
+        if data.is_admitted {
+            self.num_bytes += data.num_bytes;
+            self.num_reqs += 1;
+        }
+        self.num_delivered += data.num_ranges;
         match data.data {
-            Ok(data_bytes) => {
-                self.data_buffers[data.task_idx] = data_bytes;
+            Ok(buffers) => {
+                for (index, bytes) in buffers.into_iter().enumerate() {
+                    self.data_buffers[data.task_idx + index] = bytes;
+                }
             }
             Err(err) => {
                 // This keeps the original error, if present
@@ -478,10 +491,12 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
 
 struct IoTask {
     reader: Arc<dyn Reader>,
-    to_read: Range<u64>,
-    when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
+    to_read: Vec<Range<u64>>,
+    when_done: Box<dyn FnOnce(Result<Vec<Bytes>>, bool) + Send>,
     priority: u128,
     bypass_backpressure: bool,
+    // Only admitted tasks have concurrency and byte reservations to refund.
+    is_admitted: bool,
 }
 
 fn validate_read_length(
@@ -526,45 +541,92 @@ impl Ord for IoTask {
 }
 
 impl IoTask {
+    fn num_iops(&self) -> u32 {
+        self.to_read.len() as u32
+    }
+
     fn num_bytes(&self) -> u64 {
-        self.to_read.end - self.to_read.start
+        self.to_read
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum()
     }
     fn cancel(self) {
-        (self.when_done)(Err(Error::internal(
-            "Scheduler closed before I/O was completed".to_string(),
-        )));
+        (self.when_done)(
+            Err(Error::internal(
+                "Scheduler closed before I/O was completed".to_string(),
+            )),
+            self.is_admitted,
+        );
     }
 
     async fn run(self) {
         let file_path = self.reader.path().as_ref();
         let num_bytes = self.num_bytes();
-        let bytes = if self.to_read.start == self.to_read.end {
-            Ok(Bytes::new())
-        } else {
-            let bytes_fut = self
-                .reader
-                .get_range(self.to_read.start as usize..self.to_read.end as usize);
-            IOPS_COUNTER.fetch_add(1, Ordering::Release);
-            let num_bytes = self.num_bytes();
-            bytes_fut
-                .inspect(move |_| {
-                    BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
-                })
-                .await
-                .map_err(Error::from)
-                .and_then(|bytes| validate_read_length(self.reader.path(), &self.to_read, bytes))
-        };
+        let nonempty_ranges = self
+            .to_read
+            .iter()
+            .filter(|range| !range.is_empty())
+            .count();
+        IOPS_COUNTER.fetch_add(nonempty_ranges as u64, Ordering::Release);
+        let bytes = read_ranges(self.reader.clone(), self.to_read.clone()).await;
+        BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
         // Emit per-file I/O trace event only when tracing is enabled
-        tracing::trace!(
-            file = file_path,
-            bytes_read = num_bytes,
-            requests = 1,
-            range_start = self.to_read.start,
-            range_end = self.to_read.end,
-            "File I/O completed"
-        );
-        (self.when_done)(bytes);
+        for range in &self.to_read {
+            tracing::trace!(
+                file = file_path,
+                bytes_read = range.end - range.start,
+                requests = 1,
+                range_start = range.start,
+                range_end = range.end,
+                "File I/O completed"
+            );
+        }
+        (self.when_done)(bytes, self.is_admitted);
     }
+}
+
+// Construct the reader future eagerly: local readers may submit I/O before it
+// is polled. Both schedulers validate the batch before delivering any buffers.
+fn read_ranges(
+    reader: Arc<dyn Reader>,
+    ranges: Vec<Range<u64>>,
+) -> futures::future::BoxFuture<'static, Result<Vec<Bytes>>> {
+    let read = if ranges.len() == 1 {
+        let range = &ranges[0];
+        if range.is_empty() {
+            futures::future::ready(Ok(vec![Bytes::new()])).boxed()
+        } else {
+            reader
+                .get_range(range.start as usize..range.end as usize)
+                .map_ok(|bytes| vec![bytes])
+                .boxed()
+        }
+    } else {
+        reader.get_ranges(
+            ranges
+                .iter()
+                .map(|range| range.start as usize..range.end as usize)
+                .collect(),
+        )
+    };
+    async move {
+        let buffers = read.await?;
+        if buffers.len() != ranges.len() {
+            return Err(Error::io(format!(
+                "I/O request for file {} returned {} buffers, expected {}",
+                reader.path(),
+                buffers.len(),
+                ranges.len()
+            )));
+        }
+        ranges
+            .iter()
+            .zip(buffers)
+            .map(|(range, bytes)| validate_read_length(reader.path(), range, bytes))
+            .collect()
+    }
+    .boxed()
 }
 
 // Every time a scheduler starts up it launches a task to run the I/O loop.  This loop
@@ -803,6 +865,8 @@ pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
     io_queue: IoQueueType,
     stats: IoStats,
+    max_batch_bytes: u64,
+    max_batch_ranges: usize,
 }
 
 impl Debug for ScanScheduler {
@@ -913,6 +977,12 @@ impl ScanScheduler {
             IoQueueType::Standard(io_queue)
         };
         Arc::new(Self {
+            max_batch_ranges: io_capacity,
+            max_batch_bytes: if config.io_buffer_size_bytes == 0 {
+                object_store.max_iop_size()
+            } else {
+                object_store.max_iop_size().min(config.io_buffer_size_bytes)
+            },
             object_store,
             io_queue,
             stats,
@@ -995,13 +1065,13 @@ impl ScanScheduler {
     fn do_submit_request(
         &self,
         reader: Arc<dyn Reader>,
-        request: Vec<Range<u64>>,
+        request: Vec<Vec<Range<u64>>>,
         tx: oneshot::Sender<Response>,
         priority: u128,
         io_queue: &Arc<IoQueue>,
         bypass_backpressure: bool,
     ) {
-        let num_iops = request.len() as u32;
+        let num_iops = request.iter().map(Vec::len).sum::<usize>() as u32;
 
         let when_all_io_done = move |bytes_and_permits| {
             // We don't care if the receiver has given up so discard the result
@@ -1012,27 +1082,35 @@ impl ScanScheduler {
             when_all_io_done,
             num_iops,
             priority,
-            request.len(),
             bypass_backpressure,
             io_queue.clone(),
         ))));
 
-        for (task_idx, iop) in request.into_iter().enumerate() {
+        let mut task_idx = 0;
+        for ranges in request {
             let dest = dest.clone();
             let io_queue_clone = io_queue.clone();
-            let num_bytes = iop.end - iop.start;
+            let num_bytes = ranges.iter().map(|range| range.end - range.start).sum();
+            let num_ranges = ranges.len();
+            let batch_start = task_idx;
+            task_idx += num_ranges;
             let task = IoTask {
                 reader: reader.clone(),
-                to_read: iop,
+                to_read: ranges,
                 priority,
                 bypass_backpressure,
-                when_done: Box::new(move |data| {
-                    io_queue_clone.on_iop_complete();
+                is_admitted: false,
+                when_done: Box::new(move |data, is_admitted| {
+                    if is_admitted {
+                        io_queue_clone.on_iop_complete(num_ranges as u32);
+                    }
                     let mut dest = dest.lock().unwrap();
                     let chunk = DataChunk {
                         data,
-                        task_idx,
+                        task_idx: batch_start,
                         num_bytes,
+                        num_ranges,
+                        is_admitted,
                     };
                     dest.deliver_data(chunk);
                 }),
@@ -1044,7 +1122,7 @@ impl ScanScheduler {
     fn submit_request_standard(
         &self,
         reader: Arc<dyn Reader>,
-        request: Vec<Range<u64>>,
+        request: Vec<Vec<Range<u64>>>,
         priority: u128,
         io_queue: &Arc<IoQueue>,
         bypass_backpressure: bool,
@@ -1064,7 +1142,7 @@ impl ScanScheduler {
     fn submit_request_lite(
         &self,
         reader: Arc<dyn Reader>,
-        request: Vec<Range<u64>>,
+        request: Vec<Vec<Range<u64>>>,
         priority: u128,
         io_queue: &Arc<lite::IoQueue>,
         bypass_backpressure: bool,
@@ -1072,27 +1150,20 @@ impl ScanScheduler {
         // It's important that we submit all requests _before_ we await anything
         let maybe_tasks = request
             .into_iter()
-            .map(|task| {
+            .map(|ranges| {
                 let reader = reader.clone();
                 let queue = io_queue.clone();
-                let requested_range = task.clone();
-                let run_fn = Box::new(move || {
-                    let bytes_fut = reader
-                        .get_range(requested_range.start as usize..requested_range.end as usize);
-                    async move {
-                        let bytes = bytes_fut.await.map_err(Error::from)?;
-                        validate_read_length(reader.path(), &requested_range, bytes)
-                    }
-                    .boxed()
-                });
-                queue.submit(task, priority, run_fn, bypass_backpressure)
+                let num_bytes = ranges.iter().map(|range| range.end - range.start).sum();
+                let num_iops = ranges.len() as u64;
+                let run_fn = Box::new(move || read_ranges(reader, ranges));
+                queue.submit(num_bytes, num_iops, priority, run_fn, bypass_backpressure)
             })
             .collect::<Result<Vec<_>>>();
         match maybe_tasks {
             Ok(tasks) => async move {
                 let mut results = Vec::with_capacity(tasks.len());
                 for task in tasks {
-                    results.push(task.await?);
+                    results.extend(task.await?);
                 }
                 Ok(results)
             }
@@ -1108,18 +1179,42 @@ impl ScanScheduler {
         priority: u128,
         bypass_backpressure: bool,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
+        let max_ranges = reader
+            .max_ranges_per_request()
+            .min(self.max_batch_ranges)
+            .max(1);
+        let mut batches = Vec::new();
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0;
+        for range in request {
+            let num_bytes = range.end - range.start;
+            // A single large range retains the existing admission rules. Never
+            // combine it with more ranges beyond the configured byte budget.
+            if !batch.is_empty()
+                && (batch.len() == max_ranges
+                    || num_bytes > self.max_batch_bytes.saturating_sub(batch_bytes))
+            {
+                batches.push(std::mem::take(&mut batch));
+                batch_bytes = 0;
+            }
+            batch_bytes += num_bytes;
+            batch.push(range);
+        }
+        if !batch.is_empty() {
+            batches.push(batch);
+        }
         match &self.io_queue {
             IoQueueType::Standard(io_queue) => {
                 futures::future::Either::Left(self.submit_request_standard(
                     reader,
-                    request,
+                    batches,
                     priority,
                     io_queue,
                     bypass_backpressure,
                 ))
             }
             IoQueueType::Lite(io_queue) => futures::future::Either::Right(
-                self.submit_request_lite(reader, request, priority, io_queue, bypass_backpressure),
+                self.submit_request_lite(reader, batches, priority, io_queue, bypass_backpressure),
             ),
         }
     }
@@ -1402,10 +1497,11 @@ mod tests {
                 get_range_count: Arc::new(AtomicU64::new(0)),
                 path: Path::parse("test").unwrap(),
             }),
-            to_read: 0..1,
-            when_done: Box::new(|_| {}),
+            to_read: vec![0..1],
+            when_done: Box::new(|_, _| {}),
             priority,
             bypass_backpressure,
+            is_admitted: false,
         }
     }
 
@@ -1476,7 +1572,6 @@ mod tests {
             move |rsp| *response_clone.lock().unwrap() = Some(rsp),
             2, // num_data_buffers
             0, // priority
-            2, // num_reqs
             false,
             io_queue,
         );
@@ -2289,6 +2384,350 @@ mod tests {
         fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
             Box::pin(async { Ok(Bytes::from(vec![0u8; 1_000_000])) })
         }
+    }
+
+    #[tokio::test]
+    async fn test_default_reader_batch_preserves_eager_reads() {
+        let count = Arc::new(AtomicU64::new(0));
+        let reader = TrackingReader {
+            get_range_count: count.clone(),
+            path: Path::from("test"),
+        };
+        assert_eq!(reader.max_ranges_per_request(), 1);
+        let read = reader.get_ranges(vec![10..13, 0..2, 4..4, 10..13]);
+        assert_eq!(count.load(Ordering::Acquire), 3);
+        assert_eq!(
+            read.await
+                .unwrap()
+                .iter()
+                .map(Bytes::len)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 0, 3]
+        );
+        assert!(reader.get_ranges(vec![]).await.unwrap().is_empty());
+        let error = reader
+            .get_ranges(vec![Range { start: 4, end: 2 }])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid read range 4..2 for test")
+        );
+        assert_eq!(count.load(Ordering::Acquire), 3);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum BatchResult {
+        Success,
+        MissingBuffer,
+        ShortBuffer,
+        Error,
+    }
+
+    #[derive(Debug)]
+    struct BatchReader {
+        path: Path,
+        started: tokio::sync::mpsc::UnboundedSender<Vec<Range<usize>>>,
+        permits: Arc<tokio::sync::Semaphore>,
+        max_ranges: usize,
+        result: BatchResult,
+    }
+
+    impl lance_core::deepsize::DeepSizeOf for BatchReader {
+        fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl Reader for BatchReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+        fn block_size(&self) -> usize {
+            1
+        }
+        fn io_parallelism(&self) -> usize {
+            self.max_ranges
+        }
+        fn max_ranges_per_request(&self) -> usize {
+            self.max_ranges
+        }
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+            async { Ok(1024) }.boxed()
+        }
+        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+            async { Ok(Bytes::from(vec![0; 1024])) }.boxed()
+        }
+        fn get_range(
+            &self,
+            range: Range<usize>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            let read = self.get_ranges(vec![range]);
+            async move { Ok(read.await?.remove(0)) }.boxed()
+        }
+        fn get_ranges(
+            &self,
+            ranges: Vec<Range<usize>>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Vec<Bytes>>> {
+            self.started.send(ranges.clone()).unwrap();
+            let permits = self.permits.clone();
+            let result = self.result;
+            async move {
+                permits.acquire().await.unwrap().forget();
+                let mut buffers = ranges
+                    .into_iter()
+                    .map(|range| Bytes::from(range.map(|offset| offset as u8).collect::<Vec<_>>()))
+                    .collect::<Vec<_>>();
+                match result {
+                    BatchResult::Success => (),
+                    BatchResult::MissingBuffer => {
+                        buffers.pop();
+                    }
+                    BatchResult::ShortBuffer => {
+                        buffers[0] = Bytes::new();
+                    }
+                    BatchResult::Error => {
+                        return Err(object_store::Error::Generic {
+                            store: "BatchReader",
+                            source: "injected read failure".into(),
+                        });
+                    }
+                }
+                Ok(buffers)
+            }
+            .boxed()
+        }
+    }
+
+    fn batch_scheduler(use_lite: bool, capacity: usize, bytes: u64) -> Arc<ScanScheduler> {
+        let store = Arc::new(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("memory://").unwrap(),
+            Some(1),
+            None,
+            false,
+            false,
+            capacity,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        ScanScheduler::new(
+            store,
+            SchedulerConfig {
+                io_buffer_size_bytes: bytes,
+                use_lite_scheduler: Some(use_lite),
+            },
+        )
+    }
+
+    #[rstest]
+    #[case::standard_count(false, 2, 64, 2)]
+    #[case::lite_count(true, 2, 64, 2)]
+    #[case::standard_bytes(false, 4, 6, 2)]
+    #[case::lite_bytes(true, 4, 6, 2)]
+    #[case::standard_single(false, 4, 5, 1)]
+    #[case::lite_single(true, 4, 5, 1)]
+    #[case::standard_oversized(false, 4, 2, 1)]
+    #[case::lite_oversized(true, 4, 2, 1)]
+    #[case::standard_unlimited_bytes(false, 4, 0, 4)]
+    #[case::lite_unlimited_bytes(true, 4, 0, 4)]
+    #[tokio::test]
+    async fn test_batch_limits_and_order(
+        #[case] use_lite: bool,
+        #[case] capacity: usize,
+        #[case] budget: u64,
+        #[case] batch_size: usize,
+    ) {
+        let scheduler = batch_scheduler(use_lite, capacity, budget);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let reader = Arc::new(BatchReader {
+            path: Path::from("test"),
+            started,
+            permits: Arc::new(tokio::sync::Semaphore::new(5)),
+            max_ranges: 4,
+            result: BatchResult::Success,
+        });
+        let ranges = vec![0..3, 100..103, 200..203, 300..303, 400..403];
+        let result = timeout(
+            Duration::from_secs(2),
+            scheduler.submit_request(reader, ranges.clone(), 0, false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let expected = ranges
+            .iter()
+            .map(|range| Bytes::from(range.clone().map(|offset| offset as u8).collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        assert_eq!(result, expected);
+        let mut batches = Vec::new();
+        while let Ok(ranges) = starts.try_recv() {
+            batches.push(ranges);
+        }
+        batches.sort_by_key(|ranges| ranges[0].start);
+        assert_eq!(
+            batches,
+            ranges
+                .chunks(batch_size)
+                .map(|ranges| ranges
+                    .iter()
+                    .map(|r| r.start as usize..r.end as usize)
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[rstest]
+    #[case::standard_missing(false, BatchResult::MissingBuffer, "buffers, expected 2")]
+    #[case::lite_missing(true, BatchResult::MissingBuffer, "buffers, expected 2")]
+    #[case::standard_short(false, BatchResult::ShortBuffer, "returned 0 bytes, expected 3")]
+    #[case::lite_short(true, BatchResult::ShortBuffer, "returned 0 bytes, expected 3")]
+    #[case::standard_error(false, BatchResult::Error, "injected read failure")]
+    #[case::lite_error(true, BatchResult::Error, "injected read failure")]
+    #[tokio::test]
+    async fn test_batch_errors_release_budget(
+        #[case] use_lite: bool,
+        #[case] result: BatchResult,
+        #[case] message: &str,
+    ) {
+        let scheduler = batch_scheduler(use_lite, 2, 6);
+        let (started, _starts) = tokio::sync::mpsc::unbounded_channel();
+        let reader = Arc::new(BatchReader {
+            path: Path::from("test"),
+            started,
+            permits: Arc::new(tokio::sync::Semaphore::new(2)),
+            max_ranges: 2,
+            result,
+        });
+        let error = scheduler
+            .submit_request(reader.clone(), vec![0..3, 100..103], 0, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+        assert!(matches!(error, Error::IO { .. }));
+        if let IoQueueType::Standard(queue) = &scheduler.io_queue {
+            let state = queue.state.lock().unwrap();
+            assert_eq!(state.iops_avail, 2);
+            assert_eq!(state.bytes_avail, 6);
+            assert!(state.priorities_in_flight.is_empty());
+        }
+        // A lower-priority request must finish after the failed batch.
+        let reader = Arc::new(BatchReader {
+            result: BatchResult::Success,
+            path: reader.path.clone(),
+            started: reader.started.clone(),
+            permits: reader.permits.clone(),
+            max_ranges: reader.max_ranges,
+        });
+        assert_eq!(
+            timeout(
+                Duration::from_secs(2),
+                scheduler.submit_request(reader, vec![0..3, 100..103], 1, false)
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_reserves_each_iop() {
+        let scheduler = batch_scheduler(false, 3, 64);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let reader = Arc::new(BatchReader {
+            path: Path::from("test"),
+            started,
+            permits: permits.clone(),
+            max_ranges: 2,
+            result: BatchResult::Success,
+        });
+        let read = scheduler.submit_request(reader, vec![0..3, 10..13, 20..23, 30..33], 0, false);
+        assert_eq!(starts.recv().await.unwrap().len(), 2);
+        let IoQueueType::Standard(queue) = &scheduler.io_queue else {
+            unreachable!()
+        };
+        {
+            let state = queue.state.lock().unwrap();
+            assert_eq!(state.iops_avail, 1);
+            assert_eq!(state.pending_requests.len(), 1);
+        }
+        permits.add_permits(1);
+        assert_eq!(
+            timeout(Duration::from_secs(2), starts.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
+        permits.add_permits(1);
+        assert_eq!(read.await.unwrap().len(), 4);
+        assert_eq!(queue.state.lock().unwrap().iops_avail, 3);
+    }
+
+    #[tokio::test]
+    async fn test_closing_queue_does_not_refund_unreserved_batch() {
+        let scheduler = batch_scheduler(false, 2, 6);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let reader = Arc::new(BatchReader {
+            path: Path::from("test"),
+            started,
+            permits: permits.clone(),
+            max_ranges: 2,
+            result: BatchResult::Success,
+        });
+        let read = scheduler.submit_request(reader, vec![0..3, 10..13, 20..23, 30..33], 0, false);
+        assert_eq!(starts.recv().await.unwrap().len(), 2);
+        let IoQueueType::Standard(queue) = &scheduler.io_queue else {
+            unreachable!()
+        };
+        queue.close();
+        assert_eq!(queue.state.lock().unwrap().iops_avail, 0);
+        permits.add_permits(1);
+        let error = read.await.unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(error.to_string().contains("Scheduler closed"));
+        let state = queue.state.lock().unwrap();
+        assert_eq!(state.iops_avail, 2);
+        assert_eq!(state.bytes_avail, 6);
+        assert!(state.priorities_in_flight.is_empty());
+    }
+
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test]
+    async fn test_cancelled_batch_releases_reservation(#[case] use_lite: bool) {
+        let scheduler = batch_scheduler(use_lite, 2, 6);
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let reader = Arc::new(BatchReader {
+            path: Path::from("test"),
+            started,
+            permits: permits.clone(),
+            max_ranges: 2,
+            result: BatchResult::Success,
+        });
+        let abandoned = scheduler.submit_request(reader.clone(), vec![0..3, 100..103], 0, false);
+        assert_eq!(starts.recv().await.unwrap().len(), 2);
+        drop(abandoned);
+        // Standard keeps the admitted I/O running; lite cancels it on drop.
+        permits.add_permits(if use_lite { 1 } else { 2 });
+        let result = timeout(
+            Duration::from_secs(2),
+            scheduler.submit_request(reader, vec![0..3, 100..103], 1, false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(starts.recv().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

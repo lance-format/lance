@@ -150,6 +150,56 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// TODO: change to read_at()?
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>>;
 
+    /// Maximum number of ranges the scheduler should submit in one read.
+    ///
+    /// Readers with a native batch operation can override this. The default
+    /// preserves independent scheduling for local and custom readers.
+    fn max_ranges_per_request(&self) -> usize {
+        1
+    }
+
+    /// Read ranges, returning one buffer per range in the same order.
+    ///
+    /// Empty ranges return empty buffers. The default starts independent reads;
+    /// callers must bound the batch to their concurrency and memory budgets.
+    ///
+    /// ```no_run
+    /// # async fn example(reader: &dyn lance_io::traits::Reader) -> object_store::Result<()> {
+    /// let buffers = reader.get_ranges(vec![0..4, 16..20]).await?;
+    /// assert_eq!(buffers.len(), 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn get_ranges(
+        &self,
+        ranges: Vec<Range<usize>>,
+    ) -> BoxFuture<'static, object_store::Result<Vec<Bytes>>> {
+        if let Some(range) = ranges.iter().find(|range| range.start > range.end) {
+            let error = object_store::Error::Generic {
+                store: "Reader",
+                source: format!(
+                    "Invalid read range {}..{} for {}",
+                    range.start,
+                    range.end,
+                    self.path()
+                )
+                .into(),
+            };
+            return Box::pin(async move { Err(error) });
+        }
+        let reads = ranges
+            .into_iter()
+            .map(|range| {
+                if range.is_empty() {
+                    Box::pin(async { Ok(Bytes::new()) }) as BoxFuture<'static, _>
+                } else {
+                    self.get_range(range)
+                }
+            })
+            .collect::<Vec<_>>();
+        Box::pin(futures::future::try_join_all(reads))
+    }
+
     /// Read all bytes from the object.
     ///
     /// By default this reads the size in a separate IOP but some implementations

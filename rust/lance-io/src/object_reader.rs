@@ -227,6 +227,72 @@ impl Reader for CloudObjectReader {
         })
     }
 
+    fn max_ranges_per_request(&self) -> usize {
+        // object_store_opendal fetches at most eight ranges concurrently per
+        // reader. Larger batches would hold scheduler permits for idle ranges
+        // and reduce the total number of requests actually in flight.
+        self.io_parallelism().min(8)
+    }
+
+    fn get_ranges(&self, ranges: Vec<Range<usize>>) -> BoxFuture<'static, OSResult<Vec<Bytes>>> {
+        if let Some(range) = ranges.iter().find(|range| range.start > range.end) {
+            let error = object_store::Error::Generic {
+                store: "CloudObjectReader",
+                source: format!(
+                    "Invalid read range {}..{} for {}",
+                    range.start, range.end, self.path
+                )
+                .into(),
+            };
+            return Box::pin(async move { Err(error) });
+        }
+        let object_store = self.object_store.clone();
+        let path = self.path.clone();
+        let nonempty_ranges = ranges
+            .iter()
+            .filter(|range| !range.is_empty())
+            .map(|range| range.start as u64..range.end as u64)
+            .collect::<Vec<_>>();
+        Box::pin(async move {
+            if nonempty_ranges.is_empty() {
+                return Ok(vec![Bytes::new(); ranges.len()]);
+            }
+            let expected = nonempty_ranges.len();
+            let error_path = path.clone();
+            let bytes = do_with_retry(move || {
+                let object_store = object_store.clone();
+                let path = path.clone();
+                let ranges = nonempty_ranges.clone();
+                Box::pin(async move { object_store.get_ranges(&path, &ranges).await })
+            })
+            .await?;
+
+            if bytes.len() != expected {
+                return Err(object_store::Error::Generic {
+                    store: "CloudObjectReader",
+                    source: format!(
+                        "get_ranges for {error_path} returned {} buffers, expected {expected}",
+                        bytes.len()
+                    )
+                    .into(),
+                });
+            }
+            if bytes.len() == ranges.len() {
+                return Ok(bytes);
+            }
+            let mut result = vec![Bytes::new(); ranges.len()];
+            for ((index, _), bytes) in ranges
+                .iter()
+                .enumerate()
+                .filter(|(_, range)| !range.is_empty())
+                .zip(bytes)
+            {
+                result[index] = bytes;
+            }
+            Ok(result)
+        })
+    }
+
     #[instrument(level = "debug", skip_all)]
     fn get_all(&self) -> BoxFuture<'_, OSResult<Bytes>> {
         let get_request = Arc::new(GetRequest {

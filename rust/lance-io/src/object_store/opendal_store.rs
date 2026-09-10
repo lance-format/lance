@@ -31,7 +31,9 @@ pub(super) struct OpendalStore {
 impl OpendalStore {
     pub(super) fn new(operator: Operator) -> Self {
         Self {
-            inner: InnerOpendalStore::new(operator),
+            // The scheduler has already coalesced ranges and reserved their
+            // bytes. Do not fetch additional gaps outside that reservation.
+            inner: InnerOpendalStore::new(operator).with_get_ranges_gap(0),
         }
     }
 }
@@ -166,13 +168,265 @@ impl OSObjectStore for OpendalStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use bytes::Bytes;
     use futures::TryStreamExt;
     use object_store::ObjectStoreExt;
+    use opendal::raw::{self, oio};
     use opendal::services::Memory;
     use rstest::rstest;
 
+    use crate::object_reader::CloudObjectReader;
+    use crate::object_store::{DEFAULT_DOWNLOAD_RETRY_COUNT, ObjectStore};
+    use crate::scheduler::{ScanScheduler, SchedulerConfig};
+    use crate::traits::Reader;
+    use crate::utils::CachedFileSize;
+
     use super::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct ReadCounter {
+        readers: Arc<AtomicUsize>,
+        ranges: Arc<Mutex<Vec<opendal::BytesRange>>>,
+    }
+
+    impl raw::Layer for ReadCounter {
+        fn apply_service(&self, inner: raw::Servicer) -> raw::Servicer {
+            Arc::new(CountingService {
+                inner,
+                counter: self.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingService {
+        inner: raw::Servicer,
+        counter: ReadCounter,
+    }
+
+    impl raw::Service for CountingService {
+        type Reader = oio::Reader;
+        type Writer = oio::Writer;
+        type Lister = oio::Lister;
+        type Deleter = oio::Deleter;
+        type Copier = oio::Copier;
+        type Composer = oio::Composer;
+
+        fn info(&self) -> raw::ServiceInfo {
+            self.inner.info()
+        }
+        fn capability(&self) -> opendal::Capability {
+            self.inner.capability()
+        }
+        async fn create_dir(
+            &self,
+            ctx: &opendal::OperationContext,
+            path: &str,
+            args: opendal::raw::OpCreateDir,
+        ) -> opendal::Result<opendal::raw::RpCreateDir> {
+            self.inner.create_dir(ctx, path, args).await
+        }
+
+        async fn stat(
+            &self,
+            ctx: &opendal::OperationContext,
+            path: &str,
+            args: opendal::raw::OpStat,
+        ) -> opendal::Result<opendal::raw::RpStat> {
+            self.inner.stat(ctx, path, args).await
+        }
+
+        fn write(
+            &self,
+            ctx: &opendal::OperationContext,
+            path: &str,
+            args: opendal::raw::OpWrite,
+        ) -> opendal::Result<Self::Writer> {
+            self.inner.write(ctx, path, args)
+        }
+
+        fn delete(&self, ctx: &opendal::OperationContext) -> opendal::Result<Self::Deleter> {
+            self.inner.delete(ctx)
+        }
+
+        fn list(
+            &self,
+            ctx: &opendal::OperationContext,
+            path: &str,
+            args: opendal::raw::OpList,
+        ) -> opendal::Result<Self::Lister> {
+            self.inner.list(ctx, path, args)
+        }
+
+        fn copy(
+            &self,
+            ctx: &opendal::OperationContext,
+            from: &str,
+            to: &str,
+            args: opendal::raw::OpCopy,
+        ) -> opendal::Result<Self::Copier> {
+            self.inner.copy(ctx, from, to, args)
+        }
+
+        async fn rename(
+            &self,
+            ctx: &opendal::OperationContext,
+            from: &str,
+            to: &str,
+            args: opendal::raw::OpRename,
+        ) -> opendal::Result<opendal::raw::RpRename> {
+            self.inner.rename(ctx, from, to, args).await
+        }
+
+        async fn presign(
+            &self,
+            ctx: &opendal::OperationContext,
+            path: &str,
+            args: opendal::raw::OpPresign,
+        ) -> opendal::Result<opendal::raw::RpPresign> {
+            self.inner.presign(ctx, path, args).await
+        }
+        fn read(
+            &self,
+            ctx: &opendal::OperationContext,
+            path: &str,
+            args: raw::OpRead,
+        ) -> opendal::Result<Self::Reader> {
+            self.counter.readers.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(CountingReader {
+                inner: self.inner.read(ctx, path, args)?,
+                counter: self.counter.clone(),
+            }))
+        }
+    }
+
+    struct CountingReader {
+        inner: oio::Reader,
+        counter: ReadCounter,
+    }
+
+    impl oio::Read for CountingReader {
+        async fn open(
+            &self,
+            range: opendal::BytesRange,
+        ) -> opendal::Result<(raw::RpRead, Box<dyn oio::ReadStreamDyn>)> {
+            self.counter.ranges.lock().unwrap().push(range);
+            self.inner.open(range).await
+        }
+
+        async fn read(
+            &self,
+            range: opendal::BytesRange,
+        ) -> opendal::Result<(raw::RpRead, opendal::Buffer)> {
+            self.counter.ranges.lock().unwrap().push(range);
+            self.inner.read(range).await
+        }
+    }
+
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test]
+    async fn test_scheduler_batch_shares_opendal_reader(#[case] use_lite: bool) {
+        let operator = Operator::new(Memory::default()).unwrap();
+        operator.write("data", "0123456789abcdef").await.unwrap();
+        let counter = ReadCounter::default();
+        let store = Arc::new(OpendalStore::new(operator.layer(counter.clone())));
+        let object_store = Arc::new(ObjectStore::new(
+            store.clone(),
+            url::Url::parse("memory://").unwrap(),
+            Some(1),
+            None,
+            false,
+            false,
+            4,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig {
+                io_buffer_size_bytes: 64,
+                use_lite_scheduler: Some(use_lite),
+            },
+        );
+        let reader = Arc::new(
+            CloudObjectReader::new(
+                store,
+                Path::from("data"),
+                1,
+                Some(16),
+                DEFAULT_DOWNLOAD_RETRY_COUNT,
+            )
+            .unwrap(),
+        );
+        let file = scheduler
+            .open_file(&Path::from("data"), &CachedFileSize::new(16))
+            .await
+            .unwrap();
+        // Nearby ranges coalesce once in Lance; distant ranges stay separate.
+        let ranges = vec![0..2, 1..3, 8..10, 14..16];
+        let actual = file.submit_request(ranges, 0).await.unwrap();
+        assert_eq!(
+            actual,
+            vec![
+                Bytes::from_static(b"01"),
+                Bytes::from_static(b"12"),
+                Bytes::from_static(b"89"),
+                Bytes::from_static(b"ef")
+            ]
+        );
+        assert_eq!(counter.readers.load(Ordering::Relaxed), 1);
+        let mut reads = counter.ranges.lock().unwrap().clone();
+        reads.sort_by_key(opendal::BytesRange::offset);
+        assert_eq!(
+            reads,
+            vec![
+                opendal::BytesRange::new(0, Some(3)),
+                opendal::BytesRange::new(8, Some(2)),
+                opendal::BytesRange::new(14, Some(2))
+            ]
+        );
+        let stats = scheduler.stats();
+        assert_eq!(stats.iops, 3);
+        assert_eq!(stats.bytes_read, 7);
+
+        // The Reader API also preserves unsorted, duplicate and empty ranges.
+        let actual = reader
+            .get_ranges(vec![14..16, 4..4, 0..2, 14..16])
+            .await
+            .unwrap();
+        assert_eq!(
+            actual,
+            vec![
+                Bytes::from_static(b"ef"),
+                Bytes::new(),
+                Bytes::from_static(b"01"),
+                Bytes::from_static(b"ef")
+            ]
+        );
+        assert_eq!(counter.readers.load(Ordering::Relaxed), 2);
+        assert!(reader.get_ranges(vec![]).await.unwrap().is_empty());
+        assert_eq!(
+            reader.get_ranges(vec![4..4]).await.unwrap(),
+            vec![Bytes::new()]
+        );
+        assert_eq!(counter.readers.load(Ordering::Relaxed), 2);
+        let error = reader
+            .get_ranges(vec![Range { start: 4, end: 2 }])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid read range 4..2 for data")
+        );
+        assert_eq!(counter.readers.load(Ordering::Relaxed), 2);
+    }
 
     #[rstest]
     #[case::raw_reserved_character("tables/run~1/t.lance")]
