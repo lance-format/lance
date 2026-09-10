@@ -3262,7 +3262,7 @@ impl Scanner {
         }
 
         // Limit / offset
-        if use_limit_node && (self.limit.unwrap_or(0) > 0 || self.offset.is_some()) {
+        if use_limit_node && (self.limit.is_some() || self.offset.is_some()) {
             plan = self.limit_node(plan);
         }
 
@@ -8809,8 +8809,9 @@ mod test {
     async fn test_limit(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
+        #[values(false, true)] stable_row_ids: bool,
     ) -> Result<()> {
-        let test_ds = TestVectorDataset::new(data_storage_version, false).await?;
+        let test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids).await?;
         let dataset = &test_ds.dataset;
 
         let full_data = dataset.scan().try_into_batch().await?.slice(19, 2);
@@ -8823,6 +8824,15 @@ mod test {
 
         assert_eq!(actual.num_rows(), 2);
         assert_eq!(actual, full_data);
+
+        for filter in [None, Some("i > 2")] {
+            let mut scan = dataset.scan();
+            if let Some(filter) = filter {
+                scan.filter(filter)?;
+            }
+            let actual = scan.limit(Some(0), None)?.try_into_batch().await?;
+            assert_eq!(actual.num_rows(), 0);
+        }
         Ok(())
     }
 
