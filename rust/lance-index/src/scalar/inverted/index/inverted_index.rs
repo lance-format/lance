@@ -370,7 +370,7 @@ impl InvertedIndex {
             partitions: vec![Arc::new(InvertedPartition {
                 id: 0,
                 store,
-                tokens,
+                tokens: tokens.into(),
                 inverted_list,
                 docs: PartitionDocumentStore::Legacy(Arc::new(docs)),
                 token_set_format: TokenSetFormat::Arrow,

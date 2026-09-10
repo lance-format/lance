@@ -758,7 +758,7 @@ impl InvertedPartition {
         Ok(Self {
             id,
             store,
-            tokens,
+            tokens: tokens.into(),
             inverted_list: Arc::new(inverted_list),
             docs: PartitionDocumentStore::Modern(Arc::new(docs)),
             token_set_format,
