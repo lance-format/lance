@@ -654,6 +654,9 @@ message FragmentReuseIndexDetails {
     // Destination fragments in label order; counts are recorded at creation.
     repeated FragmentDigest destinations = 2;
     /* Exactly one mapping is required.
+     * New mapping types do not require an index_version increase if they preserve
+     * backward compatibility and older readers can handle them safely, including
+     * by falling back to a scan. Otherwise, index_version must increase.
      * Other field numbers may be used for ordinary metadata.
      */
     oneof mapping {
