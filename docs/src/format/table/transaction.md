@@ -466,6 +466,29 @@ The following operations are retryable conflicts with DataReplacement:
 A concurrent Delete or Update that only adds a deletion vector to a target fragment (without removing it) is compatible: the
 positional column file stays aligned and the rebase preserves the deletion vector.
 
+#### Replaced Offsets
+
+A replacement rewrites a whole column file, but its values may differ from the previous file on only some rows: a partial
+refresh, or a fill of rows that were null. `replaced_offset_bitmaps` lets the writer say which. It maps a replaced fragment's
+id to the physical row offsets whose values changed, encoded as a portable-serialized Roaring bitmap.
+
+When stable row ids are enabled, committing a replacement stamps `last_updated_at_version` (see
+[Row ID Lineage](row_id_lineage.md)) on each replaced fragment:
+
+- Absent, or absent for a fragment, or an empty bitmap: every row of that fragment takes the new version. This is what every
+  writer before this field produced.
+- Present for a fragment that already carries a `last_updated_at_version` sequence: only the listed offsets take the new
+  version; the other rows keep theirs.
+- Present for a fragment with no sequence to keep: every row takes the new version, since there is nothing to preserve.
+
+A writer must list every row whose value changed, including a row written as null that previously held a value. Listing
+rows that did not change is allowed and only over-stamps. Consumers must reject as invalid a transaction whose keys name a
+fragment that is not in `replacements`, whose bitmaps are not valid portable Roaring bitmaps, or whose offsets reach the
+fragment's physical row count.
+
+The field is additive: absent decodes as a full stamp, and readers that predate it ignore it, so no existing transaction
+changes meaning.
+
 ### DataOverlay
 
 Attaches [overlay files](data_overlay_file.md) to fragments, supplying new values
