@@ -945,7 +945,7 @@ mod tests {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("use_opendal".to_string(), use_opendal.to_string()),
-                    ("region".to_string(), "us-west-2".to_string()),
+                    ("region".to_string(), "us-east-1".to_string()),
                 ]),
             ))),
             ..Default::default()
