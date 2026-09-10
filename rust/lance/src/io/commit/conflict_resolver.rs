@@ -2097,28 +2097,21 @@ impl<'a> TransactionRebase<'a> {
                 let mut max_versions =
                     Vec::with_capacity(self.conflicting_frag_reuse_indices.len());
                 for committed_fri in &self.conflicting_frag_reuse_indices {
-                    let committed_fri_details = Arc::try_unwrap(
-                        load_frag_reuse_index_details(dataset, committed_fri)
-                            .await
-                            .unwrap(),
-                    )
-                    .unwrap();
+                    let committed_fri_details = Arc::unwrap_or_clone(
+                        load_frag_reuse_index_details(dataset, committed_fri).await?,
+                    );
                     let max_version = committed_fri_details
                         .versions
                         .into_iter()
                         .max_by_key(|v| v.dataset_version)
-                        .unwrap();
+                        .ok_or_else(|| Error::index("Cannot rebase an empty FRI history"))?;
                     max_versions.push(max_version);
                 }
 
                 // there should be only 1 frag_reuse_index in new indices
                 let new_fri = &new_indices[0];
-                let mut new_fri_details = Arc::try_unwrap(
-                    load_frag_reuse_index_details(dataset, new_fri)
-                        .await
-                        .unwrap(),
-                )
-                .unwrap();
+                let mut new_fri_details =
+                    Arc::unwrap_or_clone(load_frag_reuse_index_details(dataset, new_fri).await?);
                 new_fri_details.versions.extend(max_versions);
 
                 let new_frag_bitmap = new_fri_details.new_frag_bitmap();
@@ -2204,23 +2197,17 @@ impl<'a> TransactionRebase<'a> {
                     return Ok(self.transaction);
                 }
 
-                let mut new_fri_details = Arc::try_unwrap(
-                    load_frag_reuse_index_details(dataset, new_fri)
-                        .await
-                        .unwrap(),
-                )
-                .unwrap();
+                let mut new_fri_details =
+                    Arc::unwrap_or_clone(load_frag_reuse_index_details(dataset, new_fri).await?);
                 let mut min_dataset_version = new_fri_details
                     .versions
                     .iter()
                     .map(|v| v.dataset_version)
                     .min()
-                    .unwrap();
+                    .ok_or_else(|| Error::index("Cannot rebase an empty FRI history"))?;
                 for committed_fri in self.conflicting_frag_reuse_indices.into_iter() {
                     let committed_fri_details =
-                        load_frag_reuse_index_details(dataset, &committed_fri)
-                            .await
-                            .unwrap();
+                        load_frag_reuse_index_details(dataset, &committed_fri).await?;
                     let committed_min_dataset_version = committed_fri_details
                         .versions
                         .iter()
@@ -2392,6 +2379,47 @@ mod tests {
             .execute(vec![data])
             .await
             .unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case::rewrite(false)]
+    #[case::create_index(true)]
+    #[tokio::test]
+    async fn tagged_fri_rebase_returns_error_instead_of_panicking(#[case] create_index: bool) {
+        let dataset = test_dataset(4, 2).await;
+        let tagged = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: FRAG_REUSE_INDEX_NAME.into(),
+            fields: vec![],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let operation = if create_index {
+            Operation::CreateIndex {
+                new_indices: vec![tagged.clone()],
+                removed_indices: vec![tagged.clone()],
+            }
+        } else {
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(tagged.clone()),
+            }
+        };
+        let transaction = Transaction::new_from_version(dataset.manifest.version, operation);
+        let mut rebase = TransactionRebase::try_new(&dataset, transaction, None)
+            .await
+            .unwrap();
+        rebase.conflicting_frag_reuse_indices.push(tagged);
+        let error = rebase.finish(&dataset).await.unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("index_version 1"));
     }
 
     /// Helper function for tests to create UpdateConfig operations using old-style parameters

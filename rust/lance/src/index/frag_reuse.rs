@@ -22,6 +22,12 @@ pub async fn load_frag_reuse_index_details(
     dataset: &Dataset,
     index: &IndexMetadata,
 ) -> lance_core::Result<Arc<FragReuseIndexDetails>> {
+    if index.index_version != 0 {
+        return Err(Error::not_supported(format!(
+            "This operation requires interpreting FRI index_version {}; tagged FRI maintenance is not supported by this client. Upgrade to a client supporting this operation",
+            index.index_version
+        )));
+    }
     let details_any = index.index_details.clone();
     if details_any.is_none()
         || !details_any

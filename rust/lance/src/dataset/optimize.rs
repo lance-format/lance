@@ -957,6 +957,17 @@ pub async fn compact_files_with_planner(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
+    if dataset.manifest.writer_feature_flags & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
+        != 0
+        && crate::index::load_all_indices(dataset)
+            .await?
+            .iter()
+            .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
+    {
+        return Err(Error::not_supported(
+            "Compaction of FRI index_version 1 requires an upgraded writer",
+        ));
+    }
     let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
 
     // If nothing to compact, don't make a commit.
