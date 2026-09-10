@@ -653,8 +653,9 @@ message FragmentReuseIndexDetails {
     repeated FragmentDigest sources = 1;
     // Destination fragments in label order; counts are recorded at creation.
     repeated FragmentDigest destinations = 2;
-    // Exactly one mapping is required. New mapping types require a new FRI index_version.
-    // Other field numbers may be used for ordinary metadata.
+    /* Exactly one mapping is required. New mapping types require a new FRI index_version.
+     * Other field numbers may be used for ordinary metadata.
+     */
     oneof mapping {
       /* Concatenate surviving rows in source fragment order, preserving row order
        * within each fragment, then split into destination fragments.
