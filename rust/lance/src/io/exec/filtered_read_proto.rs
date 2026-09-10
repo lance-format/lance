@@ -125,6 +125,16 @@ fn fr_options_to_proto(
         None
     };
 
+    let physical_row_addr_allowlist = options
+        .physical_row_addr_prefilter
+        .as_ref()
+        .map(|rows| {
+            let mut bytes = Vec::with_capacity(rows.serialized_size());
+            rows.serialize_into(&mut bytes)?;
+            Ok::<Vec<u8>, Error>(bytes)
+        })
+        .transpose()?;
+
     Ok(pb::FilteredReadOptionsProto {
         scan_range_before_filter: options
             .scan_range_before_filter
@@ -150,6 +160,7 @@ fn fr_options_to_proto(
             .file_reader_options
             .as_ref()
             .and_then(|o| o.batch_size_bytes),
+        physical_row_addr_allowlist,
     })
 }
 
@@ -168,6 +179,13 @@ async fn fr_options_from_proto(
     if !proto.fragment_ids.is_empty() {
         let fragments = fragments_from_proto(&proto.fragment_ids, dataset)?;
         options = options.with_fragments(Arc::new(fragments));
+    }
+
+    // Physical row selection must remain an option until local planning. In
+    // particular, a serialized exec may not have a pre-computed plan yet.
+    if let Some(bytes) = proto.physical_row_addr_allowlist {
+        let rows = RowAddrTreeMap::deserialize_from(Cursor::new(bytes))?;
+        options = options.with_physical_row_addr_prefilter(Arc::new(rows));
     }
 
     // Scan ranges
@@ -783,6 +801,38 @@ mod tests {
         assert_eq!(
             exec.options().projection.field_ids,
             back.options().projection.field_ids
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unplanned_physical_row_addr_prefilter_roundtrip() {
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let rows = RowAddrTreeMap::from_iter([7u64]);
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_physical_row_addr_prefilter(Arc::new(rows.clone()));
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+        assert!(exec.plan().is_none());
+
+        let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        assert!(proto.plan.is_none());
+        assert!(
+            proto
+                .options
+                .as_ref()
+                .unwrap()
+                .physical_row_addr_allowlist
+                .is_some()
+        );
+
+        let back = filtered_read_exec_from_proto(proto, Some(dataset), None, &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            back.options().physical_row_addr_prefilter.as_deref(),
+            Some(&rows)
         );
     }
 

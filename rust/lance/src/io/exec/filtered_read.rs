@@ -709,6 +709,16 @@ impl FilteredReadStream {
             .fragments
             .clone()
             .unwrap_or_else(|| dataset.fragments().clone());
+        let fragments = match &options.physical_row_addr_prefilter {
+            Some(rows) => Arc::new(
+                fragments
+                    .iter()
+                    .filter(|fragment| rows.get(&(fragment.id as u32)).is_some())
+                    .cloned()
+                    .collect(),
+            ),
+            None => fragments,
+        };
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
         // not general enough" false positives from rustc
         let frag_futs = fragments
@@ -758,24 +768,35 @@ impl FilteredReadStream {
         };
 
         let num_physical_rows = file_fragment.physical_rows().await? as u64;
-        let (row_id_sequence, num_logical_rows, index_upper_ranges) =
-            if dataset.manifest.uses_stable_row_ids() {
-                let (row_id_sequence, index_upper_ranges) =
-                    if let Some(routing) = stable_index_routing {
-                        (routing.row_id_sequence, routing.upper_ranges)
-                    } else {
-                        (load_row_id_sequence(dataset.as_ref(), &frag).await?, None)
-                    };
-                let num_logical_rows = row_id_sequence.len();
-                (row_id_sequence, num_logical_rows, index_upper_ranges)
+        let (row_id_sequence, num_logical_rows, index_upper_ranges) = if dataset
+            .manifest
+            .uses_stable_row_ids()
+        {
+            let (row_id_sequence, index_upper_ranges) = if let Some(routing) = stable_index_routing
+            {
+                (routing.row_id_sequence, routing.upper_ranges)
             } else {
-                debug_assert!(stable_index_routing.is_none());
-                let row_ids_start = frag.id << 32;
-                let row_ids_end = row_ids_start + num_physical_rows;
-                let num_logical_rows = file_fragment.count_rows(None).await? as u64;
-                let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
-                (addrs_as_ids, num_logical_rows, None)
+                (load_row_id_sequence(dataset.as_ref(), &frag).await?, None)
             };
+            if row_id_sequence.len() != num_physical_rows {
+                return Err(Error::internal(format!(
+                    "row-id sequence length={} does not match physical_row_count={} for fragment_id={} in dataset version={}",
+                    row_id_sequence.len(),
+                    num_physical_rows,
+                    frag.id,
+                    dataset.version().version
+                )));
+            }
+            let num_logical_rows = row_id_sequence.len();
+            (row_id_sequence, num_logical_rows, index_upper_ranges)
+        } else {
+            debug_assert!(stable_index_routing.is_none());
+            let row_ids_start = frag.id << 32;
+            let row_ids_end = row_ids_start + num_physical_rows;
+            let num_logical_rows = file_fragment.count_rows(None).await? as u64;
+            let addrs_as_ids = Arc::new(RowIdSequence::from(row_ids_start..row_ids_end));
+            (addrs_as_ids, num_logical_rows, None)
+        };
         Ok(LoadedFragment {
             row_id_sequence,
             index_upper_ranges,
@@ -856,6 +877,20 @@ impl FilteredReadStream {
 
             let mut to_read: Vec<Range<u64>> =
                 Self::full_frag_range(*num_physical_rows, deletion_vector);
+
+            if let Some(rows) = &options.physical_row_addr_prefilter {
+                let fragment_id = fragment.id() as u32;
+                let Some(selection) = rows.get(&fragment_id) else {
+                    continue;
+                };
+                if let RowAddrSelection::Partial(bitmap) = selection {
+                    let requested = bitmap_to_ranges(bitmap);
+                    to_read = Self::intersect_ranges(&to_read, &requested);
+                    if to_read.is_empty() {
+                        continue;
+                    }
+                }
+            }
 
             if let Some(range_before_filter) = &options.scan_range_before_filter {
                 let range_start = range_offset;
@@ -1679,6 +1714,8 @@ pub struct FilteredReadOptions {
     pub fragment_readahead: Option<usize>,
     /// The fragments to read
     pub fragments: Option<Arc<Vec<Fragment>>>,
+    /// Physical `(fragment_id, row_offset)` allow-list applied before filters.
+    pub(crate) physical_row_addr_prefilter: Option<Arc<RowAddrTreeMap>>,
     /// The projection to use for the scan
     pub projection: Projection,
     /// If there is a scalar index input, and the index result we get from that input is exact,
@@ -1727,6 +1764,7 @@ impl FilteredReadOptions {
             file_reader_options: None,
             fragment_readahead: None,
             fragments: None,
+            physical_row_addr_prefilter: None,
             projection,
             refine_filter: None,
             full_filter: None,
@@ -1809,6 +1847,11 @@ impl FilteredReadOptions {
     /// Scan results will be returned in the order of the fragments given here.
     pub fn with_fragments(mut self, fragments: Arc<Vec<Fragment>>) -> Self {
         self.fragments = Some(fragments);
+        self
+    }
+
+    pub(crate) fn with_physical_row_addr_prefilter(mut self, rows: Arc<RowAddrTreeMap>) -> Self {
+        self.physical_row_addr_prefilter = Some(rows);
         self
     }
 
@@ -2440,6 +2483,16 @@ impl FilteredReadExec {
                     .fragments
                     .clone()
                     .unwrap_or_else(|| dataset.fragments().clone());
+                let fragments = match &options.physical_row_addr_prefilter {
+                    Some(rows) => Arc::new(
+                        fragments
+                            .iter()
+                            .filter(|fragment| rows.get(&(fragment.id as u32)).is_some())
+                            .cloned()
+                            .collect(),
+                    ),
+                    None => fragments,
+                };
 
                 let with_deleted_rows = options.with_deleted_rows;
                 // A range before filtering is expressed in dataset/fragment order. Planning it
@@ -3469,7 +3522,10 @@ impl ExecutionPlan for FilteredReadExec {
             // a scalar-index result) the rows are selected by that input, so a pre-range
             // would apply before selection and keep the wrong rows; leave the limit to a
             // node above the read instead.
-            if self.options.scan_range_before_filter.is_some() || self.index_input().is_some() {
+            if self.options.scan_range_before_filter.is_some()
+                || self.options.physical_row_addr_prefilter.is_some()
+                || self.index_input().is_some()
+            {
                 return None;
             }
             updated_options.scan_range_before_filter = Some(0..(limit as u64));

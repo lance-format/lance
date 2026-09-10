@@ -68,6 +68,7 @@ public class AsyncScanner implements AutoCloseable {
           createAsyncScanner(
               dataset,
               options.getFragmentIds(),
+              options.getFragmentSlices(),
               options.getColumns(),
               options.getSubstraitFilter(),
               options.getFilter(),
@@ -100,6 +101,7 @@ public class AsyncScanner implements AutoCloseable {
   static native AsyncScanner createAsyncScanner(
       Dataset dataset,
       Optional<List<Integer>> fragmentIds,
+      Optional<List<FragmentSlice>> fragmentSlices,
       Optional<List<String>> columns,
       Optional<ByteBuffer> substraitFilter,
       Optional<String> filter,

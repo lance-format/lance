@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
@@ -15,8 +16,9 @@ use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
-    ExecutionSummaryCounts, MaterializationStyle, Scanner,
+    ExecutionSummaryCounts, MaterializationStyle, RowAddrTreeMap, Scanner,
 };
+use lance_core::utils::address::RowAddress;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     DocumentGranularity,
@@ -257,6 +259,7 @@ fn get_document_granularity(
 /// Scanner options passed from JNI - shared between blocking and async scanners
 pub(crate) struct ScannerOptions<'a> {
     pub fragment_ids_obj: JObject<'a>,
+    pub fragment_slices_obj: JObject<'a>,
     pub columns_obj: JObject<'a>,
     pub substrait_filter_obj: JObject<'a>,
     pub filter_obj: JObject<'a>,
@@ -283,6 +286,152 @@ pub(crate) struct ScannerOptions<'a> {
     pub disable_scoring_autoprojection: jboolean,
 }
 
+#[derive(Debug)]
+struct FragmentSlice {
+    fragment_id: u32,
+    row_offset: u64,
+    row_count: u64,
+}
+
+fn parse_fragment_slices(
+    env: &mut JNIEnv<'_>,
+    fragment_slices_obj: &JObject<'_>,
+) -> Result<Option<Vec<FragmentSlice>>> {
+    env.get_list_opt(fragment_slices_obj, |env, java_slice| {
+        if java_slice.is_null() {
+            return Err(Error::input_error(
+                "fragmentSlices must not contain null".to_string(),
+            ));
+        }
+        let fragment_id = env
+            .call_method(java_slice, "getFragmentId", "()I", &[])?
+            .i()?;
+        let row_offset = env
+            .call_method(java_slice, "getRowOffset", "()J", &[])?
+            .j()?;
+        let row_count = env
+            .call_method(java_slice, "getRowCount", "()J", &[])?
+            .j()?;
+        Ok(FragmentSlice {
+            fragment_id: u32::try_from(fragment_id).map_err(|_| {
+                Error::input_error(format!(
+                    "fragmentId must be non-negative, got {fragment_id}"
+                ))
+            })?,
+            row_offset: u64::try_from(row_offset).map_err(|_| {
+                Error::input_error(format!("rowOffset must be non-negative, got {row_offset}"))
+            })?,
+            row_count: u64::try_from(row_count).map_err(|_| {
+                Error::input_error(format!("rowCount must be non-negative, got {row_count}"))
+            })?,
+        })
+    })
+}
+
+fn apply_fragment_slices(
+    env: &mut JNIEnv<'_>,
+    dataset: &lance::Dataset,
+    scanner: &mut Scanner,
+    fragment_slices_obj: &JObject<'_>,
+    fragment_ids: Option<&[jint]>,
+) -> Result<()> {
+    let Some(slices) = parse_fragment_slices(env, fragment_slices_obj)? else {
+        return Ok(());
+    };
+
+    let mut slices_by_fragment = BTreeMap::<u32, Vec<(u64, u64)>>::new();
+    for slice in slices {
+        slices_by_fragment
+            .entry(slice.fragment_id)
+            .or_default()
+            .push((slice.row_offset, slice.row_count));
+    }
+
+    let (physical_rows, fragments_by_id) = block_on(async {
+        let mut physical_rows = RowAddrTreeMap::new();
+        let mut fragments_by_id = BTreeMap::new();
+        for (fragment_id, ranges) in slices_by_fragment {
+            let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
+                return Err(Error::input_error(format!(
+                    "fragment slice references fragment_id={fragment_id}, which is not present in dataset version={}",
+                    dataset.version().version
+                )));
+            };
+            let physical_row_count =
+                u64::try_from(fragment.physical_rows().await?).map_err(|_| {
+                    Error::runtime_error(format!(
+                        "physical row count does not fit in u64 for fragment_id={fragment_id}"
+                    ))
+                })?;
+            let mut validated_ranges = Vec::with_capacity(ranges.len());
+            for (row_offset, row_count) in ranges {
+                let end = row_offset.checked_add(row_count).ok_or_else(|| {
+                    Error::input_error(format!(
+                        "fragment slice end overflow: fragment_id={fragment_id}, row_offset={row_offset}, row_count={row_count}, physical_row_count={physical_row_count}, dataset_version={}",
+                        dataset.version().version
+                    ))
+                })?;
+                if row_offset > physical_row_count || end > physical_row_count {
+                    return Err(Error::input_error(format!(
+                        "fragment slice is outside fragment bounds: fragment_id={fragment_id}, row_offset={row_offset}, row_count={row_count}, physical_row_count={physical_row_count}, dataset_version={}",
+                        dataset.version().version
+                    )));
+                }
+                if end > RowAddress::FRAGMENT_SIZE {
+                    return Err(Error::input_error(format!(
+                        "fragment slice exceeds the physical row-address limit: fragment_id={fragment_id}, row_offset={row_offset}, row_count={row_count}, physical_row_count={physical_row_count}, dataset_version={}",
+                        dataset.version().version
+                    )));
+                }
+                if row_offset == end {
+                    continue;
+                }
+                validated_ranges.push(row_offset..end);
+            }
+
+            validated_ranges.sort_unstable_by_key(|range| (range.start, range.end));
+            let mut merged_ranges: Vec<Range<u64>> = Vec::with_capacity(validated_ranges.len());
+            for range in validated_ranges {
+                if let Some(previous) = merged_ranges.last_mut()
+                    && range.start <= previous.end
+                {
+                    previous.end = previous.end.max(range.end);
+                } else {
+                    merged_ranges.push(range);
+                }
+            }
+
+            for range in merged_ranges {
+                let row_offset = range.start;
+                let row_count = range.end - range.start;
+                let row_offset = u32::try_from(row_offset).map_err(|_| {
+                    Error::input_error(format!(
+                        "rowOffset exceeds the row-address limit: fragment_id={fragment_id}, row_offset={row_offset}"
+                    ))
+                })?;
+                let start = u64::from(RowAddress::new_from_parts(fragment_id, row_offset));
+                physical_rows.insert_range(start..start + row_count);
+            }
+            fragments_by_id.insert(fragment_id, fragment.metadata().clone());
+        }
+        Ok((physical_rows, fragments_by_id))
+    })?;
+
+    // Preserve fragmentIds ordering while applying the documented intersection with slices.
+    // The per-fragment physical ranges remain separate until filtered-read planning intersects
+    // them with deletion state and any scalar-index result.
+    let fragments = match fragment_ids {
+        Some(fragment_ids) => fragment_ids
+            .iter()
+            .filter_map(|fragment_id| fragments_by_id.get(&(*fragment_id as u32)).cloned())
+            .collect(),
+        None => fragments_by_id.into_values().collect(),
+    };
+    scanner.with_fragments(fragments);
+    scanner.with_physical_row_addr_prefilter(physical_rows);
+    Ok(())
+}
+
 /// Build a scanner with options applied - shared by blocking and async scanners
 pub(crate) fn build_scanner_with_options<'a>(
     env: &mut JNIEnv<'a>,
@@ -293,10 +442,10 @@ pub(crate) fn build_scanner_with_options<'a>(
 
     // handle fragment_ids
     let fragment_ids_opt = env.get_ints_opt(&options.fragment_ids_obj)?;
-    if let Some(fragment_ids) = fragment_ids_opt {
+    if let Some(fragment_ids) = fragment_ids_opt.as_ref() {
         let mut fragments = Vec::with_capacity(fragment_ids.len());
         for fragment_id in fragment_ids {
-            let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
+            let Some(fragment) = dataset.get_fragment(*fragment_id as usize) else {
                 return Err(Error::input_error(format!(
                     "Fragment {fragment_id} not found"
                 )));
@@ -305,6 +454,14 @@ pub(crate) fn build_scanner_with_options<'a>(
         }
         scanner.with_fragments(fragments);
     }
+
+    apply_fragment_slices(
+        env,
+        dataset,
+        &mut scanner,
+        &options.fragment_slices_obj,
+        fragment_ids_opt.as_deref(),
+    )?;
 
     let columns_opt = env.get_strings_opt(&options.columns_obj)?;
     if let Some(columns) = columns_opt {
@@ -513,31 +670,32 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     mut env: JNIEnv<'local>,
     _reader: JObject<'local>,
     jdataset: JObject<'local>,
-    fragment_ids_obj: JObject<'local>, // Optional<List<Integer>>
-    columns_obj: JObject<'local>,      // Optional<List<String>>
+    fragment_ids_obj: JObject<'local>,    // Optional<List<Integer>>
+    fragment_slices_obj: JObject<'local>, // Optional<List<FragmentSlice>>
+    columns_obj: JObject<'local>,         // Optional<List<String>>
     substrait_filter_obj: JObject<'local>, // Optional<ByteBuffer>
-    filter_obj: JObject<'local>,       // Optional<String>
-    batch_size_obj: JObject<'local>,   // Optional<Long>
+    filter_obj: JObject<'local>,          // Optional<String>
+    batch_size_obj: JObject<'local>,      // Optional<Long>
     batch_size_bytes_obj: JObject<'local>, // Optional<Long>
-    io_buffer_size_obj: JObject<'local>, // Optional<Long>
-    limit_obj: JObject<'local>,        // Optional<Integer>
-    offset_obj: JObject<'local>,       // Optional<Integer>
-    query_obj: JObject<'local>,        // Optional<Query>
-    fts_query_obj: JObject<'local>,    // Optional<FullTextQuery>
-    prefilter: jboolean,               // boolean
-    with_row_id: jboolean,             // boolean
-    with_row_address: jboolean,        // boolean
-    batch_readahead: jint,             // int
+    io_buffer_size_obj: JObject<'local>,  // Optional<Long>
+    limit_obj: JObject<'local>,           // Optional<Integer>
+    offset_obj: JObject<'local>,          // Optional<Integer>
+    query_obj: JObject<'local>,           // Optional<Query>
+    fts_query_obj: JObject<'local>,       // Optional<FullTextQuery>
+    prefilter: jboolean,                  // boolean
+    with_row_id: jboolean,                // boolean
+    with_row_address: jboolean,           // boolean
+    batch_readahead: jint,                // int
     fragment_readahead_obj: JObject<'local>, // Optional<Integer>
-    scan_in_order: jboolean,           // boolean
+    scan_in_order: jboolean,              // boolean
     late_materialization_obj: JObject<'local>, // Optional<MaterializationStyle>
-    column_orderings: JObject<'local>, // Optional<List<ColumnOrdering>>
-    use_scalar_index: jboolean,        // boolean
-    fast_search: jboolean,             // boolean
+    column_orderings: JObject<'local>,    // Optional<List<ColumnOrdering>>
+    use_scalar_index: jboolean,           // boolean
+    fast_search: jboolean,                // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
-    collect_stats: jboolean,           // boolean
-    include_deleted_rows: jboolean,    // boolean
-    strict_batch_size: jboolean,       // boolean
+    collect_stats: jboolean,              // boolean
+    include_deleted_rows: jboolean,       // boolean
+    strict_batch_size: jboolean,          // boolean
     disable_scoring_autoprojection: jboolean, // boolean
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -546,6 +704,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             &mut env,
             jdataset,
             fragment_ids_obj,
+            fragment_slices_obj,
             columns_obj,
             substrait_filter_obj,
             filter_obj,
@@ -580,6 +739,7 @@ fn inner_create_scanner<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject<'local>,
     fragment_ids_obj: JObject<'local>,
+    fragment_slices_obj: JObject<'local>,
     columns_obj: JObject<'local>,
     substrait_filter_obj: JObject<'local>,
     filter_obj: JObject<'local>,
@@ -613,6 +773,7 @@ fn inner_create_scanner<'local>(
 
     let options = ScannerOptions {
         fragment_ids_obj,
+        fragment_slices_obj,
         columns_obj,
         substrait_filter_obj,
         filter_obj,

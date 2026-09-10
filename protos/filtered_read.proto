@@ -74,6 +74,11 @@ message FilteredReadOptionsProto {
    * row-based batch_size. This corresponds to FileReaderOptions.batch_size_bytes.
    */
   optional uint64 batch_size_bytes = 14;
+  /* If present, only these physical (fragment_id, row_offset) addresses are
+   * eligible for the scan. The bytes contain a serialized RowAddrTreeMap.
+   * If absent, no physical row-address restriction is applied.
+   */
+  optional bytes physical_row_addr_allowlist = 15;
 }
 
 /* Serializable form of FilteredReadPlan (planned/distributed mode).
