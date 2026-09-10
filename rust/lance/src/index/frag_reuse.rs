@@ -8,7 +8,7 @@ use lance_index::frag_reuse::{
     CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_DETAILS_FILE_NAME,
     FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
 };
-use lance_index::scalar::{MetricsCollector, RowIdRemapping};
+use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, RowIdRemapper};
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
@@ -19,12 +19,42 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+/// The remapper generation resolved for one index open.
+///
+/// The two arms never meet: `Legacy` feeds the pre-existing synchronous
+/// consumers exactly as before tagged histories existed, while `Batch` feeds
+/// the additive `*_with_remapping` entry points that may await row-map reads.
+#[derive(Clone)]
+pub(crate) enum ResolvedRemapping {
+    /// A v0 (or identity) mapping served by the compact in-memory handle.
+    Legacy(Arc<dyn RowIdRemapper>),
+    /// A tagged-history mapping whose payload may need asynchronous reads.
+    Batch(Arc<dyn BatchRowIdRemapper>),
+}
+
+/// Scope the dataset-level index cache for one resolved remapping.
+///
+/// This owns the single cache-scoping rule: a batch (tagged-history) mapping
+/// rewrites addresses per manifest snapshot, so its entries are keyed under
+/// the manifest path; every other shape keeps the pre-existing keys.
+pub(crate) fn scoped_index_cache(
+    dataset: &Dataset,
+    resolved: &Option<(Uuid, ResolvedRemapping)>,
+) -> crate::session::index_caches::DSIndexCache {
+    crate::session::index_caches::DSIndexCache(match resolved {
+        Some((_, ResolvedRemapping::Batch(_))) => dataset
+            .index_cache
+            .with_key_prefix(dataset.manifest_location.path.as_ref()),
+        _ => dataset.index_cache.0.clone(),
+    })
+}
+
 /// Resolve the FRI remapper shared by scalar and vector index loading.
 pub(super) async fn open_row_id_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
-) -> lance_core::Result<Option<(Uuid, RowIdRemapping)>> {
+) -> lance_core::Result<Option<(Uuid, ResolvedRemapping)>> {
     let indices = dataset.load_indices().await?;
     let Some(fri) = indices
         .iter()
@@ -36,7 +66,7 @@ pub(super) async fn open_row_id_remapping(
         return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
             (
                 legacy.uuid,
-                RowIdRemapping::InMemory(Arc::new(CompactFragReuseIndexHandle(legacy))),
+                ResolvedRemapping::Legacy(Arc::new(CompactFragReuseIndexHandle(legacy))),
             )
         }));
     }
@@ -58,7 +88,7 @@ pub(super) async fn open_row_id_remapping(
             CompactFragReuseIndex::try_new(fri.uuid, FragReuseIndexDetails { versions: vec![] })?;
         return Ok(Some((
             fri.uuid,
-            RowIdRemapping::InMemory(Arc::new(CompactFragReuseIndexHandle(Arc::new(identity)))),
+            ResolvedRemapping::Legacy(Arc::new(CompactFragReuseIndexHandle(Arc::new(identity)))),
         )));
     }
     let coverage = indices
@@ -90,7 +120,7 @@ pub(super) async fn open_row_id_remapping(
     }
     Ok(Some((
         fri.uuid,
-        RowIdRemapping::External(Arc::new(
+        ResolvedRemapping::Batch(Arc::new(
             super::frag_reuse_remapping::QueryRowIdRemapper::new(
                 mapping,
                 coverage,

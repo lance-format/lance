@@ -1395,13 +1395,15 @@ mod tests {
         let storage = create_pq_storage().await;
         let mapping = pq_remap_compact();
         let expected = storage.remap(&mapping).unwrap();
-        let remapping =
-            lance_index_core::remapping::RowIdRemapping::External(Arc::new(Mapping(mapping)));
+        let remapping = Mapping(mapping);
         let row_id_idx = storage.batch.schema().index_of(ROW_ID).unwrap();
-        let (batch, remapper) = remapping
-            .remap_row_ids_preserving_layout(storage.batch.clone(), row_id_idx)
-            .await
-            .unwrap();
+        let (batch, remapper) = lance_index_core::remapping::remap_row_ids_preserving_layout_async(
+            &remapping,
+            storage.batch.clone(),
+            row_id_idx,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             batch.column_by_name(PQ_CODE_COLUMN),
             storage.batch.column_by_name(PQ_CODE_COLUMN)

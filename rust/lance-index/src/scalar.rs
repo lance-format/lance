@@ -24,7 +24,7 @@ use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
 
 use crate::IndexParams;
 pub use crate::metrics::MetricsCollector;
-pub use lance_index_core::remapping::{BatchRowIdRemapper, RowIdRemapping};
+pub use lance_index_core::remapping::BatchRowIdRemapper;
 pub use lance_index_core::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
     LANCE_SCALAR_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,

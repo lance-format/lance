@@ -17,7 +17,7 @@ mod scorer;
 pub mod tokenizer;
 mod wand;
 
-use lance_index_core::remapping::RowIdRemapping;
+use lance_index_core::remapping::BatchRowIdRemapper;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
@@ -605,7 +605,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        frag_reuse_index: Option<RowIdRemapping>,
+        frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let index =

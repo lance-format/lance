@@ -3056,17 +3056,8 @@ impl DatasetIndexInternalExt for Dataset {
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
         let object_store = self.object_store_for_index(&index_meta).await?;
         let resolved = frag_reuse::open_row_id_remapping(self, &index_meta, metrics).await?;
+        let query_cache = frag_reuse::scoped_index_cache(self, &resolved);
         let remapping = resolved.map(|(_, remapping)| remapping);
-        let is_tagged = matches!(
-            remapping,
-            Some(lance_index::scalar::RowIdRemapping::External(_))
-        );
-        let query_cache = crate::session::index_caches::DSIndexCache(if is_tagged {
-            self.index_cache
-                .with_key_prefix(self.manifest_location.path.as_ref())
-        } else {
-            self.index_cache.0.clone()
-        });
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());

@@ -15,8 +15,8 @@ pub(crate) mod ngram;
 pub(crate) mod rtree;
 pub(crate) mod zonemap;
 
+use super::frag_reuse::ResolvedRemapping;
 pub use inverted::{load_segment_details, load_segment_params, load_segments};
-use lance_index::scalar::RowIdRemapping;
 
 pub use crate::index::scalar_logical::{LogicalScalarIndex, load_named_scalar_segments};
 
@@ -574,25 +574,21 @@ pub async fn open_scalar_index(
 
     let resolved = super::frag_reuse::open_row_id_remapping(dataset, index, metrics).await?;
     let cache_id = resolved.as_ref().map(|(uuid, _)| uuid);
-    let remapping = resolved.as_ref().map(|(_, remapping)| remapping.clone());
-    let is_tagged = matches!(remapping, Some(RowIdRemapping::External(_)));
-    let index_cache = dataset.index_cache.for_index(&index.uuid, cache_id);
-    let index_cache = if is_tagged {
-        index_cache.with_key_prefix(dataset.manifest_location.path.as_ref())
-    } else {
-        index_cache
-    };
-    let frag_reuse_index = match &remapping {
-        Some(RowIdRemapping::InMemory(remapper)) => Some(remapper.clone()),
-        _ => None,
-    };
+    let index_cache =
+        super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
+    let (frag_reuse_index, batch_remapping) =
+        match resolved.as_ref().map(|(_, remapping)| remapping) {
+            Some(ResolvedRemapping::Legacy(remapper)) => (Some(remapper.clone()), None),
+            Some(ResolvedRemapping::Batch(remapper)) => (None, Some(remapper.clone())),
+            None => (None, None),
+        };
 
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
     // already validated this session, saving the extra `open_index_file` IOP.
     let load: ScalarIndexLoad = Box::pin({
         let index_store = index_store.clone();
-        let remapping = remapping.clone();
+        let batch_remapping = batch_remapping.clone();
         let frag_reuse_index = frag_reuse_index.clone();
         let index_cache = index_cache.clone();
         async move {
@@ -606,8 +602,8 @@ pub async fn open_scalar_index(
                 .await?;
             }
 
-            let index = match remapping {
-                Some(remapping @ RowIdRemapping::External(_)) => {
+            let index = match batch_remapping {
+                Some(remapping) => {
                     plugin
                         .load_index_with_remapping(
                             index_store,
@@ -617,7 +613,7 @@ pub async fn open_scalar_index(
                         )
                         .await?
                 }
-                _ => {
+                None => {
                     plugin
                         .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
                         .await?
@@ -630,7 +626,7 @@ pub async fn open_scalar_index(
         }
     });
 
-    if is_tagged {
+    if batch_remapping.is_some() {
         lance_index::scalar::registry::single_flight_store_bound_open(
             index_store,
             &index_cache,
@@ -649,17 +645,13 @@ pub(crate) async fn cached_scalar_index_container(
     uuid: &Uuid,
 ) -> Option<Arc<dyn ScalarIndex>> {
     let metadata = dataset.load_indices().await.ok()?;
-    let fri = metadata
-        .iter()
-        .find(|idx| idx.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
-    let index_cache = dataset
-        .index_cache
-        .for_index(uuid, fri.map(|idx| &idx.uuid));
-    let index_cache = if fri.is_some_and(|idx| idx.index_version != 0) {
-        index_cache.with_key_prefix(dataset.manifest_location.path.as_ref())
-    } else {
-        index_cache
-    };
+    let index = metadata.iter().find(|idx| idx.uuid == *uuid)?;
+    let resolved = super::frag_reuse::open_row_id_remapping(dataset, index, &NoOpMetricsCollector)
+        .await
+        .ok()?;
+    let cache_id = resolved.as_ref().map(|(fri_uuid, _)| fri_uuid);
+    let index_cache =
+        super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(uuid, cache_id);
     index_cache
         .get_unsized_with_key(&ScalarIndexCacheKey)
         .await

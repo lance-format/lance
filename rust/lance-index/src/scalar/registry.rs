@@ -19,7 +19,7 @@ use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
 use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
-use lance_index_core::remapping::RowIdRemapping;
+use lance_index_core::remapping::BatchRowIdRemapper;
 // Re-export training types that were previously defined here
 pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
@@ -166,29 +166,31 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ) -> Result<Arc<dyn ScalarIndex>>;
 
     /// Whether this plugin can await batch row-ID translation while loading its data.
+    ///
+    /// Returning `true` requires overriding
+    /// [`load_index_with_remapping`](Self::load_index_with_remapping).
     fn supports_batch_row_id_remapping(&self) -> bool {
         false
     }
 
-    /// Load with a shared remapper, preserving the existing synchronous plugin API.
+    /// Load under a mapping whose payload may require asynchronous reads.
+    ///
+    /// This entry point is additive; the legacy [`load_index`](Self::load_index)
+    /// path never routes through it.
     async fn load_index_with_remapping(
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        remapping: Option<RowIdRemapping>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let legacy = match remapping {
-            None => None,
-            Some(RowIdRemapping::InMemory(remapper)) => Some(remapper),
-            Some(RowIdRemapping::External(_)) => {
-                return Err(lance_core::Error::not_supported(format!(
-                    "{} does not support asynchronous row-ID remapping",
-                    self.name()
-                )));
-            }
-        };
-        self.load_index(index_store, index_details, legacy, cache)
+        if remapping.is_some() {
+            return Err(lance_core::Error::not_supported(format!(
+                "{} does not support asynchronous row-ID remapping",
+                self.name()
+            )));
+        }
+        self.load_index(index_store, index_details, None, cache)
             .await
     }
 

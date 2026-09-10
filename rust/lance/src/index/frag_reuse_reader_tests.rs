@@ -791,7 +791,7 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
             assert_eq!(fri.index_version, 0);
             let (uuid, remapping) = resolved.unwrap();
             assert_eq!(uuid, fri.uuid);
-            let lance_index::scalar::RowIdRemapping::InMemory(remapper) = remapping else {
+            let super::super::frag_reuse::ResolvedRemapping::Legacy(remapper) = remapping else {
                 panic!("V1 must use the synchronous remapper");
             };
             let legacy = dataset

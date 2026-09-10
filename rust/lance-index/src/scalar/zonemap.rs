@@ -25,7 +25,7 @@ use crate::scalar::{
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use lance_index_core::remapping::RowIdRemapping;
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::sync::LazyLock;
@@ -114,7 +114,10 @@ pub struct ZoneMapIndex {
     rows_per_zone: u64,
     use_seeds: bool,
     store: Arc<dyn IndexStore>,
-    fri: Option<RowIdRemapping>,
+    fri: Option<Arc<dyn RowIdRemapper>>,
+    // Set only by `load_with_remapping`; mutually exclusive with `fri` by
+    // construction.
+    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
     index_cache: WeakLanceCache,
     // Exact set of null row addresses across all zones; None when loaded from an
     // older index that did not persist this bitmap.
@@ -510,10 +513,25 @@ impl ZoneMapIndex {
         }
     }
 
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+        use_seeds: bool,
+    ) -> Result<Arc<Self>> {
+        let index = Self::load(store, None, index_cache, use_seeds).await?;
+        let mut index = Arc::into_inner(index)
+            .ok_or_else(|| Error::internal("freshly loaded zone map index must be unshared"))?;
+        index.batch_remapper = remapping;
+        Ok(Arc::new(index))
+    }
+
     /// Load the scalar index from storage
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<RowIdRemapping>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
         use_seeds: bool,
     ) -> Result<Arc<Self>>
@@ -556,7 +574,7 @@ impl ZoneMapIndex {
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
-        fri: Option<RowIdRemapping>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
         rows_per_zone: u64,
         null_rows: Option<RowAddrTreeMap>,
@@ -622,6 +640,7 @@ impl ZoneMapIndex {
                 use_seeds,
                 store,
                 fri,
+                batch_remapper: None,
                 index_cache: WeakLanceCache::from(index_cache),
                 null_rows,
             });
@@ -664,6 +683,7 @@ impl ZoneMapIndex {
             use_seeds,
             store,
             fri,
+            batch_remapper: None,
             index_cache: WeakLanceCache::from(index_cache),
             null_rows,
         })
@@ -726,15 +746,24 @@ impl ScalarIndex for ZoneMapIndex {
             })?
         };
 
-        let Some(remapper) = &self.fri else {
+        let (selected, nulls) = if let Some(remapper) = &self.fri {
+            (
+                remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows()),
+                remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows()),
+            )
+        } else if let Some(remapper) = &self.batch_remapper {
+            (
+                remap_row_addrs_tree_map_async(
+                    remapper.as_ref(),
+                    result.row_addrs().selected_rows(),
+                )
+                .await?,
+                remap_row_addrs_tree_map_async(remapper.as_ref(), result.row_addrs().null_rows())
+                    .await?,
+            )
+        } else {
             return Ok(result);
         };
-        let selected = remapper
-            .remap_row_addrs_tree_map(result.row_addrs().selected_rows())
-            .await?;
-        let nulls = remapper
-            .remap_row_addrs_tree_map(result.row_addrs().null_rows())
-            .await?;
 
         Ok(match result {
             SearchResult::Exact(_) => SearchResult::exact(selected).with_nulls(nulls),
@@ -1009,11 +1038,11 @@ pub async fn merge_zonemap_indices(
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut any_missing_bitmap = false;
     for source in source_indices {
-        let remapper = source
-            .fri
-            .as_ref()
-            .map(RowIdRemapping::synchronous)
-            .transpose()?;
+        if source.batch_remapper.is_some() {
+            return Err(Error::not_supported(
+                "this index maintenance operation does not support asynchronous row-ID remapping",
+            ));
+        }
         if source.rows_per_zone != rows_per_zone {
             return Err(Error::invalid_input(format!(
                 "cannot merge ZoneMap segments with different rows_per_zone values: {} and {}",
@@ -1027,13 +1056,13 @@ pub async fn merge_zonemap_indices(
             )));
         }
         let remapped_null_rows = source.null_rows.as_ref().map(|null_rows| {
-            remapper.map_or_else(
+            source.fri.as_deref().map_or_else(
                 || null_rows.clone(),
                 |remapper| remapper.remap_row_addrs_tree_map(null_rows),
             )
         });
         for zone in &source.zones {
-            let source_zones = remapper.map_or_else(
+            let source_zones = source.fri.as_deref().map_or_else(
                 || Ok(vec![zone.clone()]),
                 |remapper| {
                     remap_zone(
@@ -1529,13 +1558,10 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             .ok()
             .and_then(|d| d.use_seeds)
             .unwrap_or(false);
-        Ok(ZoneMapIndex::load(
-            index_store,
-            frag_reuse_index.map(RowIdRemapping::InMemory),
-            cache,
-            use_seeds,
+        Ok(
+            ZoneMapIndex::load(index_store, frag_reuse_index, cache, use_seeds).await?
+                as Arc<dyn ScalarIndex>,
         )
-        .await? as Arc<dyn ScalarIndex>)
     }
 
     fn supports_batch_row_id_remapping(&self) -> bool {
@@ -1546,7 +1572,7 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        frag_reuse_index: Option<RowIdRemapping>,
+        frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let use_seeds = index_details
@@ -1555,8 +1581,8 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             .and_then(|d| d.use_seeds)
             .unwrap_or(false);
         Ok(
-            ZoneMapIndex::load(index_store, frag_reuse_index, cache, use_seeds).await?
-                as Arc<dyn ScalarIndex>,
+            ZoneMapIndex::load_with_remapping(index_store, frag_reuse_index, cache, use_seeds)
+                .await? as Arc<dyn ScalarIndex>,
         )
     }
 
@@ -1954,7 +1980,6 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
 mod tests {
     use crate::scalar::registry::VALUE_COLUMN_NAME;
     use crate::scalar::{IndexStore, zonemap::ROWS_PER_ZONE_DEFAULT};
-    use lance_index_core::remapping::RowIdRemapping;
     use std::sync::Arc;
 
     use crate::scalar::zoned::ZoneBound;
@@ -2210,10 +2235,7 @@ mod tests {
         zone.min = ScalarValue::Decimal128(None, 38, 10);
         zone.max = ScalarValue::Decimal128(None, 38, 10);
         source_mut.null_rows = None;
-        source_mut.fri = Some(RowIdRemapping::InMemory(Arc::new(TestRemapper::new([(
-            1,
-            3_u64 << 32,
-        )]))));
+        source_mut.fri = Some(Arc::new(TestRemapper::new([(1, 3_u64 << 32)])));
 
         let candidate = ScalarValue::Decimal128(Some(200), 38, 10);
         let queries = [
@@ -3693,6 +3715,7 @@ mod tests {
             use_seeds: false,
             store: test_store,
             fri: None,
+            batch_remapper: None,
             index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
             null_rows: None,
         };
@@ -3767,6 +3790,7 @@ mod tests {
             use_seeds: false,
             store: test_store,
             fri: None,
+            batch_remapper: None,
             index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
             null_rows: None,
         };
@@ -3836,6 +3860,7 @@ mod tests {
             use_seeds: false,
             store: test_store,
             fri: None,
+            batch_remapper: None,
             index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
             null_rows: None,
         };

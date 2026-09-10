@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Shared row-ID translation at asynchronous index loading boundaries.
+//! Batch row-ID translation at asynchronous index loading boundaries.
+//!
+//! Legacy consumers keep calling [`RowIdRemapper`] directly; nothing in this
+//! module participates in that path. The free helpers here serve the additive
+//! entry points that load indices under a mapping whose payload may require
+//! asynchronous reads, awaiting translation once per batch, never once per row.
 
 use std::sync::Arc;
 
@@ -20,163 +25,121 @@ pub trait BatchRowIdRemapper: Send + Sync + std::fmt::Debug {
     async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>>;
 }
 
-/// A shared remapper for both in-memory mappings and encodings requiring I/O.
-///
-/// Existing [`RowIdRemapper`] implementations keep their synchronous fast paths.
-/// External encodings are awaited once per batch, never once per row.
-///
-/// ```
-/// # use lance_index_core::remapping::RowIdRemapping;
-/// # async fn example(remapping: &RowIdRemapping) -> lance_core::Result<()> {
-/// let mapped = remapping.remap_row_ids(&[42, 43]).await?;
-/// assert_eq!(mapped.len(), 2);
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone, Debug)]
-pub enum RowIdRemapping {
-    /// An existing synchronous remapper, including FRI V1.
-    InMemory(Arc<dyn RowIdRemapper>),
-    /// A mapping whose payload may need asynchronous reads.
-    External(Arc<dyn BatchRowIdRemapper>),
+// Bitmap compression can hide millions of rows. Bound temporary translation buffers.
+const BATCH_SIZE: usize = 64 * 1024;
+
+/// Translate row IDs in input order, preserving duplicates and deleted positions.
+pub async fn remap_row_ids_async(
+    remapper: &dyn BatchRowIdRemapper,
+    row_ids: &[u64],
+) -> Result<Vec<Option<u64>>> {
+    let mut result = Vec::with_capacity(row_ids.len());
+    for batch in row_ids.chunks(BATCH_SIZE) {
+        let mapped = remapper.remap_row_ids(batch).await?;
+        if mapped.len() != batch.len() {
+            return Err(Error::internal(format!(
+                "row-ID remapper returned {} results for {} inputs",
+                mapped.len(),
+                batch.len()
+            )));
+        }
+        result.extend(mapped);
+    }
+    Ok(result)
 }
 
-impl RowIdRemapping {
-    /// Require an in-memory mapping for an operation that cannot await translation.
-    pub fn synchronous(&self) -> Result<&dyn RowIdRemapper> {
-        match self {
-            Self::InMemory(remapper) => Ok(remapper.as_ref()),
-            Self::External(_) => Err(Error::not_supported(
-                "this index maintenance operation does not support asynchronous row-ID remapping",
-            )),
-        }
-    }
-
-    /// Translate only the address column, leaving encoded columns in their original layout.
-    ///
-    /// The returned synchronous remapper removes tombstone slots during the
-    /// consumer's layout-aware decoding. No per-row lookup table is retained.
-    pub async fn remap_row_ids_preserving_layout(
-        &self,
-        batch: RecordBatch,
-        row_id_idx: usize,
-    ) -> Result<(RecordBatch, Arc<dyn RowIdRemapper>)> {
-        if let Self::InMemory(remapper) = self {
-            return Ok((batch, remapper.clone()));
-        }
-        let ids = batch
-            .columns()
-            .get(row_id_idx)
-            .and_then(|array| array.as_primitive_opt::<UInt64Type>())
-            .ok_or_else(|| {
-                Error::invalid_input(format!("row-ID column {row_id_idx} must have type UInt64"))
-            })?;
-        let tombstone = lance_core::utils::address::RowAddress::TOMBSTONE_ROW;
-        let mut translated = Vec::with_capacity(ids.len());
-        for start in (0..ids.len()).step_by(64 * 1024) {
-            let end = (start + 64 * 1024).min(ids.len());
-            let inputs: Vec<_> = (start..end)
-                .map(|position| {
-                    if ids.is_null(position) {
-                        tombstone
-                    } else {
-                        ids.value(position)
-                    }
-                })
-                .collect();
-            let mapped = self.remap_row_ids(&inputs).await?;
-            translated.extend(mapped.into_iter().enumerate().map(|(offset, id)| {
-                if ids.is_null(start + offset) {
+/// Translate only the address column, leaving encoded columns in their original layout.
+///
+/// The returned synchronous remapper removes tombstone slots during the
+/// consumer's layout-aware decoding. No per-row lookup table is retained.
+pub async fn remap_row_ids_preserving_layout_async(
+    remapper: &dyn BatchRowIdRemapper,
+    batch: RecordBatch,
+    row_id_idx: usize,
+) -> Result<(RecordBatch, Arc<dyn RowIdRemapper>)> {
+    let ids = batch
+        .columns()
+        .get(row_id_idx)
+        .and_then(|array| array.as_primitive_opt::<UInt64Type>())
+        .ok_or_else(|| {
+            Error::invalid_input(format!("row-ID column {row_id_idx} must have type UInt64"))
+        })?;
+    let tombstone = lance_core::utils::address::RowAddress::TOMBSTONE_ROW;
+    let mut translated = Vec::with_capacity(ids.len());
+    for start in (0..ids.len()).step_by(BATCH_SIZE) {
+        let end = (start + BATCH_SIZE).min(ids.len());
+        let inputs: Vec<_> = (start..end)
+            .map(|position| {
+                if ids.is_null(position) {
                     tombstone
                 } else {
-                    id.unwrap_or(tombstone)
+                    ids.value(position)
                 }
-            }));
-        }
-        let mut columns = batch.columns().to_vec();
-        columns[row_id_idx] = Arc::new(UInt64Array::from(translated));
-        let batch = RecordBatch::try_new(batch.schema(), columns)?;
-        Ok((batch, Arc::new(TombstoneRowIdRemapper)))
-    }
-
-    /// Translate row IDs in input order, preserving duplicates and deleted positions.
-    pub async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
-        match self {
-            Self::InMemory(remapper) => Ok(row_ids
-                .iter()
-                .map(|id| remapper.remap_row_id(*id))
-                .collect()),
-            Self::External(remapper) => {
-                let mut result = Vec::with_capacity(row_ids.len());
-                for batch in row_ids.chunks(64 * 1024) {
-                    let mapped = remapper.remap_row_ids(batch).await?;
-                    if mapped.len() != batch.len() {
-                        return Err(Error::internal(format!(
-                            "row-ID remapper returned {} results for {} inputs",
-                            mapped.len(),
-                            batch.len()
-                        )));
-                    }
-                    result.extend(mapped);
-                }
-                Ok(result)
+            })
+            .collect();
+        let mapped = remap_row_ids_async(remapper, &inputs).await?;
+        translated.extend(mapped.into_iter().enumerate().map(|(offset, id)| {
+            if ids.is_null(start + offset) {
+                tombstone
+            } else {
+                id.unwrap_or(tombstone)
             }
-        }
+        }));
     }
+    let mut columns = batch.columns().to_vec();
+    columns[row_id_idx] = Arc::new(UInt64Array::from(translated));
+    let batch = RecordBatch::try_new(batch.schema(), columns)?;
+    Ok((batch, Arc::new(TombstoneRowIdRemapper)))
+}
 
-    /// Translate a row-ID column and remove deleted rows from every column.
-    pub async fn remap_row_ids_record_batch(
-        &self,
-        batch: RecordBatch,
-        row_id_idx: usize,
-    ) -> Result<RecordBatch> {
-        if let Self::InMemory(remapper) = self {
-            return remapper.remap_row_ids_record_batch(batch, row_id_idx);
-        }
-        let (batch, remapper) = self
-            .remap_row_ids_preserving_layout(batch, row_id_idx)
-            .await?;
-        remapper.remap_row_ids_record_batch(batch, row_id_idx)
-    }
+/// Translate a row-ID column and remove deleted rows from every column.
+pub async fn remap_record_batch_async(
+    remapper: &dyn BatchRowIdRemapper,
+    batch: RecordBatch,
+    row_id_idx: usize,
+) -> Result<RecordBatch> {
+    let (batch, remapper) =
+        remap_row_ids_preserving_layout_async(remapper, batch, row_id_idx).await?;
+    remapper.remap_row_ids_record_batch(batch, row_id_idx)
+}
 
-    /// Translate an explicit physical row selection, dropping deleted addresses.
-    pub async fn remap_row_addrs_tree_map(&self, rows: &RowAddrTreeMap) -> Result<RowAddrTreeMap> {
-        if let Self::InMemory(remapper) = self {
-            return Ok(remapper.remap_row_addrs_tree_map(rows));
-        }
-        let ids = rows.row_addrs().ok_or_else(|| Error::not_supported(
-            "batch row-ID remapping requires explicit row addresses, not whole-fragment selections"
-        ))?.map(u64::from);
-        self.remap_iter(ids).await
-    }
+/// Translate an explicit physical row selection, dropping deleted addresses.
+pub async fn remap_row_addrs_tree_map_async(
+    remapper: &dyn BatchRowIdRemapper,
+    rows: &RowAddrTreeMap,
+) -> Result<RowAddrTreeMap> {
+    let ids = rows.row_addrs().ok_or_else(|| Error::not_supported(
+        "batch row-ID remapping requires explicit row addresses, not whole-fragment selections"
+    ))?.map(u64::from);
+    remap_iter(remapper, ids).await
+}
 
-    /// Translate a bitmap of row IDs, dropping deleted rows.
-    pub async fn remap_row_ids_roaring_tree_map(
-        &self,
-        rows: &RoaringTreemap,
-    ) -> Result<RoaringTreemap> {
-        if let Self::InMemory(remapper) = self {
-            return Ok(remapper.remap_row_ids_roaring_tree_map(rows));
-        }
-        self.remap_iter(rows.iter()).await
-    }
+/// Translate a bitmap of row IDs, dropping deleted rows.
+pub async fn remap_row_ids_roaring_tree_map_async(
+    remapper: &dyn BatchRowIdRemapper,
+    rows: &RoaringTreemap,
+) -> Result<RoaringTreemap> {
+    remap_iter(remapper, rows.iter()).await
+}
 
-    async fn remap_iter<C: Default + Extend<u64>>(
-        &self,
-        mut ids: impl Iterator<Item = u64>,
-    ) -> Result<C> {
-        // Bitmap compression can hide millions of rows. Bound temporary translation buffers.
-        const BATCH_SIZE: usize = 64 * 1024;
-        let mut result = C::default();
-        loop {
-            let batch = ids.by_ref().take(BATCH_SIZE).collect::<Vec<_>>();
-            if batch.is_empty() {
-                break;
-            }
-            result.extend(self.remap_row_ids(&batch).await?.into_iter().flatten());
+async fn remap_iter<C: Default + Extend<u64>>(
+    remapper: &dyn BatchRowIdRemapper,
+    mut ids: impl Iterator<Item = u64>,
+) -> Result<C> {
+    let mut result = C::default();
+    loop {
+        let batch = ids.by_ref().take(BATCH_SIZE).collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
         }
-        Ok(result)
+        result.extend(
+            remap_row_ids_async(remapper, &batch)
+                .await?
+                .into_iter()
+                .flatten(),
+        );
     }
+    Ok(result)
 }
 
 #[derive(Debug)]
@@ -258,17 +221,13 @@ mod tests {
     #[test]
     fn external_remapping_bounds_batches_and_preserves_layout() {
         block_on(async {
-            let external = Arc::new(ExternalMapping(AtomicUsize::new(0)));
-            let remapping = RowIdRemapping::External(external.clone());
+            let external = ExternalMapping(AtomicUsize::new(0));
             let batch = record_batch!(
                 ("id", UInt64, [Some(1), Some(3), None, Some(5)]),
                 ("value", Int32, [10, 30, 40, 50])
             )
             .unwrap();
-            let translated = remapping
-                .remap_row_ids_record_batch(batch, 0)
-                .await
-                .unwrap();
+            let translated = remap_record_batch_async(&external, batch, 0).await.unwrap();
             assert_eq!(
                 translated,
                 record_batch!(
@@ -282,8 +241,7 @@ mod tests {
                 Arc::new(UInt64Array::from(vec![1; 65537])) as arrow_array::ArrayRef,
             )])
             .unwrap();
-            let (batch, remapper) = remapping
-                .remap_row_ids_preserving_layout(batch, 0)
+            let (batch, remapper) = remap_row_ids_preserving_layout_async(&external, batch, 0)
                 .await
                 .unwrap();
             assert_eq!(batch.num_rows(), 65537);
@@ -293,20 +251,6 @@ mod tests {
                 remapper.remap_row_id(lance_core::utils::address::RowAddress::TOMBSTONE_ROW),
                 None
             );
-        });
-    }
-    #[test]
-    fn in_memory_keeps_the_existing_remapper() {
-        block_on(async {
-            let original: Arc<dyn RowIdRemapper> = Arc::new(TombstoneRowIdRemapper);
-            let remapping = RowIdRemapping::InMemory(original.clone());
-            let batch = record_batch!(("id", UInt64, [1])).unwrap();
-            let (unchanged, remapper) = remapping
-                .remap_row_ids_preserving_layout(batch.clone(), 0)
-                .await
-                .unwrap();
-            assert_eq!(unchanged, batch);
-            assert!(Arc::ptr_eq(&original, &remapper));
         });
     }
 }

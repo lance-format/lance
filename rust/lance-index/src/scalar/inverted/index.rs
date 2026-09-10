@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use lance_index_core::remapping::RowIdRemapping;
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_preserving_layout_async};
 use std::fmt::{Debug, Display};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
