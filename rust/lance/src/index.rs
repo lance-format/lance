@@ -2901,6 +2901,12 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 
+    /// Loads scalar index information, omitting logical indices with the given names.
+    async fn scalar_index_info_ignoring(
+        &self,
+        ignored_index_names: &HashSet<String>,
+    ) -> Result<ScalarIndexInfo>;
+
     /// Return the fragments that are not covered by any of the deltas of the index.
     async fn unindexed_fragments(&self, idx_name: &str) -> Result<Vec<Fragment>>;
 
@@ -3422,6 +3428,14 @@ impl DatasetIndexInternalExt for Dataset {
 
     #[instrument(level = "trace", skip_all)]
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
+        self.scalar_index_info_ignoring(&HashSet::new()).await
+    }
+
+    #[instrument(level = "trace", skip_all)]
+    async fn scalar_index_info_ignoring(
+        &self,
+        ignored_index_names: &HashSet<String>,
+    ) -> Result<ScalarIndexInfo> {
         let indices = self.load_indices().await?;
         let schema = self.schema();
         let mut indexed_fields = Vec::new();
@@ -3432,6 +3446,10 @@ impl DatasetIndexInternalExt for Dataset {
         // so the optimizer treats coverage as unknown.
         let mut fragment_bitmaps: HashMap<(String, String), Option<RoaringBitmap>> = HashMap::new();
         for index in indices.iter().filter(|idx| {
+            if ignored_index_names.contains(&idx.name) {
+                return false;
+            }
+
             // Check if this is an FTS index by looking at index details
             let is_fts_index = if let Some(details) = &idx.index_details {
                 IndexDetails(details.clone()).supports_fts()

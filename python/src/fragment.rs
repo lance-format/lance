@@ -211,7 +211,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, ignored_scalar_indices=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -226,6 +226,7 @@ impl FileFragment {
         blob_handling: Option<Bound<PyAny>>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
         use_scalar_index: Option<bool>,
+        ignored_scalar_indices: Option<Vec<String>>,
         io_buffer_size: Option<u64>,
         late_materialization: Option<Bound<PyAny>>,
         include_deleted_rows: Option<bool>,
@@ -304,6 +305,9 @@ impl FileFragment {
         }
         if let Some(use_scalar_index) = use_scalar_index {
             scanner.use_scalar_index(use_scalar_index);
+        }
+        if let Some(ignored_scalar_indices) = ignored_scalar_indices {
+            scanner.with_ignored_scalar_indices(ignored_scalar_indices);
         }
         if let Some(late_materialization) = late_materialization {
             if let Ok(style_as_bool) = late_materialization.extract::<bool>() {

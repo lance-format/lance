@@ -5380,6 +5380,24 @@ def test_use_scalar_index(tmp_path: Path):
     ).explain_plan(True)
 
 
+def test_ignored_scalar_indices(tmp_path: Path):
+    table = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("a", "ZONEMAP", name="a_zonemap")
+    dataset.create_scalar_index("b", "BTREE", name="b_btree")
+
+    scanner = dataset.scanner(
+        filter="a < 50 AND b < 50", ignored_scalar_indices=["a_zonemap"]
+    )
+    plan = scanner.explain_plan(True)
+    assert "@a_zonemap(ZoneMap)" not in plan
+    assert "@b_btree(BTree)" in plan
+    assert scanner.to_table().num_rows == 50
+
+    with pytest.raises(ValueError, match="must contain non-empty strings"):
+        dataset.scanner(ignored_scalar_indices=[""])
+
+
 def test_fast_search_scalar_index_skips_unindexed_fragments(tmp_path: Path):
     table = pa.table({"filter": range(100)})
     dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=100)
