@@ -2652,11 +2652,19 @@ mod tests {
     // while 20 neighbors provide a useful recall oracle.
     const PQ_MATRIX_NUM_ROWS: usize = 320;
     const PQ_MATRIX_K: usize = 20;
-    // An 8-bit PQ codebook has 256 centroids, so this is the smallest valid
-    // training fixture shared by the 8-bit and 4-bit runtime cases.
-    const LIGHTWEIGHT_PQ_ROWS: usize = 256;
+    const PQ_MATRIX_NUM_BITS: usize = 8;
     const LIGHTWEIGHT_PQ_PARTITIONS: usize = 2;
+    // An 8-bit PQ codebook has 256 codes and needs a training vector for each,
+    // so this is the smallest valid fixture, shared by the 8-bit and 4-bit
+    // runtime cases.
+    const LIGHTWEIGHT_PQ_ROWS: usize = 256;
     const LIGHTWEIGHT_PQ_SUB_VECTORS: usize = 4;
+
+    /// Partitions a fixture of `rows` supports at `num_bits`, capped by the
+    /// count the build asked for.
+    fn supported_partitions(rows: usize, num_bits: usize, requested: usize) -> usize {
+        requested.min(rows / (1usize << num_bits)).max(1)
+    }
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
@@ -3481,10 +3489,9 @@ mod tests {
         let expected_index_type = if use_hnsw { "IVF_HNSW_PQ" } else { "IVF_PQ" };
         let expected_sub_index = if use_hnsw { "HNSW" } else { "PQ" };
         assert_eq!(stats["index_type"], expected_index_type);
-        assert_eq!(
-            stats["indices"][0]["num_partitions"],
-            LIGHTWEIGHT_PQ_PARTITIONS
-        );
+        let expected_partitions =
+            supported_partitions(LIGHTWEIGHT_PQ_ROWS, num_bits, LIGHTWEIGHT_PQ_PARTITIONS);
+        assert_eq!(stats["indices"][0]["num_partitions"], expected_partitions);
         assert_eq!(
             stats["indices"][0]["sub_index"]["index_type"],
             expected_sub_index
@@ -5174,7 +5181,7 @@ mod tests {
         }
     }
 
-    fn pq_matrix_batch<T>() -> RecordBatch
+    fn pq_matrix_batch<T>(rows: usize) -> RecordBatch
     where
         T: ArrowPrimitiveType + 'static,
         T::Native: Copy + 'static,
@@ -5185,7 +5192,7 @@ mod tests {
             .with_seed(Seed(42))
             .col("id", array::step::<UInt64Type>())
             .col("vector", array::rand_vec::<T>(Dimension::from(DIM as u32)))
-            .into_batch_rows(RowCount::from(PQ_MATRIX_NUM_ROWS as u64))
+            .into_batch_rows(RowCount::from(rows as u64))
             .unwrap()
     }
 
@@ -5199,7 +5206,7 @@ mod tests {
         ivf_params.sample_rate = PQ_MATRIX_NUM_ROWS;
         let pq_params = PQBuildParams {
             num_sub_vectors: 4,
-            num_bits: 8,
+            num_bits: PQ_MATRIX_NUM_BITS,
             max_iters: 2,
             sample_rate: 1,
             ..Default::default()
@@ -5219,12 +5226,14 @@ mod tests {
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
-        let batch = pq_matrix_batch::<Float32Type>();
+        let params = pq_matrix_params(nlist, distance_type, version.clone());
+        let batch = pq_matrix_batch::<Float32Type>(PQ_MATRIX_NUM_ROWS);
+        let expected_partitions =
+            supported_partitions(PQ_MATRIX_NUM_ROWS, PQ_MATRIX_NUM_BITS, nlist);
         let schema = batch.schema();
         let query = batch["vector"].as_fixed_size_list().value(0);
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
-        let params = pq_matrix_params(nlist, distance_type, version.clone());
         dataset
             .create_index(
                 &["vector"],
@@ -5244,7 +5253,7 @@ mod tests {
         let index = &indices[0];
         assert_eq!(index["index_type"], "IVF_PQ");
         assert_eq!(index["metric_type"], distance_type.to_string());
-        assert_eq!(index["num_partitions"], nlist);
+        assert_eq!(index["num_partitions"], expected_partitions);
         assert_eq!(index["sub_index"]["index_type"], "PQ");
         assert_eq!(
             index["index_file_version"],
@@ -5622,7 +5631,7 @@ mod tests {
     #[tokio::test]
     async fn test_ivf_pq_f64_smoke(#[case] version: IndexFileVersion) {
         let test_dir = TempStrDir::default();
-        let batch = pq_matrix_batch::<Float64Type>();
+        let batch = pq_matrix_batch::<Float64Type>(PQ_MATRIX_NUM_ROWS);
         let schema = batch.schema();
         let vectors = Arc::new(batch["vector"].as_fixed_size_list().clone());
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
@@ -6316,11 +6325,11 @@ mod tests {
     #[tokio::test]
     async fn test_index_stats(
         #[values(
-            (VectorIndexParams::ivf_flat(4, DistanceType::Hamming), IndexType::IvfFlat),
-            (VectorIndexParams::ivf_pq(4, 8, 8, DistanceType::L2, 10), IndexType::IvfPq),
+            (VectorIndexParams::ivf_flat(2, DistanceType::Hamming), IndexType::IvfFlat),
+            (VectorIndexParams::ivf_pq(2, 8, 8, DistanceType::L2, 10), IndexType::IvfPq),
             (VectorIndexParams::with_ivf_hnsw_sq_params(
                 DistanceType::Cosine,
-                IvfBuildParams::new(4),
+                IvfBuildParams::new(2),
                 Default::default(),
                 Default::default()
             ), IndexType::IvfHnswSq),
@@ -6331,7 +6340,7 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        let nlist = 4;
+        let nlist = 2;
         let (mut dataset, _) = match params.metric_type {
             DistanceType::Hamming => generate_test_dataset::<UInt8Type>(test_uri, 0..2).await,
             _ => generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await,

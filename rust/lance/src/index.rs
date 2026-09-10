@@ -837,7 +837,7 @@ fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) 
 ///
 /// Older vector segments may not have `VectorIndexDetails` in the manifest, so
 /// we also recognize them by the legacy monolithic index file name.
-fn segment_has_vector_details(segment: &IndexMetadata) -> bool {
+pub(crate) fn segment_has_vector_details(segment: &IndexMetadata) -> bool {
     segment.index_details.as_ref().map_or_else(
         || {
             segment
@@ -2622,6 +2622,17 @@ async fn collect_regular_indices_statistics(
     let mut index_uri: Option<String> = None;
 
     for meta in metadatas.iter() {
+        // An index that covers no fragments has no file to load statistics
+        // from: it carries its definition and nothing else until there is
+        // enough data to train it.
+        if meta
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(roaring::RoaringBitmap::is_empty)
+        {
+            indices_stats.push(serde_json::json!({}));
+            continue;
+        }
         let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, meta).await?);
         let index_details = scalar::fetch_index_details(ds, field_path, meta).await?;
         if index_uri.is_none() {
@@ -2958,12 +2969,15 @@ impl DatasetIndexInternalExt for Dataset {
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
 
-        // Check if this is a vector index by looking at the files list
-        let is_vector_index = if let Some(files) = &index_meta.files {
-            // If we have file metadata, check if INDEX_FILE_NAME is in the list
+        // Declared type first, and the legacy file name only for segments that
+        // predate details: an index awaiting training declares itself a vector
+        // index and has no file, so a file-based answer would send it to the
+        // scalar reader.
+        let is_vector_index = if index_meta.index_details.is_some() {
+            segment_has_vector_details(&index_meta)
+        } else if let Some(files) = &index_meta.files {
             files.iter().any(|f| f.path == INDEX_FILE_NAME)
         } else {
-            // Fall back to file existence check for older indices without file metadata
             let index_dir = self.indice_files_dir(&index_meta)?;
             let index_file = index_dir
                 .clone()
@@ -5998,17 +6012,687 @@ mod tests {
         let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_pq(1, 8, 96, DistanceType::L2, 1);
-        let result = dataset
+        dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await;
+            .await
+            .expect("a table too small to train on still accepts an index");
 
-        assert!(matches!(result, Err(Error::Unprocessable { .. })));
-        if let Error::Unprocessable { message, .. } = result.unwrap_err() {
-            assert_eq!(
-                message,
-                "Not enough rows to train PQ. Requires 256 rows but only 100 available",
-            )
+        // The definition is there and covers nothing: 100 rows cannot train a
+        // 256-code quantizer, so there is nothing to cover yet.
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(
+            indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
+        );
+        // Every fragment is still unindexed, which is what optimize will pick
+        // up once the column can train.
+        let unindexed = dataset.unindexed_fragments("vector_idx").await.unwrap();
+        assert_eq!(unindexed.len(), dataset.get_fragments().len());
+    }
+
+    /// More partitions requested than the data supports trains fewer of them.
+    ///
+    /// A partition wants a codebook's worth of vectors, so 300 vectors support
+    /// one partition however many are asked for.
+    #[tokio::test]
+    async fn test_create_index_with_more_partitions_than_rows() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let rows = 300;
+        let mut dataset = small_vector_dataset(test_dir.path(), rows).await;
+
+        let params = VectorIndexParams::ivf_pq(1000, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect("more partitions than rows should reduce partitions, not fail");
+
+        // Trained, not degraded: 300 rows clear the 256-code PQ floor.
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(
+            !indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
+        );
+
+        // 300 / 256 = 1, not the 1000 requested.
+        assert_eq!(trained_partitions(&dataset).await, vec![1]);
+    }
+
+    /// Partition counts for a trained logical vector index, one per segment.
+    async fn trained_partitions(dataset: &Dataset) -> Vec<usize> {
+        dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap()
+            .as_ivf()
+            .unwrap()
+            .num_partitions_per_segment()
+            .into_iter()
+            .map(|(_, partitions)| partitions)
+            .collect()
+    }
+
+    /// Between the floor and a codebook per partition, train fewer partitions.
+    #[tokio::test]
+    async fn test_create_index_in_the_reduced_partition_band() {
+        let test_dir = tempfile::tempdir().unwrap();
+        // 8 partitions want 8 * 256 = 2048 vectors; 1000 falls inside the band.
+        let mut dataset = small_vector_dataset(test_dir.path(), 1000).await;
+
+        let params = VectorIndexParams::ivf_pq(8, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // 1000 / 256 = 3.
+        assert_eq!(trained_partitions(&dataset).await, vec![3]);
+    }
+
+    /// A codebook's worth of vectors per partition trains the count as asked.
+    #[tokio::test]
+    async fn test_create_index_above_the_reduced_partition_band() {
+        let test_dir = tempfile::tempdir().unwrap();
+        // 8 * 256 = 2048, cleared by 3000.
+        let mut dataset = small_vector_dataset(test_dir.path(), 3000).await;
+
+        let params = VectorIndexParams::ivf_pq(8, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        assert_eq!(trained_partitions(&dataset).await, vec![8]);
+    }
+
+    /// Build a dataset of `rows` random vectors, one fragment.
+    async fn small_vector_dataset(dir: &std::path::Path, rows: usize) -> Dataset {
+        let dimensions = 16;
+        let field = Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+        let values = generate_random_array(rows * dimensions as usize);
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(values, dimensions).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        Dataset::write(reader, dir.to_str().unwrap(), None)
+            .await
+            .unwrap()
+    }
+
+    /// A dataset of `rows` rows where only the first `non_null` hold a vector.
+    async fn partly_null_vector_dataset(
+        dir: &std::path::Path,
+        rows: usize,
+        non_null: usize,
+    ) -> Dataset {
+        let dimensions = 16;
+        let field = Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+        let mut builder = arrow_array::builder::FixedSizeListBuilder::new(
+            arrow_array::builder::Float32Builder::new(),
+            dimensions,
+        );
+        for row in 0..rows {
+            if row < non_null {
+                for value in 0..dimensions {
+                    builder.values().append_value(value as f32);
+                }
+                builder.append(true);
+            } else {
+                for _ in 0..dimensions {
+                    builder.values().append_null();
+                }
+                builder.append(false);
+            }
         }
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(builder.finish())]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        Dataset::write(reader, dir.to_str().unwrap(), None)
+            .await
+            .unwrap()
+    }
+
+    /// The floor counts vectors, not rows.
+    ///
+    /// A column that is mostly null has plenty of rows and nothing to train on,
+    /// so it has to degrade rather than hand too few vectors to the quantizer.
+    #[tokio::test]
+    async fn test_create_index_counts_vectors_not_rows() {
+        let test_dir = tempfile::tempdir().unwrap();
+        // 1000 rows clear the floor; the 100 actual vectors do not.
+        let mut dataset = partly_null_vector_dataset(test_dir.path(), 1000, 100).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect("a mostly-null column must not be handed to the quantizer");
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(
+            indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty),
+            "100 vectors cannot train a 256-code quantizer"
+        );
+    }
+
+    /// Append `rows` more random vectors as a new fragment.
+    async fn append_vectors(dir: &std::path::Path, rows: usize) -> Dataset {
+        let dimensions = 16;
+        let field = Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+        let values = generate_random_array(rows * dimensions as usize);
+        let vectors =
+            arrow_array::FixedSizeListArray::try_new_from_values(values, dimensions).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        Dataset::write(
+            reader,
+            dir.to_str().unwrap(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The whole point of degrading: the index fills in once the data arrives.
+    ///
+    /// A definition-only index has no model to append to, so optimizing has to
+    /// train it from scratch and then cover every fragment, including the small
+    /// one that existed before the threshold was met.
+    #[tokio::test]
+    async fn test_degraded_index_trains_on_optimize_once_data_arrives() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 100).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 8, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // Degraded: 100 rows cannot train a 256-code quantizer.
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
+        );
+
+        // 100 -> 500 across two fragments, clearing the floor.
+        let mut dataset = append_vectors(test_dir.path(), 400).await;
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 500);
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .expect("a definition-only index must train once the data is there");
+
+        // Trained and covering: both fragments, nothing left unindexed.
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let covered = indices[0].fragment_bitmap.as_ref().unwrap();
+        assert_eq!(
+            covered.len() as usize,
+            dataset.get_fragments().len(),
+            "every fragment must be covered, including the pre-threshold one"
+        );
+        assert!(
+            dataset
+                .unindexed_fragments("vector_idx")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A vector query works while the index is still only a definition.
+    ///
+    /// The index covers no fragments, so every row is unindexed and the search
+    /// has to answer from the table itself rather than opening an index file
+    /// that was never written.
+    #[tokio::test]
+    async fn test_vector_query_against_a_definition_only_index() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let rows = 100;
+        let mut dataset = small_vector_dataset(test_dir.path(), rows).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        assert!(
+            dataset.load_indices().await.unwrap()[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
+        );
+
+        let query = vec![0.0_f32; 16];
+        let results = dataset
+            .scan()
+            .nearest("vector", &Float32Array::from(query), 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .expect("a query must not open an index file that was never written");
+        assert_eq!(results.num_rows(), 5);
+    }
+
+    /// `fast_search` against an index that is still a definition finds nothing.
+    ///
+    /// It restricts the search to what the index covers, and a definition
+    /// covers no rows, so there is nothing to return rather than a fallback
+    /// scan of the table.
+    #[tokio::test]
+    async fn test_fast_search_against_a_definition_only_index() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 100).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let query = Float32Array::from(vec![0.0_f32; 16]);
+        let results = dataset
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .fast_search()
+            .try_into_batch()
+            .await
+            .expect("fast_search must not fail on an index that covers nothing");
+        assert_eq!(results.num_rows(), 0);
+    }
+
+    /// Statistics for an index that is still a definition report no coverage.
+    ///
+    /// The same shape the scalar side reports: the index is listed, indexed
+    /// rows are zero, and every row counts as unindexed.
+    #[tokio::test]
+    async fn test_statistics_for_a_definition_only_index() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let rows = 100;
+        let mut dataset = small_vector_dataset(test_dir.path(), rows).await;
+
+        let params = VectorIndexParams::ivf_pq(10, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vector_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_indexed_rows"].as_u64(), Some(0));
+        assert_eq!(stats["num_unindexed_rows"].as_u64(), Some(rows as u64));
+    }
+
+    /// An index type without a codebook trains on a table a codebook could not.
+    ///
+    /// Only PQ needs a vector per code; RQ needs a pair of values and flat
+    /// storage needs none, so 100 vectors are enough for these to cover the
+    /// table rather than degrade to a definition.
+    #[rstest]
+    #[case::ivf_flat(VectorIndexParams::ivf_flat(1, DistanceType::L2))]
+    #[case::ivf_rq(VectorIndexParams::ivf_rq(1, 8, DistanceType::L2))]
+    #[tokio::test]
+    async fn test_create_index_without_a_codebook_trains_on_a_small_table(
+        #[case] params: VectorIndexParams,
+    ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 100).await;
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect("an index with no codebook has no row floor to clear");
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(
+            !indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty),
+            "should have trained and covered the table"
+        );
+    }
+
+    /// A multivector row holds many vectors, and the floor counts vectors.
+    ///
+    /// 100 rows of 10 vectors give the quantizer 1,000 to train from, so this
+    /// must train rather than defer on the row count.
+    #[tokio::test]
+    async fn test_multivector_floor_counts_vectors_not_rows() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = multivector_dataset(test_dir.path(), 100, 10).await;
+
+        // Multivector columns are cosine-only.
+        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::Cosine, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(
+            !indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty),
+            "1,000 vectors across 100 rows are enough to train"
+        );
+    }
+
+    /// A table of `rows`, each holding `vectors_per_row` vectors.
+    async fn multivector_dataset(
+        dir: &std::path::Path,
+        rows: usize,
+        vectors_per_row: usize,
+    ) -> Dataset {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
+
+        let dimensions = 16;
+        let field = Field::new(
+            "vector",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimensions,
+                ),
+                true,
+            ))),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+
+        let mut builder =
+            ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), dimensions));
+        for row in 0..rows {
+            for vector in 0..vectors_per_row {
+                for value in 0..dimensions {
+                    builder
+                        .values()
+                        .values()
+                        .append_value((row + vector + value as usize) as f32 + 0.5);
+                }
+                builder.values().append(true);
+            }
+            builder.append(true);
+        }
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(builder.finish())]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        Dataset::write(reader, dir.to_str().unwrap(), None)
+            .await
+            .unwrap()
+    }
+
+    /// The partition cap counts a multivector row's whole list too.
+    ///
+    /// 1,000 vectors support three partitions; counting the 100 rows instead
+    /// would allow only one.
+    #[tokio::test]
+    async fn test_partition_cap_counts_multivector_lists() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = multivector_dataset(test_dir.path(), 100, 10).await;
+
+        let params = VectorIndexParams::ivf_pq(8, 8, 4, DistanceType::Cosine, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // 1,000 / 256 = 3, capped from the 8 requested.
+        assert_eq!(trained_partitions(&dataset).await, vec![3]);
+    }
+
+    /// And a multivector table that really is too small defers, not errors.
+    #[tokio::test]
+    async fn test_multivector_below_the_floor_defers() {
+        let test_dir = tempfile::tempdir().unwrap();
+        // 10 rows of 2 vectors is 20 — far short of a 256-code codebook.
+        let mut dataset = multivector_dataset(test_dir.path(), 10, 2).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::Cosine, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect("a small multivector table should take the index, not fail");
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
+        );
+    }
+
+    /// The partition cap counts vectors, so blanks cannot inflate it.
+    ///
+    /// 3,000 rows holding 300 vectors support one partition, not the eight a
+    /// row count would appear to allow.
+    #[tokio::test]
+    async fn test_partition_cap_ignores_null_rows() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = partly_null_vector_dataset(test_dir.path(), 3000, 300).await;
+
+        let params = VectorIndexParams::ivf_pq(8, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // 300 / 256 = 1.
+        assert_eq!(trained_partitions(&dataset).await, vec![1]);
+    }
+
+    /// Deleting every row leaves the index defined.
+    ///
+    /// The definition is the user's declaration, not a property of the data, so
+    /// emptying the table must not withdraw it — otherwise reloading a table
+    /// silently drops the indexes it was created with.
+    #[tokio::test]
+    async fn test_vector_index_survives_deleting_all_rows() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 1024).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 8, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+
+        dataset.delete("true").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "the index definition must survive");
+
+        // And it is still there after a reopen, so it lives in the manifest
+        // rather than in whatever the session happened to hold.
+        let reopened = Dataset::open(test_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(reopened.load_indices().await.unwrap().len(), 1);
+    }
+
+    /// Retraining an index that is still only a definition does nothing.
+    ///
+    /// A definition has no segment to open, and the retrain path resolves that
+    /// before it reaches for one.
+    #[tokio::test]
+    async fn test_retrain_an_index_that_is_still_a_definition() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 100).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::retrain())
+            .await
+            .expect("retraining a definition must not look for a segment to open");
+
+        // Still 100 vectors, so still a definition.
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(
+            indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
+        );
+    }
+
+    /// A table that shrinks below the training threshold keeps working.
+    ///
+    /// Optimizing was unrunnable in this state: the quantizer cannot train on
+    /// what is left, and erroring there blocks index maintenance outright, with
+    /// dropping and recreating the index as the only way out.
+    #[tokio::test]
+    async fn test_optimize_indices_after_shrinking_below_the_threshold() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 1024).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 8, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // 1024 -> 224, under a 256-code quantizer's floor.
+        dataset.delete("_rowid < 800").await.unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 224);
+
+        // Retrain, not append: append-mode has no new data to index here and so
+        // never reaches the quantizer, which is the path that fails.
+        dataset
+            .optimize_indices(&OptimizeOptions::retrain())
+            .await
+            .expect("optimizing a table that shrank past the threshold must not fail");
+
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+    }
+
+    /// Updating every row leaves the index defined, and optimizing still runs.
+    #[tokio::test]
+    async fn test_vector_index_survives_updating_all_rows() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 1024).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 8, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let update = crate::dataset::UpdateBuilder::new(Arc::new(dataset.clone()))
+            .set("vector", "vector")
+            .unwrap()
+            .build()
+            .unwrap();
+        let updated = update.execute().await.unwrap();
+        let mut dataset = updated.new_dataset.as_ref().clone();
+
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .expect("optimizing after a full update must not fail");
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+    }
+
+    /// A table with no rows at all takes an index, which is the case every
+    /// other database allows and the one a fresh or reloaded table is in.
+    #[tokio::test]
+    async fn test_create_vector_index_on_empty_table() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let dimensions = 16;
+        let field = Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+        let reader = RecordBatchIterator::new(
+            Vec::<std::result::Result<RecordBatch, arrow_schema::ArrowError>>::new(),
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 96, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect("an empty table still accepts an index");
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(
+            indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
+        );
+
+        // Reopening has to find the same definition: it is carried by the
+        // manifest, not by a file on disk.
+        let reopened = Dataset::open(test_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let indices = reopened.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, "vector_idx");
     }
 
     #[tokio::test]
