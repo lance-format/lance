@@ -1274,6 +1274,130 @@ async fn exact_prepared_match_fallback(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn search_prepared_match_with_exact_ties(
+    indices: &[Arc<InvertedIndex>],
+    query: &MatchQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<FtsIndexMetrics>,
+    prepared_query: Arc<PreparedBm25Query>,
+    limit: usize,
+    wand_limit: usize,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    let fts_query = FtsQuery::Match(query.clone());
+
+    // Zero-weight terms can match documents without contributing a positive
+    // score. A short score-only WAND result therefore does not prove exhaustion.
+    if prepared_query.scorer().token_docs.keys().any(|token| {
+        let weight = prepared_query.scorer().query_weight(token);
+        !weight.is_finite() || weight <= 0.0
+    }) {
+        return compound_search_prepared_match(
+            indices,
+            &fts_query,
+            params,
+            prefilter,
+            metrics,
+            prepared_query,
+        )
+        .await;
+    }
+
+    let wand_params = MatchQueryExec::effective_params(query, params.clone())
+        .with_phrase_slop(None)
+        .with_limit(Some(wand_limit));
+    let prepared = Arc::new(PreparedMatch {
+        query: prepared_query.clone(),
+        params: Arc::new(wand_params),
+        operator: query.operator,
+    });
+    prefilter.wait_for_ready().await?;
+    let mut documents = search_prepared_segments(
+        indices,
+        prepared.clone(),
+        prefilter.clone(),
+        metrics.clone(),
+        None,
+    )
+    .await?;
+    documents.iter_mut().for_each(|document| {
+        document.score.0 *= query.boost;
+    });
+    match classify_wand_exactness_certificate(&mut documents, limit, wand_limit) {
+        WandExactnessCertificate::Exhaustive | WandExactnessCertificate::Strict => {
+            Ok(finish_wand_documents(documents, limit))
+        }
+        WandExactnessCertificate::Ambiguous => {
+            let score_floor = documents
+                .get(limit - 1)
+                .map(|document| document.score.0)
+                .filter(|score| score.is_finite());
+            let completion_limit = limit
+                .checked_add(WAND_TIE_COMPLETION_BUDGET)
+                .and_then(|limit| limit.checked_add(1));
+            if let (Some(score_floor), Some(completion_limit)) = (score_floor, completion_limit) {
+                let completion_prepared = Arc::new(PreparedMatch {
+                    query: prepared_query.clone(),
+                    params: Arc::new(
+                        prepared
+                            .params
+                            .as_ref()
+                            .clone()
+                            .with_limit(Some(completion_limit)),
+                    ),
+                    operator: prepared.operator,
+                });
+                let raw_score_floor = exclusive_scaled_score_floor(score_floor, query.boost);
+                let mut completion = search_prepared_segments(
+                    indices,
+                    completion_prepared,
+                    prefilter.clone(),
+                    metrics.clone(),
+                    raw_score_floor,
+                )
+                .await?;
+                completion.iter_mut().for_each(|document| {
+                    document.score.0 *= query.boost;
+                });
+                match classify_wand_exactness_certificate(&mut completion, limit, completion_limit)
+                {
+                    WandExactnessCertificate::Exhaustive | WandExactnessCertificate::Strict => {
+                        Ok(finish_wand_documents(completion, limit))
+                    }
+                    WandExactnessCertificate::Ambiguous => {
+                        let seeded_floor = completion
+                            .iter()
+                            .all(|document| document.score.0.is_finite())
+                            .then_some(score_floor);
+                        exact_prepared_match_fallback(
+                            indices,
+                            &fts_query,
+                            params,
+                            prefilter,
+                            metrics,
+                            prepared_query,
+                            seeded_floor,
+                        )
+                        .await
+                    }
+                }
+            } else {
+                exact_prepared_match_fallback(
+                    indices,
+                    &fts_query,
+                    params,
+                    prefilter,
+                    metrics,
+                    prepared_query,
+                    score_floor,
+                )
+                .await
+            }
+        }
+    }
+}
+
 impl DisplayAs for CompoundQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
@@ -1498,119 +1622,17 @@ impl ExecutionPlan for CompoundQueryExec {
                     prepared
                 };
 
-                // Zero-weight terms can match documents without contributing a
-                // positive score. A short score-only WAND result therefore does
-                // not prove exhaustion. Preserve exact membership semantics for
-                // those rare corpora without recording a certificate attempt.
-                if prepared.query.scorer().token_docs.keys().any(|token| {
-                    let weight = prepared.query.scorer().query_weight(token);
-                    !weight.is_finite() || weight <= 0.0
-                }) {
-                    compound_search_prepared_match(
-                        &indices,
-                        &query,
-                        &params,
-                        prefilter,
-                        metrics.clone(),
-                        prepared.query.clone(),
-                    )
-                    .await?
-                } else {
-                    prefilter.wait_for_ready().await?;
-                    let mut documents = search_prepared_segments(
-                        &indices,
-                        prepared.clone(),
-                        prefilter.clone(),
-                        metrics.clone(),
-                        None,
-                    )
-                    .await?;
-                    documents.iter_mut().for_each(|document| {
-                        document.score.0 *= match_query.boost;
-                    });
-                    match classify_wand_exactness_certificate(&mut documents, limit, wand_limit) {
-                        WandExactnessCertificate::Exhaustive => {
-                            finish_wand_documents(documents, limit)
-                        }
-                        WandExactnessCertificate::Strict => finish_wand_documents(documents, limit),
-                        WandExactnessCertificate::Ambiguous => {
-                            let score_floor = documents
-                                .get(limit - 1)
-                                .map(|document| document.score.0)
-                                .filter(|score| score.is_finite());
-                            let completion_limit = limit
-                                .checked_add(WAND_TIE_COMPLETION_BUDGET)
-                                .and_then(|limit| limit.checked_add(1));
-                            if let (Some(score_floor), Some(completion_limit)) =
-                                (score_floor, completion_limit)
-                            {
-                                let completion_prepared = Arc::new(PreparedMatch {
-                                    query: prepared.query.clone(),
-                                    params: Arc::new(
-                                        prepared
-                                            .params
-                                            .as_ref()
-                                            .clone()
-                                            .with_limit(Some(completion_limit)),
-                                    ),
-                                    operator: prepared.operator,
-                                });
-                                let raw_score_floor =
-                                    exclusive_scaled_score_floor(score_floor, match_query.boost);
-                                let mut completion = search_prepared_segments(
-                                    &indices,
-                                    completion_prepared,
-                                    prefilter.clone(),
-                                    metrics.clone(),
-                                    raw_score_floor,
-                                )
-                                .await?;
-                                completion.iter_mut().for_each(|document| {
-                                    document.score.0 *= match_query.boost;
-                                });
-                                match classify_wand_exactness_certificate(
-                                    &mut completion,
-                                    limit,
-                                    completion_limit,
-                                ) {
-                                    WandExactnessCertificate::Exhaustive => {
-                                        finish_wand_documents(completion, limit)
-                                    }
-                                    WandExactnessCertificate::Strict => {
-                                        finish_wand_documents(completion, limit)
-                                    }
-                                    WandExactnessCertificate::Ambiguous => {
-                                        let seeded_floor = completion
-                                            .iter()
-                                            .all(|document| document.score.0.is_finite())
-                                            .then_some(score_floor);
-                                        exact_prepared_match_fallback(
-                                            &indices,
-                                            &query,
-                                            &params,
-                                            prefilter,
-                                            metrics.clone(),
-                                            prepared.query.clone(),
-                                            seeded_floor,
-                                        )
-                                        .await?
-                                    }
-                                }
-                            } else {
-                                exact_prepared_match_fallback(
-                                    &indices,
-                                    &query,
-                                    &params,
-                                    prefilter,
-                                    metrics.clone(),
-                                    prepared.query.clone(),
-                                    score_floor,
-                                )
-                                .await?
-                            }
-                        }
-                    }
-                }
+                search_prepared_match_with_exact_ties(
+                    &indices,
+                    &match_query,
+                    &params,
+                    prefilter,
+                    metrics.clone(),
+                    prepared.query.clone(),
+                    limit,
+                    wand_limit,
+                )
+                .await?
             } else {
                 match (preset_prepared_match, base_scorer) {
                     (Some(prepared_match), _) => {
@@ -2869,10 +2891,13 @@ impl ExecutionPlan for MatchQueryExec {
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
-        let column = query.column.ok_or(DataFusionError::Execution(format!(
-            "column not set for MatchQuery {}",
-            query.terms
-        )))?;
+        let column = query
+            .column
+            .clone()
+            .ok_or(DataFusionError::Execution(format!(
+                "column not set for MatchQuery {}",
+                query.terms
+            )))?;
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let segments = segment_selection
@@ -2965,14 +2990,56 @@ impl ExecutionPlan for MatchQueryExec {
                 }
                 prepared
             };
-
-            pre_filter.wait_for_ready().await?;
-            let mut documents =
-                search_prepared_segments(&indices, prepared, pre_filter, metrics.clone(), None)
-                    .await?;
-            documents.iter_mut().for_each(|document| {
-                document.score.0 *= query.boost;
-            });
+            let certificate_limit = match prepared.params.limit {
+                Some(limit)
+                    if limit > 0
+                        && document_granularity == DocumentGranularity::Row
+                        && prepared.params.wand_factor == 1.0
+                        && query.boost.is_finite()
+                        && query.boost > 0.0
+                        && indices
+                            .iter()
+                            .all(|index| index.supports_wand_exactness_certificate()) =>
+                {
+                    limit.checked_add(1).map(|wand_limit| (limit, wand_limit))
+                }
+                _ => None,
+            };
+            let documents = if let Some((limit, wand_limit)) = certificate_limit {
+                let (row_ids, scores) = search_prepared_match_with_exact_ties(
+                    &indices,
+                    &query,
+                    prepared.params.as_ref(),
+                    pre_filter,
+                    metrics.clone(),
+                    prepared.query.clone(),
+                    limit,
+                    wand_limit,
+                )
+                .await?;
+                row_ids
+                    .into_iter()
+                    .zip(scores)
+                    .map(|(row_id, score)| ScoredDoc::new(row_id, score))
+                    .collect()
+            } else {
+                pre_filter.wait_for_ready().await?;
+                let mut documents =
+                    search_prepared_segments(&indices, prepared, pre_filter, metrics.clone(), None)
+                        .await?;
+                documents.iter_mut().for_each(|document| {
+                    document.score.0 *= query.boost;
+                });
+                documents.sort_unstable_by(|left, right| {
+                    right
+                        .score
+                        .0
+                        .total_cmp(&left.score.0)
+                        .then_with(|| left.row_id.cmp(&right.row_id))
+                        .then_with(|| left.doc_index.cmp(&right.doc_index))
+                });
+                documents
+            };
             metrics.baseline_metrics.record_output(documents.len());
 
             let batch = scored_documents_batch(schema, documents)?;

@@ -1325,6 +1325,97 @@ async fn compound_fts_results(
         .collect()
 }
 
+async fn tied_match_page(
+    dataset: &Dataset,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Vec<(u64, f32)> {
+    let query: FtsQuery = MatchQuery::new("common".to_owned())
+        .with_column(Some("text".to_owned()))
+        .into();
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    if limit.is_some() || offset.is_some() {
+        scan.limit(limit, offset).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .collect()
+}
+
+async fn assert_tied_match_pages(dataset: &Dataset) {
+    let exhaustive = tied_match_page(dataset, None, None).await;
+    assert!(exhaustive.len() > 20);
+    let mut expected = exhaustive;
+    expected.sort_unstable_by(|(left_row_id, left_score), (right_row_id, right_score)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| left_row_id.cmp(right_row_id))
+    });
+    assert_eq!(
+        expected[9].1.to_bits(),
+        expected[10].1.to_bits(),
+        "the page boundary must split an equal-score group"
+    );
+
+    let first_page = tied_match_page(dataset, Some(10), None).await;
+    let second_page = tied_match_page(dataset, Some(10), Some(10)).await;
+    let combined = first_page
+        .into_iter()
+        .chain(second_page)
+        .collect::<Vec<_>>();
+    assert_eq!(combined, expected[..20]);
+}
+
+#[tokio::test]
+async fn test_match_pagination_preserves_equal_score_rows() {
+    const INDEXED_ROWS: usize = 180;
+    const APPENDED_ROWS: usize = 60;
+
+    let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; INDEXED_ROWS])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 60,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Flat search merges several fragments before applying its bounded sort.
+    assert_tied_match_pages(&dataset).await;
+
+    // Commit one segment per fragment in reverse order so segment completion and
+    // row-address order cannot accidentally provide the same tie break.
+    create_fragmented_fts_index_with_order(&mut dataset, "text", false, true).await;
+    assert_tied_match_pages(&dataset).await;
+
+    // Appended rows exercise the indexed/flat union used by partially covered data.
+    let appended =
+        arrow_array::record_batch!(("text", Utf8, vec!["common"; APPENDED_ROWS])).unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            Some(WriteParams {
+                max_rows_per_file: 30,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_tied_match_pages(&dataset).await;
+}
+
 fn scored_row_bits(rows: &[(u64, f32)]) -> Vec<(u64, u32)> {
     rows.iter()
         .map(|(row_id, score)| (*row_id, score.to_bits()))
