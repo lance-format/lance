@@ -36,5 +36,3 @@ they should return an "unsupported" error on any read or write operation.
 </div>
 
 Flag bit 256 is reserved. Flags with bit values 1024 and above are unknown; unknown flags cause implementations to reject the dataset with an "unsupported" error.
-
-The commit that first records a tagged fragment reuse history sets `FLAG_FRAGMENT_REUSE_INDEX` in both the reader and writer flag words, and every subsequent manifest retains both bits. A manifest whose index section carries a tagged fragment reuse index without both bits set is corrupt. Legacy compaction histories (`index_version = 0`) do not require this flag.
