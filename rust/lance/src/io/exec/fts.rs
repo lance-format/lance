@@ -3023,10 +3023,31 @@ impl ExecutionPlan for MatchQueryExec {
                     .map(|(row_id, score)| ScoredDoc::new(row_id, score))
                     .collect()
             } else {
+                let result_limit = prepared.params.limit;
+                let search_prepared = if document_granularity == DocumentGranularity::ListElement
+                    && result_limit.is_some_and(|limit| limit > 0)
+                {
+                    // Bounded WAND selection only ranks by score, so it cannot
+                    // preserve boundary ties between list elements whose final
+                    // order also depends on row_id and doc_index. Search this
+                    // granularity exhaustively until selection becomes key-aware.
+                    Arc::new(PreparedMatch {
+                        query: prepared.query.clone(),
+                        params: Arc::new(prepared.params.as_ref().clone().with_limit(None)),
+                        operator: prepared.operator,
+                    })
+                } else {
+                    prepared
+                };
                 pre_filter.wait_for_ready().await?;
-                let mut documents =
-                    search_prepared_segments(&indices, prepared, pre_filter, metrics.clone(), None)
-                        .await?;
+                let mut documents = search_prepared_segments(
+                    &indices,
+                    search_prepared,
+                    pre_filter,
+                    metrics.clone(),
+                    None,
+                )
+                .await?;
                 documents.iter_mut().for_each(|document| {
                     document.score.0 *= query.boost;
                 });
@@ -3038,6 +3059,9 @@ impl ExecutionPlan for MatchQueryExec {
                         .then_with(|| left.row_id.cmp(&right.row_id))
                         .then_with(|| left.doc_index.cmp(&right.doc_index))
                 });
+                if let Some(result_limit) = result_limit {
+                    documents.truncate(result_limit);
+                }
                 documents
             };
             metrics.baseline_metrics.record_output(documents.len());

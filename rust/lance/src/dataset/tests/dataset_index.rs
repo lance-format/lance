@@ -29,7 +29,7 @@ use arrow_array::{Array, GenericStringArray, LargeListArray, ListArray, StructAr
 use arrow_array::{
     ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
     builder::StringDictionaryBuilder,
-    types::{Float32Type, Int32Type, Int64Type},
+    types::{Float32Type, Int32Type, Int64Type, UInt32Type},
 };
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
@@ -46,7 +46,7 @@ use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
-    DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
+    DOC_INDEX_COL, DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
@@ -1374,6 +1374,38 @@ async fn assert_tied_match_pages(dataset: &Dataset) {
     assert_eq!(combined, expected[..20]);
 }
 
+async fn tied_list_element_match_page(
+    dataset: &Dataset,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Vec<(u64, Vec<u32>, f32)> {
+    let query: FtsQuery = MatchQuery::new("common".to_owned())
+        .with_column(Some("tags".to_owned()))
+        .with_document_granularity(DocumentGranularity::ListElement)
+        .into();
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    if limit.is_some() || offset.is_some() {
+        scan.limit(limit, offset).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+    let doc_indices = batch[DOC_INDEX_COL].as_list::<i32>();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>();
+    (0..batch.num_rows())
+        .map(|row| {
+            let doc_index = doc_indices
+                .value(row)
+                .as_primitive::<UInt32Type>()
+                .values()
+                .to_vec();
+            (row_ids.value(row), doc_index, scores.value(row))
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn test_match_pagination_preserves_equal_score_rows() {
     const INDEXED_ROWS: usize = 180;
@@ -1414,6 +1446,67 @@ async fn test_match_pagination_preserves_equal_score_rows() {
         .await
         .unwrap();
     assert_tied_match_pages(&dataset).await;
+}
+
+#[tokio::test]
+async fn test_list_element_match_pagination_preserves_equal_score_documents() {
+    const ROWS: usize = 60;
+
+    let mut tags = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+    for _ in 0..ROWS {
+        tags.values().append_value("common");
+        tags.values().append_value("common");
+        tags.append(true);
+    }
+    let tags = Arc::new(tags.finish()) as ArrayRef;
+    let batch = RecordBatch::try_from_iter(vec![("tags", tags)]).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 20,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let params =
+        InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement);
+    let mut segments = Vec::with_capacity(dataset.get_fragments().len());
+    for fragment in dataset.get_fragments().iter().rev() {
+        let mut builder = dataset
+            .create_index_builder(&["tags"], IndexType::Inverted, &params)
+            .name("tags_idx".to_owned())
+            .fragments(vec![fragment.id() as u32]);
+        segments.push(builder.execute_uncommitted().await.unwrap());
+    }
+    dataset
+        .commit_existing_index_segments("tags_idx", "tags", segments)
+        .await
+        .unwrap();
+
+    let mut expected = tied_list_element_match_page(&dataset, None, None).await;
+    expected.sort_unstable_by(
+        |(left_row_id, left_doc_index, left_score),
+         (right_row_id, right_doc_index, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left_row_id.cmp(right_row_id))
+                .then_with(|| left_doc_index.cmp(right_doc_index))
+        },
+    );
+    assert_eq!(expected.len(), ROWS * 2);
+    assert_eq!(expected[9].2.to_bits(), expected[10].2.to_bits());
+
+    let first_page = tied_list_element_match_page(&dataset, Some(10), None).await;
+    let second_page = tied_list_element_match_page(&dataset, Some(10), Some(10)).await;
+    let combined = first_page
+        .into_iter()
+        .chain(second_page)
+        .collect::<Vec<_>>();
+    assert_eq!(combined, expected[..20]);
 }
 
 fn scored_row_bits(rows: &[(u64, f32)]) -> Vec<(u64, u32)> {
