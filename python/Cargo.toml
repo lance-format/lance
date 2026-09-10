@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "12.0.0-beta.15"
+version = "12.0.0-beta.17"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -24,7 +24,7 @@ arrow-array = "58.0.0"
 arrow-cast = "58.0.0"
 arrow-data = "58.0.0"
 arrow-schema = "58.0.0"
-object_store = "0.13.2"
+object_store = "0.14.1"
 url = "2.5.7"
 datafusion = { version = "54.0.0", default-features = false }
 datafusion-ffi = "54.0.0"

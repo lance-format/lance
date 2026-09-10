@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::traits::{import_vec_from_method, import_vec_to_rust};
+use crate::traits::{FromJObjectWithEnv, import_vec_from_method, import_vec_to_rust};
 use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
@@ -28,6 +28,7 @@ use lance_index::scalar::inverted::{
 };
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
+use uuid::Uuid;
 
 use crate::{
     RT, block_on,
@@ -257,6 +258,7 @@ fn get_document_granularity(
 /// Scanner options passed from JNI - shared between blocking and async scanners
 pub(crate) struct ScannerOptions<'a> {
     pub fragment_ids_obj: JObject<'a>,
+    pub index_segments_obj: JObject<'a>,
     pub columns_obj: JObject<'a>,
     pub substrait_filter_obj: JObject<'a>,
     pub filter_obj: JObject<'a>,
@@ -305,6 +307,13 @@ pub(crate) fn build_scanner_with_options<'a>(
         }
         scanner.with_fragments(fragments);
     }
+
+    env.get_optional(&options.index_segments_obj, |env, java_segments| {
+        let index_segments: Vec<Uuid> =
+            import_vec_to_rust(env, &java_segments, |env, obj| obj.extract_object(env))?;
+        scanner.with_index_segments(index_segments)?;
+        Ok(())
+    })?;
 
     let columns_opt = env.get_strings_opt(&options.columns_obj)?;
     if let Some(columns) = columns_opt {
@@ -513,31 +522,32 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     mut env: JNIEnv<'local>,
     _reader: JObject<'local>,
     jdataset: JObject<'local>,
-    fragment_ids_obj: JObject<'local>, // Optional<List<Integer>>
-    columns_obj: JObject<'local>,      // Optional<List<String>>
+    fragment_ids_obj: JObject<'local>,   // Optional<List<Integer>>
+    index_segments_obj: JObject<'local>, // Optional<List<UUID>>
+    columns_obj: JObject<'local>,        // Optional<List<String>>
     substrait_filter_obj: JObject<'local>, // Optional<ByteBuffer>
-    filter_obj: JObject<'local>,       // Optional<String>
-    batch_size_obj: JObject<'local>,   // Optional<Long>
+    filter_obj: JObject<'local>,         // Optional<String>
+    batch_size_obj: JObject<'local>,     // Optional<Long>
     batch_size_bytes_obj: JObject<'local>, // Optional<Long>
     io_buffer_size_obj: JObject<'local>, // Optional<Long>
-    limit_obj: JObject<'local>,        // Optional<Integer>
-    offset_obj: JObject<'local>,       // Optional<Integer>
-    query_obj: JObject<'local>,        // Optional<Query>
-    fts_query_obj: JObject<'local>,    // Optional<FullTextQuery>
-    prefilter: jboolean,               // boolean
-    with_row_id: jboolean,             // boolean
-    with_row_address: jboolean,        // boolean
-    batch_readahead: jint,             // int
+    limit_obj: JObject<'local>,          // Optional<Integer>
+    offset_obj: JObject<'local>,         // Optional<Integer>
+    query_obj: JObject<'local>,          // Optional<Query>
+    fts_query_obj: JObject<'local>,      // Optional<FullTextQuery>
+    prefilter: jboolean,                 // boolean
+    with_row_id: jboolean,               // boolean
+    with_row_address: jboolean,          // boolean
+    batch_readahead: jint,               // int
     fragment_readahead_obj: JObject<'local>, // Optional<Integer>
-    scan_in_order: jboolean,           // boolean
+    scan_in_order: jboolean,             // boolean
     late_materialization_obj: JObject<'local>, // Optional<MaterializationStyle>
-    column_orderings: JObject<'local>, // Optional<List<ColumnOrdering>>
-    use_scalar_index: jboolean,        // boolean
-    fast_search: jboolean,             // boolean
+    column_orderings: JObject<'local>,   // Optional<List<ColumnOrdering>>
+    use_scalar_index: jboolean,          // boolean
+    fast_search: jboolean,               // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
-    collect_stats: jboolean,           // boolean
-    include_deleted_rows: jboolean,    // boolean
-    strict_batch_size: jboolean,       // boolean
+    collect_stats: jboolean,             // boolean
+    include_deleted_rows: jboolean,      // boolean
+    strict_batch_size: jboolean,         // boolean
     disable_scoring_autoprojection: jboolean, // boolean
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -546,6 +556,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             &mut env,
             jdataset,
             fragment_ids_obj,
+            index_segments_obj,
             columns_obj,
             substrait_filter_obj,
             filter_obj,
@@ -580,6 +591,7 @@ fn inner_create_scanner<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject<'local>,
     fragment_ids_obj: JObject<'local>,
+    index_segments_obj: JObject<'local>,
     columns_obj: JObject<'local>,
     substrait_filter_obj: JObject<'local>,
     filter_obj: JObject<'local>,
@@ -613,6 +625,7 @@ fn inner_create_scanner<'local>(
 
     let options = ScannerOptions {
         fragment_ids_obj,
+        index_segments_obj,
         columns_obj,
         substrait_filter_obj,
         filter_obj,

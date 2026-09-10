@@ -22,16 +22,28 @@ import org.lance.index.vector.RQBuildParams;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.index.vector.VectorTrainer;
+import org.lance.ipc.AsyncScanner;
+import org.lance.ipc.LanceScanner;
+import org.lance.ipc.Query;
+import org.lance.ipc.ScanOptions;
 
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -126,8 +138,10 @@ public class VectorIndexTest {
     }
   }
 
-  @Test
-  public void testCreateIvfFlatIndexDistributively(@TempDir Path tempDir) throws Exception {
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  public void testCreateIvfFlatIndexDistributively(boolean async, @TempDir Path tempDir)
+      throws Exception {
     try (TestVectorDataset testVectorDataset =
         new TestVectorDataset(tempDir.resolve("merge_ivfflat_index_metadata"))) {
       try (Dataset dataset = testVectorDataset.create()) {
@@ -190,6 +204,80 @@ public class VectorIndexTest {
                 List.of(firstSegment, secondSegment));
         assertEquals(2, committed.size());
         assertTrue(dataset.listIndexes().contains(TestVectorDataset.indexName));
+
+        float[] key = new float[32];
+        for (int i = 0; i < key.length; i++) {
+          key[i] = 32 + i;
+        }
+        Query query =
+            new Query.Builder()
+                .setColumn(TestVectorDataset.vectorColumnName)
+                .setKey(key)
+                .setK(5)
+                .setNprobes(2)
+                .build();
+        // Each fragment repeats the vectors but has distinct row IDs. Selecting a segment
+        // must exclude equally close rows in the other segments and unindexed fragments.
+        for (int segment = 0; segment < 2; segment++) {
+          ScanOptions options =
+              new ScanOptions.Builder()
+                  .nearest(query)
+                  .indexSegments(List.of(segment == 0 ? firstSegment.uuid() : secondSegment.uuid()))
+                  .build();
+          try (RootAllocator allocator = new RootAllocator();
+              AutoCloseable scanner =
+                  async
+                      ? AsyncScanner.create(dataset, options, allocator)
+                      : dataset.newScan(options);
+              ArrowReader reader =
+                  async
+                      ? ((AsyncScanner) scanner).scanBatchesAsync().get(10, TimeUnit.SECONDS)
+                      : ((LanceScanner) scanner).scanBatches()) {
+            Set<Integer> actual = new HashSet<>();
+            while (reader.loadNextBatch()) {
+              IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
+              for (int row = 0; row < ids.getValueCount(); row++) {
+                actual.add(ids.get(row));
+              }
+            }
+            int base = segment * 80;
+            assertEquals(Set.of(base, base + 1, base + 2, base + 3, base + 4), actual);
+          }
+        }
+
+        List<ScanOptions> invalidOptions =
+            List.of(
+                new ScanOptions.Builder().nearest(query).indexSegments(List.of()).build(),
+                new ScanOptions.Builder().indexSegments(List.of(firstSegment.uuid())).build(),
+                new ScanOptions.Builder()
+                    .nearest(query)
+                    .indexSegments(List.of(UUID.randomUUID()))
+                    .build());
+        List<String> errors =
+            List.of(
+                "empty segment list", "only supported for vector search", "unknown index segments");
+        for (int i = 0; i < invalidOptions.size(); i++) {
+          ScanOptions options = invalidOptions.get(i);
+          Exception failure =
+              assertThrows(
+                  Exception.class,
+                  () -> {
+                    try (RootAllocator allocator = new RootAllocator();
+                        AutoCloseable scanner =
+                            async
+                                ? AsyncScanner.create(dataset, options, allocator)
+                                : dataset.newScan(options);
+                        ArrowReader reader =
+                            async
+                                ? ((AsyncScanner) scanner)
+                                    .scanBatchesAsync()
+                                    .get(10, TimeUnit.SECONDS)
+                                : ((LanceScanner) scanner).scanBatches()) {
+                      reader.loadNextBatch();
+                    }
+                  });
+          assertTrue(causeChainContains(failure, errors.get(i)), failure.toString());
+        }
       }
     }
   }

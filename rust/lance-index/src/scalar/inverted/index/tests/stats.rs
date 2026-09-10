@@ -429,7 +429,8 @@ async fn test_loaded_bm25_stats_reports_invalid_loaded_token_id() {
         let PostingMetadata::V2 { metadata } = &mut posting_reader.metadata else {
             panic!("test requires modern posting metadata");
         };
-        metadata
+        Arc::get_mut(metadata)
+            .expect("test metadata should have one owner")
             .get_mut()
             .expect("metadata was loaded above")
             .lengths
