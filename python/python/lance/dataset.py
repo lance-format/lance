@@ -3127,6 +3127,28 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.version()
 
     @property
+    def version_info(self) -> Version:
+        """Return information about the currently checked out version.
+
+        Unlike :meth:`versions`, this reads the manifest already held by the dataset
+        and does not list or read the version history.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(pa.table({"a": [1]}), "example")
+        >>> dataset.version_info["version"]
+        1
+        """
+        version_info = self._ds.version_info()
+        timestamp_nanos = version_info["timestamp"]
+        version_info["timestamp"] = datetime.fromtimestamp(
+            timestamp_nanos // 1e9
+        ) + timedelta(microseconds=(timestamp_nanos % 1e9) // 1e3)
+        return version_info
+
+    @property
     def latest_version(self) -> int:
         """
         Returns the latest version of the dataset.
