@@ -641,7 +641,45 @@ message FragmentReuseIndexDetails {
   }
 
   message InlineContent {
-    repeated Version versions = 1;
+    // Existing compaction records, with the original field number and contents.
+    repeated Version legacy_versions = 1;
+    // New mappings; requires index_version = 1.
+    repeated Transition transitions = 2;
+  }
+
+  // Replaces whole source fragments without changing surviving row values.
+  message Transition {
+    // Source fragments in scan order; counts include deleted rows.
+    repeated FragmentDigest sources = 1;
+    // Destination fragments in label order; counts are recorded at creation.
+    repeated FragmentDigest destinations = 2;
+    /* Exactly one mapping is required. New mapping types require a new FRI index_version.
+     * Other field numbers may be used for ordinary metadata.
+     */
+    oneof mapping {
+      /* Concatenate surviving rows in source fragment order, preserving row order
+       * within each fragment, then split into destination fragments.
+       */
+      OrderedCompaction ordered_compaction = 3;
+      /* Process source fragments sequentially, distributing their rows across
+       * destination fragments by label in source row order.
+       */
+      StablePartition stable_partition = 4;
+    }
+  }
+
+  message OrderedCompaction {
+    // RoaringTreemap of surviving source row addresses; missing rows are deleted.
+    bytes changed_row_addrs = 1;
+  }
+
+  message StablePartition {
+    // UUID in _fri/<map_id>/stable_partition.lance; unchanged when the FRI UUID changes.
+    string map_id = 1;
+    // Size of stable_partition.lance in bytes.
+    uint64 map_size_bytes = 2;
+    // Unset: use the dataset base. Set: look up this ID in Manifest.base_paths.
+    optional uint32 base_id = 3;
   }
 
   message FragmentDigest {
