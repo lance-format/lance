@@ -578,8 +578,12 @@ pub async fn open_scalar_index(
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
     let (frag_reuse_index, batch_remapping) =
         match resolved.as_ref().map(|(_, remapping)| remapping) {
-            Some(ResolvedRemapping::Legacy(remapper)) => (Some(remapper.clone()), None),
-            Some(ResolvedRemapping::Batch(remapper)) => (None, Some(remapper.clone())),
+            Some(ResolvedRemapping::V0(remapper)) => (Some(remapper.clone()), None),
+            // An untouched segment on a tagged dataset loads the original way,
+            // with no remapper; every plugin (including legacy-API-only ones)
+            // supports this.
+            Some(ResolvedRemapping::V1Identity) => (None, None),
+            Some(ResolvedRemapping::V1Translate(remapper)) => (None, Some(remapper.clone())),
             None => (None, None),
         };
 

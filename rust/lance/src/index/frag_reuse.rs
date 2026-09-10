@@ -21,39 +21,46 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-/// The remapper generation resolved for one index open.
+/// The remapper resolved for one index open.
 ///
-/// The two arms never meet: `Legacy` feeds the pre-existing synchronous
-/// consumers exactly as before tagged histories existed, while `Batch` feeds
-/// the additive `*_with_remapping` entry points that may await row-map reads.
+/// The FRI version picks the interface and the segment's need picks the
+/// behavior: `V0` feeds the pre-existing synchronous consumers exactly as
+/// before tagged histories existed; `V1Identity` carries no remapper at all
+/// (the segment's rows are untouched, so the plugin's original load path
+/// applies); `V1Translate` feeds the additive `*_with_remapping` entry points
+/// that may await row-map reads.
 #[derive(Clone)]
 pub(crate) enum ResolvedRemapping {
-    /// A v0 (or identity) mapping served by the compact in-memory handle.
-    Legacy(Arc<dyn RowIdRemapper>),
+    /// A v0 FRI mapping served by the compact in-memory handle.
+    V0(Arc<dyn RowIdRemapper>),
+    /// A tagged history under which this segment's rows are unchanged.
+    V1Identity,
     /// A tagged-history mapping whose payload may need asynchronous reads.
-    Batch(Arc<dyn BatchRowIdRemapper>),
+    V1Translate(Arc<dyn BatchRowIdRemapper>),
 }
 
 impl std::fmt::Debug for ResolvedRemapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Legacy(_) => f.debug_tuple("Legacy").finish_non_exhaustive(),
-            Self::Batch(remapper) => f.debug_tuple("Batch").field(remapper).finish(),
+            Self::V0(_) => f.debug_tuple("V0").finish_non_exhaustive(),
+            Self::V1Identity => f.debug_tuple("V1Identity").finish(),
+            Self::V1Translate(remapper) => f.debug_tuple("V1Translate").field(remapper).finish(),
         }
     }
 }
 
 /// Scope the dataset-level index cache for one resolved remapping.
 ///
-/// This owns the single cache-scoping rule: a batch (tagged-history) mapping
-/// rewrites addresses per manifest snapshot, so its entries are keyed under
-/// the manifest path; every other shape keeps the pre-existing keys.
+/// This owns the single cache-scoping rule: a tagged history (FRI
+/// index_version != 0) rewrites what each segment covers per manifest
+/// snapshot, so its entries are keyed under the manifest path; v0 and
+/// FRI-less datasets keep the pre-existing keys.
 pub(crate) fn scoped_index_cache(
     dataset: &Dataset,
     resolved: &Option<(Uuid, ResolvedRemapping)>,
 ) -> crate::session::index_caches::DSIndexCache {
     crate::session::index_caches::DSIndexCache(match resolved {
-        Some((_, ResolvedRemapping::Batch(_))) => dataset
+        Some((_, ResolvedRemapping::V1Identity | ResolvedRemapping::V1Translate(_))) => dataset
             .index_cache
             .with_key_prefix(dataset.manifest_location.path.as_ref()),
         _ => dataset.index_cache.0.clone(),
@@ -222,7 +229,7 @@ pub(super) async fn open_row_id_remapping(
         return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
             (
                 legacy.uuid,
-                ResolvedRemapping::Legacy(Arc::new(CompactFragReuseIndexHandle(legacy))),
+                ResolvedRemapping::V0(Arc::new(CompactFragReuseIndexHandle(legacy))),
             )
         }));
     }
@@ -239,18 +246,7 @@ pub(super) async fn open_row_id_remapping(
             "FRI remapping requires committed segment metadata for {}",
             index.uuid
         ))),
-        Some(SegmentRemappingPlan::Identity) => {
-            let identity = CompactFragReuseIndex::try_new(
-                fri.uuid,
-                FragReuseIndexDetails { versions: vec![] },
-            )?;
-            Ok(Some((
-                fri.uuid,
-                ResolvedRemapping::Legacy(Arc::new(CompactFragReuseIndexHandle(Arc::new(
-                    identity,
-                )))),
-            )))
-        }
+        Some(SegmentRemappingPlan::Identity) => Ok(Some((fri.uuid, ResolvedRemapping::V1Identity))),
         Some(SegmentRemappingPlan::MissingCoverage) => Err(Error::not_supported(format!(
             "FRI query coverage is unavailable for segment {}",
             index.uuid
@@ -260,7 +256,7 @@ pub(super) async fn open_row_id_remapping(
             excluded_fragments,
         }) => Ok(Some((
             fri.uuid,
-            ResolvedRemapping::Batch(Arc::new(
+            ResolvedRemapping::V1Translate(Arc::new(
                 super::frag_reuse_remapping::QueryRowIdRemapper::new(
                     mapping,
                     coverage.clone(),

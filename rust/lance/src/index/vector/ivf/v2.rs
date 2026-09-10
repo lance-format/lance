@@ -1435,16 +1435,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         )
         .await?;
         let storage = match frag_reuse_index {
-            Some(ResolvedRemapping::Legacy(remapper)) => {
+            Some(ResolvedRemapping::V0(remapper)) => {
                 IvfQuantizationStorage::try_new_with_remapper(storage_reader, Some(remapper))
                     .await?
             }
-            Some(ResolvedRemapping::Batch(remapper)) => {
+            Some(ResolvedRemapping::V1Translate(remapper)) => {
                 IvfQuantizationStorage::try_new_with_remapper(storage_reader, None)
                     .await?
                     .with_row_id_remapping(remapper)
             }
-            None => IvfQuantizationStorage::try_new_with_remapper(storage_reader, None).await?,
+            // An untouched segment on a tagged dataset decodes the original
+            // way, with no remapper.
+            Some(ResolvedRemapping::V1Identity) | None => {
+                IvfQuantizationStorage::try_new_with_remapper(storage_reader, None).await?
+            }
         };
 
         // Cache file metadata so reconstructions from IvfIndexState can skip
@@ -2542,11 +2546,11 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         )
     };
     let storage = match frag_reuse_index {
-        Some(ResolvedRemapping::Legacy(remapper)) => make_storage(Some(remapper)),
-        Some(ResolvedRemapping::Batch(remapper)) => {
+        Some(ResolvedRemapping::V0(remapper)) => make_storage(Some(remapper)),
+        Some(ResolvedRemapping::V1Translate(remapper)) => {
             make_storage(None).with_row_id_remapping(remapper)
         }
-        None => make_storage(None),
+        Some(ResolvedRemapping::V1Identity) | None => make_storage(None),
     };
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
 
