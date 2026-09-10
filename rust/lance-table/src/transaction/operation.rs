@@ -88,6 +88,13 @@ pub enum Operation {
         rewritten_indices: Vec<RewrittenIndex>,
         /// The fragment reuse index to be created or updated to
         frag_reuse_index: Option<IndexMetadata>,
+        /// The stable-partition (reordered) part of this rewrite, if any.
+        /// In-memory only, like `frag_reuse_index`: never serialized into the
+        /// transaction file, because other writers' conflict decisions only
+        /// need the fragment sets in `groups`, which are exact either way. The
+        /// commit path assembles it into a tagged `frag_reuse_index` entry
+        /// before the manifest is built.
+        stable_partition: Option<StablePartitionRewrite>,
     },
     /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a
@@ -270,6 +277,56 @@ impl std::fmt::Display for Operation {
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
         }
+    }
+}
+
+/// A stable-partition (reordered) rewrite's contribution to an
+/// [`Operation::Rewrite`] commit.
+///
+/// Unlike compaction, the covered groups redistribute rows across their
+/// destinations, so index fragment bitmaps must not be swapped from old to
+/// new fragments: the retired source ids stay in the bitmaps as provenance
+/// and the transitions appended to the tagged fragment reuse index entry
+/// record the row-level translation (see
+/// `lance_table::system_index::frag_reuse::ledger`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StablePartitionRewrite {
+    /// The new transitions, one per covered rewrite group, in the order of
+    /// the covered groups. Each transition's sources must match its group's
+    /// old fragments in order, and its destinations the group's new
+    /// fragments in order; the commit path validates the binding before it
+    /// assembles the tagged entry.
+    pub transitions: Vec<crate::format::pb::fragment_reuse_index_details::Transition>,
+    /// `dataset_version` of the fragment reuse index entry the assembled
+    /// entry appended onto (`None` when this rewrite creates the entry). The
+    /// transaction field is never serialized, so a concurrent transition
+    /// cannot be detected from another transaction file; instead the
+    /// manifest build fails when the manifest's entry no longer matches this
+    /// base, because splicing would silently drop the concurrent transition.
+    /// The commit path re-assembles against the latest entry on retry.
+    pub base_entry_version: Option<u64>,
+}
+
+impl StablePartitionRewrite {
+    /// The union of the transitions' source fragment ids. Rewrite groups
+    /// covered by this set skip index-bitmap maintenance: their bitmaps keep
+    /// the retired source ids as provenance.
+    pub fn reordered_sources(&self) -> RoaringBitmap {
+        self.transitions
+            .iter()
+            .flat_map(|transition| transition.sources.iter().map(|source| source.id as u32))
+            .collect()
+    }
+}
+
+impl DeepSizeOf for StablePartitionRewrite {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        // prost messages do not implement DeepSizeOf; their serialized size
+        // is a stable proxy for the heap they hold.
+        self.transitions
+            .iter()
+            .map(prost::Message::encoded_len)
+            .sum()
     }
 }
 

@@ -371,7 +371,7 @@ async fn load_ledger(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReu
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
@@ -398,11 +398,11 @@ mod tests {
     use prost::encoding::WireType;
     use tokio::io::AsyncWriteExt;
     use uuid::Uuid;
-    pub(super) async fn fixture() -> Dataset {
+    pub async fn fixture() -> Dataset {
         fixture_with_index(IndexType::BTree).await
     }
 
-    pub(super) async fn fixture_with_index(index_type: IndexType) -> Dataset {
+    pub async fn fixture_with_index(index_type: IndexType) -> Dataset {
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
             .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
@@ -460,7 +460,7 @@ mod tests {
         dataset
     }
 
-    pub(super) async fn prepare(dataset: &Dataset) -> (Transition, Vec<Fragment>) {
+    pub async fn prepare(dataset: &Dataset) -> (Transition, Vec<Fragment>) {
         let batch = dataset.scan().try_into_batch().await.unwrap();
         let values = batch["i"].as_primitive::<Int32Type>();
         let labels: Vec<_> = values.iter().map(|v| (v.unwrap() % 2) as u16).collect();
@@ -552,7 +552,7 @@ mod tests {
         (transition, destinations)
     }
 
-    pub(super) fn field(tag: u32, bytes: &[u8]) -> Vec<u8> {
+    pub fn field(tag: u32, bytes: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
         prost::encoding::encode_key(tag, WireType::LengthDelimited, &mut output);
         prost::encoding::encode_varint(bytes.len() as u64, &mut output);
@@ -562,7 +562,7 @@ mod tests {
 
     // Assemble a reader snapshot directly. Publishing rewrites and their FRI
     // deltas atomically belongs to the writer PR, not this test helper.
-    pub(super) async fn install(
+    pub async fn install(
         dataset: &mut Dataset,
         content: Vec<u8>,
         destinations: Vec<Fragment>,
@@ -633,7 +633,7 @@ mod tests {
 
     // Maintenance and clone reopen the manifest instead of using the query cache.
     // Persist the assembled fixture without requiring the future rewrite writer.
-    pub(super) async fn persist_fixture(dataset: &mut Dataset, indices: Vec<IndexMetadata>) {
+    pub async fn persist_fixture(dataset: &mut Dataset, indices: Vec<IndexMetadata>) {
         let mut manifest = dataset.manifest.as_ref().clone();
         manifest.version += 1;
         manifest.update_max_fragment_id();
@@ -1671,6 +1671,7 @@ mod tests {
                         groups: vec![],
                         rewritten_indices: vec![],
                         frag_reuse_index: None,
+                        stable_partition: None,
                     },
                     None,
                 ),

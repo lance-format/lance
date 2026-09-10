@@ -3025,6 +3025,7 @@ pub async fn commit_compaction(
             groups: rewrite_groups,
             rewritten_indices,
             frag_reuse_index,
+            stable_partition: None,
         },
     )
     .transaction_properties(options.transaction_properties.clone())

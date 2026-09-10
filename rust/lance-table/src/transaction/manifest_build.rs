@@ -25,6 +25,7 @@ use crate::io::{
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::frag_reuse::metadata::{is_tagged, validate_flags};
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
@@ -413,7 +414,19 @@ impl Transaction {
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        // A rewrite carrying an already-assembled tagged entry (a
+        // stable-partition rewrite, or a future tagged compaction) appends to
+        // the tagged history instead of misinterpreting it. A bare rewrite or
+        // one carrying a v0 entry would misinterpret, so those stay rejected.
+        let appends_tagged_entry = matches!(
+            &self.operation,
+            Operation::Rewrite {
+                frag_reuse_index: Some(entry),
+                ..
+            } if is_tagged(entry)
+        );
         if current_indices.iter().any(is_tagged)
+            && !appends_tagged_entry
             && !matches!(
                 self.operation,
                 Operation::Append { .. } | Operation::ReserveFragments { .. }
@@ -815,6 +828,7 @@ impl Transaction {
                 groups,
                 rewritten_indices,
                 frag_reuse_index,
+                stable_partition,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -825,6 +839,16 @@ impl Transaction {
                     current_version,
                     next_row_id.as_ref(),
                 )?;
+
+                // Groups covered by the stable-partition transitions
+                // redistribute rows across their destinations, so index
+                // bitmaps must not follow them: the retired source ids stay
+                // in the bitmaps as provenance and the tagged fragment reuse
+                // entry records the row-level translation. Only the
+                // order-preserving groups take part in bitmap maintenance
+                // below.
+                let ordered_groups =
+                    Self::ordered_rewrite_groups(groups, stable_partition.as_ref())?;
 
                 if next_row_id.is_some() {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
@@ -841,14 +865,18 @@ impl Transaction {
                                 // that no longer resolve, so drop the rewritten fragments from
                                 // its coverage instead and let the scanner fall back to a full
                                 // scan for them.
-                                Self::drop_rewritten_fragments(fragment_bitmap, groups)
+                                Self::drop_rewritten_fragments(fragment_bitmap, &ordered_groups)
                             } else {
-                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?
+                                Self::recalculate_fragment_bitmap(fragment_bitmap, &ordered_groups)?
                             };
                         }
                     }
                 } else {
-                    Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+                    Self::handle_rewrite_indices(
+                        &mut final_indices,
+                        rewritten_indices,
+                        &ordered_groups,
+                    )?;
                 }
 
                 // A full compaction materializes a fragment's overlays into fresh
@@ -857,6 +885,34 @@ impl Transaction {
                 // coverage to keep it from serving stale values.
                 Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups);
 
+                if let Some(stable_partition) = stable_partition {
+                    // The stable-partition field is never serialized, so a
+                    // concurrent transition cannot be seen through the other
+                    // transaction file. Splicing an entry assembled against a
+                    // stale base would silently drop that transition, so the
+                    // commit fails instead; the commit path re-assembles
+                    // against the latest entry and retries.
+                    let existing_version = final_indices
+                        .iter()
+                        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                        .map(|idx| idx.dataset_version);
+                    if existing_version != stable_partition.base_entry_version {
+                        return Err(Error::invalid_input(format!(
+                            "the {} index entry changed (version {:?}, this rewrite was built on {:?}): \
+                             a concurrent rewrite landed, rebuild the stable-partition entry against \
+                             the latest version and retry",
+                            FRAG_REUSE_INDEX_NAME,
+                            existing_version,
+                            stable_partition.base_entry_version,
+                        )));
+                    }
+                    if frag_reuse_index.is_none() {
+                        return Err(Error::invalid_input(
+                            "a stable-partition rewrite must carry its assembled fragment reuse \
+                             index entry; commit through the lance commit path, which assembles it",
+                        ));
+                    }
+                }
                 if let Some(frag_reuse_index) = frag_reuse_index {
                     final_indices.retain(|idx| idx.name != frag_reuse_index.name);
                     final_indices.push(frag_reuse_index.clone());
@@ -1617,6 +1673,8 @@ mod tests {
     #[case::create_index("create_index")]
     #[case::config("config")]
     #[case::memwal("memwal")]
+    #[case::bare_rewrite("bare_rewrite")]
+    #[case::rewrite_with_v0_entry("rewrite_with_v0_entry")]
     fn tagged_history_rejects_unsupported_transactions(#[case] kind: &str) {
         let mut manifest = sample_manifest();
         manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
@@ -1643,6 +1701,24 @@ mod tests {
             "memwal" => Operation::UpdateMemWalState {
                 compacted_sstables: vec![],
             },
+            // A rewrite carrying no entry, or a v0 entry, would splice away
+            // the tagged history; only a tagged entry may replace one.
+            "bare_rewrite" => Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+                stable_partition: None,
+            },
+            "rewrite_with_v0_entry" => {
+                let mut v0_entry = fri.clone();
+                v0_entry.index_version = 0;
+                Operation::Rewrite {
+                    groups: vec![],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: Some(v0_entry),
+                    stable_partition: None,
+                }
+            }
             _ => unreachable!(),
         };
         let transaction = Transaction::new(manifest.version, operation, None);
@@ -1652,6 +1728,119 @@ mod tests {
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         assert!(
             error.to_string().contains("Tagged FRI history maintenance"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tagged_history_allows_rewrite_appending_tagged_entry() {
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        let mut current =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        current.fields.clear();
+        current.dataset_version = 7;
+        let mut appended =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        appended.fields.clear();
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(appended.clone()),
+                stable_partition: Some(crate::transaction::StablePartitionRewrite {
+                    transitions: vec![],
+                    base_entry_version: Some(7),
+                }),
+            },
+            None,
+        );
+        let (new_manifest, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![current.clone()],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
+        // The assembled entry replaced the previous one by name.
+        let entries: Vec<_> = final_indices
+            .iter()
+            .filter(|idx| idx.name == crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uuid, appended.uuid);
+        assert_ne!(
+            new_manifest.reader_feature_flags & FLAG_FRAGMENT_REUSE_INDEX,
+            0
+        );
+    }
+
+    #[test]
+    fn stable_partition_rewrite_guards_base_entry_version() {
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        let mut current =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        current.fields.clear();
+        current.dataset_version = 7;
+        let mut appended =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        appended.fields.clear();
+
+        // Assembled against an older entry (base None while the manifest
+        // holds version 7): splicing would drop the concurrent transition.
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(appended.clone()),
+                stable_partition: Some(crate::transaction::StablePartitionRewrite {
+                    transitions: vec![],
+                    base_entry_version: None,
+                }),
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![current],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("rebuild"), "{error}");
+    }
+
+    #[test]
+    fn stable_partition_rewrite_requires_assembled_entry() {
+        let manifest = sample_manifest();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+                stable_partition: Some(crate::transaction::StablePartitionRewrite {
+                    transitions: vec![],
+                    base_entry_version: None,
+                }),
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("must carry its assembled"),
             "{error}"
         );
     }

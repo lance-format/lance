@@ -2,7 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::index::DatasetIndexExt;
-use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
+use crate::index::frag_reuse::{
+    build_frag_reuse_index_metadata, build_stable_partition_rewrite_entry,
+    load_frag_reuse_index_details,
+};
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
@@ -937,6 +940,7 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::Rewrite {
             groups,
             frag_reuse_index,
+            stable_partition,
             ..
         } = &self.transaction.operation
         {
@@ -990,6 +994,44 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_index: committed_fri,
                     ..
                 } => {
+                    // Double consumption: the committed rewrite replaced
+                    // fragments our stable-partition transitions read from or
+                    // produce, so appending our transitions would record row
+                    // movement out of (or into) fragments that no longer
+                    // exist. Retry rebuilds the transitions against the
+                    // surviving fragments.
+                    // TODO(conflict matrix): SP-Rewrite rows against Delete/
+                    // Update/DataOverlay/CreateIndex stay on the generic
+                    // Rewrite rules for now; revisit in later phases.
+                    if let Some(stable_partition) = stable_partition {
+                        let touched: HashSet<u64> = stable_partition
+                            .transitions
+                            .iter()
+                            .flat_map(|transition| {
+                                transition
+                                    .sources
+                                    .iter()
+                                    .chain(transition.destinations.iter())
+                                    .map(|digest| digest.id)
+                            })
+                            .collect();
+                        if groups
+                            .iter()
+                            .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id))
+                            .any(|id| touched.contains(&id))
+                        {
+                            return Err(Error::retryable_commit_conflict_source(
+                                other_version,
+                                format!(
+                                    "A concurrent {} at version {} consumed fragments this \
+                                     stable-partition rewrite's transitions read from or produce. \
+                                     Rebuild the transitions against the latest version and retry.",
+                                    other_transaction.operation, other_version
+                                )
+                                .into(),
+                            ));
+                        }
+                    }
                     if groups
                         .iter()
                         .flat_map(|f| f.old_fragments.iter().map(|f| f.id))
@@ -2189,9 +2231,27 @@ impl<'a> TransactionRebase<'a> {
 
     async fn finish_rewrite(mut self, dataset: &Dataset) -> Result<Transaction> {
         if let Operation::Rewrite {
-            frag_reuse_index, ..
+            groups,
+            frag_reuse_index,
+            stable_partition,
+            ..
         } = &mut self.transaction.operation
         {
+            if let Some(stable_partition) = stable_partition {
+                // Assembled (and re-assembled after a conflict) against the
+                // FRI entry committed at the version this attempt builds on,
+                // so a rebase appends onto the latest entry instead of a
+                // stale one. `build_manifest` verifies the recorded base
+                // version still matches at splice time. The transitions
+                // themselves describe only this rewrite's row movement, so
+                // appending them onto a newer entry is sound once the
+                // conflict checks above ruled out double consumption.
+                let (entry, base_entry_version) =
+                    build_stable_partition_rewrite_entry(dataset, stable_partition, groups).await?;
+                stable_partition.base_entry_version = base_entry_version;
+                *frag_reuse_index = Some(entry);
+                return Ok(self.transaction);
+            }
             if let Some(new_fri) = frag_reuse_index {
                 if self.conflicting_frag_reuse_indices.is_empty() {
                     return Ok(self.transaction);
@@ -2410,6 +2470,7 @@ mod tests {
                 groups: vec![],
                 rewritten_indices: vec![],
                 frag_reuse_index: Some(tagged.clone()),
+                stable_partition: None,
             }
         };
         let transaction = Transaction::new_from_version(dataset.manifest.version, operation);
@@ -3140,6 +3201,7 @@ mod tests {
                 }],
                 rewritten_indices: vec![],
                 frag_reuse_index: None,
+                stable_partition: None,
             },
             Operation::ReserveFragments { num_fragments: 3 },
             Operation::Update {
@@ -3279,6 +3341,7 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                     frag_reuse_index: None,
+                    stable_partition: None,
                 },
                 [
                     Compatible,    // append
@@ -3301,6 +3364,7 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                     frag_reuse_index: None,
+                    stable_partition: None,
                 },
                 [
                     Compatible,    // append
@@ -3658,6 +3722,7 @@ mod tests {
             }],
             rewritten_indices: vec![],
             frag_reuse_index: None,
+            stable_partition: None,
         };
 
         let fragment0 = Fragment::new(0);
@@ -3803,6 +3868,7 @@ mod tests {
             }],
             rewritten_indices: vec![],
             frag_reuse_index: None,
+            stable_partition: None,
         };
 
         for (other, expect_conflict) in [(overlay_on(1), true), (overlay_on(0), false)] {
@@ -4608,6 +4674,7 @@ mod tests {
                 }],
                 rewritten_indices: vec![],
                 frag_reuse_index: Some(frag_reuse_index),
+                stable_partition: None,
             },
             None,
         );
@@ -5093,6 +5160,7 @@ mod tests {
                     }],
                     rewritten_indices: vec![],
                     frag_reuse_index: None,
+                    stable_partition: None,
                 },
                 Retryable,
             ),
@@ -5108,6 +5176,7 @@ mod tests {
                     }],
                     rewritten_indices: vec![],
                     frag_reuse_index: None,
+                    stable_partition: None,
                 },
                 Compatible,
             ),

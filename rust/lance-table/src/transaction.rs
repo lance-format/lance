@@ -41,8 +41,8 @@ pub(crate) mod test_support;
 
 pub use builder::{Transaction, TransactionBuilder};
 pub use operation::{
-    DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, UpdateMode,
-    UpdatedFragmentOffsets,
+    DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex,
+    StablePartitionRewrite, UpdateMode, UpdatedFragmentOffsets,
 };
 pub use update_map::{
     UpdateMap, UpdateMapEntry, translate_config_updates, translate_schema_metadata_updates,

@@ -14,9 +14,10 @@ use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, RowIdRemapper};
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
+use lance_table::transaction::{RewriteGroup, StablePartitionRewrite};
 use prost::Message;
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -426,4 +427,774 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         // Fragment reuse index is inline (no files)
         files: None,
     })
+}
+
+/// One length-delimited protobuf field, the unit both the inline details
+/// payload and appended transitions are spliced with.
+fn encode_length_delimited_field(tag: u32, bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len() + 8);
+    prost::encoding::encode_key(tag, prost::encoding::WireType::LengthDelimited, &mut output);
+    prost::encoding::encode_varint(bytes.len() as u64, &mut output);
+    output.extend_from_slice(bytes);
+    output
+}
+
+/// Extract a committed FRI entry's `FragmentReuseIndexDetails` content bytes
+/// verbatim, resolving an external reference but never reinterpreting the
+/// content: existing legacy versions and transitions keep their exact wire
+/// form when an operation carries them forward. Works for index_version 0 and
+/// 1 alike (a 0 -> 1 lift is the same bytes reinterpreted under version 1),
+/// unlike [`load_frag_reuse_index_details`], which decodes v0 semantics.
+pub(crate) async fn load_raw_frag_reuse_content(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> lance_core::Result<Vec<u8>> {
+    use bytes::Buf;
+    use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
+
+    let corrupt = |message: &str| Error::corrupt_file_named("FRI details", message);
+    let details = index
+        .index_details
+        .as_ref()
+        .filter(|details| details.type_url.ends_with("FragmentReuseIndexDetails"))
+        .ok_or_else(|| Error::index("Index details is not for the fragment reuse index"))?;
+    let mut wire = bytes::Bytes::copy_from_slice(&details.value);
+    let mut content: Option<(u32, bytes::Bytes)> = None;
+    while wire.has_remaining() {
+        let (tag, wire_type) = decode_key(&mut wire).map_err(|e| corrupt(&e.to_string()))?;
+        if wire_type == WireType::LengthDelimited {
+            let length = decode_varint(&mut wire).map_err(|e| corrupt(&e.to_string()))?;
+            if length > wire.remaining() as u64 {
+                return Err(corrupt("FRI details field length exceeds payload"));
+            }
+            let payload = wire.split_to(length as usize);
+            if matches!(tag, 1 | 2) && content.replace((tag, payload)).is_some() {
+                return Err(corrupt("multiple FRI content fields"));
+            }
+        } else {
+            skip_field(wire_type, tag, &mut wire, DecodeContext::default())
+                .map_err(|e| corrupt(&e.to_string()))?;
+        }
+    }
+    match content {
+        None => Err(corrupt("missing FRI content")),
+        Some((1, inline)) => Ok(inline.to_vec()),
+        Some((_, external)) => {
+            let external_file =
+                ExternalFile::decode(external).map_err(|e| corrupt(&e.to_string()))?;
+            let file_path = dataset
+                .indices_dir()
+                .join(index.uuid.to_string())
+                .join(external_file.path.clone());
+            let range = external_file.offset as usize
+                ..(external_file.offset as usize + external_file.size as usize);
+            let data = dataset
+                .object_store
+                .open(&file_path)
+                .await?
+                .get_range(range)
+                .await?;
+            Ok(data.to_vec())
+        }
+    }
+}
+
+/// Assemble the tagged FRI entry a stable-partition rewrite commits, and
+/// return it with the `dataset_version` of the entry it appended onto.
+///
+/// The current entry's content bytes are carried over verbatim (a v0 entry is
+/// lifted to index_version 1 by reinterpretation, not re-encoding) and each
+/// new transition is appended as another `InlineContent.transitions` element.
+/// Before anything is spilled or committed, the binding between the rewrite
+/// groups and the transitions is validated (sources and destinations must
+/// match the groups' old and new fragments one to one, in order), row counts
+/// must be conserved, and the whole assembled content must decode as a valid
+/// ledger.
+pub(crate) async fn build_stable_partition_rewrite_entry(
+    dataset: &Dataset,
+    stable_partition: &StablePartitionRewrite,
+    groups: &[RewriteGroup],
+) -> lance_core::Result<(IndexMetadata, Option<u64>)> {
+    let transitions = &stable_partition.transitions;
+    if transitions.is_empty() {
+        return Err(Error::invalid_input(
+            "a stable-partition rewrite carries no transitions",
+        ));
+    }
+
+    // Bind the covered rewrite groups to the transitions, one to one and in
+    // order. A group is covered when its old fragments appear among the
+    // transitions' sources; a group straddling covered and uncovered sources
+    // is rejected (see `ordered_rewrite_groups`).
+    let source_ids: HashSet<u64> = transitions
+        .iter()
+        .flat_map(|transition| transition.sources.iter().map(|source| source.id))
+        .collect();
+    let mut covered_groups = Vec::with_capacity(transitions.len());
+    for group in groups {
+        let covered = group
+            .old_fragments
+            .iter()
+            .filter(|frag| source_ids.contains(&frag.id))
+            .count();
+        if covered == 0 {
+            continue;
+        }
+        if covered != group.old_fragments.len() {
+            return Err(Error::invalid_input(
+                "a rewrite group mixes stable-partition and order-preserving source fragments",
+            ));
+        }
+        covered_groups.push(group);
+    }
+    if covered_groups.len() != transitions.len() {
+        return Err(Error::invalid_input(format!(
+            "the stable-partition rewrite lists {} transitions but {} rewrite groups are \
+             covered by their sources",
+            transitions.len(),
+            covered_groups.len()
+        )));
+    }
+    for (group, transition) in covered_groups.iter().zip(transitions.iter()) {
+        if group.old_fragments.len() != transition.sources.len() {
+            return Err(Error::invalid_input(format!(
+                "a transition lists {} sources but its rewrite group holds {} old fragments",
+                transition.sources.len(),
+                group.old_fragments.len()
+            )));
+        }
+        for (frag, digest) in group.old_fragments.iter().zip(transition.sources.iter()) {
+            let physical_rows = frag.physical_rows.ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "source fragment {} has no physical row count",
+                    frag.id
+                ))
+            })? as u64;
+            let num_deleted_rows = frag
+                .deletion_file
+                .as_ref()
+                .and_then(|deletion| deletion.num_deleted_rows)
+                .unwrap_or(0) as u64;
+            if digest.id != frag.id
+                || digest.physical_rows != physical_rows
+                || digest.num_deleted_rows != num_deleted_rows
+            {
+                return Err(Error::invalid_input(format!(
+                    "transition source digest {:?} does not match old fragment {} \
+                     ({physical_rows} physical rows, {num_deleted_rows} deleted)",
+                    digest, frag.id
+                )));
+            }
+        }
+        if group.new_fragments.len() != transition.destinations.len() {
+            return Err(Error::invalid_input(format!(
+                "a transition lists {} destinations but its rewrite group holds {} new fragments",
+                transition.destinations.len(),
+                group.new_fragments.len()
+            )));
+        }
+        for (frag, digest) in group
+            .new_fragments
+            .iter()
+            .zip(transition.destinations.iter())
+        {
+            let physical_rows = frag.physical_rows.ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "destination fragment {} has no physical row count",
+                    frag.id
+                ))
+            })? as u64;
+            if digest.id != frag.id
+                || digest.physical_rows != physical_rows
+                || digest.num_deleted_rows != 0
+            {
+                return Err(Error::invalid_input(format!(
+                    "transition destination digest {:?} does not match new fragment {} \
+                     ({physical_rows} physical rows)",
+                    digest, frag.id
+                )));
+            }
+        }
+        // Conservation: every live source row lands in exactly one
+        // destination. The digests were just bound to the actual fragments,
+        // so this checks the fragments themselves.
+        let live_source_rows: u64 = transition
+            .sources
+            .iter()
+            .map(|digest| digest.physical_rows.saturating_sub(digest.num_deleted_rows))
+            .sum();
+        let destination_rows: u64 = transition
+            .destinations
+            .iter()
+            .map(|digest| digest.physical_rows)
+            .sum();
+        if live_source_rows != destination_rows {
+            return Err(Error::invalid_input(format!(
+                "a transition does not conserve rows: {live_source_rows} live source rows, \
+                 {destination_rows} destination rows"
+            )));
+        }
+        // TODO(row-map totals): also validate the transition's row-map label
+        // totals against the destination digests by tail-reading the map
+        // file's counts buffer (RowMapReader keeps per-destination totals);
+        // today that costs one object-store read per transition, so the
+        // ledger's digest conservation stands in for it at commit time.
+    }
+
+    // Carry the current entry's content bytes over verbatim.
+    let stored = super::load_all_indices(dataset).await?;
+    let existing = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+    let (mut content, base_bitmap, base_entry_version) = match existing {
+        None => (Vec::new(), RoaringBitmap::new(), None),
+        Some(entry) => {
+            if !matches!(entry.index_version, 0 | 1) {
+                return Err(Error::not_supported(format!(
+                    "Cannot append a stable-partition transition to FRI index_version {}; \
+                     upgrade to a newer version of Lance",
+                    entry.index_version
+                )));
+            }
+            (
+                load_raw_frag_reuse_content(dataset, entry).await?,
+                entry.fragment_bitmap.clone().unwrap_or_default(),
+                Some(entry.dataset_version),
+            )
+        }
+    };
+    for transition in transitions {
+        // Another `InlineContent.transitions` (field 2) element; repeated
+        // protobuf fields concatenate, so appending preserves the existing
+        // wire form untouched.
+        content.extend_from_slice(&encode_length_delimited_field(
+            2,
+            &transition.encode_to_vec(),
+        ));
+    }
+
+    // Commit-side validation of the assembled entry: lineage order, digest
+    // conservation, single content field, mapping presence, unknown-mapping
+    // detection. Runs on the inline form before any spill.
+    let assembled = prost_types::Any {
+        type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+        value: encode_length_delimited_field(1, &content),
+    };
+    lance_table::system_index::frag_reuse::ledger::FragReuseLedger::decode(
+        1,
+        &assembled,
+        |_| async {
+            Err(Error::invalid_input(
+                "the assembled FRI content is inline; no external read is possible",
+            ))
+        },
+    )
+    .await?;
+
+    // Provenance: the previous coverage plus every fragment this rewrite's
+    // transitions touch, retired sources deliberately included.
+    let mut fragment_bitmap = base_bitmap;
+    for transition in transitions {
+        for digest in transition
+            .sources
+            .iter()
+            .chain(transition.destinations.iter())
+        {
+            fragment_bitmap.insert(digest.id as u32);
+        }
+    }
+
+    let index_id = Uuid::new_v4();
+    let details_value = if content.len() > 204800 {
+        let file_path = dataset
+            .indices_dir()
+            .join(index_id.to_string())
+            .join(FRAG_REUSE_DETAILS_FILE_NAME);
+        let mut writer = dataset.object_store.create(&file_path).await?;
+        writer.write_all(&content).await?;
+        writer.shutdown().await?;
+        let external_file = ExternalFile {
+            path: FRAG_REUSE_DETAILS_FILE_NAME.to_owned(),
+            offset: 0,
+            size: content.len() as u64,
+        };
+        encode_length_delimited_field(2, &external_file.encode_to_vec())
+    } else {
+        assembled.value
+    };
+
+    let entry = IndexMetadata {
+        uuid: index_id,
+        name: FRAG_REUSE_INDEX_NAME.to_string(),
+        fields: vec![],
+        covering_fields: vec![],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(fragment_bitmap),
+        index_details: Some(Arc::new(prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: details_value,
+        })),
+        index_version: 1,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        // The row-map files live in their own directories referenced from the
+        // transitions, not under this entry's uuid.
+        files: None,
+    };
+    Ok((entry, base_entry_version))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::frag_reuse_reader::tests as reader_tests;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int32Type;
+    use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+    use lance_table::format::Fragment;
+    use lance_table::format::pb::fragment_reuse_index_details::{
+        FragmentDigest, StablePartition, Transition, transition,
+    };
+    use lance_table::system_index::frag_reuse::FragDigest;
+    use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
+    use lance_table::system_index::frag_reuse::metadata::is_tagged;
+    use lance_table::transaction::{Operation, Transaction};
+    use roaring::RoaringTreemap;
+
+    async fn sorted_values(dataset: &Dataset) -> Vec<i32> {
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let mut values: Vec<i32> = batch["i"]
+            .as_primitive::<Int32Type>()
+            .iter()
+            .map(|value| value.unwrap())
+            .collect();
+        values.sort_unstable();
+        values
+    }
+
+    async fn reserve_fragments(dataset: &mut Dataset, num_fragments: u32) {
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::ReserveFragments { num_fragments },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn stored_fri(indices: &[IndexMetadata]) -> IndexMetadata {
+        indices
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .cloned()
+            .unwrap()
+    }
+
+    async fn decode_entry(dataset: &Dataset, entry: &IndexMetadata) -> FragReuseLedger {
+        let content = load_raw_frag_reuse_content(dataset, entry).await.unwrap();
+        let inline = prost_types::Any {
+            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+            value: encode_length_delimited_field(1, &content),
+        };
+        FragReuseLedger::decode(entry.index_version, &inline, |_| async {
+            unreachable!("re-wrapped inline")
+        })
+        .await
+        .unwrap()
+    }
+
+    /// One atomic Rewrite carries the whole recluster: fragments swapped, the
+    /// tagged entry installed, provenance bitmaps untouched, reads identical.
+    #[tokio::test]
+    async fn stable_partition_rewrite_commits_atomically() {
+        let mut dataset = reader_tests::fixture().await;
+        reserve_fragments(&mut dataset, 20).await;
+        let before = sorted_values(&dataset).await;
+        assert_eq!(before, (0..8).collect::<Vec<_>>());
+
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (transition, destinations) = reader_tests::prepare(&dataset).await;
+        let read_version = dataset.manifest.version;
+        let committed = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments: old_fragments.clone(),
+                        new_fragments: destinations.clone(),
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    stable_partition: Some(StablePartitionRewrite {
+                        transitions: vec![transition.clone()],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+        let mut dataset = committed;
+
+        // The table became tagged in the same commit.
+        let flag = FLAG_FRAGMENT_REUSE_INDEX;
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
+        assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
+        let live_ids: Vec<u64> = dataset.fragments().iter().map(|frag| frag.id).collect();
+        assert_eq!(live_ids, vec![10, 11]);
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let entry = stored_fri(&stored);
+        assert!(is_tagged(&entry));
+        assert_eq!(entry.index_version, 1);
+        assert_eq!(
+            entry.fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([0u32, 1, 10, 11])
+        );
+        // The scalar index keeps its retired source ids as provenance; the
+        // tagged reader depends on the stored bitmaps staying untouched.
+        let scalar = stored.iter().find(|idx| idx.name == "i_idx").unwrap();
+        assert_eq!(
+            scalar.fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([0u32, 1])
+        );
+        let ledger = decode_entry(&dataset, &entry).await;
+        assert_eq!(ledger.transitions().len(), 1);
+
+        // Reads are row-identical, unfiltered and through the translated index.
+        assert_eq!(sorted_values(&dataset).await, before);
+        assert_eq!(
+            dataset.count_rows(Some("i = 3".to_string())).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("i >= 4".to_string()))
+                .await
+                .unwrap(),
+            4
+        );
+
+        // A second stable-partition rewrite passes the tagged gate and
+        // appends onto the v1 entry, preserving its bytes verbatim.
+        let first_content = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+        reserve_fragments(&mut dataset, 20).await;
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (mut transition, mut destinations) = reader_tests::prepare(&dataset).await;
+        for (i, fragment) in destinations.iter_mut().enumerate() {
+            fragment.id = 20 + i as u64;
+            transition.destinations[i].id = 20 + i as u64;
+        }
+        let read_version = dataset.manifest.version;
+        let dataset = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments: destinations,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    stable_partition: Some(StablePartitionRewrite {
+                        transitions: vec![transition],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+        let live_ids: Vec<u64> = dataset.fragments().iter().map(|frag| frag.id).collect();
+        assert_eq!(live_ids, vec![20, 21]);
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let entry = stored_fri(&stored);
+        assert_eq!(entry.index_version, 1);
+        let second_content = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+        assert!(second_content.starts_with(&first_content));
+        let ledger = decode_entry(&dataset, &entry).await;
+        assert_eq!(ledger.transitions().len(), 2);
+        let scalar = stored.iter().find(|idx| idx.name == "i_idx").unwrap();
+        assert_eq!(
+            scalar.fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([0u32, 1])
+        );
+        assert_eq!(sorted_values(&dataset).await, before);
+        assert_eq!(
+            dataset.count_rows(Some("i = 3".to_string())).await.unwrap(),
+            1
+        );
+    }
+
+    /// A 0 -> 1 lift reinterprets the committed v0 bytes without re-encoding
+    /// them: the assembled content starts with the exact previous wire form.
+    #[tokio::test]
+    async fn lift_preserves_v0_content_bytes() {
+        let mut dataset = reader_tests::fixture().await;
+
+        // A committed v0 entry with one legacy compaction (100 -> 110).
+        let mut addrs = RoaringTreemap::new();
+        for offset in 0..4u64 {
+            addrs.insert((100 << 32) + offset);
+        }
+        let mut changed_row_addrs = Vec::new();
+        addrs.serialize_into(&mut changed_row_addrs).unwrap();
+        let digest = |id: u64| FragDigest {
+            id,
+            physical_rows: 4,
+            num_deleted_rows: 0,
+        };
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs,
+                    old_frags: vec![digest(100)],
+                    new_frags: vec![digest(110)],
+                }],
+            }],
+        };
+        let v0_entry = build_frag_reuse_index_metadata(
+            &dataset,
+            None,
+            details.clone(),
+            RoaringBitmap::from_iter([110u32]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v0_entry.index_version, 0);
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![v0_entry],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let v0_entry = stored_fri(&stored);
+        let v0_content = load_raw_frag_reuse_content(&dataset, &v0_entry)
+            .await
+            .unwrap();
+        assert_eq!(v0_content, InlineContent::from(&details).encode_to_vec());
+
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (transition, destinations) = reader_tests::prepare(&dataset).await;
+        let stable_partition = StablePartitionRewrite {
+            transitions: vec![transition.clone()],
+            base_entry_version: None,
+        };
+        let groups = vec![RewriteGroup {
+            old_fragments,
+            new_fragments: destinations,
+        }];
+        let (entry, base_entry_version) =
+            build_stable_partition_rewrite_entry(&dataset, &stable_partition, &groups)
+                .await
+                .unwrap();
+        assert_eq!(base_entry_version, Some(v0_entry.dataset_version));
+        assert_eq!(entry.index_version, 1);
+        let lifted = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+        assert!(lifted.starts_with(&v0_content));
+        assert_eq!(
+            &lifted[v0_content.len()..],
+            encode_length_delimited_field(2, &transition.encode_to_vec()).as_slice()
+        );
+        assert_eq!(
+            entry.fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([0u32, 1, 10, 11, 110])
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_mismatch_rejected() {
+        let dataset = reader_tests::fixture().await;
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (transition, destinations) = reader_tests::prepare(&dataset).await;
+        let groups = |old: Vec<Fragment>, new: Vec<Fragment>| {
+            vec![RewriteGroup {
+                old_fragments: old,
+                new_fragments: new,
+            }]
+        };
+        let sp = |transitions: Vec<Transition>| StablePartitionRewrite {
+            transitions,
+            base_entry_version: None,
+        };
+
+        // A group straddling covered and uncovered sources.
+        let mut with_extra = old_fragments.clone();
+        let mut foreign = Fragment::new(99);
+        foreign.physical_rows = Some(4);
+        with_extra.push(foreign);
+        let error = build_stable_partition_rewrite_entry(
+            &dataset,
+            &sp(vec![transition.clone()]),
+            &groups(with_extra, destinations.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("mixes"), "{error}");
+
+        // No group covered by the transition's sources.
+        let error =
+            build_stable_partition_rewrite_entry(&dataset, &sp(vec![transition.clone()]), &[])
+                .await
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("covered by their sources"),
+            "{error}"
+        );
+
+        // A source digest that disagrees with its fragment.
+        let mut tampered = transition.clone();
+        tampered.sources[0].physical_rows += 1;
+        let error = build_stable_partition_rewrite_entry(
+            &dataset,
+            &sp(vec![tampered]),
+            &groups(old_fragments.clone(), destinations.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("source digest"), "{error}");
+
+        // Destinations out of order relative to the row map's label space.
+        let mut reversed = destinations.clone();
+        reversed.reverse();
+        let error = build_stable_partition_rewrite_entry(
+            &dataset,
+            &sp(vec![transition.clone()]),
+            &groups(old_fragments, reversed),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("destination digest"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn conservation_violation_rejected() {
+        let dataset = reader_tests::fixture().await;
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (mut transition, mut destinations) = reader_tests::prepare(&dataset).await;
+        // Drop the second destination consistently from the digests and the
+        // group: the binding holds, but half the live rows have no home.
+        transition.destinations.truncate(1);
+        destinations.truncate(1);
+        let error = build_stable_partition_rewrite_entry(
+            &dataset,
+            &StablePartitionRewrite {
+                transitions: vec![transition],
+                base_entry_version: None,
+            },
+            &[RewriteGroup {
+                old_fragments,
+                new_fragments: destinations,
+            }],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("does not conserve rows"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_invalid_assembly_rejected() {
+        let dataset = reader_tests::fixture().await;
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (mut transition, destinations) = reader_tests::prepare(&dataset).await;
+        // The binding never opens the mapping; the ledger validation does.
+        let Some(transition::Mapping::StablePartition(mapping)) = &mut transition.mapping else {
+            unreachable!()
+        };
+        mapping.map_id = "not-a-uuid".to_string();
+        let error = build_stable_partition_rewrite_entry(
+            &dataset,
+            &StablePartitionRewrite {
+                transitions: vec![transition],
+                base_entry_version: None,
+            },
+            &[RewriteGroup {
+                old_fragments,
+                new_fragments: destinations,
+            }],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("map_id"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn oversized_assembly_spills_to_external_file() {
+        let dataset = reader_tests::fixture().await;
+        // Enough synthetic transitions to exceed the 200KB inline threshold.
+        // The binding only checks transitions against their groups, so the
+        // fragments need not exist in the dataset.
+        let mut transitions = Vec::new();
+        let mut groups = Vec::new();
+        for i in 0..4000u64 {
+            let fragment = |id: u64| {
+                let mut fragment = Fragment::new(id);
+                fragment.physical_rows = Some(4);
+                fragment
+            };
+            let digest = |id: u64| FragmentDigest {
+                id,
+                physical_rows: 4,
+                num_deleted_rows: 0,
+            };
+            transitions.push(Transition {
+                sources: vec![digest(1_000 + i)],
+                destinations: vec![digest(100_000 + i)],
+                mapping: Some(transition::Mapping::StablePartition(StablePartition {
+                    map_id: Uuid::new_v4().to_string(),
+                    map_size_bytes: 1,
+                    base_id: None,
+                })),
+            });
+            groups.push(RewriteGroup {
+                old_fragments: vec![fragment(1_000 + i)],
+                new_fragments: vec![fragment(100_000 + i)],
+            });
+        }
+        let expected: Vec<u8> = transitions
+            .iter()
+            .flat_map(|transition| encode_length_delimited_field(2, &transition.encode_to_vec()))
+            .collect();
+        assert!(expected.len() > 204800);
+
+        let (entry, base_entry_version) = build_stable_partition_rewrite_entry(
+            &dataset,
+            &StablePartitionRewrite {
+                transitions,
+                base_entry_version: None,
+            },
+            &groups,
+        )
+        .await
+        .unwrap();
+        assert_eq!(base_entry_version, None);
+        // The details reference an external file whose bytes are the content.
+        let details = entry.index_details.as_ref().unwrap();
+        let proto = FragmentReuseIndexDetails::decode(details.value.as_slice()).unwrap();
+        let Some(Content::External(external)) = proto.content else {
+            panic!("expected external content, got {proto:?}");
+        };
+        assert_eq!(external.path, FRAG_REUSE_DETAILS_FILE_NAME);
+        assert_eq!(external.size, expected.len() as u64);
+        assert_eq!(
+            load_raw_frag_reuse_content(&dataset, &entry).await.unwrap(),
+            expected
+        );
+    }
 }
