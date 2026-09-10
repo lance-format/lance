@@ -1123,10 +1123,10 @@ pub(super) struct PartitionDocuments {
     // Set only by `try_new_with_remapping`; mutually exclusive with `remapper`
     // by construction.
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
-    lengths: OnceCell<Arc<DocLengths>>,
-    projection: OnceCell<Arc<VersionAddressProjection>>,
-    shared_addresses: ArcSwapWeak<UInt64Array>,
-    prewarm_complete: OnceCell<()>,
+    lengths: Arc<OnceCell<Arc<DocLengths>>>,
+    projection: Arc<OnceCell<Arc<VersionAddressProjection>>>,
+    shared_addresses: Arc<ArcSwapWeak<UInt64Array>>,
+    prewarm_complete: Arc<OnceCell<()>>,
 }
 
 /// Load-boundary discriminator between the read-only legacy representation and
@@ -1301,10 +1301,10 @@ impl PartitionDocuments {
             quantized_scoring,
             remapper,
             batch_remapper: None,
-            lengths: OnceCell::new(),
-            projection: OnceCell::new(),
-            shared_addresses: ArcSwapWeak::from(Weak::new()),
-            prewarm_complete: OnceCell::new(),
+            lengths: Arc::new(OnceCell::new()),
+            projection: Arc::new(OnceCell::new()),
+            shared_addresses: Arc::new(ArcSwapWeak::from(Weak::new())),
+            prewarm_complete: Arc::new(OnceCell::new()),
         })
     }
 
@@ -1331,6 +1331,32 @@ impl PartitionDocuments {
         )?;
         docs.batch_remapper = remapping;
         Ok(docs)
+    }
+
+    /// Share reader-free state within the same index and fragment-reuse namespace.
+    /// Cache misses use the current store and remapper; no previous request's
+    /// readers or storage credentials are retained by the shared cells.
+    pub(crate) fn with_store(
+        &self,
+        store: Arc<dyn IndexStore>,
+        remapper: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Self {
+        Self {
+            store,
+            path: self.path.clone(),
+            partition_id: self.partition_id,
+            index_cache: self.index_cache.clone(),
+            num_docs: self.num_docs,
+            coordinate_rank: self.coordinate_rank,
+            persisted_total_tokens: self.persisted_total_tokens,
+            quantized_scoring: self.quantized_scoring,
+            remapper,
+            batch_remapper: None,
+            lengths: self.lengths.clone(),
+            projection: self.projection.clone(),
+            shared_addresses: self.shared_addresses.clone(),
+            prewarm_complete: self.prewarm_complete.clone(),
+        }
     }
 
     pub(crate) fn len(&self) -> usize {

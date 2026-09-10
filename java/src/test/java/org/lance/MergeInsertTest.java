@@ -13,6 +13,10 @@
  */
 package org.lance;
 
+import org.lance.index.IndexOptions;
+import org.lance.index.IndexParams;
+import org.lance.index.IndexType;
+import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
 
@@ -25,12 +29,16 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -40,10 +48,29 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.UUID;
 
 public class MergeInsertTest {
+  private static final Schema WIDE_SCHEMA =
+      new Schema(
+          Arrays.asList(
+              Field.nullable("id", new ArrowType.Int(32, true)),
+              Field.nullable("name", new ArrowType.Utf8()),
+              Field.nullable("score", new ArrowType.Int(32, true))));
+
+  /** {@link #WIDE_SCHEMA} minus "score", so a source over it is a partial-schema update. */
+  private static final Schema PARTIAL_SOURCE_SCHEMA =
+      new Schema(
+          Arrays.asList(
+              Field.nullable("id", new ArrowType.Int(32, true)),
+              Field.nullable("name", new ArrowType.Utf8())));
+
+  /** {@link #createWideDataset()} after the rows with id 1 and 4 are renamed. */
+  private static final String WIDE_AFTER_UPDATE =
+      "{0=Person 0/0, 1=Updated 1/10, 2=Person 2/20, 3=Person 3/30, 4=Updated 4/40, 5=Person 5/50}";
+
   @TempDir private Path tempDir;
   private RootAllocator allocator;
   private TestUtils.SimpleTestDataset testDataset;
@@ -296,6 +323,148 @@ public class MergeInsertTest {
             "merge insert with useIndex=false should produce correct upsert results");
       }
     }
+  }
+
+  @ParameterizedTest
+  @CsvSource({"Auto, 2", "RewriteRows, 3"})
+  public void testWriteModeOnIndexedPartialUpdate(
+      MergeInsertParams.MergeWriteMode writeMode, int expectedFragments) throws Exception {
+    try (Dataset wideDataset = createWideDataset()) {
+      createIdIndex(wideDataset);
+
+      try (VectorSchemaRoot source = buildPartialSource(1, 4);
+          ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            wideDataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing)
+                    .withWriteMode(writeMode),
+                sourceStream);
+
+        Assertions.assertEquals(2, result.stats().numUpdatedRows());
+        try (Dataset merged = result.dataset()) {
+          Assertions.assertEquals(expectedFragments, merged.getFragments().size());
+          Assertions.assertEquals(WIDE_AFTER_UPDATE, readWide(merged).toString());
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testWriteModeRewriteColumns() throws Exception {
+    try (Dataset wideDataset = createWideDataset()) {
+      try (VectorSchemaRoot source = buildPartialSource(1, 4);
+          ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            wideDataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing)
+                    .withWriteMode(MergeInsertParams.MergeWriteMode.RewriteColumns),
+                sourceStream);
+
+        Assertions.assertEquals(2, result.stats().numUpdatedRows());
+        try (Dataset merged = result.dataset()) {
+          Assertions.assertEquals(2, merged.getFragments().size());
+          // "score", which the source omits, is carried through untouched.
+          Assertions.assertEquals(WIDE_AFTER_UPDATE, readWide(merged).toString());
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testWriteModeRewriteColumnsRejectsInserts() throws Exception {
+
+    try (Dataset wideDataset = createWideDataset()) {
+      try (VectorSchemaRoot source = buildPartialSource(100);
+          ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        Exception e =
+            Assertions.assertThrows(
+                Exception.class,
+                () ->
+                    wideDataset.mergeInsert(
+                        // WhenNotMatched defaults to InsertAll.
+                        new MergeInsertParams(Collections.singletonList("id"))
+                            .withMatchedUpdateAll()
+                            .withWriteMode(MergeInsertParams.MergeWriteMode.RewriteColumns)
+                            .withConflictRetries(0),
+                        sourceStream));
+        Assertions.assertTrue(
+            e.getMessage().contains("RewriteColumns cannot express"),
+            "expected the RewriteColumns rejection, got: " + e.getMessage());
+      }
+    }
+  }
+
+  /** A dataset of 6 rows over 2 fragments, whose "score" column no partial source carries. */
+  private Dataset createWideDataset() {
+    String path = tempDir.resolve(UUID.randomUUID().toString()).toString();
+    Dataset.create(allocator, path, WIDE_SCHEMA, new WriteParams.Builder().build()).close();
+
+    List<FragmentMetadata> fragments;
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(WIDE_SCHEMA, allocator)) {
+      root.allocateNew();
+      IntVector idVector = (IntVector) root.getVector("id");
+      VarCharVector nameVector = (VarCharVector) root.getVector("name");
+      IntVector scoreVector = (IntVector) root.getVector("score");
+      for (int i = 0; i < 6; i++) {
+        idVector.setSafe(i, i);
+        nameVector.setSafe(i, ("Person " + i).getBytes(StandardCharsets.UTF_8));
+        scoreVector.setSafe(i, i * 10);
+      }
+      root.setRowCount(6);
+      fragments =
+          Fragment.create(
+              path, allocator, root, new WriteParams.Builder().withMaxRowsPerFile(3).build());
+    }
+
+    Dataset wideDataset =
+        Dataset.commit(allocator, path, new FragmentOperation.Append(fragments), Optional.of(1L));
+    Assertions.assertEquals(2, wideDataset.getFragments().size());
+    return wideDataset;
+  }
+
+  private void createIdIndex(Dataset dataset) {
+    IndexParams indexParams =
+        IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree", "{}")).build();
+    dataset.createIndex(
+        IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
+            .withIndexName("id_btree")
+            .replace(true)
+            .build());
+  }
+
+  /** A source over {@link #WIDE_SCHEMA} minus "score", renaming the rows it names. */
+  private VectorSchemaRoot buildPartialSource(int... ids) {
+    VectorSchemaRoot source = VectorSchemaRoot.create(PARTIAL_SOURCE_SCHEMA, allocator);
+    source.allocateNew();
+    IntVector idVector = (IntVector) source.getVector("id");
+    VarCharVector nameVector = (VarCharVector) source.getVector("name");
+    for (int i = 0; i < ids.length; i++) {
+      idVector.setSafe(i, ids[i]);
+      nameVector.setSafe(i, ("Updated " + ids[i]).getBytes(StandardCharsets.UTF_8));
+    }
+    source.setRowCount(ids.length);
+    return source;
+  }
+
+  /** Reads a {@link #WIDE_SCHEMA} dataset as id -&gt; "name/score". */
+  private TreeMap<Integer, String> readWide(Dataset dataset) throws Exception {
+    TreeMap<Integer, String> rows = new TreeMap<>();
+    try (ArrowReader reader = dataset.newScan().scanBatches()) {
+      while (reader.loadNextBatch()) {
+        VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+        IntVector ids = (IntVector) batch.getVector("id");
+        VarCharVector names = (VarCharVector) batch.getVector("name");
+        IntVector scores = (IntVector) batch.getVector("score");
+        for (int i = 0; i < batch.getRowCount(); i++) {
+          rows.put(ids.get(i), new String(names.get(i)) + "/" + scores.get(i));
+        }
+      }
+    }
+    return rows;
   }
 
   private TreeMap<Integer, String> readAll(Dataset dataset) throws Exception {

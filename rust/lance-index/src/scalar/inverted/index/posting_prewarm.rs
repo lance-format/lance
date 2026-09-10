@@ -130,7 +130,12 @@ impl PostingListReader {
             }
             PostingMetadata::V2 { .. } => tok_start..tok_end,
         };
-        let batch = self.reader.read_range(row_range, Some(&columns)).await?;
+        let batch = self
+            .reader
+            .get()
+            .await?
+            .read_range(row_range, Some(&columns))
+            .await?;
         Ok(batch)
     }
 
@@ -735,6 +740,7 @@ impl PostingListReader {
                 PositionsLayout::LegacyPerDoc => {
                     let batch = self
                         .reader
+                        .get().await?
                         .read_range(self.posting_list_range(token_id), Some(&[POSITION_COL]))
                         .await
                         .map_err(|e| match e {
@@ -748,6 +754,7 @@ impl PostingListReader {
                 PositionsLayout::SharedStream(codec) => {
                     let batch = self
                         .reader
+                        .get().await?
                         .read_range(
                             self.posting_list_range(token_id),
                             Some(&[COMPRESSED_POSITION_COL, POSITION_BLOCK_OFFSET_COL]),

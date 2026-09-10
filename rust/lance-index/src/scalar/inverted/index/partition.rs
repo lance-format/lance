@@ -657,7 +657,7 @@ pub struct InvertedPartition {
     // 0 for legacy format
     pub(super) id: u64,
     pub(super) store: Arc<dyn IndexStore>,
-    pub(crate) tokens: TokenSet,
+    pub(crate) tokens: Arc<TokenSet>,
     pub(crate) inverted_list: Arc<PostingListReader>,
     /// Legacy documents stay in their original complete `DocSet`; modern
     /// documents use typed, independently-loaded lengths and addresses.
@@ -720,7 +720,7 @@ impl InvertedPartition {
         Ok(Self {
             id,
             store,
-            tokens,
+            tokens: Arc::new(tokens),
             inverted_list: Arc::new(inverted_list),
             docs: PartitionDocumentStore::Modern(Arc::new(docs)),
             token_set_format,
@@ -1549,7 +1549,7 @@ impl InvertedPartition {
             self.inverted_list.posting_tail_codec(),
             self.inverted_list.block_size(),
         );
-        builder.tokens = self.tokens.into_mutable();
+        builder.tokens = Arc::unwrap_or_clone(self.tokens).into_mutable();
         builder.docs = self.docs.load_build_docset().await?;
 
         builder
