@@ -191,8 +191,13 @@ counts matrix and the requested label blocks.
 When indexing or index remapping cannot keep up with compaction or reclustering,
 FRI allows fragment rewrites to proceed while retaining existing indices.
 Each rewrite that defers index remapping records its mapping: a reuse version
-in FRI index version 0, or transitions in index version 1. Destination fragments
-and their mapping must become visible in the same committed snapshot.
+in FRI index version 0, or transitions in index version 1. A transition must
+reference only fragments that are already committed. The rewrite and its
+mapping may be published in separate commits: until the mapping lands, the
+destination fragments are not covered by any index and are served by scanning,
+so correctness never depends on the mapping being present. Atomic composition
+of a rewrite with its transition is deferred to a future composite transaction
+mechanism.
 
 Once all dependent indices have caught up, the corresponding history can be
 trimmed. Cleanup must retain intermediate transitions still needed to translate
@@ -218,8 +223,11 @@ Longer mapping chains add translation work; trimming unused history reduces it.
 ### Reader and Writer Compatibility
 
 The first commit publishing FRI index version 1 sets
-`FLAG_FRAGMENT_REUSE_INDEX` (512) in both manifest flag fields. Subsequent
+`FLAG_FRAGMENT_REUSE_INDEX` (1024) in both manifest flag fields. Subsequent
 manifests retain both bits. FRI index version 0 does not require this flag.
+
+Tables using stable row IDs do not support tagged histories; writers must not
+publish `index_version >= 1` on them.
 
 The reader flag prevents older clients from partially interpreting the new
 history. The writer flag prevents them from dropping mappings when rewriting
