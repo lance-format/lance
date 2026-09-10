@@ -1963,3 +1963,57 @@ async fn legacy_traffic_guard_rejects_batch_entry_points() {
         })
         .await;
 }
+
+#[tokio::test]
+async fn tagged_append_preserves_stored_segment_provenance() {
+    let mut dataset = fixture().await;
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+
+    let serialize = |bitmap: &Option<roaring::RoaringBitmap>| {
+        bitmap.as_ref().map(|bitmap| {
+            let mut bytes = Vec::new();
+            bitmap.serialize_into(&mut bytes).unwrap();
+            bytes
+        })
+    };
+    let before: Vec<_> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .map(|index| (index.uuid, serialize(&index.fragment_bitmap)))
+        .collect();
+    assert!(!before.is_empty());
+
+    // Query first so the session holds rewritten (derived) coverage; the
+    // commit below must not leak it into stored metadata.
+    assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
+    let appended = arrow_array::record_batch!(("i", Int32, [100])).unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Snapshot-derived coverage must never be persisted back to a manifest:
+    // every stored segment keeps byte-identical provenance.
+    let after = crate::index::load_all_indices(&dataset).await.unwrap();
+    for (uuid, bitmap) in &before {
+        let stored = after.iter().find(|index| index.uuid == *uuid).unwrap();
+        assert_eq!(&serialize(&stored.fragment_bitmap), bitmap, "{uuid}");
+    }
+    assert_eq!(dataset.count_rows(Some("i = 100".into())).await.unwrap(), 1);
+}

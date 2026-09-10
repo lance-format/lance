@@ -161,18 +161,35 @@ async fn fri_query_plan(
                 let indices = dataset.load_indices().await?;
                 let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
                     stored.iter().map(|entry| (entry.uuid, entry)).collect();
-                // One pass over the filtered listing: group selected segments
-                // by logical index name and union each group's direct (stored)
-                // coverage once.
+                // Group the filtered listing by logical index name; the
+                // backtrack derives each member's sibling exclusions from the
+                // stored provenance of the whole group in one pass, so
+                // "direct coverage wins" is owned by one algorithm.
                 let mut filtered_by_uuid: HashMap<Uuid, &IndexMetadata> =
                     HashMap::with_capacity(indices.len());
-                let mut group_coverage: HashMap<&str, RoaringBitmap> = HashMap::new();
+                let mut groups: HashMap<&str, Vec<Uuid>> = HashMap::new();
                 for entry in indices.iter() {
                     filtered_by_uuid.insert(entry.uuid, entry);
-                    if let Some(source) = stored_by_uuid.get(&entry.uuid)
-                        && let Some(bitmap) = &source.fragment_bitmap
-                    {
-                        *group_coverage.entry(entry.name.as_str()).or_default() |= bitmap;
+                    if entry.name != FRAG_REUSE_INDEX_NAME {
+                        groups
+                            .entry(entry.name.as_str())
+                            .or_default()
+                            .push(entry.uuid);
+                    }
+                }
+                let mut excluded_by_uuid: HashMap<Uuid, RoaringBitmap> = HashMap::new();
+                for members in groups.into_values() {
+                    let provenance: Vec<RoaringBitmap> = members
+                        .iter()
+                        .map(|uuid| {
+                            stored_by_uuid
+                                .get(uuid)
+                                .and_then(|source| source.fragment_bitmap.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    for (uuid, parts) in members.iter().zip(mapping.segment_plans(&provenance)) {
+                        excluded_by_uuid.insert(*uuid, parts.excluded);
                     }
                 }
                 let mut segments = HashMap::with_capacity(stored.len());
@@ -187,13 +204,8 @@ async fn fri_query_plan(
                         // Drop paths entering those fragments before later
                         // mappings can merge them with this segment's
                         // contribution.
-                        let mut excluded_fragments = group_coverage
-                            .get(entry.name.as_str())
-                            .cloned()
-                            .unwrap_or_default();
-                        if let Some(bitmap) = &source.fragment_bitmap {
-                            excluded_fragments -= bitmap;
-                        }
+                        let excluded_fragments =
+                            excluded_by_uuid.remove(&source.uuid).unwrap_or_default();
                         SegmentRemappingPlan::Translate {
                             coverage,
                             excluded_fragments,
