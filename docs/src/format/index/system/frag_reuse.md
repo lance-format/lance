@@ -1,146 +1,228 @@
 # Fragment Reuse Index
 
-The Fragment Reuse Index is an internal index used to optimize fragment operations 
-during compaction and dataset updates.
+The Fragment Reuse Index (FRI) is an internal index that keeps existing indices
+usable while fragments are compacted or reclustered. It records how old physical
+row addresses map to new addresses, without changing surviving row values.
 
-When data modifications happen against a Lance table,
-it could trigger compaction and index optimization at the same time to improve data layout and index coverage.
-By default, compaction will remap all indices at the same time to prevent read regression.
-This means both compaction and index optimization could modify the same index and cause one process to fail.
-Typically, the compaction would fail because it has to modify all indices and takes longer,
-resulting in table layout degrading over time.
+## Use Case 1: Compact Fragments
 
-Fragment Reuse Index allows a compaction to defer the index remap process.
-Suppose a compaction removes fragments A and B and produces C.
-At query runtime, it reuses the old fragments A and B by 
-updating the row addresses related to A and B in the index to the latest ones in C.
-Because indices are typically cached in memory after initial load,
-the in-memory index is up to date after the fragment reuse application process.
+When data modifications happen against a Lance table, they can trigger compaction
+and index optimization at the same time to improve data layout and index coverage.
+By default, compaction remaps all indices to prevent read regression.
+This means both compaction and index optimization can modify the same index and
+cause one process to fail. Typically, compaction fails because it has to modify
+all indices and takes longer, resulting in table layout degrading over time.
+
+Fragment Reuse Index allows compaction to defer the index remap process.
+Suppose a compaction removes fragments A and B and produces C. At query runtime,
+the existing indices are reused by translating their addresses in A and B to
+addresses in C. Because indices are typically cached in memory after initial
+load, the translated index can be reused by subsequent queries.
+
+## Use Case 2: Recluster Fragments
+
+Fragments are often organized by data arrival order. Queries filtering by fields
+such as day or user UUID may therefore need to search many fragments or index
+segments. An external engine, such as Spark, can reorganize rows into destination
+fragments grouped by those fields.
+
+A **stable partition** assigns source rows to destination fragments while
+preserving their relative source order within each destination. This lets FRI
+reuse existing indices after reclustering. Sorting or arbitrarily shuffling rows
+within a destination requires a different mapping; it is not represented by the
+stable-partition format defined here.
 
 ## Index Details
+
+FRI uses one system-index entry named `__lance_frag_reuse`. Its
+`IndexMetadata.index_details` contains `FragmentReuseIndexDetails`:
 
 ```protobuf
 %%% proto.message.FragmentReuseIndexDetails %%%
 ```
 
-## FRI Index Versions
+The outer `InlineContent` / `ExternalFile` choice applies to the entire history.
+Small histories are stored inline; larger histories store the serialized
+`InlineContent` in `_indices/<FRI UUID>/details.binpb`. Updating the history
+replaces the FRI metadata. Stable-partition row maps are separate immutable files
+and are not rewritten with that history.
 
-`IndexMetadata.index_version = 0` retains the existing compaction format and
-read/write behavior: `InlineContent.legacy_versions` (field 1) is the only
-content. Version 1 adds `InlineContent.transitions` at field 2; field 1 keeps
-its original field number and wire representation. A version-1 reader lifts
-each legacy group into an ordered-compaction transition, so both histories
-form one graph.
+### FRI Index Versions
 
-A transition records ordered source digests at field 1 (scan order; row counts
-include deleted rows) and ordered destination digests at field 2 (mapping
-order; creation-time counts with zero deletions). Exactly one mapping is
-required: ordered compaction at field 3 or stable partition at field 4. Field
-numbers outside the declared mapping alternatives carry ordinary metadata and
-do not identify mappings; such fields must be registered in the protobuf
-definition. New mapping types require a new FRI `index_version`. Readers that
-do not support a version must reject it and request an upgrade before decoding
-its content. `FLAG_FRAGMENT_REUSE_INDEX` (see
-[feature flags](../../table/versioning.md)) fences readers and writers that
-predate version negotiation.
+`IndexMetadata.index_version` identifies the format required to interpret FRI;
+it is not a dataset version or the sequence number of a rewrite.
 
-The retained history must satisfy: each fragment has at most one producing
-transition and at most one consuming transition; lineage is acyclic; within a
-transition, total surviving source rows equal total destination rows; across
-transitions, a fragment's physical row count is unchanged while its deletion
-count may only increase. Transition order is derived from fragment
-dependencies, not serialization order.
+- **Version 0** retains the existing compaction format and read/write behavior.
+  `InlineContent.legacy_versions` keeps the original field number, 1, and wire
+  representation of `versions`.
+- **Version 1** adds `InlineContent.transitions` at field 2. It supports both
+  ordered compaction and stable partition. Each legacy group can be interpreted
+  as an ordered-compaction transition, forming one history with the new records.
 
-## Stable Partition Mapping
+Adding a transition or a new mapping type does not itself require increasing
+`index_version`. Readers may skip unsupported mappings and fall back to scanning
+where a complete translation path is unavailable. Writers must reject operations
+that require interpreting or maintaining unsupported mappings; operations that
+carry the existing history unchanged need not interpret them. Changes to the
+shared metadata contract that require reader upgrades must increase `index_version`.
 
-A stable partition rewrite processes its source fragments sequentially in the
-recorded order and assigns every surviving row a label, the index of the
-destination fragment that receives it. Rows with equal labels keep their
-relative source order. Deleted source rows carry no label. Per-destination
-ordering beyond source order is not representable.
+### Shared Transition Metadata
+
+Each transition records ordered `sources` and `destinations`, plus exactly one
+mapping. A fragment digest contains its ID, physical row count, and deleted row
+count. Source counts describe the rewrite input; destination counts describe the
+newly written fragments, with zero deletions.
+
+Sources define scan order; destinations define output order for compaction and
+label order for stable partition. The surviving source row count must equal the
+total destination row count. Each fragment has at most one producer and one
+consumer in the retained history, and the graph must be acyclic. A fragment's
+physical row count stays constant across transitions; its deletion count may
+increase. Translation follows these dependencies, not the serialized list order.
+
+## Mappings
+
+### Ordered Compaction
+
+Ordered compaction concatenates surviving rows in source-fragment order, with
+ascending physical row offsets within each source, then splits that stream into
+the ordered destination fragments.
+
+`changed_row_addrs` stores a serialized RoaringTreemap of surviving source
+addresses. A physical address uses the upper 32 bits for the fragment ID and the
+lower 32 bits for the row offset. A valid source row absent from the bitmap was
+deleted.
+
+To translate a surviving row, count the surviving rows in preceding source
+fragments and the surviving rows before its offset in its own fragment. Their
+sum is its zero-based position in the output stream. Find the destination whose
+cumulative physical-row range contains that position and subtract the start of
+that range to obtain the destination offset.
+
+The legacy `Group` and the new `OrderedCompaction` mapping use this same ordering
+and bitmap representation. No per-row destination labels are required.
+
+### Stable Partition
+
+A stable partition processes source fragments sequentially in their recorded
+order and assigns each surviving row a label: the zero-based position of its
+destination in `destinations`. Rows with the same label retain their relative
+source order. Deleted source rows carry a null label.
 
 The mapping payload is one immutable Lance file,
-`_fri/<map_id>/stable_partition.lance`, resolved against the dataset base when
-`StablePartition.base_id` is unset and against the identified
-`Manifest.base_paths` entry otherwise. `map_id` is a UUID independent of the
-FRI index UUID, so the file survives FRI metadata rewrites.
-`map_size_bytes` records the exact file size. Operations that relocate the
-dataset root are unsupported until they copy the mapping files or rewrite
-these references.
+`_fri/<map_id>/stable_partition.lance`. `map_id` is a UUID independent of the FRI
+index UUID, so the file survives FRI metadata rewrites. `map_size_bytes` records
+its exact size. An unset `base_id` selects the dataset base; otherwise it selects
+the corresponding `Manifest.base_paths` entry. Relocating a dataset requires
+copying these files or updating their references.
 
-### Row Map File Schema
+#### Row Map File Schema
+
+The row map is a Lance file with one nullable `uint16` label per physical source
+row. Rows follow source-fragment order, then physical row offset within each
+fragment, including deleted rows.
 
 ```python
 import pyarrow as pa
 
-row_map_schema = pa.schema(
-    [pa.field("label", pa.uint16(), nullable=True)],
-    metadata={
-        # Index of the Lance file global buffer holding the counts matrix.
-        b"lance:stable_partition:counts_buffer_index": b"<integer>",
-    },
-)
+row_map_schema = pa.schema([pa.field("label", pa.uint16(), nullable=True)])
 ```
 
-The file holds one row per physical source row, ordered by the transition's
-source fragments in their recorded order and by physical row offset within
-each fragment. A non-null value is the row's destination label and must be
-less than the number of destinations; null means the row was deleted at
-rewrite time.
+A label tells us which destination receives the row: `0` means
+`destinations[0]`, `1` means `destinations[1]`, and `null` means the row was
+deleted at rewrite time. It stores the destination's position in the list, not
+its fragment ID or row offset. The number of destinations must be between 1
+and 65,536, and each non-null label must be smaller than that number.
 
-The counts matrix lives in the global buffer named by the schema metadata key.
-Its little-endian layout is: magic `LSPC` (4 bytes), version `u32 = 1`,
-representation `u32` (0 = dense grid; other values are reserved and must be
-rejected), `num_destinations u32`, `block_rows u32`, `total_rows u64`,
-followed by `num_blocks x num_destinations` `u32` values in block-major order,
-where `num_blocks = ceil(total_rows / block_rows)`. Grid row `b` holds, for
-each destination `d`, the number of rows labeled `d` in blocks `0..=b`; the
-final grid row therefore equals every destination's physical row count. Null
-rows are not counted, so a block's deleted count is its length minus the sum
-of its per-label deltas.
+#### Counts Matrix
 
-### Reader Navigation
+Labels tell us the destination fragment. To find the row offset inside that
+fragment, we count earlier source rows with the same label.
 
-To translate source row `r`: the containing block is `r / block_rows`; the
-destination offset is the previous block's cumulative count for the row's
-label (zero for the first block) plus the label's rank among rows from the
-block start up to `r`, read from the label column. To translate a run of rows,
-initialize per-destination counters from the cumulative counts at the
-preceding block boundary and sweep the label column forward, assigning
-`offset = counter[label]` and incrementing that counter for each surviving
-row. Readers can validate a file against its transition: per-destination
-totals must equal the destination digests' physical row counts, and
-`total_rows` must equal the sum of source digests' physical row counts.
+To avoid reading all earlier labels, source rows are divided into blocks.
+For each block and destination, the counts matrix stores the cumulative number
+of rows sent to that destination through the end of the block. Null labels are
+not counted. `block_rows` must be positive; the current writer uses 65,536.
+Only the final block may be shorter.
+
+The matrix is stored in a Lance global buffer. The schema metadata key
+`lance:stable_partition:counts_buffer_index` contains its buffer index as a
+decimal string. Readers locate the buffer through the normal Lance file metadata.
+
+The buffer starts with a 28-byte header, in this order:
+
+- Magic: four bytes, `LSPC`.
+- Version: `u32`, value 1.
+- Representation: `u32`, value 0 for the dense grid.
+- Number of destinations: `u32`.
+- Rows per block: `u32`.
+- Total physical source rows: `u64`.
+
+All integers are unsigned and little-endian. The header is followed by
+`ceil(total_rows / block_rows) * num_destinations` cumulative `u32` counts,
+ordered by block, then destination. No extra bytes are allowed. Unsupported
+versions or representations must be rejected.
+
+Counts must never decrease, and a block cannot contribute more live rows than
+its length. Final destination counts must match the destination digests. The
+label-file row count and header total must match the sum of source physical row
+counts. An empty file has no grid rows and zero destination totals.
+
+#### Address Translation
+
+For source fragment `s` and row offset `o`:
+
+1. Find its label-file position: the physical row counts of all preceding source
+   fragments, plus `o`.
+2. Read the block containing that position. A null label means the row was deleted;
+   otherwise label `d` selects `destinations[d]`.
+3. The destination row offset is the count for `d` before this block, plus the
+   number of occurrences of `d` strictly before this row within the block.
+   The count before the first block is zero.
+
+For batch translation, read each requested block once. Initialize destination
+counters from the preceding counts row, then scan the block in order. Each
+non-null label takes the current counter as its offset and increments it.
+Opening FRI history does not require reading labels; translation only needs the
+counts matrix and the requested label blocks.
 
 ## Expected Use Pattern
 
-Fragment Reuse Index should be created if the user defers index remap in compaction.
-The index accumulates a new **reuse version** every time a compaction is executed.
+When indexing or index remapping cannot keep up with compaction or reclustering,
+FRI allows fragment rewrites to proceed while retaining existing indices.
+Each rewrite that defers index remapping records its mapping: a reuse version
+in FRI index version 0, or transitions in index version 1. Destination fragments
+and their mapping must become visible in the same committed snapshot.
 
-As long as all the scalar and vector indices are created after the specific reuse version,
-the indices are all caught up and the specific reuse version can be trimmed.
+Once all dependent indices have caught up, the corresponding history can be
+trimmed. Cleanup must retain intermediate transitions still needed to translate
+old addresses. External mapping files can be deleted only when no retained
+dataset version references them.
 
 ## Impacts
 
 ### Conflict Resolution
 
-The presence of the Fragment Reuse Index changes how Lance detects conflicts between concurrent
-operations. Operations that would normally conflict with compaction (such as index building) can
-proceed without conflict when the FRI is in use. For full details on how conflict detection is
-affected, see [conflict resolution](../../table/transaction.md#conflict-resolution).
+Deferring index remapping avoids replacing existing indices during a fragment
+rewrite, reducing conflicts with concurrent index building or optimization.
+FRI does not remove conflicts between overlapping rewrites. See
+[conflict resolution](../../table/transaction.md#conflict-resolution).
 
 ### Index Load Cost
 
-When the FRI is present, indices must be remapped at load time. Each time an index is loaded into
-the cache, the FRI is applied to translate old row addresses to current ones. This adds a small
-cost to index loading but does not affect query performance once the index is cached.
+Loading affected indices requires translating their stored row addresses.
+Ordered compaction uses its bitmap and fragment layouts; stable partition also
+reads the required row-map blocks. Translated indices can be cached and reused.
+Longer mapping chains add translation work; trimming unused history reduces it.
 
-### FRI Growth and Cleanup
+### Reader and Writer Compatibility
 
-The FRI grows with each compaction. Every compaction that defers index remapping adds a new reuse
-version to the index. Over time, this can accumulate and increase the cost of index loading since
-more address translations must be applied.
+The first commit publishing FRI index version 1 sets
+`FLAG_FRAGMENT_REUSE_INDEX` (512) in both manifest flag fields. Subsequent
+manifests retain both bits. FRI index version 0 does not require this flag.
 
-Once all scalar and vector indices have been rebuilt past a given reuse version, that version is no
-longer needed and can be trimmed. Users should schedule a periodic process to trim stale reuse
-versions and keep the FRI size under control.
+The reader flag prevents older clients from partially interpreting the new
+history. The writer flag prevents them from dropping mappings when rewriting
+FRI metadata. Clients that do not support the corresponding flag must reject
+the read or write and require an upgrade. See
+[feature flags](../../table/versioning.md).
