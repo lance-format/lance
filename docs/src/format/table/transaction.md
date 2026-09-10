@@ -782,3 +782,6 @@ invariants in
 A rewrite normally publishes its transitions atomically by replacing the
 FRI entry in its own commit; this operation appends transitions after the
 fact, for mappings produced separately from the rewrite that they describe.
+When composite transactions become available, this operation is the
+sub-operation form: a rewrite composes with it to express the mapping as a
+semantic delta rather than an opaque entry replacement.
