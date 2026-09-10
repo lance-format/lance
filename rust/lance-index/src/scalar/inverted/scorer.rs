@@ -3,6 +3,7 @@
 
 use super::InvertedPartition;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // the Scorer trait is used to calculate the score of a token in a document
 // in general, the score is calculated as:
@@ -10,11 +11,79 @@ use std::collections::HashMap;
 pub trait Scorer: Send + Sync {
     fn query_weight(&self, token: &str) -> f32;
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32;
+
+    /// Finite upper bound for every non-negative value returned by
+    /// [`Self::doc_weight`]. Returning `None` disables score-independent
+    /// pruning where the posting format has no stored impact bounds.
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        None
+    }
+
+    /// Stable identity for the corpus-level inputs used by [`Self::doc_weight`].
+    ///
+    /// Implementations should return `Some` only when equal keys guarantee the
+    /// same document weight for every `(freq, doc_tokens)` pair. Scorers without
+    /// such an identity keep impact bounds in the query-local cache only.
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        None
+    }
+
+    /// The doc-length-dependent BM25 denominator addend, when `doc_weight`
+    /// factors as `(K1 + 1) * freq / (freq + addend)`; `None` for scorers
+    /// without that shape. Scoring hot loops use this to bake a per-norm-code
+    /// addend cache (Lucene's norm cache), which is bit-identical to calling
+    /// `doc_weight` because both paths evaluate the same expressions.
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        let _ = doc_tokens;
+        None
+    }
+}
+
+impl<T: Scorer + ?Sized> Scorer for Arc<T> {
+    fn query_weight(&self, token: &str) -> f32 {
+        self.as_ref().query_weight(token)
+    }
+
+    fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+        self.as_ref().doc_weight(freq, doc_tokens)
+    }
+
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        self.as_ref().doc_weight_upper_bound()
+    }
+
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        self.as_ref().doc_weight_cache_key()
+    }
+
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        self.as_ref().doc_norm(doc_tokens)
+    }
+}
+
+/// The frequency-dependent half of the BM25 doc weight; `doc_norm` is the
+/// doc-length addend (from [`Scorer::doc_norm`] or a per-norm-code cache).
+#[inline]
+pub(super) fn bm25_doc_weight_with_norm(freq: u32, doc_norm: f32) -> f32 {
+    let freq = freq as f32;
+    (K1 + 1.0) * freq / (freq + doc_norm)
 }
 
 // BM25 parameters
 pub const K1: f32 = 1.2;
 pub const B: f32 = 0.75;
+
+// The f32 multiply/add/divide sequence in `bm25_doc_weight_with_norm` can
+// round one ULP above the mathematical K1 + 1 limit.  Keep two ULPs of room so
+// every scorer-independent pruning bound remains conservative after its final
+// multiplication by the query weight.
+pub(super) const BM25_DOC_WEIGHT_UPPER_BOUND: f32 = f32::from_bits((K1 + 1.0).to_bits() + 2);
+
+#[inline]
+fn bm25_doc_norm(doc_tokens: u32, avg_doc_length: f32) -> f32 {
+    let doc_tokens = doc_tokens as f32;
+    K1 * (1.0 - B + B * doc_tokens / avg_doc_length)
+}
 
 #[derive(Debug, Clone)]
 pub struct MemBM25Scorer {
@@ -77,10 +146,20 @@ impl Scorer for MemBM25Scorer {
     }
 
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
-        let freq = freq as f32;
-        let doc_tokens = doc_tokens as f32;
-        let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length());
-        (K1 + 1.0) * freq / (freq + doc_norm)
+        let doc_norm = bm25_doc_norm(doc_tokens, self.avg_doc_length());
+        bm25_doc_weight_with_norm(freq, doc_norm)
+    }
+
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        Some(bm25_doc_norm(doc_tokens, self.avg_doc_length()))
+    }
+
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        Some(BM25_DOC_WEIGHT_UPPER_BOUND)
+    }
+
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        Some(u64::from(self.avg_doc_length().to_bits()))
     }
 }
 
@@ -91,24 +170,20 @@ pub struct IndexBM25Scorer<'a> {
 }
 
 impl<'a> IndexBM25Scorer<'a> {
-    /// Sync constructor. Reads each partition's cached `total_tokens` via
-    /// `LazyDocSet::total_tokens_cached()`; callers must have already
-    /// populated it (via `ensure_loaded`, `ensure_num_tokens_loaded`, or
-    /// `total_tokens_num`). Panics with a clear message otherwise — this
-    /// is the wand-scoring path where the contract is statically known.
+    /// Sync constructor.  Query setup populates immutable partition stats
+    /// before entering the CPU-only WAND executor.
     pub fn new(partitions: impl Iterator<Item = &'a InvertedPartition>) -> Self {
         let partitions = partitions.collect::<Vec<_>>();
-        let num_docs = partitions.iter().map(|p| p.docs.len()).sum();
-        let total_tokens: u64 = partitions
+        let stats = partitions
             .iter()
-            .map(|p| {
-                p.docs.total_tokens_cached().expect(
-                    "IndexBM25Scorer::new requires each partition's total_tokens to be \
-                     cached; call `ensure_loaded` / `ensure_num_tokens_loaded` / \
-                     `total_tokens_num` first",
+            .map(|partition| {
+                partition.docs.cached_stats().expect(
+                    "IndexBM25Scorer::new requires partition stats to be loaded before WAND",
                 )
             })
-            .sum();
+            .collect::<Vec<_>>();
+        let num_docs = stats.iter().map(|stats| stats.num_docs).sum();
+        let total_tokens: u64 = stats.iter().map(|stats| stats.total_tokens).sum();
         let avgdl = total_tokens as f32 / num_docs as f32;
         Self {
             partitions,
@@ -141,10 +216,20 @@ impl Scorer for IndexBM25Scorer<'_> {
     }
 
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
-        let freq = freq as f32;
-        let doc_tokens = doc_tokens as f32;
-        let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length);
-        (K1 + 1.0) * freq / (freq + doc_norm)
+        let doc_norm = bm25_doc_norm(doc_tokens, self.avg_doc_length);
+        bm25_doc_weight_with_norm(freq, doc_norm)
+    }
+
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        Some(bm25_doc_norm(doc_tokens, self.avg_doc_length))
+    }
+
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        Some(BM25_DOC_WEIGHT_UPPER_BOUND)
+    }
+
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        Some(u64::from(self.avg_doc_length.to_bits()))
     }
 }
 
@@ -152,4 +237,19 @@ impl Scorer for IndexBM25Scorer<'_> {
 pub fn idf(token_docs: usize, num_docs: usize) -> f32 {
     let num_docs = num_docs as f32;
     ((num_docs - token_docs as f32 + 0.5) / (token_docs as f32 + 0.5) + 1.0).ln()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bm25_doc_weight_upper_bound_covers_f32_rounding() {
+        let scorer = MemBM25Scorer::new(6_242_289_027, 2, HashMap::new());
+        let doc_weight = scorer.doc_weight(3_926_982_873, 4_078_552_115);
+
+        assert_eq!(doc_weight.to_bits(), 0x400c_ccce);
+        assert!(doc_weight > K1 + 1.0);
+        assert!(scorer.doc_weight_upper_bound().unwrap() >= doc_weight);
+    }
 }

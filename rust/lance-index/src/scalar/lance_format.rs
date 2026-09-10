@@ -12,12 +12,10 @@ use futures::TryStreamExt;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_encoding::version::LanceFileVersion;
-use lance_file::previous::{
-    reader::FileReader as PreviousFileReader,
-    writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
-};
-use lance_file::reader::{self as current_reader, FileReaderOptions, ReaderProjection};
+use lance_file::reader::{FileReader as CurrentFileReader, FileReaderOptions};
+use lance_file::version::ConcreteFileVersion;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
+use lance_file::versions::{self, OpenedFileReader};
 use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -43,15 +41,22 @@ pub struct LanceIndexStore {
     scheduler: Arc<ScanScheduler>,
     /// Cached file sizes (filename -> size in bytes)
     /// When set, used to avoid HEAD calls when opening files
-    file_sizes: HashMap<String, u64>,
-    format_version: LanceFileVersion,
+    // Partition priority views share this immutable map. Cloning all file names
+    // for every partition would make request rebinding quadratic in partitions.
+    file_sizes: Arc<HashMap<String, u64>>,
+    format_version: ConcreteFileVersion,
+    /// Base I/O priority for all requests this store submits to `scheduler`.
+    io_priority: u64,
 }
 
 impl DeepSizeOf for LanceIndexStore {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        // Exclude the shared, session-scoped `metadata_cache` (accounted once by
+        // `Session::deep_size_of_children`): it is not this store's own footprint, and
+        // sizing it here makes every opened index that holds a store report the whole
+        // cache as its own bytes — inflating and N-times double-counting it.
         self.object_store.deep_size_of_children(context)
             + self.index_dir.as_ref().deep_size_of_children(context)
-            + self.metadata_cache.deep_size_of_children(context)
     }
 }
 
@@ -66,7 +71,7 @@ impl LanceIndexStore {
             object_store,
             index_dir,
             metadata_cache,
-            LanceFileVersion::V2_0,
+            ConcreteFileVersion::V2_0,
         )
     }
 
@@ -75,7 +80,7 @@ impl LanceIndexStore {
         object_store: Arc<ObjectStore>,
         index_dir: Path,
         metadata_cache: Arc<LanceCache>,
-        format_version: LanceFileVersion,
+        format_version: ConcreteFileVersion,
     ) -> Self {
         let scheduler = ScanScheduler::new(
             object_store.clone(),
@@ -86,8 +91,9 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
-            file_sizes: HashMap::new(),
+            file_sizes: Arc::default(),
             format_version,
+            io_priority: 0,
         }
     }
 
@@ -96,8 +102,13 @@ impl LanceIndexStore {
     /// The map should contain relative paths (e.g., "index.idx") as keys
     /// and file sizes in bytes as values.
     pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
-        self.file_sizes = file_sizes;
+        self.file_sizes = Arc::new(file_sizes);
         self
+    }
+
+    /// The base I/O priority all this store's requests are submitted at.
+    pub fn io_priority(&self) -> u64 {
+        self.io_priority
     }
 
     fn index_file_path(&self, name: &str) -> Result<Path> {
@@ -116,34 +127,6 @@ impl LanceIndexStore {
             relative_path.as_ref()
         ))
         .map_err(|err| Error::invalid_input(format!("invalid index file path {name:?}: {err}")))
-    }
-}
-
-#[async_trait]
-impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWriter<M> {
-    async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
-        let offset = self.tell().await?;
-        self.write(&[batch]).await?;
-        Ok(offset as u64)
-    }
-
-    async fn finish(&mut self) -> Result<IndexFile> {
-        Self::finish(self).await?;
-        Ok(IndexFile {
-            path: String::new(),
-            size_bytes: self.tell().await? as u64,
-        })
-    }
-
-    async fn finish_with_metadata(
-        &mut self,
-        metadata: HashMap<String, String>,
-    ) -> Result<IndexFile> {
-        Self::finish_with_metadata(self, &metadata).await?;
-        Ok(IndexFile {
-            path: String::new(),
-            size_bytes: self.tell().await? as u64,
-        })
     }
 }
 
@@ -187,10 +170,14 @@ impl IndexWriter for LanceIndexWriter {
     }
 }
 
+/// Newtype wrapper to allow implementing IndexReader for V1FileReader (a foreign type)
+struct V1IndexReader(V1FileReader);
+
 #[async_trait]
-impl IndexReader for PreviousFileReader {
+impl IndexReader for V1IndexReader {
     async fn read_record_batch(&self, offset: u64, _batch_size: u64) -> Result<RecordBatch> {
-        self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
+        self.0
+            .read_batch(offset as i32, ReadBatchParams::RangeFull, self.0.schema())
             .await
     }
 
@@ -200,36 +187,39 @@ impl IndexReader for PreviousFileReader {
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch> {
         let projection = match projection {
-            Some(projection) => self.schema().project(projection)?,
-            None => self.schema().clone(),
+            Some(projection) => self.0.schema().project(projection)?,
+            None => self.0.schema().clone(),
         };
-        self.read_range(range, &projection).await
+        self.0.read_range(range, &projection).await
     }
 
     async fn num_batches(&self, _batch_size: u64) -> u32 {
-        self.num_batches() as u32
+        self.0.num_batches() as u32
     }
 
     fn num_rows(&self) -> usize {
-        self.len()
+        self.0.len()
     }
 
     fn schema(&self) -> &lance_core::datatypes::Schema {
-        Self::schema(self)
+        V1FileReader::schema(&self.0)
     }
 }
 
+/// Newtype wrapper to allow implementing IndexReader for CurrentFileReader (a foreign type)
+struct CurrentIndexReader(CurrentFileReader);
+
 #[async_trait]
-impl IndexReader for current_reader::FileReader {
+impl IndexReader for CurrentIndexReader {
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
         let start = offset * batch_size;
         let end = start + batch_size;
-        let end = end.min(self.num_rows());
+        let end = end.min(self.0.num_rows());
         self.read_range(start as usize..end as usize, None).await
     }
 
     async fn read_global_buffer(&self, n: u32) -> Result<Bytes> {
-        Self::read_global_buffer(self, n).await
+        CurrentFileReader::read_global_buffer(&self.0, n).await
     }
 
     async fn read_range(
@@ -239,19 +229,23 @@ impl IndexReader for current_reader::FileReader {
     ) -> Result<RecordBatch> {
         if range.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(
-                self.schema().as_ref().into(),
+                self.0.schema().as_ref().into(),
             )));
         }
         let projection = if let Some(projection) = projection {
-            ReaderProjection::from_column_names(
-                self.metadata().version(),
-                self.schema(),
+            versions::reader_projection_from_column_names(
+                self.0.metadata().version(),
+                self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+            versions::reader_projection_from_whole_schema(
+                self.0.schema(),
+                self.0.metadata().version(),
+            )
         };
         let batches = self
+            .0
             .read_stream_projected(
                 ReadBatchParams::Range(range),
                 u32::MAX,
@@ -273,20 +267,23 @@ impl IndexReader for current_reader::FileReader {
     ) -> Result<RecordBatch> {
         let empty_batch = || {
             Ok(RecordBatch::new_empty(Arc::new(
-                self.schema().as_ref().into(),
+                self.0.schema().as_ref().into(),
             )))
         };
         if ranges.is_empty() {
             return empty_batch();
         }
         let projection = if let Some(projection) = projection {
-            ReaderProjection::from_column_names(
-                self.metadata().version(),
-                self.schema(),
+            versions::reader_projection_from_column_names(
+                self.0.metadata().version(),
+                self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+            versions::reader_projection_from_whole_schema(
+                self.0.schema(),
+                self.0.metadata().version(),
+            )
         };
         // `DecodeBatchScheduler::schedule_ranges` requires sorted,
         // non-overlapping ranges; sort internally and permute the
@@ -300,6 +297,7 @@ impl IndexReader for current_reader::FileReader {
             .collect();
         let total_rows: u64 = sorted_ranges.iter().map(|r| r.end - r.start).sum();
         let batches = self
+            .0
             .read_stream_projected(
                 ReadBatchParams::Ranges(sorted_ranges),
                 (total_rows as u32).max(1),
@@ -352,47 +350,51 @@ impl IndexReader for current_reader::FileReader {
     ) -> Result<Pin<Box<dyn lance_io::stream::RecordBatchStream>>> {
         if range.is_empty() {
             return Ok(Box::pin(lance_io::stream::RecordBatchStreamAdapter::new(
-                Arc::new(self.schema().as_ref().into()),
+                Arc::new(self.0.schema().as_ref().into()),
                 futures::stream::empty(),
             )));
         }
         let projection = if let Some(projection) = projection {
-            ReaderProjection::from_column_names(
-                self.metadata().version(),
-                self.schema(),
+            versions::reader_projection_from_column_names(
+                self.0.metadata().version(),
+                self.0.schema(),
                 projection,
             )?
         } else {
-            ReaderProjection::from_whole_schema(self.schema(), self.metadata().version())
+            versions::reader_projection_from_whole_schema(
+                self.0.schema(),
+                self.0.metadata().version(),
+            )
         };
-        self.read_stream_projected(
-            ReadBatchParams::Range(range),
-            4096,
-            2,
-            projection,
-            FilterExpression::no_filter(),
-        )
-        .await
+        self.0
+            .read_stream_projected(
+                ReadBatchParams::Range(range),
+                4096,
+                2,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
     }
 
     // V2 format has removed the row group concept,
     // so here we assume each batch is with 4096 rows.
     async fn num_batches(&self, batch_size: u64) -> u32 {
-        Self::num_rows(self).div_ceil(batch_size) as u32
+        CurrentFileReader::num_rows(&self.0).div_ceil(batch_size) as u32
     }
 
     fn num_rows(&self) -> usize {
-        Self::num_rows(self) as usize
+        CurrentFileReader::num_rows(&self.0) as usize
     }
 
     fn schema(&self) -> &lance_core::datatypes::Schema {
-        Self::schema(self)
+        CurrentFileReader::schema(&self.0)
     }
 
     fn file_size_bytes(&self) -> Option<u64> {
         // The manifest records each index file's size and passes it to the reader
         // at open, so it's already in metadata here (no extra I/O).
-        Some(self.metadata().file_size())
+        Some(self.0.metadata().file_size())
     }
 }
 
@@ -404,6 +406,13 @@ impl IndexStore for LanceIndexStore {
 
     fn clone_arc(&self) -> Arc<dyn IndexStore> {
         Arc::new(self.clone())
+    }
+
+    fn is_same_storage_binding(&self, other: &dyn IndexStore) -> bool {
+        other.as_any().downcast_ref::<Self>().is_some_and(|other| {
+            Arc::ptr_eq(&self.object_store, &other.object_store)
+                && self.index_dir == other.index_dir
+        })
     }
 
     fn io_parallelism(&self) -> usize {
@@ -418,18 +427,25 @@ impl IndexStore for LanceIndexStore {
         let path = self.index_file_path(name)?;
         let schema = schema.as_ref().try_into()?;
         let writer = self.object_store.create(&path).await?;
-        let writer = current_writer::FileWriter::try_new(
+        let writer = versions::create_writer(
+            self.format_version,
             writer,
             schema,
-            current_writer::FileWriterOptions {
-                format_version: Some(self.format_version),
-                ..Default::default()
-            },
+            current_writer::FileWriterOptions::default(),
         )?;
         Ok(Box::new(LanceIndexWriter {
             path: name.to_string(),
             inner: writer,
         }))
+    }
+
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+        // The `scheduler` is shared (`Arc`), so this clone is cheap and the new
+        // priority only affects requests this clone submits.
+        Arc::new(Self {
+            io_priority,
+            ..self.clone()
+        })
     }
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
@@ -440,32 +456,28 @@ impl IndexStore for LanceIndexStore {
             .get(name)
             .map(|&size| CachedFileSize::new(size))
             .unwrap_or_else(CachedFileSize::unknown);
-        let file_scheduler = self.scheduler.open_file(&path, &cached_size).await?;
-        match current_reader::FileReader::try_open(
+        let file_scheduler = self
+            .scheduler
+            .open_file_with_priority(&path, self.io_priority, &cached_size)
+            .await?;
+        match versions::open_self_described_reader(
             file_scheduler,
-            None,
             Arc::<DecoderPlugins>::default(),
             &self.metadata_cache,
             FileReaderOptions::default(),
         )
-        .await
+        .await?
         {
-            Ok(reader) => Ok(Arc::new(reader)),
-            Err(e) => {
-                // If the error is a version conflict we can try to read the file with v1 reader
-                if let Error::VersionConflict { .. } = e {
-                    let path = self.index_file_path(name)?;
-                    let file_reader = PreviousFileReader::try_new_self_described(
-                        &self.object_store,
-                        &path,
-                        Some(&self.metadata_cache),
-                    )
-                    .await?;
-                    Ok(Arc::new(file_reader))
-                } else {
-                    Err(e)
-                }
+            OpenedFileReader::V1 { .. } => {
+                let reader = V1FileReader::try_new_self_described(
+                    &self.object_store,
+                    &path,
+                    Some(&self.metadata_cache),
+                )
+                .await?;
+                Ok(Arc::new(V1IndexReader(reader)))
             }
+            OpenedFileReader::Current(reader) => Ok(Arc::new(CurrentIndexReader(reader))),
         }
     }
 
@@ -481,21 +493,16 @@ impl IndexStore for LanceIndexStore {
     ) -> Result<IndexFile> {
         let path = self.index_file_path(name)?;
 
-        let other_store = dest_store.as_any().downcast_ref::<Self>();
-        match other_store {
-            Some(dest_store) if dest_store.object_store.scheme() == self.object_store.scheme() => {
-                // If both this store and the destination are lance stores we can use object_store's copy
-                // This does blindly assume that both stores are using the same underlying object_store
-                // but there is no easy way to verify this and it happens to always be true at the moment
+        match dest_store.as_any().downcast_ref::<Self>() {
+            Some(dest_store) => {
                 let dest_path = dest_store.index_file_path(new_name)?;
-                self.object_store.copy(&path, &dest_path).await?;
-                let size_bytes = match self.file_sizes.get(name) {
-                    Some(size_bytes) => *size_bytes,
-                    None => self.object_store.size(&path).await?,
-                };
+                let result = self
+                    .object_store
+                    .copy_bulk(&path, &dest_store.object_store, &dest_path)
+                    .await?;
                 Ok(IndexFile {
                     path: new_name.to_string(),
-                    size_bytes,
+                    size_bytes: result.size as u64,
                 })
             }
             _ => {
@@ -517,15 +524,14 @@ impl IndexStore for LanceIndexStore {
     async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile> {
         let path = self.index_file_path(name)?;
         let new_path = self.index_file_path(new_name)?;
-        self.object_store.copy(&path, &new_path).await?;
+        let result = self
+            .object_store
+            .copy_bulk(&path, &self.object_store, &new_path)
+            .await?;
         self.object_store.delete(&path).await?;
-        let size_bytes = match self.file_sizes.get(name) {
-            Some(size_bytes) => *size_bytes,
-            None => self.object_store.size(&new_path).await?,
-        };
         Ok(IndexFile {
             path: new_name.to_string(),
-            size_bytes,
+            size_bytes: result.size as u64,
         })
     }
 
@@ -535,7 +541,14 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
-        list_index_files_with_sizes(&self.object_store, &self.index_dir).await
+        let files = list_index_files_with_sizes(&self.object_store, &self.index_dir).await?;
+        Ok(files
+            .into_iter()
+            .map(|f| IndexFile {
+                path: f.path,
+                size_bytes: f.size_bytes,
+            })
+            .collect())
     }
 }
 
@@ -549,7 +562,7 @@ mod tests {
     use crate::scalar::bitmap::BitmapIndexPlugin;
     use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
     use crate::scalar::label_list::LabelListIndexPlugin;
-    use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
+    use crate::scalar::registry::{BasicTrainer, ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::{
         LabelListQuery, SargableQuery, ScalarIndex, SearchResult,
         bitmap::BitmapIndex,
@@ -570,6 +583,7 @@ mod tests {
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::ROW_ID;
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_core::utils::tempfile::TempDir;
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -584,6 +598,55 @@ mod tests {
             128 * 1024 * 1024,
         ));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
+    }
+
+    #[tokio::test]
+    async fn test_store_deep_size_excludes_metadata_cache() {
+        // The metadata cache is session-scoped and shared; a store must not count
+        // it as its own footprint, so growing the cache must not change store size.
+        struct BlobKey;
+        impl lance_core::cache::CacheKey for BlobKey {
+            type ValueType = Vec<u8>;
+            fn key(&self) -> std::borrow::Cow<'_, str> {
+                std::borrow::Cow::Borrowed("blob")
+            }
+            fn type_name() -> &'static str {
+                "Vec<u8>"
+            }
+            fn stable_type_id() -> &'static str {
+                "lance.scalar.lance-format.Blob"
+            }
+            fn schema() -> lance_core::cache::CacheKeySchema {
+                lance_core::cache::CacheKeySchema::new("lance.scalar.lance-format.blob-key", 1)
+            }
+            fn write_key(&self, builder: &mut lance_core::cache::KeyBuilder) {
+                builder.write_variant(0);
+            }
+        }
+
+        let index_dir = TempDir::default();
+        let test_path = index_dir.obj_path();
+        let (object_store, test_path) = ObjectStore::from_uri(test_path.as_ref())
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
+        let store = LanceIndexStore::new(object_store, test_path, cache.clone());
+
+        let before = store.deep_size_of();
+        cache
+            .insert_with_key(&BlobKey, Arc::new(vec![0u8; 4 * 1024 * 1024]))
+            .await;
+        // Force moka to commit the write so a cache-inclusive size would grow.
+        let _ = cache.size_bytes().await;
+        let after = store.deep_size_of();
+
+        assert_eq!(
+            before, after,
+            "store deep size must exclude the shared metadata cache"
+        );
     }
 
     async fn train_index(
@@ -1646,7 +1709,7 @@ mod tests {
         let remapped_dir = TempDir::default();
         let remapped_store = test_store(&remapped_dir);
         index
-            .remap(&mapping, remapped_store.as_ref())
+            .remap(&RowAddrRemap::direct(mapping), remapped_store.as_ref())
             .await
             .unwrap();
         let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())

@@ -103,11 +103,12 @@ impl Arena {
     }
 
     /// Bump-allocate `layout`. Caller must have exclusive access (single writer).
-    unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
+    /// `allocated` accumulates chunk bytes; only the cold `grow` path touches it.
+    unsafe fn alloc(&mut self, layout: Layout, allocated: &AtomicUsize) -> *mut u8 {
         let align = layout.align();
         let mut aligned = (self.cursor as usize).wrapping_add(align - 1) & !(align - 1);
         if self.cursor.is_null() || aligned + layout.size() > self.end as usize {
-            self.grow(layout);
+            self.grow(layout, allocated);
             aligned = (self.cursor as usize + align - 1) & !(align - 1);
         }
         self.cursor = (aligned + layout.size()) as *mut u8;
@@ -116,7 +117,7 @@ impl Arena {
 
     /// Allocate a fresh chunk large enough for `layout` and make it current.
     #[cold]
-    unsafe fn grow(&mut self, layout: Layout) {
+    unsafe fn grow(&mut self, layout: Layout, allocated: &AtomicUsize) {
         let align = layout.align().max(64);
         let size = CHUNK_SIZE.max(layout.size().next_power_of_two());
         let chunk_layout = Layout::from_size_align(size, align).expect("valid chunk layout");
@@ -126,6 +127,7 @@ impl Arena {
         }
         self.chunks
             .push((NonNull::new_unchecked(ptr), chunk_layout));
+        allocated.fetch_add(size, Ordering::Relaxed);
         self.cursor = ptr;
         self.end = ptr.add(size);
     }
@@ -154,6 +156,10 @@ struct SkipListCore<K> {
     height: AtomicUsize,
     /// Number of entries.
     len: AtomicUsize,
+    /// Bytes of arena chunks allocated so far. Maintained here rather than read
+    /// off `arena.chunks` because the arena is writer-only; this is readable by
+    /// anyone. Only `Arena::grow` touches it, so it costs nothing per insert.
+    arena_bytes: AtomicUsize,
 }
 
 // SAFETY: `arena` (the only non-Sync field) is mutated exclusively by the single
@@ -174,6 +180,7 @@ impl<K> SkipListCore<K> {
             arena: UnsafeCell::new(Arena::new()),
             height: AtomicUsize::new(1),
             len: AtomicUsize::new(0),
+            arena_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -250,9 +257,22 @@ impl<K: Ord> SkipListWriter<K> {
         height
     }
 
-    /// Insert `key`. Keys must be unique (the MemTable key carries a row
-    /// position, making every entry distinct); equal keys are not expected.
+    #[cfg(test)]
     pub fn insert(&mut self, key: K) {
+        self.insert_and_check_neighbors(key, |_, _| false);
+    }
+
+    /// Insert `key` and let the caller inspect its immediate level-0 neighbors.
+    ///
+    /// Keys must be unique (the MemTable key carries a row position, making
+    /// every entry distinct). Backends that index `(value, row_position)` use
+    /// the neighbor check to detect whether the same value already existed,
+    /// reusing the insertion traversal instead of issuing a second lookup.
+    pub fn insert_and_check_neighbors(
+        &mut self,
+        key: K,
+        check: impl FnOnce(Option<&K>, Option<&K>) -> bool,
+    ) -> bool {
         let cur_height = self.core.height.load(Ordering::Relaxed);
 
         // Find the predecessor at every level. For levels at/above the current
@@ -274,6 +294,15 @@ impl<K: Ord> SkipListWriter<K> {
             preds[level] = pred;
         }
 
+        let succ = self.core.next_slot(preds[0], 0).load(Ordering::Acquire);
+        // SAFETY: `preds[0]` and `succ` are either null or point to nodes owned
+        // by this skiplist's arena. The single writer never removes nodes, so
+        // any non-null neighbor remains alive for the duration of this call.
+        let had_neighbor_match =
+            check(unsafe { preds[0].as_ref().map(|node| &node.key) }, unsafe {
+                succ.as_ref().map(|node| &node.key)
+            });
+
         let height = self.random_height();
 
         // Allocate the node in one block and initialize it fully (key + tower)
@@ -281,7 +310,8 @@ impl<K: Ord> SkipListWriter<K> {
         // only mutator, so no link changes between read and publish.
         let layout = node_layout::<K>(height);
         // SAFETY: single-writer exclusive access to the arena.
-        let node = unsafe { (*self.core.arena.get()).alloc(layout) } as *mut Node<K>;
+        let node = unsafe { (*self.core.arena.get()).alloc(layout, &self.core.arena_bytes) }
+            as *mut Node<K>;
         // SAFETY: `node` points to a fresh, uninitialized, correctly-sized and
         // -aligned block; we write the key then `height` tower slots.
         unsafe {
@@ -309,6 +339,7 @@ impl<K: Ord> SkipListWriter<K> {
         }
 
         self.core.len.fetch_add(1, Ordering::Release);
+        had_neighbor_match
     }
 }
 
@@ -319,6 +350,17 @@ pub struct SkipListReader<K> {
 }
 
 impl<K: Ord> SkipListReader<K> {
+    /// Bytes of arena chunks backing this skiplist's nodes.
+    ///
+    /// Counts chunks, not entries, so it steps by `CHUNK_SIZE` and overshoots
+    /// the live nodes by at most one partly-filled chunk. Excludes any bytes a
+    /// key owns outside its node (e.g. a long `Box<[u8]>` key) — the arena
+    /// never sees those, so whoever built the key charges them; see
+    /// `BytesBackend::key_heap_bytes`.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.core.arena_bytes.load(Ordering::Relaxed)
+    }
+
     /// Greatest node with `key <= target`, mapped through `f` while it is alive.
     /// Equivalent to crossbeam's `upper_bound(Included(target))`. `None` if no
     /// such node. The closure avoids cloning the key on the hot path.

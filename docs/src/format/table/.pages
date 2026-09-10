@@ -6,4 +6,5 @@ nav:
   - Layout: layout.md
   - Branch & Tag: branch_tag.md
   - Row ID & Lineage: row_id_lineage.md
+  - Data Overlay Files: data_overlay_file.md
   - MemTable & WAL: mem_wal.md

@@ -21,10 +21,13 @@ def rand_batches(
     *,
     num_batches: Optional[int] = None,
     batch_size_bytes: Optional[int] = None,
+    rows_per_batch: Optional[int] = None,
 ):
     if not datagen.is_datagen_supported():
         raise NotImplementedError(
             "This version of lance was not built with the datagen feature"
         )
-    batch_iter = datagen.rand_batches(schema, num_batches, batch_size_bytes)
+    batch_iter = datagen.rand_batches(
+        schema, num_batches, batch_size_bytes, rows_per_batch
+    )
     return pa.RecordBatchReader.from_batches(schema, batch_iter)

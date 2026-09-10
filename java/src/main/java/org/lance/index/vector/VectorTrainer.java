@@ -15,6 +15,7 @@ package org.lance.index.vector;
 
 import org.lance.Dataset;
 import org.lance.JniLoader;
+import org.lance.LockManager;
 import org.lance.index.DistanceType;
 
 import org.apache.arrow.util.Preconditions;
@@ -64,7 +65,9 @@ public final class VectorTrainer {
         column != null && !column.isEmpty(), "column cannot be null or empty");
     Preconditions.checkArgument(params != null, "params cannot be null");
     Preconditions.checkArgument(distanceType != null, "distanceType cannot be null");
-    return nativeTrainIvfCentroids(dataset, column, params, distanceType.toString());
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeTrainIvfCentroids(dataset, column, params, distanceType.toString());
+    }
   }
 
   /**
@@ -98,7 +101,9 @@ public final class VectorTrainer {
         column != null && !column.isEmpty(), "column cannot be null or empty");
     Preconditions.checkArgument(params != null, "params cannot be null");
     Preconditions.checkArgument(distanceType != null, "distanceType cannot be null");
-    return nativeTrainPqCodebook(dataset, column, params, distanceType.toString());
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeTrainPqCodebook(dataset, column, params, distanceType.toString());
+    }
   }
 
   private static native float[] nativeTrainIvfCentroids(

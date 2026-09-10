@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::DocumentGranularity;
 use super::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
 };
@@ -42,6 +43,7 @@ impl JsonParser for MatchQuery {
             .as_u64()
             .map(|v| v as u32)
             .unwrap_or(0);
+        let document_granularity = parse_document_granularity(value)?;
 
         Ok(Self {
             column,
@@ -51,6 +53,7 @@ impl JsonParser for MatchQuery {
             max_expansions,
             operator,
             prefix_length,
+            document_granularity,
         })
     }
 }
@@ -63,12 +66,27 @@ impl JsonParser for PhraseQuery {
             .ok_or_else(|| Error::invalid_input("missing terms in phrase query"))?
             .to_string();
         let slop = value["slop"].as_u64().map(|v| v as u32).unwrap_or(0);
+        let document_granularity = parse_document_granularity(value)?;
 
         Ok(Self {
             column,
             terms,
             slop,
+            document_granularity,
         })
+    }
+}
+
+fn parse_document_granularity(value: &Value) -> Result<Option<DocumentGranularity>> {
+    match value.get("document_granularity") {
+        None | Some(Value::Null) => Ok(None),
+        Some(granularity) => serde_json::from_value(granularity.clone())
+            .map(Some)
+            .map_err(|error| {
+                Error::invalid_input(format!(
+                    "invalid document_granularity in FTS query: {error}"
+                ))
+            }),
     }
 }
 
@@ -195,6 +213,7 @@ mod tests {
             max_expansions: 10,
             operator: Operator::And,
             prefix_length: 2,
+            document_granularity: None,
         });
         assert_eq!(fts_query, expected_query);
     }
@@ -214,6 +233,7 @@ mod tests {
             column: Some("text".to_string()),
             terms: "hello world".to_string(),
             slop: 1,
+            document_granularity: None,
         });
         assert_eq!(fts_query, expected_query);
     }

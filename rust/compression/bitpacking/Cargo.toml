@@ -13,8 +13,12 @@ rust-version.workspace = true
 
 [dependencies]
 arrayref = "0.3"
+crunchy = "0.2"
 paste = "1"
 seq-macro = "0.3"
+
+[dev-dependencies]
+bitpacking = { workspace = true, features = ["bitpacker4x"] }
 
 [lints]
 workspace = true

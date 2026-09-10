@@ -5,7 +5,7 @@ use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::IntoJava;
 use crate::utils::to_rust_map;
-use crate::{JNIEnvExt, RT};
+use crate::{JNIEnvExt, block_on};
 use jni::JNIEnv;
 use jni::objects::{JMap, JObject, JValueGen};
 use lance::dataset::UpdateBuilder;
@@ -53,7 +53,7 @@ fn inner_update<'local>(
     }
 
     let job = builder.build()?;
-    let update_result = RT.block_on(job.execute())?;
+    let update_result = block_on(job.execute())?;
 
     // Avoid panicking if Lance core retains a clone of the Arc; fall back to a
     // deep clone so the JNI boundary stays panic-free.

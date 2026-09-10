@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#[cfg(test)]
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::sync::Arc;
 
 use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::{IndexParams, IndexType, vector::VectorIndex};
 use uuid::Uuid;
 
@@ -46,7 +48,7 @@ pub trait VectorIndexExtension: IndexExtension {
         dataset: Arc<Dataset>,
         column: &str,
         uuid: &Uuid,
-        reader: PreviousFileReader,
+        reader: V1FileReader,
     ) -> Result<Arc<dyn VectorIndex>>;
 }
 
@@ -62,7 +64,6 @@ mod test {
 
     use std::{
         any::Any,
-        collections::HashMap,
         sync::{Arc, atomic::AtomicBool},
     };
 
@@ -71,10 +72,10 @@ mod test {
     use arrow_schema::Schema;
     use datafusion::execution::SendableRecordBatchStream;
     use lance_core::deepsize::DeepSizeOf;
-    use lance_file::previous::writer::{
-        FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
-    };
     use lance_file::version::LanceFileVersion;
+    use lance_file::versions::v1::writer::{
+        FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions,
+    };
     use lance_index::vector::v3::subindex::SubIndexType;
     use lance_index::{
         INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
@@ -182,7 +183,7 @@ mod test {
             unimplemented!()
         }
 
-        async fn remap(&mut self, _: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 
@@ -269,13 +270,9 @@ mod test {
 
             let arrow_schema = Arc::new(Schema::new(vec![VECTOR_ID_FIELD.clone()]));
             let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref()).unwrap();
-            let mut writer: PreviousFileWriter<ManifestDescribing> =
-                PreviousFileWriter::with_object_writer(
-                    writer,
-                    schema,
-                    &PreviousFileWriterOptions::default(),
-                )
-                .unwrap();
+            let mut writer: V1FileWriter<ManifestDescribing> =
+                V1FileWriter::with_object_writer(writer, schema, &V1FileWriterOptions::default())
+                    .unwrap();
             writer.add_metadata(
                 INDEX_METADATA_SCHEMA_KEY,
                 json!(IndexMetadata {
@@ -303,7 +300,7 @@ mod test {
             _dataset: Arc<Dataset>,
             _column: &str,
             _uuid: &Uuid,
-            _reader: PreviousFileReader,
+            _reader: V1FileReader,
         ) -> Result<Arc<dyn VectorIndex>> {
             self.load_index_called
                 .store(true, std::sync::atomic::Ordering::Release);

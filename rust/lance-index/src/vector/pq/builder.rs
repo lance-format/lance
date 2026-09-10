@@ -68,7 +68,12 @@ impl Default for PQBuildParams {
 
 impl QuantizerBuildParams for PQBuildParams {
     fn sample_size(&self) -> usize {
-        self.sample_rate * 2_usize.pow(self.num_bits as u32)
+        self.training_sample_size()
+            .expect("PQ training sample size must fit in usize")
+    }
+
+    fn try_sample_size(&self) -> Result<usize> {
+        self.training_sample_size()
     }
 
     fn use_residual(distance_type: DistanceType) -> bool {
@@ -94,6 +99,29 @@ impl PQBuildParams {
         }
     }
 
+    fn num_centroids(&self) -> Result<usize> {
+        u32::try_from(self.num_bits)
+            .ok()
+            .and_then(|num_bits| 1_usize.checked_shl(num_bits))
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "PQ centroid count overflows: num_bits={}, usize_bits={}",
+                    self.num_bits,
+                    usize::BITS
+                ))
+            })
+    }
+
+    fn training_sample_size(&self) -> Result<usize> {
+        let num_centroids = self.num_centroids()?;
+        self.sample_rate.checked_mul(num_centroids).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "PQ training sample size overflows: sample_rate={}, num_centroids={num_centroids}",
+                self.sample_rate
+            ))
+        })
+    }
+
     fn build_from_fsl<T: ArrowNumericType>(
         &self,
         data: &FixedSizeListArray,
@@ -109,8 +137,10 @@ impl PQBuildParams {
             "PQ code does not support cosine"
         );
 
-        let sub_vectors = divide_to_subvectors::<T>(data, self.num_sub_vectors)?;
-        let num_centroids = 2_usize.pow(self.num_bits as u32);
+        let num_centroids = self.num_centroids()?;
+        let max_training_rows = self.try_sample_size()?;
+        let training_rows = data.len().min(max_training_rows);
+        let sub_vectors = divide_to_subvectors::<T>(data, self.num_sub_vectors, training_rows)?;
         let dimension = data.value_length() as usize;
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
@@ -174,7 +204,7 @@ impl PQBuildParams {
             data.data_type()
         )))?;
 
-        let num_centroids = 2_usize.pow(self.num_bits as u32);
+        let num_centroids = self.num_centroids()?;
         if data.len() < num_centroids {
             return Err(Error::unprocessable(format!(
                 "Not enough rows to train PQ. Requires {num_centroids} rows but only {} available",
@@ -192,5 +222,119 @@ impl PQBuildParams {
                 fsl.value_type()
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Float32Array;
+
+    #[test]
+    fn test_build_samples_before_materializing_subvectors() {
+        const N: usize = 4096;
+        const DIM: usize = 8;
+        const NUM_SUB_VECTORS: usize = 2;
+        const NUM_BITS: usize = 2;
+        const K: usize = 1 << NUM_BITS;
+        const SUB_DIM: usize = DIM / NUM_SUB_VECTORS;
+
+        // The 256 * K sample cap is smaller than N. Initial centroids make
+        // training deterministic so the optimized and reference paths can be
+        // compared exactly.
+        let values = Float32Array::from_iter((0..N).flat_map(|row| {
+            let cluster = row % K;
+            (0..DIM).map(move |col| (cluster * 1000 + col) as f32 + row as f32 * 1e-4)
+        }));
+        let fsl = FixedSizeListArray::try_new_from_values(values.clone(), DIM as i32).unwrap();
+
+        let init_values: Vec<f32> = (0..NUM_SUB_VECTORS * K)
+            .flat_map(|i| (0..SUB_DIM).map(move |col| (i % K * 1000 + col) as f32))
+            .collect();
+        let init_codebook: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(init_values.clone()),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+
+        let pq = PQBuildParams::with_codebook(NUM_SUB_VECTORS, NUM_BITS, init_codebook)
+            .build(&fsl, DistanceType::L2)
+            .unwrap();
+
+        let mut expected = Vec::with_capacity(K * DIM);
+        for sub_idx in 0..NUM_SUB_VECTORS {
+            let mut sub_values = Vec::with_capacity(N * SUB_DIM);
+            for row in values.values().chunks(DIM) {
+                sub_values.extend_from_slice(&row[sub_idx * SUB_DIM..(sub_idx + 1) * SUB_DIM]);
+            }
+            let sub_init = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(
+                    init_values[sub_idx * K * SUB_DIM..(sub_idx + 1) * K * SUB_DIM].to_vec(),
+                ),
+                SUB_DIM as i32,
+            )
+            .unwrap();
+            let params = KMeansParams::new(Some(Arc::new(sub_init)), 50, 1, DistanceType::L2);
+            let kmeans = train_kmeans::<Float32Type>(
+                &Float32Array::from(sub_values),
+                params,
+                SUB_DIM,
+                K,
+                256,
+            )
+            .unwrap();
+            expected.extend_from_slice(kmeans.centroids.as_primitive::<Float32Type>().values());
+        }
+
+        assert_eq!(
+            pq.codebook.values().as_primitive::<Float32Type>().values(),
+            expected.as_slice()
+        );
+    }
+
+    #[test]
+    fn test_try_sample_size_rejects_overflow() {
+        let mut params = PQBuildParams::new(2, 2);
+        params.sample_rate = usize::MAX;
+
+        let error = params.try_sample_size().unwrap_err();
+        let expected = format!(
+            "PQ training sample size overflows: sample_rate={}, num_centroids=4",
+            usize::MAX
+        );
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(&expected), "{error}");
+    }
+
+    #[test]
+    fn test_try_sample_size_rejects_centroid_count_overflow() {
+        let params = PQBuildParams::new(2, usize::BITS as usize);
+
+        let error = params.try_sample_size().unwrap_err();
+        let expected = format!(
+            "PQ centroid count overflows: num_bits={}, usize_bits={}",
+            usize::BITS,
+            usize::BITS
+        );
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(&expected), "{error}");
+    }
+
+    #[test]
+    fn test_build_rejects_sample_size_overflow() {
+        let values = Float32Array::from_iter((0..4 * 8).map(|v| v as f32));
+        let fsl = FixedSizeListArray::try_new_from_values(values, 8).unwrap();
+        let mut params = PQBuildParams::new(2, 2);
+        params.sample_rate = usize::MAX;
+
+        let error = params.build(&fsl, DistanceType::L2).unwrap_err();
+        let expected = format!(
+            "PQ training sample size overflows: sample_rate={}, num_centroids=4",
+            usize::MAX
+        );
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(&expected), "{error}");
     }
 }

@@ -8,6 +8,9 @@ zones that cannot contain matching values.
 Zone maps are "inexact" filters - they can definitively exclude zones but may include
 false positives that require rechecking.
 
+In addition, since finding NULLs is a common query pattern, the index also maintains a
+bitmap of null rows which allows it to return exact results for IS NULL queries.
+
 ## Index Details
 
 ```protobuf
@@ -34,17 +37,25 @@ The zone map index stores zone statistics in a single file:
 
 ### Schema Metadata
 
-| Key             | Type   | Description                               |
-|-----------------|--------|-------------------------------------------|
-| `rows_per_zone` | String | Number of rows per zone (default: "8192") |
+| Key                 | Type   | Description                               |
+|---------------------|--------|-------------------------------------------|
+| `rows_per_zone`     | String | Number of rows per zone (default: "8192") |
+| `null_bitmap`       | UInt32 | Index of null bitmap global buffer        |
+
+### Global Buffers
+
+| Metadata Key        | Description                                                |
+|---------------------|------------------------------------------------------------|
+| `null_bitmap`       | A serialized RowAddrTreeMap specifying which rows are null |
 
 ## Accelerated Queries
 
-The zone map index provides inexact results for the following query types:
+The zone map index provides inexact results for the following query types (nullability queries
+return exact results):
 
 | Query Type | Description               | Operation                                   | Result Type |
 |------------|---------------------------|---------------------------------------------|-------------|
 | **Equals** | `column = value`          | Includes zones where min ≤ value ≤ max      | AtMost      |
 | **Range**  | `column BETWEEN a AND b`  | Includes zones where ranges overlap         | AtMost      |
 | **IsIn**   | `column IN (v1, v2, ...)` | Includes zones that could contain any value | AtMost      |
-| **IsNull** | `column IS NULL`          | Includes zones where null_count > 0         | AtMost      |
+| **IsNull** | `column IS NULL`          | Includes zones where null_count > 0         | Exact       |

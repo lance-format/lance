@@ -3,7 +3,7 @@
 
 //! Metadata for index
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -34,7 +34,21 @@ pub struct IndexMetadata {
     pub uuid: Uuid,
 
     /// Fields to build the index.
+    ///
+    /// `fields[0]` is always a column the index is keyed on. Trailing entries
+    /// may instead be merely carried, not keyed on -- see [`Self::covering_fields`].
     pub fields: Vec<i32>,
+
+    /// Fields whose values this index carries but is not keyed on.
+    ///
+    /// Always a suffix of [`Self::fields`], and never all of it, so
+    /// `fields[0]` is always a column the index is keyed on. Empty for an
+    /// index that carries no extra columns.
+    ///
+    /// These ids also appear in [`Self::fields`]. That is deliberate: every
+    /// consumer that reads `fields` as the index's dependency set then covers
+    /// them with no change.
+    pub covering_fields: Vec<i32>,
 
     /// Human readable index name
     pub name: String,
@@ -119,12 +133,120 @@ impl IndexMetadata {
         let fragment_bitmap = self.fragment_bitmap.as_ref()?;
         Some(fragment_bitmap - existing_fragments)
     }
+
+    /// True when the index reports matches as physical row addresses rather than row ids
+    /// (`ScalarIndex::results_are_row_addresses`).
+    ///
+    /// Such an index cannot follow its data through a rewrite: the addresses it stores
+    /// name fragments and offsets, and neither kind supports remap.
+    pub fn results_are_row_addrs(&self) -> bool {
+        self.index_details.as_ref().is_some_and(|details| {
+            let is_fm = details
+                .type_url
+                .rsplit_once('/')
+                .is_some_and(|(_, details_type_name)| {
+                    details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
+                });
+            details.type_url.ends_with("ZoneMapIndexDetails")
+                || details.type_url.ends_with("BloomFilterIndexDetails")
+                || is_fm
+        })
+    }
+
+    /// The prefix of [`Self::fields`] this index is keyed on, with the carried
+    /// columns of [`Self::covering_fields`] removed.
+    ///
+    /// Only this prefix decides which column an index answers for; the full
+    /// `fields` vector answers what invalidates it. Empty for a system index
+    /// that declares no fields, and empty for a declaration longer than
+    /// `fields`: decoding validates, but metadata built by a caller this build
+    /// never validated does not, and failing closed beats an underflow.
+    pub fn keyed_fields(&self) -> &[i32] {
+        let keyed = self.fields.len().saturating_sub(self.covering_fields.len());
+        &self.fields[..keyed]
+    }
+
+    /// The single column this index is keyed on, or `None` when it is keyed on
+    /// several -- a genuinely composite index -- or on none at all.
+    ///
+    /// Most selection paths are only defined for one keyed column, so they can
+    /// compare this against the column they are resolving.
+    pub fn keyed_field(&self) -> Option<i32> {
+        match self.keyed_fields() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
+    /// Check the covering declaration against [`Self::fields`].
+    ///
+    /// Carried columns must be a suffix of `fields` and must not consume all of
+    /// it, so `fields[0]` is always a column the index is keyed on. An empty
+    /// declaration is always valid, which is what keeps the system indices --
+    /// `mem_wal` and `frag_reuse`, both of which commit no fields at all --
+    /// passing this check.
+    ///
+    /// The rules are checked from most to least specific, because one bad
+    /// declaration usually trips several: an id that is not a field at all is
+    /// reported ahead of the length and ordering rules, which would otherwise
+    /// name a consequence instead of the cause.
+    pub fn validate_covering_fields(&self) -> Result<()> {
+        if self.covering_fields.is_empty() {
+            return Ok(());
+        }
+
+        let missing: Vec<i32> = self
+            .covering_fields
+            .iter()
+            .copied()
+            .filter(|f| !self.fields.contains(f))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "index '{}' declares covering fields {:?} but {:?} are not \
+                 among its fields {:?}",
+                self.name, self.covering_fields, missing, self.fields,
+            )));
+        }
+
+        // A column carried twice would be projected twice. The suffix check
+        // below cannot stand in for this, because `fields` may repeat the id in
+        // the same positions -- `fields = [7, 11, 11]` has `[11, 11]` as a
+        // genuine tail.
+        let mut seen = HashSet::with_capacity(self.covering_fields.len());
+        if let Some(duplicate) = self.covering_fields.iter().find(|f| !seen.insert(**f)) {
+            return Err(Error::invalid_input(format!(
+                "index '{}' declares covering field {} more than once in {:?}",
+                self.name, duplicate, self.covering_fields,
+            )));
+        }
+
+        if self.covering_fields.len() >= self.fields.len() {
+            return Err(Error::invalid_input(format!(
+                "index '{}' declares covering fields {:?} but its fields are {:?}; \
+                 at least one field must remain indexed",
+                self.name, self.covering_fields, self.fields,
+            )));
+        }
+
+        let suffix_start = self.fields.len() - self.covering_fields.len();
+        if self.fields[suffix_start..] != self.covering_fields[..] {
+            return Err(Error::invalid_input(format!(
+                "index '{}' declares covering fields {:?} which are not the trailing \
+                 entries of {:?}; covering fields must come last",
+                self.name, self.covering_fields, self.fields,
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 impl DeepSizeOf for IndexMetadata {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.uuid.as_bytes().deep_size_of_children(context)
             + self.fields.deep_size_of_children(context)
+            + self.covering_fields.deep_size_of_children(context)
             + self.name.deep_size_of_children(context)
             + self.dataset_version.deep_size_of_children(context)
             + self
@@ -163,12 +285,13 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             )
         };
 
-        Ok(Self {
+        let metadata = Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
                 Error::invalid_input("uuid field does not exist in Index metadata".to_string())
             })??,
             name: proto.name,
             fields: proto.fields,
+            covering_fields: proto.covering_fields,
             dataset_version: proto.dataset_version,
             fragment_bitmap,
             index_details: proto.index_details.map(Arc::new),
@@ -179,20 +302,37 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             }),
             base_id: proto.base_id,
             files,
-        })
+        };
+
+        // This is the single boundary between manifest bytes and
+        // `IndexMetadata`, so validating once here is what lets every reader
+        // treat the declaration as a trailing slice of `fields`. A manifest
+        // that fails this was written by something that did not follow the
+        // format contract; refuse it rather than let each use site quietly
+        // ignore the index.
+        metadata.validate_covering_fields()?;
+
+        Ok(metadata)
     }
 }
 
 impl From<&IndexMetadata> for pb::IndexMetadata {
     fn from(idx: &IndexMetadata) -> Self {
         let mut fragment_bitmap = Vec::new();
-        if let Some(bitmap) = &idx.fragment_bitmap
-            && let Err(e) = bitmap.serialize_into(&mut fragment_bitmap)
-        {
-            // In theory, this should never error. But if we do, just
-            // recover gracefully.
-            log::error!("Failed to serialize fragment bitmap: {}", e);
-            fragment_bitmap.clear();
+        if let Some(bitmap) = &idx.fragment_bitmap {
+            // Fragment ids are allocated monotonically, so index coverage is
+            // highly contiguous. Run containers are part of the standard
+            // roaring serialization format, so converting eligible containers
+            // to runs before writing shrinks the bitmap from O(fragments) to
+            // O(runs) bytes.
+            let mut bitmap = bitmap.clone();
+            bitmap.optimize();
+            if let Err(e) = bitmap.serialize_into(&mut fragment_bitmap) {
+                // In theory, this should never error. But if we do, just
+                // recover gracefully.
+                log::error!("Failed to serialize fragment bitmap: {}", e);
+                fragment_bitmap.clear();
+            }
         }
 
         let files = idx
@@ -213,6 +353,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             uuid: Some((&idx.uuid).into()),
             name: idx.name.clone(),
             fields: idx.fields.clone(),
+            covering_fields: idx.covering_fields.clone(),
             dataset_version: idx.dataset_version,
             fragment_bitmap,
             index_details: idx
@@ -303,7 +444,40 @@ pub async fn list_index_files_with_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_fragment_bitmap_serialized_run_optimized() {
+        let bitmap = RoaringBitmap::from_sorted_iter(0..1_000_000).unwrap();
+        let unoptimized_size = bitmap.serialized_size();
+
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "my_index".to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: Some(bitmap.clone()),
+            index_details: None,
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        let proto = pb::IndexMetadata::from(&metadata);
+        assert!(
+            proto.fragment_bitmap.len() < unoptimized_size / 100,
+            "expected run-optimized bitmap ({} bytes) to be <1% of the \
+             unoptimized serialization ({} bytes)",
+            proto.fragment_bitmap.len(),
+            unoptimized_size
+        );
+
+        let recovered = IndexMetadata::try_from(proto).unwrap();
+        assert_eq!(recovered.fragment_bitmap, Some(bitmap));
+    }
 
     /// Demonstrates the pattern a disk-backed cache backend would use:
     /// serialize entries to bytes, store in a key-value map, then
@@ -317,6 +491,7 @@ mod tests {
                 uuid: Uuid::new_v4(),
                 name: "my_index".to_string(),
                 fields: vec![0, 1],
+                covering_fields: vec![],
                 dataset_version: 42,
                 fragment_bitmap: Some(RoaringBitmap::from_iter([1, 2, 3])),
                 index_details: None,
@@ -332,6 +507,7 @@ mod tests {
                 uuid: Uuid::new_v4(),
                 name: "second_index".to_string(),
                 fields: vec![2],
+                covering_fields: vec![],
                 dataset_version: 43,
                 fragment_bitmap: None,
                 index_details: None,
@@ -372,6 +548,160 @@ mod tests {
             assert_eq!(orig.index_version, rec.index_version);
             assert_eq!(orig.base_id, rec.base_id);
             assert_eq!(orig.files, rec.files);
+        }
+    }
+
+    /// The covering declaration must survive both conversion directions.
+    /// A dropped `covering_fields` would leave index files holding carried
+    /// columns the manifest no longer names.
+    #[test]
+    fn test_covering_fields_survives_proto_roundtrip() {
+        let original = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "covered".to_string(),
+            fields: vec![7, 11, 13],
+            covering_fields: vec![11, 13],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        let proto = pb::IndexMetadata::from(&original);
+        assert_eq!(proto.covering_fields, vec![11, 13]);
+
+        let recovered = IndexMetadata::try_from(proto).unwrap();
+        assert_eq!(recovered, original);
+    }
+
+    /// `TryFrom<pb::IndexMetadata>` is the only path from manifest bytes to
+    /// `IndexMetadata`, so validating here is what lets every reader downstream
+    /// assume the declaration really is a trailing slice of `fields`. Without
+    /// it, a malformed declaration reaches each use site instead, where the
+    /// keyed count saturates to zero and the index is silently ignored.
+    #[test]
+    fn test_try_from_proto_rejects_a_malformed_covering_declaration() {
+        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![7, 11], vec![11]));
+        // The leading entry, not the trailing one: claims the keyed column is
+        // carried.
+        proto.covering_fields = vec![7];
+
+        let err = IndexMetadata::try_from(proto)
+            .expect_err("a malformed covering declaration must not decode");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {:?}",
+            err
+        );
+        assert!(
+            err.to_string().contains("must come last"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// Only the keyed prefix decides which column an index answers for, and
+    /// nearly every selection path needs exactly one such column. Metadata read
+    /// from a manifest this build never wrote can still be malformed, so both
+    /// accessors must fail closed -- no keyed field -- rather than underflow.
+    #[rstest]
+    #[case::not_covered(vec![7], vec![], vec![7], Some(7))]
+    #[case::covered(vec![7, 11], vec![11], vec![7], Some(7))]
+    #[case::covered_multi(vec![7, 11, 13], vec![11, 13], vec![7], Some(7))]
+    #[case::covered_composite(vec![7, 11, 13], vec![13], vec![7, 11], None)]
+    #[case::composite(vec![7, 11], vec![], vec![7, 11], None)]
+    #[case::system_index_no_fields(vec![], vec![], vec![], None)]
+    #[case::malformed_longer_than_fields(vec![7], vec![11, 13], vec![], None)]
+    fn test_keyed_fields(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected_keyed: Vec<i32>,
+        #[case] expected_single: Option<i32>,
+    ) {
+        let metadata = index_metadata_with(fields, covering_fields);
+
+        assert_eq!(metadata.keyed_fields(), expected_keyed.as_slice());
+        assert_eq!(metadata.keyed_field(), expected_single);
+    }
+
+    fn index_metadata_with(fields: Vec<i32>, covering_fields: Vec<i32>) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "idx".to_string(),
+            fields,
+            covering_fields,
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
+
+    #[rstest]
+    #[case::zone_map("type.googleapis.com/lance.table.ZoneMapIndexDetails", true)]
+    #[case::bloom_filter("type.googleapis.com/lance.index.pb.BloomFilterIndexDetails", true)]
+    #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true)]
+    #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true)]
+    #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false)]
+    #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", false)]
+    fn test_results_are_row_addrs(#[case] type_url: &str, #[case] expected: bool) {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: type_url.to_string(),
+            value: Vec::new(),
+        }));
+
+        assert_eq!(metadata.results_are_row_addrs(), expected);
+    }
+
+    #[rstest]
+    #[case::empty_is_valid(vec![7], vec![], None)]
+    // mem_wal and frag_reuse both commit no fields at all; a bare
+    // `covering_fields.len() < fields.len()` check would reject them.
+    #[case::system_index_no_fields(vec![], vec![], None)]
+    #[case::valid_single_covered(vec![7, 11], vec![11], None)]
+    #[case::valid_suffix(vec![7, 11, 13], vec![11, 13], None)]
+    #[case::not_a_suffix(vec![7, 11, 13], vec![11], Some("must come last"))]
+    #[case::not_a_subset(vec![7, 11], vec![99], Some("are not among its fields"))]
+    #[case::wrong_order(vec![7, 11, 13], vec![13, 11], Some("must come last"))]
+    #[case::all_fields_covered(vec![7], vec![7], Some("at least one field must remain indexed"))]
+    #[case::covers_the_search_key(vec![7, 11], vec![7, 11], Some("at least one field must remain indexed"))]
+    // `fields` repeats the id in the same positions, so `[11, 11]` is a genuine
+    // tail of it -- only the duplicate check rejects this.
+    #[case::duplicate_covered(vec![7, 11, 11], vec![11, 11], Some("more than once"))]
+    // Both over-long and naming an unknown id: the unknown id is the cause, so
+    // it must be reported ahead of "at least one field must remain indexed".
+    #[case::unknown_id_reported_before_length(vec![7, 11], vec![99, 11], Some("are not among its fields"))]
+    fn test_validate_covering_fields(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let metadata = index_metadata_with(fields, covering_fields);
+        let result = metadata.validate_covering_fields();
+
+        match expected_error {
+            None => assert!(result.is_ok(), "expected valid, got {:?}", result),
+            Some(fragment) => {
+                let err = result.expect_err("expected a validation error");
+                assert!(
+                    matches!(err, Error::InvalidInput { .. }),
+                    "expected InvalidInput, got {:?}",
+                    err
+                );
+                let message = err.to_string();
+                assert!(
+                    message.contains(fragment),
+                    "expected message to contain {:?}, got {:?}",
+                    fragment,
+                    message
+                );
+            }
         }
     }
 }

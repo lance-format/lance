@@ -13,7 +13,8 @@ use futures::{StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_file::previous::writer::FileWriter as PreviousFileWriter;
+use lance_file::versions as file_versions;
+use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_file::writer::FileWriterOptions;
 use lance_index::vector::PART_ID_COLUMN;
 use lance_index::vector::pq::ProductQuantizer;
@@ -35,6 +36,7 @@ use lance_linalg::distance::{DistanceType, MetricType};
 
 use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::index::dataset_format_version;
 use crate::index::vector::ivf::io::write_pq_partitions;
 
 use super::io::write_hnsw_quantization_index_partitions;
@@ -217,7 +219,11 @@ pub async fn write_vector_storage(
         data.boxed()
     };
 
-    let mut writer = lance_file::writer::FileWriter::new_lazy(writer, FileWriterOptions::default());
+    let mut writer = file_versions::create_lazy_writer(
+        dataset_format_version(dataset),
+        writer,
+        FileWriterOptions::default(),
+    )?;
     let mut transformed_stream = data
         .map_ok(move |batch| {
             let ivf_transformer = ivf_transformer.clone();
@@ -242,8 +248,8 @@ pub async fn write_vector_storage(
 #[instrument(level = "debug", skip(writer, auxiliary_writer, data, ivf, quantizer))]
 pub(super) async fn build_hnsw_partitions(
     dataset: Arc<dyn DatasetTakeRows>,
-    writer: &mut PreviousFileWriter<ManifestDescribing>,
-    auxiliary_writer: Option<&mut PreviousFileWriter<ManifestDescribing>>,
+    writer: &mut V1FileWriter<ManifestDescribing>,
+    auxiliary_writer: Option<&mut V1FileWriter<ManifestDescribing>>,
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: &mut IvfModel,

@@ -4,6 +4,9 @@ Bloom filters are probabilistic data structures that allow for fast membership t
 They are space-efficient and can test whether an element is a member of a set.
 It's an inexact filter - they may include false positives but never false negatives.
 
+In addition, since finding NULLs is a common query pattern, the index also maintains a
+bitmap of null rows which allows it to return exact results for IS NULL queries.
+
 ## Index Details
 
 ```protobuf
@@ -32,6 +35,13 @@ The bloom filter index stores zone-based bloom filters in a single file:
 |---------------------------|--------|-------------------------------------------------------------|
 | `bloomfilter_item`        | String | Expected number of items per zone (default: "8192")         |
 | `bloomfilter_probability` | String | False positive probability (default: "0.00057", ~1 in 1754) |
+| `null_bitmap`             | UInt32 | Index of null bitmap global buffer                          |
+
+### Global Buffers
+
+| Metadata Key        | Description                                                |
+|---------------------|------------------------------------------------------------|
+| `null_bitmap`       | A serialized RowAddrTreeMap specifying which rows are null |
 
 ## Bloom Filter Spec
 
@@ -122,10 +132,11 @@ Offset 60-63:  Block 1, Word 7 (32-bit LE)
 
 ## Accelerated Queries
 
-The bloom filter index provides inexact results for the following query types:
+The bloom filter index provides inexact results for the following query types (nullability queries
+return exact results):
 
 | Query Type | Description               | Operation                                 | Result Type |
 |------------|---------------------------|-------------------------------------------|-------------|
 | **Equals** | `column = value`          | Tests if value exists in bloom filter     | AtMost      |
 | **IsIn**   | `column IN (v1, v2, ...)` | Tests if any value exists in bloom filter | AtMost      |
-| **IsNull** | `column IS NULL`          | Returns zones where has_null is true      | AtMost      |
+| **IsNull** | `column IS NULL`          | Returns zones where has_null is true      | Exact       |

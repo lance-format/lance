@@ -9,6 +9,7 @@ members = [
     "rust/lance-file",
     "rust/lance-geo",
     "rust/lance-index",
+    "rust/lance-index-core",
     "rust/lance-io",
     "rust/lance-linalg",
     "rust/lance-namespace",
@@ -32,7 +33,7 @@ resolver = "3"
 
 
 [workspace.package]
-version = "9.0.0-beta.2"
+version = "12.0.0-beta.16"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -57,27 +58,28 @@ rust-version = "1.91.0"
 [workspace.dependencies]
 arc-swap = "1.7"
 libc = "0.2.176"
-lance = { version = "=9.0.0-beta.2", path = "./rust/lance", default-features = false }
-lance-arrow = { version = "=9.0.0-beta.2", path = "./rust/lance-arrow" }
-lance-core = { version = "=9.0.0-beta.2", path = "./rust/lance-core" }
-lance-datafusion = { version = "=9.0.0-beta.2", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=9.0.0-beta.2", path = "./rust/lance-datagen" }
-lance-derive = { version = "=9.0.0-beta.2", path = "./rust/lance-derive" }
-lance-encoding = { version = "=9.0.0-beta.2", path = "./rust/lance-encoding" }
-lance-file = { version = "=9.0.0-beta.2", path = "./rust/lance-file" }
-lance-geo = { version = "=9.0.0-beta.2", path = "./rust/lance-geo" }
-lance-index = { version = "=9.0.0-beta.2", path = "./rust/lance-index" }
-lance-io = { version = "=9.0.0-beta.2", path = "./rust/lance-io", default-features = false }
-lance-linalg = { version = "=9.0.0-beta.2", path = "./rust/lance-linalg" }
-lance-namespace = { version = "=9.0.0-beta.2", path = "./rust/lance-namespace" }
-lance-namespace-impls = { version = "=9.0.0-beta.2", path = "./rust/lance-namespace-impls" }
-lance-namespace-datafusion = { version = "=7.0.0-beta.9", path = "./rust/lance-namespace-datafusion" }
-lance-namespace-reqwest-client = "0.8.6"
-lance-select = { version = "=9.0.0-beta.2", path = "./rust/lance-select" }
-lance-tokenizer = { version = "=9.0.0-beta.2", path = "./rust/lance-tokenizer" }
-lance-table = { version = "=9.0.0-beta.2", path = "./rust/lance-table" }
-lance-test-macros = { version = "=9.0.0-beta.2", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=9.0.0-beta.2", path = "./rust/lance-testing" }
+lance = { version = "=12.0.0-beta.16", path = "./rust/lance", default-features = false }
+lance-arrow = { version = "=12.0.0-beta.16", path = "./rust/lance-arrow" }
+lance-core = { version = "=12.0.0-beta.16", path = "./rust/lance-core" }
+lance-datafusion = { version = "=12.0.0-beta.16", path = "./rust/lance-datafusion" }
+lance-datagen = { version = "=12.0.0-beta.16", path = "./rust/lance-datagen" }
+lance-derive = { version = "=12.0.0-beta.16", path = "./rust/lance-derive" }
+lance-encoding = { version = "=12.0.0-beta.16", path = "./rust/lance-encoding" }
+lance-file = { version = "=12.0.0-beta.16", path = "./rust/lance-file" }
+lance-geo = { version = "=12.0.0-beta.16", path = "./rust/lance-geo" }
+lance-index = { version = "=12.0.0-beta.16", path = "./rust/lance-index" }
+lance-index-core = { version = "=12.0.0-beta.16", path = "./rust/lance-index-core" }
+lance-io = { version = "=12.0.0-beta.16", path = "./rust/lance-io", default-features = false }
+lance-linalg = { version = "=12.0.0-beta.16", path = "./rust/lance-linalg" }
+lance-namespace = { version = "=12.0.0-beta.16", path = "./rust/lance-namespace" }
+lance-namespace-impls = { version = "=12.0.0-beta.16", path = "./rust/lance-namespace-impls" }
+lance-namespace-reqwest-client = "0.12.0"
+lance-select = { version = "=12.0.0-beta.16", path = "./rust/lance-select" }
+lance-tokenizer = { version = "=12.0.0-beta.16", path = "./rust/lance-tokenizer" }
+lance-table = { version = "=12.0.0-beta.16", path = "./rust/lance-table" }
+lance-test-macros = { version = "=12.0.0-beta.16", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=12.0.0-beta.16", path = "./rust/lance-testing" }
+all_asserts = "2.3.1"
 approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "58.0.0", optional = false, features = ["prettyprint"] }
@@ -103,10 +105,15 @@ aws-sdk-s3 = { version = "1.38.0", default-features = false }
 half = { "version" = "2.1", default-features = false, features = [
     "num-traits",
     "std",
+    "bytemuck",
 ] }
-lance-bitpacking = { version = "=9.0.0-beta.2", path = "./rust/compression/bitpacking" }
+lance-bitpacking = { version = "=12.0.0-beta.16", path = "./rust/compression/bitpacking" }
 bitpacking = "0.9"
 bitvec = "1"
+blake3 = "1.8.5"
+bytemuck = { version = "1", default-features = false, features = [
+    "extern_crate_alloc",
+] }
 bytes = "1.11.1"
 byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
@@ -122,7 +129,8 @@ criterion = { version = "0.8.2", features = [
 ] }
 crossbeam-queue = "0.3"
 crossbeam-skiplist = "0.1"
-datafusion = { version = "53.0.0", default-features = false, features = [
+dashmap = "6"
+datafusion = { version = "54.0.0", default-features = false, features = [
     "crypto_expressions",
     "datetime_expressions",
     "encoding_expressions",
@@ -132,55 +140,66 @@ datafusion = { version = "53.0.0", default-features = false, features = [
     "string_expressions",
     "unicode_expressions",
 ] }
-datafusion-common = "53.0.0"
-datafusion-functions = { version = "53.0.0", default-features = false, features = ["regex_expressions"] }
-datafusion-sql = "53.0.0"
-datafusion-expr = "53.0.0"
-datafusion-ffi = "53.0.0"
-datafusion-physical-expr = "53.0.0"
-datafusion-physical-plan = "53.0.0"
-datafusion-substrait = { version = "53.0.0", default-features = false }
+datafusion-common = "54.0.0"
+datafusion-functions = { version = "54.0.0", default-features = false, features = ["regex_expressions"] }
+datafusion-sql = "54.0.0"
+datafusion-expr = "54.0.0"
+datafusion-physical-expr = "54.0.0"
+datafusion-physical-plan = "54.0.0"
+datafusion-substrait = { version = "54.0.0", default-features = false }
 dirs = "6.0.0"
 either = "1.0"
+env_logger = "0.11.7"
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=9.0.0-beta.2", path = "./rust/compression/fsst" }
+fsst = { version = "=12.0.0-beta.16", path = "./rust/compression/fsst" }
 futures = "0.3"
 geoarrow-array = "0.8"
 geoarrow-schema = "0.8"
-geodatafusion = "0.4.0"
+geodatafusion = "0.5.0"
 geo-traits = "0.3.0"
 geo-types = "0.7.16"
+hex = "0.4.3"
 http = "1.1.0"
 humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 icu_segmenter = { version = "2.2", default-features = false, features = ["compiled_data"] }
 io-uring = "0.7"
-itertools = "0.13"
+itertools = "0.14"
 jieba-rs = { version = "0.10.0", default-features = false }
 jsonb = { version = "0.5.3", default-features = false, features = ["databend"] }
 libm = "0.2.15"
 log = "0.4"
+metrics = { version = "0.24" }
+metrics-util = { version = "0.19" }
 mockall = { version = "0.14.0" }
 mock_instant = { version = "0.6.0" }
 moka = { version = "0.12", features = ["future", "sync"] }
 ndarray = { version = "0.16.1", features = ["matrixmultiply-threading"] }
 num-traits = "0.2"
-object_store = { version = "0.13.2" }
-opendal = { version = "0.57" }
-object_store_opendal = { version = "0.57" }
+object_store = { version = "0.14.1" }
+opendal = { version = "0.59.1" }
+object_store_opendal = { version = "0.60.1" }
+parquet = { version = "58.0.0", default-features = false, features = [
+    "arrow",
+    "async",
+] }
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.15.0", features = ["flamegraph"] }
+proc-macro2 = "1.0.67"
 proptest = "1.3.1"
 prost = "0.14.1"
 prost-build = "0.14.1"
 prost-types = "0.14.1"
+protobuf-src = "2.1"
+quote = "1.0.33"
 rand = { version = "0.9.1", features = ["small_rng"] }
 rand_distr = { version = "0.5.1" }
 rand_xoshiro = "0.7.0"
 rangemap = { version = "1.0" }
 rayon = "1.10"
 regex-syntax = "0.8.10"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 roaring = "0.11.4"
 rstest = "0.26.1"
 serde = { version = "^1" }
@@ -188,9 +207,9 @@ serde_json = { version = "1" }
 semver = "1.0"
 serial_test = "3"
 snafu = "0.9"
-strum = "0.26"
+syn = { version = "2.0.37", features = ["full"] }
 lindera = { version = "3.0.7" }
-tempfile = "3"
+tempfile = "3.10"
 test-log = { version = "0.2.15" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",

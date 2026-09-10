@@ -38,7 +38,9 @@ use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
-use dataset::cleanup::CleanupStats;
+use dataset::cleanup::{
+    CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+};
 use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
@@ -47,7 +49,7 @@ use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilt
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
-    LanceFileStatistics, LanceFileWriter, LancePageMetadata, stable_version,
+    LanceFileStatistics, LanceFileWriteSummary, LanceFileWriter, LancePageMetadata, stable_version,
 };
 use log::Level;
 use pyo3::exceptions::PyIOError;
@@ -60,6 +62,7 @@ use std::ffi::CString;
 use std::ptr::NonNull;
 
 pub(crate) mod arrow;
+pub(crate) mod blob;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
@@ -68,10 +71,14 @@ pub(crate) mod error;
 pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
+pub(crate) mod fts;
 pub(crate) mod indices;
 pub(crate) mod mem_wal;
 pub(crate) mod namespace;
+pub(crate) mod object_store;
+pub(crate) mod otel;
 pub(crate) mod reader;
+pub(crate) mod rowids;
 pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
@@ -88,12 +95,17 @@ pub use crate::tracing::{TraceGuard, trace_to_chrome};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::Dataset;
+pub use dataset::serialize_row_addrs;
 pub use dataset::write_dataset;
 use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;
+use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
 
+use crate::blob::{
+    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyPackedBlobWriter,
+};
 use crate::executor::BackgroundExecutor;
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -125,11 +137,13 @@ static EXECUTOR_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 static ATFORK_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
-pub fn rt() -> &'static mut BackgroundExecutor {
+pub fn rt() -> &'static BackgroundExecutor {
     loop {
         let ptr = BACKGROUND_EXECUTOR.load(Ordering::SeqCst);
         if !ptr.is_null() {
-            return unsafe { &mut *ptr };
+            // SAFETY: installed executors are leaked and remain valid for the
+            // process lifetime. BackgroundExecutor uses shared access only.
+            return unsafe { &*ptr };
         }
         if !EXECUTOR_INSTALLED.fetch_or(true, Ordering::SeqCst) {
             break;
@@ -141,7 +155,8 @@ pub fn rt() -> &'static mut BackgroundExecutor {
     }
     let new_ptr = Box::into_raw(Box::new(create_background_executor()));
     BACKGROUND_EXECUTOR.store(new_ptr, Ordering::SeqCst);
-    unsafe { &mut *new_ptr }
+    // SAFETY: the executor is leaked and all of its operations take `&self`.
+    unsafe { &*new_ptr }
 }
 
 /// After a fork() operation, force re-creation of the BackgroundExecutor. Note: this function
@@ -252,11 +267,18 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FileFragment>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;
+    m.add_class::<PyRowIdSequence>()?;
+    m.add_class::<PyRowIdSequenceIterator>()?;
     m.add_class::<PyRowDatasetVersionMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
+    m.add_class::<PyBlobDescriptor>()?;
+    m.add_class::<PyBlobDescriptorArrayBuilder>()?;
+    m.add_class::<PyPackedBlobWriter>()?;
+    m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
+    m.add_class::<LanceFileWriteSummary>()?;
     m.add_class::<LanceFileSession>()?;
     m.add_class::<LanceFileMetadata>()?;
     m.add_class::<LanceFileStatistics>()?;
@@ -265,6 +287,9 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
+    m.add_class::<CleanupCandidateFile>()?;
+    m.add_class::<CleanupReferencedBranch>()?;
+    m.add_class::<CleanupExplanation>()?;
     m.add_class::<IoStats>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;
@@ -275,8 +300,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
+    m.add_class::<object_store::PyObjectStoreProvider>()?;
+    m.add_class::<object_store::PyObjectStoreRegistry>()?;
     m.add_class::<PyTraceEvent>()?;
     m.add_class::<TraceGuard>()?;
+    m.add_class::<fts::FtsToken>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
@@ -285,7 +313,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<namespace::PyRestAdapter>()?;
     m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
     // MemWAL classes
-    m.add_class::<mem_wal::PyMergedGeneration>()?;
+    m.add_class::<mem_wal::PyCompactedSsTable>()?;
     m.add_class::<mem_wal::PyShardSnapshot>()?;
     m.add_class::<mem_wal::PyShardWriter>()?;
     m.add_class::<mem_wal::PyLsmScanner>()?;
@@ -296,6 +324,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_write_pk_sidecar))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
+    m.add_wrapped(wrap_pyfunction!(serialize_row_addrs))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
@@ -305,10 +334,18 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
     m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;
+    m.add_wrapped(wrap_pyfunction!(fts::tokenize))?;
+    // OpenTelemetry metrics bridge
+    m.add_class::<otel::PyMetricPoint>()?;
+    m.add_class::<otel::PyMetricDescription>()?;
+    m.add_wrapped(wrap_pyfunction!(otel::register_lance_metrics_recorder))?;
+    m.add_wrapped(wrap_pyfunction!(otel::lance_metrics_catalog))?;
+    m.add_wrapped(wrap_pyfunction!(otel::snapshot_lance_metrics))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
     m.add_wrapped(wrap_pyfunction!(iops_counter))?;
+    m.add_wrapped(wrap_pyfunction!(simd_info))?;
     m.add_wrapped(wrap_pyfunction!(stable_version))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
@@ -325,6 +362,37 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyfunction(name = "iops_counter")]
 fn iops_counter() -> PyResult<u64> {
     Ok(::lance::io::iops_counter())
+}
+
+/// Returns a dict describing which SIMD tier the lance runtime dispatches to
+/// on this host, plus the raw CPU feature flags it detected.
+///
+/// Mirrors `pyarrow.runtime_info()`: a cheap, transparent way to verify that
+/// the host is hitting the expected SIMD tier (e.g., `"avx512_fp16"`,
+/// `"avx2"`) when debugging vector-search performance.
+///
+/// Returns:
+///   {
+///     "tier": str,                      # e.g. "avx2", "avx_fma", "neon", "none"
+///     "target_arch": str,               # e.g. "x86_64", "aarch64", "loongarch64"
+///     "host_features": list[str],       # raw CPU feature flags (x86_64 only)
+///   }
+///
+/// Examples:
+///   >>> import lance
+///   >>> info = lance.simd_info()
+///   >>> sorted(info)
+///   ['host_features', 'target_arch', 'tier']
+///   >>> isinstance(info["tier"], str)
+///   True
+#[pyfunction]
+pub fn simd_info(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let info = lance_core::utils::cpu::simd_info();
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("tier", info.tier.to_string())?;
+    dict.set_item("target_arch", info.target_arch)?;
+    dict.set_item("host_features", info.host_features)?;
+    Ok(dict.into())
 }
 
 #[pyfunction(name = "bytes_read_counter")]
@@ -450,4 +518,16 @@ fn ffi_logical_codec_from_pycapsule(obj: Bound<PyAny>) -> PyResult<FFI_LogicalEx
     let codec = unsafe { data.as_ref() };
 
     Ok(codec.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_executor_is_a_shared_singleton() {
+        let first: &'static BackgroundExecutor = rt();
+        let second: &'static BackgroundExecutor = rt();
+        assert!(std::ptr::eq(first, second));
+    }
 }

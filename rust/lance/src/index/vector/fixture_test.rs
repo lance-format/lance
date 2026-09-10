@@ -5,10 +5,10 @@
 
 #[cfg(test)]
 mod test {
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::{
         any::Any,
         cell::OnceCell,
-        collections::HashMap,
         sync::{Arc, Mutex},
     };
 
@@ -149,7 +149,7 @@ mod test {
             todo!("this method is for only IVF_HNSW_* index");
         }
 
-        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 
@@ -278,6 +278,7 @@ mod test {
                     deleted_ids: None,
                     filtered_ids: None,
                     deleted_fragments: None,
+                    overlay_block: None,
                     final_mask: Mutex::new(OnceCell::new()),
                 }),
                 &NoOpMetricsCollector,

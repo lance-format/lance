@@ -3,8 +3,18 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Iterator, Literal, Optional, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Union,
+    cast,
+)
 
 import pyarrow as pa
 
@@ -49,6 +59,29 @@ def sanitize_ts(ts: ts_types) -> datetime:
 def td_to_micros(td: timedelta) -> int:
     """Returns the number of microseconds in a timedelta object."""
     return round(td / timedelta(microseconds=1))
+
+
+def _normalize_index_segment_ids(
+    index_segments: Optional[Iterable[Union[str, uuid.UUID]]],
+) -> Optional[List[str]]:
+    """Normalize a physical index segment selection to a list of UUID strings."""
+    if index_segments is None:
+        return None
+    if isinstance(index_segments, (str, uuid.UUID)):
+        raise TypeError(
+            "index_segments must be an iterable of str or uuid.UUID, "
+            f"not a single {type(index_segments)}."
+        )
+    segment_ids = []
+    for segment_id in index_segments:
+        if isinstance(segment_id, (str, uuid.UUID)):
+            segment_ids.append(str(segment_id))
+        else:
+            raise TypeError(
+                "index_segments must be an iterable of str or uuid.UUID. "
+                f"Got {type(segment_id)} instead."
+            )
+    return segment_ids
 
 
 class KMeans:

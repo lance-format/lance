@@ -198,3 +198,57 @@ def test_data_file_create_unknown_column(tmp_path: str):
 
     with pytest.raises(Exception, match="z"):
         DataFile.create(ds, new_file_name)
+
+
+def test_commit_conflict_raises_typed_error(tmp_path: str):
+    """A losing commit should raise CommitConflictError, not a bare OSError."""
+    from lance.commit import CommitConflictError
+
+    table = pa.table({"a": range(100)})
+    ds = lance.write_dataset(table, tmp_path)
+
+    # Two commits based on the same version; the second must conflict.
+    ds2 = lance.dataset(tmp_path)
+    ds3 = lance.dataset(tmp_path)
+
+    new_data_file = make_data_file(ds, [0], pa.table({"a": range(100, 200)}))
+    ds2.commit(
+        ds2.uri,
+        lance.LanceOperation.DataReplacement(
+            [lance.LanceOperation.DataReplacementGroup(0, new_data_file)]
+        ),
+        read_version=ds2.version,
+    )
+
+    new_data_file = make_data_file(ds, [0], pa.table({"a": range(200, 300)}))
+    with pytest.raises(CommitConflictError) as exc_info:
+        ds3.commit(
+            ds3.uri,
+            lance.LanceOperation.DataReplacement(
+                [lance.LanceOperation.DataReplacementGroup(0, new_data_file)]
+            ),
+            read_version=ds3.version,
+        )
+
+    # It must be a CommitConflictError, still catchable as OSError, and retryable.
+    assert isinstance(exc_info.value, OSError)
+    assert exc_info.value.retryable is True
+
+
+def test_incompatible_transaction_raises_non_retryable(tmp_path: str):
+    """An incompatible transaction should raise a non-retryable CommitConflictError."""
+    from lance.commit import CommitConflictError
+
+    table = pa.table({"a": [1]})
+    uri = tmp_path
+    base = lance.write_dataset(table, uri)
+    fragment = lance.fragment.LanceFragment.create(uri, table)
+    stale_append = lance.LanceOperation.Append([fragment])
+
+    # Overwrite the table, then try to append based on the stale version.
+    lance.write_dataset(table, uri, mode="overwrite")
+    with pytest.raises(CommitConflictError) as exc_info:
+        lance.LanceDataset.commit(uri, stale_append, read_version=base.version)
+
+    assert isinstance(exc_info.value, OSError)
+    assert exc_info.value.retryable is False

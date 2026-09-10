@@ -63,6 +63,16 @@ List all versions of a dataset with this request:
 dataset.versions()
 ```
 
+If you only need version numbers, use the lightweight reference API. It lists manifest
+locations without reading and deserializing every manifest:
+
+```python
+dataset.version_refs()
+```
+
+Use `dataset.latest_version` instead when only the latest version of the current branch
+is needed.
+
 You can also access any available version:
 
 ```python

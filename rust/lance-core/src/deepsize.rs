@@ -87,6 +87,16 @@ impl DeepSizeOf for String {
     }
 }
 
+impl DeepSizeOf for bytes::Bytes {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        if context.mark_seen(self.as_ptr() as usize) {
+            self.len()
+        } else {
+            0
+        }
+    }
+}
+
 impl DeepSizeOf for AtomicU64 {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         0

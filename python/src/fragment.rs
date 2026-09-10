@@ -21,11 +21,12 @@ use arrow_array::RecordBatchReader;
 use futures::TryFutureExt;
 use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
-use lance::dataset::scanner::ColumnOrdering;
+use lance::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
 use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
+use lance_table::format::overlay::DataOverlayFile;
 use lance_table::format::{
     DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
 };
@@ -210,7 +211,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -224,6 +225,12 @@ impl FileFragment {
         batch_readahead: Option<usize>,
         blob_handling: Option<Bound<PyAny>>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
+        use_scalar_index: Option<bool>,
+        io_buffer_size: Option<u64>,
+        late_materialization: Option<Bound<PyAny>>,
+        include_deleted_rows: Option<bool>,
+        batch_size_bytes: Option<u64>,
+        strict_batch_size: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
 
@@ -291,6 +298,39 @@ impl FileFragment {
             scanner
                 .order_by(col_orderings)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(io_buffer_size) = io_buffer_size {
+            scanner.io_buffer_size(io_buffer_size);
+        }
+        if let Some(use_scalar_index) = use_scalar_index {
+            scanner.use_scalar_index(use_scalar_index);
+        }
+        if let Some(late_materialization) = late_materialization {
+            if let Ok(style_as_bool) = late_materialization.extract::<bool>() {
+                if style_as_bool {
+                    scanner.materialization_style(MaterializationStyle::AllLate);
+                } else {
+                    scanner.materialization_style(MaterializationStyle::AllEarly);
+                }
+            } else if let Ok(columns) = late_materialization.extract::<Vec<String>>() {
+                scanner.materialization_style(
+                    MaterializationStyle::all_early_except(&columns, self_.fragment.schema())
+                        .infer_error()?,
+                );
+            } else {
+                return Err(PyValueError::new_err(
+                    "late_materialization must be a bool or a list of strings",
+                ));
+            }
+        }
+        if let Some(batch_size_bytes) = batch_size_bytes {
+            scanner.batch_size_bytes(batch_size_bytes);
+        }
+        if let Some(true) = include_deleted_rows {
+            scanner.include_deleted_rows();
+        }
+        if let Some(strict_batch_size) = strict_batch_size {
+            scanner.strict_batch_size(strict_batch_size);
         }
         let scn = Arc::new(scanner);
         Ok(Scanner::new(scn))
@@ -385,6 +425,38 @@ impl FileFragment {
         }
     }
 
+    /// Delete rows by their local (within-fragment) physical row offsets.
+    ///
+    /// Adds the given 0-based offsets to this fragment's deletion vector and
+    /// writes a new deletion file. Returns the updated fragment, or None if every
+    /// row is now deleted. Unlike `delete(predicate)`, this deletes exactly the
+    /// supplied rows without re-evaluating a filter -- useful when the caller
+    /// already knows which rows to delete (e.g. offsets collected from a prior
+    /// scan), avoiding a redundant predicate evaluation.
+    fn delete_rows(&self, offsets: Vec<u32>) -> PyResult<Option<Self>> {
+        let old_fragment = self.fragment.clone();
+        // The core deletion path only errors once the deletion count reaches
+        // physical_rows, so out-of-range offsets must be rejected here.
+        let updated_fragment = rt()
+            .block_on(None, async {
+                let physical_rows = old_fragment.physical_rows().await?;
+                if let Some(&offset) = offsets.iter().find(|&&o| o as usize >= physical_rows) {
+                    return Err(Error::invalid_input(format!(
+                        "delete_rows offset {offset} is out of range for fragment {} \
+                         with {physical_rows} rows",
+                        old_fragment.id()
+                    )));
+                }
+                old_fragment.extend_deletions(offsets).await
+            })?
+            .infer_error()?;
+
+        match updated_fragment {
+            Some(frag) => Ok(Some(Self::new(frag))),
+            None => Ok(None),
+        }
+    }
+
     fn schema<'py>(self_: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let schema = self_.fragment.dataset().schema();
         let logical_schema = logical_schema_from_lance(schema);
@@ -418,6 +490,11 @@ impl FileFragment {
     #[getter]
     fn physical_rows(&self) -> PyResult<usize> {
         rt().block_on(None, self.fragment.physical_rows())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    fn validate(&self) -> PyResult<()> {
+        rt().block_on(None, self.fragment.validate())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 }
@@ -793,6 +870,10 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             row_id_meta,
             last_updated_at_version_meta,
             created_at_version_meta,
+            // Round-tripped so overlays survive operations that pass existing
+            // fragments back (a manual Delete/Update/Merge commit). Sorting
+            // newest-last is deferred to the manifest reload after commit.
+            overlays: extract_vec::<DataOverlayFile>(&ob.getattr("overlays")?)?,
         }))
     }
 }
@@ -825,6 +906,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             .created_at_version_meta
             .as_ref()
             .map(|r| PyRowDatasetVersionMeta(r.clone()));
+        let overlays = export_vec(py, &self.0.overlays)?;
 
         cls.call1((
             self.0.id,
@@ -834,6 +916,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             row_id_meta,
             created_at_version_meta,
             last_updated_at_version_meta,
+            overlays,
         ))
     }
 }

@@ -56,7 +56,10 @@ fn benchmark(file_path: &str) {
     let mut decompression_out_bufs = vec![];
     let mut decompression_out_offsets_bufs = vec![];
     for _ in 0..TEST_NUM {
-        let this_decom_out_buf = vec![0u8; BUFFER_SIZE * 3];
+        // `decompress` requires the output buffer to be at least 8x the compressed input (a 1-byte
+        // code can expand to an 8-byte symbol). The compressed buffer is at most `BUFFER_SIZE`, so
+        // `BUFFER_SIZE * 8` is a safe upper bound.
+        let this_decom_out_buf = vec![0u8; BUFFER_SIZE * 8];
         let this_decom_out_offsets_buf = vec![0i32; BUFFER_SIZE * 3];
         decompression_out_bufs.push(this_decom_out_buf);
         decompression_out_offsets_bufs.push(this_decom_out_offsets_buf);

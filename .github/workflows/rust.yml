@@ -42,15 +42,34 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+  package:
+    name: Check crates are publishable
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      # Catches manifest problems that only surface at publish time (missing
+      # readme/license files, path dependencies without a version, excluded
+      # files a crate needs). `--no-verify` skips building each packaged crate,
+      # which the other jobs already cover. Keep the excludes in sync with
+      # .github/workflows/cargo-publish.yml.
+      - name: Package crates
+        run: |
+          cargo package --workspace --no-verify \
+            --exclude lance-arrow-stats \
+            --exclude lance-arrow-scalar \
+            --all-features
+
   rustdoc:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Check documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
@@ -62,10 +81,10 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Get features
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | sort | uniq | paste -s -d "," -`
@@ -85,7 +104,7 @@ jobs:
 
   linux-build:
     runs-on: "ubuntu-24.04-8x"
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
       # Need up-to-date compilers for kernels
       CC: clang
@@ -96,30 +115,38 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Setup rust toolchain
         run: |
-          rustup toolchain install nightly
-          rustup default nightly
+          rustup toolchain install stable
+          rustup default stable
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      - name: Build tests
         run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
-      - name: Start DynamodDB and S3
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          cargo nextest run \
+            --cargo-profile ci \
+            --locked \
+            --workspace \
+            --features "${ALL_FEATURES}" \
+            --no-run
+      - name: Start DynamoDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
       - name: Run tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
-          cargo +nightly llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          codecov_yml_path: codecov.yml
-          files: coverage.codecov
-          flags: unittests
-          fail_ci_if_error: false
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
+          cargo nextest run \
+            --cargo-profile ci \
+            --locked \
+            --workspace \
+            --features "${ALL_FEATURES}"
+
   linux-arm:
     runs-on: ubuntu-24.04-arm64-8x
     timeout-minutes: 75
@@ -131,47 +158,20 @@ jobs:
           rustup default stable
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt -y -qq update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Build tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES} --no-run
       - name: Start DynamodDB and S3
         run: docker compose -f docker-compose.yml up -d --wait
       - name: Run tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES}
-  query-integration-tests:
-    runs-on: ubuntu-24.04-4x
-    timeout-minutes: 75
-    env:
-      # We use opt-level 1 which makes some tests 5x faster to run.
-      RUSTFLAGS: "-C debuginfo=1 -C opt-level=1"
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup rust toolchain
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          cache-targets: false
-          cache-workspace-crates: true
-      - name: Install dependencies
-        run: |
-          sudo apt -y -qq update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
-      - name: Build query integration tests
-        run: |
-          cargo build --locked -p lance --no-default-features --features fp16kernels,slow_tests --tests --test integration_tests
-      - name: Run query integration tests
-        run: |
-          cargo test --locked -p lance --no-default-features --features fp16kernels,slow_tests --test integration_tests
   build-no-lock:
     runs-on: ubuntu-24.04-8x
     timeout-minutes: 30
@@ -189,13 +189,13 @@ jobs:
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Build all
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
     runs-on: warp-macos-14-arm64-6x
@@ -220,15 +220,21 @@ jobs:
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      # macOS runner capacity is the scarcest in CI, so this job is kept as short
+      # as it can be. nextest runs each test in its own process and schedules
+      # across all cores, rather than one test binary at a time. Benchmarks are
+      # only compile-checked here, which build-no-lock already does on Linux;
+      # nothing about bench compilation is macOS-specific.
       - name: Build tests
         run: |
-          cargo test --profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
+          cargo nextest run --cargo-profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
       - name: Run tests
         run: |
-          cargo test --profile ci --features fp16kernels,cli,dynamodb,substrait
-      - name: Check benchmarks
-        run: |
-          cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
+          cargo nextest run --cargo-profile ci --features fp16kernels,cli,dynamodb,substrait
   windows-build:
     runs-on: windows-latest-4x
     defaults:
@@ -246,12 +252,108 @@ jobs:
           7z x protoc.zip
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      # Same reasoning as mac-build: nextest schedules across all cores instead
+      # of running one test binary at a time, and build-no-lock already
+      # compile-checks the benchmarks on Linux.
       - name: Build tests
-        run: cargo test --profile ci --locked --no-run
+        run: cargo nextest run --cargo-profile ci --locked --no-run
       - name: Run tests
-        run: cargo test --profile ci
-      - name: Check benchmarks
-        run: cargo check --profile ci --benches
+        run: cargo nextest run --cargo-profile ci
+
+  qemu-pre-haswell:
+    # Verifies that lance-linalg's runtime SIMD dispatch still works
+    # correctly when the binary is built with the lower x86-64-v2 baseline
+    # (the legacy build path documented in CONTRIBUTING.md). Emulates a
+    # Nehalem CPU under qemu-user; catches any accidental AVX2/FMA
+    # instructions that leak past the runtime dispatch.
+    #
+    # The published-wheel default baseline (`target-cpu=haswell`) is set in
+    # `.cargo/config.toml`; this job overrides RUSTFLAGS for one job to
+    # exercise the legacy path without affecting any other build.
+    name: pre-Haswell SIGILL check (qemu Nehalem)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CC: clang
+      CXX: clang++
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "qemu-x86_64 -cpu Nehalem"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Restore QEMU 8.2.10
+        id: qemu-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/lance-qemu/8.2.10/qemu-x86_64
+          key: qemu-user-8.2.10-x86_64-linux-user-${{ runner.os }}-${{ runner.arch }}-v1
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Install QEMU build dependencies
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            ninja-build \
+            pkg-config \
+            libglib2.0-dev \
+            python3-venv \
+            curl \
+            xz-utils
+      - name: Build QEMU 8.2.10
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          QEMU_VERSION=8.2.10
+          QEMU_ARCHIVE="qemu-${QEMU_VERSION}.tar.xz"
+          QEMU_BIN_DIR="${RUNNER_TEMP}/lance-qemu/${QEMU_VERSION}"
+          QEMU_SOURCE_DIR="${RUNNER_TEMP}/qemu-${QEMU_VERSION}"
+
+          # Ubuntu 24.04 ships QEMU 8.2.2, which is affected by
+          # https://gitlab.com/qemu-project/qemu/-/issues/2170.
+          curl --fail --location --silent --show-error \
+            "https://download.qemu.org/${QEMU_ARCHIVE}" \
+            --output "${RUNNER_TEMP}/${QEMU_ARCHIVE}"
+          echo "37b4a643da8ed6015eef35f5d7f06e7259d9c95359965a0a98e9667c621ab2bb  ${RUNNER_TEMP}/${QEMU_ARCHIVE}" \
+            | sha256sum --check -
+          tar --extract \
+            --file "${RUNNER_TEMP}/${QEMU_ARCHIVE}" \
+            --directory "${RUNNER_TEMP}"
+          mkdir "${QEMU_SOURCE_DIR}/build"
+          (
+            cd "${QEMU_SOURCE_DIR}/build"
+            ../configure --target-list=x86_64-linux-user --disable-docs
+            ninja qemu-x86_64
+          )
+          mkdir -p "${QEMU_BIN_DIR}"
+          install -m 0755 \
+            "${QEMU_SOURCE_DIR}/build/qemu-x86_64" \
+            "${QEMU_BIN_DIR}/qemu-x86_64"
+      - name: Add QEMU to PATH
+        run: |
+          QEMU_BIN_DIR="${RUNNER_TEMP}/lance-qemu/8.2.10"
+          echo "${QEMU_BIN_DIR}" >> "${GITHUB_PATH}"
+          QEMU_VERSION_OUTPUT="$("${QEMU_BIN_DIR}/qemu-x86_64" --version)"
+          echo "${QEMU_VERSION_OUTPUT}"
+          if [[ "${QEMU_VERSION_OUTPUT}" != *"version 8.2.10"* ]]; then
+            echo "Expected QEMU 8.2.10, got: ${QEMU_VERSION_OUTPUT}" >&2
+            exit 1
+          fi
+      - name: Build lance-linalg lib tests in release mode
+        run: |
+          cargo test --release -p lance-linalg --lib --no-run
+      - name: Run lance-linalg lib tests under qemu Nehalem
+        run: |
+          cargo test --release -p lance-linalg --lib
 
   msrv:
     # Check the minimum supported Rust version
@@ -269,10 +371,10 @@ jobs:
         with:
           submodules: true
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Install ${{ matrix.msrv }}
         run: |
           rustup toolchain install ${{ matrix.msrv }}
@@ -280,5 +382,5 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.msrv }}
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo check --profile ci --workspace --tests --benches --features ${ALL_FEATURES}

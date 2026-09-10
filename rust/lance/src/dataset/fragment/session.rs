@@ -54,14 +54,27 @@ impl FragmentSession {
         };
 
         // Then call take rows
-        self.take_rows(&row_ids).await
+        let batch = self.take_rows(&row_ids).await?;
+
+        // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
+        // for user-facing output, mirroring FileFragment::take.
+        if batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| lance_arrow::json::is_json_field(f) || lance_arrow::json::has_json_fields(f))
+        {
+            Ok(lance_arrow::json::convert_lance_json_to_arrow(&batch)?)
+        } else {
+            Ok(batch)
+        }
     }
 
     pub(crate) async fn take_rows(&self, row_offsets: &[u32]) -> Result<RecordBatch> {
         if row_offsets.len() > 1 && FileFragment::row_ids_contiguous(row_offsets) {
             let range =
                 (row_offsets[0] as usize)..(row_offsets[row_offsets.len() - 1] as usize + 1);
-            self.reader.legacy_read_range_as_batch(range).await
+            self.reader.read_range_as_batch(range).await
         } else {
             self.reader.take_as_batch(row_offsets, None).await
         }
@@ -76,7 +89,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ADDR;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_encoding::version::LanceFileVersion;
+    use lance_file::version::LanceFileVersion;
     use rstest::rstest;
     use std::sync::Arc;
 
@@ -202,6 +215,78 @@ mod tests {
             batch.column_by_name(ROW_ADDR).unwrap().as_ref(),
             &UInt64Array::from(vec![(3 << 32) + 1, (3 << 32) + 5, (3 << 32) + 8])
         );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_session_take_json() {
+        use arrow_array::LargeBinaryArray;
+        use lance_arrow::ARROW_EXT_NAME_KEY;
+        use lance_arrow::json::{ARROW_JSON_EXT_NAME, JsonArray, json_field};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        // Build a schema with a Lance JSON column (LargeBinary + lance.json metadata).
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            json_field("j", true),
+        ]));
+
+        let json_strings = (0..10)
+            .map(|v| Some(format!("{{\"v\":{}}}", v)))
+            .collect::<Vec<_>>();
+        let jsonb = JsonArray::try_from_iter(json_strings).unwrap().into_inner();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(jsonb),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let fragment = dataset.get_fragments().into_iter().next().unwrap();
+        let take_session = fragment
+            .open_session(dataset.schema(), false)
+            .await
+            .unwrap();
+        let result = take_session.take(&[0, 3, 7]).await.unwrap();
+
+        // The JSON column must be returned as Arrow JSON (Utf8 + arrow.json), not raw JSONB.
+        let field = result.schema().field_with_name("j").unwrap().clone();
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert_eq!(
+            field.metadata().get(ARROW_EXT_NAME_KEY).map(|s| s.as_str()),
+            Some(ARROW_JSON_EXT_NAME)
+        );
+        assert!(
+            result
+                .column_by_name("j")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .is_none(),
+            "JSON column should not be raw LargeBinary JSONB"
+        );
+        let json_col = result
+            .column_by_name("j")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("JSON column should be Utf8 strings");
+        assert_eq!(json_col.value(0), "{\"v\":0}");
+        assert_eq!(json_col.value(1), "{\"v\":3}");
+        assert_eq!(json_col.value(2), "{\"v\":7}");
     }
 
     async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {

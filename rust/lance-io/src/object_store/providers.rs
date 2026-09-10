@@ -50,8 +50,13 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     /// Meanwhile, for a file store, the path is relative to the filesystem root.
     /// So a URL of `file:///path/to/file` would return `/path/to/file`.
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        Path::parse(url.path())
-            .map_err(|_| Error::invalid_input(format!("Invalid path in URL: {}", url.path())))
+        // url.path() returns a percent-encoded string (per the WHATWG URL spec).
+        // Path::from_url_path decodes it first so the Path internal representation
+        // holds the raw UTF-8 string. This prevents double-encoding when the
+        // object store client later percent-encodes the path for HTTP requests.
+        Path::from_url_path(url.path()).map_err(|e| {
+            Error::invalid_input(format!("Invalid path in URL '{}': {}", url.path(), e))
+        })
     }
 
     /// Calculate the unique prefix that should be used for this object store.
@@ -200,6 +205,57 @@ impl ObjectStoreRegistry {
         Error::invalid_input(message)
     }
 
+    async fn build_store(
+        &self,
+        provider: Arc<dyn ObjectStoreProvider>,
+        base_path: Url,
+        params: &ObjectStoreParams,
+        store_prefix: &str,
+    ) -> Result<Arc<ObjectStore>> {
+        let mut store = provider.new_store(base_path, params).await?;
+
+        store.inner = store.inner.traced();
+
+        // Label metrics by the store's unique prefix (e.g. `s3$bucket`,
+        // `az$container@account`) so multiple stores on one cloud differ.
+        crate::object_store::meter_store(&mut store.inner, &mut store.io_tracker, store_prefix);
+
+        if let Some(wrapper) = &params.object_store_wrapper {
+            store.apply_wrapper(wrapper.as_ref());
+        }
+
+        // Always wrap with IO tracking
+        store.inner = store.io_tracker.wrap("", store.inner);
+
+        Ok(Arc::new(store))
+    }
+
+    /// Build a fresh object store without consulting or populating the cache.
+    ///
+    /// Callers should retain the returned [`Arc`] for as long as they want to
+    /// reuse provider-local state such as HTTP clients and rate limiters.
+    #[doc(hidden)]
+    pub async fn new_store(
+        &self,
+        base_path: Url,
+        params: &ObjectStoreParams,
+    ) -> Result<Arc<ObjectStore>> {
+        // Base-scoped storage options (`base_<id>.<key>`) are directives for
+        // other registered base paths; resolve them away before building a
+        // store for this location.
+        let params = params.scoped_to_base(None);
+        let params = params.as_ref();
+        let scheme = base_path.scheme();
+        let Some(provider) = self.get_provider(scheme) else {
+            return Err(self.scheme_not_found_error(scheme));
+        };
+        let store_prefix =
+            provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
+
+        self.build_store(provider, base_path, params, &store_prefix)
+            .await
+    }
+
     /// Get an object store for a given base path and parameters.
     ///
     /// If the object store is already in use, it will return a strong reference
@@ -210,6 +266,12 @@ impl ObjectStoreRegistry {
         base_path: Url,
         params: &ObjectStoreParams,
     ) -> Result<Arc<ObjectStore>> {
+        // Base-scoped storage options (`base_<id>.<key>`) are directives for
+        // other registered base paths; resolve them away before building or
+        // caching a store for this location. Params already resolved for a
+        // base contain no scoped entries, so this is a no-op for them.
+        let params = params.scoped_to_base(None);
+        let params = params.as_ref();
         let scheme = base_path.scheme();
         let Some(provider) = self.get_provider(scheme) else {
             return Err(self.scheme_not_found_error(scheme));
@@ -250,18 +312,9 @@ impl ObjectStoreRegistry {
 
         self.misses.fetch_add(1, Ordering::Relaxed);
 
-        let mut store = provider.new_store(base_path, params).await?;
-
-        store.inner = store.inner.traced();
-
-        if let Some(wrapper) = &params.object_store_wrapper {
-            store.inner = wrapper.wrap(&cache_path, store.inner);
-        }
-
-        // Always wrap with IO tracking
-        store.inner = store.io_tracker.wrap("", store.inner);
-
-        let store = Arc::new(store);
+        let store = self
+            .build_store(provider, base_path, params, &cache_path)
+            .await?;
 
         {
             // Insert the store into the cache
@@ -362,8 +415,14 @@ impl ObjectStoreRegistry {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     use super::*;
+    use object_store::ObjectStore as OSObjectStore;
+
+    use crate::object_store::providers::memory::MemoryStoreProvider;
+    use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
+    use rstest::rstest;
 
     #[derive(Debug)]
     struct DummyProvider;
@@ -379,6 +438,125 @@ mod tests {
         }
     }
 
+    /// A lister that exists only to be handed to a wrapper.
+    struct StubLister;
+
+    #[async_trait::async_trait]
+    impl PaginatedListStore for StubLister {
+        async fn list_paginated(
+            &self,
+            _prefix: Option<&str>,
+            _opts: PaginatedListOptions,
+        ) -> object_store::Result<PaginatedListResult> {
+            unimplemented!("this lister exists to be wrapped, not to list")
+        }
+    }
+
+    /// A provider whose stores come with a paginated lister, which the memory store does not.
+    #[derive(Debug)]
+    struct PaginatedProvider;
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for PaginatedProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            let mut store = MemoryStoreProvider.new_store(base_path, params).await?;
+            store.paginated_lister = Some(Arc::new(StubLister));
+            Ok(store)
+        }
+
+        fn calculate_object_store_prefix(
+            &self,
+            _url: &Url,
+            _storage_options: Option<&HashMap<String, String>>,
+        ) -> Result<String> {
+            Ok("memory".to_string())
+        }
+    }
+
+    /// Swaps the store out for an empty one, the way a wrapper enforcing visibility would, and
+    /// records the prefix each call was labelled with. `keep_pushdown` is what it answers when
+    /// asked about the lister.
+    #[derive(Debug)]
+    struct RecordingWrapper {
+        keep_pushdown: bool,
+        prefixes: Mutex<Vec<String>>,
+    }
+
+    impl WrappingObjectStore for RecordingWrapper {
+        fn wrap(
+            &self,
+            store_prefix: &str,
+            _original: Arc<dyn OSObjectStore>,
+        ) -> Arc<dyn OSObjectStore> {
+            self.prefixes
+                .lock()
+                .unwrap()
+                .push(format!("wrap@{store_prefix}"));
+            Arc::new(object_store::memory::InMemory::new())
+        }
+
+        fn wrap_paginated(
+            &self,
+            store_prefix: &str,
+            original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            self.prefixes
+                .lock()
+                .unwrap()
+                .push(format!("wrap_paginated@{store_prefix}"));
+            self.keep_pushdown.then_some(original)
+        }
+    }
+
+    /// A decorator supplied through [`ObjectStoreParams`] has to reach the paginated lister
+    /// too, or `read_dir_page` would talk to the backend behind its back — and a decorator
+    /// that gives the pushdown up gets a store with no lister, so its listings go through the
+    /// wrapped `inner` and see what the wrapper allows rather than what the backend holds.
+    #[rstest]
+    #[case::keeps_the_pushdown(true)]
+    #[case::gives_up_the_pushdown(false)]
+    #[tokio::test]
+    async fn test_the_registry_hands_the_lister_to_the_wrapper(#[case] keep_pushdown: bool) {
+        let wrapper = Arc::new(RecordingWrapper {
+            keep_pushdown,
+            prefixes: Mutex::new(Vec::new()),
+        });
+        let registry = ObjectStoreRegistry::default();
+        registry.insert("pagmem", Arc::new(PaginatedProvider));
+
+        let store = registry
+            .get_store(
+                Url::parse("pagmem:///").unwrap(),
+                &ObjectStoreParams {
+                    object_store_wrapper: Some(wrapper.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.paginated_lister.is_some(), keep_pushdown);
+        // Both halves of the store are labelled with the same prefix.
+        assert_eq!(
+            *wrapper.prefixes.lock().unwrap(),
+            vec!["wrap@memory", "wrap_paginated@memory"]
+        );
+        if !keep_pushdown {
+            // `StubLister` panics if it is ever asked to list, so reaching a page at all is
+            // the other half of the assertion.
+            let page = store
+                .read_dir_page(Path::from(""), Default::default())
+                .await
+                .unwrap();
+            assert!(page.result.common_prefixes.is_empty());
+            assert!(page.result.objects.is_empty());
+        }
+    }
+
     #[test]
     fn test_calculate_object_store_prefix() {
         let provider = DummyProvider;
@@ -387,6 +565,36 @@ mod tests {
             "dummy$blah",
             provider.calculate_object_store_prefix(&url, None).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_store_resolves_base_scoped_options() {
+        use crate::object_store::StorageOptionsAccessor;
+
+        let registry = ObjectStoreRegistry::default();
+        let url = Url::parse("memory://test").unwrap();
+
+        let with_scoped = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("shared".to_string(), "value".to_string()),
+                    ("base_1.account_key".to_string(), "base1-key".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+        let without_scoped = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("shared".to_string(), "value".to_string())]),
+            ))),
+            ..Default::default()
+        };
+
+        // Base-scoped entries are resolved away before the store is built and
+        // cached, so params with and without them yield the same cached store.
+        let store_scoped = registry.get_store(url.clone(), &with_scoped).await.unwrap();
+        let store_plain = registry.get_store(url, &without_scoped).await.unwrap();
+        assert!(Arc::ptr_eq(&store_scoped, &store_plain));
     }
 
     #[test]
@@ -471,5 +679,19 @@ mod tests {
 
         // Same params returns same instance
         assert!(Arc::ptr_eq(&stores[0], &stores[1]));
+    }
+
+    #[tokio::test]
+    async fn test_new_store_bypasses_cache() {
+        let registry = ObjectStoreRegistry::default();
+        let url = Url::parse("memory://test").unwrap();
+        let params = ObjectStoreParams::default();
+
+        let first = registry.new_store(url.clone(), &params).await.unwrap();
+        let second = registry.new_store(url, &params).await.unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        let stats = registry.stats();
+        assert_eq!((stats.hits, stats.misses, stats.active_stores), (0, 0, 0));
     }
 }

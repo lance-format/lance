@@ -27,27 +27,9 @@ In addition to the [activities of maintainers](./maintainers.md#activities), PMC
 
 ## Roster
 
-| Name            | GitHub Handle   | Affiliation  | Ecosystem Roles                                                                                               |
-|-----------------|-----------------|--------------|---------------------------------------------------------------------------------------------------------------|
-| Yang Cen        | BubbleCal       | LanceDB      | Milvus Contributor                                                                                            |
-| Pablo Delgado   | pablete         | Netflix      |                                                                                                               |
-| Hao Ding        | Xuanwo          | LanceDB      | Apache OpenDAL PMC Chair, Apache Iceberg Committer, Apache Member and [more](https://xuanwo.io/about/)        |
-| Zhaowei Huang   | SaintBacchus    | Alibaba      | Apache Doris Committer                                                                                        |
-| Will Jones      | wjones127       | LanceDB      | Apache Arrow PMC Member, Apache DataFusion PMC Member, Delta Lake Maintainer                                  |
-| Matt Kafonek    | kafonek         | Runway AI    |                                                                                                               |
-| Denny Lee       | dennyglee       | Databricks   | Unity Catalog Maintainer, Delta Lake Maintainer, Apache Spark Contributor, MLflow Contributor                 |
-| Rob Meng        | chebbyChefNEQ   | Jump Trading |                                                                                                               |
-| Dao Mi          | dowjones226     | Netflix      |                                                                                                               |
-| Weston Pace     | westonpace      | LanceDB      | Apache Arrow PMC Member, Substrait SMC Member                                                                 |
-| Calvin Qi       | calvinqi        | Harvey.ai    |                                                                                                               |
-| Prashanth Rao   | prrao87         | LanceDB      |                                                                                                               |
-| Ethan Rosenthal | EthanRosenthal  | Runway AI    |                                                                                                               |                                                 |
-| Tim Saucer      | timsaucer       | Rerun.io     | Apache DataFusion PMC Member                                                                                  |
-| Chang She       | changhiskhan    | LanceDB      | Pandas Co-Author                                                                                              |
-| Jasmine Wang    | onigiriisabunny | LanceDB      | Alluxio PMC Community Manager                                                                                 |
-| Lei Xu          | eddyxu          | LanceDB      | Apache Hadoop PMC Member                                                                                      |
-| Vino Yang       | yanghua         | Bytedance    | Apache Hudi PMC Member, Apache Kyuubi PMC Member, Apache Kylin Committer, Apache Incubation Program Committer |
-| Jack Ye         | jackye1995      | LanceDB      | Apache Iceberg PMC Member, Apache Polaris (incubating) PPMC Member, Apache Incubation Program Committer       |
+<!-- The roster table is generated at build time from `pmc.yaml` by the
+     `hooks/pmc_roster.py` MkDocs hook. Edit `pmc.yaml`, not this placeholder. -->
+<!-- PMC_ROSTER_TABLE -->
 
 ## Becoming a PMC Member
 

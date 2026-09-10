@@ -11,7 +11,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-24.04
-    if: github.repository == 'lancedb/lance'
+    if: github.repository == 'lance-format/lance'
     permissions:
       actions: write
     steps:
@@ -25,16 +25,16 @@ jobs:
   jumbo-tests:
     # jumbo tests need more resources
     runs-on: ubuntu-24.04-8x
-    if: github.repository == 'lancedb/lance'
+    if: github.repository == 'lance-format/lance'
     timeout-minutes: 60
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Run Jumbo String/Binary Tests
         run: |
           echo "Running jumbo tests for Lance 2.0 and 2.1..."
@@ -44,3 +44,69 @@ jobs:
           # Run only the jumbo tests in release mode with limited parallelism
           # to avoid OOM issues (these tests use >5GiB memory each)
           cargo test --release --package lance-encoding -- --ignored jumbo --test-threads=1
+
+  # Cross-version index maintenance-sequence search (see python/tests/compat/compat_sequence.py).
+  # Ages an index under the latest release of each of the two previous majors and exercises it
+  # under this commit, searching op sequences for panics or correctness divergence. The search is
+  # slow and unbounded in depth, so it runs nightly with a generous timeout rather than blocking
+  # merges; the manual escape hatch for arbitrary ref pairs lives in compat-pair.yml.
+  compat-sequence:
+    if: github.repository == 'lance-format/lance'
+    timeout-minutes: 360
+    runs-on: ubuntu-24.04
+    name: Index Sequence Compat
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: 3.13
+      # Toolchain to build the reader (HEAD) wheel from source -- no upstream build job to
+      # borrow a wheel from here, unlike the old post-merge path in python.yml.
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: python
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Install host deps
+        run: pip install pytest pytest-xdist pyarrow packaging maturin
+      # Build HEAD once and feed it to the suite as the prebuilt reader, so the two writer
+      # passes below don't each recompile it.
+      - name: Build reader wheel (HEAD)
+        run: python -m maturin build --release -m Cargo.toml --out wheels
+      # Age under each of the two previous majors (writer wheels from PyPI) and read under
+      # this commit's freshly built wheel. Length 5 is the shallowest depth that reaches the
+      # ENT-1662 sequence; -n oversubscribes cores since the work is I/O-bound.
+      - name: Run sequence search (previous two majors -> HEAD)
+        env:
+          COMPAT_MAX_LENGTH: "5"
+          COMPAT_TO_REF: HEAD
+          COMPAT_PREBUILT_REF: HEAD
+        run: |
+          set -euo pipefail
+          wheel=$(ls "$PWD"/wheels/pylance-*.whl | head -1)
+          refs=$(PYTHONPATH=python/tests python -c "
+          from compat.compat_decorator import pylance_stable_versions
+          latest = {}
+          for v in pylance_stable_versions():
+              latest[v.major] = v
+          print(' '.join(str(latest[m]) for m in sorted(latest)[-2:]))
+          ")
+          echo "reader wheel: $wheel"
+          echo "writer refs : $refs"
+          status=0
+          for from_ref in $refs; do
+            echo "::group::$from_ref -> HEAD"
+            COMPAT_FROM_REF="$from_ref" COMPAT_PREBUILT_WHEEL="$wheel" \
+              python -m pytest python/tests/compat/test_index_sequence.py \
+                --run-compat -n "$(( $(nproc) * 4 ))" -v --no-header || status=1
+            echo "::endgroup::"
+          done
+          exit $status

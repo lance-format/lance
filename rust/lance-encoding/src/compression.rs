@@ -20,13 +20,16 @@
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
 use crate::{
     buffer::LanceBuffer,
-    compression_config::{BssMode, CompressionFieldParams, CompressionParams},
+    compression_config::{BssMode, CompressionFieldParams},
     constants::{
         BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, RLE_THRESHOLD_META_KEY,
     },
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
-        logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
+        logical::primitive::{
+            fullzip::PerValueCompressor,
+            miniblock::{MAX_MINIBLOCK_VALUES, MiniBlockCompressor},
+        },
         physical::{
             binary::{
                 BinaryBlockDecompressor, BinaryMiniBlockDecompressor, BinaryMiniBlockEncoder,
@@ -46,21 +49,21 @@ use crate::{
             },
             general::{GeneralMiniBlockCompressor, GeneralMiniBlockDecompressor},
             packed::{
+                PackedStructFixedPerValueDecompressor, PackedStructFixedPerValueEncoder,
                 PackedStructFixedWidthMiniBlockDecompressor,
                 PackedStructFixedWidthMiniBlockEncoder, PackedStructVariablePerValueDecompressor,
                 PackedStructVariablePerValueEncoder, VariablePackedStructFieldDecoder,
                 VariablePackedStructFieldKind,
             },
-            rle::{RleDecompressor, RleEncoder},
+            rle::{
+                RleChildDecompressor, RleDecompressor, RleEncoder, RunLengthWidth,
+                rle_encoded_size, select_run_length_width,
+            },
             value::{ValueDecompressor, ValueEncoder},
         },
     },
-    format::{
-        ProtobufUtils21,
-        pb21::{CompressiveEncoding, compressive_encoding::Compression},
-    },
+    format::pb21::{CompressiveEncoding, compressive_encoding::Compression},
     statistics::{GetStat, Stat},
-    version::LanceFileVersion,
 };
 
 use arrow_array::{cast::AsArray, types::UInt64Type};
@@ -78,6 +81,7 @@ const DEFAULT_RLE_COMPRESSION_THRESHOLD: f64 = 0.5;
 
 // Minimum block size (32kb) to trigger general block compression
 const MIN_BLOCK_SIZE_FOR_GENERAL_COMPRESSION: u64 = 32 * 1024;
+const RLE_BLOCK_HEADER_BYTES: u128 = std::mem::size_of::<u64>() as u128;
 
 /// Trait for compression algorithms that compress an entire block of data into one opaque
 /// and self-described chunk.
@@ -92,11 +96,11 @@ const MIN_BLOCK_SIZE_FOR_GENERAL_COMPRESSION: u64 = 32 * 1024;
 /// required (e.g. when encoding metadata buffers like a dictionary or for encoding rep/def
 /// mini-block chunks)
 pub trait BlockCompressor: std::fmt::Debug + Send + Sync {
-    /// Compress the data into a single buffer
+    /// Compress the data into zero or one buffers and describe the codec used.
     ///
-    /// Also returns a description of the compression that can be used to decompress
-    /// when reading the data back
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer>;
+    /// `None` represents a metadata-only codec. `Some` represents a physical
+    /// payload, including a zero-byte payload.
+    fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)>;
 }
 
 /// A trait to pick which compression to use for given data
@@ -112,12 +116,12 @@ pub trait BlockCompressor: std::fmt::Debug + Send + Sync {
 ///   used for narrow data types (both fixed and variable length) where we can
 ///   fit many values into an 16KiB block.
 pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
-    /// Create a block compressor for the given data
+    /// Create a block compressor for the given data.
     fn create_block_compressor(
         &self,
         field: &Field,
         data: &DataBlock,
-    ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)>;
+    ) -> Result<Box<dyn BlockCompressor>>;
 
     /// Create a per-value compressor for the given data
     fn create_per_value(
@@ -134,12 +138,17 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
     ) -> Result<Box<dyn MiniBlockCompressor>>;
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct DefaultCompressionStrategy {
-    /// User-configured compression parameters
-    params: CompressionParams,
-    /// The lance file version for compatibilities.
-    version: LanceFileVersion,
+pub(crate) fn compress_required_block(
+    strategy: &dyn CompressionStrategy,
+    field: &Field,
+    data: DataBlock,
+) -> Result<(LanceBuffer, CompressiveEncoding)> {
+    let compressor = strategy.create_block_compressor(field, &data)?;
+    let (payload, encoding) = compressor.compress(data)?;
+    let payload = payload.ok_or_else(|| {
+        Error::internal("Required block compressor selected a metadata-only codec".to_string())
+    })?;
+    Ok((payload, encoding))
 }
 
 fn try_bss_for_mini_block(
@@ -162,10 +171,7 @@ fn try_bss_for_mini_block(
     None
 }
 
-fn try_rle_for_mini_block(
-    data: &FixedWidthDataBlock,
-    params: &CompressionFieldParams,
-) -> Option<Box<dyn MiniBlockCompressor>> {
+fn rle_is_applicable(data: &FixedWidthDataBlock, params: &CompressionFieldParams) -> Option<u128> {
     let bits = data.bits_per_value;
     if !matches!(bits, 8 | 16 | 32 | 64) {
         return None;
@@ -188,43 +194,96 @@ fn try_rle_for_mini_block(
         return None;
     }
 
-    // Estimate the encoded size.
-    //
-    // RLE stores (value, run_length) pairs. Run lengths are u8 and long runs are split into
-    // multiple entries of up to 255 values. We don't know the run length distribution here,
-    // so we conservatively account for splitting with an upper bound.
-    let num_values = data.num_values;
-    let estimated_pairs = (run_count.saturating_add(num_values / 255)).min(num_values);
-
-    let raw_bytes = (num_values as u128) * (type_size as u128);
-    let rle_bytes = (estimated_pairs as u128) * ((type_size + 1) as u128);
-
-    if rle_bytes < raw_bytes {
-        #[cfg(feature = "bitpacking")]
-        {
-            if let Some(bitpack_bytes) = estimate_inline_bitpacking_bytes(data)
-                && (bitpack_bytes as u128) < rle_bytes
-            {
-                return None;
-            }
-        }
-        return Some(Box::new(RleEncoder::new()));
-    }
-    None
+    Some((data.num_values as u128) * (type_size as u128))
 }
 
-fn try_rle_for_block(
+fn rle_beats_raw_and_bitpacking(
     data: &FixedWidthDataBlock,
-    version: LanceFileVersion,
-    params: &CompressionFieldParams,
-) -> Option<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
-    if version < LanceFileVersion::V2_2 {
-        return None;
+    encoded_bytes: u128,
+    raw_bytes: u128,
+) -> bool {
+    if encoded_bytes >= raw_bytes {
+        return false;
     }
 
+    #[cfg(feature = "bitpacking")]
+    {
+        if let Some(bitpack_bytes) = estimate_inline_bitpacking_bytes(data).map(u128::from)
+            && bitpack_bytes < encoded_bytes
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn try_fixed_u8_rle_for_mini_block(
+    data: &FixedWidthDataBlock,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    let raw_bytes = rle_is_applicable(data, params)?;
+    let rle_bytes = estimate_rle_size_for_width_from_data(
+        data,
+        Some(*MAX_MINIBLOCK_VALUES),
+        RunLengthWidth::U8,
+    )
+    .ok()?;
+    rle_beats_raw_and_bitpacking(data, rle_bytes, raw_bytes)
+        .then(|| Box::new(RleEncoder::with_run_length_width(RunLengthWidth::U8)) as _)
+}
+
+fn try_child_rle_for_mini_block(
+    data: &FixedWidthDataBlock,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    let raw_bytes = rle_is_applicable(data, params)?;
+    let (run_length_width, estimated_bytes) =
+        estimate_rle_width_and_size_from_data(data, Some(*MAX_MINIBLOCK_VALUES)).ok()?;
+    let child_compression = rle_child_compression_config(params);
+    let encoder = || {
+        RleEncoder::with_child_encoding(
+            run_length_width,
+            child_compression,
+            child_compression,
+            true,
+        )
+    };
+
+    #[cfg(feature = "bitpacking")]
+    let bitpack_bytes = estimate_inline_bitpacking_bytes(data).map(u128::from);
+    #[cfg(not(feature = "bitpacking"))]
+    let bitpack_bytes = None::<u128>;
+
+    let should_measure_children = (child_compression.is_some() || cfg!(feature = "bitpacking"))
+        && (estimated_bytes >= raw_bytes
+            || bitpack_bytes.is_some_and(|bytes| bytes < estimated_bytes));
+    let selected_bytes = if should_measure_children {
+        encoder().selected_payload_size(data).ok()?
+    } else {
+        estimated_bytes
+    };
+
+    rle_beats_raw_and_bitpacking(data, selected_bytes, raw_bytes).then(|| Box::new(encoder()) as _)
+}
+
+fn rle_child_compression_config(params: &CompressionFieldParams) -> Option<CompressionConfig> {
+    let raw = params.compression.as_deref()?;
+    if matches!(raw, "none" | "fsst") {
+        return None;
+    }
+    let scheme = CompressionScheme::from_str(raw).ok()?;
+    Some(CompressionConfig::new(scheme, params.compression_level))
+}
+
+fn try_rle_for_block_with_width(
+    data: &FixedWidthDataBlock,
+    params: &CompressionFieldParams,
+    run_length_width: RunLengthWidth,
+    rle_payload_bytes: u128,
+) -> Result<Option<Box<dyn BlockCompressor>>> {
     let bits = data.bits_per_value;
     if !matches!(bits, 8 | 16 | 32 | 64) {
-        return None;
+        return Ok(None);
     }
 
     let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
@@ -232,15 +291,82 @@ fn try_rle_for_block(
         .rle_threshold
         .unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
 
-    if (run_count as f64) < (data.num_values as f64) * threshold {
-        let compressor = Box::new(RleEncoder::new());
-        let encoding = ProtobufUtils21::rle(
-            ProtobufUtils21::flat(bits, None),
-            ProtobufUtils21::flat(/*bits_per_value=*/ 8, None),
-        );
-        return Some((compressor, encoding));
+    let passes_threshold = match params.rle_threshold {
+        Some(_) => (run_count as f64) < (data.num_values as f64) * threshold,
+        None => true,
+    };
+
+    if !passes_threshold {
+        return Ok(None);
     }
-    None
+
+    let raw_bytes = (data.num_values as u128) * ((bits / 8) as u128);
+    let rle_bytes = rle_payload_bytes.saturating_add(RLE_BLOCK_HEADER_BYTES);
+
+    if rle_bytes >= raw_bytes {
+        return Ok(None);
+    }
+
+    #[cfg(feature = "bitpacking")]
+    {
+        if let Some(bitpack_bytes) = estimate_block_bitpacking_bytes(data)
+            && bitpack_bytes < rle_bytes
+        {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(Box::new(RleEncoder::with_run_length_width(
+        run_length_width,
+    ))))
+}
+
+fn try_fixed_u8_rle_for_block(
+    data: &FixedWidthDataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn BlockCompressor>>> {
+    if !matches!(data.bits_per_value, 8 | 16 | 32 | 64) {
+        return Ok(None);
+    }
+    let encoded_bytes = estimate_rle_size_for_width_from_data(data, None, RunLengthWidth::U8)?;
+    try_rle_for_block_with_width(data, params, RunLengthWidth::U8, encoded_bytes)
+}
+
+fn try_variable_rle_for_block(
+    data: &FixedWidthDataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn BlockCompressor>>> {
+    if !matches!(data.bits_per_value, 8 | 16 | 32 | 64) {
+        return Ok(None);
+    }
+    let (width, encoded_bytes) = estimate_rle_width_and_size_from_data(data, None)?;
+    try_rle_for_block_with_width(data, params, width, encoded_bytes)
+}
+
+fn estimate_rle_width_and_size_from_data(
+    data: &FixedWidthDataBlock,
+    max_segment_values: Option<u64>,
+) -> Result<(RunLengthWidth, u128)> {
+    select_run_length_width(
+        &data.data,
+        data.num_values,
+        data.bits_per_value,
+        max_segment_values,
+    )
+}
+
+fn estimate_rle_size_for_width_from_data(
+    data: &FixedWidthDataBlock,
+    max_segment_values: Option<u64>,
+    run_length_width: RunLengthWidth,
+) -> Result<u128> {
+    rle_encoded_size(
+        &data.data,
+        data.num_values,
+        data.bits_per_value,
+        max_segment_values,
+        run_length_width,
+    )
 }
 
 fn try_bitpack_for_mini_block(_data: &FixedWidthDataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
@@ -292,9 +418,7 @@ fn estimate_inline_bitpacking_bytes(data: &FixedWidthDataBlock) -> Option<u64> {
     u64::try_from(estimated_bytes).ok()
 }
 
-fn try_bitpack_for_block(
-    data: &FixedWidthDataBlock,
-) -> Option<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+fn try_bitpack_for_block(data: &FixedWidthDataBlock) -> Option<Box<dyn BlockCompressor>> {
     let bits = data.bits_per_value;
     if !matches!(bits, 8 | 16 | 32 | 64) {
         return None;
@@ -312,17 +436,71 @@ fn try_bitpack_for_block(
     }
 
     if data.num_values <= 1024 {
-        let compressor = Box::new(InlineBitpacking::new(bits));
-        let encoding = ProtobufUtils21::inline_bitpacking(bits, None);
-        Some((compressor, encoding))
+        Some(Box::new(InlineBitpacking::new(bits)))
     } else {
-        let compressor = Box::new(OutOfLineBitpacking::new(max_bit_width, bits));
-        let encoding = ProtobufUtils21::out_of_line_bitpacking(
-            bits,
-            ProtobufUtils21::flat(max_bit_width, None),
-        );
-        Some((compressor, encoding))
+        Some(Box::new(OutOfLineBitpacking::new(max_bit_width, bits)))
     }
+}
+
+#[cfg(feature = "bitpacking")]
+fn estimate_block_bitpacking_bytes(data: &FixedWidthDataBlock) -> Option<u128> {
+    let bits = data.bits_per_value;
+    if !matches!(bits, 8 | 16 | 32 | 64) || data.num_values == 0 {
+        return None;
+    }
+
+    let bit_widths = data.expect_stat(Stat::BitWidth);
+    let widths = bit_widths.as_primitive::<UInt64Type>();
+    let max_bit_width = *widths.values().iter().max()?;
+    let word_bytes = (bits / 8) as u128;
+
+    let bitpacked_words = if data.num_values <= 1024 {
+        1 + (1024u128 * (max_bit_width as u128)) / (bits as u128)
+    } else {
+        estimate_out_of_line_bitpacking_words(data.num_values, max_bit_width, bits)?
+    };
+    let bitpacked_bytes = bitpacked_words.saturating_mul(word_bytes);
+    if bitpacked_bytes >= data.data_size() as u128 {
+        return None;
+    }
+
+    Some(bitpacked_bytes)
+}
+
+#[cfg(feature = "bitpacking")]
+fn estimate_out_of_line_bitpacking_words(
+    num_values: u64,
+    compressed_bits_per_value: u64,
+    bits_per_value: u64,
+) -> Option<u128> {
+    let num_values = usize::try_from(num_values).ok()?;
+    let compressed_bits_per_value = usize::try_from(compressed_bits_per_value).ok()?;
+    let bits_per_value = usize::try_from(bits_per_value).ok()?;
+    if compressed_bits_per_value >= bits_per_value {
+        return None;
+    }
+
+    let elems_per_chunk = 1024usize;
+    let num_chunks = num_values.div_ceil(elems_per_chunk);
+    let words_per_chunk = (elems_per_chunk * compressed_bits_per_value).div_ceil(bits_per_value);
+    let last_chunk_is_runt = !num_values.is_multiple_of(elems_per_chunk);
+
+    if !last_chunk_is_runt {
+        return Some((num_chunks * words_per_chunk) as u128);
+    }
+
+    let num_whole_chunks = num_chunks - 1;
+    let remaining_items = num_values - num_whole_chunks * elems_per_chunk;
+    let tail_bit_savings = bits_per_value - compressed_bits_per_value;
+    let padding_cost = compressed_bits_per_value * (elems_per_chunk - remaining_items);
+    let tail_pack_savings = tail_bit_savings * remaining_items;
+    let tail_words = if padding_cost < tail_pack_savings {
+        words_per_chunk
+    } else {
+        remaining_items
+    };
+
+    Some((num_whole_chunks * words_per_chunk + tail_words) as u128)
 }
 
 fn maybe_wrap_general_for_mini_block(
@@ -341,7 +519,6 @@ fn maybe_wrap_general_for_mini_block(
 }
 
 fn try_general_compression(
-    version: LanceFileVersion,
     field_params: &CompressionFieldParams,
     data: &DataBlock,
 ) -> Result<Option<(Box<dyn BlockCompressor>, CompressionConfig)>> {
@@ -352,9 +529,7 @@ fn try_general_compression(
 
     // User-requested compression (unused today but perhaps still used
     // in the future someday)
-    if let Some(compression_scheme) = &field_params.compression
-        && version >= LanceFileVersion::V2_2
-    {
+    if let Some(compression_scheme) = &field_params.compression {
         let scheme: CompressionScheme = compression_scheme.parse()?;
         let config = CompressionConfig::new(scheme, field_params.compression_level);
         let compressor = Box::new(CompressedBufferEncoder::try_new(config)?);
@@ -362,9 +537,7 @@ fn try_general_compression(
     }
 
     // Automatic compression for large blocks
-    if data.data_size() > MIN_BLOCK_SIZE_FOR_GENERAL_COMPRESSION
-        && version >= LanceFileVersion::V2_2
-    {
+    if data.data_size() > MIN_BLOCK_SIZE_FOR_GENERAL_COMPRESSION {
         let compressor = Box::new(CompressedBufferEncoder::default());
         let config = compressor.compressor.config();
         return Ok(Some((compressor, config)));
@@ -373,349 +546,360 @@ fn try_general_compression(
     Ok(None)
 }
 
-impl DefaultCompressionStrategy {
-    /// Create a new compression strategy with default behavior
-    pub fn new() -> Self {
-        Self::default()
+/// Parse field-level compression metadata without applying format-specific constraints.
+pub fn field_metadata_params(field: &Field) -> CompressionFieldParams {
+    let mut params = CompressionFieldParams::default();
+
+    if let Some(compression) = field.metadata.get(COMPRESSION_META_KEY) {
+        params.compression = Some(compression.clone());
     }
-
-    /// Create a new compression strategy with user-configured parameters
-    pub fn with_params(params: CompressionParams) -> Self {
-        Self {
-            params,
-            version: LanceFileVersion::default(),
+    if let Some(level) = field.metadata.get(COMPRESSION_LEVEL_META_KEY) {
+        params.compression_level = level.parse().ok();
+    }
+    if let Some(threshold) = field.metadata.get(RLE_THRESHOLD_META_KEY) {
+        params.rle_threshold = threshold.parse().ok();
+    }
+    if let Some(bss_str) = field.metadata.get(BSS_META_KEY) {
+        match BssMode::parse(bss_str) {
+            Some(mode) => params.bss = Some(mode),
+            None => log::warn!("Invalid BSS mode '{}', using default", bss_str),
         }
     }
-
-    /// Override the file version used to make compression decisions
-    pub fn with_version(mut self, version: LanceFileVersion) -> Self {
-        self.version = version;
-        self
-    }
-
-    /// Parse compression parameters from field metadata
-    fn parse_field_metadata(field: &Field, version: &LanceFileVersion) -> CompressionFieldParams {
-        let mut params = CompressionFieldParams::default();
-
-        // Parse compression method
-        if let Some(compression) = field.metadata.get(COMPRESSION_META_KEY) {
-            params.compression = Some(compression.clone());
-        }
-
-        // Parse compression level
-        if let Some(level) = field.metadata.get(COMPRESSION_LEVEL_META_KEY) {
-            params.compression_level = level.parse().ok();
-        }
-
-        // Parse RLE threshold
-        if let Some(threshold) = field.metadata.get(RLE_THRESHOLD_META_KEY) {
-            params.rle_threshold = threshold.parse().ok();
-        }
-
-        // Parse BSS mode
-        if let Some(bss_str) = field.metadata.get(BSS_META_KEY) {
-            match BssMode::parse(bss_str) {
-                Some(mode) => params.bss = Some(mode),
-                None => {
-                    log::warn!("Invalid BSS mode '{}', using default", bss_str);
-                }
-            }
-        }
-
-        // Parse minichunk size
-        if let Some(minichunk_size_str) = field
-            .metadata
-            .get(super::constants::MINICHUNK_SIZE_META_KEY)
-        {
-            if let Ok(minichunk_size) = minichunk_size_str.parse::<i64>() {
-                // for lance v2.1, only 32kb or smaller is supported
-                if minichunk_size >= 32 * 1024 && *version <= LanceFileVersion::V2_1 {
-                    log::warn!(
-                        "minichunk_size '{}' too large for version '{}', using default",
-                        minichunk_size,
-                        version
-                    );
-                } else {
-                    params.minichunk_size = Some(minichunk_size);
-                }
-            } else {
-                log::warn!("Invalid minichunk_size '{}', skipping", minichunk_size_str);
-            }
-        }
-
-        params
-    }
-
-    fn build_fixed_width_compressor(
-        &self,
-        params: &CompressionFieldParams,
-        data: &FixedWidthDataBlock,
-    ) -> Result<Box<dyn MiniBlockCompressor>> {
-        if params.compression.as_deref() == Some("none") {
-            return Ok(Box::new(ValueEncoder::default()));
-        }
-
-        let base = try_bss_for_mini_block(data, params)
-            .or_else(|| try_rle_for_mini_block(data, params))
-            .or_else(|| try_bitpack_for_mini_block(data))
-            .unwrap_or_else(|| Box::new(ValueEncoder::default()));
-
-        maybe_wrap_general_for_mini_block(base, params)
-    }
-
-    /// Build compressor based on parameters for variable-width data
-    fn build_variable_width_compressor(
-        &self,
-        field: &Field,
-        data: &VariableWidthBlock,
-    ) -> Result<Box<dyn MiniBlockCompressor>> {
-        let params = self.get_merged_field_params(field);
-        let compression = params.compression.as_deref();
-        if data.bits_per_offset != 32 && data.bits_per_offset != 64 {
-            return Err(Error::invalid_input(format!(
-                "Variable width compression not supported for {} bit offsets",
-                data.bits_per_offset
-            )));
-        }
-
-        // Get statistics
-        let data_size = data.expect_single_stat::<UInt64Type>(Stat::DataSize);
-        let max_len = data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
-
-        // Explicitly disable all compression.
-        if compression == Some("none") {
-            return Ok(Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size)));
-        }
-
-        let use_fsst = compression == Some("fsst")
-            || (compression.is_none()
-                && !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
-                && max_len >= FSST_LEAST_INPUT_MAX_LENGTH
-                && data_size >= FSST_LEAST_INPUT_SIZE as u64);
-
-        // Choose base encoder (FSST or Binary) once.
-        let mut base_encoder: Box<dyn MiniBlockCompressor> = if use_fsst {
-            Box::new(FsstMiniBlockEncoder::new(params.minichunk_size))
+    if let Some(minichunk_size_str) = field
+        .metadata
+        .get(super::constants::MINICHUNK_SIZE_META_KEY)
+    {
+        if let Ok(minichunk_size) = minichunk_size_str.parse::<i64>() {
+            params.minichunk_size = Some(minichunk_size);
         } else {
-            Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size))
-        };
-
-        // Wrap with general compression when configured (except FSST / none).
-        if let Some(compression_scheme) = compression.filter(|scheme| *scheme != "fsst") {
-            let scheme: CompressionScheme = compression_scheme.parse()?;
-            let config = CompressionConfig::new(scheme, params.compression_level);
-            base_encoder = Box::new(GeneralMiniBlockCompressor::new(base_encoder, config));
+            log::warn!("Invalid minichunk_size '{}', skipping", minichunk_size_str);
         }
-
-        Ok(base_encoder)
     }
 
-    /// Merge user-configured parameters with field metadata
-    /// Field metadata has highest priority
-    fn get_merged_field_params(&self, field: &Field) -> CompressionFieldParams {
-        let mut field_params = self
-            .params
-            .get_field_params(&field.name, &field.data_type());
+    params
+}
 
-        // Override with field metadata if present (highest priority)
-        let metadata_params = Self::parse_field_metadata(field, &self.version);
-        field_params.merge(&metadata_params);
-
-        field_params
+/// Apply general-purpose compression requested for a fixed-width miniblock.
+pub fn finalize_miniblock_compressor(
+    data: &DataBlock,
+    compressor: Box<dyn MiniBlockCompressor>,
+    params: &CompressionFieldParams,
+) -> Result<Box<dyn MiniBlockCompressor>> {
+    if matches!(data, DataBlock::FixedWidth(_)) {
+        maybe_wrap_general_for_mini_block(compressor, params)
+    } else {
+        Ok(compressor)
     }
 }
 
-impl CompressionStrategy for DefaultCompressionStrategy {
-    fn create_miniblock_compressor(
-        &self,
-        field: &Field,
-        data: &DataBlock,
-    ) -> Result<Box<dyn MiniBlockCompressor>> {
-        match data {
-            DataBlock::FixedWidth(fixed_width_data) => {
-                let field_params = self.get_merged_field_params(field);
-                self.build_fixed_width_compressor(&field_params, fixed_width_data)
-            }
-            DataBlock::VariableWidth(variable_width_data) => {
-                self.build_variable_width_compressor(field, variable_width_data)
-            }
-            DataBlock::Struct(struct_data_block) => {
-                // this condition is actually checked at `PrimitiveStructuralEncoder::do_flush`,
-                // just being cautious here.
-                if struct_data_block.has_variable_width_child() {
-                    return Err(Error::invalid_input(
-                        "Packed struct mini-block encoding supports only fixed-width children",
-                    ));
-                }
-                Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()))
-            }
-            DataBlock::FixedSizeList(_) => {
-                // Ideally we would compress the list items but this creates something of a challenge.
-                // We don't want to break lists across chunks and we need to worry about inner validity
-                // layers.  If we try and use a compression scheme then it is unlikely to respect these
-                // constraints.
-                //
-                // For now, we just don't compress.  In the future, we might want to consider a more
-                // sophisticated approach.
-                Ok(Box::new(ValueEncoder::default()))
-            }
-            _ => Err(Error::not_supported_source(
-                format!(
-                    "Mini-block compression not yet supported for block type {}",
-                    data.name()
-                )
-                .into(),
-            )),
-        }
+/// Honor an explicit `compression = none` request for fixed-width miniblocks.
+pub fn try_uncompressed_fixed_width_miniblock(
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    (matches!(data, DataBlock::FixedWidth(_)) && params.compression.as_deref() == Some("none"))
+        .then(|| Box::new(ValueEncoder::default()) as _)
+}
+
+/// Select byte-stream-split compression for an applicable fixed-width miniblock.
+pub fn try_byte_stream_split_miniblock(
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    let DataBlock::FixedWidth(data) = data else {
+        return None;
+    };
+    try_bss_for_mini_block(data, params)
+}
+
+/// Select the original fixed-u8 RLE miniblock grammar.
+pub fn try_fixed_u8_rle_miniblock(
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    let DataBlock::FixedWidth(data) = data else {
+        return None;
+    };
+    try_fixed_u8_rle_for_mini_block(data, params)
+}
+
+/// Select variable-width RLE with independently encoded children.
+pub fn try_child_rle_miniblock(
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    let DataBlock::FixedWidth(data) = data else {
+        return None;
+    };
+    try_child_rle_for_mini_block(data, params)
+}
+
+/// Select inline bitpacking for applicable fixed-width miniblocks.
+pub fn try_bitpacking_miniblock(data: &DataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
+    let DataBlock::FixedWidth(data) = data else {
+        return None;
+    };
+    try_bitpack_for_mini_block(data)
+}
+
+/// Store fixed-width miniblock values without a value codec.
+pub fn try_raw_fixed_width_miniblock(data: &DataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
+    matches!(data, DataBlock::FixedWidth(_)).then(|| Box::new(ValueEncoder::default()) as _)
+}
+
+/// Encode variable-width miniblocks with binary or FSST encoding.
+pub fn try_variable_width_miniblock(
+    field: &Field,
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn MiniBlockCompressor>>> {
+    let DataBlock::VariableWidth(data) = data else {
+        return Ok(None);
+    };
+    if data.bits_per_offset != 32 && data.bits_per_offset != 64 {
+        return Err(Error::invalid_input(format!(
+            "Variable width compression not supported for {} bit offsets",
+            data.bits_per_offset
+        )));
     }
 
-    fn create_per_value(
-        &self,
-        field: &Field,
-        data: &DataBlock,
-    ) -> Result<Box<dyn PerValueCompressor>> {
-        let field_params = self.get_merged_field_params(field);
-
-        match data {
-            DataBlock::FixedWidth(_) => Ok(Box::new(ValueEncoder::default())),
-            DataBlock::FixedSizeList(_) => Ok(Box::new(ValueEncoder::default())),
-            DataBlock::Struct(struct_block) => {
-                if field.children.len() != struct_block.children.len() {
-                    return Err(Error::invalid_input(
-                        "Struct field metadata does not match data block children",
-                    ));
-                }
-                let has_variable_child = struct_block.has_variable_width_child();
-                if has_variable_child {
-                    if self.version < LanceFileVersion::V2_2 {
-                        return Err(Error::not_supported_source("Variable packed struct encoding requires Lance file version 2.2 or later".into()));
-                    }
-                    Ok(Box::new(PackedStructVariablePerValueEncoder::new(
-                        self.clone(),
-                        field.children.clone(),
-                    )))
-                } else {
-                    Err(Error::invalid_input(
-                        "Packed struct per-value compression should not be used for fixed-width-only structs",
-                    ))
-                }
-            }
-            DataBlock::VariableWidth(variable_width) => {
-                let compression = field_params.compression.as_deref();
-                // Check for explicit "none" compression
-                if compression == Some("none") {
-                    return Ok(Box::new(VariableEncoder::default()));
-                }
-
-                let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
-                let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
-
-                // If values are very large then use block compression on a per-value basis
-                //
-                // TODO: Could maybe use median here
-
-                let per_value_requested =
-                    compression.is_some_and(|compression| compression != "fsst");
-
-                if (max_len > 32 * 1024 || per_value_requested)
-                    && data_size >= FSST_LEAST_INPUT_SIZE as u64
-                {
-                    return Ok(Box::new(CompressedBufferEncoder::default()));
-                }
-
-                if variable_width.bits_per_offset == 32 || variable_width.bits_per_offset == 64 {
-                    let variable_compression = Box::new(VariableEncoder::default());
-                    let use_fsst = compression == Some("fsst")
-                        || (compression.is_none()
-                            && !matches!(
-                                field.data_type(),
-                                DataType::Binary | DataType::LargeBinary
-                            )
-                            && max_len >= FSST_LEAST_INPUT_MAX_LENGTH
-                            && data_size >= FSST_LEAST_INPUT_SIZE as u64);
-
-                    // Use FSST if explicitly requested or if data characteristics warrant it.
-                    if use_fsst {
-                        Ok(Box::new(FsstPerValueEncoder::new(variable_compression)))
-                    } else {
-                        Ok(variable_compression)
-                    }
-                } else {
-                    panic!(
-                        "Does not support MiniBlockCompression for VariableWidth DataBlock with {} bits offsets.",
-                        variable_width.bits_per_offset
-                    );
-                }
-            }
-            _ => unreachable!(
-                "Per-value compression not yet supported for block type: {}",
-                data.name()
-            ),
-        }
+    let compression = params.compression.as_deref();
+    let data_size = data.expect_single_stat::<UInt64Type>(Stat::DataSize);
+    let max_len = data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
+    if compression == Some("none") {
+        return Ok(Some(Box::new(BinaryMiniBlockEncoder::new(
+            params.minichunk_size,
+        ))));
     }
 
-    fn create_block_compressor(
-        &self,
-        field: &Field,
-        data: &DataBlock,
-    ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
-        let field_params = self.get_merged_field_params(field);
+    let use_fsst = compression == Some("fsst")
+        || (compression.is_none()
+            && !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
+            && max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+            && data_size >= FSST_LEAST_INPUT_SIZE as u64);
+    let mut encoder: Box<dyn MiniBlockCompressor> = if use_fsst {
+        Box::new(FsstMiniBlockEncoder::new(params.minichunk_size))
+    } else {
+        Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size))
+    };
+    if let Some(compression_scheme) = compression.filter(|scheme| *scheme != "fsst") {
+        let scheme: CompressionScheme = compression_scheme.parse()?;
+        let config = CompressionConfig::new(scheme, params.compression_level);
+        encoder = Box::new(GeneralMiniBlockCompressor::new(encoder, config));
+    }
+    Ok(Some(encoder))
+}
 
-        match data {
-            DataBlock::FixedWidth(fixed_width) => {
-                if let Some((compressor, encoding)) =
-                    try_rle_for_block(fixed_width, self.version, &field_params)
-                {
-                    return Ok((compressor, encoding));
-                }
-                if let Some((compressor, encoding)) = try_bitpack_for_block(fixed_width) {
-                    return Ok((compressor, encoding));
-                }
+/// Encode fixed-width packed structs as miniblocks.
+pub fn try_fixed_packed_struct_miniblock(
+    data: &DataBlock,
+) -> Result<Option<Box<dyn MiniBlockCompressor>>> {
+    let DataBlock::Struct(data) = data else {
+        return Ok(None);
+    };
+    if data.has_variable_width_child() {
+        return Err(Error::invalid_input(
+            "Packed struct mini-block encoding supports only fixed-width children",
+        ));
+    }
+    Ok(Some(Box::new(
+        PackedStructFixedWidthMiniBlockEncoder::default(),
+    )))
+}
 
-                // Try general compression (user-requested or automatic over MIN_BLOCK_SIZE_FOR_GENERAL_COMPRESSION)
-                if let Some((compressor, config)) =
-                    try_general_compression(self.version, &field_params, data)?
-                {
-                    let encoding = ProtobufUtils21::wrapped(
-                        config,
-                        ProtobufUtils21::flat(fixed_width.bits_per_value, None),
-                    )?;
-                    return Ok((compressor, encoding));
-                }
+/// Store fixed-size-list miniblocks without a value codec.
+pub fn try_raw_fixed_size_list_miniblock(data: &DataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
+    matches!(data, DataBlock::FixedSizeList(_)).then(|| Box::new(ValueEncoder::default()) as _)
+}
 
-                let encoder = Box::new(ValueEncoder::default());
-                let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
-                Ok((encoder, encoding))
-            }
-            DataBlock::VariableWidth(variable_width) => {
-                // Try general compression
-                if let Some((compressor, config)) =
-                    try_general_compression(self.version, &field_params, data)?
-                {
-                    let encoding = ProtobufUtils21::wrapped(
-                        config,
-                        ProtobufUtils21::variable(
-                            ProtobufUtils21::flat(variable_width.bits_per_offset as u64, None),
-                            None,
-                        ),
-                    )?;
-                    return Ok((compressor, encoding));
-                }
+/// Store fixed-width and fixed-size-list values directly in full-zip pages.
+pub fn try_raw_per_value(data: &DataBlock) -> Option<Box<dyn PerValueCompressor>> {
+    matches!(data, DataBlock::FixedWidth(_) | DataBlock::FixedSizeList(_))
+        .then(|| Box::new(ValueEncoder::default()) as _)
+}
 
-                let encoder = Box::new(VariableEncoder::default());
-                let encoding = ProtobufUtils21::variable(
-                    ProtobufUtils21::flat(variable_width.bits_per_offset as u64, None),
-                    None,
-                );
-                Ok((encoder, encoding))
-            }
-            _ => unreachable!(),
+fn validate_packed_struct(field: &Field, data: &DataBlock) -> Result<Option<bool>> {
+    let DataBlock::Struct(data) = data else {
+        return Ok(None);
+    };
+    if field.children.len() != data.children.len() {
+        return Err(Error::invalid_input(
+            "Struct field metadata does not match data block children",
+        ));
+    }
+    Ok(Some(data.has_variable_width_child()))
+}
+
+/// Reject variable-width packed structs while preserving the fixed-width error.
+pub fn reject_packed_struct_per_value(
+    field: &Field,
+    data: &DataBlock,
+) -> Result<Option<Box<dyn PerValueCompressor>>> {
+    let Some(has_variable_child) = validate_packed_struct(field, data)? else {
+        return Ok(None);
+    };
+    if has_variable_child {
+        return Err(Error::not_supported_source(
+            "Variable packed struct encoding is not enabled by the selected file format".into(),
+        ));
+    }
+    Err(Error::invalid_input(
+        "Packed struct per-value compression should not be used for fixed-width-only structs",
+    ))
+}
+
+/// Encode variable-width packed structs with the exact strategy recursively.
+pub fn try_variable_packed_struct_per_value(
+    strategy: Arc<dyn CompressionStrategy>,
+    field: &Field,
+    data: &DataBlock,
+) -> Result<Option<Box<dyn PerValueCompressor>>> {
+    let Some(has_variable_child) = validate_packed_struct(field, data)? else {
+        return Ok(None);
+    };
+    if !has_variable_child {
+        return Err(Error::invalid_input(
+            "Packed struct per-value compression should not be used for fixed-width-only structs",
+        ));
+    }
+    Ok(Some(Box::new(PackedStructVariablePerValueEncoder::new(
+        strategy,
+        field.children.clone(),
+    ))))
+}
+
+/// Encode all packed structs with the exact strategy recursively.
+pub fn try_packed_struct_per_value(
+    strategy: Arc<dyn CompressionStrategy>,
+    field: &Field,
+    data: &DataBlock,
+) -> Result<Option<Box<dyn PerValueCompressor>>> {
+    let Some(has_variable_child) = validate_packed_struct(field, data)? else {
+        return Ok(None);
+    };
+    if has_variable_child {
+        return Ok(Some(Box::new(PackedStructVariablePerValueEncoder::new(
+            strategy,
+            field.children.clone(),
+        ))));
+    }
+
+    Ok(Some(Box::new(PackedStructFixedPerValueEncoder::new(
+        field.children.clone(),
+    ))))
+}
+
+/// Encode variable-width values directly, with FSST or per-value compression
+/// when applicable.
+pub fn try_variable_width_per_value(
+    field: &Field,
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn PerValueCompressor>>> {
+    let DataBlock::VariableWidth(data) = data else {
+        return Ok(None);
+    };
+    let compression = params.compression.as_deref();
+    if compression == Some("none") {
+        return Ok(Some(Box::new(VariableEncoder::default())));
+    }
+
+    let max_len = data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
+    let data_size = data.expect_single_stat::<UInt64Type>(Stat::DataSize);
+    let per_value_requested = compression.is_some_and(|compression| compression != "fsst");
+    if (max_len > 32 * 1024 || per_value_requested) && data_size >= FSST_LEAST_INPUT_SIZE as u64 {
+        if compression == Some("zstd") {
+            let config = CompressionConfig::new(CompressionScheme::Zstd, params.compression_level);
+            return Ok(Some(Box::new(CompressedBufferEncoder::try_new(config)?)));
         }
+        return Ok(Some(Box::new(CompressedBufferEncoder::default())));
+    }
+
+    if data.bits_per_offset != 32 && data.bits_per_offset != 64 {
+        return Err(Error::invalid_input(format!(
+            "Per-value compression does not support variable-width data with {}-bit offsets",
+            data.bits_per_offset
+        )));
+    }
+    let encoder = Box::new(VariableEncoder::default());
+    let use_fsst = compression == Some("fsst")
+        || (compression.is_none()
+            && !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
+            && max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+            && data_size >= FSST_LEAST_INPUT_SIZE as u64);
+    Ok(Some(if use_fsst {
+        Box::new(FsstPerValueEncoder::new(encoder))
+    } else {
+        encoder
+    }))
+}
+
+/// Select fixed-u8 RLE for block compression.
+pub fn try_fixed_u8_rle_block(
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn BlockCompressor>>> {
+    let DataBlock::FixedWidth(data) = data else {
+        return Ok(None);
+    };
+    try_fixed_u8_rle_for_block(data, params)
+}
+
+/// Select variable-width RLE for block compression.
+pub fn try_variable_rle_block(
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn BlockCompressor>>> {
+    let DataBlock::FixedWidth(data) = data else {
+        return Ok(None);
+    };
+    try_variable_rle_for_block(data, params)
+}
+
+/// Select block bitpacking for applicable fixed-width values.
+pub fn try_bitpacking_block(data: &DataBlock) -> Option<Box<dyn BlockCompressor>> {
+    let DataBlock::FixedWidth(data) = data else {
+        return None;
+    };
+    try_bitpack_for_block(data)
+}
+
+/// Select explicitly requested or automatic general-purpose block compression.
+pub fn try_general_block(
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn BlockCompressor>>> {
+    let Some((compressor, _config)) = try_general_compression(params, data)? else {
+        return Ok(None);
+    };
+    Ok(Some(compressor))
+}
+
+/// Store fixed- and variable-width block values without block compression.
+pub fn try_raw_block(data: &DataBlock) -> Option<Box<dyn BlockCompressor>> {
+    match data {
+        DataBlock::FixedWidth(_) => {
+            Some(Box::new(ValueEncoder::default()) as Box<dyn BlockCompressor>)
+        }
+        DataBlock::VariableWidth(_) => {
+            Some(Box::new(VariableEncoder::default()) as Box<dyn BlockCompressor>)
+        }
+        _ => None,
     }
 }
 
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Returns the exact aggregate decoded size when it is determined solely by the value count.
+    ///
+    /// Implementations should only return `Some` when this aggregate estimate can be used by
+    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
+    /// represented by one aggregate estimate should return `None`.
+    fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
+        None
+    }
 }
 
 pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
@@ -725,6 +909,16 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
     ///
     /// Currently (and probably long term) this must be a multiple of 8
     fn bits_per_value(&self) -> u64;
+
+    /// Returns the exact aggregate decoded size when it is determined solely by the value count.
+    ///
+    /// Implementations should only return `Some` when this aggregate estimate can be used by
+    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
+    /// represented by one aggregate estimate should return `None`.
+    fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
+        None
+    }
 }
 
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
@@ -733,7 +927,31 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
 }
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
+
+    /// Whether this codec consumes one payload buffer.
+    fn requires_payload(&self) -> bool {
+        true
+    }
+
+    /// Inspect a block for an exact payload-derived value count when supported.
+    ///
+    /// This must not materialize the decoded values. `None` means the encoding requires an
+    /// external count or cannot safely prove one from this payload.
+    fn infer_num_values(&self, _data: &LanceBuffer) -> Result<Option<u64>> {
+        Ok(None)
+    }
+}
+
+pub(crate) fn require_block_payload(data: Option<LanceBuffer>, codec: &str) -> Result<LanceBuffer> {
+    data.ok_or_else(|| Error::invalid_input(format!("{codec} requires one payload")))
+}
+
+pub(crate) fn require_no_block_payload(data: Option<LanceBuffer>, codec: &str) -> Result<()> {
+    if data.is_some() {
+        return Err(Error::invalid_input(format!("{codec} expects no payload")));
+    }
+    Ok(())
 }
 
 pub trait DecompressionStrategy: std::fmt::Debug + Send + Sync {
@@ -814,10 +1032,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 // compression.
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
             }
-            Compression::Rle(rle) => {
-                let bits_per_value = validate_rle_compression(rle)?;
-                Ok(Box::new(RleDecompressor::new(bits_per_value)))
-            }
+            Compression::Rle(rle) => Ok(Box::new(create_rle_decompressor(
+                rle,
+                decompression_strategy,
+            )?)),
             Compression::ByteStreamSplit(bss) => {
                 let Compression::Flat(values) =
                     bss.values.as_ref().unwrap().compression.as_ref().unwrap()
@@ -868,6 +1086,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             ))),
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::FixedSizeList(fsl) => Ok(Box::new(ValueDecompressor::from_fsl(fsl))),
+            Compression::PackedStruct(description) => Ok(Box::new(
+                PackedStructFixedPerValueDecompressor::new(description)?,
+            )),
             _ => todo!("fixed-per-value decompressor for {:?}", description),
         }
     }
@@ -1004,16 +1225,15 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
 
                 Ok(Box::new(general_decompressor))
             }
-            Compression::Rle(rle) => {
-                let bits_per_value = validate_rle_compression(rle)?;
-                Ok(Box::new(RleDecompressor::new(bits_per_value)))
-            }
+            Compression::Rle(rle) => Ok(Box::new(create_rle_decompressor(rle, self)?)),
             _ => todo!(),
         }
     }
 }
-/// Validates RLE compression format and extracts bits_per_value
-fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> Result<u64> {
+pub(crate) fn create_rle_decompressor(
+    rle: &crate::format::pb21::Rle,
+    decompression_strategy: &dyn DecompressionStrategy,
+) -> Result<RleDecompressor> {
     let values = rle
         .values
         .as_ref()
@@ -1023,45 +1243,197 @@ fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> Result<u64> {
         .as_ref()
         .ok_or_else(|| Error::invalid_input("RLE compression missing run lengths encoding"))?;
 
-    let values = values
-        .compression
-        .as_ref()
-        .ok_or_else(|| Error::invalid_input("RLE compression missing values compression"))?;
-    let Compression::Flat(values) = values else {
-        return Err(Error::invalid_input(
-            "RLE compression only supports flat values",
-        ));
-    };
+    let values = create_rle_child_decompressor(values, "values", decompression_strategy)?;
+    let run_lengths =
+        create_rle_child_decompressor(run_lengths, "run lengths", decompression_strategy)?;
 
-    let run_lengths = run_lengths
-        .compression
-        .as_ref()
-        .ok_or_else(|| Error::invalid_input("RLE compression missing run lengths compression"))?;
-    let Compression::Flat(run_lengths) = run_lengths else {
-        return Err(Error::invalid_input(
-            "RLE compression only supports flat run lengths",
-        ));
-    };
-
-    if run_lengths.bits_per_value != 8 {
+    if !matches!(values.bits_per_value(), 8 | 16 | 32 | 64) {
         return Err(Error::invalid_input(format!(
-            "RLE compression only supports 8-bit run lengths, got {}",
-            run_lengths.bits_per_value
+            "RLE compression only supports 8, 16, 32, or 64-bit values, got {}",
+            values.bits_per_value()
         )));
     }
 
-    Ok(values.bits_per_value)
+    let run_length_width =
+        RunLengthWidth::from_bits(run_lengths.bits_per_value()).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "RLE compression only supports 8, 16, or 32-bit run lengths, got {}",
+                run_lengths.bits_per_value()
+            ))
+        })?;
+
+    if values.requires_num_values() && run_lengths.requires_num_values() {
+        return Err(Error::invalid_input(
+            "RLE values and run lengths child encodings cannot both require the run count",
+        ));
+    }
+
+    if values.is_identity() && run_lengths.is_identity() {
+        return Ok(RleDecompressor::with_run_length_width(
+            values.bits_per_value(),
+            run_length_width,
+        ));
+    }
+
+    Ok(RleDecompressor::with_child_decompressors(
+        values.bits_per_value(),
+        run_length_width,
+        values,
+        run_lengths,
+    ))
+}
+
+fn create_rle_child_decompressor(
+    encoding: &CompressiveEncoding,
+    role: &str,
+    decompression_strategy: &dyn DecompressionStrategy,
+) -> Result<RleChildDecompressor> {
+    let compression = encoding
+        .compression
+        .as_ref()
+        .ok_or_else(|| Error::invalid_input(format!("RLE {role} missing child compression")))?;
+    let (bits_per_value, requires_num_values, needs_decompressor) =
+        validate_rle_child_compression(compression, role)?;
+
+    if needs_decompressor {
+        Ok(RleChildDecompressor::block(
+            bits_per_value,
+            decompression_strategy.create_block_decompressor(encoding)?,
+            requires_num_values,
+        ))
+    } else {
+        Ok(RleChildDecompressor::flat(bits_per_value))
+    }
+}
+
+fn validate_rle_child_compression(
+    compression: &Compression,
+    role: &str,
+) -> Result<(u64, bool, bool)> {
+    match compression {
+        Compression::Flat(flat) => Ok((flat.bits_per_value, false, false)),
+        Compression::General(general) => {
+            general.compression.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} general child missing compression config"
+                ))
+            })?;
+            let values = general.values.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!("RLE {role} general child missing inner encoding"))
+            })?;
+            let inner = values.compression.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} general child missing inner compression"
+                ))
+            })?;
+            let (bits_per_value, requires_num_values) =
+                validate_rle_block_child_inner(inner, role)?;
+            Ok((bits_per_value, requires_num_values, true))
+        }
+        Compression::OutOfLineBitpacking(out_of_line) => {
+            let values = out_of_line.values.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} bitpacking child missing values encoding"
+                ))
+            })?;
+            let Compression::Flat(_) = values.compression.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} bitpacking child missing values compression"
+                ))
+            })?
+            else {
+                return Err(Error::invalid_input(format!(
+                    "RLE {role} bitpacking child only supports flat values"
+                )));
+            };
+            Ok((out_of_line.uncompressed_bits_per_value, true, true))
+        }
+        other => Err(Error::invalid_input(format!(
+            "RLE {role} only supports flat, general, or out-of-line bitpacking child encodings, got {}",
+            compression_name(other)
+        ))),
+    }
+}
+
+fn validate_rle_block_child_inner(compression: &Compression, role: &str) -> Result<(u64, bool)> {
+    match compression {
+        Compression::Flat(flat) => Ok((flat.bits_per_value, false)),
+        Compression::OutOfLineBitpacking(out_of_line) => {
+            let values = out_of_line.values.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} bitpacking child missing values encoding"
+                ))
+            })?;
+            let Compression::Flat(_) = values.compression.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} bitpacking child missing values compression"
+                ))
+            })?
+            else {
+                return Err(Error::invalid_input(format!(
+                    "RLE {role} bitpacking child only supports flat values"
+                )));
+            };
+            Ok((out_of_line.uncompressed_bits_per_value, true))
+        }
+        other => Err(Error::invalid_input(format!(
+            "RLE {role} general child only supports flat or out-of-line bitpacking inner encodings, got {}",
+            compression_name(other)
+        ))),
+    }
+}
+
+fn compression_name(compression: &Compression) -> &'static str {
+    match compression {
+        Compression::Flat(_) => "flat",
+        Compression::Variable(_) => "variable",
+        Compression::Fsst(_) => "fsst",
+        Compression::OutOfLineBitpacking(_) => "out-of-line bitpacking",
+        Compression::InlineBitpacking(_) => "inline bitpacking",
+        Compression::General(_) => "general",
+        Compression::Constant(_) => "constant",
+        Compression::Dictionary(_) => "dictionary",
+        Compression::ByteStreamSplit(_) => "byte stream split",
+        Compression::PackedStruct(_) => "packed struct",
+        Compression::FixedSizeList(_) => "fixed-size list",
+        Compression::VariablePackedStruct(_) => "variable packed struct",
+        Compression::Rle(_) => "rle",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::buffer::LanceBuffer;
+    use crate::compression_config::CompressionParams;
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+    use crate::encodings::logical::primitive::miniblock::MiniBlockCompressionContext;
     use crate::statistics::ComputeStat;
-    use crate::testing::extract_array_encoding_chain;
+    use crate::testing::{TestEncoding, extract_array_encoding_chain, test_compression_strategy};
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
+
+    fn strategy(encoding: TestEncoding, params: CompressionParams) -> Arc<dyn CompressionStrategy> {
+        test_compression_strategy(encoding, params)
+    }
+
+    fn baseline_strategy(params: CompressionParams) -> Arc<dyn CompressionStrategy> {
+        strategy(TestEncoding::StructuralU16, params)
+    }
+
+    fn selected_block_codec(
+        strategy: &Arc<dyn CompressionStrategy>,
+        field: &Field,
+        data: &DataBlock,
+    ) -> (Box<dyn BlockCompressor>, CompressiveEncoding) {
+        let compressor = strategy.create_block_compressor(field, data).unwrap();
+        let (_, encoding) = compressor.compress(data.clone()).unwrap();
+        (compressor, encoding)
+    }
+
+    fn miniblock_context() -> MiniBlockCompressionContext {
+        MiniBlockCompressionContext::new(0, true, true)
+    }
 
     fn create_test_field(name: &str, data_type: DataType) -> Field {
         let arrow_field = ArrowField::new(name, data_type, true);
@@ -1137,6 +1509,37 @@ mod tests {
         block.compute_stat();
 
         DataBlock::FixedWidth(block)
+    }
+
+    fn rle_run_length_bits(encoding: &CompressiveEncoding) -> u64 {
+        let Compression::Rle(rle) = encoding.compression.as_ref().unwrap() else {
+            panic!("expected RLE encoding");
+        };
+        let Compression::Flat(run_lengths) = rle
+            .run_lengths
+            .as_ref()
+            .unwrap()
+            .compression
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("expected flat run lengths");
+        };
+        run_lengths.bits_per_value
+    }
+
+    fn expect_rle_encoding(encoding: &CompressiveEncoding) -> &crate::format::pb21::Rle {
+        match encoding.compression.as_ref().unwrap() {
+            Compression::Rle(rle) => rle,
+            Compression::General(general) => {
+                let inner = general.values.as_ref().unwrap();
+                let Compression::Rle(rle) = inner.compression.as_ref().unwrap() else {
+                    panic!("expected wrapped RLE encoding");
+                };
+                rle
+            }
+            other => panic!("expected RLE encoding, got {}", compression_name(other)),
+        }
     }
 
     fn create_variable_width_block(
@@ -1220,7 +1623,7 @@ mod tests {
             },
         );
 
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
         let field = create_test_field("user_id", DataType::Int32);
 
         // Create data with low run count for RLE
@@ -1252,7 +1655,7 @@ mod tests {
             },
         );
 
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
         let field = create_test_field("some_column", DataType::Int32);
         // Create data with very low run count (50 runs for 1000 values = 0.05 ratio)
         let data = create_fixed_width_block_with_stats(32, 1000, 50);
@@ -1267,7 +1670,7 @@ mod tests {
     #[test]
     #[cfg(feature = "bitpacking")]
     fn test_block_bitpacks_with_zero_segment() {
-        let strategy = DefaultCompressionStrategy::new();
+        let strategy = baseline_strategy(CompressionParams::default());
         let field = create_test_field("levels", DataType::UInt16);
 
         // First 1024 zeros, then 1024 ones; max bit width is 1.
@@ -1282,7 +1685,7 @@ mod tests {
         block.compute_stat();
         let data = DataBlock::FixedWidth(block);
 
-        let (compressor, _encoding) = strategy.create_block_compressor(&field, &data).unwrap();
+        let compressor = strategy.create_block_compressor(&field, &data).unwrap();
         let debug_str = format!("{:?}", compressor);
         assert!(
             debug_str.contains("OutOfLineBitpacking"),
@@ -1291,9 +1694,63 @@ mod tests {
     }
 
     #[test]
+    fn test_rle_block_accounts_for_header_before_selecting() {
+        let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::default());
+        let field = create_test_field("small_constant", DataType::Int32);
+        let values = vec![42i32; 2];
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 2,
+            block_info: BlockInfo::default(),
+        };
+        block.compute_stat();
+        let data = DataBlock::FixedWidth(block);
+
+        let (compressor, encoding) = selected_block_codec(&strategy, &field, &data);
+
+        assert!(format!("{compressor:?}").contains("ValueEncoder"));
+        assert!(matches!(
+            encoding.compression.as_ref(),
+            Some(Compression::Flat(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_rle_block_prefers_bitpacking_when_smaller() {
+        let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::default());
+        let field = create_test_field("levels", DataType::UInt16);
+
+        let mut values = Vec::with_capacity(2048);
+        for run_idx in 0..1024 {
+            values.extend(std::iter::repeat_n((run_idx % 2) as u16, 2));
+        }
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 16,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 2048,
+            block_info: BlockInfo::default(),
+        };
+        block.compute_stat();
+        let data = DataBlock::FixedWidth(block);
+
+        let (compressor, encoding) = selected_block_codec(&strategy, &field, &data);
+        let debug_str = format!("{compressor:?}");
+        assert!(
+            debug_str.contains("OutOfLineBitpacking"),
+            "expected OutOfLineBitpacking, got: {debug_str}"
+        );
+        assert!(matches!(
+            encoding.compression.as_ref(),
+            Some(Compression::OutOfLineBitpacking(_))
+        ));
+    }
+
+    #[test]
     #[cfg(feature = "bitpacking")]
     fn test_low_cardinality_prefers_bitpacking_over_rle() {
-        let strategy = DefaultCompressionStrategy::new();
+        let strategy = baseline_strategy(CompressionParams::default());
         let field = create_test_field("int_score", DataType::Int64);
 
         // Low cardinality values (3/4/5) but with moderate run count:
@@ -1356,7 +1813,7 @@ mod tests {
             },
         );
 
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
         let field = create_test_field("embeddings", DataType::Float32);
         let fixed_data = create_fixed_width_block(32, 1000);
         let variable_data = create_variable_width_block(32, 10, 32 * 1024);
@@ -1365,12 +1822,16 @@ mod tests {
         let compressor = strategy
             .create_miniblock_compressor(&field, &fixed_data)
             .unwrap();
-        let (_block, encoding) = compressor.compress(fixed_data.clone()).unwrap();
+        let (_block, encoding) = compressor
+            .compress(miniblock_context(), fixed_data.clone())
+            .unwrap();
         check_uncompressed_encoding(&encoding, false);
         let compressor = strategy
             .create_miniblock_compressor(&field, &variable_data)
             .unwrap();
-        let (_block, encoding) = compressor.compress(variable_data.clone()).unwrap();
+        let (_block, encoding) = compressor
+            .compress(miniblock_context(), variable_data.clone())
+            .unwrap();
         check_uncompressed_encoding(&encoding, true);
 
         // Test pervalue
@@ -1391,7 +1852,7 @@ mod tests {
         arrow_field = arrow_field.with_metadata(metadata);
         let field = Field::try_from(&arrow_field).unwrap();
 
-        let strategy = DefaultCompressionStrategy::with_params(CompressionParams::new());
+        let strategy = baseline_strategy(CompressionParams::new());
 
         // Test miniblock
         let fixed_data = create_fixed_width_block(32, 1000);
@@ -1400,13 +1861,17 @@ mod tests {
         let compressor = strategy
             .create_miniblock_compressor(&field, &fixed_data)
             .unwrap();
-        let (_block, encoding) = compressor.compress(fixed_data.clone()).unwrap();
+        let (_block, encoding) = compressor
+            .compress(miniblock_context(), fixed_data.clone())
+            .unwrap();
         check_uncompressed_encoding(&encoding, false);
 
         let compressor = strategy
             .create_miniblock_compressor(&field, &variable_data)
             .unwrap();
-        let (_block, encoding) = compressor.compress(variable_data.clone()).unwrap();
+        let (_block, encoding) = compressor
+            .compress(miniblock_context(), variable_data.clone())
+            .unwrap();
         check_uncompressed_encoding(&encoding, true);
 
         // Test pervalue
@@ -1421,7 +1886,7 @@ mod tests {
 
     #[test]
     fn test_auto_fsst_disabled_for_binary_fields() {
-        let strategy = DefaultCompressionStrategy::new();
+        let strategy = baseline_strategy(CompressionParams::default());
         let field = create_test_field("bytes", DataType::Binary);
         let variable_data = create_fsst_candidate_variable_width_block();
 
@@ -1452,7 +1917,7 @@ mod tests {
 
     #[test]
     fn test_auto_fsst_still_enabled_for_utf8_fields() {
-        let strategy = DefaultCompressionStrategy::new();
+        let strategy = baseline_strategy(CompressionParams::default());
         let field = create_test_field("text", DataType::Utf8);
         let variable_data = create_fsst_candidate_variable_width_block();
 
@@ -1484,7 +1949,7 @@ mod tests {
             },
         );
 
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
         let field = create_test_field("bytes", DataType::Binary);
         let variable_data = create_fsst_candidate_variable_width_block();
 
@@ -1502,6 +1967,30 @@ mod tests {
         assert!(
             per_value_debug.contains("FsstPerValueEncoder"),
             "expected FsstPerValueEncoder, got: {per_value_debug}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn test_compression_level_honored_for_large_per_value() {
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "html".to_string(),
+            CompressionFieldParams {
+                compression: Some("zstd".to_string()),
+                compression_level: Some(19),
+                ..Default::default()
+            },
+        );
+        let strategy = baseline_strategy(params);
+        let field = create_test_field("html", DataType::Utf8);
+        let large = create_variable_width_block(32, 64, 40 * 1024);
+
+        let per_value = strategy.create_per_value(&field, &large).unwrap();
+        let debug = format!("{per_value:?}");
+        assert!(
+            debug.contains("ZstdBufferCompressor") && debug.contains("compression_level: 19"),
+            "expected zstd level 19 to reach the per-value compressor, got: {debug}"
         );
     }
 
@@ -1531,12 +2020,8 @@ mod tests {
             },
         );
 
-        let strategy = DefaultCompressionStrategy::with_params(params);
-
         // Get merged params
-        let merged = strategy
-            .params
-            .get_field_params("user_id", &DataType::Int32);
+        let merged = params.get_field_params("user_id", &DataType::Int32);
 
         // Column params should override type params
         assert_eq!(merged.rle_threshold, Some(0.2));
@@ -1544,9 +2029,7 @@ mod tests {
         assert_eq!(merged.compression_level, Some(6));
 
         // Test field with only type params
-        let merged = strategy
-            .params
-            .get_field_params("other_field", &DataType::Int32);
+        let merged = params.get_field_params("other_field", &DataType::Int32);
         assert_eq!(merged.rle_threshold, Some(0.5));
         assert_eq!(merged.compression, Some("lz4".to_string()));
         assert_eq!(merged.compression_level, None);
@@ -1566,26 +2049,20 @@ mod tests {
             },
         );
 
-        let strategy = DefaultCompressionStrategy::with_params(params);
-
         // Should match pattern
-        let merged = strategy
-            .params
-            .get_field_params("log_messages", &DataType::Utf8);
+        let merged = params.get_field_params("log_messages", &DataType::Utf8);
         assert_eq!(merged.compression, Some("zstd".to_string()));
         assert_eq!(merged.compression_level, Some(6));
 
         // Should not match
-        let merged = strategy
-            .params
-            .get_field_params("messages_log", &DataType::Utf8);
+        let merged = params.get_field_params("messages_log", &DataType::Utf8);
         assert_eq!(merged.compression, None);
     }
 
     #[test]
     fn test_legacy_metadata_support() {
         let params = CompressionParams::new();
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
 
         // Test field with "none" compression metadata
         let mut metadata = HashMap::new();
@@ -1604,7 +2081,7 @@ mod tests {
     fn test_default_behavior() {
         // Empty params should fall back to default behavior
         let params = CompressionParams::new();
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
 
         let field = create_test_field("random_column", DataType::Int32);
         // Create data with high run count that won't trigger RLE (600 runs for 1000 values = 0.6 ratio)
@@ -1619,7 +2096,7 @@ mod tests {
     #[test]
     fn test_field_metadata_compression() {
         let params = CompressionParams::new();
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
 
         // Test field with compression metadata
         let mut metadata = HashMap::new();
@@ -1639,7 +2116,7 @@ mod tests {
     #[test]
     fn test_field_metadata_rle_threshold() {
         let params = CompressionParams::new();
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
 
         // Test field with RLE threshold metadata
         let mut metadata = HashMap::new();
@@ -1660,6 +2137,277 @@ mod tests {
     }
 
     #[test]
+    fn test_rle_v2_miniblock_selects_u16_run_lengths() {
+        let mut metadata = HashMap::new();
+        metadata.insert(RLE_THRESHOLD_META_KEY.to_string(), "1.0".to_string());
+        metadata.insert(BSS_META_KEY.to_string(), "off".to_string());
+        let mut field = create_test_field("test_column", DataType::Int32);
+        field.metadata = metadata;
+
+        let values = vec![7i32; 1000];
+        let mut data = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 1000,
+            block_info: BlockInfo::default(),
+        };
+        data.compute_stat();
+        let data = DataBlock::FixedWidth(data);
+
+        let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::default());
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
+        assert_eq!(rle_run_length_bits(&encoding), 16);
+    }
+
+    #[test]
+    fn test_rle_v2_miniblock_keeps_u8_run_lengths_before_v2_3() {
+        for version in [TestEncoding::StructuralU16, TestEncoding::StructuralU32] {
+            let mut metadata = HashMap::new();
+            metadata.insert(RLE_THRESHOLD_META_KEY.to_string(), "1.0".to_string());
+            metadata.insert(BSS_META_KEY.to_string(), "off".to_string());
+            let mut field = create_test_field("test_column", DataType::Int32);
+            field.metadata = metadata;
+
+            let values = vec![7i32; 1000];
+            let mut data = FixedWidthDataBlock {
+                bits_per_value: 32,
+                data: LanceBuffer::reinterpret_vec(values),
+                num_values: 1000,
+                block_info: BlockInfo::default(),
+            };
+            data.compute_stat();
+            let data = DataBlock::FixedWidth(data);
+
+            let strategy = strategy(version, CompressionParams::default());
+            let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+            let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
+            assert_eq!(rle_run_length_bits(&encoding), 8, "version={version}");
+        }
+    }
+
+    #[test]
+    fn test_rle_v2_uses_selected_width_cost_before_bitpacking() {
+        let mut metadata = HashMap::new();
+        metadata.insert(RLE_THRESHOLD_META_KEY.to_string(), "1.0".to_string());
+        metadata.insert(BSS_META_KEY.to_string(), "off".to_string());
+        let mut field = create_test_field("test_column", DataType::Int32);
+        field.metadata = metadata;
+
+        let values = vec![0i32; 4096];
+        let mut data = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 4096,
+            block_info: BlockInfo::default(),
+        };
+        data.compute_stat();
+        let data = DataBlock::FixedWidth(data);
+
+        let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::default());
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let debug_str = format!("{compressor:?}");
+        assert!(debug_str.contains("RleEncoder"));
+
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
+        assert_eq!(rle_run_length_bits(&encoding), 16);
+    }
+
+    #[test]
+    fn test_rle_v2_sorted_dictionary_indices_select_u16_run_lengths() {
+        let field = create_test_field("dict_indices", DataType::Int32);
+
+        let mut values = Vec::with_capacity(1_200);
+        for value in 0..4 {
+            values.extend(std::iter::repeat_n(value, 300));
+        }
+        let mut data = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 1_200,
+            block_info: BlockInfo::default(),
+        };
+        data.compute_stat();
+        let data = DataBlock::FixedWidth(data);
+
+        let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::default());
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
+        assert_eq!(rle_run_length_bits(&encoding), 16);
+    }
+
+    #[test]
+    fn test_rle_v2_short_runs_keep_u8_run_lengths() {
+        let field = create_test_field("dict_indices", DataType::Int32);
+
+        let mut values = Vec::with_capacity(1_280);
+        for value in 0..10 {
+            values.extend(std::iter::repeat_n(value, 128));
+        }
+        let mut data = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 1_280,
+            block_info: BlockInfo::default(),
+        };
+        data.compute_stat();
+        let data = DataBlock::FixedWidth(data);
+
+        let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::default());
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
+        assert_eq!(rle_run_length_bits(&encoding), 8);
+    }
+
+    #[test]
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    fn test_rle_miniblock_released_versions_keep_flat_children_when_compression_requested() {
+        for version in [TestEncoding::StructuralU16, TestEncoding::StructuralU32] {
+            let mut params = CompressionParams::new();
+            params.columns.insert(
+                "dict_indices".to_string(),
+                CompressionFieldParams {
+                    compression: Some(
+                        if cfg!(feature = "lz4") { "lz4" } else { "zstd" }.to_string(),
+                    ),
+                    rle_threshold: Some(1.0),
+                    bss: Some(BssMode::Off),
+                    ..Default::default()
+                },
+            );
+            let strategy = strategy(version, params);
+            let field = create_test_field("dict_indices", DataType::UInt32);
+
+            let mut values = Vec::with_capacity(8192 * 4);
+            for value in 0..8192u32 {
+                values.extend(std::iter::repeat_n(value, 4));
+            }
+            let mut data = FixedWidthDataBlock {
+                bits_per_value: 32,
+                data: LanceBuffer::reinterpret_vec(values),
+                num_values: 8192 * 4,
+                block_info: BlockInfo::default(),
+            };
+            data.compute_stat();
+            let data = DataBlock::FixedWidth(data);
+
+            let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+            let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
+            let rle = expect_rle_encoding(&encoding);
+
+            assert!(
+                matches!(
+                    rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
+                    Compression::Flat(_)
+                ),
+                "version={version}"
+            );
+            assert!(
+                matches!(
+                    rle.run_lengths
+                        .as_ref()
+                        .unwrap()
+                        .compression
+                        .as_ref()
+                        .unwrap(),
+                    Compression::Flat(_)
+                ),
+                "version={version}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_rle_miniblock_strategy_bitpacks_child_values_when_smaller() {
+        let field = create_test_field("dict_indices", DataType::Int32);
+
+        let mut values = Vec::with_capacity(8192 * 4);
+        for value in 0..8192 {
+            values.extend(std::iter::repeat_n(value, 4));
+        }
+        let mut data = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 8192 * 4,
+            block_info: BlockInfo::default(),
+        };
+        data.compute_stat();
+        let data = DataBlock::FixedWidth(data);
+
+        let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::default());
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let debug_str = format!("{compressor:?}");
+        assert!(debug_str.contains("RleEncoder"));
+
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
+        let Compression::Rle(rle) = encoding.compression.as_ref().unwrap() else {
+            panic!("expected RLE encoding");
+        };
+        assert!(matches!(
+            rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
+            Compression::OutOfLineBitpacking(_)
+        ));
+        assert!(matches!(
+            rle.run_lengths
+                .as_ref()
+                .unwrap()
+                .compression
+                .as_ref()
+                .unwrap(),
+            Compression::Flat(_)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_rle_miniblock_keeps_child_bitpacked_rle_when_smaller_than_inline_bitpacking() {
+        let field = create_test_field("int_score", DataType::UInt64);
+
+        let mut values = Vec::with_capacity(8192 * 8);
+        for run_idx in 0..8192 {
+            let value = match run_idx % 3 {
+                0 => 3u64,
+                1 => 4u64,
+                _ => 5u64,
+            };
+            values.extend(std::iter::repeat_n(value, 8));
+        }
+        let mut data = FixedWidthDataBlock {
+            bits_per_value: 64,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 8192 * 8,
+            block_info: BlockInfo::default(),
+        };
+        data.compute_stat();
+        let data = DataBlock::FixedWidth(data);
+
+        let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::default());
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let debug_str = format!("{compressor:?}");
+        assert!(
+            debug_str.contains("RleEncoder"),
+            "expected RLE to beat inline bitpacking after child selection, got: {debug_str}"
+        );
+
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
+        let rle = expect_rle_encoding(&encoding);
+        assert!(matches!(
+            rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
+            Compression::OutOfLineBitpacking(_)
+        ));
+        assert!(matches!(
+            rle.run_lengths
+                .as_ref()
+                .unwrap()
+                .compression
+                .as_ref()
+                .unwrap(),
+            Compression::Flat(_)
+        ));
+    }
+
+    #[test]
     fn test_field_metadata_override_params() {
         // Set up params with one configuration
         let mut params = CompressionParams::new();
@@ -1674,7 +2422,7 @@ mod tests {
             },
         );
 
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
 
         // Field metadata should override params
         let mut metadata = HashMap::new();
@@ -1702,7 +2450,7 @@ mod tests {
             },
         );
 
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
 
         // Field metadata provides partial override
         let mut metadata = HashMap::new();
@@ -1721,7 +2469,7 @@ mod tests {
     #[test]
     fn test_bss_field_metadata() {
         let params = CompressionParams::new();
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
 
         // Test BSS "on" mode with compression enabled (BSS requires compression to be effective)
         let mut metadata = HashMap::new();
@@ -1742,7 +2490,7 @@ mod tests {
     #[test]
     fn test_bss_with_compression() {
         let params = CompressionParams::new();
-        let strategy = DefaultCompressionStrategy::with_params(params);
+        let strategy = baseline_strategy(params);
 
         // Test BSS with LZ4 compression
         let mut metadata = HashMap::new();
@@ -1775,8 +2523,7 @@ mod tests {
             },
         );
 
-        let mut strategy = DefaultCompressionStrategy::with_params(params);
-        strategy.version = LanceFileVersion::V2_2;
+        let strategy = strategy(TestEncoding::StructuralU32, params);
 
         let field = create_test_field("dict_values", DataType::FixedSizeBinary(3));
         let data = create_fixed_width_block(24, 1024);
@@ -1787,17 +2534,16 @@ mod tests {
         let expected_num_values = expected_block.num_values;
         let num_values = expected_num_values;
 
-        let (compressor, encoding) = strategy
+        let compressor = strategy
             .create_block_compressor(&field, &data)
             .expect("general compression should be selected");
+        let (compressed_buffer, encoding) = compressor
+            .compress(data.clone())
+            .expect("write path general compression should succeed");
         match encoding.compression.as_ref() {
             Some(Compression::General(_)) => {}
             other => panic!("expected general compression, got {:?}", other),
         }
-
-        let compressed_buffer = compressor
-            .compress(data.clone())
-            .expect("write path general compression should succeed");
 
         let decompressor = DefaultDecompressionStrategy::default()
             .create_block_decompressor(&encoding)
@@ -1817,6 +2563,60 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    fn assert_general_block_preserves_compression_level(
+        compression: &str,
+        expected_scheme: crate::format::pb21::CompressionScheme,
+        compression_level: Option<i32>,
+    ) {
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "dict_values".to_string(),
+            CompressionFieldParams {
+                compression: Some(compression.to_string()),
+                compression_level,
+                ..Default::default()
+            },
+        );
+        let strategy = strategy(TestEncoding::StructuralU32, params);
+        let field = create_test_field("dict_values", DataType::FixedSizeBinary(3));
+        let data = create_fixed_width_block(24, 1024);
+
+        let compressor = strategy.create_block_compressor(&field, &data).unwrap();
+        let (_, encoding) = compressor.compress(data).unwrap();
+        let Some(Compression::General(general)) = encoding.compression.as_ref() else {
+            panic!("expected general compression");
+        };
+
+        assert_eq!(
+            general.compression.as_ref(),
+            Some(&crate::format::pb21::BufferCompression {
+                scheme: expected_scheme as i32,
+                level: compression_level,
+            })
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn test_general_block_preserves_absent_zstd_level() {
+        assert_general_block_preserves_compression_level(
+            "zstd",
+            crate::format::pb21::CompressionScheme::CompressionAlgorithmZstd,
+            None,
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lz4")]
+    fn test_general_block_preserves_explicit_lz4_level() {
+        assert_general_block_preserves_compression_level(
+            "lz4",
+            crate::format::pb21::CompressionScheme::CompressionAlgorithmLz4,
+            Some(7),
+        );
+    }
+
     #[test]
     #[cfg(any(feature = "lz4", feature = "zstd"))]
     fn test_general_compression_not_selected_for_v2_1_even_if_requested() {
@@ -1829,14 +2629,14 @@ mod tests {
             },
         );
 
-        let strategy =
-            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_1);
+        let strategy = strategy(TestEncoding::StructuralU16, params);
         let field = create_test_field("dict_values", DataType::FixedSizeBinary(3));
         let data = create_fixed_width_block(24, 1024);
 
-        let (_compressor, encoding) = strategy
+        let compressor = strategy
             .create_block_compressor(&field, &data)
             .expect("block compressor selection should succeed");
+        let (_, encoding) = compressor.compress(data).unwrap();
 
         assert!(
             !matches!(encoding.compression.as_ref(), Some(Compression::General(_))),
@@ -1855,8 +2655,7 @@ mod tests {
             },
         );
 
-        let strategy =
-            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_2);
+        let strategy = strategy(TestEncoding::StructuralU32, params);
         let field = create_test_field("dict_values", DataType::FixedSizeBinary(3));
         let data = create_fixed_width_block(24, 20_000);
 
@@ -1865,14 +2664,67 @@ mod tests {
             "test requires block size above automatic general compression threshold"
         );
 
-        let (_compressor, encoding) = strategy
+        let compressor = strategy
             .create_block_compressor(&field, &data)
             .expect("block compressor selection should succeed");
+        let (_, encoding) = compressor.compress(data).unwrap();
 
         assert!(
             !matches!(encoding.compression.as_ref(), Some(Compression::General(_))),
             "compression=none should disable automatic block general compression"
         );
+    }
+
+    #[test]
+    fn test_rle_v2_block_selects_u32_run_lengths() {
+        let field = create_test_field("dict_indices", DataType::Int32);
+        let expected_values = vec![42i32; 70_000];
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(expected_values.clone()),
+            num_values: expected_values.len() as u64,
+            block_info: BlockInfo::default(),
+        };
+        block.compute_stat();
+        let data = DataBlock::FixedWidth(block);
+
+        let strategy = strategy(TestEncoding::StructuralSparse, CompressionParams::new());
+        let compressor = strategy.create_block_compressor(&field, &data).unwrap();
+        let (compressed, encoding) = compressor.compress(data).unwrap();
+        assert_eq!(rle_run_length_bits(&encoding), 32);
+        let decompressor = DefaultDecompressionStrategy::default()
+            .create_block_decompressor(&encoding)
+            .unwrap();
+        let decoded = decompressor
+            .decompress(compressed, expected_values.len() as u64)
+            .unwrap();
+
+        match decoded {
+            DataBlock::FixedWidth(block) => {
+                let values = block.data.borrow_to_typed_slice::<i32>();
+                assert_eq!(values.as_ref(), expected_values);
+            }
+            _ => panic!("expected fixed-width block"),
+        }
+    }
+
+    #[test]
+    fn test_rle_v2_block_keeps_u8_run_lengths_for_v2_2() {
+        let field = create_test_field("dict_indices", DataType::Int32);
+        let values = vec![42i32; 70_000];
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 70_000,
+            block_info: BlockInfo::default(),
+        };
+        block.compute_stat();
+        let data = DataBlock::FixedWidth(block);
+
+        let strategy = strategy(TestEncoding::StructuralU32, CompressionParams::new());
+        let compressor = strategy.create_block_compressor(&field, &data).unwrap();
+        let (_, encoding) = compressor.compress(data).unwrap();
+        assert_eq!(rle_run_length_bits(&encoding), 8);
     }
 
     #[test]
@@ -1899,10 +2751,9 @@ mod tests {
 
         let data_block = DataBlock::FixedWidth(block);
 
-        let strategy = DefaultCompressionStrategy::with_params(CompressionParams::new())
-            .with_version(LanceFileVersion::V2_2);
+        let strategy = strategy(TestEncoding::StructuralU32, CompressionParams::new());
 
-        let (compressor, _) = strategy
+        let compressor = strategy
             .create_block_compressor(&field, &data_block)
             .unwrap();
 
@@ -1934,10 +2785,9 @@ mod tests {
 
         let data_block = DataBlock::FixedWidth(block);
 
-        let strategy = DefaultCompressionStrategy::with_params(CompressionParams::new())
-            .with_version(LanceFileVersion::V2_1);
+        let strategy = strategy(TestEncoding::StructuralU16, CompressionParams::new());
 
-        let (compressor, _) = strategy
+        let compressor = strategy
             .create_block_compressor(&field, &data_block)
             .unwrap();
 

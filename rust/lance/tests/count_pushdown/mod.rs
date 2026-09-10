@@ -81,7 +81,7 @@ fn lance_aware_context(dataset: Arc<Dataset>) -> SessionContext {
 fn plan_contains_pushdown(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let mut found = false;
     plan.apply(|node| {
-        if node.as_any().is::<CountFromMaskExec>() {
+        if node.is::<CountFromMaskExec>() {
             found = true;
             Ok(TreeNodeRecursion::Stop)
         } else {

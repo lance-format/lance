@@ -70,6 +70,7 @@ public class WriteDatasetBuilder {
   private WriteParams.WriteMode mode = WriteParams.WriteMode.CREATE;
   private Schema schema;
   private Map<String, String> storageOptions = new HashMap<>();
+  private Map<String, String> properties = new HashMap<>();
   private Map<String, Map<String, String>> baseStoreParams = new HashMap<>();
   private boolean ignoreNamespaceStorageOptions = false;
   private Optional<Integer> maxRowsPerFile = Optional.empty();
@@ -204,6 +205,27 @@ public class WriteDatasetBuilder {
    */
   public WriteDatasetBuilder storageOptions(Map<String, String> storageOptions) {
     this.storageOptions = new HashMap<>(storageOptions);
+    return this;
+  }
+
+  /**
+   * Sets the table properties to forward to the namespace on table creation.
+   *
+   * <p>These are Lance-namespace <b>properties</b>: catalog-level key-value metadata stored by the
+   * namespace outside the Lance table (available even if the table manifest does not exist), as
+   * distinct from the manifest-stored {@code config} (read/write behavior) and {@code metadata}
+   * (business metadata), and from non-persisted {@code storageOptions}. They are attached to the
+   * underlying declareTable request via its {@code properties} field.
+   *
+   * <p>Only used when a namespace client is configured via namespaceClient()+tableId() and the
+   * write creates the table (CREATE mode). Ignored for direct-URI writes and for APPEND/OVERWRITE
+   * modes.
+   *
+   * @param properties Table properties to forward on declareTable
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder properties(Map<String, String> properties) {
+    this.properties = new HashMap<>(properties);
     return this;
   }
 
@@ -410,6 +432,9 @@ public class WriteDatasetBuilder {
     if (mode == WriteParams.WriteMode.CREATE) {
       DeclareTableRequest declareRequest = new DeclareTableRequest();
       declareRequest.setId(tableId);
+      if (properties != null && !properties.isEmpty()) {
+        declareRequest.setProperties(properties);
+      }
       DeclareTableResponse declareResponse = namespaceClient.declareTable(declareRequest);
 
       tableUri = declareResponse.getLocation();

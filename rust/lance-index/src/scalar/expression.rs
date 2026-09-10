@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Bound, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet, hash_map::Entry},
+    ops::Bound,
+    sync::Arc,
+};
 
 use arrow_schema::{DataType, Field};
 use async_recursion::async_recursion;
@@ -15,7 +20,7 @@ use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
+    SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -269,6 +274,11 @@ pub struct SargableQueryParser {
     index_name: String,
     index_type: String,
     needs_recheck: bool,
+    /// Whether IS NULL queries need post-filter rechecking. May be false even
+    /// when `needs_recheck` is true for indexes that track exact null positions
+    /// (e.g. zone maps with a null bitmap).
+    is_null_needs_recheck: bool,
+    supports_like_prefix: bool,
 }
 
 impl SargableQueryParser {
@@ -277,7 +287,25 @@ impl SargableQueryParser {
             index_name,
             index_type,
             needs_recheck,
+            is_null_needs_recheck: needs_recheck,
+            supports_like_prefix: true,
         }
+    }
+
+    /// Bitmap (and similar) indexes cannot answer prefix queries; disabling
+    /// `LikePrefix` emission makes `LIKE`/`starts_with` predicates fall back to
+    /// ordinary filtering instead of failing at search time.
+    pub fn without_like_prefix(mut self) -> Self {
+        self.supports_like_prefix = false;
+        self
+    }
+
+    /// Mark IS NULL as exact so that IS NOT NULL can be served by the index
+    /// without a post-filter. Use this when the index tracks null row addresses
+    /// precisely (e.g. a zone map with a null bitmap).
+    pub fn with_exact_null_tracking(mut self) -> Self {
+        self.is_null_needs_recheck = false;
+        self
     }
 }
 
@@ -347,7 +375,7 @@ impl ScalarQueryParser for SargableQueryParser {
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(SargableQuery::IsNull()),
-            self.needs_recheck,
+            self.is_null_needs_recheck,
         ))
     }
 
@@ -392,11 +420,23 @@ impl ScalarQueryParser for SargableQueryParser {
     ) -> Option<IndexedExpression> {
         // Handle starts_with(col, 'prefix') -> convert to LikePrefix query
         if func.name() == "starts_with" && args.len() == 2 {
+            // Indexes that cannot answer prefix queries (e.g. bitmap) fall back to
+            // ordinary filtering rather than emitting a query they would reject.
+            if !self.supports_like_prefix {
+                return None;
+            }
             // Extract the prefix from the second argument
             let prefix = match &args[1] {
                 Expr::Literal(ScalarValue::Utf8(Some(s)), _) => ScalarValue::Utf8(Some(s.clone())),
                 Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => {
                     ScalarValue::LargeUtf8(Some(s.clone()))
+                }
+                // Lance stores `Utf8View` columns as `Utf8` (normalized at write time), so a
+                // `Utf8View` literal is normalized to `Utf8` to match the indexed data: the
+                // BTree compares the query bound against `Utf8` page statistics at the Arrow
+                // level, which rejects a `Utf8View` bound.
+                Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => {
+                    ScalarValue::Utf8(Some(s.clone()))
                 }
                 _ => return None,
             };
@@ -425,19 +465,29 @@ impl ScalarQueryParser for SargableQueryParser {
             return None;
         }
 
+        // Indexes that cannot answer prefix queries (e.g. bitmap) fall back to
+        // ordinary filtering rather than emitting a query they would reject.
+        if !self.supports_like_prefix {
+            return None;
+        }
+
         // Extract the pattern string
         let pattern_str = match pattern {
-            ScalarValue::Utf8(Some(s)) => s.as_str(),
-            ScalarValue::LargeUtf8(Some(s)) => s.as_str(),
+            ScalarValue::Utf8(Some(s))
+            | ScalarValue::LargeUtf8(Some(s))
+            | ScalarValue::Utf8View(Some(s)) => s.as_str(),
             _ => return None,
         };
 
         // Try to extract a prefix from the LIKE pattern
         let (prefix, needs_refine) = extract_like_leading_prefix(pattern_str, like.escape_char)?;
 
-        // Create the prefix ScalarValue with the same type as the pattern
+        // Create the prefix ScalarValue with the same type as the pattern. `Utf8View` is
+        // normalized to `Utf8` because Lance stores `Utf8View` columns as `Utf8`, and the
+        // downstream BTree compares the query bound against `Utf8` page statistics at the
+        // Arrow level (a `Utf8View` bound would fail that comparison).
         let prefix_value = match pattern {
-            ScalarValue::Utf8(_) => ScalarValue::Utf8(Some(prefix)),
+            ScalarValue::Utf8(_) | ScalarValue::Utf8View(_) => ScalarValue::Utf8(Some(prefix)),
             ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(prefix)),
             _ => return None,
         };
@@ -737,6 +787,11 @@ impl ScalarQueryParser for LabelListQueryParser {
         if args.len() != 2 {
             return None;
         }
+        // LABEL_LIST stores unnested items as bitmap keys. Nested items cannot be
+        // ordered by the bitmap lookup, so legacy indexes must fall back to a scan.
+        if validate_label_list_data_type(data_type).is_err() {
+            return None;
+        }
         // DataFusion normalizes array_contains to array_has
         if func.name() == "array_has" {
             let inner_type = match data_type {
@@ -759,34 +814,34 @@ impl ScalarQueryParser for LabelListQueryParser {
         }
 
         let label_list = maybe_scalar(&args[1], data_type)?;
-        if let ScalarValue::List(list_arr) = label_list {
-            let list_values = list_arr.values();
-            if list_values.is_empty() {
-                return None;
-            }
-            let mut scalars = Vec::with_capacity(list_values.len());
-            for idx in 0..list_values.len() {
-                scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
-            }
-            if func.name() == "array_has_all" {
-                let query = LabelListQuery::HasAllLabels(scalars);
-                Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    self.index_type.clone(),
-                    Arc::new(query),
-                ))
-            } else if func.name() == "array_has_any" {
-                let query = LabelListQuery::HasAnyLabel(scalars);
-                Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    self.index_type.clone(),
-                    Arc::new(query),
-                ))
-            } else {
-                None
-            }
+        let list_values = match label_list {
+            ScalarValue::List(list_arr) => list_arr.values().clone(),
+            ScalarValue::LargeList(list_arr) => list_arr.values().clone(),
+            _ => return None,
+        };
+        if list_values.is_empty() {
+            return None;
+        }
+        let mut scalars = Vec::with_capacity(list_values.len());
+        for idx in 0..list_values.len() {
+            scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
+        }
+        if func.name() == "array_has_all" {
+            let query = LabelListQuery::HasAllLabels(scalars);
+            Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                self.index_type.clone(),
+                Arc::new(query),
+            ))
+        } else if func.name() == "array_has_any" {
+            let query = LabelListQuery::HasAnyLabel(scalars);
+            Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                self.index_type.clone(),
+                Arc::new(query),
+            ))
         } else {
             None
         }
@@ -801,6 +856,10 @@ pub struct TextQueryParser {
     index_type: String,
     needs_recheck: bool,
     supports_regex: bool,
+    /// The shortest `contains` pattern (in characters, not bytes) the index can
+    /// say anything useful about.  Shorter patterns bypass the index entirely so
+    /// they are answered by a full scan.  Use 0 for indices with no such limit.
+    min_contains_chars: usize,
 }
 
 impl TextQueryParser {
@@ -809,12 +868,14 @@ impl TextQueryParser {
         index_type: String,
         needs_recheck: bool,
         supports_regex: bool,
+        min_contains_chars: usize,
     ) -> Self {
         Self {
             index_name,
             index_type,
             needs_recheck,
             supports_regex,
+            min_contains_chars,
         }
     }
 }
@@ -871,7 +932,16 @@ impl ScalarQueryParser for TextQueryParser {
         };
 
         let query = match func.name() {
-            "contains" if args.len() == 2 => TextQuery::StringContains(pattern),
+            "contains" if args.len() == 2 => {
+                // A pattern shorter than the index's token width produces no
+                // tokens, so the index can only answer "recheck everything".
+                // Leave it to a full scan instead.  The count is in characters
+                // because tokenizers split on characters, not bytes.
+                if pattern.chars().count() < self.min_contains_chars {
+                    return None;
+                }
+                TextQuery::StringContains(pattern)
+            }
             "regexp_like" | "regexp_match" if self.supports_regex => {
                 let pattern = match args.get(2) {
                     Some(flags_expr) => apply_regex_flags(&pattern, flags_expr)?,
@@ -1370,6 +1440,20 @@ pub trait ScalarIndexLoader: Send + Sync {
         index_name: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// Translate an address-domain index result into the row-id domain
+    ///
+    /// Address-domain indices (see [`ScalarIndex::results_are_row_addresses`])
+    /// report matches as physical row addresses. The default returns `result`
+    /// unchanged, which is correct when addresses and row ids coincide (no
+    /// stable row ids). A dataset with stable row ids overrides this to remap
+    /// addresses to stable row ids via its per-fragment row-id sequences.
+    async fn row_addr_result_to_row_ids(
+        &self,
+        result: NullableIndexExprResult,
+    ) -> Result<NullableIndexExprResult> {
+        Ok(result)
+    }
 }
 
 /// This represents a search into a scalar index
@@ -1430,6 +1514,388 @@ impl PartialEq for ScalarIndexExpr {
     }
 }
 
+/// Conservative grouping key for rewrites targeting the same parsed scalar index.
+/// `index_type` is display metadata, but including it prevents rewrites across
+/// index implementations that may not share query semantics.
+type ScalarIndexQueryKey = (String, String, String);
+
+/// Returns the tighter (more restrictive) lower bound.
+///
+/// Returns `None` if the bound values cannot be compared. In that case callers
+/// keep the original predicates rather than inventing ordering semantics.
+fn tighter_lower_bound(
+    a: &Bound<ScalarValue>,
+    b: &Bound<ScalarValue>,
+) -> Option<Bound<ScalarValue>> {
+    match (a, b) {
+        (Bound::Unbounded, Bound::Unbounded) => Some(Bound::Unbounded),
+        (Bound::Unbounded, other) | (other, Bound::Unbounded) => Some(other.clone()),
+        (
+            Bound::Included(a_value) | Bound::Excluded(a_value),
+            Bound::Included(b_value) | Bound::Excluded(b_value),
+        ) => match a_value.partial_cmp(b_value)? {
+            Ordering::Less => Some(b.clone()),
+            Ordering::Equal => Some(stricter_bound_for_equal_value(a_value, a, b)),
+            Ordering::Greater => Some(a.clone()),
+        },
+    }
+}
+
+/// Returns the tighter (more restrictive) upper bound.
+///
+/// Returns `None` if the bound values cannot be compared. In that case callers
+/// keep the original predicates rather than inventing ordering semantics.
+fn tighter_upper_bound(
+    a: &Bound<ScalarValue>,
+    b: &Bound<ScalarValue>,
+) -> Option<Bound<ScalarValue>> {
+    match (a, b) {
+        (Bound::Unbounded, Bound::Unbounded) => Some(Bound::Unbounded),
+        (Bound::Unbounded, other) | (other, Bound::Unbounded) => Some(other.clone()),
+        (
+            Bound::Included(a_value) | Bound::Excluded(a_value),
+            Bound::Included(b_value) | Bound::Excluded(b_value),
+        ) => match a_value.partial_cmp(b_value)? {
+            Ordering::Less => Some(a.clone()),
+            Ordering::Equal => Some(stricter_bound_for_equal_value(a_value, a, b)),
+            Ordering::Greater => Some(b.clone()),
+        },
+    }
+}
+
+fn is_excluded_bound(bound: &Bound<ScalarValue>) -> bool {
+    matches!(bound, Bound::Excluded(_))
+}
+
+/// For an equal scalar value, an excluded bound is stricter than an included
+/// bound. This handles cases like `x >= 5 AND x > 5`.
+fn stricter_bound_for_equal_value(
+    value: &ScalarValue,
+    lhs: &Bound<ScalarValue>,
+    rhs: &Bound<ScalarValue>,
+) -> Bound<ScalarValue> {
+    if is_excluded_bound(lhs) || is_excluded_bound(rhs) {
+        Bound::Excluded(value.clone())
+    } else {
+        Bound::Included(value.clone())
+    }
+}
+
+fn range_has_non_null_bound(lower: &Bound<ScalarValue>, upper: &Bound<ScalarValue>) -> bool {
+    let mut has_bound = false;
+    for bound in [lower, upper] {
+        match bound {
+            Bound::Included(value) | Bound::Excluded(value) => {
+                if value.is_null() {
+                    return false;
+                }
+                has_bound = true;
+            }
+            Bound::Unbounded => {}
+        }
+    }
+    has_bound
+}
+
+/// Null bounds are skipped by range optimization. Comparisons with NULL should
+/// already be rejected by normal parsing, but this keeps manually constructed
+/// ScalarIndexExpr values from being rewritten into misleading ranges.
+fn range_has_null_bound(lower: &Bound<ScalarValue>, upper: &Bound<ScalarValue>) -> bool {
+    [lower, upper].iter().any(|bound| match bound {
+        Bound::Included(value) | Bound::Excluded(value) => value.is_null(),
+        Bound::Unbounded => false,
+    })
+}
+
+impl ScalarIndexSearch {
+    /// Only SargableQuery participates in these expression-level rewrites.
+    /// Other AnyQuery implementations may have different null/range semantics.
+    fn sargable_query(&self) -> Option<&SargableQuery> {
+        self.query.as_any().downcast_ref::<SargableQuery>()
+    }
+
+    /// Require a concrete SargableQuery before producing a key so callers do not
+    /// accidentally group unrelated AnyQuery implementations by metadata alone.
+    fn sargable_query_key(&self) -> Option<ScalarIndexQueryKey> {
+        self.sargable_query()?;
+        Some((
+            self.column.clone(),
+            self.index_name.clone(),
+            self.index_type.clone(),
+        ))
+    }
+
+    /// Only exact SargableQuery values may drive NULL-elimination rewrites.
+    /// Range merging also accepts inexact queries and preserves their recheck.
+    fn exact_sargable_query(&self) -> Option<&SargableQuery> {
+        if self.needs_recheck {
+            return None;
+        }
+        self.sargable_query()
+    }
+
+    /// Return a scalar-index key only when the query is an exact SargableQuery.
+    fn exact_sargable_query_key(&self) -> Option<ScalarIndexQueryKey> {
+        self.exact_sargable_query()?;
+        self.sargable_query_key()
+    }
+
+    /// A query is null-intolerant if the original predicate cannot match NULL.
+    /// Only exact queries can make `IS NOT NULL` redundant in the index expression.
+    fn is_null_intolerant_sargable_query(&self) -> bool {
+        match self.exact_sargable_query() {
+            Some(SargableQuery::Range(lower, upper)) => range_has_non_null_bound(lower, upper),
+            Some(SargableQuery::Equals(value)) => !value.is_null(),
+            Some(SargableQuery::IsIn(values)) => {
+                !values.is_empty() && values.iter().all(|value| !value.is_null())
+            }
+            _ => false,
+        }
+    }
+}
+
+impl ScalarIndexExpr {
+    /// Apply scalar-index optimizer rules within each contiguous AND region.
+    ///
+    /// Range queries for the same parsed scalar index are intersected and retain
+    /// `needs_recheck` if any input range requires it. An exact `IS NOT NULL`
+    /// query is removed when another exact same-index query is null-intolerant.
+    /// OR branches are optimized independently. Range queries are still merged
+    /// under NOT, but `IS NOT NULL` elimination is disabled there to preserve
+    /// SQL NULL semantics.
+    ///
+    /// Compatible [`SargableQuery::Range`] values carried by
+    /// [`ScalarIndexSearch`] are merged into one query.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use std::{ops::Bound, sync::Arc};
+    /// # use lance_index::scalar::{SargableQuery, expression::{ScalarIndexExpr, ScalarIndexSearch}};
+    /// # let range = |lower, upper| ScalarIndexExpr::Query(ScalarIndexSearch {
+    /// #     column: "x".into(),
+    /// #     index_name: "x_idx".into(),
+    /// #     index_type: "BTree".into(),
+    /// #     query: Arc::new(SargableQuery::Range(lower, upper)),
+    /// #     needs_recheck: false,
+    /// #     fragment_bitmap: None,
+    /// # });
+    /// let optimized = ScalarIndexExpr::And(
+    ///     Box::new(range(Bound::Included(10_i64.into()), Bound::Unbounded)),
+    ///     Box::new(range(Bound::Unbounded, Bound::Included(20_i64.into()))),
+    /// )
+    /// .optimize();
+    ///
+    /// assert!(matches!(optimized, ScalarIndexExpr::Query(_)));
+    /// ```
+    pub fn optimize(self) -> Self {
+        self.optimize_with_context(true)
+    }
+
+    fn optimize_with_context(self, is_not_null_elidable: bool) -> Self {
+        match self {
+            Self::And(_, _) => self.optimize_and_tree(is_not_null_elidable),
+            Self::Or(lhs, rhs) => Self::Or(
+                Box::new(lhs.optimize_with_context(is_not_null_elidable)),
+                Box::new(rhs.optimize_with_context(is_not_null_elidable)),
+            ),
+            Self::Not(inner) => Self::Not(Box::new(inner.optimize_with_context(false))),
+            other => other,
+        }
+    }
+
+    /// Flatten one contiguous AND region, apply local optimizer rules, and
+    /// rebuild a balanced AND tree.
+    fn optimize_and_tree(self, is_not_null_elidable: bool) -> Self {
+        let mut leaves = Vec::new();
+        self.collect_and_leaves(&mut leaves, is_not_null_elidable);
+        let leaves = Self::optimize_and_leaves(leaves, is_not_null_elidable);
+
+        Self::rebuild_and_tree(leaves).expect("AND tree optimization should keep at least one leaf")
+    }
+
+    /// Apply optimizer rules within one AND region only. OR branches have already
+    /// been kept as opaque leaves, so range and null-intolerance rewrites cannot
+    /// cross boolean boundaries.
+    fn optimize_and_leaves(leaves: Vec<Self>, is_not_null_elidable: bool) -> Vec<Self> {
+        let null_intolerant_keys = if !is_not_null_elidable {
+            HashSet::new()
+        } else {
+            let is_not_null_keys = leaves
+                .iter()
+                .filter_map(Self::is_not_null_query_key)
+                .collect::<HashSet<_>>();
+            if is_not_null_keys.is_empty() {
+                HashSet::new()
+            } else {
+                leaves
+                    .iter()
+                    .filter_map(Self::null_intolerant_query_key)
+                    .filter(|key| is_not_null_keys.contains(key))
+                    .collect()
+            }
+        };
+
+        let mut optimized = Vec::with_capacity(leaves.len());
+        let mut range_positions = HashMap::new();
+
+        for leaf in leaves {
+            if let Some(key) = leaf.is_not_null_query_key()
+                && null_intolerant_keys.contains(&key)
+            {
+                continue;
+            }
+
+            if let Some(key) = leaf.range_query_key() {
+                match range_positions.entry(key) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(optimized.len());
+                        optimized.push(leaf);
+                    }
+                    Entry::Occupied(entry) => {
+                        if !optimized[*entry.get()].try_merge_range(&leaf) {
+                            optimized.push(leaf);
+                        }
+                    }
+                }
+            } else {
+                optimized.push(leaf);
+            }
+        }
+
+        optimized
+    }
+
+    /// Recursively collect all leaf nodes from an AND tree. OR branches are
+    /// optimized independently with the current null-elision context. NOT
+    /// branches remain leaves while their children are optimized with null
+    /// elimination disabled.
+    fn collect_and_leaves(self, leaves: &mut Vec<Self>, is_not_null_elidable: bool) {
+        match self {
+            Self::And(lhs, rhs) => {
+                lhs.collect_and_leaves(leaves, is_not_null_elidable);
+                rhs.collect_and_leaves(leaves, is_not_null_elidable);
+            }
+            Self::Or(lhs, rhs) => {
+                leaves.push(Self::Or(
+                    Box::new(lhs.optimize_with_context(is_not_null_elidable)),
+                    Box::new(rhs.optimize_with_context(is_not_null_elidable)),
+                ));
+            }
+            Self::Not(inner) => {
+                leaves.push(Self::Not(Box::new(inner.optimize_with_context(false))))
+            }
+            other => leaves.push(other),
+        }
+    }
+
+    /// Rebuild as a balanced tree so large planner-generated conjunctions do not
+    /// become deep left-leaning trees after optimization.
+    fn rebuild_and_tree(leaves: Vec<Self>) -> Option<Self> {
+        let mut leaves = leaves;
+        if leaves.is_empty() {
+            return None;
+        }
+
+        while leaves.len() > 1 {
+            let mut next = Vec::with_capacity(leaves.len().div_ceil(2));
+            let mut iter = leaves.into_iter();
+            while let Some(lhs) = iter.next() {
+                if let Some(rhs) = iter.next() {
+                    next.push(Self::And(Box::new(lhs), Box::new(rhs)));
+                } else {
+                    next.push(lhs);
+                }
+            }
+            leaves = next;
+        }
+
+        leaves.pop()
+    }
+
+    /// Detect the scalar-index representation of `col IS NOT NULL`, which is
+    /// stored as `NOT(col IS NULL)`.
+    fn is_not_null_query_key(&self) -> Option<ScalarIndexQueryKey> {
+        match self {
+            Self::Not(inner) => match inner.as_ref() {
+                Self::Query(search)
+                    if matches!(search.sargable_query(), Some(SargableQuery::IsNull())) =>
+                {
+                    search.exact_sargable_query_key()
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Return the key of a same-column predicate that makes `IS NOT NULL`
+    /// redundant in the same AND region.
+    fn null_intolerant_query_key(&self) -> Option<ScalarIndexQueryKey> {
+        match self {
+            Self::Query(search) if search.is_null_intolerant_sargable_query() => {
+                search.exact_sargable_query_key()
+            }
+            Self::Not(inner) => match inner.as_ref() {
+                // `NOT (predicate)` is NULL wherever the predicate is, so it
+                // cannot match a NULL row either, and `IS NOT NULL` adds nothing.
+                Self::Query(search) if search.is_null_intolerant_sargable_query() => {
+                    search.exact_sargable_query_key()
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Return the grouping key for an optimizable range query. Ranges with NULL
+    /// bounds are left unchanged.
+    fn range_query_key(&self) -> Option<ScalarIndexQueryKey> {
+        let Self::Query(search) = self else {
+            return None;
+        };
+        let SargableQuery::Range(lower, upper) = search.sargable_query()? else {
+            return None;
+        };
+        if range_has_null_bound(lower, upper) {
+            return None;
+        }
+        search.sargable_query_key()
+    }
+
+    /// Merge another compatible range into this expression.
+    ///
+    /// The caller must first group both expressions by [`ScalarIndexQueryKey`].
+    /// Different fragment coverage or incomparable bounds leave both predicates
+    /// unchanged. Empty intersections are retained as ranges.
+    fn try_merge_range(&mut self, other: &Self) -> bool {
+        let (Self::Query(search), Self::Query(other_search)) = (self, other) else {
+            return false;
+        };
+        if search.fragment_bitmap != other_search.fragment_bitmap {
+            return false;
+        }
+
+        let (
+            Some(SargableQuery::Range(lower, upper)),
+            Some(SargableQuery::Range(other_lower, other_upper)),
+        ) = (search.sargable_query(), other_search.sargable_query())
+        else {
+            return false;
+        };
+        let Some(lower) = tighter_lower_bound(lower, other_lower) else {
+            return false;
+        };
+        let Some(upper) = tighter_upper_bound(upper, other_upper) else {
+            return false;
+        };
+
+        search.query = Arc::new(SargableQuery::Range(lower, upper));
+        search.needs_recheck |= other_search.needs_recheck;
+        true
+    }
+}
+
 impl std::fmt::Display for ScalarIndexExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1447,12 +1913,16 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
-impl From<SearchResult> for NullableIndexExprResult {
-    fn from(result: SearchResult) -> Self {
-        match result {
-            SearchResult::Exact(mask) => Self::exact(NullableRowAddrMask::AllowList(mask)),
-            SearchResult::AtMost(mask) => Self::at_most(NullableRowAddrMask::AllowList(mask)),
-            SearchResult::AtLeast(mask) => Self::at_least(NullableRowAddrMask::AllowList(mask)),
+fn search_result_to_nullable(result: SearchResult) -> NullableIndexExprResult {
+    match result {
+        SearchResult::Exact(mask) => {
+            NullableIndexExprResult::exact(NullableRowAddrMask::AllowList(mask))
+        }
+        SearchResult::AtMost(mask) => {
+            NullableIndexExprResult::at_most(NullableRowAddrMask::AllowList(mask))
+        }
+        SearchResult::AtLeast(mask) => {
+            NullableIndexExprResult::at_least(NullableRowAddrMask::AllowList(mask))
         }
     }
 }
@@ -1464,26 +1934,40 @@ impl ScalarIndexExpr {
     ///
     /// TODO: We could potentially try and be smarter about reusing loaded indices for
     /// any situations where the session cache has been disabled.
-    #[async_recursion]
     pub async fn evaluate_nullable(
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableIndexExprResult> {
+        self.evaluate_with_options(index_loader, metrics, true)
+            .await
+    }
+
+    #[async_recursion]
+    async fn evaluate_with_options(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+        track_nulls: bool,
+    ) -> Result<NullableIndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate_nullable(index_loader, metrics).await?;
+                // NOT needs the child's NULL rows to preserve SQL three-valued
+                // logic. Once enabled, keep tracking through the whole subtree.
+                let result = inner
+                    .evaluate_with_options(index_loader, metrics, true)
+                    .await?;
                 Ok(!result)
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result | rhs_result)
             }
@@ -1491,8 +1975,22 @@ impl ScalarIndexExpr {
                 let index = index_loader
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
-                let search_result = index.search(search.query.as_ref(), metrics).await?;
-                Ok(search_result.into())
+                let search_result = index
+                    .search_with_options(
+                        search.query.as_ref(),
+                        SearchOptions::default().with_track_nulls(track_nulls),
+                        metrics,
+                    )
+                    .await?;
+                let result = search_result_to_nullable(search_result);
+                if index.results_are_row_addresses() {
+                    // Translate address-domain results to the row-id domain
+                    // before combining or scanning; otherwise stable-row-id
+                    // datasets silently drop matches (issue #7434).
+                    index_loader.row_addr_result_to_row_ids(result).await
+                } else {
+                    Ok(result)
+                }
             }
         }
     }
@@ -1504,7 +2002,7 @@ impl ScalarIndexExpr {
         metrics: &dyn MetricsCollector,
     ) -> Result<IndexExprResult> {
         Ok(self
-            .evaluate_nullable(index_loader, metrics)
+            .evaluate_with_options(index_loader, metrics, false)
             .await?
             .drop_nulls())
     }
@@ -1543,27 +2041,30 @@ fn maybe_column(expr: &Expr) -> Option<&str> {
     }
 }
 
-// Extract the full nested column path from a get_field expression chain
-// For example: get_field(get_field(metadata, "status"), "code") -> "metadata.status.code"
+// Extract the full nested column path from chained or variadic get_field expressions.
+// For example, both get_field(get_field(metadata, "status"), "code") and
+// get_field(metadata, "status", "code") produce "metadata.status.code".
 fn extract_nested_column_path(expr: &Expr) -> Option<String> {
     let mut current_expr = expr;
     let mut parts = Vec::new();
 
-    // Walk up the get_field chain
+    // Walk up the get_field chain. Add variadic arguments in reverse because all
+    // parts are reversed after reaching the base column.
     loop {
         match current_expr {
             Expr::ScalarFunction(udf) if udf.name() == "get_field" => {
-                if udf.args.len() != 2 {
+                if udf.args.len() < 2 {
                     return None;
                 }
-                // Extract the field name from the second argument
-                // The Literal now has two fields: ScalarValue and Option<FieldMetadata>
-                if let Expr::Literal(ScalarValue::Utf8(Some(field_name)), _) = &udf.args[1] {
-                    parts.push(field_name.clone());
-                } else {
-                    return None;
+
+                for field_expr in udf.args[1..].iter().rev() {
+                    if let Expr::Literal(ScalarValue::Utf8(Some(field_name)), _) = field_expr {
+                        parts.push(field_name.clone());
+                    } else {
+                        return None;
+                    }
                 }
-                // Move up to the parent expression
+
                 current_expr = &udf.args[0];
             }
             Expr::Column(col) => {
@@ -1637,7 +2138,7 @@ fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Option<ScalarValue> {
         // In this case we need to extract the value, apply the cast, and then test the casted value
         Expr::Cast(cast) => match cast.expr.as_ref() {
             Expr::Literal(value, _) => {
-                let casted = value.cast_to(&cast.data_type).ok()?;
+                let casted = value.cast_to(cast.field.data_type()).ok()?;
                 safe_coerce_scalar(&casted, expected_type)
             }
             _ => None,
@@ -2151,13 +2652,14 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow_array::Array;
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{Field, Fields, Schema};
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
     use lance_select::result::IndexExprResultWireFormat;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 
@@ -2219,15 +2721,26 @@ mod tests {
             Field::new("price", DataType::Float32, false),
             Field::new("json", DataType::LargeBinary, false),
         ]);
+        check_with_schema(index_info, expr, expected, optimize, schema);
+    }
+
+    fn check_with_schema(
+        index_info: &dyn IndexInformationProvider,
+        expr: &str,
+        expected: Option<IndexedExpression>,
+        optimize: bool,
+        schema: Schema,
+    ) {
         let df_schema: DFSchema = schema.try_into().unwrap();
 
         let ctx = get_session_context(&LanceExecutionOptions::default());
         let state = ctx.state();
         let mut expr = state.create_logical_expr(expr, &df_schema).unwrap();
         if optimize {
-            let simplify_context = SimplifyContext::default()
+            let simplify_context = SimplifyContext::builder()
                 .with_schema(Arc::new(df_schema))
-                .with_query_execution_start_time(Some(Utc::now()));
+                .with_query_execution_start_time(Some(Utc::now()))
+                .build();
             let simplifier =
                 datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
             expr = simplifier.simplify(expr).unwrap();
@@ -2305,6 +2818,117 @@ mod tests {
             ),
             false,
         )
+    }
+
+    #[rstest]
+    #[case::list(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))))]
+    #[case::large_list(DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))))]
+    fn test_label_list_query_parser(#[case] label_type: DataType) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "labels",
+            ColInfo::new(
+                label_type.clone(),
+                Box::new(LabelListQueryParser::new(
+                    "labels_idx".to_string(),
+                    "LabelList".to_string(),
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("labels", label_type, true)]);
+
+        check_with_schema(
+            &index_info,
+            "array_has_any(labels, ['distributed'])",
+            Some(IndexedExpression::index_query(
+                "labels".to_string(),
+                "labels_idx".to_string(),
+                "LabelList".to_string(),
+                Arc::new(LabelListQuery::HasAnyLabel(vec![ScalarValue::Utf8(Some(
+                    "distributed".to_string(),
+                ))])),
+            )),
+            true,
+            schema,
+        );
+    }
+
+    #[rstest]
+    #[case::list(DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    ))))]
+    #[case::large_list(DataType::LargeList(Arc::new(Field::new(
+        "item",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    ))))]
+    fn test_label_list_nested_item(#[case] label_type: DataType) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "labels",
+            ColInfo::new(
+                label_type.clone(),
+                Box::new(LabelListQueryParser::new(
+                    "labels_idx".to_string(),
+                    "LabelList".to_string(),
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("labels", label_type, true)]);
+
+        // Nested item types must not produce a scalar index query.
+        check_with_schema(
+            &index_info,
+            "array_has_any(labels, [[1]])",
+            None,
+            true,
+            schema,
+        );
+    }
+
+    #[test]
+    fn test_nested_column_index() {
+        let column = "user_profile.basic.age";
+        let index_info = MockIndexInfoProvider::new(vec![(
+            column,
+            ColInfo::new(
+                DataType::Int32,
+                Box::new(SargableQueryParser::new(
+                    format!("{column}_idx"),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new(
+            "user_profile",
+            DataType::Struct(Fields::from(vec![Field::new(
+                "basic",
+                DataType::Struct(Fields::from(vec![Field::new("age", DataType::Int32, true)])),
+                true,
+            )])),
+            true,
+        )]);
+
+        let planner = Planner::new(Arc::new(schema));
+        let filter = planner
+            .parse_filter("user_profile.basic.age > 900")
+            .unwrap();
+        let plan = planner
+            .create_filter_plan(filter, &index_info, true)
+            .unwrap();
+        let expected = IndexedExpression::index_query(
+            column.to_string(),
+            format!("{column}_idx"),
+            "BTree".to_string(),
+            Arc::new(SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int32(Some(900))),
+                Bound::Unbounded,
+            )),
+        );
+
+        assert_eq!(plan.index_query, expected.scalar_query);
+        assert!(plan.refine_expr.is_none());
     }
 
     #[test]
@@ -3101,9 +3725,10 @@ mod tests {
             .unwrap();
 
         // Apply DataFusion simplification (this may convert starts_with to LIKE)
-        let simplify_context = SimplifyContext::default()
+        let simplify_context = SimplifyContext::builder()
             .with_schema(Arc::new(df_schema))
-            .with_query_execution_start_time(Some(Utc::now()));
+            .with_query_execution_start_time(Some(Utc::now()))
+            .build();
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
         let simplified_expr = simplifier.simplify(expr).unwrap();
@@ -3215,6 +3840,166 @@ mod tests {
                 "starts_with and LIKE 'prefix%' should produce identical queries"
             );
         }
+    }
+
+    #[test]
+    fn test_sargable_query_parser_utf8view() {
+        // Follow-up to PR #7310 / #7139: the BTree `SargableQueryParser` must accept
+        // `Utf8View` prefixes for `starts_with` and infix-free LIKE, not only `Utf8` /
+        // `LargeUtf8`. DataFusion can coerce the predicate literal to `ScalarValue::Utf8View`;
+        // dropping that variant silently skips the index. The `Utf8View` prefix is normalized
+        // to `Utf8` (Lance stores `Utf8View` columns as `Utf8`), so the emitted query is a
+        // `LikePrefix(Utf8(..))`. `visit_scalar_function` / `visit_like` are exercised directly
+        // so the test does not depend on the planner's coercion choices, and the `Utf8` case
+        // is a parity control: the pre-existing path must keep behaving identically.
+        let parser = SargableQueryParser::new("color_idx".to_string(), "BTree".to_string(), false);
+
+        let assert_like_prefix =
+            |indexed: &IndexedExpression, expected: &ScalarValue, needs_refine: bool| {
+                assert_eq!(
+                    indexed.refine_expr.is_some(),
+                    needs_refine,
+                    "unexpected refine_expr presence"
+                );
+                let Some(ScalarIndexExpr::Query(search)) = &indexed.scalar_query else {
+                    panic!("expected a scalar index query");
+                };
+                match search
+                    .query
+                    .as_any()
+                    .downcast_ref::<SargableQuery>()
+                    .expect("query should be a SargableQuery")
+                {
+                    SargableQuery::LikePrefix(prefix) => assert_eq!(prefix, expected),
+                    _ => panic!("expected a LikePrefix query"),
+                }
+            };
+
+        // starts_with(col, <Utf8View prefix>) -> LikePrefix(Utf8). Reuse a real
+        // `starts_with` UDF parsed from SQL, then swap in a `Utf8View` literal argument.
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8View, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+        let Expr::ScalarFunction(starts_with) = state
+            .create_logical_expr("starts_with(color, 'foo')", &df_schema)
+            .unwrap()
+        else {
+            panic!("expected starts_with to parse as a scalar function");
+        };
+        let args = vec![
+            starts_with.args[0].clone(),
+            Expr::Literal(ScalarValue::Utf8View(Some("foo".to_string())), None),
+        ];
+        let indexed = parser
+            .visit_scalar_function(
+                "color",
+                &DataType::Utf8View,
+                starts_with.func.as_ref(),
+                &args,
+            )
+            .expect("starts_with should use the BTree index");
+        assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), false);
+
+        // col LIKE <Utf8View pattern>. `visit_like` is called directly so the test does not
+        // depend on DataFusion's LIKE type coercion choosing `Utf8View` for the pattern.
+        let like = |pattern: ScalarValue| {
+            Like::new(
+                false,
+                Box::new(Expr::Column(Column::new_unqualified("color"))),
+                Box::new(Expr::Literal(pattern, None)),
+                None,
+                false,
+            )
+        };
+
+        // Pure prefix: routed to the index with no recheck needed.
+        let pattern = ScalarValue::Utf8View(Some("foo%".to_string()));
+        let indexed = parser
+            .visit_like("color", &like(pattern.clone()), &pattern)
+            .expect("LIKE prefix should use the BTree index");
+        assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), false);
+
+        // Wildcards beyond the leading prefix keep the original LIKE as a recheck.
+        let pattern = ScalarValue::Utf8View(Some("foo%bar%".to_string()));
+        let indexed = parser
+            .visit_like("color", &like(pattern.clone()), &pattern)
+            .expect("LIKE prefix should use the BTree index");
+        assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), true);
+
+        // Parity control: the pre-existing `Utf8` path is unchanged.
+        let pattern = ScalarValue::Utf8(Some("foo%".to_string()));
+        let indexed = parser
+            .visit_like("color", &like(pattern.clone()), &pattern)
+            .expect("LIKE prefix should use the BTree index");
+        assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), false);
+    }
+
+    #[test]
+    fn test_sargable_query_parser_without_like_prefix() {
+        // Bitmap indexes configure the parser with `without_like_prefix`: a bitmap index
+        // cannot answer `LikePrefix` queries (its `search` rejects them), so `starts_with` /
+        // `LIKE 'prefix%'` must not be turned into an index query. Returning `None` lets the
+        // predicate fall back to ordinary filtering instead of failing at search time.
+        let bitmap_parser =
+            SargableQueryParser::new("color_idx".to_string(), "BITMAP".to_string(), false)
+                .without_like_prefix();
+        let btree_parser =
+            SargableQueryParser::new("color_idx".to_string(), "BTree".to_string(), false);
+
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+        let Expr::ScalarFunction(starts_with) = state
+            .create_logical_expr("starts_with(color, 'foo')", &df_schema)
+            .unwrap()
+        else {
+            panic!("expected starts_with to parse as a scalar function");
+        };
+
+        let pattern = ScalarValue::Utf8(Some("foo%".to_string()));
+        let like = Like::new(
+            false,
+            Box::new(Expr::Column(Column::new_unqualified("color"))),
+            Box::new(Expr::Literal(pattern.clone(), None)),
+            None,
+            false,
+        );
+
+        // Bitmap parser: both prefix paths fall back (return `None`).
+        assert!(
+            bitmap_parser
+                .visit_scalar_function(
+                    "color",
+                    &DataType::Utf8,
+                    starts_with.func.as_ref(),
+                    &starts_with.args,
+                )
+                .is_none(),
+            "bitmap parser must not emit a LikePrefix for starts_with"
+        );
+        assert!(
+            bitmap_parser.visit_like("color", &like, &pattern).is_none(),
+            "bitmap parser must not emit a LikePrefix for LIKE"
+        );
+
+        // A prefix-capable parser (e.g. BTree) still emits the index query.
+        assert!(
+            btree_parser
+                .visit_scalar_function(
+                    "color",
+                    &DataType::Utf8,
+                    starts_with.func.as_ref(),
+                    &starts_with.args,
+                )
+                .is_some(),
+            "BTree parser should still emit a LikePrefix for starts_with"
+        );
+        assert!(
+            btree_parser.visit_like("color", &like, &pattern).is_some(),
+            "BTree parser should still emit a LikePrefix for LIKE"
+        );
     }
 
     #[test]
@@ -3437,5 +4222,1474 @@ mod tests {
 
         // Query against an unindexed path must not bind to either index.
         check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
+    }
+
+    #[test]
+    fn test_optimize_nested_and_tree() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // Simulate: AND(AND(fqdn@idx_fqdn, log_time >= X @idx_time), AND(log_time <= Y @idx_time, channel@idx_ch))
+        let fqdn_query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "fqdn".to_string(),
+            index_name: "fqdn_idx".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                "eng.bhd.0068".to_string(),
+            )))),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let time_gte = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "log_time".to_string(),
+            index_name: "log_time_idx".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(100))),
+                Bound::Unbounded,
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let time_lte = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "log_time".to_string(),
+            index_name: "log_time_idx".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(200))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let channel_query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "channel".to_string(),
+            index_name: "channel_idx".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                "/ados/node/monitor".to_string(),
+            )))),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        // Build nested AND: AND(AND(fqdn, time_gte), AND(time_lte, channel))
+        let nested = ScalarIndexExpr::And(
+            Box::new(ScalarIndexExpr::And(
+                Box::new(fqdn_query),
+                Box::new(time_gte),
+            )),
+            Box::new(ScalarIndexExpr::And(
+                Box::new(time_lte),
+                Box::new(channel_query),
+            )),
+        );
+
+        // Optimize should merge time_gte + time_lte into a single Range
+        let optimized = nested.optimize();
+
+        // The optimized tree should contain a merged Range(Included(100), Included(200))
+        // and the other queries as separate leaves
+        // Let's verify by collecting leaves
+        let mut leaves = Vec::new();
+        optimized.collect_and_leaves(&mut leaves, true);
+
+        // Should have 3 leaves: fqdn, merged_time, channel
+        assert_eq!(
+            leaves.len(),
+            3,
+            "Expected 3 leaves after merge, got: {:?}",
+            leaves
+        );
+
+        // Find the merged time query
+        let time_query = leaves
+            .iter()
+            .find(|l| {
+                if let ScalarIndexExpr::Query(s) = l {
+                    s.index_name == "log_time_idx"
+                } else {
+                    false
+                }
+            })
+            .expect("Should have a log_time query");
+
+        if let ScalarIndexExpr::Query(s) = time_query {
+            let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+            assert_eq!(
+                *range,
+                SargableQuery::Range(
+                    Bound::Included(ScalarValue::Int64(Some(100))),
+                    Bound::Included(ScalarValue::Int64(Some(200))),
+                ),
+                "Range should be merged into closed interval"
+            );
+        }
+    }
+
+    #[test]
+    fn test_optimize_no_merge_different_indexes() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // Two range queries on DIFFERENT indexes should NOT be merged
+        let range_a = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "a".to_string(),
+            index_name: "idx_a".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(10))),
+                Bound::Unbounded,
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let range_b = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "b".to_string(),
+            index_name: "idx_b".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(100))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let expr = ScalarIndexExpr::And(Box::new(range_a), Box::new(range_b));
+        let optimized = expr.optimize();
+
+        // Should remain as two separate leaves (not merged)
+        let mut leaves = Vec::new();
+        optimized.collect_and_leaves(&mut leaves, true);
+        assert_eq!(leaves.len(), 2);
+    }
+
+    #[test]
+    fn test_optimize_no_merge_non_range() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // Equals + Range on same index should NOT merge
+        let eq_query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::Int64(Some(42)))),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let range_query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(100))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let expr = ScalarIndexExpr::And(Box::new(eq_query), Box::new(range_query));
+        let optimized = expr.optimize();
+
+        let mut leaves = Vec::new();
+        optimized.collect_and_leaves(&mut leaves, true);
+        assert_eq!(leaves.len(), 2, "Equals + Range should not merge");
+    }
+
+    #[test]
+    fn test_optimize_exclusive_bounds() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // x > 10 AND x < 20 → Range(Excluded(10), Excluded(20))
+        let gt = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int64(Some(10))),
+                Bound::Unbounded,
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let lt = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int64(Some(20))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let expr = ScalarIndexExpr::And(Box::new(gt), Box::new(lt));
+        let optimized = expr.optimize();
+
+        let mut leaves = Vec::new();
+        optimized.collect_and_leaves(&mut leaves, true);
+        assert_eq!(leaves.len(), 1);
+
+        if let ScalarIndexExpr::Query(s) = &leaves[0] {
+            let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+            assert_eq!(
+                *range,
+                SargableQuery::Range(
+                    Bound::Excluded(ScalarValue::Int64(Some(10))),
+                    Bound::Excluded(ScalarValue::Int64(Some(20))),
+                )
+            );
+        } else {
+            panic!("Expected a Query leaf");
+        }
+    }
+
+    #[test]
+    fn test_optimize_preserves_or_and_not() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // AND(OR(a, b), Range_gte, Range_lte)
+        // OR node should be preserved, ranges should merge
+        let or_node = ScalarIndexExpr::Or(
+            Box::new(ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "c".to_string(),
+                index_name: "idx_c".to_string(),
+                index_type: "".to_string(),
+                query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                    "a".to_string(),
+                )))),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            })),
+            Box::new(ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "c".to_string(),
+                index_name: "idx_c".to_string(),
+                index_type: "".to_string(),
+                query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                    "b".to_string(),
+                )))),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            })),
+        );
+        let range_gte = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "t".to_string(),
+            index_name: "idx_t".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(5))),
+                Bound::Unbounded,
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let range_lte = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "t".to_string(),
+            index_name: "idx_t".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(50))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let expr = ScalarIndexExpr::And(
+            Box::new(ScalarIndexExpr::And(Box::new(or_node), Box::new(range_gte))),
+            Box::new(range_lte),
+        );
+        let optimized = expr.optimize();
+
+        let mut leaves = Vec::new();
+        optimized.collect_and_leaves(&mut leaves, true);
+        // Should have 2 leaves: OR node (preserved) + merged range
+        assert_eq!(leaves.len(), 2);
+
+        // One leaf should be the merged range
+        let merged = leaves
+            .iter()
+            .find(|l| matches!(l, ScalarIndexExpr::Query(s) if s.index_name == "idx_t"))
+            .expect("Should have merged range");
+
+        if let ScalarIndexExpr::Query(s) = merged {
+            let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+            assert_eq!(
+                *range,
+                SargableQuery::Range(
+                    Bound::Included(ScalarValue::Int64(Some(5))),
+                    Bound::Included(ScalarValue::Int64(Some(50))),
+                )
+            );
+        }
+
+        // Other leaf should be the OR node
+        assert!(
+            leaves
+                .iter()
+                .any(|l| matches!(l, ScalarIndexExpr::Or(_, _)))
+        );
+    }
+
+    #[test]
+    fn test_optimize_respects_fragment_coverage_when_merging_ranges() {
+        let fragments = RoaringBitmap::from_iter([1, 3, 5]);
+        let lower = test_scalar_range_with_metadata(
+            Bound::Included(ScalarValue::Int64(Some(1))),
+            Bound::Unbounded,
+            true,
+            Some(fragments.clone()),
+        );
+        let upper = test_scalar_range_with_metadata(
+            Bound::Unbounded,
+            Bound::Included(ScalarValue::Int64(Some(99))),
+            false,
+            Some(fragments.clone()),
+        );
+
+        let leaves = collect_test_and_leaves(test_and_terms(vec![lower.clone(), upper]).optimize());
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Query(search)
+                if search.needs_recheck
+                    && search.fragment_bitmap.as_ref() == Some(&fragments)
+                    && matches!(
+                        search.sargable_query(),
+                        Some(SargableQuery::Range(
+                            Bound::Included(ScalarValue::Int64(Some(1))),
+                            Bound::Included(ScalarValue::Int64(Some(99))),
+                        ))
+                    )
+        ));
+
+        let upper_without_coverage = test_scalar_range_with_metadata(
+            Bound::Unbounded,
+            Bound::Included(ScalarValue::Int64(Some(99))),
+            false,
+            None,
+        );
+        for (lhs, rhs) in [
+            (lower.clone(), upper_without_coverage.clone()),
+            (upper_without_coverage, lower),
+        ] {
+            let optimized = ScalarIndexExpr::And(Box::new(lhs), Box::new(rhs)).optimize();
+            let leaves = collect_test_and_leaves(optimized);
+            assert_eq!(leaves.len(), 2);
+            assert!(leaves.iter().any(|leaf| {
+                matches!(leaf, ScalarIndexExpr::Query(search)
+                    if search.needs_recheck
+                        && search.fragment_bitmap.as_ref() == Some(&fragments))
+            }));
+            assert!(leaves.iter().any(|leaf| {
+                matches!(leaf, ScalarIndexExpr::Query(search)
+                    if !search.needs_recheck && search.fragment_bitmap.is_none())
+            }));
+        }
+    }
+
+    #[test]
+    fn test_optimize_merges_recheck_ranges_into_empty_range() {
+        let lower = test_scalar_query_with_recheck(
+            "x",
+            "idx_x",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(200))),
+                Bound::Unbounded,
+            ),
+        );
+        let upper = test_scalar_query_with_recheck(
+            "x",
+            "idx_x",
+            SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(100))),
+            ),
+        );
+
+        let leaves = collect_test_and_leaves(test_and_terms(vec![lower, upper]).optimize());
+
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Query(search)
+                if search.needs_recheck
+                    && matches!(
+                        search.sargable_query(),
+                        Some(SargableQuery::Range(
+                            Bound::Included(ScalarValue::Int64(Some(200))),
+                            Bound::Included(ScalarValue::Int64(Some(100))),
+                        ))
+                    )
+        ));
+    }
+
+    fn test_scalar_query(column: &str, index_name: &str, query: SargableQuery) -> ScalarIndexExpr {
+        ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column.to_string(),
+            index_name: index_name.to_string(),
+            index_type: "BTree".to_string(),
+            query: Arc::new(query),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        })
+    }
+
+    fn test_scalar_query_with_recheck(
+        column: &str,
+        index_name: &str,
+        query: SargableQuery,
+    ) -> ScalarIndexExpr {
+        ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column.to_string(),
+            index_name: index_name.to_string(),
+            index_type: "ZoneMap".to_string(),
+            query: Arc::new(query),
+            needs_recheck: true,
+            fragment_bitmap: None,
+        })
+    }
+
+    fn test_scalar_range(
+        column: &str,
+        index_name: &str,
+        lower: Bound<ScalarValue>,
+        upper: Bound<ScalarValue>,
+    ) -> ScalarIndexExpr {
+        test_scalar_query(column, index_name, SargableQuery::Range(lower, upper))
+    }
+
+    fn test_scalar_range_with_metadata(
+        lower: Bound<ScalarValue>,
+        upper: Bound<ScalarValue>,
+        needs_recheck: bool,
+        fragment_bitmap: Option<RoaringBitmap>,
+    ) -> ScalarIndexExpr {
+        ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "ZoneMap".to_string(),
+            query: Arc::new(SargableQuery::Range(lower, upper)),
+            needs_recheck,
+            fragment_bitmap,
+        })
+    }
+
+    fn test_and_terms(mut terms: Vec<ScalarIndexExpr>) -> ScalarIndexExpr {
+        assert!(!terms.is_empty());
+        while terms.len() > 1 {
+            let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+            let mut iter = terms.into_iter();
+            while let Some(lhs) = iter.next() {
+                if let Some(rhs) = iter.next() {
+                    next.push(ScalarIndexExpr::And(Box::new(lhs), Box::new(rhs)));
+                } else {
+                    next.push(lhs);
+                }
+            }
+            terms = next;
+        }
+        terms.pop().unwrap()
+    }
+
+    fn collect_test_and_leaves(expr: ScalarIndexExpr) -> Vec<ScalarIndexExpr> {
+        let mut leaves = Vec::new();
+        expr.collect_and_leaves(&mut leaves, true);
+        leaves
+    }
+
+    fn test_and_depth(expr: &ScalarIndexExpr) -> usize {
+        match expr {
+            ScalarIndexExpr::And(lhs, rhs) => 1 + test_and_depth(lhs).max(test_and_depth(rhs)),
+            ScalarIndexExpr::Or(lhs, rhs) => test_and_depth(lhs).max(test_and_depth(rhs)),
+            ScalarIndexExpr::Not(inner) => test_and_depth(inner),
+            ScalarIndexExpr::Query(_) => 0,
+        }
+    }
+
+    fn balanced_depth_bound(mut term_count: usize) -> usize {
+        let mut depth = 0;
+        while term_count > 1 {
+            term_count = term_count.div_ceil(2);
+            depth += 1;
+        }
+        depth
+    }
+
+    fn int64_index_info(index_type: &str, needs_recheck: bool) -> MockIndexInfoProvider {
+        let parser = |column: &str| {
+            ColInfo::new(
+                DataType::Int64,
+                Box::new(SargableQueryParser::new(
+                    format!("{}_idx", column),
+                    index_type.to_string(),
+                    needs_recheck,
+                )),
+            )
+        };
+        MockIndexInfoProvider::new(vec![("x", parser("x")), ("y", parser("y"))])
+    }
+
+    fn parse_int64_filter(
+        expr: &str,
+        index_info: &dyn IndexInformationProvider,
+    ) -> IndexedExpression {
+        let schema = Schema::new(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("y", DataType::Int64, true),
+        ]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+        let expr = state.create_logical_expr(expr, &df_schema).unwrap();
+        apply_scalar_indices(expr, index_info).unwrap()
+    }
+
+    fn optimize_parsed_scalar_filter(
+        expr: &str,
+        index_info: &dyn IndexInformationProvider,
+    ) -> Vec<ScalarIndexExpr> {
+        let indexed = parse_int64_filter(expr, index_info);
+        collect_test_and_leaves(indexed.scalar_query.unwrap().optimize())
+    }
+
+    #[test]
+    fn test_optimize_does_not_remove_is_not_null_for_recheck_range() {
+        let is_not_null = ScalarIndexExpr::Not(Box::new(test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::IsNull(),
+        )));
+        let mut range = test_scalar_range(
+            "x",
+            "idx_x",
+            Bound::Included(ScalarValue::Int64(Some(10))),
+            Bound::Unbounded,
+        );
+        let ScalarIndexExpr::Query(search) = &mut range else {
+            panic!("expected a range query");
+        };
+        search.needs_recheck = true;
+
+        let leaves = collect_test_and_leaves(test_and_terms(vec![is_not_null, range]).optimize());
+
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Not(inner)
+                    if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
+                        if matches!(search.sargable_query(), Some(SargableQuery::IsNull()))
+                            && !search.needs_recheck)
+            )
+        }));
+    }
+
+    #[test]
+    fn test_optimize_does_not_remove_is_not_null_across_or() {
+        let is_not_null = ScalarIndexExpr::Not(Box::new(test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::IsNull(),
+        )));
+        let range = test_scalar_range(
+            "x",
+            "idx_x",
+            Bound::Included(ScalarValue::Int64(Some(10))),
+            Bound::Unbounded,
+        );
+        let other = test_scalar_query(
+            "y",
+            "idx_y",
+            SargableQuery::Equals(ScalarValue::Int64(Some(1))),
+        );
+        let disjunction = ScalarIndexExpr::Or(Box::new(range), Box::new(other));
+
+        let leaves = collect_test_and_leaves(
+            ScalarIndexExpr::And(Box::new(is_not_null), Box::new(disjunction)).optimize(),
+        );
+
+        assert_eq!(leaves.len(), 2);
+        assert!(
+            leaves
+                .iter()
+                .any(|leaf| matches!(leaf, ScalarIndexExpr::Not(_)))
+        );
+        assert!(
+            leaves
+                .iter()
+                .any(|leaf| matches!(leaf, ScalarIndexExpr::Or(_, _)))
+        );
+    }
+
+    #[test]
+    fn test_optimize_does_not_remove_is_not_null_for_different_index() {
+        let is_not_null = ScalarIndexExpr::Not(Box::new(test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::IsNull(),
+        )));
+        let range = test_scalar_range(
+            "x",
+            "idx_x_other",
+            Bound::Included(ScalarValue::Int64(Some(10))),
+            Bound::Unbounded,
+        );
+
+        let leaves = collect_test_and_leaves(
+            ScalarIndexExpr::And(Box::new(is_not_null), Box::new(range)).optimize(),
+        );
+
+        assert_eq!(leaves.len(), 2);
+        assert!(
+            leaves
+                .iter()
+                .any(|leaf| matches!(leaf, ScalarIndexExpr::Not(_)))
+        );
+    }
+
+    #[test]
+    fn test_optimize_does_not_merge_different_index_types() {
+        let range = |index_type: &str, lower, upper| {
+            ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "x".to_string(),
+                index_name: "idx_x".to_string(),
+                index_type: index_type.to_string(),
+                query: Arc::new(SargableQuery::Range(lower, upper)),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            })
+        };
+        let btree = range(
+            "BTree",
+            Bound::Included(ScalarValue::Int64(Some(10))),
+            Bound::Unbounded,
+        );
+        let zone_map = range(
+            "ZoneMap",
+            Bound::Unbounded,
+            Bound::Included(ScalarValue::Int64(Some(20))),
+        );
+
+        let leaves = collect_test_and_leaves(test_and_terms(vec![btree, zone_map]).optimize());
+
+        assert_eq!(leaves.len(), 2);
+    }
+
+    #[test]
+    fn test_optimize_parser_exact_removes_is_not_null_and_merges_ranges() {
+        let index_info = int64_index_info("BTree", false);
+
+        let leaves = optimize_parsed_scalar_filter(
+            "x IS NOT NULL AND y = 1 AND x >= 10 AND x <= 20",
+            &index_info,
+        );
+
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "x"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Included(ScalarValue::Int64(Some(10))),
+                                Bound::Included(ScalarValue::Int64(Some(20))),
+                            ))
+                        )
+            )
+        }));
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "y"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Equals(ScalarValue::Int64(Some(1))))
+                        )
+            )
+        }));
+        assert!(
+            !leaves
+                .iter()
+                .any(|leaf| matches!(leaf, ScalarIndexExpr::Not(_)))
+        );
+    }
+
+    #[test]
+    fn test_optimize_parser_merges_ranges_for_multiple_columns() {
+        let index_info = int64_index_info("BTree", false);
+
+        let leaves =
+            optimize_parsed_scalar_filter("x > 10 AND x < 20 AND y > 30 AND y < 40", &index_info);
+
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "x"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Excluded(ScalarValue::Int64(Some(10))),
+                                Bound::Excluded(ScalarValue::Int64(Some(20))),
+                            ))
+                        )
+            )
+        }));
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "y"
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Excluded(ScalarValue::Int64(Some(30))),
+                                Bound::Excluded(ScalarValue::Int64(Some(40))),
+                            ))
+                        )
+            )
+        }));
+    }
+
+    #[test]
+    fn test_optimize_parser_preserves_standalone_null_checks() {
+        let index_info = int64_index_info("BTree", false);
+
+        let is_not_null = optimize_parsed_scalar_filter("x IS NOT NULL", &index_info);
+        assert_eq!(is_not_null.len(), 1);
+        assert!(matches!(&is_not_null[0], ScalarIndexExpr::Not(_)));
+
+        let is_null = optimize_parsed_scalar_filter("x IS NULL", &index_info);
+        assert_eq!(is_null.len(), 1);
+        assert!(matches!(
+            &is_null[0],
+            ScalarIndexExpr::Query(search)
+                if matches!(search.sargable_query(), Some(SargableQuery::IsNull()))
+        ));
+    }
+
+    #[test]
+    fn test_optimize_parser_does_not_remove_is_not_null_for_different_column() {
+        let index_info = int64_index_info("BTree", false);
+
+        let leaves = optimize_parsed_scalar_filter("x IS NOT NULL AND y >= 10", &index_info);
+
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Not(inner)
+                    if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
+                        if search.column == "x"
+                            && matches!(search.sargable_query(), Some(SargableQuery::IsNull())))
+            )
+        }));
+    }
+
+    #[test]
+    fn test_optimize_parser_handles_in_list_null_semantics() {
+        let index_info = int64_index_info("BTree", false);
+
+        let leaves = optimize_parsed_scalar_filter("x IS NOT NULL AND x IN (1, 2)", &index_info);
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Query(search)
+                if matches!(search.sargable_query(), Some(SargableQuery::IsIn(values)) if values.len() == 2)
+        ));
+
+        let indexed = parse_int64_filter("x IS NOT NULL AND x IN (1, NULL)", &index_info);
+        assert!(indexed.refine_expr.is_some());
+        let leaves = collect_test_and_leaves(indexed.scalar_query.unwrap().optimize());
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(&leaves[0], ScalarIndexExpr::Not(_)));
+    }
+
+    #[test]
+    fn test_optimize_parser_removes_is_not_null_from_not_equal() {
+        let index_info = int64_index_info("BTree", false);
+
+        let leaves = optimize_parsed_scalar_filter("x IS NOT NULL AND x != 5", &index_info);
+
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Not(inner)
+                if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
+                    if matches!(search.sargable_query(), Some(SargableQuery::Equals(value))
+                        if *value == ScalarValue::Int64(Some(5))))
+        ));
+    }
+
+    #[test]
+    fn test_optimize_parser_removes_is_not_null_from_not_in_list() {
+        let index_info = int64_index_info("BTree", false);
+
+        // The signed-zero rewrite turns `x != 0.0` into this shape, and it is just
+        // as null-intolerant as `x != 5`.
+        let leaves =
+            optimize_parsed_scalar_filter("x IS NOT NULL AND x NOT IN (1, 2)", &index_info);
+
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Not(inner)
+                if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
+                    if matches!(search.sargable_query(), Some(SargableQuery::IsIn(values))
+                        if values.len() == 2))
+        ));
+    }
+
+    #[test]
+    fn test_optimize_parser_merges_recheck_ranges() {
+        let index_info = int64_index_info("ZoneMap", true);
+
+        let leaves = optimize_parsed_scalar_filter("x >= 10 AND y = 1 AND x <= 20", &index_info);
+
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Query(search)
+                    if search.column == "x"
+                        && search.needs_recheck
+                        && matches!(
+                            search.sargable_query(),
+                            Some(SargableQuery::Range(
+                                Bound::Included(ScalarValue::Int64(Some(10))),
+                                Bound::Included(ScalarValue::Int64(Some(20))),
+                            ))
+                        )
+            )
+        }));
+    }
+
+    #[test]
+    fn test_optimize_parser_keeps_recheck_is_not_null_as_refine() {
+        let index_info = int64_index_info("ZoneMap", true);
+
+        let indexed = parse_int64_filter("x IS NOT NULL AND x >= 10", &index_info);
+
+        assert!(indexed.scalar_query.is_some());
+        assert!(matches!(
+            indexed.refine_expr.as_ref(),
+            Some(Expr::IsNotNull(expr))
+                if matches!(expr.as_ref(), Expr::Column(column) if column.name == "x")
+        ));
+        let leaves = collect_test_and_leaves(indexed.scalar_query.unwrap().optimize());
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Query(search)
+                if search.needs_recheck
+                    && matches!(search.sargable_query(), Some(SargableQuery::Range(_, _)))
+        ));
+    }
+
+    #[test]
+    fn test_optimize_preserves_balanced_depth_for_unmerged_terms() {
+        let term_count = 2048;
+        let terms = (0..term_count)
+            .map(|value| {
+                test_scalar_query(
+                    "x",
+                    "idx_x",
+                    SargableQuery::Equals(ScalarValue::Int64(Some(value))),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let optimized = test_and_terms(terms).optimize();
+
+        assert_eq!(
+            collect_test_and_leaves(optimized.clone()).len(),
+            term_count as usize
+        );
+        assert!(
+            test_and_depth(&optimized) <= balanced_depth_bound(term_count as usize),
+            "optimized AND depth should stay balanced, got {} for {} terms",
+            test_and_depth(&optimized),
+            term_count
+        );
+    }
+
+    #[test]
+    fn test_optimize_merges_ranges_inside_not() {
+        let lower = test_scalar_range(
+            "x",
+            "idx_x",
+            Bound::Included(ScalarValue::Int64(Some(10))),
+            Bound::Unbounded,
+        );
+        let upper = test_scalar_range(
+            "x",
+            "idx_x",
+            Bound::Unbounded,
+            Bound::Included(ScalarValue::Int64(Some(20))),
+        );
+        let sibling = test_scalar_query(
+            "y",
+            "idx_y",
+            SargableQuery::Equals(ScalarValue::Int64(Some(1))),
+        );
+
+        let nested_not = ScalarIndexExpr::Not(Box::new(test_and_terms(vec![lower, upper])));
+        let optimized = ScalarIndexExpr::And(Box::new(nested_not), Box::new(sibling)).optimize();
+
+        let ScalarIndexExpr::And(nested_not, _) = optimized else {
+            panic!("expected outer AND expression");
+        };
+        let ScalarIndexExpr::Not(inner) = *nested_not else {
+            panic!("expected NOT expression");
+        };
+        let leaves = collect_test_and_leaves(*inner);
+
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Query(search)
+                if matches!(
+                    search.sargable_query(),
+                    Some(SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(10))),
+                        Bound::Included(ScalarValue::Int64(Some(20))),
+                    ))
+                )
+        ));
+    }
+
+    #[test]
+    fn test_optimize_does_not_remove_is_not_null_inside_not() {
+        let is_not_null = ScalarIndexExpr::Not(Box::new(test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::IsNull(),
+        )));
+        let range = test_scalar_range(
+            "x",
+            "idx_x",
+            Bound::Included(ScalarValue::Int64(Some(10))),
+            Bound::Unbounded,
+        );
+        let guarded_range = test_and_terms(vec![is_not_null, range]);
+        let alternative = test_scalar_query(
+            "y",
+            "idx_y",
+            SargableQuery::Equals(ScalarValue::Int64(Some(1))),
+        );
+        let or = ScalarIndexExpr::Or(Box::new(guarded_range), Box::new(alternative));
+        let sibling = test_scalar_query(
+            "z",
+            "idx_z",
+            SargableQuery::Equals(ScalarValue::Int64(Some(2))),
+        );
+        let outer_sibling = test_scalar_query(
+            "w",
+            "idx_w",
+            SargableQuery::Equals(ScalarValue::Int64(Some(3))),
+        );
+
+        let nested_not = ScalarIndexExpr::Not(Box::new(test_and_terms(vec![or, sibling])));
+        let optimized =
+            ScalarIndexExpr::And(Box::new(nested_not), Box::new(outer_sibling)).optimize();
+
+        let ScalarIndexExpr::And(nested_not, _) = optimized else {
+            panic!("expected outer AND expression");
+        };
+        let ScalarIndexExpr::Not(inner) = *nested_not else {
+            panic!("expected NOT expression");
+        };
+        let ScalarIndexExpr::And(or, _) = *inner else {
+            panic!("expected AND expression");
+        };
+        let ScalarIndexExpr::Or(lhs, _) = *or else {
+            panic!("expected OR expression");
+        };
+        let leaves = collect_test_and_leaves(*lhs);
+
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Not(inner)
+                    if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
+                        if matches!(search.sargable_query(), Some(SargableQuery::IsNull())))
+            )
+        }));
+    }
+
+    #[test]
+    fn test_optimize_single_query_passthrough() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // A single query (not in AND) should pass through unchanged
+        let single = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(1))),
+                Bound::Unbounded,
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let optimized = single.clone().optimize();
+        assert_eq!(optimized, single);
+    }
+
+    #[test]
+    fn test_optimize_complex_nested_cases() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        let make_range =
+            |col: &str, idx: &str, low: Bound<ScalarValue>, high: Bound<ScalarValue>| {
+                ScalarIndexExpr::Query(ScalarIndexSearch {
+                    column: col.to_string(),
+                    index_name: idx.to_string(),
+                    index_type: "".to_string(),
+                    query: Arc::new(SargableQuery::Range(low, high)),
+                    needs_recheck: false,
+                    fragment_bitmap: None,
+                })
+            };
+        let make_eq = |col: &str, idx: &str, val: ScalarValue| {
+            ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: col.to_string(),
+                index_name: idx.to_string(),
+                index_type: "".to_string(),
+                query: Arc::new(SargableQuery::Equals(val)),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            })
+        };
+
+        // Case 1: Multiple ranges on same index should all merge
+        // x >= 10 AND x <= 200 AND x >= 50 AND x <= 100 → Range(50, 100)
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_range(
+                        "x",
+                        "idx_x",
+                        Bound::Included(ScalarValue::Int64(Some(10))),
+                        Bound::Unbounded,
+                    )),
+                    Box::new(make_range(
+                        "x",
+                        "idx_x",
+                        Bound::Unbounded,
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                    )),
+                )),
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_range(
+                        "x",
+                        "idx_x",
+                        Bound::Included(ScalarValue::Int64(Some(50))),
+                        Bound::Unbounded,
+                    )),
+                    Box::new(make_range(
+                        "x",
+                        "idx_x",
+                        Bound::Unbounded,
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                    )),
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves, true);
+            assert_eq!(leaves.len(), 1, "All 4 ranges should merge into 1");
+
+            if let ScalarIndexExpr::Query(s) = &leaves[0] {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(50))),
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                    )
+                );
+            } else {
+                panic!("Expected merged Query");
+            }
+        }
+
+        // Case 2: NOT(range) should NOT be merged with sibling range
+        // AND(NOT(x >= 10), x <= 20) → stays as 2 leaves
+        {
+            let not_node = ScalarIndexExpr::Not(Box::new(make_range(
+                "x",
+                "idx_x",
+                Bound::Included(ScalarValue::Int64(Some(10))),
+                Bound::Unbounded,
+            )));
+            let range_lte = make_range(
+                "x",
+                "idx_x",
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(20))),
+            );
+
+            let expr = ScalarIndexExpr::And(Box::new(not_node), Box::new(range_lte));
+            let optimized = expr.optimize();
+
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves, true);
+            assert_eq!(
+                leaves.len(),
+                2,
+                "NOT(range) should not merge with sibling range"
+            );
+            assert!(leaves.iter().any(|l| matches!(l, ScalarIndexExpr::Not(_))));
+        }
+
+        // Case 3: Ranges inside OR branches get optimized independently
+        // OR(AND(x >= 10, x <= 20), AND(x >= 30, x <= 40))
+        {
+            let branch1 = ScalarIndexExpr::And(
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(10))),
+                    Bound::Unbounded,
+                )),
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Unbounded,
+                    Bound::Included(ScalarValue::Int64(Some(20))),
+                )),
+            );
+            let branch2 = ScalarIndexExpr::And(
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(30))),
+                    Bound::Unbounded,
+                )),
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Unbounded,
+                    Bound::Included(ScalarValue::Int64(Some(40))),
+                )),
+            );
+
+            let expr = ScalarIndexExpr::Or(Box::new(branch1), Box::new(branch2));
+            let optimized = expr.optimize();
+
+            // Top level should still be OR
+            if let ScalarIndexExpr::Or(lhs, rhs) = &optimized {
+                // Each branch should be a single merged range
+                let mut left_leaves = Vec::new();
+                lhs.clone().collect_and_leaves(&mut left_leaves, true);
+                assert_eq!(
+                    left_leaves.len(),
+                    1,
+                    "Left OR branch should have merged range"
+                );
+                if let ScalarIndexExpr::Query(s) = &left_leaves[0] {
+                    let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                    assert_eq!(
+                        *range,
+                        SargableQuery::Range(
+                            Bound::Included(ScalarValue::Int64(Some(10))),
+                            Bound::Included(ScalarValue::Int64(Some(20))),
+                        )
+                    );
+                }
+
+                let mut right_leaves = Vec::new();
+                rhs.clone().collect_and_leaves(&mut right_leaves, true);
+                assert_eq!(
+                    right_leaves.len(),
+                    1,
+                    "Right OR branch should have merged range"
+                );
+                if let ScalarIndexExpr::Query(s) = &right_leaves[0] {
+                    let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                    assert_eq!(
+                        *range,
+                        SargableQuery::Range(
+                            Bound::Included(ScalarValue::Int64(Some(30))),
+                            Bound::Included(ScalarValue::Int64(Some(40))),
+                        )
+                    );
+                }
+            } else {
+                panic!("Expected OR at top level");
+            }
+        }
+
+        // Case 4: Multiple indexes, each with its own range pair
+        // AND(a >= 1, a <= 10, b >= 100, b <= 200)
+        // → merged into: AND(a in [1,10], b in [100,200])
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_range(
+                        "a",
+                        "idx_a",
+                        Bound::Included(ScalarValue::Int64(Some(1))),
+                        Bound::Unbounded,
+                    )),
+                    Box::new(make_range(
+                        "a",
+                        "idx_a",
+                        Bound::Unbounded,
+                        Bound::Included(ScalarValue::Int64(Some(10))),
+                    )),
+                )),
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_range(
+                        "b",
+                        "idx_b",
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                        Bound::Unbounded,
+                    )),
+                    Box::new(make_range(
+                        "b",
+                        "idx_b",
+                        Bound::Unbounded,
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                    )),
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves, true);
+            assert_eq!(
+                leaves.len(),
+                2,
+                "Two indexes should each merge independently"
+            );
+
+            let a_leaf = leaves
+                .iter()
+                .find(|l| matches!(l, ScalarIndexExpr::Query(s) if s.index_name == "idx_a"))
+                .expect("Should have idx_a");
+            if let ScalarIndexExpr::Query(s) = a_leaf {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(1))),
+                        Bound::Included(ScalarValue::Int64(Some(10))),
+                    )
+                );
+            }
+
+            let b_leaf = leaves
+                .iter()
+                .find(|l| matches!(l, ScalarIndexExpr::Query(s) if s.index_name == "idx_b"))
+                .expect("Should have idx_b");
+            if let ScalarIndexExpr::Query(s) = b_leaf {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                    )
+                );
+            }
+        }
+
+        // Case 5: Mix of Equals and Range on different indexes
+        // AND(fqdn = 'x', time >= 100, time <= 200, channel = 'y')
+        // → AND(fqdn = 'x', time in [100,200], channel = 'y')
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_eq(
+                        "fqdn",
+                        "fqdn_idx",
+                        ScalarValue::Utf8(Some("x".to_string())),
+                    )),
+                    Box::new(make_range(
+                        "time",
+                        "time_idx",
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                        Bound::Unbounded,
+                    )),
+                )),
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_range(
+                        "time",
+                        "time_idx",
+                        Bound::Unbounded,
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                    )),
+                    Box::new(make_eq(
+                        "channel",
+                        "ch_idx",
+                        ScalarValue::Utf8(Some("y".to_string())),
+                    )),
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves, true);
+            assert_eq!(leaves.len(), 3, "fqdn + merged_time + channel = 3 leaves");
+
+            let time_leaf = leaves
+                .iter()
+                .find(|l| matches!(l, ScalarIndexExpr::Query(s) if s.index_name == "time_idx"))
+                .expect("Should have time query");
+            if let ScalarIndexExpr::Query(s) = time_leaf {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                    )
+                );
+            }
+        }
+
+        // Case 6: Overlapping closed ranges → takes intersection
+        // Range(10, 50) AND Range(30, 80) → Range(30, 50)
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(10))),
+                    Bound::Included(ScalarValue::Int64(Some(50))),
+                )),
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(30))),
+                    Bound::Included(ScalarValue::Int64(Some(80))),
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves, true);
+            assert_eq!(leaves.len(), 1);
+            if let ScalarIndexExpr::Query(s) = &leaves[0] {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(30))),
+                        Bound::Included(ScalarValue::Int64(Some(50))),
+                    )
+                );
+            }
+        }
+
+        // Case 7: Mixed Included/Excluded on same value
+        // x >= 5 AND x > 5 → Excluded(5) (stricter)
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(5))),
+                    Bound::Unbounded,
+                )),
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Excluded(ScalarValue::Int64(Some(5))),
+                    Bound::Unbounded,
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves, true);
+            assert_eq!(leaves.len(), 1);
+            if let ScalarIndexExpr::Query(s) = &leaves[0] {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Excluded(ScalarValue::Int64(Some(5))),
+                        Bound::Unbounded,
+                    )
+                );
+            }
+        }
+
+        // Case 8: Empty range (lower > upper) — still valid, just produces empty results
+        // x >= 200 AND x <= 100 → Range(Included(200), Included(100))
+        // BTree search will find 0 pages matching this, which is correct.
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(200))),
+                    Bound::Unbounded,
+                )),
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Unbounded,
+                    Bound::Included(ScalarValue::Int64(Some(100))),
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves, true);
+            assert_eq!(leaves.len(), 1);
+            if let ScalarIndexExpr::Query(s) = &leaves[0] {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                // Merged: lower=Included(200), upper=Included(100) — empty range, but valid
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                    )
+                );
+            }
+        }
     }
 }

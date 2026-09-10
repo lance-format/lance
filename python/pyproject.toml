@@ -1,7 +1,7 @@
 [project]
 name = "pylance"
 dynamic = ["version"]
-dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.8.5,<0.9"]
+dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.11.1,<0.12"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lance.org" }]
 license = { file = "LICENSE" }
@@ -49,21 +49,21 @@ build-backend = "maturin"
 [project.optional-dependencies]
 tests = [
     "boto3",
-    "datasets",
-    "duckdb",
+    "datasets==4.4.0",
+    "duckdb>=1.5.0,<1.6.0",
     "ml_dtypes",
     "pillow",
     "pandas",
     "polars[pyarrow,pandas]",
     "psutil",
     "pytest",
-    # Only test tensorflow on linux for now. We will deprecate tensorflow soon.
-    "tensorflow; sys_platform == 'linux'",
+    "pytest-xdist",
     "tqdm",
-    "datafusion>=53,<54",
+    "datafusion>=54,<55",
 ]
 dev = ["ruff==0.11.2", "pyright"]
 benchmarks = ["pytest-benchmark"]
+otel = ["opentelemetry-api", "opentelemetry-sdk"]
 torch = ["torch>=2.0"]
 geo = [
     "geoarrow-rust-core",
@@ -73,17 +73,18 @@ geo = [
 [dependency-groups]
 tests = [
     "boto3==1.40.43",
-    "datasets==4.1.1",
-    "duckdb==1.4.0",
+    "datasets==4.4.0",
+    "duckdb>=1.5.0,<1.6.0",
     "ml_dtypes==0.5.3",
     "pillow==11.3.0",
     "pandas==2.3.3",
     "polars[pyarrow,pandas]==1.34.0",
     "psutil==7.1.0",
     "pytest==8.4.2",
-    "tensorflow==2.20.0; sys_platform == 'linux'",
+    "pytest-xdist==3.8.0",
     "tqdm==4.67.1",
-    "datafusion==53.0.0",
+    "datafusion==54.0.0",
+    "opentelemetry-sdk==1.30.0",
 ]
 dev = [
     "maturin==1.13.3",
@@ -104,7 +105,7 @@ lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 "*.pyi" = ["E301", "E302"]
 
 [tool.pyright]
-pythonVersion = "3.13"
+pythonVersion = "3.14"
 # TODO: expand this list as we fix more files.
 include = [
     "python/lance/util.py",
@@ -112,8 +113,13 @@ include = [
     "python/lance/tracing.py",
     "python/lance/dependencies.py",
     "python/lance/schema.py",
+    "python/tests/test_schema.py",
     "python/lance/file.py",
     "python/lance/util.py",
+    "python/lance/arrow.py",
+    "python/tests/test_arrow.py",
+    "python/tests/test_fragment_typing.py",
+    "python/tests/test_udf.py",
 ]
 # Dependencies like pyarrow make this difficult to enforce strictly.
 reportMissingTypeStubs = "warning"
@@ -130,14 +136,10 @@ markers = [
     "gpu: tests which rely on pytorch and some kind of gpu",
     "slow",
     "torch: tests which rely on pytorch being installed",
-    "recurring: marks tests as recurring tests",
 ]
 filterwarnings = [
     'error::FutureWarning',
     'error::DeprecationWarning',
-    # TensorFlow import can emit NumPy deprecation FutureWarnings in some environments.
-    # We keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
-    'ignore:.*`np\\.object` will be defined as the corresponding NumPy scalar\\..*:FutureWarning',
     # Boto3
     'ignore:.*datetime\.datetime\.utcnow\(\) is deprecated.*:DeprecationWarning',
     # Hugging Face Hub calls this deprecated hf-xet API internally.
@@ -151,9 +153,8 @@ filterwarnings = [
     'ignore:.*the load_module\(\) method is deprecated.*:DeprecationWarning',
     # Pytorch uses deprecated jit.script_method internally (torch/utils/mkldnn.py)
     'ignore:.*torch\.jit\.script_method.*is deprecated.*:DeprecationWarning',
+    # Pytorch uses the same API internally on Python 3.14+ with a different warning message.
+    'ignore:.*torch\.jit\.script_method.*is not supported in Python 3\.14\+.*:DeprecationWarning',
     # huggingface_hub still calls the deprecated hf_xet.download_files() during Xet downloads
     'ignore:.*hf_xet\.download_files\(\) is deprecated.*:DeprecationWarning',
-    # TensorFlow/Keras import can emit NumPy deprecation FutureWarnings in some environments.
-    # Keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
-    'ignore:.*np\.object.*:FutureWarning',
 ]

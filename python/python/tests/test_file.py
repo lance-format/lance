@@ -87,7 +87,30 @@ def test_multiple_close(tmp_path):
     writer = LanceFileWriter(str(path), schema)
     writer.write_batch(pa.table({"a": [1, 2, 3]}))
     writer.close()
+    size_bytes = writer.size_bytes
+    # The second close is a no-op and must not clear the recorded size
     writer.close()
+    assert writer.size_bytes == size_bytes
+
+
+@pytest.mark.parametrize("num_rows", [0, 3])
+def test_size_bytes(tmp_path, num_rows):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    writer = LanceFileWriter(str(path), schema)
+    assert writer.size_bytes is None
+    writer.write_batch(pa.table({"a": list(range(num_rows))}))
+    assert writer.close() == num_rows
+    # Even an empty file has a footer, so the size is always positive
+    assert writer.size_bytes > 0
+    assert writer.size_bytes == os.path.getsize(path)
+
+
+def test_size_bytes_with_session(tmp_path):
+    session = LanceFileSession(tmp_path)
+    with session.open_writer("foo.lance") as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    assert writer.size_bytes == os.path.getsize(tmp_path / "foo.lance")
 
 
 def test_version(tmp_path):
@@ -459,18 +482,27 @@ def test_write_read_additional_schema_metadata(tmp_path):
 
 
 def test_writer_maintains_order(tmp_path):
-    # 100Ki strings, each string is a couple of KiBs
-    big_strings = [f"{i}" * 1024 for i in range(100 * 1024)]
-    table = pa.table({"big_strings": big_strings})
+    row_ids = list(range(8))
+    payloads = ["0123456789abcdef" * (64 * 1024)] + [
+        f"page-{row_id}" for row_id in row_ids[1:]
+    ]
+    table = pa.table({"payload": payloads, "row_id": row_ids})
+    path = tmp_path / "ordered-pages.lance"
 
-    for i in range(4):
-        path = tmp_path / f"foo-{i}.lance"
-        with LanceFileWriter(str(path)) as writer:
-            writer.write_batch(table)
+    # Before #2836, the seven cheap pages could finish encoding before the
+    # expensive first page and be written out of order.
+    with LanceFileWriter(
+        str(path),
+        table.schema,
+        version="2.0",
+        data_cache_bytes=1,
+        max_page_bytes=64 * 1024,
+    ) as writer:
+        writer.write_batch(table)
 
-        reader = LanceFileReader(str(path))
-        result = reader.read_all().to_table()
-        assert result == table
+    reader = LanceFileReader(str(path))
+    assert [len(column.pages) for column in reader.metadata().columns] == [8, 1]
+    assert reader.read_all().to_table() == table
 
 
 def test_compression(tmp_path):
@@ -736,6 +768,44 @@ def test_session_list_with_trailing_slash(tmp_path):
     assert files_no_slash == ["dir/file.lance"]
 
 
+def test_session_list_with_delimiter(tmp_path):
+    """Test that LanceFileSession.list_with_delimiter() is non-recursive."""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    # Two top-level files and two nested subtrees.
+    with session.open_writer("file1.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+    with session.open_writer("file2.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+    with session.open_writer("subdir/file3.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [3]}))
+    with session.open_writer("subdir/nested/file4.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [4]}))
+    with session.open_writer("other/file5.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [5]}))
+
+    # Listing the base path returns only the immediate children: the two
+    # top-level files and the two child directories (not their contents).
+    result = session.list_with_delimiter()
+    assert sorted(result.common_prefixes) == ["other", "subdir"]
+    assert sorted(result.objects) == ["file1.lance", "file2.lance"]
+
+    # Listing a subdirectory descends exactly one level: the direct file and
+    # the nested directory, but not the file inside the nested directory.
+    subdir = session.list_with_delimiter("subdir")
+    assert subdir.common_prefixes == ["subdir/nested"]
+    assert subdir.objects == ["subdir/file3.lance"]
+
+    # Trailing slash behaves the same as no trailing slash.
+    assert session.list_with_delimiter("subdir/") == subdir
+
+    # A non-existent prefix yields empty results rather than erroring.
+    empty = session.list_with_delimiter("nonexistent")
+    assert empty.common_prefixes == []
+    assert empty.objects == []
+
+
 def test_session_contains(tmp_path):
     """Test that LanceFileSession.contains() works correctly"""
     session = LanceFileSession(str(tmp_path))
@@ -757,6 +827,56 @@ def test_session_contains(tmp_path):
 
     assert session.contains("subdir/nested.lance")
     assert not session.contains("subdir/nonexistent.lance")
+
+
+def test_session_read_range(tmp_path):
+    """Test that LanceFileSession.read_range() returns the requested bytes."""
+    session = LanceFileSession(str(tmp_path))
+
+    payload = bytes(range(256))
+    local = tmp_path / "src.bin"
+    local.write_bytes(payload)
+    session.upload_file(str(local), "data/file.bin")
+
+    # A range in the middle of the file.
+    assert session.read_range("data/file.bin", 10, 5) == payload[10:15]
+    # From the start.
+    assert session.read_range("data/file.bin", 0, 4) == payload[0:4]
+    # Up to the end.
+    assert session.read_range("data/file.bin", 250, 6) == payload[250:256]
+    # A zero-length read yields empty bytes.
+    assert session.read_range("data/file.bin", 100, 0) == b""
+
+    # Reading a missing object raises OSError (consistent with download_file).
+    with pytest.raises(OSError):
+        session.read_range("data/missing.bin", 0, 4)
+
+
+def test_session_delete_file(tmp_path):
+    """Test that LanceFileSession.delete_file() removes files and is idempotent."""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    with session.open_writer("test.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+    with session.open_writer("subdir/nested.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+
+    # Deleting an existing file removes it.
+    assert session.contains("test.lance")
+    session.delete_file("test.lance")
+    assert not session.contains("test.lance")
+
+    # Nested paths work too.
+    assert session.contains("subdir/nested.lance")
+    session.delete_file("subdir/nested.lance")
+    assert not session.contains("subdir/nested.lance")
+
+    # Deleting a missing path raises OSError (consistent with download_file).
+    with pytest.raises(OSError):
+        session.delete_file("test.lance")
+    with pytest.raises(OSError):
+        session.delete_file("never_existed.lance")
 
 
 def test_struct_null_regression():

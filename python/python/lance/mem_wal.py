@@ -9,24 +9,25 @@ dataset via an LSM-tree structure.  Data flows through three levels:
 
 1. **WAL** – append-only durable log (raw writes)
 2. **Active MemTable** – in-memory write buffer
-3. **Flushed MemTable** – Lance files written to object store
-4. **Base table** – canonical Lance dataset files (after merge_insert)
+3. **SSTable** – Lance files written to object store
+4. **Base table** – canonical Lance dataset files (after SSTable compaction)
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Union
 
 import pyarrow as pa
 
 from .lance import (
+    _CompactedSsTable,
     _evaluate_sharding_spec,
     _ExecutionPlan,
     _LsmPointLookupPlanner,
     _LsmScanner,
     _LsmVectorSearchPlanner,
-    _MergedGeneration,
     _ShardSnapshot,
     _ShardWriter,
 )
@@ -39,7 +40,7 @@ __all__ = [
     "ShardingField",
     "ShardingSpec",
     "evaluate_sharding_spec",
-    "MergedGeneration",
+    "CompactedSsTable",
     "ShardSnapshot",
     "ShardWriter",
     "LsmScanner",
@@ -123,19 +124,19 @@ def _sharding_spec_to_dict(spec: Union[ShardingSpec, Mapping[str, object]]) -> d
 
 
 @dataclass
-class MergedGeneration:
-    """Identifies a flushed MemWAL generation that has been merged.
+class CompactedSsTable:
+    """Points to an SSTable compacted into the base table.
 
-    Pass a list of these to mark_generations_as_merged
-    so Lance knows which generations are now in the base table.
+    Pass a list of these to mark_sstables_as_compacted
+    so Lance can record compaction progress.
 
     Parameters
     ----------
     shard_id : str
         UUID string for the write shard.
     generation : int
-        Generation number (from
-        :attr:`ShardSnapshot.flushed_generations`).
+        Generation number of the compacted SSTable (as passed to
+        :meth:`ShardSnapshot.with_sstable`).
     """
 
     shard_id: str
@@ -169,9 +170,9 @@ class ShardSnapshot:
         self._raw = self._raw.with_current_generation(generation)
         return self
 
-    def with_flushed_generation(self, generation: int, path: str) -> "ShardSnapshot":
-        """Add a flushed generation with its storage path."""
-        self._raw = self._raw.with_flushed_generation(generation, path)
+    def with_sstable(self, generation: int, path: str) -> "ShardSnapshot":
+        """Add an SSTable with its storage path."""
+        self._raw = self._raw.with_sstable(generation, path)
         return self
 
     def __repr__(self) -> str:
@@ -186,6 +187,7 @@ class ShardWriter:
 
         with dataset.mem_wal_writer(shard_id) as writer:
             writer.put(batch)
+            writer.delete(pa.table({"id": [1]}))
 
     Parameters
     ----------
@@ -223,6 +225,36 @@ class ShardWriter:
         reader = _coerce_reader(data, schema)
         self._raw.put(reader)
 
+    def delete(self, keys, *, schema: Optional[pa.Schema] = None) -> None:
+        """Delete rows by primary key from the MemWAL.
+
+        Parameters
+        ----------
+        keys : ReaderLike
+            Any Arrow-compatible data containing this shard's primary key
+            column(s). Non-primary-key columns, if present, are ignored by
+            the Rust core delete path.
+        schema : pa.Schema, optional
+            Schema hint, needed when *keys* is a generator.
+
+        Raises
+        ------
+        IOError
+            If delete validation fails, WAL flush fails, or the writer has
+            already been closed. Delete validation is centralized in Rust and
+            includes checks for primary-key metadata and tombstone-compatible
+            nullable non-key columns.
+
+        Examples
+        --------
+        ::
+
+            with dataset.mem_wal_writer(shard_id) as writer:
+                writer.delete(pa.table({"id": [42]}))
+        """
+        reader = _coerce_reader(keys, schema)
+        self._raw.delete(reader)
+
     def close(self) -> None:
         """Flush and close the writer.
 
@@ -251,7 +283,7 @@ class ShardWriter:
         -------
         dict
             Keys: ``row_count``, ``batch_count``, ``estimated_size_bytes``,
-            ``generation``.
+            ``generation``, ``frozen_count``, ``frozen_bytes``.
         """
         return self._raw.memtable_stats()
 
@@ -260,7 +292,7 @@ class ShardWriter:
     ) -> "LsmScanner":
         """Create an LSM scanner that includes the active MemTable.
 
-        This scanner covers the base table, the given flushed generations,
+        This scanner covers the base table, the given SSTables,
         and the current active MemTable — providing strong read-your-writes
         consistency.
 
@@ -289,10 +321,10 @@ class LsmScanner:
     """LSM-aware scanner covering all data levels.
 
     Deduplicates by primary key, always returning the newest version of
-    each row across base table, flushed MemTables, and the active MemTable.
+    each row across base table, SSTables, and the active MemTable.
 
     Obtain an instance from `ShardWriter.lsm_scanner` (includes
-    active MemTable) or `LsmScanner.from_snapshots` (flushed only).
+    active MemTable) or `LsmScanner.from_snapshots` (SSTables only).
 
     The builder methods (`project`, `filter`, `limit`)
     return ``self`` for chaining.
@@ -322,7 +354,7 @@ class LsmScanner:
         dataset : LanceDataset
             The base dataset to scan.
         shard_snapshots : list of ShardSnapshot
-            Shard snapshots specifying flushed generations to include.
+            Shard snapshots specifying SSTables to include.
         """
         raw = _LsmScanner.from_snapshots(dataset._ds, [s._raw for s in shard_snapshots])
         return LsmScanner(raw)
@@ -337,7 +369,9 @@ class LsmScanner:
         self._raw = self._raw.filter(expr)
         return self
 
-    def limit(self, n: int, offset: Optional[int] = None) -> "LsmScanner":
+    def limit(
+        self, n: Optional[int] = None, offset: Optional[int] = None
+    ) -> "LsmScanner":
         """Limit rows returned, optionally with an offset."""
         self._raw = self._raw.limit(n, offset)
         return self
@@ -422,7 +456,7 @@ class LsmPointLookupPlanner:
     dataset : LanceDataset
         The base dataset.
     shard_snapshots : list of ShardSnapshot
-        Shard snapshots specifying flushed generations to include.
+        Shard snapshots specifying SSTables to include.
     pk_columns : list of str, optional
         Primary key column names.  Inferred from schema metadata if omitted.
 
@@ -481,7 +515,7 @@ class LsmVectorSearchPlanner:
     dataset : LanceDataset
         The base dataset.
     shard_snapshots : list of ShardSnapshot
-        Shard snapshots specifying flushed generations to include.
+        Shard snapshots specifying SSTables to include.
     vector_column : str
         Name of the ``FixedSizeList<float32>`` vector column.
     pk_columns : list of str, optional
@@ -489,6 +523,9 @@ class LsmVectorSearchPlanner:
     distance_type : str, optional
         Distance metric — one of ``"l2"`` (default), ``"cosine"``,
         ``"dot"``, ``"hamming"``.
+    filter : str, optional
+        SQL predicate applied as a prefilter to every LSM source before vector
+        candidate selection.
 
     Examples
     --------
@@ -506,12 +543,15 @@ class LsmVectorSearchPlanner:
         vector_column: str,
         pk_columns: Optional[List[str]] = None,
         distance_type: Optional[str] = None,
+        filter: Optional[str] = None,
     ) -> None:
         kwargs = {}
         if pk_columns is not None:
             kwargs["pk_columns"] = pk_columns
         if distance_type is not None:
             kwargs["distance_type"] = distance_type
+        if filter is not None:
+            kwargs["filter"] = filter
         self._raw = _LsmVectorSearchPlanner(
             dataset._ds,
             [s._raw for s in shard_snapshots],
@@ -547,22 +587,11 @@ class LsmVectorSearchPlanner:
             IVF-PQ).  Memtable arms use exact HNSW and are unaffected.
             Auto-enabled whenever stale filtering is on (see ``overfetch_factor``).
         overfetch_factor : float, optional
-            Single knob controlling **both** stale-read filtering and over-fetch
-            (default: ``1.0``):
-
-            - ``< 1.0`` (e.g. ``0.0``): stale filtering **off**.  Rows superseded
-              by a newer generation may surface.  (The global primary-key dedup
-              still runs, so it suppresses stale copies whenever both the stale
-              and the fresh row reach it.)
-            - ``== 1.0``: filtering **on**, no over-fetch.  Each source with
-              superseded rows fetches exactly ``k`` candidates and drops the stale
-              ones, so it may return fewer than ``k`` live rows.
-            - ``> 1.0``: filtering **on**, with over-fetch.  Such a source fetches
-              ``ceil(k * overfetch_factor)`` candidates so dropping the stale ones
-              still leaves ``k`` live rows.
-
-            There is no separate on/off flag: over-fetch is only meaningful while
-            filtering, so the factor encodes both.
+            Over-fetch multiple for sources with rows superseded by newer
+            generations. Must be at least ``1.0``. At ``1.0`` each affected
+            source fetches exactly ``k`` candidates; above ``1.0`` it fetches
+            ``ceil(k * overfetch_factor)`` candidates so dropping stale rows is
+            less likely to under-fill the result.
 
         Returns
         -------
@@ -570,6 +599,14 @@ class LsmVectorSearchPlanner:
             Physical plan for the vector search. Execute it via
             `to_table`, `to_reader`, or `to_batches`.
         """
+        if k <= 0:
+            raise ValueError(f"k must be positive, got {k}")
+        if nprobes <= 0:
+            raise ValueError(f"nprobes must be positive, got {nprobes}")
+        if not math.isfinite(overfetch_factor) or overfetch_factor < 1.0:
+            raise ValueError(
+                f"overfetch_factor must be finite and >= 1.0, got {overfetch_factor}"
+            )
         return ExecutionPlan(
             self._raw.plan_search(
                 query,
@@ -590,8 +627,8 @@ def _unwrap_shard_id(shard_id: str) -> str:
     return shard_id
 
 
-def _to_raw_merged_generations(
-    generations: Iterable[MergedGeneration],
+def _to_raw_compacted_sstables(
+    sstables: Iterable[CompactedSsTable],
 ) -> list:
-    """Convert Python MergedGeneration list to PyO3 _MergedGeneration list."""
-    return [_MergedGeneration(g.shard_id, g.generation) for g in generations]
+    """Convert Python CompactedSsTable list to PyO3 _CompactedSsTable list."""
+    return [_CompactedSsTable(s.shard_id, s.generation) for s in sstables]

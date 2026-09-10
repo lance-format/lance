@@ -66,6 +66,7 @@ pub const AUDIT_TYPE_DELETION: &str = "deletion";
 pub const AUDIT_TYPE_MANIFEST: &str = "manifest";
 pub const AUDIT_TYPE_INDEX: &str = "index";
 pub const AUDIT_TYPE_DATA: &str = "data";
+pub const AUDIT_TYPE_TRANSACTION: &str = "transaction";
 pub const TRACE_FILE_CREATE: &str = "create";
 pub const TRACE_IO_EVENTS: &str = "lance::io_events";
 pub const IO_TYPE_OPEN_SCALAR: &str = "open_scalar_index";

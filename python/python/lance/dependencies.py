@@ -27,7 +27,7 @@ _TORCH_AVAILABLE = True
 _CAGRA_AVAILABLE = True
 _RAFT_COMMON_AVAILABLE = True
 _HUGGING_FACE_AVAILABLE = True
-_TENSORFLOW_AVAILABLE = True
+_PYDANTIC_AVAILABLE = True
 
 
 class _LazyModule(ModuleType):
@@ -49,7 +49,6 @@ class _LazyModule(ModuleType):
         "pandas": "pd.",
         "polars": "pl.",
         "torch": "torch.",
-        "tensorflow": "tf.",
     }
 
     def __init__(
@@ -163,8 +162,7 @@ if TYPE_CHECKING:
     import numpy
     import pandas
     import polars
-    import tensorflow
-    import torch
+    import torch  # type: ignore[reportMissingImports]
 else:
     # heavy/optional third party libs
     numpy, _NUMPY_AVAILABLE = _lazy_import("numpy")
@@ -172,7 +170,7 @@ else:
     polars, _POLARS_AVAILABLE = _lazy_import("polars")
     torch, _TORCH_AVAILABLE = _lazy_import("torch")
     datasets, _HUGGING_FACE_AVAILABLE = _lazy_import("datasets")
-    tensorflow, _TENSORFLOW_AVAILABLE = _lazy_import("tensorflow")
+    _, _PYDANTIC_AVAILABLE = _lazy_import("pydantic")
 
 
 @lru_cache(maxsize=None)
@@ -215,10 +213,51 @@ def _check_for_hugging_face(obj: Any, *, check_type: bool = True) -> bool:
     )
 
 
-def _check_for_tensorflow(obj: Any, *, check_type: bool = True) -> bool:
-    return _TENSORFLOW_AVAILABLE and _might_be(
-        cast("Hashable", type(obj) if check_type else obj), "tensorflow"
+def _check_for_pydantic(obj: Any, *, check_type: bool = True) -> bool:
+    return _PYDANTIC_AVAILABLE and _might_be(
+        cast("Hashable", type(obj) if check_type else obj), "pydantic"
     )
+
+
+def _is_pydantic_base_model(obj: Any) -> bool:
+    if not _PYDANTIC_AVAILABLE:
+        return False
+    from pydantic import BaseModel
+
+    return isinstance(obj, BaseModel)
+
+
+def _is_pydantic_base_model_class(obj: Any) -> bool:
+    if not _PYDANTIC_AVAILABLE:
+        return False
+    from pydantic import BaseModel
+
+    return isinstance(obj, type) and issubclass(obj, BaseModel)
+
+
+def model_to_dict(obj: Any) -> dict[str, Any]:
+    return obj.model_dump() if hasattr(obj, "model_dump") else obj.dict()
+
+
+def _validate_pydantic_list(data: Any, model_class: type) -> None:
+    """Validate that `data` is a list of exact `model_class` instances.
+
+    Rejects non-list iterables (e.g. generators), which would otherwise be
+    drained by this validation loop and leave nothing for the caller to
+    serialize, and rejects subclass instances, whose extra/overridden fields
+    would not match the schema derived from `model_class`.
+    """
+    if not isinstance(data, list):
+        raise TypeError(
+            f"Pydantic model data must be provided as a list, got {type(data)!r}"
+        )
+    for i, item in enumerate(data):
+        if type(item) is not model_class:
+            raise TypeError(
+                f"data[{i}] must be an instance of {model_class!r} exactly "
+                f"(subclasses are not accepted), got {type(item)!r} "
+                f"(data has {len(data)} items)"
+            )
 
 
 __all__ = [
@@ -227,21 +266,24 @@ __all__ = [
     "numpy",
     "pandas",
     "polars",
-    "tensorflow",
     "torch",
     # lazy utilities
     "_check_for_hugging_face",
     "_check_for_numpy",
     "_check_for_pandas",
     "_check_for_polars",
-    "_check_for_tensorflow",
+    "_check_for_pydantic",
     "_check_for_torch",
+    "_is_pydantic_base_model",
+    "_is_pydantic_base_model_class",
     "_LazyModule",
+    "model_to_dict",
+    "_validate_pydantic_list",
     # exported flags/guards
     "_NUMPY_AVAILABLE",
     "_PANDAS_AVAILABLE",
     "_POLARS_AVAILABLE",
+    "_PYDANTIC_AVAILABLE",
     "_TORCH_AVAILABLE",
     "_HUGGING_FACE_AVAILABLE",
-    "_TENSORFLOW_AVAILABLE",
 ]

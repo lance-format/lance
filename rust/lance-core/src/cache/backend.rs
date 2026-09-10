@@ -4,9 +4,31 @@
 //! Backend interface for cache implementors.
 //!
 //! This module defines the trait that custom cache backends must implement,
-//! along with the key and entry types they operate on. Most callers should
+//! along with the entry type they operate on. Most callers should
 //! use [`LanceCache`](super::LanceCache) instead of interacting with
 //! backends directly.
+//!
+//! # Migrating custom backends
+//!
+//! Cache keys are opaque 16-byte values. Store
+//! [`InternalCacheKey::as_bytes`] directly instead of decomposing a logical
+//! prefix, key string, and Rust type name. The physical namespace must also
+//! include [`CACHE_KEY_FORMAT`](super::CACHE_KEY_FORMAT), so a future key
+//! protocol produces cold misses instead of aliases. Persistent or tiered
+//! backends can route serializable values with [`CacheCodec::type_id`].
+//!
+//! Prefix invalidation and key inventory are intentionally not part of this
+//! interface: one-way digests cannot support either operation without
+//! retaining the logical strings that fixed-size keys are designed to remove.
+//! Existing callers should migrate removed symbols as follows:
+//! - replace `with_backend_and_prefix(backend, prefix)` with
+//!   [`LanceCache::with_backend`](super::LanceCache::with_backend) followed by
+//!   [`LanceCache::with_key_prefix`](super::LanceCache::with_key_prefix);
+//! - replace `invalidate_prefix` with [`LanceCache::clear`](super::LanceCache::clear)
+//!   when clearing the shared backend is acceptable, or rotate a versioned
+//!   namespace to leave older entries to age out;
+//! - remove uses of `prefix`, `keys`, and session key-inventory methods; opaque
+//!   keys have no readable or enumerable equivalent.
 
 use std::any::Any;
 use std::pin::Pin;
@@ -16,56 +38,12 @@ use async_trait::async_trait;
 use futures::Future;
 
 use crate::Result;
+use crate::deepsize::Context;
 
-use super::CacheCodec;
+use super::{CacheCodec, InternalCacheKey};
 
 /// A type-erased cache entry.
 pub type CacheEntry = Arc<dyn Any + Send + Sync>;
-
-/// Iterator over cache keys currently known to a backend.
-pub type CacheKeyIterator<'a> = Box<dyn Iterator<Item = InternalCacheKey> + Send + 'a>;
-
-/// Structured cache key passed to [`CacheBackend`] methods.
-///
-/// CacheBackend impls receive these ready-made from [`LanceCache`](super::LanceCache)
-/// — you do not construct them yourself. Composed of three parts:
-/// - **prefix**: scopes the key to a dataset or index (e.g. `"s3://bucket/dataset/"`)
-/// - **key**: identifies the specific entry (e.g. `"42"` for a version number)
-/// - **type_name**: distinguishes different value types stored under the same
-///   user key (e.g. `"Vec<IndexMetadata>"`)
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct InternalCacheKey {
-    prefix: Arc<str>,
-    key: Arc<str>,
-    type_name: &'static str,
-}
-
-impl InternalCacheKey {
-    pub fn new(prefix: Arc<str>, key: Arc<str>, type_name: &'static str) -> Self {
-        Self {
-            prefix,
-            key,
-            type_name,
-        }
-    }
-
-    pub fn prefix(&self) -> &str {
-        &self.prefix
-    }
-
-    pub fn key(&self) -> &str {
-        &self.key
-    }
-
-    pub fn type_name(&self) -> &'static str {
-        self.type_name
-    }
-
-    /// Returns true if this key's prefix starts with the given string.
-    pub fn starts_with(&self, prefix: &str) -> bool {
-        self.prefix.starts_with(prefix)
-    }
-}
 
 /// Low-level pluggable cache backend.
 ///
@@ -100,7 +78,8 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Get an existing entry or compute it from `loader`.
     ///
     /// Implementations should deduplicate concurrent loads for the same key
-    /// so the loader runs at most once.
+    /// so the loader runs at most once, unless caching is disabled. Disabled
+    /// caches may invoke each caller's loader independently.
     ///
     /// Returns `(entry, was_cached)` where `was_cached` is `true` if the entry
     /// was already present in the cache (the loader was not invoked).
@@ -113,20 +92,8 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)>;
 
-    /// Remove all entries whose prefix starts with the given string.
-    async fn invalidate_prefix(&self, prefix: &str);
-
     /// Remove all entries.
     async fn clear(&self);
-
-    /// Return an iterator over cache keys currently known to this backend.
-    ///
-    /// Backends that cannot enumerate keys cheaply or accurately should return
-    /// `None`. An empty iterator means key inventory is supported and the
-    /// cache currently has no entries.
-    async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
-        None
-    }
 
     /// Number of entries currently stored (may flush pending operations).
     async fn num_entries(&self) -> usize;
@@ -141,12 +108,31 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     }
 
     /// Approximate weighted size in bytes, callable from synchronous contexts.
-    /// Used by `DeepSizeOf` to report cache memory usage.
+    /// Used as a `DeepSizeOf` fallback when exact entry traversal is unavailable.
     /// Backends that cannot provide this cheaply should return 0.
     ///
     /// Assumes entries do not share underlying buffers; if they do, the
     /// returned total may overcount.
     fn approx_size_bytes(&self) -> usize {
         0
+    }
+
+    /// Computes the size of the entries currently held in memory.
+    ///
+    /// `size_of_entry` threads a shared [`Context`] through each value so
+    /// allocations shared by multiple entries are counted once. It returns
+    /// `None` when the value's concrete type was not registered by
+    /// [`LanceCache`](super::LanceCache); implementations should use the
+    /// entry's declared eviction size as a fallback in that case.
+    ///
+    /// Backends that can enumerate their in-memory entries should include the
+    /// physical key footprint in the returned total. The default returns
+    /// `None`, causing `LanceCache` to use [`approx_size_bytes`](Self::approx_size_bytes).
+    fn deep_size_of_entries(
+        &self,
+        _context: &mut Context,
+        _size_of_entry: &dyn Fn(&CacheEntry, &mut Context) -> Option<usize>,
+    ) -> Option<usize> {
+        None
     }
 }

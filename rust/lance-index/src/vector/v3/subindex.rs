@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BinaryHeap, HashMap};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -30,6 +31,15 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
 
     /// Return the schema of the sub index
     fn schema() -> arrow_schema::SchemaRef;
+
+    /// The subset of [`Self::schema`] that [`Self::load`] actually reads.
+    ///
+    /// Index files always carry the full `schema()`, so narrowing the read is
+    /// purely a storage optimization: it keeps write-only columns from being
+    /// fetched, without changing what is written. `None` reads every column.
+    fn read_columns() -> Option<&'static [&'static str]> {
+        None
+    }
 
     /// Search the sub index for nearest neighbors.
     /// # Arguments:
@@ -106,7 +116,7 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     where
         Self: Sized;
 
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>, store: &impl VectorStore) -> Result<Self>
+    fn remap(&self, mapping: &RowAddrRemap, store: &impl VectorStore) -> Result<Self>
     where
         Self: Sized;
 

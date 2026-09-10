@@ -258,7 +258,9 @@ impl BlobPageScheduler {
             let bytes = read_fut.await?;
             let mut bytes_iter = bytes.into_iter();
             for blob in loaded_blobs.iter_mut() {
-                if blob.def == 0 {
+                // Empty values have def == 0 too but scheduled no read; their
+                // bytes were set at scheduling time.
+                if blob.def == 0 && blob.bytes.is_none() {
                     blob.set_bytes(bytes_iter.next().expect_ok()?);
                 }
             }
@@ -364,7 +366,17 @@ impl StructuralPageScheduler for BlobPageScheduler {
                 if size == 0 {
                     let rep = (position & 0xFFFF) as u16;
                     let def = ((position >> 16) & 0xFFFF) as u16;
-                    loaded_blobs.push(LoadedBlob::new(rep, def));
+                    let mut blob = LoadedBlob::new(rep, def);
+                    if def == 0 {
+                        // A size-0 descriptor with definition level 0 is a
+                        // valid, empty value (nulls carry their non-zero
+                        // packed rep/def levels in `position`). No read is
+                        // scheduled for it, so it gets its zero-length bytes
+                        // here rather than consuming another blob's read
+                        // result in the load task.
+                        blob.set_bytes(Bytes::new());
+                    }
+                    loaded_blobs.push(blob);
                 } else {
                     loaded_blobs.push(LoadedBlob::new(0, 0));
                     ranges_to_read.push(position..(position + size));

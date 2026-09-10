@@ -22,11 +22,25 @@ jobs:
       - name: Check out code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install license-header-checker
+        env:
+          # Pin to a specific release and download the asset directly from the
+          # release CDN. This avoids the flaky dynamic "latest" tag lookup in the
+          # upstream install.sh (it fetches the releases page and parses tag_name,
+          # which intermittently returns empty and fails the job).
+          LHC_VERSION: "1.5.0"
         run: |
           set -euo pipefail
-          curl -sfSL https://raw.githubusercontent.com/lluissm/license-header-checker/master/install.sh -o /tmp/install-lhc.sh
-          bash /tmp/install-lhc.sh
-          rm -f /tmp/install-lhc.sh
+          mkdir -p ./bin
+          base="https://github.com/lluissm/license-header-checker/releases/download/v${LHC_VERSION}"
+          asset="license-header-checker_${LHC_VERSION}_linux_amd64.tar.gz"
+          curl -sfSL "${base}/${asset}" -o "/tmp/${asset}"
+          curl -sfSL "${base}/checksums.txt" -o /tmp/lhc-checksums.txt
+          # Verify the download against the release checksums before extracting so a
+          # corrupted or tampered asset cannot be executed. This restores the
+          # integrity check the upstream install.sh performed via hash_sha256_verify.
+          (cd /tmp && sha256sum -c --ignore-missing lhc-checksums.txt)
+          tar -xzf "/tmp/${asset}" -C ./bin license-header-checker
+          rm -f "/tmp/${asset}" /tmp/lhc-checksums.txt
       - name: Check license headers (rust)
         run: ./bin/license-header-checker -a -v ./rust/license_header.txt rust rs && [[ -z `git status -s` ]]
       - name: Check license headers (python)

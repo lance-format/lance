@@ -179,7 +179,8 @@ impl LanceSchema {
             fields: Fields(fields),
             metadata,
         };
-        let schema = Schema::from(fields_with_meta);
+        let schema = Schema::try_from(fields_with_meta)
+            .map_err(|err| PyValueError::new_err(format!("Failed to reconstruct schema: {err}")))?;
         Ok(Self(schema))
     }
 

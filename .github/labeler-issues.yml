@@ -1,0 +1,28 @@
+version: 1
+# Never remove labels a template or a human already applied.
+appendOnly: true
+# Content-based labels for issues, applied by srvaroa/labeler via
+# .github/workflows/issue-labeler.yml. This covers issues that bypass the
+# .github/ISSUE_TEMPLATE forms entirely — those filed via `gh issue create`,
+# the REST API, or an agent, which never see the web-UI template chooser.
+#
+# The primary signal is a leading marker in the title (e.g. "bug:", "[feature]",
+# "perf -"), which many people type by hand; a modest body keyword match is a
+# secondary fallback. Rules are OR'd (one label per matching entry), so an
+# unmatched issue gets no label and is left for human / LLM triage rather than
+# guessed at. appendOnly means matches stack harmlessly with template labels.
+labels:
+# --- Primary signal: a leading bug/feature/perf marker in the title ---
+- label: bug
+  title: "(?i)^\\s*[\\[(]?\\s*bug\\b"
+- label: feature
+  title: "(?i)^\\s*[\\[(]?\\s*(feature|feat)\\b"
+- label: performance
+  title: "(?i)^\\s*[\\[(]?\\s*(perf|performance)\\b"
+# --- Secondary fallback: keywords anywhere in the body ---
+- label: bug
+  body: "(?i)(panic|segfault|traceback|stack ?trace|crash|corrupt|incorrect result|wrong result)"
+- label: performance
+  body: "(?i)(regression|latency|throughput|\\bOOM\\b|out of memory|memory usage|too slow)"
+- label: feature
+  body: "(?i)(feature request|would be (nice|great|useful)|it would be nice|support for|add .+ support)"

@@ -17,7 +17,12 @@ fn all_stop_words() -> impl Iterator<Item = &'static str> {
         stop_words::get("ar"),
         stopwords::DANISH,
         stopwords::DUTCH,
-        stopwords::ENGLISH,
+        // Use the fuller `stop-words` crate English list (~198 words) rather
+        // than the local Tantivy-style list (~33 words), which omits extremely
+        // common pronouns/function words (you, my, your, we, she, what, ...).
+        // Those omissions let the highest-frequency English tokens through the
+        // ICU stop-word path and build pathologically large posting lists.
+        stop_words::get("en"),
         stopwords::FINNISH,
         stopwords::FRENCH,
         stopwords::GERMAN,
@@ -51,7 +56,11 @@ impl StopWordFilter {
             Language::Arabic => stop_words::get("ar"),
             Language::Danish => stopwords::DANISH,
             Language::Dutch => stopwords::DUTCH,
-            Language::English => stopwords::ENGLISH,
+            // Use the fuller `stop-words` crate English list (~198 words); the
+            // local Tantivy-style list (~33 words) omits common pronouns/function
+            // words (you, my, your, we, ...) that would otherwise leak through
+            // stop-word removal and build pathologically large posting lists.
+            Language::English => stop_words::get("en"),
             Language::Finnish => stopwords::FINNISH,
             Language::French => stopwords::FRENCH,
             Language::German => stopwords::GERMAN,

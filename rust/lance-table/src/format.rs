@@ -6,7 +6,10 @@ use uuid::Uuid;
 
 mod fragment;
 mod index;
+pub mod key_existence;
 mod manifest;
+pub mod overlay;
+mod row_ids;
 mod transaction;
 
 pub use crate::rowids::version::{
@@ -16,10 +19,12 @@ pub use fragment::*;
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
 
 pub use manifest::{
-    BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, SelfDescribingFileReader,
-    WriterVersion, is_detached_version,
+    BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, ManifestBuildConfig,
+    SelfDescribingFileReader, WriterVersion, is_detached_version,
+    populate_manifest_schema_dictionaries,
 };
-pub use transaction::Transaction;
+pub use row_ids::{ExternalFile, InlineRowIds, RowIdMeta};
+pub use transaction::{Transaction, operation_may_change_schema};
 
 use lance_core::{Error, Result};
 

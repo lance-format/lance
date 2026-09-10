@@ -4,15 +4,61 @@
 use super::transaction::Transaction;
 use crate::Dataset;
 use crate::Result;
-use crate::dataset::scanner::DatasetRecordBatchStream;
+use crate::dataset::fragment::FileFragment;
+use crate::dataset::rowids::load_row_id_sequence;
+use crate::dataset::scanner::{
+    BATCH_SIZE_FALLBACK, DatasetRecordBatchStream, get_default_batch_size,
+};
+use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::SortOptions;
 use chrono::{DateTime, Utc};
+use datafusion::common::NullEquality;
+use datafusion::error::DataFusionError;
+use datafusion::logical_expr::JoinType;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::joins::SortMergeJoinExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_expr::expressions::Column;
+use futures::Stream;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_core::Error;
 use lance_core::ROW_CREATED_AT_VERSION;
 use lance_core::ROW_ID;
+use lance_core::ROW_ID_FIELD;
 use lance_core::ROW_LAST_UPDATED_AT_VERSION;
 use lance_core::WILDCARD;
+use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
+use lance_table::format::Fragment;
+use lance_table::rowids::RowIdSequence;
+use lance_table::rowids::segment::U64Segment;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Rows per batch of [`DatasetDelta::get_deleted_row_ids`], taken from the
+/// scanner so it matches the sibling readers.
+fn deleted_row_id_batch_rows() -> usize {
+    batch_rows(get_default_batch_size())
+}
+
+/// The largest batch this reader will emit whatever the configuration says:
+/// the batch is the unit of buffering, so an unbounded setting would defeat
+/// the chunking.
+const DELETED_ROW_ID_BATCH_CAP: usize = 64 * 1024;
+
+/// A configured size of zero would mean no bound at all, so it is refused in
+/// favour of the default; an oversized one is clamped to the cap.
+fn batch_rows(configured: Option<usize>) -> usize {
+    configured
+        .filter(|rows| *rows > 0)
+        .unwrap_or(BATCH_SIZE_FALLBACK)
+        .min(DELETED_ROW_ID_BATCH_CAP)
+}
 
 /// Builder for creating a [`DatasetDelta`] to explore changes between dataset versions.
 ///
@@ -270,6 +316,107 @@ impl DatasetDelta {
             .await
     }
 
+    /// The stable row ids live at the begin version and absent at the end
+    /// version, as a stream of batches carrying a single [`ROW_ID`] column.
+    /// Rows in a fragment the range removed outright count as deleted.
+    ///
+    /// Requires stable row ids at both endpoints and an ordered range;
+    /// version 0 is the empty snapshot. Runs in bounded memory: subtracting
+    /// the still-live ids is a sort-merge anti join that spills past the
+    /// session memory pool.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use futures::TryStreamExt;
+    /// # async fn example(dataset: &Dataset, previous_version: u64) -> Result<()> {
+    /// let delta = dataset
+    ///     .delta()
+    ///     .compared_against_version(previous_version)
+    ///     .build()?;
+    /// let mut deleted = delta.get_deleted_row_ids().await?;
+    /// while let Some(batch) = deleted.try_next().await? {
+    ///     // Each batch holds a `_rowid` column of deleted ids.
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_deleted_row_ids(&self) -> Result<DatasetRecordBatchStream> {
+        let (begin_version, end_version) = self.resolve_range().await?;
+        if begin_version > end_version {
+            // A reversed range would report the rows the range added as
+            // deleted.
+            return Err(Error::invalid_input(format!(
+                "begin version {begin_version} is newer than end version {end_version}"
+            )));
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()]));
+        // Version 0 is the empty snapshot: nothing is live at it, so nothing
+        // is deleted relative to it.
+        if begin_version == 0 {
+            return Ok(DatasetRecordBatchStream::new(Box::pin(
+                RecordBatchStreamAdapter::new(schema, stream::empty()),
+            )));
+        }
+        let begin = Arc::new(self.base_dataset.checkout_version(begin_version).await?);
+        let end = Arc::new(self.base_dataset.checkout_version(end_version).await?);
+        // Both endpoints: a restore can leave later versions without them.
+        for endpoint in [&begin, &end] {
+            if !endpoint.manifest.uses_stable_row_ids() {
+                return Err(Error::invalid_input(format!(
+                    "deleted row ids require stable row ids, version {} does not use them",
+                    endpoint.manifest.version
+                )));
+            }
+        }
+
+        let begin_frags = begin.get_fragments();
+        let end_frags = end.get_fragments();
+        let delta = fragment_delta(
+            begin_frags.iter().map(|f| f.metadata()),
+            end_frags.iter().map(|f| f.metadata()),
+        );
+        let out_schema = schema.clone();
+        let candidate_end = end.clone();
+        let candidate_begin = begin.clone();
+        let batches = stream::iter(delta.candidates)
+            .map(move |(before, after)| {
+                deleted_batches_in_fragment(
+                    candidate_begin.clone(),
+                    candidate_end.clone(),
+                    before,
+                    after,
+                    schema.clone(),
+                )
+            })
+            .buffered(get_num_compute_intensive_cpus())
+            .try_flatten()
+            .map_err(DataFusionError::from)
+            .try_filter(|batch| std::future::ready(batch.num_rows() > 0));
+        let candidates: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(out_schema.clone(), batches));
+        if delta.added.is_empty() && delta.changed.is_empty() {
+            return Ok(DatasetRecordBatchStream::new(candidates));
+        }
+
+        // A candidate is only deleted if it is live nowhere at end: a moved
+        // row lands in a fragment the range created, a restored one where a
+        // deletion vector shrank. Subtracting those newly live ids is an
+        // anti join, run the way merge_insert runs its joins: sorted with
+        // spilling past the memory pool, so a delta of any size is bounded.
+        let live = live_id_batches(begin.clone(), end, delta.added, delta.changed, out_schema);
+        let stream = anti_join(
+            candidates,
+            live,
+            LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            },
+        )?;
+        Ok(DatasetRecordBatchStream::new(stream))
+    }
+
     /// Get inserted rows between the two versions.
     ///
     /// This returns rows where `_row_created_at_version` is greater than `begin_version`
@@ -450,8 +597,357 @@ impl DatasetDelta {
     }
 }
 
+/// A fragment's deletion vector at this version, empty where it has none.
+async fn deletion_offsets(
+    dataset: Arc<Dataset>,
+    fragment: &Fragment,
+) -> Result<Arc<DeletionVector>> {
+    let fragment = FileFragment::new(dataset, fragment.clone());
+    Ok(fragment.get_deletion_vector().await?.unwrap_or_default())
+}
+
+/// The fragment-level shape of a version range, from metadata alone: a
+/// shared fragment whose deletion file is unchanged has neither lost nor
+/// regained a row, so nothing else costs any I/O. Each entry carries the
+/// fragment metadata it names, so readers never look ids up in a manifest.
+struct FragmentDelta {
+    /// Fragments only the end version holds: every live row is newly live.
+    added: Vec<Fragment>,
+    /// Shared fragments whose deletion vector changed, as (begin, end)
+    /// metadata: only rows a shrink revived are newly live.
+    changed: Vec<(Fragment, Fragment)>,
+    /// Begin fragments that can have lost rows, with their end-version
+    /// metadata where they survive: vanished, or a changed deletion vector.
+    candidates: Vec<(Fragment, Option<Fragment>)>,
+}
+
+fn fragment_delta<'a>(
+    begin: impl Iterator<Item = &'a Fragment>,
+    end: impl Iterator<Item = &'a Fragment>,
+) -> FragmentDelta {
+    let begin_meta: HashMap<u64, &Fragment> = begin.map(|f| (f.id, f)).collect();
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    let mut end_meta = HashMap::new();
+    for fragment in end {
+        end_meta.insert(fragment.id, fragment);
+        match begin_meta.get(&fragment.id) {
+            None => added.push(fragment.clone()),
+            Some(before) if before.deletion_file != fragment.deletion_file => {
+                changed.push(((*before).clone(), fragment.clone()));
+            }
+            Some(_) => {}
+        }
+    }
+    let candidates = begin_meta
+        .into_values()
+        .filter_map(|before| match end_meta.get(&before.id) {
+            None => Some((before.clone(), None)),
+            Some(after) if after.deletion_file != before.deletion_file => {
+                Some((before.clone(), Some((*after).clone())))
+            }
+            Some(_) => None,
+        })
+        .collect();
+    FragmentDelta {
+        added,
+        changed,
+        candidates,
+    }
+}
+
+/// The ids one begin-version fragment lost by the end version, a batch at a
+/// time. The offsets are iterated straight off the deletion vectors, so a
+/// fragment's deletions are never held whole.
+async fn deleted_batches_in_fragment(
+    begin: Arc<Dataset>,
+    end: Arc<Dataset>,
+    before: Fragment,
+    after: Option<Fragment>,
+    schema: Arc<ArrowSchema>,
+) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
+    let before_dv = deletion_offsets(begin.clone(), &before).await?;
+    let emit = if let Some(after) = after {
+        // The rows it lost are the offsets its deletion vector gained.
+        let after_dv = deletion_offsets(end, &after).await?;
+        let before_dv = before_dv.clone();
+        let gained: Box<dyn Iterator<Item = u32> + Send> = Box::new(
+            DeletionVector::clone(&after_dv)
+                .into_sorted_iter()
+                .filter(move |offset| !before_dv.contains(*offset)),
+        );
+        Emit::At(gained.peekable())
+    } else {
+        // Gone: every row it still held at the begin version left with it.
+        Emit::Skipping(before_dv)
+    };
+
+    let sequence = load_row_id_sequence(&begin, &before).await?;
+    Ok(id_batches(SequenceCursor::new(sequence, emit), schema))
+}
+
+/// Batches of the ids newly live at the end version: every live row of a
+/// fragment the range created, and the rows a shrunk deletion vector
+/// revived in a shared one. A growth-only change revives nothing and feeds
+/// nothing.
+fn live_id_batches(
+    begin: Arc<Dataset>,
+    end: Arc<Dataset>,
+    added: Vec<Fragment>,
+    changed: Vec<(Fragment, Fragment)>,
+    schema: Arc<ArrowSchema>,
+) -> SendableRecordBatchStream {
+    // Paired with the begin-version metadata for a shared fragment; a
+    // fragment the range created has none.
+    let fragments: Vec<(Fragment, Option<Fragment>)> = added
+        .into_iter()
+        .map(|f| (f, None))
+        .chain(
+            changed
+                .into_iter()
+                .map(|(before, after)| (after, Some(before))),
+        )
+        .collect();
+    let batches = stream::iter(fragments)
+        .map(move |(fragment, before)| {
+            let (begin, end, schema) = (begin.clone(), end.clone(), schema.clone());
+            async move {
+                let end_dv = deletion_offsets(end.clone(), &fragment).await?;
+                let sequence = load_row_id_sequence(&end, &fragment).await?;
+                let emit = match before {
+                    None => Emit::Skipping(end_dv),
+                    Some(before) => {
+                        let begin_dv = deletion_offsets(begin.clone(), &before).await?;
+                        // Lazy: a mass restore revives offsets without ever
+                        // holding them whole.
+                        let revived: Box<dyn Iterator<Item = u32> + Send> = Box::new(
+                            DeletionVector::clone(&begin_dv)
+                                .into_sorted_iter()
+                                .filter(move |offset| !end_dv.contains(*offset)),
+                        );
+                        Emit::At(revived.peekable())
+                    }
+                };
+                Ok::<_, Error>(id_batches(SequenceCursor::new(sequence, emit), schema))
+            }
+        })
+        .buffered(get_num_compute_intensive_cpus())
+        .try_flatten()
+        .map_err(DataFusionError::from);
+    let schema = Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()]));
+    Box::pin(RecordBatchStreamAdapter::new(schema, batches))
+}
+
+/// One forward traversal of a row id sequence, resumable across batches.
+/// The cursor keeps only positions and reads storage through the shared
+/// sequence each round, so nothing is cloned, and resuming re-walks no
+/// prefix.
+struct SequenceCursor {
+    sequence: Arc<RowIdSequence>,
+    segment: usize,
+    /// Length of the current segment, computed once on entry: encoded
+    /// cardinality is not constant-time.
+    segment_len: Option<usize>,
+    /// Rows of the current segment already consumed.
+    consumed: usize,
+    /// Global offset of the next unconsumed row.
+    offset: u32,
+    /// Value resume point for the sorted range-backed encodings; the
+    /// array-backed ones resume by element through `consumed`.
+    next_value: u64,
+    emit: Emit,
+}
+
+/// Which of the traversed ids to emit.
+enum Emit {
+    /// Every offset the deletion vector does not hold.
+    Skipping(Arc<DeletionVector>),
+    /// Exactly these offsets, ascending.
+    At(std::iter::Peekable<Box<dyn Iterator<Item = u32> + Send>>),
+}
+
+/// A segment's ids from a resume point, without cloning storage or
+/// re-walking what came before.
+fn segment_ids<'a>(
+    segment: &'a U64Segment,
+    consumed: usize,
+    next_value: u64,
+) -> Box<dyn Iterator<Item = u64> + 'a> {
+    match segment {
+        U64Segment::Range(range) => Box::new(next_value.max(range.start)..range.end),
+        U64Segment::RangeWithHoles { range, holes } => {
+            let start = next_value.max(range.start);
+            Box::new((start..range.end).filter(move |&v| holes.binary_search(v).is_err()))
+        }
+        U64Segment::RangeWithBitmap { range, bitmap } => {
+            let (base, start) = (range.start, next_value.max(range.start));
+            Box::new((start..range.end).filter(move |&v| bitmap.get((v - base) as usize)))
+        }
+        U64Segment::SortedArray(array) | U64Segment::Array(array) => {
+            Box::new((consumed..array.len()).filter_map(move |i| array.get(i)))
+        }
+    }
+}
+
+impl SequenceCursor {
+    fn new(sequence: Arc<RowIdSequence>, emit: Emit) -> Self {
+        Self {
+            sequence,
+            segment: 0,
+            segment_len: None,
+            consumed: 0,
+            offset: 0,
+            next_value: 0,
+            emit,
+        }
+    }
+
+    /// Append up to `cap` emitted ids to `out`, stopping early when the
+    /// traversal is exhausted.
+    fn fill(&mut self, out: &mut Vec<u64>, cap: usize) {
+        while out.len() < cap {
+            let Some(segment) = self.sequence.segments().get(self.segment) else {
+                return;
+            };
+            let segment_len = *self.segment_len.get_or_insert_with(|| segment.len());
+            let remaining = segment_len - self.consumed;
+            if remaining == 0 {
+                self.segment += 1;
+                self.segment_len = None;
+                self.consumed = 0;
+                self.next_value = 0;
+                continue;
+            }
+            // Hop the rest of a segment with no wanted offset in it without
+            // touching its encoding.
+            if let Emit::At(wanted) = &mut self.emit {
+                let Some(target) = wanted.peek().copied() else {
+                    return;
+                };
+                if (target - self.offset) as usize >= remaining {
+                    self.offset += remaining as u32;
+                    self.segment += 1;
+                    self.segment_len = None;
+                    self.consumed = 0;
+                    self.next_value = 0;
+                    continue;
+                }
+            }
+            let mut ids = segment_ids(segment, self.consumed, self.next_value);
+            match &mut self.emit {
+                Emit::Skipping(dv) => {
+                    let take = remaining.min(cap - out.len());
+                    for _ in 0..take {
+                        let Some(id) = ids.next() else {
+                            debug_assert!(false, "sequence shorter than segment lengths");
+                            return;
+                        };
+                        if !dv.contains(self.offset) {
+                            out.push(id);
+                        }
+                        self.offset += 1;
+                        self.consumed += 1;
+                        self.next_value = id.saturating_add(1);
+                    }
+                }
+                Emit::At(wanted) => {
+                    while out.len() < cap {
+                        let Some(target) = wanted.peek().copied() else {
+                            return;
+                        };
+                        let skip = (target - self.offset) as usize;
+                        if skip >= segment_len - self.consumed {
+                            break;
+                        }
+                        let Some(id) = ids.nth(skip) else {
+                            debug_assert!(false, "sequence shorter than segment lengths");
+                            return;
+                        };
+                        out.push(id);
+                        wanted.next();
+                        self.consumed += skip + 1;
+                        self.offset = target + 1;
+                        self.next_value = id.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The cursor's ids, batched.
+fn id_batches(
+    cursor: SequenceCursor,
+    schema: Arc<ArrowSchema>,
+) -> impl Stream<Item = Result<RecordBatch>> + Send {
+    let rows = deleted_row_id_batch_rows();
+    stream::try_unfold(cursor, move |mut cursor| {
+        let schema = schema.clone();
+        async move {
+            let mut ids: Vec<u64> = Vec::with_capacity(rows);
+            cursor.fill(&mut ids, rows);
+            if ids.is_empty() {
+                return Ok(None);
+            }
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(ids)) as ArrayRef])?;
+            Ok(Some((batch, cursor)))
+        }
+    })
+}
+
+/// Candidates minus the live ids, streamed. Sort-merge rather than hash:
+/// the sorts spill past the memory pool where a hash build cannot, so a
+/// delta of any size runs in bounded memory.
+fn anti_join(
+    candidates: SendableRecordBatchStream,
+    live: SendableRecordBatchStream,
+    options: LanceExecutionOptions,
+) -> Result<SendableRecordBatchStream> {
+    let sorted = |stream: SendableRecordBatchStream| -> Result<Arc<dyn ExecutionPlan>> {
+        let key = Column::new_with_schema(ROW_ID, stream.schema().as_ref())?;
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(key),
+            SortOptions::default(),
+        )])
+        .expect("one sort key");
+        Ok(Arc::new(SortExec::new(
+            ordering,
+            Arc::new(OneShotExec::new(stream)),
+        )))
+    };
+    let candidate_key = Column::new_with_schema(ROW_ID, candidates.schema().as_ref())?;
+    let live_key = Column::new_with_schema(ROW_ID, live.schema().as_ref())?;
+    let joined = Arc::new(SortMergeJoinExec::try_new(
+        sorted(candidates)?,
+        sorted(live)?,
+        vec![(Arc::new(candidate_key), Arc::new(live_key))],
+        None,
+        JoinType::LeftAnti,
+        vec![SortOptions::default()],
+        NullEquality::NullEqualsNothing,
+    )?);
+    execute_plan(joined, options)
+}
+
 #[cfg(test)]
 mod tests {
+
+    async fn collect_deleted(delta: &super::DatasetDelta) -> Vec<u64> {
+        let mut ids = Vec::new();
+        let mut stream = delta.get_deleted_row_ids().await.unwrap();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            ids.extend(
+                batch[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+        }
+        ids.sort_unstable();
+        ids
+    }
 
     use crate::dataset::transaction::Operation;
     use crate::dataset::{Dataset, WriteParams};
@@ -1369,6 +1865,548 @@ mod tests {
             assert_eq!(created_at[i], 3);
             assert!(keys[i] >= 80 && keys[i] < 100);
         }
+    }
+
+    /// One deleted row must not drag the fragment's survivors through the
+    /// join: a growth-only change revives nothing.
+    #[tokio::test]
+    async fn test_one_row_deletion_on_a_large_fragment() {
+        let mut dataset = create_test_dataset(200_000, 1, "value", true).await;
+        let begin = dataset.manifest.version;
+        dataset.delete("key = 123456").await.unwrap();
+        let delta = dataset
+            .delta()
+            .compared_against_version(begin)
+            .build()
+            .unwrap();
+        assert_eq!(collect_deleted(&delta).await, vec![123456]);
+    }
+
+    /// The cursor walks a many-segment sequence once, with either a skip
+    /// set or a wanted list; a naive per-offset read is its oracle. The
+    /// sequence covers every segment encoding, asserted below.
+    #[test]
+    fn test_sequence_cursor_matches_naive_reads() {
+        use lance_core::utils::deletion::DeletionVector;
+        use lance_table::rowids::RowIdSequence;
+        use lance_table::rowids::segment::U64Segment;
+
+        let mut sequence = RowIdSequence::from(100..200);
+        sequence.extend(RowIdSequence::try_from_iter([5, 900, 42]).unwrap());
+        sequence.extend(RowIdSequence::from(300..350));
+        sequence.extend(RowIdSequence::try_from_iter((20_000..26_000).step_by(2)).unwrap());
+        sequence.extend(
+            RowIdSequence::try_from_iter((50_000..53_000).filter(|v| v % 997 != 0)).unwrap(),
+        );
+        // Large enough to span many bounded batches during the resume loops.
+        sequence.extend(RowIdSequence::try_from_iter((100_000..500_000).step_by(4)).unwrap());
+        sequence.extend(
+            RowIdSequence::try_from_iter((600_000..700_000).filter(|v| v % 9973 != 0)).unwrap(),
+        );
+        let sequence = Arc::new(sequence);
+        for expected in [
+            |s: &U64Segment| matches!(s, U64Segment::Range(_)),
+            |s: &U64Segment| matches!(s, U64Segment::Array(_) | U64Segment::SortedArray(_)),
+            |s: &U64Segment| matches!(s, U64Segment::RangeWithBitmap { .. }),
+            |s: &U64Segment| matches!(s, U64Segment::RangeWithHoles { .. }),
+        ] {
+            assert!(sequence.segments().iter().any(expected), "encoding missing");
+        }
+        let len = sequence.len() as u32;
+        let dv = Arc::new(DeletionVector::from_iter(
+            (0..len).step_by(97).chain([3u32, 101, 152]),
+        ));
+
+        let mut skipped: Vec<u64> = Vec::new();
+        super::SequenceCursor::new(sequence.clone(), super::Emit::Skipping(dv.clone()))
+            .fill(&mut skipped, usize::MAX);
+        let naive: Vec<u64> = sequence
+            .iter()
+            .enumerate()
+            .filter(|(offset, _)| !dv.contains(*offset as u32))
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(skipped, naive);
+
+        // A tiny cap forces many resumes, covering the position keeping
+        // across batches.
+        let mut resumed: Vec<u64> = Vec::new();
+        let mut cursor = super::SequenceCursor::new(sequence.clone(), super::Emit::Skipping(dv));
+        loop {
+            let before = resumed.len();
+            cursor.fill(&mut resumed, before + 3);
+            if resumed.len() == before {
+                break;
+            }
+        }
+        assert_eq!(resumed, naive);
+
+        // The second list leaves whole segments and a consumed tail
+        // unwanted, covering the hops.
+        for wanted in [
+            vec![
+                0u32, 99, 100, 102, 152, 153, 154, 500, 3152, 3153, 4000, 6149,
+            ],
+            vec![5u32, 200, 6000, 6150, 106_000, 206_139],
+        ] {
+            let lazy: Box<dyn Iterator<Item = u32> + Send> = Box::new(wanted.clone().into_iter());
+            let mut at: Vec<u64> = Vec::new();
+            let mut cursor =
+                super::SequenceCursor::new(sequence.clone(), super::Emit::At(lazy.peekable()));
+            loop {
+                let before = at.len();
+                cursor.fill(&mut at, before + 1);
+                if at.len() == before {
+                    break;
+                }
+            }
+            let naive: Vec<u64> = wanted
+                .iter()
+                .filter_map(|offset| sequence.get(*offset as usize))
+                .collect();
+            assert_eq!(at, naive);
+        }
+    }
+
+    /// A range spanning the stable-id migration has a bare begin endpoint
+    /// and is rejected, naming the offending version.
+    #[tokio::test]
+    async fn test_mixed_stable_id_endpoints_are_rejected() {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        let mut dataset = write_dataset_temp(&dir, 0, 10, 1, "v1", false, false).await;
+        dataset.migrate_to_stable_row_ids().await.unwrap();
+
+        let delta = dataset.delta().compared_against_version(1).build().unwrap();
+        let err = delta.get_deleted_row_ids().await.err().unwrap();
+        assert!(
+            err.to_string().contains("stable row ids") && err.to_string().contains("version 1"),
+            "{err}"
+        );
+    }
+
+    /// One deletion per fragment across many fragments.
+    #[tokio::test]
+    async fn test_deletes_across_many_fragments_are_reported() {
+        let data = lance_datagen::gen_batch()
+            .col("key", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(160), BatchCount::from(1));
+        let params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(data, "memory://", Some(params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 16);
+        let begin = dataset.manifest.version;
+
+        dataset.delete("key % 10 = 3").await.unwrap();
+
+        let delta = dataset
+            .delta()
+            .compared_against_version(begin)
+            .build()
+            .unwrap();
+        let expected: Vec<u64> = (0..16).map(|i| i * 10 + 3).collect();
+        assert_eq!(collect_deleted(&delta).await, expected);
+    }
+
+    /// An append neither removes nor moves a row: the stream is empty.
+    #[tokio::test]
+    async fn test_appends_report_no_deleted_row_ids() {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        write_dataset_temp(&dir, 0, 10, 1, "v1", true, false).await;
+        let ds = write_dataset_temp(&dir, 10, 10, 1, "v2", true, true).await;
+        let delta = ds.delta().compared_against_version(1).build().unwrap();
+        let deleted = collect_deleted(&delta).await;
+        assert!(deleted.is_empty(), "an append deletes nothing: {deleted:?}");
+    }
+
+    /// Deletes on both sides of a merging compaction are all reported.
+    #[tokio::test]
+    async fn test_deletes_after_a_merging_compaction_are_reported() {
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        write_dataset_temp(&dir, 0, 100, 1, "v1", true, false).await;
+        let mut dataset = write_dataset_temp(&dir, 100, 100, 1, "v2", true, true).await;
+        let begin = dataset.manifest.version;
+
+        dataset.delete("key = 0 OR key = 100").await.unwrap();
+        let options = CompactionOptions {
+            materialize_deletions_threshold: 0.0,
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+        dataset.delete("key = 150").await.unwrap();
+
+        let delta = dataset
+            .delta()
+            .compared_against_version(begin)
+            .build()
+            .unwrap();
+        let deleted = collect_deleted(&delta).await;
+        assert_eq!(deleted, vec![0, 100, 150], "one id per deleted row");
+    }
+
+    /// Repeated partial updates leave fully tombstoned outputs; the result
+    /// stays exact regardless.
+    #[tokio::test]
+    async fn test_repeated_updates_report_no_deleted_row_ids() {
+        let mut dataset = create_test_dataset(100, 1, "value", true).await;
+        for round in 0..4 {
+            dataset = update_where(dataset, "key < 75", &format!("round {round}")).await;
+        }
+        let delta = dataset.delta().compared_against_version(1).build().unwrap();
+        let deleted = collect_deleted(&delta).await;
+        assert!(deleted.is_empty(), "updates delete nothing: {deleted:?}");
+    }
+
+    /// The anti join must stay correct when its build side exceeds the
+    /// memory pool and spills.
+    #[tokio::test]
+    async fn test_anti_join_is_exact_under_a_tiny_memory_pool() {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use lance_core::ROW_ID_FIELD;
+        use lance_datafusion::exec::LanceExecutionOptions;
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![ROW_ID_FIELD.clone()]));
+        // ~8 MB of candidates against a 2 MB pool: the sorts must spill,
+        // and the pool still clears DataFusion's fixed merge reservations.
+        let candidate_ids: Vec<u64> = (0..1_000_000).collect();
+        let live_ids: Vec<u64> = (0..1_000_000).filter(|id| id % 3 == 0).collect();
+        let expected = candidate_ids.len() - live_ids.len();
+        let as_stream = |ids: Vec<u64>| -> datafusion::physical_plan::SendableRecordBatchStream {
+            let batches: Vec<_> = ids
+                .chunks(8192)
+                .map(|chunk| {
+                    Ok(arrow_array::RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(arrow_array::UInt64Array::from(chunk.to_vec())) as _],
+                    )
+                    .unwrap())
+                })
+                .collect();
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(batches),
+            ))
+        };
+        let stream = super::anti_join(
+            as_stream(candidate_ids),
+            as_stream(live_ids),
+            LanceExecutionOptions {
+                use_spilling: true,
+                mem_pool_size: Some(2 * 1024 * 1024),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, expected, "anti join dropped or kept the wrong ids");
+    }
+
+    /// Interleaved updates leave every row live; none may read as deleted.
+    #[tokio::test]
+    async fn test_interleaved_updates_are_not_reported_as_deleted() {
+        let dataset = create_test_dataset(100, 2, "value", true).await;
+        let begin = dataset.manifest.version;
+        let dataset = update_where(dataset, "key % 2 = 0", "even").await;
+        let dataset = update_where(dataset, "key % 2 = 1", "odd").await;
+
+        let delta = dataset
+            .delta()
+            .compared_against_version(begin)
+            .build()
+            .unwrap();
+        let deleted = collect_deleted(&delta).await;
+        assert!(
+            deleted.is_empty(),
+            "every updated row is live at end: {deleted:?}"
+        );
+    }
+
+    /// A restore must not rewind the row-id high-water mark, or the next
+    /// append reuses old ids.
+    #[tokio::test]
+    async fn test_restore_preserves_the_row_id_high_water_mark() {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        write_dataset_temp(&dir, 0, 1, 1, "v1", true, false).await;
+        // v2: append row A, taking the next stable id.
+        let a = write_dataset_temp(&dir, 1, 1, 1, "v2", true, true).await;
+        let begin = a.manifest.version;
+        // v3: restore v1, dropping row A.
+        let mut dataset = a.checkout_version(1).await.unwrap();
+        dataset.restore().await.unwrap();
+        // v4: append row B, which must not reuse A's id.
+        let dataset = write_dataset_temp(&dir, 2, 1, 1, "v4", true, true).await;
+
+        let delta = dataset
+            .delta()
+            .with_begin_version(begin)
+            .with_end_version(dataset.manifest.version)
+            .build()
+            .unwrap();
+        let deleted = collect_deleted(&delta).await;
+        assert_eq!(
+            deleted,
+            vec![1],
+            "row A's id is gone, not reused: {deleted:?}"
+        );
+    }
+
+    /// A mass delete-and-restore revives every row; the revived offsets are
+    /// streamed, and the result is exact at scale.
+    #[tokio::test]
+    async fn test_mass_restore_reports_no_deleted_row_ids() {
+        let mut dataset = create_test_dataset(50_000, 1, "value", true).await;
+        dataset.delete("key >= 0").await.unwrap();
+        let begin = dataset.manifest.version;
+        let mut restored = dataset.checkout_version(1).await.unwrap();
+        restored.restore().await.unwrap();
+
+        let delta = restored
+            .delta()
+            .with_begin_version(begin)
+            .with_end_version(restored.manifest.version)
+            .build()
+            .unwrap();
+        let deleted = collect_deleted(&delta).await;
+        assert!(
+            deleted.is_empty(),
+            "every row revived: {} ids",
+            deleted.len()
+        );
+    }
+
+    /// A restore drops the deletion vector an update left behind, so the
+    /// updated row is live at both endpoints in a fragment both hold.
+    #[tokio::test]
+    async fn test_restored_updated_rows_are_not_reported_as_deleted() {
+        let dataset = create_test_dataset(100, 2, "value", true).await;
+        let updated = update_where(dataset, "key = 0", "changed").await;
+
+        let mut restored = updated.checkout_version(1).await.unwrap();
+        restored.restore().await.unwrap();
+        let delta = restored
+            .delta()
+            .with_begin_version(2)
+            .with_end_version(3)
+            .build()
+            .unwrap();
+        let deleted = collect_deleted(&delta).await;
+        assert!(
+            deleted.is_empty(),
+            "a restored row is live at both endpoints: {deleted:?}"
+        );
+    }
+
+    /// A reversed range would report the rows the range added as deleted.
+    #[tokio::test]
+    async fn test_deleted_row_ids_rejects_a_reversed_range() {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        write_dataset_temp(&dir, 0, 10, 1, "v1", true, false).await;
+        let ds = write_dataset_temp(&dir, 10, 10, 1, "v2", true, true).await;
+        let delta = ds
+            .delta()
+            .with_begin_version(2)
+            .with_end_version(1)
+            .build()
+            .unwrap();
+        let Err(err) = delta.get_deleted_row_ids().await else {
+            panic!("a reversed range must be rejected")
+        };
+        assert!(err.to_string().contains("newer than end version"), "{err}");
+    }
+
+    /// A window opening before v1 resolves begin to the version-0 sentinel:
+    /// the empty snapshot, relative to which nothing is deleted.
+    #[tokio::test]
+    async fn test_deleted_row_ids_accepts_the_zero_version_sentinel() {
+        MockClock::set_system_time(std::time::Duration::from_secs(100));
+        let mut dataset = create_test_dataset(10, 1, "v1", true).await;
+        MockClock::set_system_time(std::time::Duration::from_secs(200));
+        dataset.delete("key = 0").await.unwrap();
+
+        let delta = dataset
+            .delta()
+            .with_begin_date(chrono::DateTime::<chrono::Utc>::from_timestamp(50, 0).unwrap())
+            .with_end_date(chrono::DateTime::<chrono::Utc>::from_timestamp(250, 0).unwrap())
+            .build()
+            .unwrap();
+        let deleted = collect_deleted(&delta).await;
+        assert!(
+            deleted.is_empty(),
+            "nothing is deleted relative to the empty snapshot: {deleted:?}"
+        );
+    }
+
+    /// Unchanged shared fragments appear nowhere; changed ones on both
+    /// sides; vanished as candidates; added as probed.
+    #[test]
+    fn test_fragment_delta_classifies_by_metadata() {
+        use lance_table::format::{DeletionFile, DeletionFileType, Fragment};
+
+        let deletion_file = |read_version| DeletionFile {
+            read_version,
+            id: 7,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+        };
+        let dv_version = |f: &Fragment| f.deletion_file.as_ref().unwrap().read_version;
+        let unchanged = Fragment::new(1);
+        let mut changed_before = Fragment::new(2);
+        changed_before.deletion_file = Some(deletion_file(1));
+        let mut changed_after = changed_before.clone();
+        changed_after.deletion_file = Some(deletion_file(2));
+        let vanished = Fragment::new(3);
+        let added = Fragment::new(4);
+
+        let begin = [unchanged.clone(), changed_before, vanished];
+        let end = [unchanged, changed_after, added];
+        let delta = super::fragment_delta(begin.iter(), end.iter());
+
+        let added: Vec<u64> = delta.added.iter().map(|f| f.id).collect();
+        assert_eq!(added, vec![4], "only the new fragment is added");
+        let changed: Vec<(u64, u64, u64)> = delta
+            .changed
+            .iter()
+            .map(|(b, a)| (b.id, dv_version(b), dv_version(a)))
+            .collect();
+        assert_eq!(
+            changed,
+            vec![(2, 1, 2)],
+            "the changed pair carries each side's metadata"
+        );
+        let mut candidates: Vec<(u64, Option<u64>)> = delta
+            .candidates
+            .iter()
+            .map(|(b, a)| (b.id, a.as_ref().map(dv_version)))
+            .collect();
+        candidates.sort_unstable();
+        assert_eq!(
+            candidates,
+            vec![(2, Some(2)), (3, None)],
+            "changed and vanished bear candidates, with end metadata where it survives"
+        );
+    }
+
+    /// A configured batch size of zero would leave the stream unbounded.
+    #[test]
+    fn test_batch_rows_refuses_a_nonpositive_configuration() {
+        use super::{BATCH_SIZE_FALLBACK, DELETED_ROW_ID_BATCH_CAP, batch_rows};
+        assert_eq!(batch_rows(Some(0)), BATCH_SIZE_FALLBACK);
+        assert_eq!(batch_rows(None), BATCH_SIZE_FALLBACK);
+        assert_eq!(batch_rows(Some(64)), 64);
+        assert_eq!(batch_rows(Some(usize::MAX)), DELETED_ROW_ID_BATCH_CAP);
+    }
+
+    /// An update rewrites a row under the same stable id, so the old
+    /// fragment gains a deletion offset for a row that still exists.
+    #[tokio::test]
+    async fn test_updated_rows_are_not_reported_as_deleted() {
+        let dataset = create_test_dataset(100, 2, "value", true).await;
+        let begin = dataset.manifest.version;
+
+        let dataset = update_where(dataset, "key >= 10 AND key < 20", "changed").await;
+
+        let delta = dataset
+            .delta()
+            .compared_against_version(begin)
+            .build()
+            .unwrap();
+        let deleted = collect_deleted(&delta).await;
+        assert!(
+            deleted.is_empty(),
+            "an update is not a deletion: {deleted:?}"
+        );
+    }
+
+    /// A fragment's deletions can outnumber one batch.
+    #[tokio::test]
+    async fn test_deleted_row_ids_arrive_in_bounded_batches() {
+        let rows = super::deleted_row_id_batch_rows() * 2 + 100;
+        let mut dataset = create_test_dataset(rows, 1, "value", true).await;
+        let begin = dataset.manifest.version;
+        dataset.delete("true").await.unwrap();
+
+        let delta = dataset
+            .delta()
+            .compared_against_version(begin)
+            .build()
+            .unwrap();
+        let mut stream = delta.get_deleted_row_ids().await.unwrap();
+        let mut sizes = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            sizes.push(batch.num_rows());
+        }
+        assert_eq!(sizes.iter().sum::<usize>(), rows, "{sizes:?}");
+        assert!(
+            sizes
+                .iter()
+                .all(|n| *n <= super::deleted_row_id_batch_rows()),
+            "a batch exceeded the bound: {sizes:?}"
+        );
+    }
+
+    /// Deleted ids are recoverable even though the rows cannot be scanned,
+    /// and a compaction in the range is not mistaken for deletion.
+    #[tokio::test]
+    async fn test_get_deleted_row_ids() {
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+        let mut dataset = create_test_dataset(100, 2, "value", true).await;
+        let begin = dataset.manifest.version;
+
+        dataset.delete("key >= 10 AND key < 20").await.unwrap();
+        let delta = dataset
+            .delta()
+            .compared_against_version(begin)
+            .build()
+            .unwrap();
+        let deleted = collect_deleted(&delta).await;
+        assert_eq!(deleted.len(), 10, "one id per deleted row: {deleted:?}");
+
+        // Compaction rewrites the surviving rows into new fragments; their
+        // ids are unchanged, so the deleted set must not grow.
+        // Materializing the deletions rewrites the fragment under a new id.
+        let options = CompactionOptions {
+            materialize_deletions_threshold: 0.0,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert!(
+            metrics.fragments_removed > 0,
+            "the compaction case is vacuous unless fragments were actually rewritten"
+        );
+        let delta = dataset
+            .delta()
+            .compared_against_version(begin)
+            .build()
+            .unwrap();
+        let after_compaction = collect_deleted(&delta).await;
+        assert_eq!(
+            after_compaction, deleted,
+            "compaction moved live rows; only the deleted ids may be reported"
+        );
+
+        // A row deleted after its fragment was compacted away is still
+        // addressable, so surviving an address lookup does not prove it lives.
+        dataset.delete("key >= 20 AND key < 30").await.unwrap();
+        let delta = dataset
+            .delta()
+            .compared_against_version(begin)
+            .build()
+            .unwrap();
+        let after_delete = collect_deleted(&delta).await;
+        assert_eq!(
+            after_delete.len(),
+            20,
+            "deletes on both sides of the compaction must be reported: {after_delete:?}"
+        );
     }
 
     #[tokio::test]

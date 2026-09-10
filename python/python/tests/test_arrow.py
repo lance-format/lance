@@ -7,10 +7,11 @@ import re
 from pathlib import Path
 
 import lance
+import lance.arrow
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pytest
+import pytest  # pyright: ignore[reportMissingImports]
 from lance.arrow import (
     BFloat16,
     BFloat16Array,
@@ -272,8 +273,6 @@ def test_image_uri_arrays(tmp_path: Path, png_uris):
 
 
 def test_image_tensor_arrays(tmp_path: Path, png_uris):
-    tf = pytest.importorskip("tensorflow")
-
     n = 10
 
     encoded_image_array = ImageURIArray.from_uris(png_uris).read_uris()
@@ -296,22 +295,22 @@ def test_image_tensor_arrays(tmp_path: Path, png_uris):
     assert tensor_image_array.storage.type == pa.list_(pa.uint8(), 4)
     assert tensor_image_array[2].as_py() == [42, 42, 42, 255]
 
-    test_tensor = tf.constant(
-        np.array([42, 42, 42, 255] * n, dtype=np.uint8).reshape((n, 1, 1, 4))
-    )
+    test_tensor = np.array([42, 42, 42, 255] * n, dtype=np.uint8).reshape((n, 1, 1, 4))
 
     assert test_tensor.shape == (n, 1, 1, 4)
-    assert tf.math.reduce_all(
-        tf.convert_to_tensor(tensor_image_array.to_numpy()) == test_tensor
-    )
+    assert np.array_equal(tensor_image_array.to_numpy(), test_tensor)
     assert tensor_image_array.to_encoded().to_tensor() == tensor_image_array
 
     def png_encoder(images):
-        import tensorflow as tf
+        import io
 
-        encoded_images = (
-            tf.io.encode_png(x).numpy() for x in tf.convert_to_tensor(images)
-        )
+        from PIL import Image  # pyright: ignore[reportMissingImports]
+
+        encoded_images = []
+        for image in images:
+            with io.BytesIO() as buf:
+                Image.fromarray(image).save(buf, format="PNG")
+                encoded_images.append(buf.getvalue())
         return pa.array(encoded_images, type=pa.binary())
 
     assert tensor_image_array.to_encoded(png_encoder).to_tensor() == tensor_image_array
@@ -323,20 +322,18 @@ def test_image_tensor_arrays(tmp_path: Path, png_uris):
         uris = [str(Path(x)) for x in uris]
 
     encoded_image_array = ImageArray.from_array(uris).read_uris()
-    with pytest.raises(
-        tf.errors.InvalidArgumentError, match="Shapes of all inputs must match"
-    ):
+    with pytest.raises(ValueError, match="all input arrays must have the same shape"):
         encoded_image_array.to_tensor()
 
     pattern = r"(object at) 0x[\w\d]+(:?>)"
     repl = r"\1 0x..\2"
-    assert re.sub(pattern, repl, encoded_image_array.__repr__()) == (
-        "<lance.arrow.EncodedImageArray object at 0x..>\n"
-        "[<tf.Tensor: shape=(1, 1, 4), dtype=uint8, numpy=array([[[ 42,  42,  42, "
-        "255]]], dtype=uint8)>, ..]\n"
+    repr_ = re.sub(pattern, repl, encoded_image_array.__repr__())
+    assert repr_.startswith("<lance.arrow.EncodedImageArray object at 0x..>\n[<PIL.")
+    assert "image mode=RGBA size=1x1" in repr_
+    assert (
         "b'\\x89PNG\\r\\n\\x1a\\n\\x00\\x00\\x00\\rIHDR\\x00\\x00\\x00\\x01\\x00\\x00"
         "\\x00\\x01\\x08\\x06\\x00\\x00\\x00\\x1f'"
-    )
+    ) in repr_
 
 
 def test_roundtrip_image_tensor(tmp_path: Path):

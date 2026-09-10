@@ -8,6 +8,52 @@ use snafu::{IntoError as _, Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+#[cfg(feature = "backtrace")]
+mod backtrace_support {
+    use std::backtrace::Backtrace;
+
+    use snafu::{AsBacktrace, GenerateImplicitData};
+
+    #[derive(Debug)]
+    pub struct MaybeBacktrace(pub Option<Backtrace>);
+
+    impl GenerateImplicitData for MaybeBacktrace {
+        fn generate() -> Self {
+            Self(<Option<Backtrace>>::generate())
+        }
+    }
+
+    impl AsBacktrace for MaybeBacktrace {
+        fn as_backtrace(&self) -> Option<&Backtrace> {
+            self.0.as_ref()
+        }
+    }
+}
+
+#[cfg(not(feature = "backtrace"))]
+mod backtrace_support {
+    use std::backtrace::Backtrace;
+
+    use snafu::{AsBacktrace, GenerateImplicitData};
+
+    #[derive(Debug)]
+    pub struct MaybeBacktrace;
+
+    impl GenerateImplicitData for MaybeBacktrace {
+        fn generate() -> Self {
+            Self
+        }
+    }
+
+    impl AsBacktrace for MaybeBacktrace {
+        fn as_backtrace(&self) -> Option<&Backtrace> {
+            None
+        }
+    }
+}
+
+use backtrace_support::MaybeBacktrace;
+
 /// Error for when a requested field is not found in a schema.
 ///
 /// This error computes suggestions lazily (only when displayed) to avoid
@@ -45,10 +91,67 @@ impl fmt::Display for FieldNotFoundError {
 
 impl std::error::Error for FieldNotFoundError {}
 
+/// A manifest commit returned an error and its final outcome could not be
+/// determined safely.
+///
+/// This is wrapped in [`Error::Wrapped`] so Lance can expose a structured
+/// source without adding a variant to the exhaustive public [`Error`] enum.
+#[derive(Debug)]
+pub struct CommitStatusUnknownError {
+    version: u64,
+    source: BoxedError,
+}
+
+impl CommitStatusUnknownError {
+    /// Return the manifest version whose commit outcome is unknown.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+impl std::fmt::Display for CommitStatusUnknownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Commit result for version {} is unknown: the commit may or may not have been \
+             applied; check the table state before retrying: {}",
+            self.version, self.source
+        )
+    }
+}
+
+impl std::error::Error for CommitStatusUnknownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Allocates error on the heap and then places `e` into it.
 #[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
     Box::new(e)
+}
+
+/// Why a writer is fenced. Both reasons are terminal, but callers must tell them
+/// apart (a peer takeover vs. our own failure) rather than parse the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FenceReason {
+    /// A successor writer claimed a higher epoch; this writer lost ownership.
+    PeerClaimedEpoch,
+    /// Our own WAL persistence failed, so in-memory state may have diverged from
+    /// the durable WAL. The writer must be reopened to replay.
+    PersistenceFailure,
+}
+
+impl std::fmt::Display for FenceReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Stable strings — surfaced in error messages.
+        let s = match self {
+            Self::PeerClaimedEpoch => "peer claimed epoch",
+            Self::PersistenceFailure => "persistence failure",
+        };
+        f.write_str(s)
+    }
 }
 
 #[derive(Debug, Snafu)]
@@ -59,18 +162,24 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Dataset already exists: {uri}, {location}"))]
     DatasetAlreadyExists {
         uri: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Append with different schema: {difference}, location: {location}"))]
     SchemaMismatch {
         difference: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Dataset at path {path} was not found: {source}, {location}"))]
     DatasetNotFound {
@@ -78,6 +187,8 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Encountered corrupt file {path}: {source}, {location}"))]
     CorruptFile {
@@ -85,13 +196,16 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
-        // TODO: add backtrace?
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Not supported: {source}, {location}"))]
     NotSupported {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Commit conflict for version {version}: {source}, {location}"))]
     CommitConflict {
@@ -99,12 +213,16 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Incompatible transaction: {source}, {location}"))]
     IncompatibleTransaction {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Retryable commit conflict for version {version}: {source}, {location}"))]
     RetryableCommitConflict {
@@ -112,12 +230,16 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Too many concurrent writers. {message}, {location}"))]
     TooMuchWriteContention {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Operation timed out: {message}, {location}"))]
     Timeout {
@@ -132,54 +254,72 @@ pub enum Error {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]
     PrerequisiteFailed {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Unprocessable: {message}, {location}"))]
     Unprocessable {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(Arrow): {message}, {location}"))]
     Arrow {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(Schema): {message}, {location}"))]
     Schema {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Not found: {uri}, {location}"))]
     NotFound {
         uri: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(IO): {source}, {location}"))]
     IO {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(Index): {message}, {location}"))]
     Index {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Lance index not found: {identity}, {location}"))]
     IndexNotFound {
         identity: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Cannot infer storage location from: {message}"))]
     InvalidTableLocation { message: String },
@@ -187,21 +327,28 @@ pub enum Error {
     Stop,
     #[snafu(display("Wrapped error: {error}, {location}"))]
     Wrapped {
+        #[snafu(source)]
         error: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Cloned error: {message}, {location}"))]
     Cloned {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Query Execution error: {message}, {location}"))]
     Execution {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Ref is invalid: {message}"))]
     InvalidRef { message: String },
@@ -220,12 +367,16 @@ pub enum Error {
         minor_version: u16,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Namespace error: {source}, {location}"))]
     Namespace {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     /// External error passed through from user code.
     ///
@@ -238,12 +389,117 @@ pub enum Error {
     /// A requested field was not found in a schema.
     #[snafu(transparent)]
     FieldNotFound { source: FieldNotFoundError },
+
+    #[snafu(display(
+        "Spill disk cap of {cap_bytes} bytes exceeded; currently using {used_bytes} bytes, {location}"
+    ))]
+    DiskCapExceeded {
+        cap_bytes: u64,
+        used_bytes: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    /// A writer has been fenced and must stop (see [`FenceReason`]). The message
+    /// keeps the `Writer fenced` prefix for legacy string consumers; new code
+    /// should match on [`Error::fence_reason`].
+    #[snafu(display("Writer fenced ({reason}): {message}, {location}"))]
+    Fenced {
+        reason: FenceReason,
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    /// A write was refused to keep the writer inside its memory budget.
+    ///
+    /// Unlike every other write error this one is *expected* under load and
+    /// carries no data loss: the write was never accepted, so a caller that
+    /// retries once the flush pipeline drains loses nothing. Callers should
+    /// surface it as a retryable "busy" signal (HTTP 503), not a failure.
+    /// Match via [`Error::is_backpressure`] rather than on the message.
+    #[snafu(display("Write rejected by backpressure: {message}, {location}"))]
+    Backpressure {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl Error {
+    /// Returns the captured Rust backtrace, if available.
+    ///
+    /// Requires the `backtrace` feature to be enabled at compile time
+    /// and `RUST_BACKTRACE=1` at runtime.
+    #[cfg(feature = "backtrace")]
+    pub fn backtrace(&self) -> Option<&std::backtrace::Backtrace> {
+        match self {
+            Self::InvalidInput { backtrace, .. }
+            | Self::DatasetAlreadyExists { backtrace, .. }
+            | Self::SchemaMismatch { backtrace, .. }
+            | Self::DatasetNotFound { backtrace, .. }
+            | Self::CorruptFile { backtrace, .. }
+            | Self::NotSupported { backtrace, .. }
+            | Self::CommitConflict { backtrace, .. }
+            | Self::IncompatibleTransaction { backtrace, .. }
+            | Self::RetryableCommitConflict { backtrace, .. }
+            | Self::TooMuchWriteContention { backtrace, .. }
+            | Self::Internal { backtrace, .. }
+            | Self::PrerequisiteFailed { backtrace, .. }
+            | Self::Unprocessable { backtrace, .. }
+            | Self::Arrow { backtrace, .. }
+            | Self::Schema { backtrace, .. }
+            | Self::NotFound { backtrace, .. }
+            | Self::IO { backtrace, .. }
+            | Self::Index { backtrace, .. }
+            | Self::IndexNotFound { backtrace, .. }
+            | Self::Wrapped { backtrace, .. }
+            | Self::Cloned { backtrace, .. }
+            | Self::Execution { backtrace, .. }
+            | Self::VersionConflict { backtrace, .. }
+            | Self::Namespace { backtrace, .. } => {
+                use snafu::AsBacktrace;
+                backtrace.as_backtrace()
+            }
+            // Variants without a backtrace field — listed explicitly so that
+            // adding a new variant with a backtrace field triggers a compiler error.
+            Self::InvalidTableLocation { .. }
+            | Self::Stop
+            | Self::InvalidRef { .. }
+            | Self::RefConflict { .. }
+            | Self::RefNotFound { .. }
+            | Self::Cleanup { .. }
+            | Self::VersionNotFound { .. }
+            | Self::External { .. }
+            | Self::FieldNotFound { .. }
+            | Self::Timeout { .. }
+            | Self::DiskCapExceeded { .. }
+            | Self::Fenced { .. }
+            | Self::Backpressure { .. } => None,
+        }
+    }
+
+    /// Returns the captured Rust backtrace, if available.
+    ///
+    /// Always returns `None` when the `backtrace` feature is not enabled.
+    #[cfg(not(feature = "backtrace"))]
+    pub fn backtrace(&self) -> Option<&std::backtrace::Backtrace> {
+        None
+    }
+
     #[track_caller]
     pub fn corrupt_file(path: object_store::path::Path, message: impl Into<String>) -> Self {
         CorruptFileSnafu { path }.into_error(message.into().into())
+    }
+
+    /// Reports a corrupt file when the caller only has a logical/section name
+    /// rather than the real file path (for example, a decoder that validates an
+    /// in-memory buffer and does not know where it came from).
+    ///
+    /// `name` is carried in the `path` field of the resulting [`Error::CorruptFile`]
+    /// variant and is NOT a filesystem path; callers that have the real path should
+    /// use [`Self::corrupt_file`] instead.
+    #[track_caller]
+    pub fn corrupt_file_named(name: &str, message: impl Into<String>) -> Self {
+        Self::corrupt_file(object_store::path::Path::from(name), message)
     }
 
     #[track_caller]
@@ -259,6 +515,53 @@ impl Error {
     #[track_caller]
     pub fn io(message: impl Into<String>) -> Self {
         IOSnafu.into_error(message.into().into())
+    }
+
+    /// A successor writer claimed a higher epoch; this writer lost ownership.
+    #[track_caller]
+    pub fn fenced_by_peer(message: impl Into<String>) -> Self {
+        FencedSnafu {
+            reason: FenceReason::PeerClaimedEpoch,
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// Our WAL persistence failed; in-memory state may have diverged from the
+    /// durable WAL, so the writer must be reopened to replay.
+    #[track_caller]
+    pub fn writer_poisoned(message: impl Into<String>) -> Self {
+        FencedSnafu {
+            reason: FenceReason::PersistenceFailure,
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// The [`FenceReason`] if this is [`Error::Fenced`], else `None`. Prefer this
+    /// over matching the error message to decide how to react to a fence.
+    pub fn fence_reason(&self) -> Option<FenceReason> {
+        match self {
+            Self::Fenced { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+
+    /// A write was refused because the writer is at its memory ceiling; the
+    /// data was never accepted. See [`Error::Backpressure`].
+    #[track_caller]
+    pub fn backpressure(message: impl Into<String>) -> Self {
+        BackpressureSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// Whether this is [`Error::Backpressure`] — i.e. a retryable "writer is
+    /// full" signal rather than a real failure. Prefer this over matching the
+    /// error message.
+    pub fn is_backpressure(&self) -> bool {
+        matches!(self, Self::Backpressure { .. })
     }
 
     #[track_caller]
@@ -295,9 +598,25 @@ impl Error {
         NotFoundSnafu { uri: uri.into() }.build()
     }
 
+    /// Return whether this error or one of its typed sources is a missing object.
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Self::NotFound { .. } => true,
+            Self::Wrapped { error, .. }
+                if error.downcast_ref::<CommitStatusUnknownError>().is_some() =>
+            {
+                false
+            }
+            Self::IO { source, .. } | Self::Wrapped { error: source, .. } => {
+                error_source_is_not_found(source.as_ref())
+            }
+            _ => false,
+        }
+    }
+
     #[track_caller]
     pub fn wrapped(error: BoxedError) -> Self {
-        WrappedSnafu { error }.build()
+        WrappedSnafu.into_error(error)
     }
 
     #[track_caller]
@@ -427,8 +746,32 @@ impl Error {
     }
 
     #[track_caller]
+    pub fn commit_status_unknown_source(version: u64, source: BoxedError) -> Self {
+        Self::wrapped(box_error(CommitStatusUnknownError { version, source }))
+    }
+
+    /// Return whether this error represents a commit whose final outcome could
+    /// not be determined safely.
+    pub fn is_commit_status_unknown(&self) -> bool {
+        matches!(
+            self,
+            Self::Wrapped { error, .. }
+                if error.downcast_ref::<CommitStatusUnknownError>().is_some()
+        )
+    }
+
+    #[track_caller]
     pub fn incompatible_transaction_source(source: BoxedError) -> Self {
         IncompatibleTransactionSnafu.into_error(source)
+    }
+
+    #[track_caller]
+    pub fn disk_cap_exceeded(cap_bytes: u64, used_bytes: u64) -> Self {
+        DiskCapExceededSnafu {
+            cap_bytes,
+            used_bytes,
+        }
+        .build()
     }
 
     /// Create an External error from a boxed error source.
@@ -465,6 +808,17 @@ impl Error {
             other => Err(other),
         }
     }
+}
+
+fn error_source_is_not_found(source: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(error) = source.downcast_ref::<Error>() {
+        return error.is_not_found();
+    }
+    if let Some(error) = source.downcast_ref::<object_store::Error>() {
+        return matches!(error, object_store::Error::NotFound { .. })
+            || std::error::Error::source(error).is_some_and(error_source_is_not_found);
+    }
+    source.source().is_some_and(error_source_is_not_found)
 }
 
 pub trait LanceOptionExt<T> {
@@ -512,6 +866,17 @@ impl From<&ArrowError> for Error {
 impl From<std::io::Error> for Error {
     #[track_caller]
     fn from(e: std::io::Error) -> Self {
+        // A lance `Error` may have been wrapped in an `io::Error` (e.g. via
+        // `io::Error::other(Error::...)`) to cross an `AsyncWrite`/`AsyncRead`
+        // boundary. Recover it so typed errors such as `DiskCapExceeded`
+        // survive the round-trip instead of collapsing into an opaque `IO`.
+        if e.get_ref().is_some_and(|inner| inner.is::<Self>()) {
+            return *e
+                .into_inner()
+                .expect("checked Some above")
+                .downcast::<Self>()
+                .expect("checked type above");
+        }
         Self::io_source(box_error(e))
     }
 }
@@ -519,7 +884,11 @@ impl From<std::io::Error> for Error {
 impl From<object_store::Error> for Error {
     #[track_caller]
     fn from(e: object_store::Error) -> Self {
-        Self::io_source(box_error(e))
+        match e {
+            // source intentionally dropped; Error::NotFound carries only the path
+            object_store::Error::NotFound { path, .. } => Self::not_found(path),
+            other => Self::io_source(box_error(other)),
+        }
     }
 }
 
@@ -614,6 +983,22 @@ impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {
         match e {
+            // DataFusion wraps an error to attach end-user context and source
+            // spans (`Diagnostic`), a description of what was running
+            // (`Context`), or to report several failures at once
+            // (`Collection`). All three are display-transparent, so the
+            // category has to come from the error underneath; classifying the
+            // wrapper itself reports a malformed query as an internal failure.
+            datafusion_common::DataFusionError::Diagnostic(_, inner)
+            | datafusion_common::DataFusionError::Context(_, inner) => Self::from(*inner),
+            datafusion_common::DataFusionError::Collection(errors) => {
+                match errors.into_iter().next() {
+                    // `Collection` reports the first error's message, so take
+                    // its category too.
+                    Some(first) => Self::from(first),
+                    None => Self::execution("DataFusion returned an empty error collection"),
+                }
+            }
             datafusion_common::DataFusionError::SQL(..)
             | datafusion_common::DataFusionError::Plan(..)
             | datafusion_common::DataFusionError::Configuration(..)
@@ -625,6 +1010,22 @@ impl From<datafusion_common::DataFusionError> for Error {
                 Self::not_supported_source(box_error(e))
             }
             datafusion_common::DataFusionError::Execution(..) => Self::execution(e.to_string()),
+            datafusion_common::DataFusionError::Shared(shared) => {
+                // DataFusion shares an error across consumers (e.g. a join's
+                // build-side error fanned out to every probe partition) behind an
+                // `Arc`. If we are the sole owner we can recurse for full fidelity;
+                // otherwise re-wrap in `Shared` so the concrete error type is still
+                // reachable via `Error::source` / `downcast_ref`.
+                match std::sync::Arc::try_unwrap(shared) {
+                    Ok(inner) => Self::from(inner),
+                    Err(shared) => {
+                        let rewrapped = datafusion_common::DataFusionError::Shared(shared);
+                        Self::External {
+                            source: box_error(rewrapped),
+                        }
+                    }
+                }
+            }
             datafusion_common::DataFusionError::External(source) => {
                 // Try to downcast to lance_core::Error first
                 match source.downcast::<Self>() {
@@ -657,14 +1058,46 @@ pub fn get_caller_location() -> &'static std::panic::Location<'static> {
 /// Wrap an error in a new error type that implements Clone
 ///
 /// This is useful when two threads/streams share a common fallible source
-/// The base error will always have the full error.  Any cloned results will
-/// only have Error::Cloned with the to_string of the base error.
+/// Definite not-found errors preserve typed source-chain detection and their
+/// human-readable representation. Timeout and I/O errors preserve their error
+/// categories. Other cloned results use Error::Cloned with the string
+/// representation of the base error.
 pub struct CloneableError(pub Error);
+
+struct DisplayError(Error);
+
+impl fmt::Debug for DisplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for DisplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for DisplayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 
 impl Clone for CloneableError {
     #[track_caller]
     fn clone(&self) -> Self {
-        Self(Error::cloned(self.0.to_string()))
+        match &self.0 {
+            Error::NotFound { uri, .. } => Self(Error::wrapped(Box::new(DisplayError(
+                Error::not_found(uri.clone()),
+            )))),
+            error if error.is_not_found() => Self(Error::wrapped(Box::new(DisplayError(
+                Error::not_found(error.to_string()),
+            )))),
+            Error::Timeout { message, .. } => Self(Error::timeout(message.clone())),
+            Error::IO { source, .. } => Self(Error::io(source.to_string())),
+            error => Self(Error::cloned(error.to_string())),
+        }
     }
 }
 
@@ -680,7 +1113,55 @@ impl<T: Clone> From<Result<T>> for CloneableResult<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::error::Error as _;
     use std::fmt;
+
+    #[test]
+    fn cloneable_error_preserves_not_found_contract() {
+        let original = CloneableError(Error::not_found("metadata.lance"));
+        let cloned = original.clone();
+        let cloned_again = cloned.clone();
+        assert!(matches!(original.0, Error::NotFound { .. }));
+        assert!(cloned.0.is_not_found());
+        assert!(cloned_again.0.is_not_found());
+        assert!(cloned.0.to_string().to_lowercase().contains("not found"));
+        assert!(
+            cloned_again
+                .0
+                .to_string()
+                .to_lowercase()
+                .contains("not found")
+        );
+        assert!(
+            format!("{:?}", cloned.0)
+                .to_lowercase()
+                .contains("not found")
+        );
+        assert!(cloned.0.source().is_some_and(|source| source.is::<Error>()
+            || source.source().is_some_and(|source| source.is::<Error>())));
+        let downstream_error = Error::wrapped(Box::new(Error::io_source(Box::new(
+            object_store::Error::Generic {
+                store: "N/A",
+                source: Box::new(cloned.0),
+            },
+        ))));
+        assert!(downstream_error.is_not_found());
+        assert!(
+            format!("{downstream_error:?}")
+                .to_lowercase()
+                .contains("not found")
+        );
+
+        let original = CloneableError(Error::timeout("metadata read timed out"));
+        let cloned = original.clone();
+        assert!(matches!(original.0, Error::Timeout { .. }));
+        assert!(matches!(cloned.0, Error::Timeout { .. }));
+
+        let original = CloneableError(Error::io("metadata read was denied"));
+        let cloned = original.clone();
+        assert!(matches!(original.0, Error::IO { .. }));
+        assert!(matches!(cloned.0, Error::IO { .. }));
+    }
 
     #[test]
     fn test_caller_location_capture() {
@@ -704,6 +1185,41 @@ mod test {
         }
     }
 
+    #[test]
+    fn test_caller_location_capture_not_found() {
+        let current_fn = get_caller_location();
+        let f: Box<dyn Fn() -> Result<()>> = Box::new(|| {
+            Err(object_store::Error::NotFound {
+                path: "some/path".to_string(),
+                source: "not found".into(),
+            })?;
+            Ok(())
+        });
+        match f().unwrap_err() {
+            Error::NotFound { location, .. } => {
+                // +2 is the beginning of object_store::Error::NotFound...
+                assert_eq!(location.line(), current_fn.line() + 2, "{}", location)
+            }
+            #[allow(unreachable_patterns)]
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_object_store_not_found_converts_to_not_found() {
+        let os_err = object_store::Error::NotFound {
+            path: "test/path".to_string(),
+            source: "no such file".into(),
+        };
+        let lance_err: Error = os_err.into();
+        match lance_err {
+            Error::NotFound { uri, .. } => {
+                assert_eq!(uri, "test/path");
+            }
+            other => panic!("Expected NotFound, got {:?}", other),
+        }
+    }
+
     #[derive(Debug)]
     struct MyCustomError {
         code: i32,
@@ -717,6 +1233,52 @@ mod test {
     }
 
     impl std::error::Error for MyCustomError {}
+
+    #[test]
+    fn test_io_error_recovers_wrapped_lance_error() {
+        // A lance Error wrapped in io::Error::other should round-trip back to
+        // the original variant rather than collapsing into Error::IO.
+        let io_err = std::io::Error::other(Error::disk_cap_exceeded(100, 50));
+        let recovered: Error = io_err.into();
+        match recovered {
+            Error::DiskCapExceeded {
+                cap_bytes,
+                used_bytes,
+                ..
+            } => {
+                assert_eq!(cap_bytes, 100);
+                assert_eq!(used_bytes, 50);
+            }
+            other => panic!("expected DiskCapExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_io_error_without_lance_error_stays_io() {
+        // A plain io::Error (no wrapped lance Error) should become Error::IO.
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let converted: Error = io_err.into();
+        assert!(matches!(converted, Error::IO { .. }));
+    }
+
+    #[test]
+    fn test_commit_status_unknown_is_structured_without_masking_as_not_found() {
+        let error = Error::commit_status_unknown_source(
+            42,
+            box_error(Error::not_found("temporarily invisible manifest")),
+        );
+
+        assert!(error.is_commit_status_unknown());
+        assert!(!error.is_not_found());
+        assert!(error.to_string().contains("version 42 is unknown"));
+        let Error::Wrapped { error, .. } = error else {
+            panic!("commit-status-unknown must use the semver-compatible wrapper")
+        };
+        let status = error
+            .downcast_ref::<CommitStatusUnknownError>()
+            .expect("wrapper must retain the typed commit status");
+        assert_eq!(status.version(), 42);
+    }
 
     #[test]
     fn test_external_error_creation() {
@@ -841,6 +1403,86 @@ mod test {
         }
     }
 
+    /// DataFusion wraps errors to attach end-user context (`Diagnostic`), a
+    /// description of what was running (`Context`), or to report several at
+    /// once (`Collection`). All three are display-transparent, so a wrapped
+    /// user error looks exactly like an unwrapped one but would be classified
+    /// as an internal failure if the conversion matched on the wrapper.
+    #[cfg(feature = "datafusion")]
+    #[rstest::rstest]
+    #[case::diagnostic(|inner| datafusion_common::DataFusionError::Diagnostic(
+        Box::new(datafusion_common::Diagnostic::new_error("invalid function", None)),
+        Box::new(inner),
+    ))]
+    #[case::context(|inner| datafusion_common::DataFusionError::Context(
+        "type_coercion".to_string(),
+        Box::new(inner),
+    ))]
+    #[case::collection(|inner| datafusion_common::DataFusionError::Collection(vec![inner]))]
+    #[case::nested(|inner| datafusion_common::DataFusionError::Diagnostic(
+        Box::new(datafusion_common::Diagnostic::new_error("invalid function", None)),
+        Box::new(datafusion_common::DataFusionError::Context(
+            "type_coercion".to_string(),
+            Box::new(inner),
+        )),
+    ))]
+    fn test_datafusion_wrapped_plan_error_is_invalid_input(
+        #[case] wrap: fn(datafusion_common::DataFusionError) -> datafusion_common::DataFusionError,
+    ) {
+        let df_err = wrap(datafusion_common::DataFusionError::Plan(
+            "Invalid function 'no_such_function'".to_string(),
+        ));
+        let lance_err = Error::from(df_err);
+
+        assert!(
+            matches!(lance_err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {lance_err:?}"
+        );
+        assert!(
+            lance_err.to_string().contains("no_such_function"),
+            "expected the function name to survive, got: {lance_err}"
+        );
+    }
+
+    /// Unwrapping must classify by the inner error rather than assume the
+    /// wrapper always hides a user error.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_datafusion_wrapped_internal_error_is_not_invalid_input() {
+        let df_err = datafusion_common::DataFusionError::Context(
+            "while running".to_string(),
+            Box::new(datafusion_common::DataFusionError::Internal(
+                "invariant violated".to_string(),
+            )),
+        );
+
+        assert!(
+            matches!(Error::from(df_err), Error::IO { .. }),
+            "an internal DataFusion failure must not be reported as user input"
+        );
+    }
+
+    /// A Lance error that round-trips through DataFusion keeps its own
+    /// category even when DataFusion wraps it on the way back.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_wrapped_external_lance_error_keeps_its_category() {
+        let df_err = datafusion_common::DataFusionError::Context(
+            "while scanning".to_string(),
+            Box::new(datafusion_common::DataFusionError::from(Error::io(
+                "object store unavailable",
+            ))),
+        );
+
+        match Error::from(df_err) {
+            Error::IO { source, .. } => assert!(
+                source.to_string().contains("object store unavailable"),
+                "expected the original message, got: {source}"
+            ),
+            other => panic!("expected the original IO error, got {other:?}"),
+        }
+    }
+
     #[cfg(feature = "datafusion")]
     #[test]
     fn test_datafusion_external_error_conversion() {
@@ -928,5 +1570,105 @@ mod test {
             }
             _ => panic!("Expected InvalidInput variant, got {:?}", recovered),
         }
+    }
+
+    /// Test that a typed error survives a multiply-owned `DataFusionError::Shared`.
+    ///
+    /// When DataFusion fans one error out to multiple consumers via `Arc`, we
+    /// cannot move the inner error out.  The typed source must still be
+    /// reachable after conversion to `lance_core::Error`.
+    #[cfg(feature = "datafusion")]
+    #[test]
+    fn test_datafusion_shared_multi_owner_preserves_type() {
+        let custom_err = MyCustomError {
+            code: 42,
+            message: "shared typed error".to_string(),
+        };
+        let marker = datafusion_common::DataFusionError::External(Box::new(custom_err));
+        // Put it in an Arc and keep a second owner so try_unwrap fails.
+        let arc = std::sync::Arc::new(marker);
+        let _arc2 = arc.clone();
+        let shared = datafusion_common::DataFusionError::Shared(arc);
+
+        let lance_err: Error = shared.into();
+
+        // The concrete error must be discoverable via source chain.
+        let mut found = false;
+        let mut src: Option<&dyn std::error::Error> = Some(&lance_err);
+        while let Some(e) = src {
+            if e.downcast_ref::<MyCustomError>().is_some() {
+                found = true;
+                break;
+            }
+            src = e.source();
+        }
+        assert!(
+            found,
+            "MyCustomError not found in source chain: {lance_err:?}"
+        );
+    }
+
+    #[test]
+    fn test_backtrace_accessor() {
+        // Verify that backtrace() returns the expected result based on feature state
+        let err = Error::io("test backtrace");
+        let bt = err.backtrace();
+        #[cfg(feature = "backtrace")]
+        {
+            // With the backtrace feature enabled, whether a backtrace is captured
+            // depends on the RUST_BACKTRACE env var at runtime. We just verify
+            // the accessor doesn't panic and returns a valid Option.
+            let _ = bt;
+        }
+        #[cfg(not(feature = "backtrace"))]
+        {
+            // Without the backtrace feature, this must always be None.
+            assert!(bt.is_none());
+        }
+    }
+
+    #[test]
+    fn test_backtrace_captured_when_feature_enabled() {
+        // Test that backtrace is actually captured when the feature is on and
+        // RUST_BACKTRACE=1 is set in the environment before the process starts.
+        //
+        // NOTE: std::backtrace::Backtrace caches the RUST_BACKTRACE env check,
+        // so set_var at runtime does not reliably enable capture. This test
+        // verifies the accessor works correctly in both cases:
+        // - If RUST_BACKTRACE=1 was set before the test binary started, we get Some.
+        // - If not, we get None (even with the feature on), which is expected.
+        #[cfg(feature = "backtrace")]
+        {
+            let err = Error::io("backtrace capture test");
+            if std::env::var("RUST_BACKTRACE").is_ok() {
+                assert!(
+                    err.backtrace().is_some(),
+                    "Expected a backtrace when RUST_BACKTRACE=1 and backtrace feature is enabled"
+                );
+            }
+            // When RUST_BACKTRACE is not set, backtrace() may return None even
+            // with the feature enabled — this is correct runtime gating behavior.
+        }
+        #[cfg(not(feature = "backtrace"))]
+        {
+            let err = Error::io("backtrace capture test");
+            assert!(err.backtrace().is_none());
+        }
+    }
+
+    #[test]
+    fn test_backtrace_returns_none_for_variants_without_location() {
+        let err = Error::InvalidTableLocation {
+            message: "test".to_string(),
+        };
+        assert!(err.backtrace().is_none());
+
+        let err = Error::InvalidRef {
+            message: "test".to_string(),
+        };
+        assert!(err.backtrace().is_none());
+
+        let err = Error::Stop;
+        assert!(err.backtrace().is_none());
     }
 }

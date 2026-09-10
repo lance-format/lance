@@ -13,7 +13,7 @@
  */
 package org.lance.merge;
 
-import org.lance.memwal.MergedGeneration;
+import org.lance.memwal.CompactedSsTable;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
@@ -39,7 +39,8 @@ public class MergeInsertParams {
   private long retryTimeoutMs = 30 * 1000;
   private boolean skipAutoCleanup = false;
   private boolean useIndex = true;
-  private List<MergedGeneration> markedGenerations = Collections.emptyList();
+  private MergeWriteMode writeMode = MergeWriteMode.Auto;
+  private List<CompactedSsTable> compactedSstables = Collections.emptyList();
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -245,17 +246,44 @@ public class MergeInsertParams {
   }
 
   /**
-   * Mark MemWAL generations as merged into the base table.
+   * Selects how the merged rows are written.
    *
-   * <p>Use this when the merge insert incorporates data from MemWAL flushed generations. It updates
-   * the MemWAL generation tracking to prevent the same generations from being merged again.
+   * <p>Only has an effect on a partial-schema update (the source omits some dataset columns), where
+   * {@link MergeWriteMode#RewriteColumns} writes fewer bytes than {@link
+   * MergeWriteMode#RewriteRows} once the fraction of rows matched exceeds roughly the fraction of
+   * each row's bytes the source columns occupy: nearly always for a KB-scale update of a MB-per-row
+   * table, possibly never for a table of narrow columns.
    *
-   * @param generations the flushed generations being merged
+   * <p>Default is {@link MergeWriteMode#Auto}: the write mode is chosen by the engine, typically
+   * rewriting whole rows.
+   *
+   * @param writeMode How the merged rows are written.
    * @return This MergeInsertParams instance
    */
-  public MergeInsertParams markGenerationsAsMerged(List<MergedGeneration> generations) {
-    Preconditions.checkNotNull(generations, "generations must not be null");
-    this.markedGenerations = generations;
+  public MergeInsertParams withWriteMode(MergeWriteMode writeMode) {
+    Preconditions.checkNotNull(writeMode, "writeMode must not be null");
+    this.writeMode = writeMode;
+    return this;
+  }
+
+  /**
+   * Mark MemWAL SSTables as compacted into the base table.
+   *
+   * <p>Use this when merge insert compacts MemWAL SSTables. It updates MemWAL compaction progress
+   * to prevent the same SSTables from being compacted again, in the same commit as the data.
+   *
+   * <p><b>For multi-pass compaction, call this only on the final successful data-changing pass.</b>
+   * Intermediate passes must not carry compaction progress. Lance cannot tell whether a caller has
+   * another pass planned, so it cannot enforce this: if a delete pass carried the marker and the
+   * process then died before the matching upsert, the recorded progress would claim rows were
+   * copied in that never were.
+   *
+   * @param sstables the SSTables being compacted
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams markSstablesAsCompacted(List<CompactedSsTable> sstables) {
+    Preconditions.checkNotNull(sstables, "sstables must not be null");
+    this.compactedSstables = sstables;
     return this;
   }
 
@@ -263,8 +291,8 @@ public class MergeInsertParams {
     return on;
   }
 
-  public List<MergedGeneration> markedGenerations() {
-    return markedGenerations;
+  public List<CompactedSsTable> getCompactedSstables() {
+    return compactedSstables;
   }
 
   public WhenMatched whenMatched() {
@@ -319,6 +347,14 @@ public class MergeInsertParams {
     return useIndex;
   }
 
+  public MergeWriteMode writeMode() {
+    return writeMode;
+  }
+
+  public String writeModeValue() {
+    return writeMode.name();
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -337,7 +373,44 @@ public class MergeInsertParams {
         .add("retryTimeoutMs", retryTimeoutMs)
         .add("skipAutoCleanup", skipAutoCleanup)
         .add("useIndex", useIndex)
+        .add("writeMode", writeMode)
         .toString();
+  }
+
+  /**
+   * How a merge insert writes the merged rows.
+   *
+   * <p>The caller chooses rather than the engine because which mode writes fewer bytes depends on
+   * the fraction of each fragment's rows the source matches, which is only known once the join has
+   * run.
+   */
+  public enum MergeWriteMode {
+    /**
+     * Let the engine choose, typically rewriting whole rows. A partial-schema update whose join key
+     * carries a scalar index may instead patch columns on the indexed path that predates this enum.
+     */
+    Auto,
+
+    /**
+     * Delete the matched rows and write whole rows into new fragments. Cost scales with the number
+     * of matched rows.
+     *
+     * <p>For a partial-schema update this gives up the scalar-index probe on the join key, because
+     * the indexed path only ever patches columns.
+     */
+    RewriteRows,
+
+    /**
+     * Attach new data files holding the source columns to the fragments that already hold the
+     * matched rows, and tombstone the old versions of those columns. The omitted columns are
+     * neither read nor written, but the replacement column file covers every row of each fragment
+     * it touches, so the bytes written barely fall as fewer rows match.
+     *
+     * <p>Errors if the merge cannot be expressed this way: it must update matched rows only (no
+     * inserts, no matched deletes, no delete-by-source) with a source that omits at least one
+     * dataset column, carries at least one column besides the join key, and carries no blob column.
+     */
+    RewriteColumns,
   }
 
   public enum WhenMatched {

@@ -184,6 +184,22 @@ pub trait FloatArray<T: ArrowFloatType + ?Sized>: Array + Clone + 'static {
     type FloatType: ArrowFloatType;
 
     /// Returns a reference to the underlying data as a slice.
+    ///
+    /// # Panics
+    ///
+    /// Implementations may panic if the array's storage shape does not match
+    /// the expected element layout. In particular, the `bf16` impl panics if
+    /// `value_length() != 2` (the `FixedSizeBinary(2)` shape required by
+    /// `BFloat16Array`).
+    ///
+    /// # Preconditions
+    ///
+    /// Implementations may impose additional invariants on the underlying
+    /// buffer. The `bf16` impl requires the value buffer to be at least
+    /// 2-byte aligned — satisfied automatically by every in-tree Lance
+    /// constructor, but external callers passing externally-built arrays
+    /// (FFI, IPC, `Buffer::from_custom_allocation`) must ensure alignment.
+    /// See the impl's docstring for details.
     fn as_slice(&self) -> &[T::Native];
 
     /// Construct an array from a vector of values.

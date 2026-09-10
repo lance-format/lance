@@ -224,3 +224,95 @@ def test_commit_index_with_index_details(dataset_with_index, test_table, tmp_pat
     committed_txn = dataset_without_index.get_transactions(1)[0]
     committed_index = committed_txn.operation.new_indices[0]
     assert committed_index.index_details == original_index.index_details
+
+
+def test_index_covering_fields_roundtrip(dataset_with_index, test_table, tmp_path):
+    """A non-empty covering declaration must survive both the transaction
+    round trip (transaction.rs) and the describe_indices round trip
+    (indices.rs)."""
+    from lance.dataset import Index
+
+    index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
+
+    # Create a new dataset without index
+    dataset_without_index = lance.write_dataset(
+        test_table, tmp_path / "dataset_without_index"
+    )
+
+    # Copy the index from dataset_with_index to dataset_without_index
+    src_index_dir = Path(dataset_with_index.uri) / "_indices" / index_id
+    dest_index_dir = Path(dataset_without_index.uri) / "_indices" / index_id
+    shutil.copytree(src_index_dir, dest_index_dir)
+
+    meta_id = _get_field_id_by_name(dataset_without_index.lance_schema, "meta")
+    price_id = _get_field_id_by_name(dataset_without_index.lance_schema, "price")
+
+    # `covering_fields` must be a non-empty, non-total suffix of `fields`:
+    # [price_id] is the trailing entry of [meta_id, price_id], leaving
+    # meta_id as the column the index is keyed on.
+    index = Index(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[meta_id, price_id],
+        dataset_version=dataset_without_index.version,
+        fragment_ids=set(
+            [f.fragment_id for f in dataset_without_index.get_fragments()]
+        ),
+        index_version=0,
+        covering_fields=[price_id],
+    )
+
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+    dataset_without_index = lance.LanceDataset.commit(
+        dataset_without_index.uri,
+        create_index_op,
+        read_version=dataset_without_index.version,
+    )
+
+    # Exercises transaction.rs: the Index <-> IndexMetadata PyO3 conversion.
+    committed_txn = dataset_without_index.get_transactions(1)[0]
+    committed_index = committed_txn.operation.new_indices[0]
+    assert committed_index.covering_fields == [price_id]
+
+    # Exercises indices.rs: the IndexMetadata -> PyIndexSegmentDescription
+    # conversion used by describe_indices().
+    segment = dataset_without_index.describe_indices()[0].segments[0]
+    assert segment.covering_fields == [price_id]
+
+
+def test_commit_index_rejects_invalid_covering_fields(dataset_with_index, tmp_path):
+    """The invariant is enforced at commit, not at construction.
+
+    LanceOperation.CreateIndex is a plain dataclass; it only reaches Rust at
+    commit(), so a construction-time gate would miss this path entirely.
+    """
+    from lance.dataset import Index
+
+    index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
+    field_id = _get_field_id_by_name(dataset_with_index.lance_schema, "meta")
+
+    # Constructing it is fine -- this is a dataclass, nothing is validated.
+    index = Index(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[field_id],
+        dataset_version=dataset_with_index.version,
+        fragment_ids=set([f.fragment_id for f in dataset_with_index.get_fragments()]),
+        index_version=0,
+        covering_fields=[field_id],  # covers the only field -- degenerate
+    )
+
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+
+    with pytest.raises(OSError, match="at least one field must remain indexed"):
+        lance.LanceDataset.commit(
+            dataset_with_index.uri,
+            create_index_op,
+            read_version=dataset_with_index.version,
+        )

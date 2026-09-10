@@ -1,12 +1,18 @@
 [package]
 name = "pylance"
-version = "9.0.0-beta.2"
+version = "12.0.0-beta.16"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
 rust-version = "1.91"
 exclude = ["python/lance/conftest.py"]
 publish = false
+
+# `python/` is excluded from the top-level workspace (see ../Cargo.toml) and keeps
+# its own Cargo.lock. Declaring an empty workspace here makes this crate an explicit
+# workspace root, so cargo resolves it standalone even when the checkout is nested
+# inside another cargo project (e.g. a git worktree placed under the main checkout).
+[workspace]
 
 [lib]
 name = "lance"
@@ -18,10 +24,11 @@ arrow-array = "58.0.0"
 arrow-cast = "58.0.0"
 arrow-data = "58.0.0"
 arrow-schema = "58.0.0"
-object_store = "0.13.2"
-datafusion = { version = "53.0.0", default-features = false }
-datafusion-ffi = "53.0.0"
-datafusion-common = "53.0.0"
+object_store = "0.14.1"
+url = "2.5.7"
+datafusion = { version = "54.0.0", default-features = false }
+datafusion-ffi = "54.0.0"
+datafusion-common = "54.0.0"
 # Keep the Python FFI build on the working Brotli allocator resolution until
 # datafusion-ffi no longer enables datafusion-proto/default.
 # See https://github.com/lance-format/lance/issues/7271.
@@ -38,6 +45,7 @@ lance = { path = "../rust/lance", features = [
     "goosefs",
     "dynamodb",
     "substrait",
+    "metrics",
 ] }
 lance-arrow = { path = "../rust/lance-arrow" }
 lance-core = { path = "../rust/lance-core" }
@@ -48,7 +56,7 @@ lance-index = { path = "../rust/lance-index", features = [
     "tokenizer-lindera",
     "tokenizer-jieba",
 ] }
-lance-io = { path = "../rust/lance-io" }
+lance-io = { path = "../rust/lance-io", features = ["metrics"] }
 lance-linalg = { path = "../rust/lance-linalg" }
 lance-namespace = { path = "../rust/lance-namespace" }
 lance-namespace-impls = { path = "../rust/lance-namespace-impls", features = ["rest", "rest-adapter", "dir-goosefs"] }
@@ -56,10 +64,11 @@ lance-table = { path = "../rust/lance-table" }
 lance-datafusion = { path = "../rust/lance-datafusion" }
 libc = "0.2.176"
 log = "0.4"
+metrics = "0.24"
+metrics-util = "0.19"
 prost = "0.14.1"
 prost-types = "0.14.1"
 pyo3 = { version = "0.28", features = [
-    "extension-module",
     "abi3-py310",
     "py-clone",
     "chrono",
@@ -74,11 +83,12 @@ serde_yaml = "0.9.34"
 tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.17"
 tracing = { version = "0.1" }
-bytes = "1.4"
+bytes = "1.11.1"
 
 [features]
-default = []
+default = ["extension-module"]
 datagen = ["lance-datagen"]
+extension-module = ["pyo3/extension-module"]
 fp16kernels = ["lance/fp16kernels"]
 
 [profile.ci]

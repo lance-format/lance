@@ -7,7 +7,7 @@ use arrow_array::{Float64Array, Int64Array, RecordBatch, RecordBatchIterator, St
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{Criterion, criterion_group, criterion_main};
 use lance::dataset::{Dataset, ProjectionRequest, WriteParams};
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use std::collections::HashMap;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -85,7 +85,12 @@ fn utf8_field_without_fsst(name: &str) -> Field {
 }
 
 fn utf8_field_for(version: LanceFileVersion, enable_fsst: bool, name: &str) -> Field {
-    if enable_fsst && version >= LanceFileVersion::V2_1 {
+    if enable_fsst
+        && matches!(
+            version.resolve(),
+            ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+        )
+    {
         Field::new(name, DataType::Utf8, false)
     } else {
         utf8_field_without_fsst(name)

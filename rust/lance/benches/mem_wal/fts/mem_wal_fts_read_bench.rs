@@ -5,11 +5,11 @@
 //!
 //! Sibling of `mem_wal_vector_bench.rs` / `mem_wal_point_lookup_bench.rs`:
 //! same `--phase prepare|search` shape, same `ShardWriter`-based ingestion
-//! of flushed generations + an active memtable, same `--uri` cloud/local
+//! of SSTables + an active memtable, same `--uri` cloud/local
 //! detection, and the same JSON output contract. The payload is real
 //! HuggingFace FineWeb `text` and the query path is
-//! [`LsmFtsSearchPlanner`] (local scoring) over the base table + flushed
-//! generations + active memtable.
+//! [`LsmFtsSearchPlanner`] (local scoring) over the base table + SSTables
+//! + active memtable.
 //!
 //! Each `search` invocation times a query set against the LSM hierarchy
 //! and reports latency percentiles. With `--with-baseline`, it also builds
@@ -108,7 +108,7 @@ struct Args {
     uri: String,
     base_rows: usize,
     max_memtable_rows: usize,
-    flushed_generations: usize,
+    sstables: usize,
     batch_rows: usize,
     queries: usize,
     k: usize,
@@ -126,7 +126,7 @@ impl Default for Args {
             uri: String::new(),
             base_rows: 1_000_000,
             max_memtable_rows: 100_000,
-            flushed_generations: 2,
+            sstables: 2,
             batch_rows: 1_000,
             queries: 200,
             k: 10,
@@ -175,7 +175,7 @@ fn parse_args() -> Result<Args> {
             }
             "--base-rows" => args.base_rows = parse_val(&flag, &value)?,
             "--max-memtable-rows" => args.max_memtable_rows = parse_val(&flag, &value)?,
-            "--flushed-generations" => args.flushed_generations = parse_val(&flag, &value)?,
+            "--sstables" => args.sstables = parse_val(&flag, &value)?,
             "--batch-rows" => args.batch_rows = parse_val(&flag, &value)?,
             "--queries" => args.queries = parse_val(&flag, &value)?,
             "--k" => args.k = parse_val(&flag, &value)?,
@@ -524,7 +524,7 @@ async fn run_local(planner: &LsmFtsSearchPlanner, queries: &[String], k: usize) 
     for q in queries {
         let t0 = Instant::now();
         let plan = planner
-            .plan_search(TEXT_COL, FullTextSearchQuery::new(q.clone()), k, None)
+            .plan_search(TEXT_COL, FullTextSearchQuery::new(q.clone()), Some(k), None)
             .await?;
         let stream = plan.execute(0, ctx.task_ctx())?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
@@ -664,7 +664,7 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
     // covering both the memtable payload and the query-term sample, instead
     // of re-reading the whole base corpus from parquet.
     let active_rows = args.max_memtable_rows / 2;
-    let total_memtable_rows = args.flushed_generations * args.max_memtable_rows + active_rows;
+    let total_memtable_rows = args.sstables * args.max_memtable_rows + active_rows;
     let sample_rows = args.base_rows.min(50_000);
     let load_rows = total_memtable_rows.max(sample_rows);
     println!("loading {load_rows} FineWeb rows for memtable payload + query sample ...");
@@ -673,20 +673,16 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
 
     let shard_id = Uuid::new_v4();
     let row_bytes = 2048; // rough FineWeb text row size
-    // The memtable flush trigger is `estimated_size >= max_memtable_size ||
-    // batch_store_full`. FineWeb text rows vary in size, so a byte threshold
-    // is an unreliable way to flush exactly one generation per
-    // `max_memtable_rows`. Instead make the *batch-count* cap the trigger:
-    // set `max_memtable_batches` to one generation's worth of batches so the
-    // store fills (and flushes) precisely at each generation boundary,
-    // independent of text length. Keep `max_memtable_size` high so it never
-    // pre-empts the batch-count trigger.
+    // The memtable seals at `max_memtable_rows`, giving one generation per cap.
+    // `max_memtable_batches` is sized to that same boundary, and
+    // `max_memtable_size` kept high so the byte threshold never pre-empts it.
     let batches_per_gen = (args.max_memtable_rows / args.batch_rows).max(1);
     let config = ShardWriterConfig {
         shard_id,
+        max_wal_persist_retries: 3,
+        wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write: false,
-        sync_indexed_write: false,
         max_memtable_size: args.max_memtable_rows * row_bytes * 100,
         max_memtable_rows: args.max_memtable_rows,
         max_memtable_batches: batches_per_gen,
@@ -702,10 +698,8 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
         Duration::from_millis(500)
     };
 
-    // Ingest flushed generations + 1 active (50% full).
-    let mut gen_sizes: Vec<usize> = (0..args.flushed_generations)
-        .map(|_| args.max_memtable_rows)
-        .collect();
+    // Ingest SSTables + 1 active (50% full).
+    let mut gen_sizes: Vec<usize> = (0..args.sstables).map(|_| args.max_memtable_rows).collect();
     gen_sizes.push(active_rows);
 
     let id_base = args.base_rows as i64;
@@ -722,19 +716,19 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
             cursor += chunk;
             written += chunk;
         }
-        let is_flushed = gen_idx < args.flushed_generations;
+        let is_sstable = gen_idx < args.sstables;
         println!(
             "  gen {}: wrote {} rows ({})",
             gen_idx + 1,
             gen_rows,
-            if is_flushed { "flushed" } else { "active" }
+            if is_sstable { "sstable" } else { "active" }
         );
-        if is_flushed {
+        if is_sstable {
             tokio::time::sleep(flush_wait).await;
         }
     }
     // Wait for any triggered (sealed) memtable flushes to commit to the
-    // manifest before we snapshot it — otherwise the flushed generations
+    // manifest before we snapshot it — otherwise the SSTables
     // race the read and may not all be visible yet.
     writer.wait_for_flush_drain().await?;
     println!(
@@ -748,17 +742,14 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
     let mut shard_snapshot = ShardSnapshot::new(shard_id);
     if let Some(ref m) = manifest {
         shard_snapshot = shard_snapshot.with_current_generation(m.current_generation);
-        for fg in &m.flushed_generations {
-            shard_snapshot = shard_snapshot.with_flushed_generation(fg.generation, fg.path.clone());
+        for sstable in &m.sstables {
+            shard_snapshot = shard_snapshot.with_sstable(sstable.generation, sstable.path.clone());
         }
     }
-    let num_flushed = manifest
-        .as_ref()
-        .map(|m| m.flushed_generations.len())
-        .unwrap_or(0);
-    println!("manifest: {num_flushed} flushed generations");
+    let num_sstables = manifest.as_ref().map(|m| m.sstables.len()).unwrap_or(0);
+    println!("manifest: {num_sstables} SSTables");
 
-    // Flushed generations carry the same maintained secondary indexes as
+    // SSTables carry the same maintained secondary indexes as
     // the active memtable: the flush handler builds them during flush
     // (lance #6901), so each generation already has the FTS index and
     // both scoring modes use the fast indexed path. No manual indexing
@@ -825,7 +816,7 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
         "uri_kind": if is_cloud_uri(&args.uri) { "cloud" } else { "local" },
         "base_rows": args.base_rows,
         "max_memtable_rows": args.max_memtable_rows,
-        "flushed_generations": num_flushed,
+        "sstables": num_sstables,
         "active_rows": active_rows,
         "k": args.k,
         "queries": queries.len(),
@@ -846,12 +837,12 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
 
 async fn run(args: Args) -> Result<()> {
     println!(
-        "bench=mem_wal_fts_read phase={} uri={} base_rows={} max_memtable_rows={} flushed_generations={} queries={} k={} with_baseline={}",
+        "bench=mem_wal_fts_read phase={} uri={} base_rows={} max_memtable_rows={} sstables={} queries={} k={} with_baseline={}",
         args.phase.as_str(),
         args.uri,
         args.base_rows,
         args.max_memtable_rows,
-        args.flushed_generations,
+        args.sstables,
         args.queries,
         args.k,
         args.with_baseline,

@@ -5,7 +5,7 @@
 //!
 //! Drops a row when any newer generation's membership ([`GenMembership`])
 //! contains its primary key — in-memory generations probe their PK index by
-//! value, flushed generations probe their on-disk PK BTree. Each generation is
+//! value, SSTables probe their on-disk PK BTree. Each generation is
 //! probed once per batch (see the perf note below). Used both as the KNN
 //! post-filter (vector search, with over-fetch) and the cross-generation scan
 //! filter (`k = 0`).
@@ -22,12 +22,11 @@
 //! `BTreeIndex::contains_keys` (one page pass, no per-key `SearchResult`
 //! allocation); the in-memory arm maps a sync PK lookup over the keys. Probes
 //! are not disk-bound in steady state: the opened index and its (small,
-//! memtable-sized) pages are held by the injected `FlushedMemTableCache` /
+//! memtable-sized) pages are held by the injected `SsTableCache` /
 //! `LanceCache`, so after the first touch every probe is memory-resident.
 //! Already-blocked rows are dropped from the key set before probing older
 //! generations, preserving the per-row short-circuit.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -109,10 +108,6 @@ impl ExecutionPlan for PkBlockFilterExec {
         "PkBlockFilterExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.input.schema()
     }
@@ -185,8 +180,8 @@ struct PkBlockFilterStream {
     warned: bool,
 }
 
-/// Keep only the rows no newer-gen membership contains. Async because flushed
-/// generations are probed against their on-disk PK BTree.
+/// Keep only the rows no newer-gen membership contains. Async because SSTables
+/// are probed against their on-disk PK BTree.
 async fn filter_batch(batch: RecordBatch, config: Arc<FilterConfig>) -> DFResult<RecordBatch> {
     let FilterConfig {
         pk_columns,
@@ -266,13 +261,19 @@ impl Stream for PkBlockFilterStream {
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(None) => {
-                    // >= k candidates in, < k out: over-fetch missed superseded rows.
+                    // >= k candidates in, < k out: over-fetch missed superseded
+                    // rows. Each is a PK shadowed by a newer generation — an
+                    // update (replaced elsewhere) or a delete (a tombstone that
+                    // emits nothing, so it is pure, uncompensated subtraction).
+                    // A burst of deletes between compactions is the likeliest
+                    // cause of repeated warnings.
                     if !this.warned && this.input_seen >= this.k && this.kept < this.k {
                         warn!(
                             k = this.k,
                             fetched = this.input_seen,
                             kept = this.kept,
-                            "LSM vector search: < k live rows survived the PK post-filter; \
+                            "LSM vector search: < k live rows survived the PK post-filter \
+                             (superseded by newer-generation updates or deletes); \
                              raise the over-fetch factor or use a true KNN prefilter."
                         );
                         this.warned = true;
@@ -316,7 +317,7 @@ mod tests {
             let (bp, off, _) = store.append(b.clone()).unwrap();
             index.insert_with_batch_position(&b, off, Some(bp)).unwrap();
         }
-        let max_visible_row = store.max_visible_row(index.max_visible_batch_position());
+        let max_visible_row = store.max_visible_row(index.visible_count());
         GenMembership::InMemory {
             index_store: Arc::new(index),
             max_visible_row,

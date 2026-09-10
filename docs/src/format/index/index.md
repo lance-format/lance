@@ -98,7 +98,12 @@ Index segments are created and updated through a transactional process:
 2. **Prepare the metadata**: Create an `IndexMetadata` message with:
    - `uuid`: The newly generated UUID
    - `name`: The index name (must match existing segments if adding to an existing index)
-   - `fields`: The column(s) being indexed
+   - `fields`: The columns the index depends on: the keyed column(s) it is searched on, followed
+     by any merely-carried columns named in `covering_fields`. `fields[0]` is always a keyed column.
+   - `covering_fields`: The trailing subset of `fields` whose values the index carries but is not
+     keyed on, letting a query that only projects those columns be answered without a fragment take.
+     Empty for an index that carries no extra columns. Declaring a column here does not by itself
+     make it servable -- see [Serving carried columns](#serving-carried-columns).
    - `fragment_bitmap`: The set of fragment IDs covered by this segment
    - `index_details`: Index-specific configuration and parameters
    - `version`: The format version of this index type
@@ -108,10 +113,11 @@ Index segments are created and updated through a transactional process:
    in its `IndexSection`. This is done atomically using the same transaction mechanism
    as data writes.
 
-When updating an indexed column in place (without deleting the row), the engine must
-remove the affected fragment IDs from the `fragment_bitmap` field of any index segments
-that cover those fragments. This marks those fragments as needing re-indexing without
-invalidating the entire segment and prevents invalid data from being read from the index.
+When updating a column in place (without deleting the row), the engine must remove the
+affected fragment IDs from the `fragment_bitmap` field of any index segment whose `fields`
+include that column — whether the index is keyed on it or merely carries it. This marks
+those fragments as needing re-indexing without invalidating the entire segment and prevents
+invalid data from being read from the index.
 
 ## Index Compatibility
 
@@ -128,6 +134,25 @@ Before using an index segment, engines must verify they support it:
 
 When an engine cannot use an index segment, it should fall back to scanning the
 fragments that would have been covered by that segment.
+
+### Serving carried columns
+
+`IndexMetadata.covering_fields` records the columns an index segment *declares* it
+carries. It does not establish that the segment's storage holds their values.
+
+**The segment's storage schema is authoritative.** Before answering a query from a
+carried column, an engine must confirm that column is present in the storage it opened,
+and fall back to a take against the base table when it is not. A segment whose
+declaration names a column its storage does not hold is a legal state, not corruption:
+a maintenance operation that cannot carry the payload through a rebuild is permitted to
+withdraw it and leave the declaration standing.
+
+!!! note "Current state"
+
+    No index builder writes carried values yet, so today every declaration is ahead of
+    its storage. Engines that read `covering_fields` must therefore treat it purely as a
+    declaration and serve every column from the base table until they have verified the
+    storage themselves. This is transitional; the rule above is not.
 
 ## Loading an index
 
@@ -147,7 +172,12 @@ When loading an index:
 The `IndexMetadata` message contains important information about the index segment:
 
 - `uuid`: the unique identifier of the index segment.
-- `fields`: the column(s) the index is built on.
+- `fields`: the columns the index depends on: the keyed column(s) the index is searched on, followed
+  by any columns it merely carries, as named in `covering_fields`. `fields[0]` is always a keyed column.
+- `covering_fields`: the trailing subset of `fields` whose values the index carries alongside its own
+  data but is not keyed on. Empty for an index that carries no extra columns. This declaration is
+  not authoritative for what the segment can serve -- see
+  [Serving carried columns](#serving-carried-columns).
 - `fragment_bitmap`: the set of fragment IDs covered by this index segment.
 - `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.
@@ -177,7 +207,7 @@ or updated. These should be filtered out during query execution.
   </figcaption>
 </figure>
 
-There are three situations to consider:
+There are four situations to consider:
 
 1. **A fragment has some deleted rows.** A few of the rows in the fragment have been marked
    as deleted, but some of the rows are still present. The row addresses from the deletion
@@ -185,9 +215,27 @@ There are three situations to consider:
 2. **A fragment has been completely deleted.** This can be detected by checking if a
    fragment ID present in the fragment bitmap is missing from the dataset.
    Any row addresses from this fragment should be filtered out.
-3. **A fragment has had the indexed column updated in place.** This cannot be detected just
-   by examining metadata. To prevent reading invalid data, the engine should filter out any
+3. **A fragment has had one of the index's columns updated in place.** This cannot be detected
+   just by examining metadata. To prevent reading invalid data, the engine should filter out any
    row addresses that are not in the index's current `fragment_bitmap`.
+   The column need not be one the index is keyed on: every column in `fields` counts, including
+   the merely-carried ones named in `covering_fields`. A carried column can be updated while the
+   keyed column is untouched, and a segment left covering that fragment would answer from an
+   obsolete carried value.
+4. **A fragment has an updated value in an [overlay file](../table/data_overlay_file.md).**
+   This can be detected by checking if any of the fragments in the index's `fragment_bitmap`
+   have overlay files. For each overlay whose `committed_version` is greater than the index
+   segment's `dataset_version`, the overlay carries updated values not reflected in the index,
+   so its covered rows must be excluded from index results. Excluded rows are re-evaluated
+   against their current (overlaid) values on the flat path — dropping them without
+   re-evaluation would silently lose rows that match under the new value. Exclusion is
+   field-aware: only overlays covering a column in the index's `fields` matter — keyed or
+   merely carried. Restricting this to the keyed column would leave a fragment covered after
+   an overlay updated a carried one, and the index would then serve a stale carried value.
+   You may exclude just the affected rows or the whole fragment; the latter is simpler and
+   safer but re-evaluates more rows than necessary.
+   See [Data Overlay Files](../table/data_overlay_file.md#index-integration)
+   for the exclusion set, re-evaluation, and correctness invariant.
 
 ## Compaction and remapping
 
@@ -220,7 +268,8 @@ logical identifier that remains constant even when rows are moved during compact
 **Benefits:**
 
 - No remapping needed after compaction
-- Updates only invalidate the index if the indexed column data changes
+- Updates only invalidate the index if data in one of its `fields` changes — the keyed
+  column(s) or any column named in `covering_fields`
 
 **Tradeoffs:**
 

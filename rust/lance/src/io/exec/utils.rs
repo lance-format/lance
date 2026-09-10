@@ -2,13 +2,15 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_datafusion::utils::{
-    BYTES_READ_METRIC, ExecutionPlanMetricsSetExt, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
-    IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+    BYTES_READ_METRIC, ExecutionPlanMetricsSetExt, INDEX_CACHE_HITS_METRIC,
+    INDEX_CACHE_MISSES_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
+    PARTS_LOADED_METRIC, REQUESTS_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -17,23 +19,52 @@ use std::task::{Context, Poll};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricValue,
 };
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream,
 };
+use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use futures::future::{BoxFuture, Shared};
 use futures::stream::FuturesUnordered;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
 use lance_select::{RowAddrMask, RowAddrTreeMap, result::IndexExprResult};
+use tracing::Instrument;
 
+use super::row_addr_mask::MaskAndLoader;
 use crate::Dataset;
 use crate::index::prefilter::DatasetPreFilter;
+
+/// Open fragments on cancellation-safe tasks while preserving the stream's
+/// ordering and readahead bound.
+pub(crate) fn buffered_fragment_opens<S, Open, OpenFuture, Reader>(
+    fragments: S,
+    fragment_readahead: usize,
+    mut open: Open,
+) -> impl Stream<Item = DataFusionResult<Reader>>
+where
+    S: Stream + Send,
+    Open: FnMut(S::Item) -> OpenFuture + Send,
+    OpenFuture: Future<Output = DataFusionResult<Reader>> + Send + 'static,
+    Reader: Send + 'static,
+{
+    fragments
+        .map(move |fragment| {
+            SpawnedTask::spawn(open(fragment).in_current_span()).map(|task_result| {
+                task_result.map_err(|error| DataFusionError::External(Box::new(error)))?
+            })
+        })
+        .buffered(fragment_readahead)
+}
 
 #[derive(Debug, Clone)]
 pub enum PreFilterSource {
@@ -45,29 +76,365 @@ pub enum PreFilterSource {
     None,
 }
 
+type SharedPreFilterFuture = Shared<BoxFuture<'static, CloneableResult<Arc<RowAddrMask>>>>;
+
+struct SharedPreFilterEntry {
+    context: std::sync::Weak<datafusion::execution::TaskContext>,
+    future: SharedPreFilterFuture,
+    waiters: usize,
+    is_complete: bool,
+    generation: u64,
+}
+
+/// Query-plan-local materialization state for a MultiMatch base prefilter.
+///
+/// Entries are keyed by task-context identity and partition. This prevents a
+/// reused physical plan from carrying a mask into a later query and keeps an
+/// accidental multi-partition execution from sharing across input partitions.
+/// The mutex is held only while installing or cloning a future; prefilter
+/// execution never runs under it.
+struct SharedPreFilterMaterialization {
+    queries: Mutex<HashMap<(usize, usize), SharedPreFilterEntry>>,
+    next_generation: std::sync::atomic::AtomicU64,
+}
+
+impl std::fmt::Debug for SharedPreFilterMaterialization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let queries = self
+            .queries
+            .lock()
+            .map(|queries| queries.len())
+            .unwrap_or_default();
+        f.debug_struct("SharedPreFilterMaterialization")
+            .field("queries", &queries)
+            .finish()
+    }
+}
+
+impl SharedPreFilterMaterialization {
+    fn new() -> Self {
+        Self {
+            queries: Mutex::new(HashMap::new()),
+            next_generation: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SharedPreFilterExec {
+    source: Arc<dyn ExecutionPlan>,
+    materialization: Arc<SharedPreFilterMaterialization>,
+    properties: Arc<PlanProperties>,
+}
+
+impl SharedPreFilterExec {
+    fn new(
+        source: Arc<dyn ExecutionPlan>,
+        materialization: Arc<SharedPreFilterMaterialization>,
+    ) -> Self {
+        Self {
+            properties: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(source.schema()),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            )),
+            source,
+            materialization,
+        }
+    }
+}
+
+impl DisplayAs for SharedPreFilterExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "SharedMultiMatchPrefilter")
+    }
+}
+
+impl ExecutionPlan for SharedPreFilterExec {
+    fn name(&self) -> &str {
+        "SharedPreFilterExec"
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.source]
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let source = match children.len() {
+            1 => children.pop().ok_or_else(|| {
+                DataFusionError::Internal(
+                    "shared MultiMatch prefilter lost its source child".to_string(),
+                )
+            })?,
+            count => {
+                return Err(DataFusionError::Internal(format!(
+                    "shared MultiMatch prefilter expected one child, got {count}"
+                )));
+            }
+        };
+        Ok(Arc::new(Self::new(source, self.materialization.clone())))
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        Err(DataFusionError::Internal(
+            "shared MultiMatch prefilter must be materialized by its FTS consumer".to_string(),
+        ))
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+}
+
+pub(crate) struct PreFilterMasks {
+    pub overlay_block: Option<RowAddrMask>,
+    pub external_mask: Option<Arc<RowAddrMask>>,
+}
+
+impl PreFilterSource {
+    /// Return a plan-local shared form for a MultiMatch with multiple fields.
+    /// No-filter and already-shared sources retain their existing identity.
+    pub(crate) fn shared_for_multimatch_fields(&self, field_count: usize) -> Vec<Self> {
+        if field_count <= 1 {
+            return vec![self.clone(); field_count];
+        }
+        match self {
+            Self::FilteredRowIds(source) | Self::ScalarIndexQuery(source) => {
+                let materialization = Arc::new(SharedPreFilterMaterialization::new());
+                (0..field_count)
+                    .map(|_| {
+                        let shared = Arc::new(SharedPreFilterExec::new(
+                            source.clone(),
+                            materialization.clone(),
+                        ));
+                        if matches!(self, Self::FilteredRowIds(_)) {
+                            Self::FilteredRowIds(shared)
+                        } else {
+                            Self::ScalarIndexQuery(shared)
+                        }
+                    })
+                    .collect()
+            }
+            Self::None => vec![self.clone(); field_count],
+        }
+    }
+
+    pub(crate) fn execution_plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
+        match self {
+            Self::FilteredRowIds(source) | Self::ScalarIndexQuery(source) => Some(source),
+            Self::None => None,
+        }
+    }
+
+    pub(crate) fn with_execution_plan(
+        &self,
+        source: Arc<dyn ExecutionPlan>,
+    ) -> DataFusionResult<Self> {
+        match self {
+            Self::FilteredRowIds(_) => Ok(Self::FilteredRowIds(source)),
+            Self::ScalarIndexQuery(_) => Ok(Self::ScalarIndexQuery(source)),
+            Self::None => Err(DataFusionError::Internal(
+                "prefilter source received an unexpected execution-plan child".to_string(),
+            )),
+        }
+    }
+}
+
+struct SharedPreFilterWaiter {
+    materialization: Arc<SharedPreFilterMaterialization>,
+    key: (usize, usize),
+    generation: u64,
+}
+
+impl SharedPreFilterWaiter {
+    fn mark_complete(&self) {
+        if let Ok(mut queries) = self.materialization.queries.lock()
+            && let Some(entry) = queries.get_mut(&self.key)
+            && entry.generation == self.generation
+        {
+            entry.is_complete = true;
+        }
+    }
+}
+
+impl Drop for SharedPreFilterWaiter {
+    fn drop(&mut self) {
+        let Ok(mut queries) = self.materialization.queries.lock() else {
+            return;
+        };
+        let should_remove = if let Some(entry) = queries.get_mut(&self.key)
+            && entry.generation == self.generation
+        {
+            let Some(waiters) = entry.waiters.checked_sub(1) else {
+                debug_assert!(false, "shared prefilter waiter count underflowed");
+                return;
+            };
+            entry.waiters = waiters;
+            entry.waiters == 0 && !entry.is_complete
+        } else {
+            false
+        };
+        if should_remove {
+            queries.remove(&self.key);
+        }
+    }
+}
+
+fn shared_prefilter_future(
+    materialization: Arc<SharedPreFilterMaterialization>,
+    source: Arc<dyn ExecutionPlan>,
+    is_scalar_index_query: bool,
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+) -> BoxFuture<'static, Result<Arc<RowAddrMask>>> {
+    async move {
+        let context_id = Arc::as_ptr(&context) as usize;
+        let key = (context_id, partition);
+        let (future, generation) = {
+            let mut queries = materialization.queries.lock().map_err(|_| {
+                Error::internal("MultiMatch prefilter materialization lock was poisoned")
+            })?;
+            queries.retain(|_, entry| entry.context.strong_count() > 0);
+            if let Some(entry) = queries.get_mut(&key) {
+                entry.waiters = entry.waiters.checked_add(1).ok_or_else(|| {
+                    Error::internal("MultiMatch prefilter waiter count overflowed")
+                })?;
+                (entry.future.clone(), entry.generation)
+            } else {
+                let generation = materialization
+                    .next_generation
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |generation| generation.checked_add(1),
+                    )
+                    .map_err(|_| {
+                        Error::internal("MultiMatch prefilter generation counter overflowed")
+                    })?;
+                let entry = SharedPreFilterEntry {
+                    context: Arc::downgrade(&context),
+                    future: {
+                        async move {
+                            let result = async move {
+                                let stream = source.execute(partition, context)?;
+                                if is_scalar_index_query {
+                                    Box::new(SelectionVectorToPrefilter(stream)).load().await
+                                } else {
+                                    Box::new(FilteredRowIdsToPrefilter(stream)).load().await
+                                }
+                            }
+                            .await;
+                            CloneableResult::from(result.map(Arc::new))
+                        }
+                        .boxed()
+                        .shared()
+                    },
+                    waiters: 1,
+                    is_complete: false,
+                    generation,
+                };
+                let future = entry.future.clone();
+                queries.insert(key, entry);
+                (future, generation)
+            }
+        };
+        let waiter = SharedPreFilterWaiter {
+            materialization,
+            key,
+            generation,
+        };
+        let CloneableResult(result) = future.await;
+        waiter.mark_complete();
+        result.map_err(|error| error.0)
+    }
+    .boxed()
+}
+
 pub(crate) fn build_prefilter(
     context: Arc<datafusion::execution::TaskContext>,
     partition: usize,
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
     index_meta: &[IndexMetadata],
+    masks: PreFilterMasks,
 ) -> Result<Arc<DatasetPreFilter>> {
+    let mut shared_filter = None;
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
-            let stream = src_node.execute(partition, context)?;
-            Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+            if let Some(shared) = src_node.downcast_ref::<SharedPreFilterExec>() {
+                shared_filter = Some(shared_prefilter_future(
+                    shared.materialization.clone(),
+                    shared.source.clone(),
+                    false,
+                    context,
+                    partition,
+                ));
+                None
+            } else {
+                let stream = src_node.execute(partition, context)?;
+                Some(Box::new(FilteredRowIdsToPrefilter(stream)) as Box<dyn FilterLoader>)
+            }
         }
         PreFilterSource::ScalarIndexQuery(src_node) => {
-            let stream = src_node.execute(partition, context)?;
-            Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+            if let Some(shared) = src_node.downcast_ref::<SharedPreFilterExec>() {
+                shared_filter = Some(shared_prefilter_future(
+                    shared.materialization.clone(),
+                    shared.source.clone(),
+                    true,
+                    context,
+                    partition,
+                ));
+                None
+            } else {
+                let stream = src_node.execute(partition, context)?;
+                Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+            }
         }
         PreFilterSource::None => None,
     };
-    Ok(Arc::new(DatasetPreFilter::new(
-        ds,
-        index_meta,
-        prefilter_loader,
-    )))
+    // Combine the external row-address mask (logical AND) with whatever the
+    // filter produced, so an FTS prefilter restricts BM25 scoring to masked rows
+    // (mirrors the ANN path). Independent of `overlay_block`, which the prefilter
+    // applies separately to drop index entries staled by a data overlay.
+    let mut prefilter = if let Some(shared_filter) = shared_filter {
+        let shared_filter = match masks.external_mask {
+            Some(mask) => async move {
+                Ok(Arc::new(
+                    mask.as_ref().clone() & shared_filter.await?.as_ref().clone(),
+                ))
+            }
+            .boxed(),
+            None => shared_filter,
+        };
+        DatasetPreFilter::new_with_filter_future(ds, index_meta, Some(shared_filter))
+    } else {
+        let prefilter_loader = match masks.external_mask {
+            Some(mask) => {
+                Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
+            }
+            None => prefilter_loader,
+        };
+        DatasetPreFilter::new(ds, index_meta, prefilter_loader)
+    };
+    if let Some(overlay_block) = masks.overlay_block {
+        prefilter = prefilter.with_overlay_block(overlay_block);
+    }
+    Ok(Arc::new(prefilter))
 }
 
 // Utility to convert an input (containing row ids) into a prefilter
@@ -173,14 +540,16 @@ impl DisplayAs for ReplayExec {
 
 // There's some annoying adapter-work that needs to happen here.  In order
 // to share a stream we need its items to be Clone and DataFusionError is
-// not Clone.  So we wrap the stream in a CloneableResult.  However, in order
-// for that shared stream to be a SendableRecordBatchStream, it needs to be
-// using DataFusionError.  So we need to adapt the stream back to a
-// SendableRecordBatchStream.
+// not Clone.  So we wrap errors in Arc<DataFusionError> (which is Clone).
+// In order for that shared stream to be a SendableRecordBatchStream it must
+// use DataFusionError, so the adapter unwraps the Arc via DataFusionError::Shared,
+// which preserves the typed source chain for both consumers.
 pub struct ShareableRecordBatchStream(pub SendableRecordBatchStream);
 
+type SharedBatchResult = std::result::Result<RecordBatch, std::sync::Arc<DataFusionError>>;
+
 impl Stream for ShareableRecordBatchStream {
-    type Item = CloneableResult<RecordBatch>;
+    type Item = SharedBatchResult;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -189,28 +558,25 @@ impl Stream for ShareableRecordBatchStream {
         match self.0.poll_next_unpin(cx) {
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
             std::task::Poll::Ready(Some(res)) => {
-                std::task::Poll::Ready(Some(CloneableResult::from(res.map_err(Error::from))))
+                std::task::Poll::Ready(Some(res.map_err(std::sync::Arc::new)))
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
 
-pub struct ShareableRecordBatchStreamAdapter<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin>
-{
+pub struct ShareableRecordBatchStreamAdapter<S: Stream<Item = SharedBatchResult> + Unpin> {
     schema: SchemaRef,
     stream: S,
 }
 
-impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> ShareableRecordBatchStreamAdapter<S> {
+impl<S: Stream<Item = SharedBatchResult> + Unpin> ShareableRecordBatchStreamAdapter<S> {
     pub fn new(schema: SchemaRef, stream: S) -> Self {
         Self { schema, stream }
     }
 }
 
-impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> Stream
-    for ShareableRecordBatchStreamAdapter<S>
-{
+impl<S: Stream<Item = SharedBatchResult> + Unpin> Stream for ShareableRecordBatchStreamAdapter<S> {
     type Item = DataFusionResult<RecordBatch>;
 
     fn poll_next(
@@ -219,16 +585,15 @@ impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> Stream
     ) -> std::task::Poll<Option<Self::Item>> {
         match self.stream.poll_next_unpin(cx) {
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Ready(Some(res)) => std::task::Poll::Ready(Some(
-                res.0
-                    .map_err(|e| DataFusionError::External(e.0.to_string().into())),
-            )),
+            std::task::Poll::Ready(Some(res)) => {
+                std::task::Poll::Ready(Some(res.map_err(DataFusionError::Shared)))
+            }
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
 
-impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> RecordBatchStream
+impl<S: Stream<Item = SharedBatchResult> + Unpin> RecordBatchStream
     for ShareableRecordBatchStreamAdapter<S>
 {
     fn schema(&self) -> SchemaRef {
@@ -421,10 +786,6 @@ impl ExecutionPlan for ReplayExec {
         "ReplayExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.input.schema()
     }
@@ -521,6 +882,8 @@ pub struct IndexMetrics {
     indices_loaded: Count,
     parts_loaded: Count,
     index_comparisons: Count,
+    index_cache_hits: Count,
+    index_cache_misses: Count,
     /// Per-query sink that accumulates exact index-file I/O as partitions are
     /// loaded from storage.  Shared by all clones of this `IndexMetrics`, so
     /// concurrent partition loads all funnel into the same counters.  Published
@@ -535,6 +898,8 @@ impl IndexMetrics {
             indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
             parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
             index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
+            index_cache_hits: metrics.new_count(INDEX_CACHE_HITS_METRIC, partition),
+            index_cache_misses: metrics.new_count(INDEX_CACHE_MISSES_METRIC, partition),
             io_stats: IoStats::new(),
             io_metrics: IoMetrics::new(metrics, partition),
         }
@@ -559,6 +924,12 @@ impl MetricsCollector for IndexMetrics {
     fn record_comparisons(&self, num_comparisons: usize) {
         self.index_comparisons.add(num_comparisons);
     }
+    fn record_index_cache_hits(&self, num_hits: usize) {
+        self.index_cache_hits.add(num_hits);
+    }
+    fn record_index_cache_misses(&self, num_misses: usize) {
+        self.index_cache_misses.add(num_misses);
+    }
     fn io_stats(&self) -> Option<IoStats> {
         Some(self.io_stats.clone())
     }
@@ -569,9 +940,10 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{RecordBatchReader, types::UInt32Type};
-    use arrow_schema::SortOptions;
+    use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array, types::UInt32Type};
+    use arrow_schema::{DataType, Field, Schema, SortOptions};
     use datafusion::common::NullEquality;
+    use datafusion::error::{DataFusionError, Result as DataFusionResult};
     use datafusion::{
         logical_expr::JoinType,
         physical_expr::expressions::Column,
@@ -579,12 +951,295 @@ mod tests {
             ExecutionPlan, joins::SortMergeJoinExec, stream::RecordBatchStreamAdapter,
         },
     };
-    use futures::{StreamExt, TryStreamExt};
-    use lance_core::utils::futures::Capacity;
+    use futures::{StreamExt, TryStreamExt, stream};
+    use lance_core::{ROW_ID, utils::futures::Capacity};
     use lance_datafusion::exec::OneShotExec;
     use lance_datagen::{BatchCount, RowCount, array};
+    use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResult};
+    use roaring::RoaringBitmap;
+    use rstest::rstest;
 
-    use super::{InstrumentedChildInputStream, ReplayExec};
+    use super::{
+        InstrumentedChildInputStream, PreFilterSource, ReplayExec, SharedPreFilterExec,
+        SharedPreFilterMaterialization, shared_prefilter_future,
+    };
+
+    fn prefilter_source(is_scalar_index_query: bool, is_empty: bool) -> PreFilterSource {
+        let mask = if is_empty {
+            RowAddrMask::allow_nothing()
+        } else {
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(0_u64..4))
+        };
+        let batch = if is_scalar_index_query {
+            IndexExprResult::exact(mask)
+                .serialize(
+                    &RoaringBitmap::from_iter([0_u32]),
+                    IndexExprResultWireFormat::TwoMask,
+                )
+                .unwrap()
+        } else {
+            let row_ids = if is_empty {
+                UInt64Array::from(Vec::<u64>::new())
+            } else {
+                UInt64Array::from_iter_values(0_u64..4)
+            };
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    ROW_ID,
+                    DataType::UInt64,
+                    false,
+                )])),
+                vec![Arc::new(row_ids)],
+            )
+            .unwrap()
+        };
+        // A duplicate source execution fails, so successful concurrent
+        // materialization verifies sharing without production metrics.
+        let source = Arc::new(OneShotExec::from_batch(batch));
+        if is_scalar_index_query {
+            PreFilterSource::ScalarIndexQuery(source)
+        } else {
+            PreFilterSource::FilteredRowIds(source)
+        }
+    }
+
+    fn shared_materialization(source: &PreFilterSource) -> Arc<SharedPreFilterMaterialization> {
+        match source {
+            PreFilterSource::FilteredRowIds(source) | PreFilterSource::ScalarIndexQuery(source) => {
+                source
+                    .downcast_ref::<SharedPreFilterExec>()
+                    .expect("expected a shared prefilter source")
+                    .materialization
+                    .clone()
+            }
+            _ => panic!("expected a shared prefilter source"),
+        }
+    }
+
+    fn shared_source(source: &PreFilterSource) -> Arc<dyn ExecutionPlan> {
+        match source {
+            PreFilterSource::FilteredRowIds(source) | PreFilterSource::ScalarIndexQuery(source) => {
+                source
+                    .downcast_ref::<SharedPreFilterExec>()
+                    .expect("expected a shared prefilter source")
+                    .source
+                    .clone()
+            }
+            _ => panic!("expected a shared prefilter source"),
+        }
+    }
+
+    #[rstest]
+    #[case::two_fields(2)]
+    #[case::four_fields(4)]
+    #[case::eight_fields(8)]
+    #[tokio::test]
+    async fn shared_multimatch_prefilter_materializes_once(
+        #[case] field_count: usize,
+        #[values(false, true)] is_scalar_index_query: bool,
+        #[values(false, true)] is_empty: bool,
+    ) {
+        let shared_sources = prefilter_source(is_scalar_index_query, is_empty)
+            .shared_for_multimatch_fields(field_count);
+        assert_eq!(
+            shared_sources
+                .iter()
+                .filter(|source| source.execution_plan().is_some())
+                .count(),
+            field_count,
+            "every field must declare its shared source dependency"
+        );
+        let context = Arc::new(datafusion::execution::TaskContext::default());
+        let masks = futures::future::try_join_all(shared_sources.iter().map(|source| {
+            shared_prefilter_future(
+                shared_materialization(source),
+                shared_source(source),
+                is_scalar_index_query,
+                context.clone(),
+                0,
+            )
+        }))
+        .await
+        .unwrap();
+
+        assert!(masks.windows(2).all(|pair| Arc::ptr_eq(&pair[0], &pair[1])));
+        assert_eq!(masks[0].allow_list().unwrap().is_empty(), is_empty);
+    }
+
+    #[test]
+    fn no_filter_and_single_field_do_not_install_sharing() {
+        let no_filter = PreFilterSource::None.shared_for_multimatch_fields(8);
+        assert!(
+            no_filter
+                .iter()
+                .all(|source| matches!(source, PreFilterSource::None))
+        );
+
+        let single = prefilter_source(false, false).shared_for_multimatch_fields(1);
+        assert!(matches!(
+            single.as_slice(),
+            [PreFilterSource::FilteredRowIds(_)]
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_multimatch_prefilter_caches_source_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            ROW_ID,
+            DataType::UInt64,
+            false,
+        )]));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Err(DataFusionError::Execution(
+                "shared prefilter failure".to_string(),
+            ))]),
+        ));
+        let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
+        let shared_sources = source.shared_for_multimatch_fields(2);
+        let context = Arc::new(datafusion::execution::TaskContext::default());
+        let left = shared_prefilter_future(
+            shared_materialization(&shared_sources[0]),
+            shared_source(&shared_sources[0]),
+            false,
+            context.clone(),
+            0,
+        );
+        let right = shared_prefilter_future(
+            shared_materialization(&shared_sources[1]),
+            shared_source(&shared_sources[1]),
+            false,
+            context,
+            0,
+        );
+        let (left, right) = tokio::join!(left, right);
+
+        assert!(
+            left.unwrap_err()
+                .to_string()
+                .contains("shared prefilter failure")
+        );
+        assert!(
+            right
+                .unwrap_err()
+                .to_string()
+                .contains("shared prefilter failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_multimatch_prefilter_survives_waiter_cancellation() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                ROW_ID,
+                DataType::UInt64,
+                false,
+            )])),
+            vec![Arc::new(UInt64Array::from_iter_values(0_u64..4))],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let (started, has_started) = tokio::sync::oneshot::channel::<()>();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async move {
+                started.send(()).map_err(|_| {
+                    DataFusionError::Execution(
+                        "shared prefilter startup receiver dropped".to_string(),
+                    )
+                })?;
+                wait.await.map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "shared prefilter release sender dropped: {error}"
+                    ))
+                })?;
+                Ok(batch)
+            }),
+        ));
+        let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
+        let shared_sources = source.shared_for_multimatch_fields(2);
+        let materialization = shared_materialization(&shared_sources[0]);
+        let context = Arc::new(datafusion::execution::TaskContext::default());
+        let first = tokio::spawn(shared_prefilter_future(
+            materialization.clone(),
+            shared_source(&shared_sources[0]),
+            false,
+            context.clone(),
+            0,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), has_started)
+            .await
+            .expect("shared prefilter source should start")
+            .expect("shared prefilter startup sender should remain alive");
+        let second = tokio::spawn(shared_prefilter_future(
+            materialization.clone(),
+            shared_source(&shared_sources[1]),
+            false,
+            context,
+            0,
+        ));
+        loop {
+            let waiters = materialization
+                .queries
+                .lock()
+                .unwrap()
+                .values()
+                .map(|entry| entry.waiters)
+                .sum::<usize>();
+            if waiters == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        release.send(()).unwrap();
+        let mask = tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("replacement waiter should resume the shared source")
+            .unwrap()
+            .unwrap();
+        assert_eq!(mask.allow_list().unwrap().len(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn shared_multimatch_prefilter_drops_fully_canceled_query() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            ROW_ID,
+            DataType::UInt64,
+            false,
+        )]));
+        let (started, has_started) = tokio::sync::oneshot::channel::<()>();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async move {
+                started.send(()).map_err(|_| {
+                    DataFusionError::Execution(
+                        "shared prefilter startup receiver dropped".to_string(),
+                    )
+                })?;
+                std::future::pending::<DataFusionResult<RecordBatch>>().await
+            }),
+        ));
+        let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
+        let shared_sources = source.shared_for_multimatch_fields(2);
+        let materialization = shared_materialization(&shared_sources[0]);
+        let waiter = tokio::spawn(shared_prefilter_future(
+            materialization.clone(),
+            shared_source(&shared_sources[0]),
+            false,
+            Arc::new(datafusion::execution::TaskContext::default()),
+            0,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), has_started)
+            .await
+            .expect("shared prefilter source should start")
+            .expect("shared prefilter startup sender should remain alive");
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(materialization.queries.lock().unwrap().is_empty());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn instrumented_child_input_stream_excludes_child_poll_time() {
@@ -737,6 +1392,63 @@ mod tests {
             // We don't test much here but shouldn't really need to.  The join and stream sharing
             // are tested on their own.  We just need to make sure they get hooked up correctly
             assert_eq!(batch.unwrap().num_columns(), 2);
+        }
+    }
+
+    /// Verify that a typed error survives both consumers of a `ReplayExec`.
+    #[tokio::test]
+    async fn test_replay_preserves_typed_error() {
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::SendableRecordBatchStream;
+
+        // A marker type that we will look for in the source chain.
+        #[derive(Debug)]
+        struct MarkerError;
+        impl std::fmt::Display for MarkerError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "marker error")
+            }
+        }
+        impl std::error::Error for MarkerError {}
+
+        let schema = Arc::new(arrow_schema::Schema::empty());
+
+        // Build a stream that immediately yields a typed external DataFusion error.
+        let typed_err = DataFusionError::External(Box::new(MarkerError));
+        let err_stream: SendableRecordBatchStream = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::once(async move { Err(typed_err) }),
+            ),
+        );
+
+        let input = Arc::new(OneShotExec::new(err_stream));
+        let shared = Arc::new(ReplayExec::new(Capacity::Bounded(4), input));
+
+        let ctx = Arc::new(datafusion::execution::TaskContext::default());
+
+        // Both consumers must receive an error whose source chain includes MarkerError.
+        for partition in 0..2 {
+            let mut stream = shared.execute(partition, ctx.clone()).unwrap();
+            let err = stream
+                .next()
+                .await
+                .expect("stream should yield an error item")
+                .expect_err("expected error");
+
+            let mut found = false;
+            let mut src: Option<&dyn std::error::Error> = Some(&err);
+            while let Some(e) = src {
+                if e.downcast_ref::<MarkerError>().is_some() {
+                    found = true;
+                    break;
+                }
+                src = e.source();
+            }
+            assert!(
+                found,
+                "partition {partition}: MarkerError not found in source chain: {err}"
+            );
         }
     }
 }

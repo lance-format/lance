@@ -231,6 +231,17 @@ impl LevelLinks {
         }
     }
 
+    /// Heap bytes for one level, counting `published` at its full width even
+    /// while empty — the build fills it, and the caller budgets against a
+    /// ceiling where over-counting is the safe direction.
+    fn allocated_bytes(max_neighbors: usize) -> usize {
+        // Arc<Vec<u32>>: strong + weak refcounts, the Vec header, then the ids.
+        let published = 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<Vec<u32>>()
+            + max_neighbors * std::mem::size_of::<u32>();
+        published + max_neighbors * std::mem::size_of::<ScoredPoint>()
+    }
+
     fn publish_from_ranked(&self, ranked: &[ScoredPoint]) {
         self.published.store(Arc::new(
             ranked.iter().map(|point| point.id).collect::<Vec<_>>(),
@@ -257,6 +268,16 @@ impl Node {
             levels,
             dirty_levels: AtomicU64::new(0),
         }
+    }
+
+    /// Heap bytes held by a node of `target_level`, excluding the `Node` itself
+    /// (which lives inline in the graph's node arena).
+    fn allocated_bytes(target_level: u16, m: usize) -> usize {
+        let levels = target_level as usize + 1;
+        levels * std::mem::size_of::<LevelLinks>()
+            + (0..=target_level)
+                .map(|level| LevelLinks::allocated_bytes(max_neighbors(m, level)))
+                .sum::<usize>()
     }
 
     fn has_level(&self, level: u16) -> bool {
@@ -292,6 +313,12 @@ pub struct HnswGraph {
     visible_len: AtomicUsize,
     visited_pool: ArrayQueue<VisitedList>,
     packed_level0: ArcSwap<PackedLevel>,
+    /// Heap bytes of the node arena and visited pool. Fixed at construction:
+    /// both are sized from `capacity`, not from `len()`.
+    base_bytes: usize,
+    /// Heap bytes of the current `packed_level0` snapshot, which is rebuilt
+    /// wholesale on each level-0 publish rather than grown.
+    packed_bytes: AtomicUsize,
 }
 
 impl HnswGraph {
@@ -309,16 +336,18 @@ impl HnswGraph {
 
         let mut rng = SmallRng::seed_from_u64(params.seed);
         let mut nodes = Vec::with_capacity(capacity);
+        let mut node_bytes = 0;
         for id in 0..capacity {
             let target_level = if id == 0 {
                 0
             } else {
                 random_level(&params, &mut rng)
             };
+            node_bytes += Node::allocated_bytes(target_level, params.m);
             nodes.push(Node::new(target_level, params.m));
         }
 
-        let pool_size = rayon::current_num_threads().max(1) * 2;
+        let pool_size = visited_pool_size();
         let visited_pool = ArrayQueue::new(pool_size);
         for _ in 0..pool_size {
             let _ = visited_pool.push(VisitedList::new(0));
@@ -326,6 +355,9 @@ impl HnswGraph {
 
         Ok(Self {
             params,
+            base_bytes: capacity * std::mem::size_of::<Node>()
+                + node_bytes
+                + visited_pool_bytes(capacity),
             nodes,
             build_entry_point: AtomicU32::new(0),
             build_max_level: AtomicU16::new(0),
@@ -335,7 +367,50 @@ impl HnswGraph {
             visible_len: AtomicUsize::new(0),
             visited_pool,
             packed_level0: ArcSwap::from_pointee(PackedLevel::empty()),
+            packed_bytes: AtomicUsize::new(0),
         })
+    }
+
+    /// Upper bound on the graph's dominant heap allocations.
+    ///
+    /// Near-constant from the first insert rather than proportional to `len()`:
+    /// the node arena is allocated in full at construction, sized by `capacity`.
+    /// Callers budgeting memtable memory must account for this the moment a
+    /// vector memtable takes its first row.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.base_bytes + self.packed_bytes.load(Ordering::Relaxed)
+    }
+
+    /// What [`Self::resident_bytes`] will report for a graph of this shape,
+    /// answerable before one is built.
+    ///
+    /// Everything `try_new` allocates is sized from `capacity`; the only random
+    /// input is how nodes divide across levels, and that division is a
+    /// geometric ladder — every node holds level 0, and the share reaching each
+    /// level above it falls by a factor of `m`. Walking that ladder lands close
+    /// to the built graph instead of sampling it, and level 0 — which dominates
+    /// — is not an estimate at all.
+    ///
+    /// Exists because the allocation is committed well before it happens: the
+    /// first vector row into a memtable materializes the whole graph. Charging
+    /// it only from that row on would put the largest single allocation in a
+    /// vector memtable beyond the reach of admission control.
+    pub(crate) fn reserved_bytes(capacity: usize, params: &BuildParams) -> usize {
+        // Guard the ladder's divisor rather than `params.m` itself: `validate`
+        // rejects m < 2, but this is reachable before that runs.
+        let ratio = params.m.max(2);
+        let mut reaching = capacity;
+        let mut links = 0;
+        for level in 0..params.max_level {
+            links += reaching
+                * (std::mem::size_of::<LevelLinks>()
+                    + LevelLinks::allocated_bytes(max_neighbors(params.m, level)));
+            reaching /= ratio;
+            if reaching == 0 {
+                break;
+            }
+        }
+        capacity * std::mem::size_of::<Node>() + links + visited_pool_bytes(capacity)
     }
 
     /// Number of nodes visible to readers.
@@ -526,11 +601,19 @@ impl HnswGraph {
     /// The resulting batch uses the same schema and `lance:hnsw` metadata
     /// expected by `lance-index`'s `HNSW::load`.
     ///
-    /// Call this when no writer batch is in flight. Ordinary search readers
-    /// can run concurrently with insertion, but flush export should snapshot a
-    /// completed graph prefix.
-    pub fn to_lance_hnsw_batch(&self) -> Result<RecordBatch> {
+    /// `max_nodes` caps the prefix, for a caller that has already captured a
+    /// companion artifact and needs this one to agree with it: vector storage
+    /// is materialized separately, and a graph that advanced past it would name
+    /// rows the storage batch has no vector for.
+    ///
+    /// Ordinary search readers can run concurrently with insertion; a flush
+    /// export snapshots a completed prefix.
+    pub fn to_lance_hnsw_batch(&self, max_nodes: Option<usize>) -> Result<RecordBatch> {
         let visible_len = self.visible_len.load(Ordering::Acquire);
+        let visible_len = match max_nodes {
+            Some(max_nodes) => visible_len.min(max_nodes),
+            None => visible_len,
+        };
         let max_level = self.params.max_level as usize;
         let mut level_counts = vec![0usize; max_level];
         for id in 0..visible_len {
@@ -556,13 +639,45 @@ impl HnswGraph {
                 }
                 let ranked = node.ranked(level as u16)?;
                 vector_id_builder.append_value(id as u32);
-                neighbors_builder.append_value(ranked.iter().map(|point| Some(point.id)));
-                distances_builder.append_value(ranked.iter().map(|point| Some(point.distance)));
+                // `visible_len` is snapshotted but adjacency is read live, so a
+                // batch landing mid-export can append itself to a node already
+                // emitted. Those ids are not rows in this batch: `HNSW::load`
+                // slices level 0 to the rows below, and `neighbors_at` would
+                // address past them. `search` caps in-memory traversal the same
+                // way; the export has to persist the bound. Both columns filter
+                // together so a reader pairing them sees equal lengths.
+                neighbors_builder.append_value(
+                    ranked
+                        .iter()
+                        .filter(|point| (point.id as usize) < visible_len)
+                        .map(|point| Some(point.id)),
+                );
+                distances_builder.append_value(
+                    ranked
+                        .iter()
+                        .filter(|point| (point.id as usize) < visible_len)
+                        .map(|point| Some(point.distance)),
+                );
             }
         }
 
+        // `publish_visible` stores the entry point before `visible_len`, so it
+        // can name a node outside this prefix. `search` returns no results in
+        // that case; an exported index cannot, so fall back to the deepest node
+        // the prefix does hold.
+        let entry_point = {
+            let published = self.visible_entry_point.load(Ordering::Acquire);
+            if (published as usize) < visible_len {
+                published
+            } else {
+                (0..visible_len)
+                    .max_by_key(|&id| self.nodes[id].levels.len())
+                    .map(|id| id as u32)
+                    .unwrap_or(0)
+            }
+        };
         let metadata = LanceHnswMetadata {
-            entry_point: self.visible_entry_point.load(Ordering::Acquire),
+            entry_point,
             params: self.params.clone(),
             level_offsets: level_counts
                 .iter()
@@ -594,9 +709,12 @@ impl HnswGraph {
     }
 
     fn validate_source(&self, vectors: &impl VectorSource, needed_len: usize) -> Result<()> {
+        // Not caller input: the graph was sized below what the memtable holds.
+        // See the matching note in `storage.rs::append_batch`.
         if needed_len > self.nodes.len() {
-            return Err(Error::invalid_input(format!(
-                "graph capacity {} exhausted: need {needed_len}",
+            return Err(Error::internal(format!(
+                "HNSW graph capacity {} exhausted: need {needed_len}; \
+                 the graph is sized below the memtable's row capacity",
                 self.nodes.len()
             )));
         }
@@ -1051,9 +1169,13 @@ impl HnswGraph {
             offsets.push(neighbors.len());
         }
 
+        let packed_bytes = offsets.capacity() * std::mem::size_of::<usize>()
+            + neighbors.capacity() * std::mem::size_of::<u32>();
+
         // ArcSwap reclaims the prior snapshot once no reader guard holds it.
         self.packed_level0
             .store(Arc::new(PackedLevel { offsets, neighbors }));
+        self.packed_bytes.store(packed_bytes, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1081,6 +1203,20 @@ fn random_level(params: &BuildParams, rng: &mut SmallRng) -> u16 {
 
 fn max_neighbors(m: usize, level: u16) -> usize {
     if level == 0 { m * 2 } else { m }
+}
+
+/// One list per worker, doubled so a searcher never blocks on the queue.
+fn visited_pool_size() -> usize {
+    rayon::current_num_threads().max(1) * 2
+}
+
+/// Heap the visited pool settles at for a graph of `capacity` nodes. The lists
+/// are pushed empty but `VisitedList::reset` resizes each to one bit per node
+/// on first use, so the pool is charged at its grown size from the start.
+fn visited_pool_bytes(capacity: usize) -> usize {
+    visited_pool_size()
+        * (std::mem::size_of::<VisitedList>()
+            + capacity.div_ceil(WORD_BITS) * std::mem::size_of::<usize>())
 }
 
 #[derive(Debug)]
@@ -1125,6 +1261,7 @@ impl VisitedList {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
     use arrow_schema::{DataType, Field};
@@ -1182,6 +1319,159 @@ mod tests {
         assert!(result.iter().any(|point| point.id == 42));
     }
 
+    /// The graph must be exportable to a boundary its caller chose, because the
+    /// companion vector storage is captured separately: a graph that advanced
+    /// past it would name rows the storage batch has no vector for, and a search
+    /// would score them.
+    #[test]
+    fn to_lance_hnsw_batch_honors_a_caller_supplied_prefix() {
+        const ROWS: usize = 256;
+        const DIM: usize = 8;
+        const PREFIX: usize = 64;
+        let store = Arc::new(
+            ArrowFixedSizeListVectorStore::try_new(512, 4, DIM, DistanceType::L2).unwrap(),
+        );
+        let ids = store.append_batch(fsl(ROWS, DIM), 0).unwrap();
+        let snapshot = store.snapshot();
+        let graph = HnswGraph::try_new(
+            512,
+            BuildParams::mem_wal_default()
+                .num_edges(8)
+                .ef_construction(32)
+                .seed(17),
+        )
+        .unwrap();
+        graph.insert_batch(ids, &snapshot).unwrap();
+
+        let full = graph.to_lance_hnsw_batch(None).unwrap();
+        let bounded = graph.to_lance_hnsw_batch(Some(PREFIX)).unwrap();
+        assert!(
+            bounded.num_rows() < full.num_rows(),
+            "the cap has to actually bound the export"
+        );
+        assert_eq!(HNSW::load(bounded.clone()).unwrap().len(), PREFIX);
+
+        // Every edge must stay inside the requested prefix, not merely inside
+        // whatever the graph had published.
+        let neighbors = bounded
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .expect("neighbors column is a list");
+        for row in 0..bounded.num_rows() {
+            let ids = neighbors.value(row);
+            let ids = ids
+                .as_any()
+                .downcast_ref::<arrow_array::UInt32Array>()
+                .expect("neighbor ids are u32");
+            for i in 0..ids.len() {
+                assert!(
+                    (ids.value(i) as usize) < PREFIX,
+                    "row {row} points at {} outside the {PREFIX}-node prefix",
+                    ids.value(i)
+                );
+            }
+        }
+    }
+
+    /// An export racing inserts must persist only edges inside the prefix it
+    /// publishes.
+    ///
+    /// `to_lance_hnsw_batch` snapshots `visible_len` but reads each node's ranked
+    /// list live, so a batch landing mid-export can append itself to a node
+    /// already emitted. `HNSW::load` then slices level 0 to the exported rows and
+    /// a walk over that edge addresses past them. `search` bounds in-memory
+    /// traversal by `visible_len` for the same reason.
+    #[test]
+    fn test_lance_hnsw_batch_edges_stay_inside_the_exported_prefix() {
+        const ROWS: usize = 1024;
+        const DIM: usize = 16;
+        const CHUNK: usize = 32;
+        let store = Arc::new(
+            ArrowFixedSizeListVectorStore::try_new(2048, 8, DIM, DistanceType::L2).unwrap(),
+        );
+        let ids = store.append_batch(fsl(ROWS, DIM), 0).unwrap();
+        let snapshot = store.snapshot();
+        let graph = Arc::new(
+            HnswGraph::try_new(
+                2048,
+                BuildParams::mem_wal_default()
+                    .num_edges(8)
+                    .ef_construction(32)
+                    .seed(13),
+            )
+            .unwrap(),
+        );
+
+        // Seed a prefix so an export has real adjacency to walk.
+        let chunk = CHUNK as u32;
+        graph
+            .insert_batch(ids.start..ids.start + chunk, &snapshot)
+            .unwrap();
+
+        let writing = Arc::new(AtomicBool::new(true));
+        let writer = {
+            let graph = Arc::clone(&graph);
+            let writing = Arc::clone(&writing);
+            std::thread::spawn(move || {
+                let mut next = ids.start + chunk;
+                while next < ids.end {
+                    let stop = (next + chunk).min(ids.end);
+                    graph.insert_batch(next..stop, &snapshot).unwrap();
+                    next = stop;
+                }
+                writing.store(false, Ordering::Release);
+            })
+        };
+
+        // Export while the writer runs rather than a fixed count, so the overlap
+        // does not depend on how fast this machine inserts.
+        let mut exports = 0;
+        let mut edges_checked = 0;
+        while writing.load(Ordering::Acquire) || exports < 5 {
+            let batch = graph.to_lance_hnsw_batch(None).unwrap();
+            let rows = batch.num_rows();
+            let neighbors = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::ListArray>()
+                .expect("neighbors column is a list");
+            let distances = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<arrow_array::ListArray>()
+                .expect("distances column is a list");
+            // Level 0 holds every visible node, so its row count is the prefix.
+            let prefix = HNSW::load(batch.clone()).unwrap().len() as u32;
+            for row in 0..rows {
+                let ids = neighbors.value(row);
+                let ids = ids
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt32Array>()
+                    .expect("neighbor ids are u32");
+                assert_eq!(
+                    ids.len(),
+                    distances.value(row).len(),
+                    "row {row} pairs {} ids with {} distances",
+                    ids.len(),
+                    distances.value(row).len()
+                );
+                for i in 0..ids.len() {
+                    let nid = ids.value(i);
+                    assert!(
+                        nid < prefix,
+                        "exported row {row} points at {nid}, outside the \
+                         {prefix}-node prefix it was exported with"
+                    );
+                    edges_checked += 1;
+                }
+            }
+            exports += 1;
+        }
+        writer.join().unwrap();
+        assert!(edges_checked > 0, "test never inspected an edge");
+    }
+
     #[test]
     fn test_lance_hnsw_batch_loads_with_lance_index() {
         let rows = 64;
@@ -1201,7 +1491,7 @@ mod tests {
         .unwrap();
         graph.insert_batch(ids, &snapshot).unwrap();
 
-        let batch = graph.to_lance_hnsw_batch().unwrap();
+        let batch = graph.to_lance_hnsw_batch(None).unwrap();
         let loaded = HNSW::load(batch).unwrap();
         assert_eq!(loaded.len(), rows);
     }

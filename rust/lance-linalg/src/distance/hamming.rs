@@ -4,10 +4,10 @@
 //! Hamming distance.
 //!
 //! This module provides hamming distance computation for binary vectors,
-//! including SIMD-accelerated pairwise hamming distance for 64-bit hashes.
+//! including SIMD-accelerated pairwise hamming distance for binary hashes.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::builder::{ListBuilder, UInt64Builder};
 use arrow_array::cast::AsArray;
@@ -20,6 +20,27 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rayon::prelude::*;
 
 use crate::{Error, Result};
+
+/// Schema of a Hamming distance-pair batch.
+static DISTANCE_PAIR_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("row_id_a", DataType::UInt64, false),
+        Field::new("row_id_b", DataType::UInt64, false),
+        Field::new("distance", DataType::UInt32, false),
+    ]))
+});
+
+/// Schema of a Hamming clustering-result batch.
+static CLUSTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("representative", DataType::UInt64, false),
+        Field::new(
+            "duplicates",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
+            false,
+        ),
+    ]))
+});
 
 pub trait Hamming {
     /// Hamming distance between two vectors.
@@ -102,6 +123,196 @@ pub fn hamming_u64(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
 }
 
+/// Binary hash values stored as 64-bit lanes in lane-major order.
+///
+/// For a hash width of `N` bytes, `N` must be a positive multiple of 8 and the
+/// number of lanes is `N / 8`. Lane-major layout keeps each lane contiguous for
+/// all rows, which allows the pairwise path to reuse the SIMD `u64` batch
+/// implementation for wider hashes.
+#[derive(Debug, Clone)]
+pub struct BinaryHashValues {
+    lane_values: Vec<u64>,
+    num_rows: usize,
+    byte_width: usize,
+}
+
+impl BinaryHashValues {
+    /// Create hash values from lane-major `u64` values.
+    pub fn try_new(lane_values: Vec<u64>, num_rows: usize, byte_width: usize) -> Result<Self> {
+        let num_lanes = validate_hash_byte_width(byte_width)?;
+        let expected_values = checked_lane_value_count(num_rows, num_lanes)?;
+        if lane_values.len() != expected_values {
+            return Err(Error::InvalidArgumentError(format!(
+                "Expected {} lane values for {} rows and {} byte hashes, got {}",
+                expected_values,
+                num_rows,
+                byte_width,
+                lane_values.len()
+            )));
+        }
+        Ok(Self {
+            lane_values,
+            num_rows,
+            byte_width,
+        })
+    }
+
+    /// Extract binary hash values from a `FixedSizeList<UInt8, N>` Arrow array.
+    pub fn from_fixed_size_list(array: &FixedSizeListArray) -> Result<Self> {
+        let byte_width = usize::try_from(array.value_length()).map_err(|_| {
+            Error::InvalidArgumentError(format!(
+                "Expected FixedSizeList with a positive size that is a multiple of 8 bytes, got size {}",
+                array.value_length()
+            ))
+        })?;
+        let num_lanes = validate_hash_byte_width(byte_width)?;
+
+        let values = array
+            .values()
+            .as_any()
+            .downcast_ref::<arrow_array::UInt8Array>()
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(
+                    "Expected UInt8Array values in FixedSizeList".to_string(),
+                )
+            })?;
+
+        let num_rows = array.len();
+        let value_count = checked_lane_value_count(num_rows, num_lanes)?;
+        let expected_bytes = checked_hash_byte_count(num_rows, byte_width)?;
+        let bytes = values.values();
+        if bytes.len() != expected_bytes {
+            return Err(Error::InvalidArgumentError(format!(
+                "Expected {} bytes for {} rows and {} byte hashes, got {}",
+                expected_bytes,
+                num_rows,
+                byte_width,
+                bytes.len()
+            )));
+        }
+
+        let mut lane_values = vec![0u64; value_count];
+        for row in 0..num_rows {
+            let row_start = row * byte_width;
+            for lane in 0..num_lanes {
+                let start = row_start + lane * 8;
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&bytes[start..start + 8]);
+                lane_values[lane * num_rows + row] = u64::from_le_bytes(arr);
+            }
+        }
+
+        Ok(Self {
+            lane_values,
+            num_rows,
+            byte_width,
+        })
+    }
+
+    /// Concatenate chunks with the same hash width into a single lane-major set.
+    pub fn concat(chunks: &[Self]) -> Result<Self> {
+        let Some(first) = chunks.first() else {
+            return Err(Error::InvalidArgumentError(
+                "Cannot concatenate zero binary hash chunks".to_string(),
+            ));
+        };
+
+        let byte_width = first.byte_width;
+        let num_lanes = first.num_lanes();
+        let mut num_rows = 0usize;
+        for chunk in chunks {
+            if chunk.byte_width != byte_width {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Cannot concatenate binary hash chunks with different widths: {} and {} bytes",
+                    byte_width, chunk.byte_width
+                )));
+            }
+            num_rows = num_rows.checked_add(chunk.num_rows).ok_or_else(|| {
+                Error::InvalidArgumentError(
+                    "Binary hash row count overflowed while concatenating chunks".to_string(),
+                )
+            })?;
+        }
+
+        let value_count = checked_lane_value_count(num_rows, num_lanes)?;
+        let mut lane_values = vec![0u64; value_count];
+        let mut row_offset = 0;
+        for chunk in chunks {
+            for lane in 0..num_lanes {
+                let dest_start = lane * num_rows + row_offset;
+                let dest_end = dest_start + chunk.num_rows;
+                lane_values[dest_start..dest_end].copy_from_slice(chunk.lane(lane));
+            }
+            row_offset += chunk.num_rows;
+        }
+
+        Ok(Self {
+            lane_values,
+            num_rows,
+            byte_width,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.num_rows
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.num_rows == 0
+    }
+
+    pub fn byte_width(&self) -> usize {
+        self.byte_width
+    }
+
+    pub fn num_lanes(&self) -> usize {
+        self.byte_width / 8
+    }
+
+    pub fn lane(&self, lane: usize) -> &[u64] {
+        let start = lane * self.num_rows;
+        &self.lane_values[start..start + self.num_rows]
+    }
+
+    pub fn into_u64_values(self) -> Result<Vec<u64>> {
+        if self.num_lanes() != 1 {
+            return Err(Error::InvalidArgumentError(format!(
+                "Expected 8-byte binary hashes, got {} byte hashes",
+                self.byte_width
+            )));
+        }
+        Ok(self.lane_values)
+    }
+}
+
+fn checked_lane_value_count(num_rows: usize, num_lanes: usize) -> Result<usize> {
+    num_rows.checked_mul(num_lanes).ok_or_else(|| {
+        Error::InvalidArgumentError(format!(
+            "Binary hash lane value count overflowed for {} rows and {} lanes",
+            num_rows, num_lanes
+        ))
+    })
+}
+
+fn checked_hash_byte_count(num_rows: usize, byte_width: usize) -> Result<usize> {
+    num_rows.checked_mul(byte_width).ok_or_else(|| {
+        Error::InvalidArgumentError(format!(
+            "Binary hash byte count overflowed for {} rows and {} byte hashes",
+            num_rows, byte_width
+        ))
+    })
+}
+
+fn validate_hash_byte_width(byte_width: usize) -> Result<usize> {
+    if byte_width == 0 || !byte_width.is_multiple_of(8) {
+        return Err(Error::InvalidArgumentError(format!(
+            "Expected FixedSizeList with a positive size that is a multiple of 8 bytes, got size {}",
+            byte_width
+        )));
+    }
+    Ok(byte_width / 8)
+}
+
 /// Result of pairwise hamming distance computation.
 #[derive(Debug, Clone)]
 pub struct PairwiseResult {
@@ -149,11 +360,7 @@ impl PairwiseResult {
 
     /// Convert to Arrow RecordBatch, consuming self.
     pub fn into_record_batch(self) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("row_id_a", DataType::UInt64, false),
-            Field::new("row_id_b", DataType::UInt64, false),
-            Field::new("distance", DataType::UInt32, false),
-        ]));
+        let schema = DISTANCE_PAIR_SCHEMA.clone();
 
         let row_id_a = Arc::new(UInt64Array::from(self.row_id_a));
         let row_id_b = Arc::new(UInt64Array::from(self.row_id_b));
@@ -172,24 +379,57 @@ impl Default for PairwiseResult {
 
 /// Compute hamming distances for a query against multiple targets.
 /// Uses SIMD acceleration when available.
+///
+/// # Panics
+///
+/// Panics if `results` is not the same length as `targets`.
 #[inline]
 pub fn hamming_batch_u64(query: u64, targets: &[u64], results: &mut [u32]) {
-    debug_assert_eq!(targets.len(), results.len());
+    // Rejected in either direction, and before the dispatch. A shorter `results` the
+    // dispatcher's reslice would refuse on its own, and that reslice is what keeps the
+    // kernels' raw stores in bounds; this check just gets there first, with a message
+    // that names both lengths. An over-long one the reslice would instead truncate,
+    // handing the surplus tail back unwritten for the caller to read as distances.
+    // That is wrong output rather than a crash, which is why this is an `assert_eq!`
+    // and not a `debug_assert_eq!`.
+    let num_targets = targets.len();
+    let num_slots = results.len();
+    assert_eq!(
+        num_targets, num_slots,
+        "hamming_batch_u64 needs one result slot per target, \
+         got {num_targets} target(s) and {num_slots} slot(s)"
+    );
     hamming_batch_simd(query, targets, results);
 }
 
 /// SIMD-accelerated batch hamming distance computation.
+///
+/// # Panics
+///
+/// Panics if `results` is shorter than `targets`. `results.len()` is required to equal
+/// `targets.len()`: an over-long `results` is truncated here rather than rejected, and
+/// the surplus tail goes back to the caller unwritten. `hamming_batch_u64` asserts the
+/// equality before dispatching.
 #[inline]
 fn hamming_batch_simd(query: u64, targets: &[u64], results: &mut [u32]) {
+    // Both x86 kernels store through raw pointers over a range bounded by
+    // `targets.len()`, and this reslice makes `results` exactly that long, so it has to
+    // stay above the dispatch.
+    let results = &mut results[..targets.len()];
+
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512vpopcntdq") && is_x86_feature_detected!("avx512f") {
+            // SAFETY: both required features were just detected, and the reslice
+            // above makes `results.len() == targets.len()`.
             unsafe {
                 hamming_batch_avx512(query, targets, results);
             }
             return;
         }
         if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was just detected, and the reslice above makes
+            // `results.len() == targets.len()`.
             unsafe {
                 hamming_batch_avx2(query, targets, results);
             }
@@ -229,6 +469,15 @@ fn hamming_batch_scalar(query: u64, targets: &[u64], results: &mut [u32]) {
 }
 
 /// AVX-512 VPOPCNTDQ: Process 8 x 64-bit values at once.
+///
+/// The chunk loop reaches only the first `targets.len() / 8 * 8` slots through a
+/// raw pointer, 8 x u32 per chunk with no bounds check; the trailing slots go
+/// through bounds-checked indexing.
+///
+/// # Safety
+///
+/// The host must support AVX-512F and AVX512VPOPCNTDQ, and `results.len()` must
+/// be at least `targets.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f", enable = "avx512vpopcntdq")]
 unsafe fn hamming_batch_avx512(query: u64, targets: &[u64], results: &mut [u32]) {
@@ -263,7 +512,16 @@ unsafe fn hamming_batch_avx512(query: u64, targets: &[u64], results: &mut [u32])
     }
 }
 
-/// AVX2 popcount using lookup table (Harley-Seal / PSHUFB method).
+/// AVX2 popcount using a PSHUFB nibble lookup table.
+///
+/// The chunk loop reaches only the first `targets.len() / 4 * 4` slots through a
+/// raw pointer, 4 x u32 per chunk with no bounds check; the trailing slots go
+/// through bounds-checked indexing.
+///
+/// # Safety
+///
+/// The host must support AVX2, and `results.len()` must be at least
+/// `targets.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn hamming_batch_avx2(query: u64, targets: &[u64], results: &mut [u32]) {
@@ -386,6 +644,88 @@ pub fn pairwise_hamming_distance_parallel(
     combined
 }
 
+/// Compute pairwise hamming distances for all pairs of fixed-width binary hashes.
+///
+/// This supports any hash width that is a positive multiple of 8 bytes. For
+/// 8-byte hashes this delegates to the existing `u64` implementation.
+pub fn pairwise_hamming_distance_binary(
+    hashes: &BinaryHashValues,
+    row_ids: Option<&[u64]>,
+    threshold: Option<u32>,
+) -> PairwiseResult {
+    let n = hashes.len();
+    if n < 2 {
+        return PairwiseResult::new();
+    }
+
+    if hashes.num_lanes() == 1 {
+        return pairwise_hamming_distance(hashes.lane(0), row_ids, threshold);
+    }
+
+    let threshold = threshold.unwrap_or(u32::MAX);
+    let num_pairs = n * (n - 1) / 2;
+    let mut result = PairwiseResult::with_capacity(num_pairs.min(1_000_000));
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let mut dist = 0;
+            for lane in 0..hashes.num_lanes() {
+                let lane_values = hashes.lane(lane);
+                dist += hamming_u64(lane_values[i], lane_values[j]);
+            }
+            if dist <= threshold {
+                let id_a = row_ids.map_or(i as u64, |ids| ids[i]);
+                let id_b = row_ids.map_or(j as u64, |ids| ids[j]);
+                result.push(id_a, id_b, dist);
+            }
+        }
+    }
+
+    result
+}
+
+/// Compute pairwise hamming distances in parallel for fixed-width binary hashes.
+///
+/// Wider hashes reuse the SIMD `u64` batch implementation lane-by-lane.
+pub fn pairwise_hamming_distance_binary_parallel(
+    hashes: &BinaryHashValues,
+    row_ids: Option<&[u64]>,
+    threshold: Option<u32>,
+) -> PairwiseResult {
+    let n = hashes.len();
+    if n < 2 {
+        return PairwiseResult::new();
+    }
+
+    if hashes.num_lanes() == 1 {
+        return pairwise_hamming_distance_parallel(hashes.lane(0), row_ids, threshold);
+    }
+
+    let threshold = threshold.unwrap_or(u32::MAX);
+    let total_pairs = n * (n - 1) / 2;
+
+    if total_pairs < 10_000 {
+        return pairwise_hamming_distance_binary(hashes, row_ids, Some(threshold));
+    }
+
+    let threads = rayon::current_num_threads();
+    let pairs_per_chunk = total_pairs.div_ceil(threads);
+    let chunks = compute_balanced_chunks(n, pairs_per_chunk);
+
+    let results: Vec<PairwiseResult> = chunks
+        .into_par_iter()
+        .map(|(start_row, end_row)| {
+            process_row_range_binary(hashes, row_ids, threshold, start_row, end_row)
+        })
+        .collect();
+
+    let mut combined = PairwiseResult::new();
+    for r in results {
+        combined.extend(r);
+    }
+    combined
+}
+
 /// Compute balanced chunks for parallel processing.
 fn compute_balanced_chunks(n: usize, target_pairs_per_chunk: usize) -> Vec<(usize, usize)> {
     let mut chunks = Vec::new();
@@ -439,36 +779,80 @@ fn process_row_range(
     result
 }
 
+/// Process a range of rows for pairwise comparison of wider binary hashes.
+fn process_row_range_binary(
+    hashes: &BinaryHashValues,
+    row_ids: Option<&[u64]>,
+    threshold: u32,
+    start_row: usize,
+    end_row: usize,
+) -> PairwiseResult {
+    let n = hashes.len();
+    let mut result = PairwiseResult::new();
+    let mut distances = Vec::new();
+    let mut lane_distances = Vec::new();
+
+    for i in start_row..end_row {
+        let remaining = n - i - 1;
+        if remaining == 0 {
+            continue;
+        }
+
+        distances.clear();
+        distances.resize(remaining, 0);
+
+        let first_lane = hashes.lane(0);
+        hamming_batch_u64(
+            first_lane[i],
+            &first_lane[i + 1..],
+            distances.as_mut_slice(),
+        );
+
+        for lane in 1..hashes.num_lanes() {
+            lane_distances.clear();
+            lane_distances.resize(remaining, 0);
+            let lane_values = hashes.lane(lane);
+            hamming_batch_u64(
+                lane_values[i],
+                &lane_values[i + 1..],
+                lane_distances.as_mut_slice(),
+            );
+            for (distance, lane_distance) in distances.iter_mut().zip(&lane_distances) {
+                *distance += *lane_distance;
+            }
+        }
+
+        let id_a = row_ids.map_or(i as u64, |ids| ids[i]);
+        for (j_offset, &dist) in distances.iter().enumerate() {
+            if dist <= threshold {
+                let j = i + 1 + j_offset;
+                let id_b = row_ids.map_or(j as u64, |ids| ids[j]);
+                result.push(id_a, id_b, dist);
+            }
+        }
+    }
+
+    result
+}
+
 /// Extract u64 hashes from a FixedSizeList<UInt8, 8> Arrow array.
 pub fn extract_hashes_from_fixed_list(array: &FixedSizeListArray) -> Result<Vec<u64>> {
-    let list_size = array.value_length();
-    if list_size != 8 {
+    let hashes = extract_binary_hashes_from_fixed_list(array)?;
+    if hashes.byte_width() != 8 {
         return Err(Error::InvalidArgumentError(format!(
             "Expected FixedSizeList with size 8, got size {}",
-            list_size
+            hashes.byte_width()
         )));
     }
+    hashes.into_u64_values()
+}
 
-    let values = array
-        .values()
-        .as_any()
-        .downcast_ref::<arrow_array::UInt8Array>()
-        .ok_or_else(|| {
-            Error::InvalidArgumentError("Expected UInt8Array values in FixedSizeList".to_string())
-        })?;
-
-    let n = array.len();
-    let mut hashes = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let start = i * 8;
-        let bytes = &values.values()[start..start + 8];
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(bytes);
-        hashes.push(u64::from_le_bytes(arr));
-    }
-
-    Ok(hashes)
+/// Extract binary hashes from a `FixedSizeList<UInt8, N>` Arrow array where
+/// `N` is a positive multiple of 8 bytes.
+pub fn extract_binary_hashes_from_fixed_list(
+    array: &FixedSizeListArray,
+) -> Result<BinaryHashValues> {
+    BinaryHashValues::from_fixed_size_list(array)
 }
 
 /// Union-Find data structure with path compression for clustering.
@@ -599,14 +983,7 @@ impl ClusteringResult {
 
     /// Get the schema for clustering result batches.
     pub fn schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("representative", DataType::UInt64, false),
-            Field::new(
-                "duplicates",
-                DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
-                false,
-            ),
-        ]))
+        CLUSTER_SCHEMA.clone()
     }
 
     /// Convert to Arrow RecordBatch with columns:
@@ -733,6 +1110,22 @@ pub fn cluster_pairwise_result(result: &PairwiseResult) -> ClusteringResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_arrow::FixedSizeListArrayExt;
+    use rstest::rstest;
+
+    #[test]
+    fn test_result_schemas_are_initialized_once() {
+        // These schemas are handed out per call and per batch, so they are
+        // shared rather than rebuilt. Pointer equality is what distinguishes a
+        // shared schema from an equal-but-freshly-allocated one.
+        assert!(Arc::ptr_eq(
+            &ClusteringResult::schema(),
+            &ClusteringResult::schema()
+        ));
+
+        let batch = PairwiseResult::default().into_record_batch();
+        assert!(Arc::ptr_eq(&batch.schema(), &DISTANCE_PAIR_SCHEMA));
+    }
 
     #[test]
     fn test_hamming() {
@@ -768,6 +1161,85 @@ mod tests {
         assert_eq!(results[1], 1);
         assert_eq!(results[3], 2); // 0b11 has 2 bits set
         assert_eq!(results[7], 3); // 0b111 has 3 bits set
+    }
+
+    #[rstest]
+    // Fewer slots than targets is the case that used to write out of bounds: on a
+    // host that takes the AVX2 path, `hamming_batch_avx2` wrote 28 bytes past a
+    // one-slot `results`.
+    #[case::eight_targets_one_slot(8, 1)]
+    // On the same path this one overran by 4 bytes instead of 28.
+    #[case::eight_targets_seven_slots(8, 7)]
+    // More slots than targets left the tail unwritten rather than overrunning, but
+    // the contract is one slot per target either way. This and the zero-target case
+    // below are the two that catch a guard weakened to a one-sided
+    // `results.len() >= targets.len()`.
+    #[case::eight_targets_nine_slots(8, 9)]
+    // The target count varies too, so that the two shortcuts most likely to appear
+    // here cannot slip past every case: an `if targets.is_empty() { return; }` above
+    // the check, or a `targets.len() < 8` fast path, would otherwise leave every
+    // eight-target case green. Four is the smallest target count that still reaches
+    // the AVX2 chunk loop.
+    #[case::four_targets_one_slot(4, 1)]
+    #[case::no_targets_one_slot(0, 1)]
+    // Zero slots is the case with no in-bounds slot at all, and the only one here
+    // that a `results.is_empty()` early return above the check would not survive.
+    // Its sentinel assertion is vacuous, so it pins the message and nothing else.
+    #[case::eight_targets_no_slots(8, 0)]
+    fn test_hamming_batch_u64_rejects_mismatched_lengths(
+        #[case] num_targets: usize,
+        #[case] num_slots: usize,
+    ) {
+        // No CPU feature gate: the length check precedes every kernel, so the panic
+        // happens on each host and no case reaches a kernel at all. Every case here is
+        // a mismatch; matching lengths are covered by `test_hamming_batch_u64` above,
+        // which calls `hamming_batch_u64` directly, and by
+        // `test_pairwise_correctness_1000_deterministic` below, which reaches it
+        // through `pairwise_hamming_distance_parallel`'s chunked path and checks the
+        // result against `reference_pairwise`.
+        //
+        // `catch_unwind` rather than `#[should_panic]`, because the property worth
+        // protecting is that the check runs before the dispatch, and
+        // `#[should_panic]` cannot observe order: a check moved below it can still
+        // panic with this same message, after a kernel has already written through
+        // `results`. The sentinel assertion at the end is what rules that out. It is
+        // also why the nine-slot case is here: a kernel's writes all land in bounds
+        // there, so nothing else would notice that it ran.
+        //
+        // A `debug_assert_eq!` carrying the same message still passes here when
+        // debug assertions are on, which is the profile `--profile ci` gives this
+        // crate; `cargo test --release -p lance-linalg --lib` (rust.yml) is what
+        // catches that revert.
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+        let targets = vec![u64::MAX; num_targets];
+        let mut results = vec![SENTINEL; num_slots];
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hamming_batch_u64(0, &targets, &mut results);
+        }))
+        .expect_err("a length mismatch must panic");
+
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&'static str>().copied())
+            .expect("panic payload should be a string");
+        // Matching the whole message, not the two numbers separately, is deliberate:
+        // it pins the function name and the order the two lengths are reported in,
+        // which is what a message copied from a sibling guard would get wrong.
+        let expected = format!(
+            "hamming_batch_u64 needs one result slot per target, \
+             got {num_targets} target(s) and {num_slots} slot(s)"
+        );
+        assert!(
+            message.contains(&expected),
+            "expected {expected:?} in panic message, got {message:?}"
+        );
+        assert_eq!(
+            results.iter().position(|&slot| slot != SENTINEL),
+            None,
+            "a kernel reached `results`, so the length check no longer precedes it"
+        );
     }
 
     #[test]
@@ -910,6 +1382,121 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn test_extract_binary_hashes_from_fixed_list_128() {
+        use arrow_array::UInt8Array;
+
+        let rows = [
+            (0x0102_0304_0506_0708u64, 0x1112_1314_1516_1718u64),
+            (0x2122_2324_2526_2728u64, 0x3132_3334_3536_3738u64),
+        ];
+        let bytes: Vec<u8> = rows
+            .iter()
+            .flat_map(|(lo, hi)| lo.to_le_bytes().into_iter().chain(hi.to_le_bytes()))
+            .collect();
+        let array = FixedSizeListArray::try_new_from_values(UInt8Array::from(bytes), 16).unwrap();
+
+        let hashes = extract_binary_hashes_from_fixed_list(&array).unwrap();
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes.byte_width(), 16);
+        assert_eq!(hashes.num_lanes(), 2);
+        assert_eq!(hashes.lane(0), &[rows[0].0, rows[1].0]);
+        assert_eq!(hashes.lane(1), &[rows[0].1, rows[1].1]);
+    }
+
+    #[test]
+    fn test_extract_binary_hashes_rejects_non_u64_multiple() {
+        use arrow_array::UInt8Array;
+
+        let array =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0u8; 24]), 12).unwrap();
+        let err = extract_binary_hashes_from_fixed_list(&array).unwrap_err();
+        assert!(err.to_string().contains("multiple of 8 bytes"), "{}", err);
+    }
+
+    #[test]
+    fn test_binary_hash_values_rejects_width_not_divisible_by_8() {
+        let err = BinaryHashValues::try_new(Vec::new(), 0, 12).unwrap_err();
+        assert!(err.to_string().contains("multiple of 8 bytes"), "{}", err);
+    }
+
+    #[test]
+    fn test_pairwise_binary_hashes_128() {
+        let hashes = BinaryHashValues::try_new(
+            vec![
+                0,
+                0,
+                1,
+                u64::MAX, // lane 0
+                0,
+                1,
+                1,
+                u64::MAX, // lane 1
+            ],
+            4,
+            16,
+        )
+        .unwrap();
+
+        let seq = pairwise_hamming_distance_binary(&hashes, None, Some(1));
+        let par = pairwise_hamming_distance_binary_parallel(&hashes, None, Some(1));
+        let expected = vec![(0, 1, 1), (1, 2, 1)];
+        assert_eq!(result_to_sorted_vec(&seq), expected);
+        assert_eq!(result_to_sorted_vec(&par), expected);
+    }
+
+    #[test]
+    fn test_pairwise_binary_hashes_parallel_128_matches_sequential() {
+        let rows: Vec<(u64, u64)> = (0..80)
+            .flat_map(|i| {
+                let lo = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let hi = !lo.rotate_left(17);
+                [(lo, hi), (lo ^ 1, hi)]
+            })
+            .collect();
+        let mut lane_values = Vec::with_capacity(rows.len() * 2);
+        lane_values.extend(rows.iter().map(|(lo, _)| *lo));
+        lane_values.extend(rows.iter().map(|(_, hi)| *hi));
+        let hashes = BinaryHashValues::try_new(lane_values, rows.len(), 16).unwrap();
+        let row_ids: Vec<u64> = (0..rows.len()).map(|i| 10_000 + i as u64).collect();
+
+        let seq = pairwise_hamming_distance_binary(&hashes, Some(&row_ids), Some(1));
+        let par = pairwise_hamming_distance_binary_parallel(&hashes, Some(&row_ids), Some(1));
+
+        assert_eq!(result_to_sorted_vec(&par), result_to_sorted_vec(&seq));
+        assert!(par.len() >= 80);
+    }
+
+    #[test]
+    fn test_pairwise_binary_hashes_32_with_row_ids() {
+        let hashes = BinaryHashValues::try_new(
+            vec![
+                0,
+                0,
+                1, // lane 0
+                0,
+                1,
+                1, // lane 1
+                7,
+                7,
+                7, // lane 2
+                u64::MAX,
+                u64::MAX,
+                u64::MAX - 1, // lane 3
+            ],
+            3,
+            32,
+        )
+        .unwrap();
+        let row_ids = [10, 20, 30];
+
+        let result = pairwise_hamming_distance_binary_parallel(&hashes, Some(&row_ids), Some(2));
+        assert_eq!(
+            result_to_sorted_vec(&result),
+            vec![(10, 20, 1), (20, 30, 2)]
+        );
     }
 
     #[test]

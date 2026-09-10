@@ -326,7 +326,7 @@ impl RetryExecutor for DeleteJob {
                         Error::internal(format!("Failed to receive row ids: {}", err))
                     })?;
                     let row_id_index = get_row_id_index(&self.dataset).await?;
-                    let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+                    let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref())?;
 
                     let (fragments, deleted_ids) =
                         apply_deletions(&self.dataset, &removed_row_addrs).await?;

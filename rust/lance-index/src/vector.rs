@@ -4,9 +4,10 @@
 //! Vector Index
 //!
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
 use std::fmt::Debug;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
@@ -84,8 +85,9 @@ pub const DEFAULT_QUERY_PARALLELISM: i32 = 0;
 
 /// Controls the speed / accuracy tradeoff for approximate vector search.
 ///
-/// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
-/// Other index types ignore this setting.
+/// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
+/// prefiltered search on HNSW sub-indexes, where `Fast` enables the ACORN
+/// traversal. Other index types ignore this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApproxMode {
     /// Prefer lower query latency, which can reduce recall.
@@ -408,7 +410,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// If an old row id is not in the mapping then it should be
     /// left alone.
-    async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
+    async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()>;
 
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;

@@ -13,6 +13,8 @@
  */
 package org.lance;
 
+import org.lance.fragment.DeletionFile;
+import org.lance.fragment.DeletionFileType;
 import org.lance.fragment.FragmentMergeResult;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -39,6 +41,11 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -49,6 +56,18 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class FragmentTest {
+  @Test
+  void testDeletionFileRelativePath() {
+    DeletionFile bitmap = new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null);
+    DeletionFile array = new DeletionFile(7, 11, 2L, DeletionFileType.ARRAY, null);
+    DeletionFile highBitId = new DeletionFile(-1L, 11, 2L, DeletionFileType.BITMAP, null);
+
+    assertEquals("_deletions/5-11-7.bin", bitmap.getRelativePath(5));
+    assertEquals("_deletions/5-11-7.arrow", array.getRelativePath(5));
+    assertEquals("_deletions/5-11-18446744073709551615.bin", highBitId.getRelativePath(5));
+    assertThrows(IllegalArgumentException.class, () -> bitmap.getRelativePath(-1));
+  }
+
   @Test
   void testFragmentCreateFfiArray(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("new_fragment_array").toString();
@@ -69,6 +88,7 @@ public class FragmentTest {
       testDataset.createEmptyDataset().close();
       int rowCount = 21;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      assertEquals(fragmentMeta.getFiles(), fragmentMeta.getReferencedLanceFiles());
 
       // Commit fragment
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
@@ -148,6 +168,64 @@ public class FragmentTest {
         }
       }
     }
+  }
+
+  @Test
+  void testWriteFragmentWithSession(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_with_session").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Session session = Session.builder().build()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      long sizeBefore = session.sizeBytes();
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(testDataset.getSchema(), allocator)) {
+        root.allocateNew();
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+        IntVector idVector = (IntVector) root.getVector("id");
+        nameVector.setSafe(0, "Person 1".getBytes(StandardCharsets.UTF_8));
+        idVector.setSafe(0, 1);
+        root.setRowCount(1);
+
+        // First append in APPEND mode without an explicit schema: the
+        // manifest load for schema inference populates the shared session's
+        // metadata cache.
+        List<FragmentMetadata> firstFragments =
+            appendWithSession(datasetPath, allocator, root, session);
+        assertEquals(1, firstFragments.size());
+        assertEquals(1, firstFragments.get(0).getPhysicalRows());
+        assertTrue(session.sizeBytes() > sizeBefore);
+        long hitsAfterFirst = session.metadataCacheStats().getHits();
+
+        // Second append through the same session: schema inference reads the
+        // manifest cached by the first write, so cache hits must increase.
+        List<FragmentMetadata> secondFragments =
+            appendWithSession(datasetPath, allocator, root, session);
+        assertEquals(1, secondFragments.size());
+        assertEquals(1, secondFragments.get(0).getPhysicalRows());
+        assertTrue(session.metadataCacheStats().getHits() > hitsAfterFirst);
+
+        // A closed session has a zero native handle and degrades to "no
+        // session", matching Dataset's behavior for closed sessions.
+        Session closedSession = Session.builder().build();
+        closedSession.close();
+        List<FragmentMetadata> fragmentsWithClosedSession =
+            appendWithSession(datasetPath, allocator, root, closedSession);
+        assertEquals(1, fragmentsWithClosedSession.size());
+      }
+    }
+  }
+
+  private static List<FragmentMetadata> appendWithSession(
+      String datasetPath, RootAllocator allocator, VectorSchemaRoot root, Session session) {
+    return Fragment.write()
+        .datasetUri(datasetPath)
+        .allocator(allocator)
+        .data(root)
+        .mode(WriteParams.WriteMode.APPEND)
+        .session(session)
+        .execute();
   }
 
   @Test
@@ -278,7 +356,10 @@ public class FragmentTest {
         assertNotNull(updateFragment.getDeletionFile());
 
         Update update =
-            Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
+            Update.builder()
+                .updatedFragments(Collections.singletonList(updateFragment))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
         Dataset dataset3;
         try (Transaction txn =
             new Transaction.Builder().readVersion(dataset2.version()).operation(update).build()) {
@@ -298,7 +379,10 @@ public class FragmentTest {
         assertNotNull(updateFragment.getDeletionFile());
 
         update =
-            Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
+            Update.builder()
+                .updatedFragments(Collections.singletonList(updateFragment))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
         Dataset dataset4;
         try (Transaction txn =
             new Transaction.Builder().readVersion(dataset3.version()).operation(update).build()) {
@@ -318,6 +402,7 @@ public class FragmentTest {
         update =
             Update.builder()
                 .removedFragmentIds(Collections.singletonList(Long.valueOf(fragment.getId())))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
                 .build();
         Dataset dataset5;
         try (Transaction txn =
@@ -410,6 +495,116 @@ public class FragmentTest {
             }
           }
         }
+      }
+    }
+  }
+
+  @Test
+  void testFragmentStatistics(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_statistics").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // Two fragments with different row counts
+      FragmentMetadata frag1 = testDataset.createNewFragment(21);
+      FragmentMetadata frag2 = testDataset.createNewFragment(9);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(frag1, frag2));
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        List<Fragment> fragments = dataset.getFragments();
+        FragmentStatistics stats = dataset.getFragmentStatistics();
+        assertEquals(fragments.size(), stats.size());
+
+        // Parity with getFragments across all three arrays
+        assertArrayEquals(fragments.stream().mapToInt(Fragment::getId).toArray(), stats.getIds());
+        assertArrayEquals(
+            fragments.stream().mapToLong(f -> f.metadata().getNumRows()).toArray(),
+            stats.getRowCounts());
+        assertArrayEquals(
+            fragments.stream().mapToInt(f -> f.metadata().getFiles().size()).toArray(),
+            stats.getDataFileNums());
+
+        assertEquals(30, Arrays.stream(stats.getRowCounts()).sum());
+
+        dataset.delete("id < 5");
+        assertArrayEquals(new long[] {16, 4}, dataset.getFragmentStatistics().getRowCounts());
+      }
+    }
+  }
+
+  @Test
+  void testFragmentStatisticsOnEmptyDataset(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_statistics_empty").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(0, dataset.getFragmentStatistics().size());
+      }
+    }
+  }
+
+  @Test
+  void testFragmentStatisticsPreservesLegacyMissingRowCount() {
+    String historicalPath =
+        Path.of("..", "test_data", "v0.7.5", "with_deletions")
+            .toAbsolutePath()
+            .normalize()
+            .toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Dataset dataset = Dataset.open(historicalPath, allocator)) {
+      FragmentStatistics stats = dataset.getFragmentStatistics();
+      assertArrayEquals(new int[] {0}, stats.getIds());
+      assertArrayEquals(new long[] {0}, stats.getRowCounts());
+      assertArrayEquals(new int[] {1}, stats.getDataFileNums());
+    }
+  }
+
+  @Test
+  void testCountRowsConcurrentWithClose(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("count_rows_close_race").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(100);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
+      Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L));
+      Fragment fragment = dataset.getFragments().get(0);
+
+      int threadCount = 8;
+      ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+      try {
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < threadCount; i++) {
+          futures.add(
+              executor.submit(
+                  () -> {
+                    start.await();
+                    // Hammer countRows until close() wins the race. The only acceptable
+                    // failure is the "Dataset is closed" rejection; anything else (a native
+                    // crash or "Null pointer in rust value from Java") means the native
+                    // handle was released while still in use.
+                    while (true) {
+                      try {
+                        fragment.countRows();
+                      } catch (IllegalArgumentException e) {
+                        assertEquals("Dataset is closed", e.getMessage());
+                        return null;
+                      }
+                    }
+                  }));
+        }
+        start.countDown();
+        Thread.sleep(50);
+        dataset.close();
+        for (Future<?> future : futures) {
+          future.get(30, TimeUnit.SECONDS);
+        }
+      } finally {
+        executor.shutdownNow();
       }
     }
   }

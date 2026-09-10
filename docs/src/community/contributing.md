@@ -21,7 +21,18 @@ Major technical changes are discussed organically through the following approach
 - **Iterate on Design**: Engage with the community to refine the approach based on their input and expertise
 - **Draft PRs for Details**: Once the general direction is acceptable to the community, publish draft PRs to help hash out implementation details. Draft PRs are encouraged as they facilitate concrete discussions
 - **Break Down Changes**: Split large draft PRs into smaller, incremental PRs for easier review and to demonstrate progress
-- **Formal Voting**: Maintainers with write access can approve code modifications related to the design. If the design requires Lance format spec changes, a separate vote will be conducted on GitHub Discussions following the [voting requirements](./voting.md#voting-requirements)
+- **Formal Voting**: Maintainers with write access can approve code modifications related to the design. If the design requires Lance format spec changes, those changes go in their own PR and the PMC votes on that PR following the [voting requirements](./voting.md#voting-requirements)
+
+## Format Specification Changes
+
+Changes to the Lance format specification — the protobuf definitions and the docs
+under `docs/src/format/` — are proposed as a pull request and voted on there by the
+PMC. The PR is the proposal; there is no separate discussion thread to open first.
+
+Scope such a PR to the specification itself, plus the minimum library changes needed
+to keep the build green, and put the implementation in follow-up PRs. See
+[Lance Format Specification Changes](./voting.md#lance-format-specification-changes)
+for what the vote requires and how it is counted.
 
 ## AI Tooling Integrations
 

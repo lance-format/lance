@@ -19,6 +19,7 @@ GitHub organization.
 |---|---|---|
 | [Apache DataFusion](datafusion.md) | Register Lance datasets as DataFusion tables and run SQL with predicate/projection pushdown. Available in both Rust and Python. | Built-in |
 | [Apache Spark](spark/index.md) | Read and write Lance datasets from Spark SQL and DataFrames. | [lance-format/lance-spark](https://github.com/lance-format/lance-spark) |
+| [Apache Doris](https://doris.apache.org/docs/4.x/lakehouse/catalogs/lance-catalog/) | Query Lance datasets with Doris SQL through filesystem and REST catalogs, with predicate pushdown and vector search. Read-only. | [apache/doris](https://github.com/apache/doris) |
 | [DuckDB](duckdb) | Query Lance datasets directly from DuckDB. | [lance-format/lance-duckdb](https://github.com/lance-format/lance-duckdb) |
 | [Trino](trino) | Federate Lance into Trino alongside other connectors. | [lance-format/lance-trino](https://github.com/lance-format/lance-trino) |
 
@@ -27,7 +28,7 @@ GitHub organization.
 | Integration | Description | Source |
 |---|---|---|
 | [PyTorch](pytorch.md) | Use `lance.torch.data.LanceDataset` as a `torch.utils.data.IterableDataset` for training and inference. | Built-in |
-| [TensorFlow](tensorflow.md) | Use `lance.tf.data.from_lance` to stream Lance data into `tf.data.Dataset` pipelines. | Built-in |
+| [TensorFlow](tensorflow.md) | Use `lance_tensorflow.from_lance` to stream Lance data into `tf.data.Dataset` pipelines. | [lance-format/lance-tensorflow](https://github.com/lance-format/lance-tensorflow) |
 | [Ray](ray) | Distributed read/write of Lance datasets with Ray Data. | [lance-format/lance-ray](https://github.com/lance-format/lance-ray) |
 | [Hugging Face](huggingface) | Convert and load Hugging Face datasets to and from Lance in a single call. | [lance-format/lance-huggingface](https://github.com/lance-format/lance-huggingface) |
 

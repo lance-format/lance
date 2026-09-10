@@ -364,7 +364,7 @@ pub fn needs_vector_details_inference(
 ) -> bool {
     match &index.index_details {
         Some(d) => d.type_url.ends_with("VectorIndexDetails") && d.value.is_empty(),
-        None => index.fields.iter().any(|&field_id| {
+        None => index.fields.first().is_some_and(|&field_id| {
             schema
                 .field_by_id(field_id)
                 .map(|f| matches!(f.data_type(), arrow_schema::DataType::FixedSizeList(_, _)))
@@ -926,6 +926,7 @@ mod tests {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: vec![],
             name: "test_index".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -948,6 +949,7 @@ mod tests {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: vec![],
             name: "test_index".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -968,6 +970,7 @@ mod tests {
         let index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],
+            covering_fields: vec![],
             name: "test_index".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -980,6 +983,89 @@ mod tests {
 
         let metric = metric_type_from_index_metadata(&index);
         assert_eq!(metric, None);
+    }
+
+    // Schema with a vector column ("vec", FixedSizeList) and a scalar column
+    // ("tag", Utf8). Field ids are assigned by `set_field_id` during conversion,
+    // so look them up by name rather than hardcoding.
+    fn schema_with_vector_and_scalar() -> lance_core::datatypes::Schema {
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    8,
+                ),
+                true,
+            ),
+            ArrowField::new("tag", DataType::Utf8, true),
+        ]);
+        lance_core::datatypes::Schema::try_from(&arrow).unwrap()
+    }
+
+    fn index_over_field(field_id: i32, index_details: Option<prost_types::Any>) -> IndexMetadata {
+        IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![field_id],
+            covering_fields: vec![],
+            name: "idx".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: index_details.map(Arc::new),
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
+
+    #[test]
+    fn test_needs_inference_missing_details_on_vector_field() {
+        // Oldest legacy case (<=0.19.2): no details, but the indexed field is a
+        // vector type => must infer.
+        let schema = schema_with_vector_and_scalar();
+        let vec_id = schema.field("vec").unwrap().id;
+        let index = index_over_field(vec_id, None);
+        assert!(needs_vector_details_inference(&index, &schema));
+    }
+
+    #[test]
+    fn test_needs_inference_missing_details_on_scalar_field() {
+        // No details and the indexed field is not a vector type (e.g. an FTS or
+        // scalar index) => nothing to infer, so the load_indices fast path may
+        // skip the clone/infer/compare.
+        let schema = schema_with_vector_and_scalar();
+        let tag_id = schema.field("tag").unwrap().id;
+        let index = index_over_field(tag_id, None);
+        assert!(!needs_vector_details_inference(&index, &schema));
+    }
+
+    #[test]
+    fn test_needs_inference_empty_vector_details() {
+        // Newer pre-details case: a VectorIndexDetails type_url with empty value
+        // bytes => must infer.
+        let schema = schema_with_vector_and_scalar();
+        let vec_id = schema.field("vec").unwrap().id;
+        let index = index_over_field(vec_id, Some(vector_index_details_default()));
+        assert!(needs_vector_details_inference(&index, &schema));
+    }
+
+    #[test]
+    fn test_needs_inference_populated_vector_details() {
+        // Modern vector index with populated details => no inference needed.
+        let schema = schema_with_vector_and_scalar();
+        let vec_id = schema.field("vec").unwrap().id;
+        let details = make_details(
+            VectorMetricType::L2,
+            None,
+            Some(Compression::Pq(ProductQuantization {
+                num_bits: 8,
+                num_sub_vectors: 16,
+            })),
+        );
+        let index = index_over_field(vec_id, Some(details));
+        assert!(!needs_vector_details_inference(&index, &schema));
     }
 
     #[test]
@@ -1009,6 +1095,7 @@ mod tests {
             let index = IndexMetadata {
                 uuid: uuid::Uuid::new_v4(),
                 fields: vec![0],
+                covering_fields: vec![],
                 name: "test_index".to_string(),
                 dataset_version: 1,
                 fragment_bitmap: None,

@@ -456,3 +456,146 @@ affected files are no longer part of any ANN index if they were before. Because
 of this, it's recommended to rewrite files before re-building indices.
 
 <!-- TODO: remove this last comment once stable row ids are default. -->
+
+### Cleanup old versions
+
+Lance is an immutable format — every write creates a new version. The new version
+only writes the data that changed, so an insert writes the new rows and an update
+rewrites the affected columns for the affected rows. Even a delete creates a
+small deletion file. However, old versions still reference the previous data
+files, so those files are kept on disk until explicitly removed. Over time this
+means storage grows with each operation — inserts, updates, and deletes alike.
+
+Keeping old versions has important benefits: readers that opened an older version
+can continue reading it without interference from concurrent writers, providing
+snapshot isolation. Old versions also enable time travel queries, letting you
+read the dataset as it existed at any prior point in time.
+
+`cleanup_old_versions` deletes old version metadata and any data files that are
+no longer referenced by any version, reclaiming the accumulated storage.
+
+!!! warning
+
+    Once old versions are cleaned up, time travel queries to those versions are
+    no longer possible. Choose your retention window (`older_than`) accordingly —
+    any version removed by cleanup cannot be recovered.
+
+```python
+import lance
+
+dataset = lance.dataset("./my_dataset.lance")
+dataset.cleanup_old_versions()
+```
+
+By default, versions older than 7 days are removed. You can override this with
+the `older_than` parameter (a `timedelta`):
+
+```python
+from datetime import timedelta
+
+dataset.cleanup_old_versions(older_than=timedelta(days=1))
+```
+
+!!! note
+
+    Tagged versions are exempt from cleanup. See [Tags and Branches](tags_and_branches.md)
+    for details.
+
+By default, Lance only removes files that it can **verify** are no longer needed.
+A file is verified when Lance can see that it was referenced by an older version
+and is no longer referenced by any newer version. However, some orphaned files
+cannot be verified this way — for example, files left behind by aborted or failed
+commits that were never recorded in any version. These files are
+indistinguishable from files being written by an in-progress operation.
+
+Cleanup will never delete the current (active) version. This means passing
+`older_than=timedelta(0)` is safe and will delete all versions except the current
+one.
+
+The `delete_unverified` flag enables a more aggressive strategy that will also
+delete these unverified files:
+
+```python
+dataset.cleanup_old_versions(
+    older_than=timedelta(hours=2),
+    delete_unverified=True,
+)
+```
+
+!!! danger
+
+    Only use `delete_unverified=True` when you are confident that no other
+    concurrent operation has been in-progress for longer than the `older_than`
+    duration. Lance uses the file's age to decide whether an unverified file is
+    safe to remove, so any operation that is still running past the `older_than`
+    window risks having its files deleted out from under it.
+
+    In particular, combining `delete_unverified=True` with `older_than=timedelta(0)`
+    is **extremely dangerous** — if any other operation is in-progress at all,
+    its data files may be deleted, leading to dataset corruption.
+
+### Automatic cleanup
+
+Instead of calling `cleanup_old_versions` manually, you can configure Lance to
+clean up old versions automatically during writes. When auto cleanup is enabled,
+Lance will run cleanup every *N* commits (the **interval**), removing versions
+older than a specified duration.
+
+Auto cleanup can be enabled when creating a new dataset:
+
+```python
+import lance
+import pyarrow as pa
+from lance.dataset import AutoCleanupConfig
+
+table = pa.table({"id": range(100)})
+ds = lance.write_dataset(
+    table,
+    "./my_dataset.lance",
+    auto_cleanup_options=AutoCleanupConfig(
+        interval=20,             # run cleanup every 20 commits
+        older_than_seconds=3600, # remove versions older than 1 hour
+    ),
+)
+```
+
+Or enabled on an existing dataset:
+
+```python
+ds = lance.dataset("./my_dataset.lance")
+ds.optimize.enable_auto_cleanup(
+    AutoCleanupConfig(
+        interval=20,
+        older_than_seconds=3600,
+    )
+)
+```
+
+And disabled again:
+
+```python
+ds.optimize.disable_auto_cleanup()
+```
+
+Auto cleanup parameters can also be set directly via dataset config keys:
+
+```python
+ds.update_config({
+    "lance.auto_cleanup.interval": "20",
+    "lance.auto_cleanup.older_than": "3600s",
+})
+```
+
+!!! warning
+
+    Auto cleanup runs as part of the commit path. If your writer does not have
+    delete permissions, or you are doing high-frequency writes where the extra
+    latency matters, pass `skip_auto_cleanup=True` to `write_dataset` to skip it
+    on a per-write basis.
+
+### Other cleanup strategies
+
+It is common to run cleanup as a periodic background task on a dedicated server
+(for example, via a cron job or scheduled workflow). This keeps cleanup off the
+write path entirely, avoiding any impact to write latency, but requires setting
+up and maintaining additional infrastructure.

@@ -1,30 +1,86 @@
 version: 2
 updates:
+  # Rust — one grouped version-bump PR per directory each week, and security
+  # advisories that land together in a directory batched into a single PR
+  # instead of one PR per advisory.
   - package-ecosystem: "cargo"
-    directory: "/"
+    directories:
+      - "/"
+      - "/python"
+      - "/java/lance-jni"
     versioning-strategy: lockfile-only
     schedule:
       interval: "weekly"
       day: "wednesday"
+    groups:
+      cargo:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      cargo-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
-  - package-ecosystem: "cargo"
-    directory: "/python"
-    versioning-strategy: lockfile-only
-    schedule:
-      interval: "weekly"
-      day: "wednesday"
-
-  - package-ecosystem: "cargo"
-    directory: "/java/lance-jni"
-    versioning-strategy: lockfile-only
-    schedule:
-      interval: "weekly"
-      day: "wednesday"
-
+  # Python (uv) — same weekly-grouped + grouped-security treatment.
   - package-ecosystem: "uv"
     directory: "/python"
     versioning-strategy: lockfile-only
     schedule:
       interval: "weekly"
       day: "wednesday"
+    groups:
+      uv:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      uv-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
+  # Standalone Rust lockfiles for dev/test fixtures. Dependabot security updates
+  # scan these regardless of config, so we group them; open-pull-requests-limit: 0
+  # disables the (unwanted) weekly version bumps for these crates.
+  - package-ecosystem: "cargo"
+    directories:
+      - "/memtest"
+      - "/test_data/fri_straddle_pre_6610/datagen"
+    open-pull-requests-limit: 0
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+    groups:
+      cargo-fixtures-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # Java (Maven). Security updates fire regardless of config; group them and
+  # skip version bumps (limit 0) — we bump Java deps manually.
+  - package-ecosystem: "maven"
+    directory: "/java"
+    open-pull-requests-limit: 0
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+    groups:
+      maven-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # Python benchmark scripts (pip / requirements.txt). Group security updates
+  # and skip version bumps (limit 0).
+  - package-ecosystem: "pip"
+    directories:
+      - "/benchmarks/*"
+    open-pull-requests-limit: 0
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+    groups:
+      pip-security:
+        applies-to: security-updates
+        patterns:
+          - "*"

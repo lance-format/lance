@@ -16,6 +16,7 @@ use arrow_array::{
     },
 };
 use arrow_schema::{ArrowError, DataType};
+use half::{bf16, f16};
 use num_traits::AsPrimitive;
 use num_traits::{Float, Num, bounds::Bounded};
 
@@ -135,19 +136,72 @@ pub fn argmin_opt<T: Num + Bounded + PartialOrd>(
     argmin_value_opt(iter).map(|(idx, _)| idx)
 }
 
+/// The accumulator used to sum squares when normalizing a `T` vector.
+///
+/// A type narrow enough that its squares leave its own range, and for which a
+/// wider float exists, accumulates in that wider type: squaring an `f16`
+/// saturates to `inf` at `|x| >= 256` and to zero at `|x| <= 1.726e-4`, so an
+/// ordinary `f16` vector would otherwise normalize to all-zero or all-`inf`.
+/// `f32` and `f64` accumulate in themselves — the same saturation still exists at
+/// the extremes of their own range (an `f32` square overflows above `1.8447e19`),
+/// but widening `f32` would perturb the output of existing f32 vectors by a few
+/// ulp (about 10 at dimension 768, growing as sqrt(dim)), so it is deliberately
+/// left alone; `f64` has nothing wider to widen to.
+///
+/// The width relation is a contract on the implementor, not something the bounds
+/// can express. Tying the accumulator to the element type here still buys two
+/// things over passing it in: the accumulator cannot drift between the three
+/// dispatch sites, and no call site can pick the wrong one.
+pub trait Normalizable: Float + AsPrimitive<Self::Acc> {
+    /// Must be at least as wide as `Self` in both exponent and mantissa.
+    type Acc: Float + Sum + AsPrimitive<Self> + AsPrimitive<f32>;
+}
+
+/// `f16` squares leave its own range, so it accumulates in `f32` — which has
+/// 2^96 of headroom over `f16::MAX` squared.
+impl Normalizable for f16 {
+    type Acc = f32;
+}
+
+/// `bf16` has the same exponent range as `f32` (both 8 bits), so widening to
+/// `f32` would buy no headroom for squaring — `bf16(1e20)` squared already
+/// overflows `f32`. It needs `f64`.
+impl Normalizable for bf16 {
+    type Acc = f64;
+}
+
+impl Normalizable for f32 {
+    type Acc = Self;
+}
+
+impl Normalizable for f64 {
+    type Acc = Self;
+}
+
 /// L2 normalize a vector.
 ///
-/// Returns an iterator of normalized values.
-pub fn normalize<T: Float + Sum + AsPrimitive<f32>>(
-    v: &[T],
-) -> (impl Iterator<Item = T> + '_, f32) {
-    let l2_norm = v.iter().map(|x| x.powi(2)).sum::<T>().sqrt();
-    (v.iter().map(move |&x| x / l2_norm), l2_norm.as_())
+/// Returns an iterator of normalized values, and the norm as `f32`.
+///
+/// The sum of squares is accumulated in [`Normalizable::Acc`], which is wider
+/// than `T` where `T` alone would overflow.
+pub fn normalize<T: Normalizable>(v: &[T]) -> (impl Iterator<Item = T> + '_, f32) {
+    let l2_norm = v
+        .iter()
+        .map(|x| {
+            let x: T::Acc = x.as_();
+            x * x
+        })
+        .sum::<T::Acc>()
+        .sqrt();
+    (
+        v.iter().map(move |&x| (x.as_() / l2_norm).as_()),
+        l2_norm.as_(),
+    )
 }
 
 fn do_normalize_arrow<T: ArrowPrimitiveType>(arr: &dyn Array) -> Result<(ArrayRef, f32)>
 where
-    <T as ArrowPrimitiveType>::Native: Float + Sum + AsPrimitive<f32>,
+    T::Native: Normalizable,
 {
     let v = arr.as_primitive::<T>();
     let (iter, l2_norm) = normalize(v.values());
@@ -171,7 +225,7 @@ pub fn normalize_arrow(v: &dyn Array) -> Result<(ArrayRef, f32)> {
 
 fn do_normalize_fsl<T: ArrowPrimitiveType>(fsl: &FixedSizeListArray) -> Result<FixedSizeListArray>
 where
-    T::Native: Float + Sum + AsPrimitive<f32>,
+    T::Native: Normalizable,
 {
     let dim = fsl.value_length() as usize;
     let norm_arr = PrimitiveArray::<T>::from_iter_values(
@@ -214,7 +268,7 @@ fn do_normalize_fsl_inplace<T: ArrowPrimitiveType>(
     fsl: FixedSizeListArray,
 ) -> Result<FixedSizeListArray>
 where
-    T::Native: Float + Sum + AsPrimitive<f32>,
+    T::Native: Normalizable,
 {
     let dim = fsl.value_length() as usize;
     let (field, size, values_array, nulls) = fsl.into_parts();
@@ -233,9 +287,17 @@ where
     match prim.into_builder() {
         Ok(mut builder) => {
             for chunk in builder.values_slice_mut().chunks_mut(dim) {
-                let l2_norm = chunk.iter().map(|x| x.powi(2)).sum::<T::Native>().sqrt();
+                // Accumulate in the wider type; see [`Normalizable`].
+                let l2_norm = chunk
+                    .iter()
+                    .map(|x| {
+                        let x: <T::Native as Normalizable>::Acc = x.as_();
+                        x * x
+                    })
+                    .sum::<<T::Native as Normalizable>::Acc>()
+                    .sqrt();
                 for x in chunk.iter_mut() {
-                    *x = *x / l2_norm;
+                    *x = (x.as_() / l2_norm).as_();
                 }
             }
             FixedSizeListArray::try_new(field, size, Arc::new(builder.finish()), nulls)
@@ -323,10 +385,12 @@ mod tests {
 
     use approx::assert_relative_eq;
     use arrow_array::{
-        Float32Array, Int8Array, Int16Array, LargeStringArray, StringArray, UInt8Array, UInt32Array,
+        Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, LargeStringArray,
+        StringArray, UInt8Array, UInt32Array,
     };
     use arrow_buffer::NullBuffer;
     use arrow_schema::Field;
+    use half::f16;
 
     #[test]
     fn test_argmax() {
@@ -431,6 +495,204 @@ mod tests {
             .enumerate()
             .for_each(|(idx, &x)| assert_relative_eq!(x, (idx + 1) as f32 / 55.0_f32.sqrt()));
         assert_relative_eq!(1.0, normalized.iter().map(|&x| x.powi(2)).sum::<f32>());
+    }
+
+    /// The accumulator must not be *narrower* than the element type either.
+    /// Accumulating f64 in f32 overflows above `|x| = 1.8447e19` (where f64 has
+    /// headroom to 1.34e154), collapses to a zero norm at or below `|x| = 2^-75`
+    /// (2.647e-23), and costs ~29 bits of mantissa on every ordinary vector.
+    #[test]
+    fn test_normalize_f64_accumulates_wide() {
+        // Range: each case is finite and correctly normalizable in f64, but
+        // overflows or underflows an f32 accumulator.
+        let range_cases: &[(&str, Vec<f64>)] = &[
+            ("square_overflows", vec![1e20, 0.0]),
+            ("sum_overflows", vec![1e19; 12]),
+            ("square_underflows", vec![1e-25, 1e-25]),
+            ("element_underflows", vec![1e-100, 1e-100]),
+        ];
+        for (name, v) in range_cases {
+            // Cover all three public entry points: each has its own `match` over
+            // the element type, so a dispatch cell could regress on its own.
+            for out in [
+                ("normalize_arrow", normalize_f64(v)),
+                ("normalize_fsl", normalize_f64_fsl(v, false)),
+                ("normalize_fsl_owned", normalize_f64_fsl(v, true)),
+            ] {
+                let (entry, out) = out;
+                let norm = out.iter().map(|x| x * x).sum::<f64>().sqrt();
+                assert!(
+                    approx::relative_eq!(norm, 1.0, max_relative = 1e-9),
+                    "{entry} / {name}: normalized norm {norm} != 1, output {out:?}"
+                );
+            }
+        }
+
+        // Precision: an f32 accumulator would round the output to f32, leaving
+        // a relative error around f32::EPSILON (~1.2e-7).
+        let v = vec![1.0_f64, 2.0, 3.0];
+        let expected_norm = 14.0_f64.sqrt();
+        let out = normalize_f64(&v);
+        for (i, (&got, &raw)) in out.iter().zip(v.iter()).enumerate() {
+            let want = raw / expected_norm;
+            assert!(
+                approx::relative_eq!(got, want, max_relative = 1e-15),
+                "element {i}: got {got:.17}, want {want:.17}"
+            );
+        }
+    }
+
+    /// Normalize an `f64` slice through the public Arrow entry point, so the
+    /// test exercises the accumulator `normalize_arrow` actually selects.
+    fn normalize_f64(v: &[f64]) -> Vec<f64> {
+        let arr = Float64Array::from(v.to_vec());
+        let (out, _) = normalize_arrow(&arr).unwrap();
+        out.as_primitive::<Float64Type>().values().to_vec()
+    }
+
+    /// Same, through the FSL entry points. `owned` selects
+    /// [`normalize_fsl_owned`], whose freshly built array takes the in-place
+    /// branch of `do_normalize_fsl_inplace`.
+    fn normalize_f64_fsl(v: &[f64], owned: bool) -> Vec<f64> {
+        let values = Float64Array::from(v.to_vec());
+        let field = Arc::new(Field::new("item", DataType::Float64, true));
+        let fsl =
+            FixedSizeListArray::try_new(field, v.len() as i32, Arc::new(values), None).unwrap();
+        let out = if owned {
+            normalize_fsl_owned(fsl).unwrap()
+        } else {
+            normalize_fsl(&fsl).unwrap()
+        };
+        out.values().as_primitive::<Float64Type>().values().to_vec()
+    }
+
+    /// `normalize` must accumulate the sum of squares in a type wider than the
+    /// element type. `f16::powi` rounds each square back to `f16`, which
+    /// saturates to `inf` at `|x| >= 256` and to zero at `|x| <= 1.726e-4`, so an
+    /// ordinary vector normalizes to all-zero or all-`inf`.
+    #[test]
+    fn test_normalize_f16_accumulates_wide() {
+        let cases: &[(&str, &[f32])] = &[
+            // A single element whose square leaves the f16 range.
+            ("square_overflows", &[256.0, 0.0]),
+            // No element overflows, but the sum of squares does.
+            ("sum_overflows", &[100.0; 7]),
+            // Every square rounds to zero, so the norm is zero and x/0 is inf.
+            ("square_underflows", &[1e-4; 8]),
+        ];
+        for (name, input) in cases {
+            let v = input.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>();
+            // Independent reference: accumulate the same f16 inputs in f64.
+            let expected = v
+                .iter()
+                .map(|x| x.to_f64() * x.to_f64())
+                .sum::<f64>()
+                .sqrt();
+            let (normalized, norm) = normalize(&v);
+            assert!(
+                approx::relative_eq!(norm, expected as f32, max_relative = 1e-3),
+                "{name}: norm {norm} != expected {expected}"
+            );
+            let normalized = normalized.collect::<Vec<_>>();
+            assert!(
+                normalized.iter().all(|x| x.is_finite()),
+                "{name}: non-finite output {normalized:?}"
+            );
+
+            // The output must be a unit vector. This is the assertion that pins
+            // the division: an independent f64 sum of the squares, not a
+            // comparison against another call into the same code.
+            let unit = normalized
+                .iter()
+                .map(|x| x.to_f64() * x.to_f64())
+                .sum::<f64>();
+            assert!(
+                approx::relative_eq!(unit, 1.0, max_relative = 1e-2),
+                "{name}: output is not a unit vector, sum of squares {unit}"
+            );
+
+            // Also drive the `normalize_arrow` Float16 arm, so the dispatch cell
+            // is covered. Equality against the generic path only proves the two
+            // agree — the unit-norm check above is what proves either is right.
+            let (out, arrow_norm) = normalize_arrow(&Float16Array::from(v)).unwrap();
+            assert!(
+                approx::relative_eq!(arrow_norm, expected as f32, max_relative = 1e-3),
+                "{name}: normalize_arrow norm {arrow_norm} != expected {expected}"
+            );
+            let out = out.as_primitive::<Float16Type>();
+            assert_eq!(
+                out.values().as_ref(),
+                normalized.as_slice(),
+                "{name}: normalize_arrow values differ from the generic path"
+            );
+        }
+    }
+
+    /// `bf16` shares f32's exponent range, so it needs an `f64` accumulator —
+    /// `f32` would leave the same overflow the f16 case exists to fix.
+    #[test]
+    fn test_normalize_bf16_accumulates_wide() {
+        let cases: &[(&str, &[f32])] = &[
+            ("square_overflows", &[1e20, 0.0]),
+            ("sum_overflows", &[1e19; 12]),
+            ("square_underflows", &[1e-25, 1e-25]),
+        ];
+        for (name, input) in cases {
+            let v = input.iter().map(|&x| bf16::from_f32(x)).collect::<Vec<_>>();
+            let expected = v
+                .iter()
+                .map(|x| x.to_f64() * x.to_f64())
+                .sum::<f64>()
+                .sqrt();
+            let (normalized, norm) = normalize(&v);
+            let normalized = normalized.collect::<Vec<_>>();
+            assert!(
+                approx::relative_eq!(norm as f64, expected, max_relative = 1e-2),
+                "{name}: norm {norm} != expected {expected}"
+            );
+            let unit = normalized
+                .iter()
+                .map(|x| x.to_f64() * x.to_f64())
+                .sum::<f64>();
+            assert!(
+                approx::relative_eq!(unit, 1.0, max_relative = 1e-2),
+                "{name}: output is not a unit vector, sum of squares {unit}"
+            );
+        }
+    }
+
+    /// Both FSL entry points share the defect, including the in-place path in
+    /// [`do_normalize_fsl_inplace`], which has its own copy of the expression.
+    #[test]
+    fn test_normalize_fsl_f16_accumulates_wide() {
+        // dim 2, row 0 overflows at the square, row 1 underflows at the square.
+        let make = || {
+            let values =
+                Float16Array::from_iter_values([256.0f32, 0.0, 1e-4, 1e-4].map(f16::from_f32));
+            let field = Arc::new(Field::new("item", DataType::Float16, true));
+            FixedSizeListArray::try_new(field, 2, Arc::new(values), None).unwrap()
+        };
+
+        // `normalize_fsl_owned` gets a freshly built array so the buffer is
+        // uniquely owned and the in-place branch is the one exercised.
+        let outputs = [
+            ("normalize_fsl", normalize_fsl(&make()).unwrap()),
+            ("normalize_fsl_owned", normalize_fsl_owned(make()).unwrap()),
+        ];
+        for (label, out) in outputs {
+            let got = out.values().as_primitive::<Float16Type>();
+            for (row, chunk) in got.values().chunks(2).enumerate() {
+                let norm = chunk
+                    .iter()
+                    .map(|x| x.to_f64() * x.to_f64())
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(
+                    approx::relative_eq!(norm, 1.0, max_relative = 1e-2),
+                    "{label} row {row}: normalized norm {norm} != 1, values {chunk:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -17,7 +17,6 @@ arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
 byteorder = { workspace = true }
 tracing = { workspace = true }
-bytes = { workspace = true }
 itertools = { workspace = true }
 lance-core = { workspace = true }
 roaring = { workspace = true }
@@ -25,7 +24,6 @@ roaring = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
-rstest = { workspace = true }
 
 [[bench]]
 name = "index_expr_result"

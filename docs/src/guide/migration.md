@@ -6,6 +6,22 @@ stable and breaking changes should generally be communicated (via warnings) for 
 give users a chance to migrate.  This page documents the breaking changes between releases and gives advice on how to
 migrate.
 
+## 9.0.0
+
+* Unless overridden, newly created FTS indexes use format v2. The code analyzer
+  and `block_size=256` require format v3, so readers must support v3 before an
+  index using either option is created. `document_granularity="list_element"`
+  also requires v3 reader capability, independently of the posting format.
+
+* To keep new indexes readable by nodes that support at most format v1 or v2,
+  set `format_version` in the index creation parameters, or set
+  `LANCE_FTS_FORMAT_VERSION` for a rollout-wide override. Formats v1 and v2
+  require the text analyzer and `block_size=128`.
+
+* Operations that maintain an existing FTS index, including append, incremental
+  indexing, optimize, and mem-wal maintained-index flush, preserve its format
+  version.
+
 ## 7.2.0
 
 * The `IndexSegmentBuilder` API has been removed from Rust, Python, and Java.

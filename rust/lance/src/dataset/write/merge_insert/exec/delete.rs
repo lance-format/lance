@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use datafusion::common::Result as DFResult;
@@ -22,7 +25,10 @@ use roaring::RoaringTreemap;
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::write::merge_insert::assign_action::Action;
-use crate::dataset::write::merge_insert::{MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats};
+use crate::dataset::write::merge_insert::{
+    MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, SourceDedupeBehavior,
+    create_duplicate_row_error, resolve_target_bases,
+};
 
 use super::{MergeInsertMetrics, apply_deletions};
 
@@ -46,6 +52,7 @@ pub struct DeleteOnlyMergeInsertExec {
     merge_stats: Arc<Mutex<Option<MergeStats>>>,
     transaction: Arc<Mutex<Option<Transaction>>>,
     affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
+    source_skipped_duplicates: Arc<AtomicU64>,
 }
 
 impl DeleteOnlyMergeInsertExec {
@@ -53,6 +60,7 @@ impl DeleteOnlyMergeInsertExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
+        source_skipped_duplicates: Arc<AtomicU64>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -71,6 +79,7 @@ impl DeleteOnlyMergeInsertExec {
             merge_stats: Arc::new(Mutex::new(None)),
             transaction: Arc::new(Mutex::new(None)),
             affected_rows: Arc::new(Mutex::new(None)),
+            source_skipped_duplicates,
         })
     }
 
@@ -101,6 +110,8 @@ impl DeleteOnlyMergeInsertExec {
     async fn collect_deletions(
         mut input_stream: SendableRecordBatchStream,
         metrics: MergeInsertMetrics,
+        source_dedupe_behavior: SourceDedupeBehavior,
+        on_columns: &[String],
     ) -> DFResult<RoaringTreemap> {
         let schema = input_stream.schema();
 
@@ -156,8 +167,25 @@ impl DeleteOnlyMergeInsertExec {
 
                 if action == Action::Delete && !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
-                    delete_row_addrs.insert(row_addr);
-                    metrics.num_deleted_rows.add(1);
+                    // The treemap dedupes addresses, so a repeat insert signals
+                    // a duplicate source row matching the same target; apply the
+                    // same dedupe policy as updates. (Delete-only never carries
+                    // `delete_not_matched_by_source`, so every delete here is a
+                    // source match.)
+                    if delete_row_addrs.insert(row_addr) {
+                        metrics.num_deleted_rows.add(1);
+                    } else {
+                        match source_dedupe_behavior {
+                            SourceDedupeBehavior::Fail => {
+                                return Err(create_duplicate_row_error(
+                                    &batch, row_idx, on_columns,
+                                ));
+                            }
+                            SourceDedupeBehavior::FirstSeen => {
+                                metrics.num_skipped_duplicates.add(1);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -194,10 +222,6 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         "DeleteOnlyMergeInsertExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(arrow_schema::Schema::empty())
     }
@@ -224,6 +248,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
             merge_stats: self.merge_stats.clone(),
             transaction: self.transaction.clone(),
             affected_rows: self.affected_rows.clone(),
+            source_skipped_duplicates: self.source_skipped_duplicates.clone(),
         }))
     }
 
@@ -257,13 +282,25 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         let input_stream = self.input.execute(partition, context)?;
 
         let dataset = self.dataset.clone();
+        let params = self.params.clone();
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
-        let merged_generations = self.params.merged_generations.clone();
+        let compacted_sstables = self.params.compacted_sstables.clone();
+        let source_dedupe_behavior = self.params.source_dedupe_behavior;
+        let on_columns = self.params.on.clone();
+        let source_skipped_duplicates = self.source_skipped_duplicates.clone();
 
         let result_stream = futures::stream::once(async move {
-            let delete_row_addrs = Self::collect_deletions(input_stream, metrics).await?;
+            // Delete-only merges write no data files, but still validate any
+            // requested target bases so unknown bases fail on every path.
+            resolve_target_bases(&dataset, &params).await?;
+            // `metrics` is moved into `collect_deletions`; keep a handle on the
+            // skipped-duplicate counter so it can be folded into the stats below.
+            let skipped_duplicates = metrics.num_skipped_duplicates.clone();
+            let delete_row_addrs =
+                Self::collect_deletions(input_stream, metrics, source_dedupe_behavior, &on_columns)
+                    .await?;
 
             let (updated_fragments, removed_fragment_ids) =
                 apply_deletions(&dataset, &delete_row_addrs)
@@ -275,7 +312,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                 updated_fragments,
                 new_fragments: vec![],
                 fields_modified: vec![],
-                merged_generations,
+                compacted_sstables,
                 fields_for_preserving_frag_bitmap: dataset
                     .schema()
                     .fields
@@ -290,6 +327,13 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
             let transaction = Transaction::new(dataset.manifest.version, operation, None);
 
             let num_deleted = delete_row_addrs.len();
+            let num_skipped_duplicates = (skipped_duplicates.value() as u64)
+                .checked_add(source_skipped_duplicates.load(Ordering::Relaxed))
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Execution(
+                        "merge insert skipped duplicate count overflowed u64".to_string(),
+                    )
+                })?;
             let stats = MergeStats {
                 num_deleted_rows: num_deleted,
                 num_inserted_rows: 0,
@@ -297,7 +341,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                 bytes_written: 0,
                 num_files_written: 0,
                 num_attempts: 1,
-                num_skipped_duplicates: 0,
+                num_skipped_duplicates,
             };
 
             if let Ok(mut transaction_guard) = transaction_holder.lock() {

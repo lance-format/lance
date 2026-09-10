@@ -7,7 +7,7 @@ import os
 import pickle
 import sqlite3
 from contextlib import closing
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple, Optional, Union
 
 import pyarrow as pa
 
@@ -18,6 +18,8 @@ from .dependencies import pandas as pd
 from .types import _coerce_reader
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .dataset import LanceDataset, LanceFragment
     from .types import ReaderLike
 
@@ -28,20 +30,26 @@ class BatchUDF:
     Use :func:`lance.add_columns_udf` decorator to wrap a function with this class.
     """
 
-    def __init__(self, func, output_schema=None, checkpoint_file=None):
+    def __init__(
+        self,
+        func: Callable[[pa.RecordBatch], Any],
+        output_schema: Optional[pa.Schema] = None,
+        checkpoint_file: Optional[Union[str, Path]] = None,
+    ) -> None:
         self.func = func
         self.output_schema = output_schema
+        self.cache: Optional[BatchUDFCheckpoint]
         if checkpoint_file is not None:
             self.cache = BatchUDFCheckpoint(checkpoint_file)
         else:
             self.cache = None
 
-    def __call__(self, batch: pa.RecordBatch):
+    def __call__(self, batch: pa.RecordBatch) -> Any:
         # Directly call inner function. This is to allow the user to test the
         # function and have it behave exactly as it was written.
         return self.func(batch)
 
-    def _call(self, batch: pa.RecordBatch):
+    def _call(self, batch: pa.RecordBatch) -> pa.RecordBatch:
         if self.output_schema is None:
             raise ValueError(
                 "output_schema must be provided when using a function that "
@@ -59,7 +67,10 @@ class BatchUDF:
         return result
 
 
-def batch_udf(output_schema=None, checkpoint_file=None):
+def batch_udf(
+    output_schema: Optional[pa.Schema] = None,
+    checkpoint_file: Optional[Union[str, Path]] = None,
+) -> Callable[[Callable[[pa.RecordBatch], Any]], BatchUDF]:
     """
     Create a user defined function (UDF) that adds columns to a dataset.
 
@@ -88,7 +99,7 @@ def batch_udf(output_schema=None, checkpoint_file=None):
     AddColumnsUDF
     """
 
-    def inner(func):
+    def inner(func: Callable[[pa.RecordBatch], Any]) -> BatchUDF:
         return BatchUDF(func, output_schema, checkpoint_file)
 
     return inner

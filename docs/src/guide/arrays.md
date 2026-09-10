@@ -119,11 +119,11 @@ calling `lance.arrow.ImageTensorArray.to_encoded`.
 
 A `lance.arrow.EncodedImageArray.to_tensor` method is provided to decode
 encoded images and return them as `lance.arrow.FixedShapeImageTensorArray`, from
-which they can be converted to numpy arrays or TensorFlow tensors.
+which they can be converted to numpy arrays.
 For decoding images, it will first attempt to use a decoder provided via the optional
 function parameter. If decoder is not provided it will attempt to use
-[Pillow](https://pillow.readthedocs.io/en/stable/) and [tensorflow](https://www.tensorflow.org/api_docs/python/tf/io/encode_png) in that
-order. If neither library or custom decoder is available an exception will be raised.
+[Pillow](https://pillow.readthedocs.io/en/stable/). If neither Pillow nor a custom
+decoder is available an exception will be raised.
 
 ```python
 from lance.arrow import ImageURIArray
@@ -132,13 +132,16 @@ uris = [os.path.join(os.path.dirname(__file__), "images/1.png")]
 encoded_images = ImageURIArray.from_uris(uris).read_uris()
 print(encoded_images.to_tensor())
 
-def tensorflow_decoder(images):
-    import tensorflow as tf
+def pillow_decoder(images):
+    import io
     import numpy as np
+    from PIL import Image
 
-    return np.stack(tf.io.decode_png(img.as_py(), channels=3) for img in images.storage)
+    return np.stack(
+        np.asarray(Image.open(io.BytesIO(img.as_py()))) for img in images.storage
+    )
 
-print(encoded_images.to_tensor(tensorflow_decoder))
+print(encoded_images.to_tensor(pillow_decoder))
 # <lance.arrow.FixedShapeImageTensorArray object at 0x...>
 # [[42, 42, 42, 255]]
 # <lance.arrow.FixedShapeImageTensorArray object at 0x...>
@@ -164,8 +167,8 @@ created by calling `lance.arrow.ImageArray.from_array` and passing in a
 It can be encoded into to `lance.arrow.EncodedImageArray` by calling
 `lance.arrow.FixedShapeImageTensorArray.to_encoded` and passing custom encoder
 If encoder is not provided it will attempt to use
-[tensorflow](https://www.tensorflow.org/api_docs/python/tf/io/encode_png) and [Pillow](https://pillow.readthedocs.io/en/stable/) in that order. Default encoders will
-encode to PNG. If neither library is available it will raise an exception.
+[Pillow](https://pillow.readthedocs.io/en/stable/). The default encoder will encode
+to PNG. If neither Pillow nor a custom encoder is available it will raise an exception.
 
 ```python
 from lance.arrow import ImageURIArray
@@ -176,4 +179,4 @@ tensor_images.to_encoded()
 # <lance.arrow.EncodedImageArray object at 0x...>
 # [...
 # b'\x89PNG\r\n\x1a...'
-``` 
+```

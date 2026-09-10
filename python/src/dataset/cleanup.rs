@@ -14,8 +14,8 @@
 
 use pyo3::{pyclass, pymethods};
 
-#[pyclass(get_all)]
-#[derive(Debug)]
+#[pyclass(get_all, skip_from_py_object)]
+#[derive(Clone, Debug)]
 pub struct CleanupStats {
     pub bytes_removed: u64,
     pub old_versions: u64,
@@ -27,6 +27,56 @@ pub struct CleanupStats {
 
 #[pymethods]
 impl CleanupStats {
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+#[pyclass(get_all, skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub struct CleanupCandidateFile {
+    pub path: String,
+    pub kind: String,
+    pub unverified: bool,
+    pub size_bytes: u64,
+}
+
+#[pymethods]
+impl CleanupCandidateFile {
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+#[pyclass(get_all, skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub struct CleanupReferencedBranch {
+    pub name: String,
+    pub referenced_version: u64,
+    pub cleanup_candidate: bool,
+}
+
+#[pymethods]
+impl CleanupReferencedBranch {
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+#[pyclass(get_all, skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub struct CleanupExplanation {
+    pub read_version: u64,
+    pub stats: CleanupStats,
+    pub candidate_files: Vec<CleanupCandidateFile>,
+    pub candidate_files_truncated: bool,
+    pub candidate_file_limit: usize,
+    pub referenced_branches: Vec<CleanupReferencedBranch>,
+    pub warnings: Vec<String>,
+}
+
+#[pymethods]
+impl CleanupExplanation {
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }

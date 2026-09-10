@@ -8,7 +8,7 @@
 #
 # For each (backend, base_rows) the bench's `prepare` phase runs once to
 # write the base dataset + FTS index + MemWAL; then for each k the `search`
-# phase ingests flushed generations + an active memtable through ShardWriter
+# phase ingests SSTables + an active memtable through ShardWriter
 # and times the FTS query panel under both Local and LocalWithGlobalRescore
 # scoring modes.
 #
@@ -23,8 +23,8 @@
 #   CACHE_DIR       FineWeb shard download cache (default <tmpdir>/lance-fineweb-cache)
 #   BASE_ROWS_LIST  space-separated base sizes (default "100000 1000000")
 #   K_LIST          space-separated top-k values (default "10 100")
-#   MAX_MEMTABLE_ROWS  active/flushed memtable cap (default 100000)
-#   GENS_LIST       space-separated flushed-generation counts (default "1 2 5")
+#   MAX_MEMTABLE_ROWS  active/SSTable cap (default 100000)
+#   GENS_LIST       space-separated SSTable counts (default "1 2 5")
 #   QUERIES         queries per config (default 200)
 #   WITH_BASELINE   "1" to also build the merged-index accuracy baseline
 #                   and report local-vs-merged Jaccard (default off)
@@ -117,7 +117,7 @@ for backend in $BACKENDS; do
             --base-rows "$base_rows" --batch-rows 1000 \
             --cache-dir "$CACHE_DIR" || continue
 
-        # search for each (flushed-generations, k)
+        # search for each (SSTables, k)
         for gens in $GENS_LIST; do
             for k in $K_LIST; do
                 name="search_${backend}_${btag}_g${gens}_k${k}"
@@ -136,7 +136,7 @@ for backend in $BACKENDS; do
                     --phase search --uri "$uri" \
                     --base-rows "$base_rows" \
                     --max-memtable-rows "$MAX_MEMTABLE_ROWS" \
-                    --flushed-generations "$gens" \
+                    --sstables "$gens" \
                     --batch-rows 1000 \
                     --queries "$QUERIES" --k "$k" \
                     "${baseline_flag[@]}" \

@@ -11,13 +11,13 @@ use arrow_array::{PrimitiveArray, UInt32Array};
 
 use lance_core::{Error, Result};
 
-pub mod encodings;
 pub mod ffi;
 pub mod local;
 pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
 pub mod scheduler;
+pub mod spill;
 pub mod stream;
 #[cfg(test)]
 pub mod testing;

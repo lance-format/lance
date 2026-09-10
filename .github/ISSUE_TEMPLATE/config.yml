@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question / usage help
+    url: https://discord.gg/lance
+    about: >-
+      For questions and general discussion, please ask in the Lance Discord
+      rather than opening an issue.

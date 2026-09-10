@@ -24,10 +24,11 @@ datafusion-physical-expr.workspace = true
 datafusion-substrait = {workspace = true, optional = true}
 datafusion.workspace = true
 futures.workspace = true
+half.workspace = true
 jsonb = {workspace = true}
 lance-arrow.workspace = true
 lance-core = {workspace = true, features = ["datafusion"]}
-lance-datagen.workspace = true
+lance-datagen = {workspace = true, optional = true}
 lance-geo = {workspace = true, optional = true}
 chrono.workspace = true
 log.workspace = true
@@ -38,12 +39,14 @@ tracing.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
-protobuf-src = {version = "2.1", optional = true}
+protobuf-src = { workspace = true, optional = true }
 
 [dev-dependencies]
 lance-datagen.workspace = true
+rstest.workspace = true
 
 [features]
+datagen = ["dep:lance-datagen"]
 geo = ["dep:lance-geo"]
 substrait = ["dep:datafusion-substrait"]
 protoc = ["dep:protobuf-src"]

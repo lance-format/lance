@@ -861,3 +861,34 @@ def test_json_merge_insert(tmp_path: Path):
 
     result = dataset.to_table(filter="json_get_int(data, 'score') >= 35")
     assert result.num_rows == 2
+
+
+def test_json_fragment_session_take(tmp_path: Path):
+    """FragmentSession.take must return JSON columns as pa.json_(), not raw JSONB."""
+
+    dataset_path = tmp_path / "json_fragment_session.lance"
+
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4, 5], type=pa.int32()),
+            "data": pa.array(
+                [json.dumps({"name": "row", "score": v}) for v in range(5)],
+                type=pa.json_(),
+            ),
+        }
+    )
+    lance.write_dataset(table, dataset_path)
+
+    dataset = lance.dataset(dataset_path)
+    fragment = dataset.get_fragments()[0]
+    session = fragment.open_session(columns=["id", "data"])
+    result = session.take([0, 2, 4])
+
+    # JSON column must be the logical pa.json_() type, not raw LargeBinary JSONB.
+    assert result.schema.field("data").type == pa.json_()
+    assert result.column("id").to_pylist() == [1, 3, 5]
+    assert [json.loads(v) for v in result.column("data").to_pylist()] == [
+        {"name": "row", "score": 0},
+        {"name": "row", "score": 2},
+        {"name": "row", "score": 4},
+    ]

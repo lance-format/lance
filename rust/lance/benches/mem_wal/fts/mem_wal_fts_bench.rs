@@ -718,7 +718,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
         qps_nt,
         term_recall_v,
         phrase_recall_v,
-        index.memory_usage() as f64 / 1.0e6,
+        index.resident_bytes_exact() as f64 / 1.0e6,
     );
     println!(
         "{{\"impl\":\"lance_fts\",\"run\":\"{}\",\"docs\":{},\"queries\":{},\"k\":{},\
@@ -738,7 +738,7 @@ fn run_bench(args: &BenchArgs) -> Result<()> {
         term_recall_v,
         phrase_recall_v,
         or_recall_v,
-        index.memory_usage(),
+        index.resident_bytes_exact(),
     );
     Ok(())
 }

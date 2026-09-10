@@ -10,7 +10,7 @@ use arrow_array::{
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Fields, Schema as ArrowSchema,
 };
-use lance_encoding::version::LanceFileVersion;
+use lance_file::version::LanceFileVersion;
 use rstest::rstest;
 use std::collections::HashMap;
 use std::sync::Arc;

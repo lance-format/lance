@@ -22,7 +22,7 @@ from lance import (
 )
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter
-from lance.fragment import write_fragments
+from lance.fragment import RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
 
@@ -279,7 +279,7 @@ def test_fragment_meta():
         "file_size_bytes=100), DataFile(path='1.lance', fields=[1], column_indices=[], "
         "file_major_version=0, file_minor_version=0, file_size_bytes=None)], "
         "physical_rows=100, deletion_file=None, row_id_meta=None, "
-        "created_at_version_meta=None, last_updated_at_version_meta=None)"
+        "created_at_version_meta=None, last_updated_at_version_meta=None, overlays=[])"
     )
 
 
@@ -617,6 +617,139 @@ def test_fragment_update_columns_with_custom_join_key(tmp_path):
     assert result["name"][2] == "Chase"  # id=3 should have name Chase
 
 
+def test_fragment_update_columns_with_blob_v2(tmp_path):
+    data = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4]),
+            "payload": lance.blob_array([b"one", b"two", b"", None]),
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_blob_v2"
+    dataset = lance.write_dataset(
+        data,
+        dataset_uri,
+        data_storage_version="2.2",
+    )
+
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(
+        pa.table(
+            {
+                "id": pa.array([2]),
+                "payload": lance.blob_array([b"NEW"]),
+            }
+        ),
+        left_on="id",
+    )
+
+    operation = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = LanceDataset.commit(
+        dataset_uri,
+        operation,
+        read_version=dataset.version,
+    )
+
+    result = updated_dataset.to_table(blob_handling="all_binary")
+    assert result["id"].to_pylist() == [1, 2, 3, 4]
+    assert result["payload"].to_pylist() == [b"one", b"NEW", b"", None]
+
+
+def test_fragment_update_columns_with_nested_blob_v2(tmp_path):
+    def info_array(names, payloads):
+        fields = [pa.field("name", pa.string()), lance.blob_field("blob")]
+        return pa.StructArray.from_arrays(
+            [pa.array(names), lance.blob_array(payloads)], fields=fields
+        )
+
+    dataset_uri = tmp_path / "test_dataset_update_columns_nested_blob_v2"
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array([1, 2]),
+                "info": info_array(["a", "b"], [b"one", b"two"]),
+            }
+        ),
+        dataset_uri,
+        data_storage_version="2.2",
+    )
+
+    updated_fragment, fields_modified = dataset.get_fragment(0).update_columns(
+        pa.table(
+            {
+                "id": pa.array([2]),
+                "info": info_array(["B"], [b"NEW"]),
+            }
+        ),
+        left_on="id",
+    )
+    updated_dataset = LanceDataset.commit(
+        dataset_uri,
+        LanceOperation.Update(
+            updated_fragments=[updated_fragment],
+            fields_modified=fields_modified,
+        ),
+        read_version=dataset.version,
+    )
+
+    info = updated_dataset.to_table(blob_handling="all_binary")["info"].combine_chunks()
+    assert info.field("name").to_pylist() == ["a", "B"]
+    assert info.field("blob").to_pylist() == [b"one", b"NEW"]
+
+
+def test_fragment_update_columns_preserves_external_blob_v2(tmp_path):
+    dataset_uri = tmp_path / "test_dataset_update_columns_external_blob_v2"
+    external = tmp_path / "existing-payload.bin"
+    external.write_bytes(b"outside")
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array([1, 2]),
+                "payload": lance.blob_array([external.as_uri(), b"two"]),
+            }
+        ),
+        dataset_uri,
+        data_storage_version="2.2",
+        allow_external_blob_outside_bases=True,
+    )
+
+    updated_fragment, fields_modified = dataset.get_fragment(0).update_columns(
+        pa.table(
+            {
+                "id": pa.array([2]),
+                "payload": lance.blob_array([b"NEW"]),
+            }
+        ),
+        left_on="id",
+    )
+    updated_dataset = LanceDataset.commit(
+        dataset_uri,
+        LanceOperation.Update(
+            updated_fragments=[updated_fragment],
+            fields_modified=fields_modified,
+        ),
+        read_version=dataset.version,
+    )
+
+    result = updated_dataset.to_table(blob_handling="all_binary")
+    assert result["payload"].to_pylist() == [b"outside", b"NEW"]
+
+    new_external = tmp_path / "new-payload.bin"
+    new_external.write_bytes(b"new outside")
+    with pytest.raises(ValueError, match="outside registered external bases"):
+        updated_dataset.get_fragment(0).update_columns(
+            pa.table(
+                {
+                    "id": pa.array([2]),
+                    "payload": lance.blob_array([new_external.as_uri()]),
+                }
+            ),
+            left_on="id",
+        )
+
+
 def test_fragment_update_columns_with_nulls(tmp_path):
     """Test fragment update columns with null values."""
     # Create initial dataset
@@ -800,3 +933,566 @@ def test_fragment_update_columns_error_on_metadata_column(tmp_path):
         "metadata column" in str(exc_info.value).lower()
         or "cannot be updated" in str(exc_info.value).lower()
     )
+
+
+def test_fragment_delete_rows(tmp_path: Path):
+    # LanceFragment.delete_rows deletes by local row offset (not a predicate):
+    # exactly the given rows are removed, the rest survive, and the fragment is
+    # gone when every row is deleted.
+    data = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(data, tmp_path)
+    frag = dataset.get_fragment(0)
+
+    new_meta = frag.delete_rows([0, 5, 99])
+    assert new_meta is not None
+    op = LanceOperation.Delete(
+        updated_fragments=[new_meta],
+        deleted_fragment_ids=[],
+        predicate="delete_rows([0, 5, 99])",
+    )
+    dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
+
+    assert dataset.count_rows() == 97
+    remaining = set(dataset.to_table(columns=["a"])["a"].to_pylist())
+    assert {0, 5, 99}.isdisjoint(remaining)
+    assert {1, 98}.issubset(remaining)
+
+    # Deleting every row removes the fragment entirely (returns None).
+    frag = lance.dataset(tmp_path).get_fragment(0)
+    assert frag.delete_rows(range(100)) is None
+
+    # Offsets outside the fragment's physical rows are rejected, not silently
+    # written to the deletion file.
+    frag = lance.dataset(tmp_path).get_fragment(0)
+    with pytest.raises(ValueError, match="out of range"):
+        frag.delete_rows([100])
+    with pytest.raises(ValueError, match="out of range"):
+        frag.delete_rows([0, 50, 1000])
+
+
+def test_fragment_take_with_json_column(tmp_path):
+    """Test that FileFragment.take returns JSON columns in Arrow JSON format."""
+    json_type = pa.json_()
+    data = pa.table(
+        {
+            "id": pa.array(range(10), type=pa.int64()),
+            "meta": pa.array(
+                [f'{{"val":{i}}}' for i in range(10)],
+                type=json_type,
+            ),
+        }
+    )
+    dataset_uri = tmp_path / "test_frag_take_json"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    fragment = dataset.get_fragment(0)
+    result = fragment.take([1, 4, 7])
+
+    # Should return arrow.json type (Utf8), not lance.json (LargeBinary)
+    meta_field = result.schema.field("meta")
+    assert meta_field.type == pa.utf8() or meta_field.type == pa.json_(), (
+        f"Expected arrow.json (Utf8), got {meta_field.type}"
+    )
+
+    metas = result.column("meta").to_pylist()
+    assert metas[0] == '{"val":1}'
+    assert metas[1] == '{"val":4}'
+    assert metas[2] == '{"val":7}'
+
+
+def test_fragment_create_with_json_column(tmp_path):
+    """Test that LanceFragment.create works with Arrow JSON extension type.
+
+    Previously the single-fragment create path skipped the Arrow JSON (Utf8) ->
+    Lance JSON (JSONB LargeBinary) conversion that write_dataset/write_fragments
+    perform, so the raw UTF-8 string bytes were written into a column whose schema
+    declared JSONB. Reads then miss-decoded the bytes and returned garbage.
+    """
+    json_type = pa.json_()
+    data = pa.table(
+        {
+            "uid": pa.array(["a", "b", "c", "d"], type=pa.utf8()),
+            "payload": pa.array(
+                ['{"x":1}', '{"x":2}', '{"y":3}', '{"y":4}'],
+                type=json_type,
+            ),
+        }
+    )
+
+    frag = LanceFragment.create(tmp_path, data)
+    operation = LanceOperation.Overwrite(data.schema, [frag])
+    dataset = LanceDataset.commit(tmp_path, operation)
+
+    result = dataset.to_table()
+    assert result.column("uid").to_pylist() == ["a", "b", "c", "d"]
+    payloads = result.column("payload").to_pylist()
+    assert [json.loads(p) for p in payloads] == [
+        {"x": 1},
+        {"x": 2},
+        {"y": 3},
+        {"y": 4},
+    ]
+
+
+def test_fragment_update_columns_with_json_column(tmp_path):
+    """Test that fragment update_columns works with Arrow JSON extension type.
+
+    Previously this would fail with a type mismatch error because the
+    HashJoiner didn't convert Arrow JSON (Utf8) to Lance JSON (LargeBinary).
+    """
+    # Create initial dataset with a JSON extension type column
+    json_type = pa.json_()
+    data = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4, 5], type=pa.int64()),
+            "name": pa.array(["a", "b", "c", "d", "e"], type=pa.utf8()),
+            "meta": pa.array(
+                ['{"x":1}', '{"x":2}', '{"x":3}', '{"x":4}', '{"x":5}'],
+                type=json_type,
+            ),
+        }
+    )
+    dataset_uri = tmp_path / "test_update_cols_json"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    # Prepare update data: update the JSON column for some rows
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([1, 3], type=pa.uint64()),
+            "meta": pa.array(
+                ['{"updated":true,"id":2}', '{"updated":true,"id":4}'],
+                type=json_type,
+            ),
+        }
+    )
+
+    # This should NOT raise a type mismatch error
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(update_data)
+
+    assert len(fields_modified) > 0
+
+    # Commit and verify
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    result = updated_dataset.to_table()
+    ids = result.column("id").to_pylist()
+    metas = result.column("meta").to_pylist()
+
+    for i, (id_val, meta_val) in enumerate(zip(ids, metas)):
+        meta = json.loads(meta_val) if isinstance(meta_val, str) else meta_val
+        if id_val == 2 or id_val == 4:
+            assert "updated" in meta_val or meta.get("updated") is True, (
+                f"id={id_val} should be updated, got {meta_val}"
+            )
+        else:
+            assert "x" in meta_val or "x" in str(meta), (
+                f"id={id_val} should have original value, got {meta_val}"
+            )
+
+
+def test_row_id_sequence_from_range():
+    # A step-of-one range is the compact case and must not materialize its ids.
+    sequence = RowIdSequence(range(10))
+
+    assert len(sequence) == 10
+    assert sequence.to_pyarrow() == pa.array(range(10), type=pa.uint64())
+    assert sequence.to_pyarrow().type == pa.uint64()
+    assert list(sequence) == list(range(10))
+
+
+@pytest.mark.parametrize(
+    "row_ids",
+    [
+        pytest.param(pa.array([1, 2, 3]), id="pyarrow_array"),
+        pytest.param(pa.array([1, 2, 3], type=pa.uint64()), id="pyarrow_uint64_array"),
+        pytest.param(pa.array([1, 2, 3], type=pa.int8()), id="pyarrow_int8_array"),
+        pytest.param(pa.array([1, 2, 3], type=pa.uint16()), id="pyarrow_uint16_array"),
+        # A slice carries an offset into a larger buffer; only the slice counts.
+        pytest.param(pa.array([9, 1, 2, 3, 9]).slice(1, 3), id="pyarrow_sliced_array"),
+        pytest.param(pa.chunked_array([[1], [2, 3]]), id="pyarrow_chunked_array"),
+        pytest.param((x for x in [1, 2, 3]), id="generator"),
+        pytest.param([1, 2, 3], id="list"),
+        pytest.param(range(1, 4), id="range"),
+        pytest.param(range(3, 0, -1), id="descending_range"),
+    ],
+)
+def test_row_id_sequence_accepts_input_types(row_ids):
+    sequence = RowIdSequence(row_ids)
+
+    assert sorted(sequence) == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "row_ids",
+    [
+        pytest.param([], id="empty_list"),
+        pytest.param(range(0), id="empty_range"),
+        pytest.param(pa.array([], type=pa.uint64()), id="empty_array"),
+    ],
+)
+def test_row_id_sequence_empty(row_ids):
+    sequence = RowIdSequence(row_ids)
+
+    assert len(sequence) == 0
+    assert list(sequence) == []
+    assert sequence.to_pyarrow() == pa.array([], type=pa.uint64())
+
+
+@pytest.mark.parametrize(
+    "row_ids",
+    [
+        pytest.param(list(range(4100)), id="contiguous"),
+        pytest.param(list(range(0, 8200, 2)), id="gapped"),
+        pytest.param(list(range(4100))[::-1], id="unsorted"),
+    ],
+)
+def test_row_id_sequence_iterates_large_sequences(row_ids):
+    # Each shape picks a different segment encoding, so all of them have to
+    # round-trip through iteration.
+    sequence = RowIdSequence(row_ids)
+
+    assert list(sequence) == row_ids
+    # Each call must hand back a fresh iterator rather than a spent one.
+    assert list(sequence) == row_ids
+
+
+def test_row_id_sequence_from_range_above_isize():
+    # Range bounds are read as isize; beyond that the values are read one at a
+    # time instead, which must still cover the whole uint64 row id domain.
+    start = 2**63
+    sequence = RowIdSequence(range(start, start + 3))
+
+    assert list(sequence) == [start, start + 1, start + 2]
+
+
+def test_row_id_sequence_unsorted_round_trips():
+    sequence = RowIdSequence([12, 11, 10])
+
+    assert list(sequence) == [12, 11, 10]
+    assert sequence.to_pyarrow() == pa.array([12, 11, 10], type=pa.uint64())
+
+
+@pytest.mark.parametrize(
+    "row_ids",
+    [
+        pytest.param([1, 1, 2], id="adjacent"),
+        pytest.param([1, 2, 3, 1], id="separated"),
+        pytest.param(pa.array([5, 3, 5]), id="unsorted_array"),
+    ],
+)
+def test_row_id_sequence_rejects_duplicates(row_ids):
+    with pytest.raises(ValueError, match="Row ids must be unique"):
+        RowIdSequence(row_ids)
+
+
+@pytest.mark.parametrize(
+    ("row_ids", "message"),
+    [
+        pytest.param(pa.array([1, None, 3]), "must not be null", id="null_in_array"),
+        pytest.param(pa.array([1.5, 2.5]), "array of integers", id="float_array"),
+        pytest.param(pa.array([-1, 2]), "uint64", id="negative_in_array"),
+        pytest.param(range(-5, 5), "non-negative", id="negative_range"),
+        pytest.param(5, "iterable of integers", id="not_iterable"),
+    ],
+)
+def test_row_id_sequence_rejects_invalid_input(row_ids, message):
+    with pytest.raises((ValueError, TypeError), match=message):
+        RowIdSequence(row_ids)
+
+
+def test_row_id_sequence_metadata_round_trip():
+    sequence = RowIdSequence([7, 12, 3])
+
+    metadata = sequence.to_inline_metadata()
+    assert isinstance(metadata, RowIdMeta)
+    assert RowIdSequence.from_inline_metadata(metadata) == sequence
+
+
+def test_row_id_sequence_equality_and_repr():
+    assert RowIdSequence(range(3)) == RowIdSequence([0, 1, 2])
+    assert RowIdSequence(range(3)) != RowIdSequence([0, 1])
+    # Comparing against an unrelated type is False rather than an error.
+    assert RowIdSequence(range(3)) != "not a sequence"
+
+    assert repr(RowIdSequence([1, 2])) == "RowIdSequence([1, 2])"
+    assert repr(RowIdSequence(range(12))) == (
+        "RowIdSequence([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, ...], len=12)"
+    )
+
+
+def test_row_id_sequence_pickle():
+    sequence = RowIdSequence([7, 12, 3])
+
+    assert pickle.loads(pickle.dumps(sequence)) == sequence
+
+
+def _row_ids_by_id(dataset: LanceDataset) -> dict:
+    table = dataset.to_table(columns=["id"], with_row_id=True)
+    return dict(zip(table["id"].to_pylist(), table["_rowid"].to_pylist()))
+
+
+def test_row_id_sequence_preserves_ids_in_manual_update(tmp_path: Path):
+    # An update assembled externally (delete the old row, append a replacement)
+    # keeps the row's identity only if the new fragment carries its row id.
+    dataset = write_dataset(
+        pa.table({"id": [1, 2, 3, 4], "v": [10, 20, 30, 40]}),
+        tmp_path,
+        max_rows_per_file=2,
+        enable_stable_row_ids=True,
+    )
+    row_ids_before = _row_ids_by_id(dataset)
+
+    updated_fragment = dataset.get_fragments()[0].delete("id = 2")
+    (new_fragment,) = write_fragments(pa.table({"id": [2], "v": [99]}), tmp_path)
+    new_fragment.row_id_meta = RowIdSequence([row_ids_before[2]]).to_inline_metadata()
+
+    dataset = LanceDataset.commit(
+        tmp_path,
+        LanceOperation.Update(
+            removed_fragment_ids=[],
+            updated_fragments=[updated_fragment],
+            new_fragments=[new_fragment],
+            fields_modified=[],
+        ),
+        read_version=dataset.version,
+    )
+
+    assert _row_ids_by_id(dataset) == row_ids_before
+    assert dataset.to_table().sort_by("id").to_pydict() == {
+        "id": [1, 2, 3, 4],
+        "v": [10, 99, 30, 40],
+    }
+
+
+def test_row_id_sequence_reads_back_fragment_metadata(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"a": range(10)}),
+        tmp_path,
+        max_rows_per_file=5,
+        enable_stable_row_ids=True,
+    )
+
+    sequences = [
+        RowIdSequence.from_inline_metadata(fragment.metadata.row_id_meta)
+        for fragment in dataset.get_fragments()
+    ]
+
+    assert [list(sequence) for sequence in sequences] == [
+        [0, 1, 2, 3, 4],
+        [5, 6, 7, 8, 9],
+    ]
+
+
+def test_fragment_validate(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"a": range(100), "b": range(100)}),
+        tmp_path,
+        max_rows_per_file=50,
+    )
+    # A valid fragment validates without raising.
+    for fragment in dataset.get_fragments():
+        assert fragment.validate() is None
+
+
+def test_fragment_validate_across_data_files(tmp_path: Path):
+    # add_columns writes a second data file per fragment; validate must still
+    # pass (field ids increasing and unique across a fragment's data files).
+    dataset = write_dataset(pa.table({"a": range(100)}), tmp_path, max_rows_per_file=50)
+    dataset.add_columns({"b": "a + 1"})
+    for fragment in dataset.get_fragments():
+        assert len(fragment.data_files()) > 1
+        fragment.validate()
+
+
+def test_fragment_validate_after_delete(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(100)}), tmp_path, max_rows_per_file=50)
+    dataset.delete("a < 10")
+    # A fragment carrying a deletion vector still validates.
+    for fragment in dataset.get_fragments():
+        fragment.validate()
+
+
+def _dataset_with_scalar_index(tmp_path: Path) -> LanceDataset:
+    dataset = write_dataset(
+        pa.table({"val": range(10000), "other": range(10000)}),
+        tmp_path,
+        max_rows_per_file=5000,
+    )
+    dataset.create_scalar_index("val", index_type="BTREE")
+    return dataset
+
+
+def test_fragment_scanner_use_scalar_index_disables_index_query(tmp_path: Path):
+    # A filtered fragment scan on an indexed column plans a dataset-wide
+    # ScalarIndexQuery (and caches its index pages) unless the scan opts out.
+    dataset = _dataset_with_scalar_index(tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "val >= 10 AND val <= 20"
+
+    default_plan = fragment.scanner(filter=filt, with_row_id=True).explain_plan(True)
+    assert "ScalarIndexQuery" in default_plan
+
+    opted_out_plan = fragment.scanner(
+        filter=filt, with_row_id=True, use_scalar_index=False
+    ).explain_plan(True)
+    assert "ScalarIndexQuery" not in opted_out_plan
+
+
+@pytest.mark.parametrize("use_scalar_index", [None, True, False])
+def test_fragment_scanner_matches_dataset_scanner(tmp_path: Path, use_scalar_index):
+    # The fragment scanner must build the same plan as the dataset scanner
+    # restricted to that single fragment.
+    dataset = _dataset_with_scalar_index(tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "val >= 10 AND val <= 20"
+
+    frag_plan = fragment.scanner(
+        filter=filt, with_row_id=True, use_scalar_index=use_scalar_index
+    ).explain_plan(True)
+    dataset_plan = dataset.scanner(
+        fragments=[fragment],
+        filter=filt,
+        with_row_id=True,
+        use_scalar_index=use_scalar_index,
+    ).explain_plan(True)
+    assert frag_plan == dataset_plan
+
+
+def _fragment_with_deletions(tmp_path: Path) -> LanceFragment:
+    dataset = write_dataset(pa.table({"a": range(20)}), tmp_path, max_rows_per_file=10)
+    dataset.delete("a < 3")
+    return dataset.get_fragments()[0]
+
+
+def test_fragment_scanner_include_deleted_rows(tmp_path: Path):
+    fragment = _fragment_with_deletions(tmp_path)
+    assert fragment.physical_rows == 10
+    assert fragment.num_deletions == 3
+
+    # By default the deleted rows are omitted.
+    default = fragment.to_table(with_row_id=True)
+    assert default.num_rows == 7
+    assert default["a"].to_pylist() == list(range(3, 10))
+
+    # With include_deleted_rows the deleted rows are surfaced with a null _rowid.
+    included = fragment.scanner(with_row_id=True, include_deleted_rows=True).to_table()
+    assert included.num_rows == fragment.physical_rows
+    assert included["a"].to_pylist() == list(range(10))
+    assert included["_rowid"].null_count == fragment.num_deletions
+
+
+def test_fragment_scanner_include_deleted_rows_requires_row_id(tmp_path: Path):
+    fragment = _fragment_with_deletions(tmp_path)
+    with pytest.raises(ValueError, match="with_row_id"):
+        fragment.scanner(include_deleted_rows=True).to_table()
+
+
+def test_fragment_scanner_include_deleted_rows_matches_dataset_scanner(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(20)}), tmp_path, max_rows_per_file=10)
+    dataset.delete("a < 3")
+    fragment = dataset.get_fragments()[0]
+
+    frag_plan = fragment.scanner(
+        with_row_id=True, include_deleted_rows=True
+    ).explain_plan(True)
+    dataset_plan = dataset.scanner(
+        fragments=[fragment], with_row_id=True, include_deleted_rows=True
+    ).explain_plan(True)
+    assert frag_plan == dataset_plan
+
+
+@pytest.mark.parametrize(
+    ("late_materialization", "is_late"),
+    [
+        pytest.param(None, False, id="default"),
+        pytest.param(True, True, id="all_late"),
+        pytest.param(False, False, id="all_early"),
+        pytest.param(["values"], True, id="late_column"),
+        pytest.param(["filter"], False, id="early_column"),
+    ],
+)
+def test_fragment_scanner_late_materialization(
+    tmp_path: Path, late_materialization, is_late
+):
+    # With no index, the plan shows whether `values` is fetched late (a take over
+    # the row stream) or early (materialized in the scan projection).
+    dataset = write_dataset(
+        pa.table({"filter": range(2000), "values": range(2000)}),
+        tmp_path,
+        data_storage_version="stable",
+    )
+    fragment = dataset.get_fragments()[0]
+
+    plan = fragment.scanner(
+        filter="filter % 2 == 0", late_materialization=late_materialization
+    ).explain_plan(True)
+
+    if is_late:
+        assert "projection=[values], source=stream" in plan
+    else:
+        assert "projection=[filter, values]" in plan
+
+
+def test_fragment_scanner_rejects_invalid_late_materialization(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(10)}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+
+    with pytest.raises(
+        ValueError, match="late_materialization must be a bool or a list of strings"
+    ):
+        fragment.scanner(late_materialization=123)
+
+
+def test_fragment_scanner_io_buffer_size_forwarded(tmp_path: Path):
+    # io_buffer_size has no plan-visible marker, so assert it is accepted through
+    # both scan entry points and leaves results unchanged.
+    dataset = write_dataset(pa.table({"val": range(1000)}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "val < 100"
+    expected = fragment.to_table(filter=filt)
+
+    assert fragment.to_table(filter=filt, io_buffer_size=4 * 1024 * 1024) == expected
+
+    batched = pa.Table.from_batches(
+        list(fragment.to_batches(filter=filt, io_buffer_size=4 * 1024 * 1024))
+    )
+    assert batched == expected
+
+
+def test_fragment_scanner_strict_batch_size(tmp_path: Path):
+    dataset = write_dataset(pa.table({"a": range(1000)}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+    filt = "a % 3 == 0"
+
+    # A filtered scan emits uneven, sub-batch_size batches by default.
+    loose = [b.num_rows for b in fragment.to_batches(batch_size=100, filter=filt)]
+    assert any(n < 100 for n in loose[:-1])
+
+    # strict_batch_size coalesces to exactly batch_size (except the last batch).
+    strict = [
+        b.num_rows
+        for b in fragment.to_batches(
+            batch_size=100, filter=filt, strict_batch_size=True
+        )
+    ]
+    assert all(n == 100 for n in strict[:-1])
+    assert sum(strict) == sum(loose)
+
+
+def test_fragment_scanner_batch_size_bytes(tmp_path: Path):
+    # A small byte budget over wide rows forces many more batches than the
+    # default, without changing the results.
+    dataset = write_dataset(pa.table({"s": ["x" * 1024] * 2000}), tmp_path)
+    fragment = dataset.get_fragments()[0]
+
+    default_batches = list(fragment.to_batches())
+    small_budget = list(fragment.to_batches(batch_size_bytes=64 * 1024))
+    assert len(small_budget) > len(default_batches)
+    assert pa.Table.from_batches(small_budget) == fragment.to_table()
