@@ -676,7 +676,19 @@ public class ScanOptions {
     }
 
     /**
-     * Set the index segment UUIDs to use for vector search.
+     * Restrict vector search to the specified index segment UUIDs from a single logical index.
+     *
+     * <p>By default, no segment restriction is applied. The engine rejects empty lists, unknown
+     * segments, and use without a nearest-neighbor query. When {@link #fragmentIds(List)} is also
+     * set, selected fragments outside these segments are searched with flat KNN; otherwise,
+     * fragments outside the selected segments are excluded.
+     *
+     * <pre>{@code
+     * ScanOptions options = new ScanOptions.Builder()
+     *     .nearest(query)
+     *     .indexSegments(List.of(segment.uuid()))
+     *     .build();
+     * }</pre>
      *
      * @param indexSegments the index segment UUIDs to use
      * @return Builder instance for method chaining.

@@ -69,7 +69,7 @@ public class AsyncScanner implements AutoCloseable {
           createAsyncScanner(
               dataset,
               options.getFragmentIds(),
-               options.getIndexSegments(),
+              options.getIndexSegments(),
               options.getColumns(),
               options.getSubstraitFilter(),
               options.getFilter(),

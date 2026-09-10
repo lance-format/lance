@@ -65,7 +65,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
           createScanner(
               dataset,
               options.getFragmentIds(),
-               options.getIndexSegments(),
+              options.getIndexSegments(),
               options.getColumns(),
               options.getSubstraitFilter(),
               options.getFilter(),
