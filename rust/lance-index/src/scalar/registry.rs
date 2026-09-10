@@ -185,6 +185,11 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         if remapping.is_some() {
+            debug_assert!(
+                !self.supports_batch_row_id_remapping(),
+                "{} advertises batch row-ID remapping but does not override load_index_with_remapping",
+                self.name()
+            );
             return Err(lance_core::Error::not_supported(format!(
                 "{} does not support asynchronous row-ID remapping",
                 self.name()

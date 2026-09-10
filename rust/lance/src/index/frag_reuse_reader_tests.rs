@@ -1537,3 +1537,111 @@ async fn unsupported_scalar_type_is_not_advertised_for_rewritten_fragments() {
     assert!(dataset.load_index_by_name("i_idx").await.unwrap().is_none());
     assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
 }
+
+#[tokio::test]
+async fn tagged_remapping_plans_coverage_once_per_snapshot() {
+    use crate::index::frag_reuse::{FriQueryPlanKey, ResolvedRemapping, open_row_id_remapping};
+
+    let mut dataset = fixture().await;
+    let params = ScalarIndexParams::default();
+    let fragments: Vec<_> = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let mut segments = Vec::new();
+    for fragment in &fragments {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+                .name("i_idx".into())
+                .replace(true)
+                .fragments(vec![*fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments("i_idx", "i", segments)
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    let indices = dataset.load_indices().await.unwrap();
+    let fri = indices
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        .unwrap();
+    assert_ne!(fri.index_version, 0);
+    let siblings: Vec<_> = indices
+        .iter()
+        .filter(|index| index.name == "i_idx")
+        .cloned()
+        .collect();
+    assert_eq!(siblings.len(), 2);
+
+    let plan_cache = dataset
+        .index_cache
+        .with_key_prefix(dataset.manifest_location.path.as_ref());
+    let key = FriQueryPlanKey {
+        fri_uuid: &fri.uuid,
+    };
+    assert!(
+        plan_cache.get_with_key(&key).await.is_none(),
+        "no plan may exist before the first tagged open"
+    );
+
+    let first = open_row_id_remapping(&dataset, &siblings[0], &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert!(matches!(first, Some((_, ResolvedRemapping::Batch(_)))));
+    let plan = plan_cache
+        .get_with_key(&key)
+        .await
+        .expect("the first tagged open must publish the snapshot plan");
+    assert!(plan.segments.contains_key(&siblings[1].uuid));
+
+    // Later opens must resolve from the published plan instead of re-running
+    // the whole-dataset sibling scan: with the sibling dropped from the cached
+    // plan, its open must fail with the plan-miss error.
+    let mut pruned = plan.as_ref().clone();
+    pruned.segments.remove(&siblings[1].uuid);
+    plan_cache.insert_with_key(&key, Arc::new(pruned)).await;
+    let error = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires committed segment metadata"),
+        "{error}"
+    );
+
+    // With the real plan restored, the sibling opens as a cache hit on the
+    // same plan entry; nothing is recomputed or re-published.
+    plan_cache.insert_with_key(&key, plan.clone()).await;
+    let second = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert!(matches!(second, Some((_, ResolvedRemapping::Batch(_)))));
+    let republished = plan_cache.get_with_key(&key).await.unwrap();
+    assert!(
+        Arc::ptr_eq(&plan, &republished),
+        "the second open must reuse the published plan instead of rebuilding it"
+    );
+    for value in 0..8 {
+        assert_eq!(
+            dataset
+                .count_rows(Some(format!("i = {value}")))
+                .await
+                .unwrap(),
+            1
+        );
+    }
+}

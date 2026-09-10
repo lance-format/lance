@@ -4,6 +4,8 @@
 use crate::Dataset;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance_core::Error;
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
+use lance_core::deepsize::DeepSizeOf;
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_DETAILS_FILE_NAME,
     FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
@@ -14,7 +16,7 @@ use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineConte
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use prost::Message;
 use roaring::RoaringBitmap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -32,6 +34,15 @@ pub(crate) enum ResolvedRemapping {
     Batch(Arc<dyn BatchRowIdRemapper>),
 }
 
+impl std::fmt::Debug for ResolvedRemapping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy(_) => f.debug_tuple("Legacy").finish_non_exhaustive(),
+            Self::Batch(remapper) => f.debug_tuple("Batch").field(remapper).finish(),
+        }
+    }
+}
+
 /// Scope the dataset-level index cache for one resolved remapping.
 ///
 /// This owns the single cache-scoping rule: a batch (tagged-history) mapping
@@ -47,6 +58,137 @@ pub(crate) fn scoped_index_cache(
             .with_key_prefix(dataset.manifest_location.path.as_ref()),
         _ => dataset.index_cache.0.clone(),
     })
+}
+
+/// The translation inputs one segment needs under a tagged history.
+#[derive(Clone, Debug)]
+pub(crate) enum SegmentRemappingPlan {
+    /// The segment's stored coverage cannot intersect any rewritten path.
+    Identity,
+    /// The rewritten query coverage plus the fragments owned by other
+    /// selected sibling segments of the same logical index.
+    Translate {
+        coverage: RoaringBitmap,
+        excluded_fragments: RoaringBitmap,
+    },
+    /// Committed metadata exists but the filtered listing carries no query
+    /// coverage for this segment (it was skipped or lost its bitmap).
+    MissingCoverage,
+}
+
+/// Snapshot-level plan of every committed segment's translation inputs.
+///
+/// Which rows a segment owns is decided once per manifest snapshot, from one
+/// pass over the same `load_indices` output every per-open resolution used to
+/// re-scan. Openers only look their segment up by UUID.
+#[derive(Clone, Debug)]
+pub(crate) struct FriQueryPlan {
+    pub(crate) segments: HashMap<Uuid, SegmentRemappingPlan>,
+}
+
+impl DeepSizeOf for FriQueryPlan {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        self.segments
+            .values()
+            .map(|segment| match segment {
+                SegmentRemappingPlan::Translate {
+                    coverage,
+                    excluded_fragments,
+                } => coverage.serialized_size() + excluded_fragments.serialized_size(),
+                _ => 0,
+            })
+            .sum::<usize>()
+            + self.segments.len() * std::mem::size_of::<(Uuid, SegmentRemappingPlan)>()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FriQueryPlanKey<'a> {
+    pub(crate) fri_uuid: &'a Uuid,
+}
+
+impl CacheKey for FriQueryPlanKey<'_> {
+    type ValueType = FriQueryPlan;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        self.fri_uuid.to_string().into()
+    }
+
+    fn type_name() -> &'static str {
+        "FriQueryPlan"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.fri-query-plan", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.fri_uuid.as_bytes());
+    }
+}
+
+/// Build or fetch the snapshot's FRI query plan.
+///
+/// Cached in the tagged (manifest-path scoped) namespace; concurrent opens
+/// coalesce on one build.
+async fn fri_query_plan(
+    dataset: &Dataset,
+    fri: &IndexMetadata,
+    indices: &[IndexMetadata],
+    mapping: &Arc<super::frag_reuse_reader::FragmentReuseIndex>,
+) -> lance_core::Result<Arc<FriQueryPlan>> {
+    dataset
+        .index_cache
+        .with_key_prefix(dataset.manifest_location.path.as_ref())
+        .get_or_insert_with_key(
+            FriQueryPlanKey {
+                fri_uuid: &fri.uuid,
+            },
+            || async {
+                // Resolve provenance here, before query coverage is rewritten.
+                // Callers hold metadata returned by load_indices and cannot
+                // supply this distinction.
+                let stored = super::load_all_indices(dataset).await?;
+                let mut segments = HashMap::with_capacity(stored.len());
+                for source in stored.iter() {
+                    let plan = if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
+                        SegmentRemappingPlan::Identity
+                    } else if let Some(entry) =
+                        indices.iter().find(|entry| entry.uuid == source.uuid)
+                        && let Some(bitmap) = &entry.fragment_bitmap
+                    {
+                        let coverage = bitmap & dataset.fragment_bitmap.as_ref();
+                        // Other selected segments own their direct coverage. Drop
+                        // paths entering those fragments before later mappings can
+                        // merge them with this segment's contribution.
+                        let selected: HashSet<_> = indices
+                            .iter()
+                            .filter(|sibling| sibling.name == entry.name)
+                            .map(|sibling| sibling.uuid)
+                            .collect();
+                        let mut excluded_fragments = RoaringBitmap::new();
+                        for sibling in stored.iter().filter(|entry| selected.contains(&entry.uuid))
+                        {
+                            if let Some(bitmap) = &sibling.fragment_bitmap {
+                                excluded_fragments |= bitmap;
+                            }
+                        }
+                        if let Some(bitmap) = &source.fragment_bitmap {
+                            excluded_fragments -= bitmap;
+                        }
+                        SegmentRemappingPlan::Translate {
+                            coverage,
+                            excluded_fragments,
+                        }
+                    } else {
+                        SegmentRemappingPlan::MissingCoverage
+                    };
+                    segments.insert(source.uuid, plan);
+                }
+                Ok(FriQueryPlan { segments })
+            },
+        )
+        .await
 }
 
 /// Resolve the FRI remapper shared by scalar and vector index loading.
@@ -71,63 +213,42 @@ pub(super) async fn open_row_id_remapping(
         }));
     }
     let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
-    // Resolve provenance here, before query coverage is rewritten. Callers may
-    // hold metadata returned by load_indices and cannot supply this distinction.
-    let stored = super::load_all_indices(dataset).await?;
-    let source = stored
-        .iter()
-        .find(|entry| entry.uuid == index.uuid)
-        .ok_or_else(|| {
-            Error::not_supported(format!(
-                "FRI remapping requires committed segment metadata for {}",
-                index.uuid
-            ))
-        })?;
-    if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
-        let identity =
-            CompactFragReuseIndex::try_new(fri.uuid, FragReuseIndexDetails { versions: vec![] })?;
-        return Ok(Some((
-            fri.uuid,
-            ResolvedRemapping::Legacy(Arc::new(CompactFragReuseIndexHandle(Arc::new(identity)))),
-        )));
-    }
-    let coverage = indices
-        .iter()
-        .find(|entry| entry.uuid == index.uuid)
-        .and_then(|entry| entry.fragment_bitmap.clone())
-        .ok_or_else(|| {
-            Error::not_supported(format!(
-                "FRI query coverage is unavailable for segment {}",
-                index.uuid
-            ))
-        })?
-        & dataset.fragment_bitmap.as_ref();
-    // Other selected segments own their direct coverage. Drop paths entering
-    // those fragments before later mappings can merge them with our contribution.
-    let selected: HashSet<_> = indices
-        .iter()
-        .filter(|entry| entry.name == index.name)
-        .map(|entry| entry.uuid)
-        .collect();
-    let mut excluded_fragments = RoaringBitmap::new();
-    for sibling in stored.iter().filter(|entry| selected.contains(&entry.uuid)) {
-        if let Some(bitmap) = &sibling.fragment_bitmap {
-            excluded_fragments |= bitmap;
+    let plan = fri_query_plan(dataset, fri, &indices, &mapping).await?;
+    match plan.segments.get(&index.uuid) {
+        None => Err(Error::not_supported(format!(
+            "FRI remapping requires committed segment metadata for {}",
+            index.uuid
+        ))),
+        Some(SegmentRemappingPlan::Identity) => {
+            let identity = CompactFragReuseIndex::try_new(
+                fri.uuid,
+                FragReuseIndexDetails { versions: vec![] },
+            )?;
+            Ok(Some((
+                fri.uuid,
+                ResolvedRemapping::Legacy(Arc::new(CompactFragReuseIndexHandle(Arc::new(
+                    identity,
+                )))),
+            )))
         }
+        Some(SegmentRemappingPlan::MissingCoverage) => Err(Error::not_supported(format!(
+            "FRI query coverage is unavailable for segment {}",
+            index.uuid
+        ))),
+        Some(SegmentRemappingPlan::Translate {
+            coverage,
+            excluded_fragments,
+        }) => Ok(Some((
+            fri.uuid,
+            ResolvedRemapping::Batch(Arc::new(
+                super::frag_reuse_remapping::QueryRowIdRemapper::new(
+                    mapping,
+                    coverage.clone(),
+                    excluded_fragments.clone(),
+                ),
+            )),
+        ))),
     }
-    if let Some(bitmap) = &source.fragment_bitmap {
-        excluded_fragments -= bitmap;
-    }
-    Ok(Some((
-        fri.uuid,
-        ResolvedRemapping::Batch(Arc::new(
-            super::frag_reuse_remapping::QueryRowIdRemapper::new(
-                mapping,
-                coverage,
-                excluded_fragments,
-            ),
-        )),
-    )))
 }
 
 /// Load fragment reuse index details from index metadata
