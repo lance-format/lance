@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use std::{
     any::Any,
     collections::HashMap,
@@ -100,6 +101,20 @@ impl LabelListIndex {
         let values_index =
             BitmapIndex::load(store.clone(), frag_reuse_index.clone(), index_cache).await?;
         let list_nulls = read_list_nulls(store, frag_reuse_index).await?;
+        Ok(Arc::new(Self::new(values_index, Arc::new(list_nulls))))
+    }
+
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        let values_index =
+            BitmapIndex::load_with_remapping(store.clone(), remapping.clone(), index_cache).await?;
+        let list_nulls = read_list_nulls_with_remapping(store, remapping).await?;
         Ok(Arc::new(Self::new(values_index, Arc::new(list_nulls))))
     }
 }
@@ -462,6 +477,29 @@ async fn read_list_nulls(
     Ok(RowAddrTreeMap::default())
 }
 
+async fn read_list_nulls_with_remapping(
+    store: Arc<dyn IndexStore>,
+    remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+) -> Result<RowAddrTreeMap> {
+    let reader = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+    if let Some(buffer_idx_str) = reader.schema().metadata.get(LABEL_LIST_NULLS_METADATA_KEY) {
+        let buffer_idx = buffer_idx_str.parse::<u32>().map_err(|err| {
+            Error::internal(format!(
+                "LabelList metadata key {} had invalid global buffer index {}: {}",
+                LABEL_LIST_NULLS_METADATA_KEY, buffer_idx_str, err
+            ))
+        })?;
+        let bytes = reader.read_global_buffer(buffer_idx).await?;
+        let null_map = RowAddrTreeMap::deserialize_from(bytes.as_ref())?;
+        return if let Some(remapper) = remapping {
+            remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await
+        } else {
+            Ok(null_map)
+        };
+    }
+    Ok(RowAddrTreeMap::default())
+}
+
 fn serialize_list_nulls(null_map: &RowAddrTreeMap) -> Result<Bytes> {
     let mut bytes = Vec::new();
     null_map.serialize_into(&mut bytes)?;
@@ -810,6 +848,20 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             LabelListIndex::load(index_store, frag_reuse_index, cache).await?
                 as Arc<dyn ScalarIndex>,
         )
+    }
+
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(LabelListIndex::load_with_remapping(index_store, remapping, cache).await?)
     }
 
     async fn get_from_cache(

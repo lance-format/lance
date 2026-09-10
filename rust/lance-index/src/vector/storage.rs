@@ -14,6 +14,7 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::FileReader;
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_preserving_layout_async};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::IoStats;
 use lance_linalg::distance::DistanceType;
@@ -551,7 +552,11 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     metadata: Q::Metadata,
 
     ivf: IvfModel,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Asynchronous batch remapper (tagged histories).
+    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
 }
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
@@ -623,6 +628,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             metadata,
             ivf,
             frag_reuse_index,
+            batch_remapper: None,
         })
     }
 
@@ -654,7 +660,19 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             metadata,
             ivf,
             frag_reuse_index,
+            batch_remapper: None,
         }
+    }
+
+    /// Set the batch row-ID remapper used when decoding each partition.
+    ///
+    /// Only tagged fragment-reuse histories use this; the legacy remapper is
+    /// supplied through the constructors instead.
+    pub fn with_row_id_remapping(mut self, remapping: Arc<dyn BatchRowIdRemapper>) -> Self {
+        self.frag_reuse_index = None;
+        self.batch_remapper = Some(remapping);
+        debug_assert!(self.frag_reuse_index.is_none() || self.batch_remapper.is_none());
+        self
     }
 
     pub fn reader(&self) -> &FileReader {
@@ -730,6 +748,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let schema = Arc::new(self.reader.schema().as_ref().into());
             concat_batches(&schema, batches.iter())?
         };
+        if let Some(remapping) = &self.batch_remapper {
+            // Tagged asynchronous path.
+            lance_index_core::remapping::check_batch_remapping_entry()?;
+            let row_id_idx = batch.schema().index_of(ROW_ID)?;
+            let (batch, remapper) =
+                remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
+                    .await?;
+            return Q::Storage::try_from_batch_with_remapper(
+                batch,
+                self.metadata(),
+                self.distance_type,
+                Some(remapper),
+            );
+        }
+        // Legacy synchronous remapping path.
         Q::Storage::try_from_batch_with_remapper(
             batch,
             self.metadata(),
@@ -754,6 +787,27 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     {
         let metadata = self.metadata.clone();
         let distance_type = self.distance_type;
+        if let Some(remapping) = &self.batch_remapper {
+            // Tagged asynchronous path.
+            lance_index_core::remapping::check_batch_remapping_entry()?;
+            let batch =
+                spawn_prewarm_materialization(move || compact_prewarm_batches(batches)).await?;
+            let row_id_idx = batch.schema().index_of(ROW_ID)?;
+            // Row-map IO must finish outside the CPU-only materialization pool.
+            let (batch, remapper) =
+                remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
+                    .await?;
+            return spawn_prewarm_materialization(move || {
+                Q::Storage::try_from_batch_with_remapper(
+                    batch,
+                    &metadata,
+                    distance_type,
+                    Some(remapper),
+                )
+            })
+            .await;
+        }
+        // Legacy synchronous remapping path.
         let frag_reuse_index = self.frag_reuse_index.clone();
         spawn_prewarm_materialization(move || {
             let batch = compact_prewarm_batches(batches)?;
