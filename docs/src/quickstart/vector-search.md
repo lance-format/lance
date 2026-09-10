@@ -311,9 +311,11 @@ The refinement column does not need an index. The final `_distance` and
 together and set a positive `refine_factor`; omitting them preserves ordinary
 same-column refinement. Batched queries must have matching query counts.
 
-For a quantized coarse index, candidates are selected using its approximate
-distances. Cross-column refinement replaces the ordinary exact refinement step;
-it does not first rerank candidates using the coarse column's original values.
+For a fully indexed coarse search, quantized candidates are selected using the
+index's approximate distances. Cross-column refinement replaces the ordinary
+same-column exact refinement step. If appended or updated coarse vectors must be
+merged with index results, Lance's existing merge path may read and rescore coarse
+vectors before selecting the final coarse TopM.
 With `use_index=False`, Lance selects exact coarse TopM before refinement, which
 is still different from a full scan in the final vector space.
 

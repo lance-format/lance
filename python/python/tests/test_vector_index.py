@@ -307,15 +307,25 @@ def test_cross_column_refinement(
         ("IVF_HNSW_SQ", {"max_level": 2, "m": 4, "ef_construction": 16}),
     ],
 )
+@pytest.mark.parametrize("index_mode", ["complete", "appended", "updated"])
 def test_cross_column_candidate_budget_and_range(
-    cross_column_dataset, index_type, kwargs
+    cross_column_dataset, index_type, kwargs, index_mode
 ):
     path, table, coarse, original = cross_column_dataset
-    ds = lance.write_dataset(table, path, max_rows_per_file=128)
+    initial = 256 if index_mode == "appended" else len(table)
+    ds = lance.write_dataset(table.slice(0, initial), path, max_rows_per_file=128)
     ds.create_index("coarse", index_type, metric="l2", num_partitions=4, **kwargs)
-    query_id = 33
+    query_id = 260 if index_mode == "appended" else 33
+    if index_mode == "appended":
+        ds = lance.write_dataset(table.slice(initial), path, mode="append")
+    elif index_mode == "updated":
+        ds.update({"coarse": str(coarse[query_id].tolist())}, where="id = 319")
     common = dict(column="coarse", q=coarse[query_id], metric="l2", nprobes=4)
     candidates = ds.to_table(columns=["id"], nearest={**common, "k": 20})
+    if index_mode == "appended":
+        assert query_id in candidates["id"].to_pylist()
+    elif index_mode == "updated":
+        assert 319 in candidates["id"].to_pylist()
     if index_type == "IVF_FLAT":
         legacy = ds.to_table(
             columns=["id"], nearest={**common, "k": 10, "refine_factor": 2}
