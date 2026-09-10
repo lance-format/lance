@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::utils::to_rust_map;
+use crate::utils::{extract_file_writer_options, to_rust_map};
 use crate::{
     JNIEnvExt, block_on,
     error::{Error, Result},
@@ -21,11 +21,7 @@ use jni::{
     sys::jlong,
 };
 use lance::io::ObjectStore;
-use lance_file::{
-    version::LanceFileVersion,
-    versions as file_versions,
-    writer::{FileWriter, FileWriterOptions},
-};
+use lance_file::{version::LanceFileVersion, versions as file_versions, writer::FileWriter};
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 
 pub const NATIVE_WRITER: &str = "nativeFileWriterHandle";
@@ -70,6 +66,7 @@ pub extern "system" fn Java_org_lance_file_LanceFileWriter_openNative<'local>(
     file_uri: JString,
     data_storage_version: JObject, // Optional<String>
     storage_options_obj: JObject,  // Map<String, String>
+    file_write_options: JObject,   // FileWriteOptions
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -77,7 +74,8 @@ pub extern "system" fn Java_org_lance_file_LanceFileWriter_openNative<'local>(
             &mut env,
             file_uri,
             data_storage_version,
-            storage_options_obj
+            storage_options_obj,
+            file_write_options
         )
     )
 }
@@ -87,11 +85,14 @@ fn inner_open<'local>(
     file_uri: JString,
     data_storage_version: JObject,
     storage_options_obj: JObject,
+    file_write_options: JObject,
 ) -> Result<JObject<'local>> {
     let file_uri_str: String = env.get_string(&file_uri)?.into();
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let data_storage_version_opt = env.get_string_opt(&data_storage_version)?;
     let storage_options = to_rust_map(env, &jmap)?;
+    let file_writer_options =
+        extract_file_writer_options(env, &file_write_options)?.unwrap_or_default();
 
     let writer = block_on(async move {
         let object_params = ObjectStoreParams {
@@ -114,7 +115,7 @@ fn inner_open<'local>(
             .transpose()?
             .unwrap_or_default()
             .resolve();
-        file_versions::create_lazy_writer(version, obj_writer, FileWriterOptions::default())
+        file_versions::create_lazy_writer(version, obj_writer, file_writer_options)
     })?;
 
     let writer = BlockingFileWriter::create(writer);

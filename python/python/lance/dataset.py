@@ -7808,6 +7808,8 @@ def write_dataset(
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = 90 * 1024 * 1024 * 1024,
+    data_cache_bytes: Optional[int] = None,
+    max_page_bytes: Optional[int] = None,
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
@@ -7861,6 +7863,13 @@ def write_dataset(
         means larger groups may cause this to be overshot meaningfully. This
         defaults to 90 GB, since we have a hard limit of 100 GB per file on
         object stores.
+    data_cache_bytes : int, optional
+        Total bytes to buffer for column data before writing pages. The budget
+        is divided evenly across top-level columns. If not set, the current
+        file writer uses 8 MiB per column. Ignored for legacy V1 files.
+    max_page_bytes : int, optional
+        Best-effort maximum page size in bytes. If not set, the current file
+        writer uses its configured default. Ignored for legacy V1 files.
     commit_lock : CommitLock, optional
         A custom commit lock.  Only needed if your object store does not support
         atomic commits.  See the user guide for more details.
@@ -8075,6 +8084,8 @@ def write_dataset(
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
         "max_bytes_per_file": max_bytes_per_file,
+        "data_cache_bytes": data_cache_bytes,
+        "max_page_bytes": max_page_bytes,
         "progress": progress,
         "storage_options": storage_options,
         "data_storage_version": data_storage_version,

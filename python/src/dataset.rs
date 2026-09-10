@@ -71,6 +71,7 @@ use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
+use lance_file::writer::FileWriterOptions;
 use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
@@ -4772,6 +4773,15 @@ pub fn get_write_params(
         }
         if let Some(maybe_nbytes) = get_dict_opt::<usize>(options, "max_bytes_per_file")? {
             p.max_bytes_per_file = maybe_nbytes;
+        }
+        let data_cache_bytes = get_dict_opt::<u64>(options, "data_cache_bytes")?;
+        let max_page_bytes = get_dict_opt::<u64>(options, "max_page_bytes")?;
+        if data_cache_bytes.is_some() || max_page_bytes.is_some() {
+            p.file_writer_options = Some(FileWriterOptions {
+                data_cache_bytes,
+                max_page_bytes,
+                ..Default::default()
+            });
         }
         if let Some(data_storage_version) = get_dict_opt::<String>(options, "data_storage_version")?
         {

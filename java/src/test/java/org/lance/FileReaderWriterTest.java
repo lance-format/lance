@@ -15,6 +15,7 @@ package org.lance;
 
 import org.lance.file.BlobReadMode;
 import org.lance.file.FileReadOptions;
+import org.lance.file.FileWriteOptions;
 import org.lance.file.LanceFileReader;
 import org.lance.file.LanceFileWriter;
 import org.lance.util.Range;
@@ -42,6 +43,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -207,6 +209,26 @@ public class FileReaderWriterTest {
   void testBasicWrite(@TempDir Path tempDir) throws Exception {
     String filePath = tempDir.resolve("basic_write.lance").toString();
     createSimpleFile(filePath);
+  }
+
+  @Test
+  void testWriteWithPageOptions(@TempDir Path tempDir) throws Exception {
+    String filePath = tempDir.resolve("page_options.lance").toString();
+    FileWriteOptions options =
+        FileWriteOptions.builder().dataCacheBytes(1024).maxPageBytes(2048).build();
+
+    try (BufferAllocator allocator = new RootAllocator();
+        LanceFileWriter writer =
+            LanceFileWriter.open(
+                filePath, allocator, null, Optional.empty(), Collections.emptyMap(), options);
+        VectorSchemaRoot batch = createBatch(allocator)) {
+      writer.write(batch);
+    }
+
+    try (BufferAllocator allocator = new RootAllocator();
+        LanceFileReader reader = LanceFileReader.open(filePath, allocator)) {
+      assertEquals(100, reader.numRows());
+    }
   }
 
   @Test

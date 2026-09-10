@@ -691,6 +691,13 @@ pub struct WriteParams {
     /// When a pack file reaches this size, a new one is started.
     /// If not set, defaults to 1 GiB.
     pub blob_pack_file_size_threshold: Option<usize>,
+
+    /// File writer options to use when writing data files.
+    ///
+    /// Options set here apply to current-format data files. They have no effect
+    /// when writing legacy V1 files. If not set, the file writer uses its
+    /// configured defaults.
+    pub file_writer_options: Option<FileWriterOptions>,
 }
 
 impl Default for WriteParams {
@@ -721,6 +728,7 @@ impl Default for WriteParams {
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
+            file_writer_options: None,
         }
     }
 }
@@ -938,6 +946,7 @@ where
 
     // Keep a copy so failure paths can clean up files written to target bases.
     let cleanup_bases = target_bases_info.clone();
+    let file_writer_options = params.file_writer_options.clone().unwrap_or_default();
     let writer_generator = WriterGenerator::new(
         object_store.clone(),
         base_dir,
@@ -950,6 +959,7 @@ where
         source_store_registry,
         source_store_params,
         params.blob_pack_file_size_threshold,
+        file_writer_options,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -2022,6 +2032,7 @@ pub(crate) struct WriterOptions {
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
+    file_writer_options: FileWriterOptions,
 }
 
 impl WriterOptions {
@@ -2079,17 +2090,25 @@ where
         Schema,
         String,
         Option<u32>,
+        FileWriterOptions,
     ) -> Result<(current_writer::FileWriter, DataFile)>,
 {
     let WriterOptions {
         add_data_dir,
         base_id,
+        file_writer_options,
         ..
     } = options;
     let (_data_file_key, filename, _data_dir, full_path) =
         prepare_data_file_path(base_dir, add_data_dir);
     let writer = object_store.create(&full_path).await?;
-    let (file_writer, data_file) = create_file_writer(writer, schema.clone(), filename, base_id)?;
+    let (file_writer, data_file) = create_file_writer(
+        writer,
+        schema.clone(),
+        filename,
+        base_id,
+        file_writer_options,
+    )?;
     Ok(Box::new(V2WriterAdapter {
         writer: file_writer,
         data_file: Some(data_file),
@@ -2110,6 +2129,7 @@ where
         Schema,
         String,
         Option<u32>,
+        FileWriterOptions,
     ) -> Result<(current_writer::FileWriter, DataFile)>,
 {
     let WriterOptions {
@@ -2121,11 +2141,18 @@ where
         source_store_registry,
         source_store_params,
         blob_pack_file_size_threshold,
+        file_writer_options,
     } = options;
     let (data_file_key, filename, data_dir, full_path) =
         prepare_data_file_path(base_dir, add_data_dir);
     let writer = object_store.create(&full_path).await?;
-    let (file_writer, data_file) = create_file_writer(writer, schema.clone(), filename, base_id)?;
+    let (file_writer, data_file) = create_file_writer(
+        writer,
+        schema.clone(),
+        filename,
+        base_id,
+        file_writer_options,
+    )?;
     let preprocessor = BlobPreprocessor::new(
         object_store.clone(),
         data_dir,
@@ -2194,6 +2221,7 @@ struct WriterGenerator<OpenWriter> {
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
+    file_writer_options: FileWriterOptions,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
@@ -2216,6 +2244,7 @@ where
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
         blob_pack_file_size_threshold: Option<usize>,
+        file_writer_options: FileWriterOptions,
     ) -> Self {
         Self {
             object_store,
@@ -2229,6 +2258,7 @@ where
             source_store_registry,
             source_store_params,
             blob_pack_file_size_threshold,
+            file_writer_options,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -2264,6 +2294,7 @@ where
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
+                    file_writer_options: self.file_writer_options.clone(),
                 },
             )
             .await?
@@ -2281,6 +2312,7 @@ where
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
+                    file_writer_options: self.file_writer_options.clone(),
                 },
             )
             .await?
@@ -2352,13 +2384,10 @@ mod tests {
         options: WriterOptions,
     ) -> Result<Box<dyn GenericWriter>> {
         open_current_writer(
-            |object_writer, schema, filename, base_id| {
-                let writer = lance_file::versions::v2_1::create_writer(
-                    object_writer,
-                    schema,
-                    lance_file::writer::FileWriterOptions::default(),
-                )?
-                .into();
+            |object_writer, schema, filename, base_id, options| {
+                let writer =
+                    lance_file::versions::v2_1::create_writer(object_writer, schema, options)?
+                        .into();
                 let mut data_file = DataFile::new_unstarted(filename, ConcreteFileVersion::V2_1);
                 data_file.base_id = base_id;
                 Ok((writer, data_file))
@@ -3214,6 +3243,7 @@ mod tests {
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
             None,
+            FileWriterOptions::default(),
         );
 
         // Create a writer
@@ -3332,6 +3362,7 @@ mod tests {
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
             None,
+            FileWriterOptions::default(),
         );
 
         // Create test batch
