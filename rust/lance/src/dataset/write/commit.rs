@@ -11,6 +11,7 @@ use lance_select::RowAddrTreeMap;
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
+    transaction::Precondition,
 };
 
 use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
@@ -54,6 +55,8 @@ pub struct CommitBuilder<'a> {
     timeout: Option<Duration>,
     /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
     migration_next_row_id: Option<u64>,
+    /// Cells (fields × rows) that must be unchanged for this commit to land.
+    preconditions: Vec<Precondition>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -78,6 +81,7 @@ impl<'a> CommitBuilder<'a> {
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
             migration_next_row_id: None,
+            preconditions: Vec::new(),
         }
     }
 
@@ -274,6 +278,31 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Require the given cells (fields × rows) to be unchanged when this
+    /// transaction commits.
+    ///
+    /// A staged value computed from other columns is only correct if those
+    /// columns did not change between the read version and publication. When a
+    /// concurrent transaction modified any protected cell, this commit is
+    /// rejected with [`Error::PrerequisiteFailed`] instead of rebased, so the
+    /// caller can recompute and retry. Physical row addresses: if a concurrent
+    /// rewrite relocates the rows, the precondition is reported as violated.
+    ///
+    /// The precondition is carried on the transaction itself, so a lost
+    /// successful response is still recovered correctly: the retried commit
+    /// re-checks the same declared dependencies rather than publishing twice.
+    pub fn with_cells_unchanged(
+        mut self,
+        field_ids: impl IntoIterator<Item = i32>,
+        rows: RowAddrTreeMap,
+    ) -> Self {
+        self.preconditions.push(Precondition {
+            field_ids: field_ids.into_iter().collect(),
+            rows,
+        });
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let timeout = self.timeout;
         if let Some(t) = timeout
@@ -300,7 +329,24 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
-    async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+    async fn execute_inner(self, mut transaction: Transaction) -> Result<Dataset> {
+        if !self.preconditions.is_empty() {
+            if self.detached {
+                return Err(Error::invalid_input_source(
+                    "commit preconditions cannot be enforced on a detached commit".into(),
+                ));
+            }
+            if matches!(transaction.operation, Operation::Overwrite { .. }) {
+                // Overwrite replaces the entire dataset, so cell-level protection
+                // is meaningless. Its read_version is 0, so the pinned baseline
+                // the preconditions are evaluated against would not even be the
+                // state the values were computed from.
+                return Err(Error::invalid_input_source(
+                    "commit preconditions are incompatible with Overwrite".into(),
+                ));
+            }
+            transaction.preconditions = self.preconditions.clone();
+        }
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -587,6 +633,7 @@ impl<'a> CommitBuilder<'a> {
             },
             read_version,
             tag: None,
+            preconditions: Vec::new(),
             transaction_properties: None,
         };
         let dataset = self.execute(merged.clone()).await?;
@@ -657,6 +704,7 @@ mod tests {
             read_version,
             tag: None,
             transaction_properties: None,
+            preconditions: Vec::new(),
         }
     }
 
@@ -1129,6 +1177,7 @@ mod tests {
             read_version: 1,
             tag: None,
             transaction_properties: None,
+            preconditions: Vec::new(),
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])
@@ -1231,6 +1280,201 @@ mod tests {
             io_stats.read_iops < 10,
             "read_iops = {}; a full listing was likely used",
             io_stats.read_iops
+        );
+    }
+    #[test]
+    fn test_cells_unchanged_precondition_round_trips_through_proto() {
+        use lance_table::transaction::Precondition as TablePrecondition;
+
+        // The precondition must survive the transaction's proto round trip: the
+        // lost-response recovery in verify_commit_outcome compares
+        // committed_transaction == transaction byte-wise, and the read-back copy
+        // is deserialized from disk.
+        let mut rows = roaring::RoaringTreemap::new();
+        rows.insert(1_u64);
+        rows.insert(3_u64);
+        let protected = lance_select::RowAddrTreeMap::from(rows); // all in fragment 0
+
+        let mut transaction = sample_transaction(1);
+        transaction.preconditions = vec![TablePrecondition {
+            field_ids: vec![3, 4],
+            rows: protected,
+        }];
+
+        let pb: lance_table::format::pb::Transaction =
+            lance_table::format::pb::Transaction::from(&transaction);
+        let round_tripped = lance_table::transaction::Transaction::try_from(pb.clone()).unwrap();
+
+        assert_eq!(round_tripped, transaction);
+        assert_eq!(round_tripped.preconditions.len(), 1);
+        assert_eq!(round_tripped.preconditions[0].field_ids, vec![3, 4]);
+        let rows_back = round_tripped.preconditions[0]
+            .rows
+            .get_fragment_bitmap(0)
+            .unwrap();
+        assert_eq!(rows_back.len(), 2);
+        assert_eq!(pb.preconditions[0].field_ids, vec![3, 4]);
+    }
+
+    #[test]
+    fn test_is_precondition_violated_detects_data_file_rewrite() {
+        use lance_select::RowAddrTreeMap;
+        use roaring::RoaringTreemap;
+
+        let mut rows = RoaringTreemap::new();
+        rows.insert(1_u64);
+        rows.insert(2_u64);
+        let protected = RowAddrTreeMap::from(rows);
+
+        let precondition = lance_table::transaction::Precondition {
+            field_ids: vec![0],
+            rows: protected,
+        };
+
+        let before_frag = sample_fragment();
+        let mut after_frag = sample_fragment();
+        after_frag.files[0].path = "rewritten.lance".to_string();
+
+        let mut before = HashMap::new();
+        before.insert(0_u64, &before_frag);
+        let mut after = HashMap::new();
+        after.insert(0_u64, &after_frag);
+
+        // A rewrite replaced the data files: protected cells are gone.
+        assert!(
+            crate::io::commit::is_precondition_violated(&precondition, &before, &after).unwrap()
+        );
+
+        // Same files: no violation.
+        let mut same_after = HashMap::new();
+        same_after.insert(0_u64, &before_frag);
+        assert!(
+            !crate::io::commit::is_precondition_violated(&precondition, &before, &same_after)
+                .unwrap()
+        );
+
+        // Fragment removed: the protected rows no longer exist.
+        let removed = HashMap::new();
+        assert!(
+            crate::io::commit::is_precondition_violated(&precondition, &before, &removed).unwrap()
+        );
+    }
+
+    use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use roaring::{RoaringBitmap, RoaringTreemap};
+
+    fn sample_overlay(
+        field_ids: &[i32],
+        covered: &[u32],
+        committed_version: u64,
+    ) -> DataOverlayFile {
+        let (major_version, minor_version) =
+            LanceFileVersion::Stable.resolve().to_data_file_numbers();
+        DataOverlayFile {
+            data_file: DataFile {
+                path: "overlay.lance".to_string(),
+                fields: Arc::from(field_ids),
+                column_indices: Arc::from(vec![0; field_ids.len()]),
+                file_major_version: major_version,
+                file_minor_version: minor_version,
+                file_size_bytes: CachedFileSize::new(100),
+                base_id: None,
+            },
+            coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter(
+                covered.iter().copied(),
+            ))),
+            committed_version,
+        }
+    }
+
+    fn fragment_map(frag: &Fragment) -> HashMap<u64, &Fragment> {
+        HashMap::from([(0, frag)])
+    }
+
+    #[test]
+    fn test_is_precondition_violated_overlays() {
+        let mut rows = RoaringTreemap::new();
+        rows.insert(1_u64);
+        rows.insert(2);
+        let protected_rows = RowAddrTreeMap::from(rows);
+        let precondition = lance_table::transaction::Precondition {
+            field_ids: vec![0],
+            rows: protected_rows,
+        };
+
+        // An overlay that already existed at the read version and is unchanged
+        // does not violate: the values read then were the overlay's values, and
+        // they are still there.
+        let mut before_frag = sample_fragment();
+        before_frag.overlays = vec![sample_overlay(&[0], &[1, 2], 1)];
+        let unchanged_after = before_frag.clone();
+        assert!(
+            !crate::io::commit::is_precondition_violated(
+                &precondition,
+                &fragment_map(&before_frag),
+                &fragment_map(&unchanged_after),
+            )
+            .unwrap()
+        );
+
+        // A new overlay supplying a value for a protected cell violates.
+        let mut with_new_overlay = before_frag.clone();
+        with_new_overlay.overlays = vec![
+            sample_overlay(&[0], &[1, 2], 1),
+            sample_overlay(&[0], &[2], 3),
+        ];
+        assert!(
+            crate::io::commit::is_precondition_violated(
+                &precondition,
+                &fragment_map(&before_frag),
+                &fragment_map(&with_new_overlay),
+            )
+            .unwrap()
+        );
+
+        // A new overlay on a different field does not violate.
+        let mut other_field_overlay = before_frag.clone();
+        other_field_overlay.overlays = vec![
+            sample_overlay(&[0], &[1, 2], 1),
+            sample_overlay(&[7], &[2], 3),
+        ];
+        assert!(
+            !crate::io::commit::is_precondition_violated(
+                &precondition,
+                &fragment_map(&before_frag),
+                &fragment_map(&other_field_overlay),
+            )
+            .unwrap()
+        );
+
+        // A new overlay on the protected field but disjoint rows does not
+        // violate.
+        let mut disjoint_rows_overlay = before_frag.clone();
+        disjoint_rows_overlay.overlays = vec![
+            sample_overlay(&[0], &[1, 2], 1),
+            sample_overlay(&[0], &[5, 6], 3),
+        ];
+        assert!(
+            !crate::io::commit::is_precondition_violated(
+                &precondition,
+                &fragment_map(&before_frag),
+                &fragment_map(&disjoint_rows_overlay),
+            )
+            .unwrap()
+        );
+
+        // An overlay removed since the read version lets the base values it
+        // shadowed resurface: a change to those cells, checked against the
+        // pre-removal coverage.
+        let mut overlay_removed = before_frag.clone();
+        overlay_removed.overlays = vec![];
+        assert!(
+            crate::io::commit::is_precondition_violated(
+                &precondition,
+                &fragment_map(&before_frag),
+                &fragment_map(&overlay_removed),
+            )
+            .unwrap()
         );
     }
 }

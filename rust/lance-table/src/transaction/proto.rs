@@ -13,13 +13,14 @@ use crate::format::pb;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::{
-    DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
-    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
-    translate_schema_metadata_updates,
+    DataOverlayGroup, DataReplacementGroup, Operation, Precondition, RewriteGroup, RewrittenIndex,
+    Transaction, UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
+    translate_config_updates, translate_schema_metadata_updates,
 };
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_file::datatypes::Fields;
+use lance_select::RowAddrTreeMap;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -421,6 +422,16 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(Arc::new(message.transaction_properties))
             },
+            preconditions: message
+                .preconditions
+                .into_iter()
+                .map(|p| {
+                    Ok(Precondition {
+                        field_ids: p.field_ids,
+                        rows: RowAddrTreeMap::deserialize_from(p.rows.as_slice())?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 }
@@ -713,12 +724,25 @@ impl From<&Transaction> for pb::Transaction {
             .as_ref()
             .map(|arc| arc.as_ref().clone())
             .unwrap_or_default();
+        let mut preconditions = Vec::with_capacity(value.preconditions.len());
+        for precondition in &value.preconditions {
+            let mut rows = Vec::with_capacity(precondition.rows.serialized_size());
+            precondition
+                .rows
+                .serialize_into(&mut rows)
+                .expect("serialization into an in-memory buffer cannot fail");
+            preconditions.push(pb::transaction::Precondition {
+                field_ids: precondition.field_ids.clone(),
+                rows,
+            });
+        }
         Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
+            preconditions,
         }
     }
 }
