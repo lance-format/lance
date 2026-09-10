@@ -50,3 +50,34 @@ pub async fn ensure_clone_supported(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn entry(name: &str, index_version: i32) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::nil(),
+            fields: vec![],
+            covering_fields: vec![],
+            name: name.into(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
+
+    #[test]
+    fn tagged_requires_the_reserved_name_and_a_nonzero_version() {
+        assert!(!is_tagged(&entry(FRAG_REUSE_INDEX_NAME, 0)));
+        assert!(is_tagged(&entry(FRAG_REUSE_INDEX_NAME, 1)));
+        assert!(is_tagged(&entry(FRAG_REUSE_INDEX_NAME, 2)));
+        assert!(!is_tagged(&entry("user_idx", 0)));
+        assert!(!is_tagged(&entry("user_idx", 1)));
+    }
+}
