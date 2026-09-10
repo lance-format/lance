@@ -202,9 +202,8 @@ New fragment IDs must be reserved via `ReserveFragments` before executing a `Rew
 
 A rewrite that defers index remapping publishes its address mapping in the
 same commit by replacing the [Fragment Reuse Index](../index/system/frag_reuse.md)
-entry in the manifest's index section; the mapping is not part of the
-serialized transaction message. `append_fri_transitions` (below) is the
-delta form of the same record, appended in a separate commit.
+entry in the manifest's index section. `append_fri_transitions` (below)
+appends the same kind of record in a separate commit.
 
 <details>
 <summary>Rewrite protobuf message</summary>
