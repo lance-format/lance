@@ -115,10 +115,14 @@ const REASSIGN_SAMPLE_SIZE: usize = 512;
 /// margin of its own centroid's distance, so near-ties do not prune a neighbor
 /// that unsampled rows would still leave.
 const REASSIGN_MARGIN: f32 = 0.05;
-/// Logical rows a join fetches at a time from a multivector column, where a
-/// row can expand to many vectors; a single oversized row is the one working
-/// set that cannot be split further.
-const JOIN_MULTIVECTOR_ROWS_PER_FETCH: usize = 64;
+/// Decoded bytes of raw vectors a join holds at a time: rows are fetched and
+/// regrouped until a batch reaches this size, so the working set does not
+/// depend on how many vectors the rows hold. A single row larger than this is
+/// the one batch that cannot be split further.
+const JOIN_FETCH_BYTES: usize = 32 * 1024 * 1024;
+/// Single-row fetches in flight while a join reads a multivector column, whose
+/// row sizes are unknown until read.
+const JOIN_MULTIVECTOR_FETCHES_IN_FLIGHT: usize = 4;
 /// Vectors a join routes and quantizes at a time before handing them to the
 /// shuffler, whatever the fetched rows expanded to.
 const JOIN_VECTORS_PER_BATCH: usize = 1024;
@@ -2647,10 +2651,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 .shuffle(Box::new(RecordBatchStreamAdapter::new(schema, batches)))
                 .await
         };
+        // A fixed-size vector row has a known size, so a chunk is sized to the
+        // budget up front; a multivector row does not, so those are fetched one
+        // at a time and regrouped by measured size.
         let (rows_per_fetch, prefetch) = if multivector {
-            (JOIN_MULTIVECTOR_ROWS_PER_FETCH, 1)
+            (1, JOIN_MULTIVECTOR_FETCHES_IN_FLIGHT)
         } else {
-            (self.store.block_size(), 2)
+            let row_bytes = ivf.dimension() * vector_field_element_width(&vector_field);
+            (
+                (JOIN_FETCH_BYTES / row_bytes.max(1)).clamp(1, self.store.block_size()),
+                2,
+            )
         };
         let route = async move {
             for (&part_idx, row_ids) in partitions.iter().zip(rows_per_partition) {
@@ -2663,7 +2674,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let partition_window =
                     self.select_reassign_candidates(ivf, part_idx, &c0, removed)?;
                 let mut overflowed = 0usize;
-                let mut chunks = Self::take_vectors_stream(
+                let fetched = Self::take_vectors_stream(
                     dataset,
                     &self.column,
                     row_ids,
@@ -2671,6 +2682,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     prefetch,
                 )
                 .await?;
+                let mut chunks = Box::pin(regroup_by_bytes(fetched, JOIN_FETCH_BYTES));
                 while let Some(chunk) = chunks.try_next().await? {
                     let (row_ids, vectors) = self.flatten_raw_vectors(&chunk)?;
                     for start in (0..row_ids.len()).step_by(JOIN_VECTORS_PER_BATCH) {
@@ -3080,6 +3092,44 @@ where
     })?
     .ok_or_else(|| Error::internal("a joined partition has no neighbor to receive its rows"))?;
     Ok((target, false))
+}
+
+/// Regroup `batches` so that each yielded batch holds up to `budget` bytes of
+/// decoded rows; a single batch larger than that passes through alone. This
+/// bounds the working set of a consumer that expands every row it holds.
+fn regroup_by_bytes<S>(batches: S, budget: usize) -> impl Stream<Item = Result<RecordBatch>>
+where
+    S: Stream<Item = Result<RecordBatch>> + Unpin,
+{
+    stream::try_unfold(
+        (batches, Vec::<RecordBatch>::new(), 0usize),
+        move |(mut batches, mut pending, mut pending_bytes)| async move {
+            loop {
+                let Some(batch) = batches.try_next().await? else {
+                    if pending.is_empty() {
+                        return Ok(None);
+                    }
+                    let grouped = arrow::compute::concat_batches(&pending[0].schema(), &pending)?;
+                    return Ok(Some((grouped, (batches, Vec::new(), 0))));
+                };
+                let bytes = batch.get_array_memory_size();
+                if !pending.is_empty() && pending_bytes + bytes > budget {
+                    let grouped = arrow::compute::concat_batches(&pending[0].schema(), &pending)?;
+                    return Ok(Some((grouped, (batches, vec![batch], bytes))));
+                }
+                pending.push(batch);
+                pending_bytes += bytes;
+            }
+        },
+    )
+}
+
+/// Bytes of one element of a fixed-size vector field.
+fn vector_field_element_width(field: &Field) -> usize {
+    match field.data_type() {
+        DataType::FixedSizeList(item, _) => item.data_type().primitive_width().unwrap_or(4),
+        _ => 4,
+    }
 }
 
 /// The `REASSIGN_RANGE` nearest surviving partitions to `vector` itself, for a
@@ -4227,6 +4277,42 @@ mod tests {
             sizes.iter().all(|&rows| rows <= 400),
             "a join destination exceeds the split threshold: {sizes:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn regroup_by_bytes_bounds_each_batch_to_the_budget() {
+        let one_row = |value: f32| {
+            let vectors =
+                FixedSizeListArray::try_new_from_values(Float32Array::from(vec![value; 4]), 4)
+                    .unwrap();
+            let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+                "vec",
+                vectors.data_type().clone(),
+                false,
+            )]));
+            RecordBatch::try_new(schema, vec![Arc::new(vectors)]).unwrap()
+        };
+        let rows: Vec<RecordBatch> = (0..5).map(|i| one_row(i as f32)).collect();
+        let row_bytes = rows[0].get_array_memory_size();
+        // Two rows fit the budget, a third would not.
+        let grouped: Vec<RecordBatch> = regroup_by_bytes(
+            stream::iter(rows.clone().into_iter().map(Ok)),
+            2 * row_bytes,
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        assert_eq!(
+            grouped.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+        // A single row over the budget still comes through, on its own.
+        let grouped: Vec<RecordBatch> =
+            regroup_by_bytes(stream::iter(rows.into_iter().map(Ok)), row_bytes / 2)
+                .try_collect()
+                .await
+                .unwrap();
+        assert_eq!(grouped.len(), 5);
     }
 
     #[test]
