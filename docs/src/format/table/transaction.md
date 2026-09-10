@@ -200,6 +200,12 @@ This includes operations such as compaction, defragmentation, and re-ordering.
 Rewrite operations change row addresses, requiring index updates.
 New fragment IDs must be reserved via `ReserveFragments` before executing a `Rewrite` transaction.
 
+A rewrite that defers index remapping publishes its address mapping in the
+same commit by replacing the [Fragment Reuse Index](../index/system/frag_reuse.md)
+entry in the manifest's index section; the mapping is not part of the
+serialized transaction message. `append_fri_transitions` (below) is the
+delta form of the same record, appended in a separate commit.
+
 <details>
 <summary>Rewrite protobuf message</summary>
 
