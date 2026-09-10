@@ -728,6 +728,7 @@ impl ShardManifestStore {
 mod tests {
     use super::*;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+    use rstest::rstest;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -968,6 +969,98 @@ mod tests {
         }
 
         assert_eq!(batch_sizes, vec![2, 4, 8, 16, 32, 64, 64]);
+    }
+
+    /// Requests a cold scan issued, as seen by the counting policy in the test
+    /// below.
+    #[derive(Debug, Default)]
+    struct ScanRequestTally {
+        /// GETs of `version_hint.json`.
+        version_hint_reads: usize,
+        /// Requests for manifest version files: the HEAD confirming the hinted
+        /// version, the speculative successor HEADs, and the GET of the
+        /// discovered tip.
+        manifest_requests: usize,
+    }
+
+    /// Pins the request-count side of the adaptive scan: how many successor
+    /// HEADs a cold `refresh_latest` issues for each version-hint lag.
+    ///
+    /// After reading the hint and confirming it with one HEAD, the scan walks
+    /// forward in batches that double from 2 up to the cap of 64 until a whole
+    /// batch comes back empty. The growth buys fewer round trips at the price
+    /// of more speculative HEADs on a stale hint, and these counts are the
+    /// executable record of that trade-off:
+    ///
+    /// - precise hint (tip 3, hint 3): one empty batch of 2 → 2 HEADs
+    /// - one-version lag (tip 3, hint 2): 2, then an empty 4 → 6 HEADs (a
+    ///   fixed batch of 2 would issue 4)
+    /// - ten-version lag (tip 12, hint 2): 2 + 4 + 8 catch up, empty 16 → 30
+    /// - hundred-version lag (tip 102, hint 2): 2 + 4 + 8 + 16 + 32 + 64 catch
+    ///   up; the cap holds the final empty batch at 64 → 190
+    ///
+    /// The first missing version is probed twice — speculatively beside the
+    /// tip, then again leading the empty batch that ends the scan — which the
+    /// counts include.
+    #[rstest]
+    #[case::precise_hint(3, 3, 2)]
+    #[case::one_version_lag(3, 2, 6)]
+    #[case::ten_version_lag(12, 2, 30)]
+    #[case::hundred_version_lag_caps_at_64(102, 2, 190)]
+    #[tokio::test]
+    async fn cold_scan_successor_head_requests_by_hint_lag(
+        #[case] tip: u64,
+        #[case] hint: u64,
+        #[case] expected_successor_heads: usize,
+    ) {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+
+        // Setup goes through the plain store so only the cold scan is tallied.
+        let writer = ShardManifestStore::new_adaptive(store.clone(), &base_path, shard_id);
+        for version in 1..=tip {
+            writer
+                .write(&create_test_manifest(shard_id, version, 1))
+                .await
+                .unwrap();
+        }
+        writer.write_version_hint(hint).await;
+
+        let tally = Arc::new(Mutex::new(ScanRequestTally::default()));
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        let counting = tally.clone();
+        policy.lock().unwrap().set_before_policy(
+            "tally_scan_requests",
+            Arc::new(move |_method: &str, path: &Path| {
+                let mut tally = counting.lock().unwrap();
+                let filename = path.filename().unwrap_or_default();
+                if filename == "version_hint.json" {
+                    tally.version_hint_reads += 1;
+                } else if filename.ends_with(".binpb") {
+                    tally.manifest_requests += 1;
+                }
+                Ok(())
+            }),
+        );
+        let mut proxied = (*store).clone();
+        proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
+        let reader = ShardManifestStore::new_adaptive(Arc::new(proxied), &base_path, shard_id);
+
+        let latest = reader.refresh_latest().await.unwrap().unwrap();
+        assert_eq!(latest.version, tip, "the scan must still find the tip");
+
+        let tally = tally.lock().unwrap();
+        assert_eq!(
+            tally.version_hint_reads, 1,
+            "a cold scan reads the hint exactly once"
+        );
+        // Of the manifest requests, two are not successor probes: the HEAD
+        // confirming the hinted version and the GET of the discovered tip.
+        assert_eq!(
+            tally.manifest_requests,
+            expected_successor_heads + 2,
+            "successor HEADs issued after confirming hint v{hint} against tip v{tip}"
+        );
     }
 
     #[tokio::test]
