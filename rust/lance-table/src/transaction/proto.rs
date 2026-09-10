@@ -719,6 +719,9 @@ impl From<&Transaction> for pb::Transaction {
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
+            // Populated by the commit-precondition implementation; nothing
+            // produces preconditions yet.
+            preconditions: Vec::new(),
         }
     }
 }
