@@ -126,10 +126,11 @@ pub struct BitmapIndex {
 
     index_cache: WeakLanceCache,
 
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 
-    // Set only by `load_with_remapping`; mutually exclusive with
-    // `frag_reuse_index` by construction.
+    /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
 
     lazy_reader: LazyIndexReader,
@@ -404,6 +405,7 @@ impl BitmapIndex {
     ) -> Self {
         let mut index = Self::new(index_map, null_map, value_type, store, index_cache, None);
         index.batch_remapper = batch_remapper;
+        debug_assert!(index.frag_reuse_index.is_none() || index.batch_remapper.is_none());
         index
     }
 
@@ -609,8 +611,10 @@ impl BitmapIndex {
         let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
         if let Some(fri) = &self.frag_reuse_index {
+            // Legacy synchronous remapping path.
             bitmap = fri.remap_row_addrs_tree_map(&bitmap);
         } else if let Some(remapper) = &self.batch_remapper {
+            // Tagged asynchronous path.
             bitmap = remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await?;
         }
 
@@ -734,8 +738,10 @@ impl Index for BitmapIndex {
                 let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
                 if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
+                    // Legacy synchronous remapping path.
                     bitmap = frag_reuse_index_ref.remap_row_addrs_tree_map(&bitmap);
                 } else if let Some(remapper) = self.batch_remapper.as_ref() {
+                    // Tagged asynchronous path.
                     bitmap = remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await?;
                 }
 

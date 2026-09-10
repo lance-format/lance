@@ -93,9 +93,10 @@ pub struct BloomFilterIndex {
     probability: f64,
     // Exact set of null row addresses; None for older indices without this bitmap.
     null_rows: Option<RowAddrTreeMap>,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    // Set only by `load_with_remapping`; mutually exclusive with
-    // `frag_reuse_index` by construction.
+    /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
 }
 
@@ -125,6 +126,7 @@ impl BloomFilterIndex {
         lance_index_core::remapping::check_batch_remapping_entry()?;
         let mut index = Self::load(store, None, index_cache).await?.as_ref().clone();
         index.batch_remapper = remapping;
+        debug_assert!(index.frag_reuse_index.is_none() || index.batch_remapper.is_none());
         Ok(Arc::new(index))
     }
 
@@ -511,11 +513,13 @@ impl ScalarIndex for BloomFilterIndex {
         };
 
         let (selected, nulls) = if let Some(remapper) = &self.frag_reuse_index {
+            // Legacy synchronous remapping path.
             (
                 remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows()),
                 remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows()),
             )
         } else if let Some(remapper) = &self.batch_remapper {
+            // Tagged asynchronous path.
             (
                 remap_row_addrs_tree_map_async(
                     remapper.as_ref(),

@@ -1552,9 +1552,10 @@ pub struct BTreeIndex {
     /// - The local page_idx is calculated: `142 - 100 = 42`.
     /// - The system now knows to read page `42` from the file `part_2_page_file.lance`.
     ranges_to_files: Option<Arc<RangeInclusiveMap<u32, (String, u32)>>>,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    // Set only by `load_with_remapping`; mutually exclusive with
-    // `frag_reuse_index` by construction.
+    /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
 }
 
@@ -1683,9 +1684,11 @@ impl BTreeIndex {
             .read_record_batch(page_number as u64, self.batch_size)
             .await?;
         if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
+            // Legacy synchronous remapping path.
             serialized_page =
                 frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
         } else if let Some(remapper) = self.batch_remapper.as_ref() {
+            // Tagged asynchronous path.
             serialized_page =
                 remap_record_batch_async(remapper.as_ref(), serialized_page, 1).await?;
         }
@@ -1770,6 +1773,7 @@ impl BTreeIndex {
         lance_index_core::remapping::check_batch_remapping_entry()?;
         let mut index = Self::load(store, None, index_cache).await?.as_ref().clone();
         index.batch_remapper = remapping;
+        debug_assert!(index.frag_reuse_index.is_none() || index.batch_remapper.is_none());
         Ok(Arc::new(index))
     }
 
@@ -1937,8 +1941,10 @@ impl BTreeIndex {
             }
             let stream = segment.data_stream().await?;
             let stream = if let Some(frag_reuse_index) = segment.frag_reuse_index.clone() {
+                // Legacy synchronous remapping path.
                 remap_row_ids(stream, frag_reuse_index)
             } else if let Some(remapper) = segment.batch_remapper.clone() {
+                // Tagged asynchronous path.
                 remap_row_ids_batch(stream, remapper)
             } else {
                 stream

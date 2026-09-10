@@ -114,9 +114,10 @@ pub struct ZoneMapIndex {
     rows_per_zone: u64,
     use_seeds: bool,
     store: Arc<dyn IndexStore>,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     fri: Option<Arc<dyn RowIdRemapper>>,
-    // Set only by `load_with_remapping`; mutually exclusive with `fri` by
-    // construction.
+    /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
     index_cache: WeakLanceCache,
     // Exact set of null row addresses across all zones; None when loaded from an
@@ -526,6 +527,7 @@ impl ZoneMapIndex {
         let mut index = Arc::into_inner(index)
             .ok_or_else(|| Error::internal("freshly loaded zone map index must be unshared"))?;
         index.batch_remapper = remapping;
+        debug_assert!(index.fri.is_none() || index.batch_remapper.is_none());
         Ok(Arc::new(index))
     }
 
@@ -748,11 +750,13 @@ impl ScalarIndex for ZoneMapIndex {
         };
 
         let (selected, nulls) = if let Some(remapper) = &self.fri {
+            // Legacy synchronous remapping path.
             (
                 remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows()),
                 remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows()),
             )
         } else if let Some(remapper) = &self.batch_remapper {
+            // Tagged asynchronous path.
             (
                 remap_row_addrs_tree_map_async(
                     remapper.as_ref(),

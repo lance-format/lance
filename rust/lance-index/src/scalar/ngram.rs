@@ -252,9 +252,10 @@ impl NGramPostingList {
 /// Reads on-demand ngram posting lists from storage (and stores them in a cache)
 struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    // Set only by `load_with_remapping`; mutually exclusive with
-    // `frag_reuse_index` by construction.
+    /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
     index_cache: WeakLanceCache,
 }
@@ -289,8 +290,10 @@ impl NGramPostingListReader {
                     )
                     .await?;
                 if let Some(remapper) = self.batch_remapper.clone() {
+                    // Tagged asynchronous path.
                     NGramPostingList::try_from_batch_with_remapping(batch, remapper).await
                 } else {
+                    // Legacy synchronous remapping path.
                     NGramPostingList::try_from_batch(batch, self.frag_reuse_index.clone())
                 }
         }).await;
@@ -438,6 +441,10 @@ impl NGramIndex {
             batch_remapper: remapping,
             index_cache: WeakLanceCache::from(index_cache),
         });
+        debug_assert!(
+            index.list_reader.frag_reuse_index.is_none()
+                || index.list_reader.batch_remapper.is_none()
+        );
         Ok(Arc::new(index))
     }
 

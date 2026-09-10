@@ -1119,9 +1119,10 @@ pub(super) struct PartitionDocuments {
     coordinate_rank: usize,
     persisted_total_tokens: Option<u64>,
     quantized_scoring: bool,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     remapper: Option<Arc<dyn RowIdRemapper>>,
-    // Set only by `try_new_with_remapping`; mutually exclusive with `remapper`
-    // by construction.
+    /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
     lengths: Arc<OnceCell<Arc<DocLengths>>>,
     projection: Arc<OnceCell<Arc<VersionAddressProjection>>>,
@@ -1330,6 +1331,7 @@ impl PartitionDocuments {
             quantized_scoring,
         )?;
         docs.batch_remapper = remapping;
+        debug_assert!(docs.remapper.is_none() || docs.batch_remapper.is_none());
         Ok(docs)
     }
 
@@ -1524,6 +1526,7 @@ impl PartitionDocuments {
             .projection
             .get_or_try_init(|| async {
                 if let Some(remapping) = &self.batch_remapper {
+                    // Tagged asynchronous path.
                     VersionAddressProjection::try_new_with_remapping(
                         row_ids.as_ref(),
                         self.num_docs,
@@ -1532,6 +1535,7 @@ impl PartitionDocuments {
                     )
                     .await
                 } else {
+                    // Legacy synchronous remapping path.
                     Result::Ok(Arc::new(VersionAddressProjection::try_new(
                         row_ids.as_ref(),
                         self.num_docs,
@@ -1904,8 +1908,10 @@ impl PartitionDocuments {
     /// Materialize the build-side table for rewrite/update operations.
     pub(crate) async fn load_build_docset(&self) -> Result<DocSet> {
         if let Some(remapping) = &self.batch_remapper {
+            // Tagged asynchronous path.
             DocSet::load_with_remapping(self.reader().await?, false, Some(remapping.clone())).await
         } else {
+            // Legacy synchronous remapping path.
             DocSet::load(self.reader().await?, false, self.remapper.clone()).await
         }
     }
@@ -1928,6 +1934,7 @@ impl PartitionDocuments {
                         ));
                     }
                     let projection = if let Some(remapping) = &self.batch_remapper {
+                        // Tagged asynchronous path.
                         VersionAddressProjection::try_new_with_remapping(
                             row_ids.as_ref(),
                             self.num_docs,
@@ -1936,6 +1943,7 @@ impl PartitionDocuments {
                         )
                         .await?
                     } else {
+                        // Legacy synchronous remapping path.
                         Arc::new(VersionAddressProjection::try_new(
                             row_ids.as_ref(),
                             self.num_docs,

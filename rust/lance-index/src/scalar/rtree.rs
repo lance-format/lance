@@ -299,9 +299,10 @@ impl CacheKey for RTreeCacheKey {
 pub struct RTreeIndex {
     pub(crate) metadata: Arc<RTreeMetadata>,
     store: Arc<dyn IndexStore>,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    // Set only by `load_with_remapping`; mutually exclusive with
-    // `frag_reuse_index` by construction.
+    /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
     index_cache: WeakLanceCache,
     pages_reader: Arc<dyn IndexReader>,
@@ -628,8 +629,10 @@ pub async fn merge_rtree_indices(
         }
         let mut source_nulls = source.search_null(&NoOpMetricsCollector).await?;
         if let Some(remapper) = &source.frag_reuse_index {
+            // Legacy synchronous remapping path.
             source_nulls = remapper.remap_row_addrs_tree_map(&source_nulls);
         } else if let Some(remapper) = &source.batch_remapper {
+            // Tagged asynchronous path.
             source_nulls = remap_row_addrs_tree_map_async(remapper.as_ref(), &source_nulls).await?;
         }
         if let Some(filter) = filter {
@@ -639,8 +642,10 @@ pub async fn merge_rtree_indices(
 
         let mut data = source.as_ref().clone().into_data_stream().await?;
         if let Some(remapper) = source.frag_reuse_index.clone() {
+            // Legacy synchronous remapping path.
             data = remap_rtree_data(data, remapper);
         } else if let Some(remapper) = source.batch_remapper.clone() {
+            // Tagged asynchronous path.
             data = remap_rtree_data_async(data, remapper);
         }
         data_streams.push(match filter {
@@ -761,9 +766,11 @@ impl ScalarIndex for RTreeIndex {
                 let mut null_map = self.search_null(metrics).await?;
 
                 if let Some(fri) = &self.frag_reuse_index {
+                    // Legacy synchronous remapping path.
                     rowids = fri.remap_row_addrs_tree_map(&rowids);
                     null_map = fri.remap_row_addrs_tree_map(&null_map);
                 } else if let Some(remapper) = &self.batch_remapper {
+                    // Tagged asynchronous path.
                     rowids = remap_row_addrs_tree_map_async(remapper.as_ref(), &rowids).await?;
                     null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
                 }
@@ -775,8 +782,10 @@ impl ScalarIndex for RTreeIndex {
                 let mut null_map = self.search_null(metrics).await?;
 
                 if let Some(fri) = &self.frag_reuse_index {
+                    // Legacy synchronous remapping path.
                     null_map = fri.remap_row_addrs_tree_map(&null_map);
                 } else if let Some(remapper) = &self.batch_remapper {
+                    // Tagged asynchronous path.
                     null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
                 }
                 Ok(SearchResult::Exact(NullableRowAddrSet::new(

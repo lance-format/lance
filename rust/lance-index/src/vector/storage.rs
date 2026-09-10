@@ -552,9 +552,10 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     metadata: Q::Metadata,
 
     ivf: IvfModel,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    // Set only by `with_row_id_remapping`; mutually exclusive with
-    // `frag_reuse_index` by construction.
+    /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
 }
 
@@ -670,6 +671,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     pub fn with_row_id_remapping(mut self, remapping: Arc<dyn BatchRowIdRemapper>) -> Self {
         self.frag_reuse_index = None;
         self.batch_remapper = Some(remapping);
+        debug_assert!(self.frag_reuse_index.is_none() || self.batch_remapper.is_none());
         self
     }
 
@@ -747,6 +749,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             concat_batches(&schema, batches.iter())?
         };
         if let Some(remapping) = &self.batch_remapper {
+            // Tagged asynchronous path.
             lance_index_core::remapping::check_batch_remapping_entry()?;
             let row_id_idx = batch.schema().index_of(ROW_ID)?;
             let (batch, remapper) =
@@ -759,6 +762,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 Some(remapper),
             );
         }
+        // Legacy synchronous remapping path.
         Q::Storage::try_from_batch_with_remapper(
             batch,
             self.metadata(),
@@ -784,6 +788,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let metadata = self.metadata.clone();
         let distance_type = self.distance_type;
         if let Some(remapping) = &self.batch_remapper {
+            // Tagged asynchronous path.
             lance_index_core::remapping::check_batch_remapping_entry()?;
             let batch =
                 spawn_prewarm_materialization(move || compact_prewarm_batches(batches)).await?;
@@ -802,6 +807,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             })
             .await;
         }
+        // Legacy synchronous remapping path.
         let frag_reuse_index = self.frag_reuse_index.clone();
         spawn_prewarm_materialization(move || {
             let batch = compact_prewarm_batches(batches)?;
