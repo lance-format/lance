@@ -401,6 +401,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
+            Some(pb::transaction::Operation::AppendFriTransitions(_)) => {
+                return Err(Error::not_supported(
+                    "AppendFragmentReuseTransitions is not yet supported",
+                ));
+            }
             None => {
                 return Err(Error::internal(
                     "Transaction message did not contain an operation".to_string(),
@@ -810,6 +815,19 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+
+    #[test]
+    fn test_append_fri_transitions_is_not_supported() {
+        let message = pb::Transaction {
+            operation: Some(pb::transaction::Operation::AppendFriTransitions(
+                pb::transaction::AppendFragmentReuseTransitions::default(),
+            )),
+            ..Default::default()
+        };
+        let error = Transaction::try_from(message).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("AppendFragmentReuseTransitions"));
+    }
 
     #[test]
     fn test_data_overlay_operation_roundtrips() {
