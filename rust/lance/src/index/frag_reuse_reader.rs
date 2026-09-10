@@ -155,52 +155,66 @@ impl FragmentReuseIndex {
                 direct.entry(fragment).or_default().push(segment);
             }
         }
-        // None records an uncovered fragment; shared ancestors are resolved only once.
-        let mut resolved: HashMap<u32, Option<Vec<usize>>> = HashMap::new();
+        // Direct coverage takes precedence: a fragment resolves to its direct
+        // segments when present and to its producing transition otherwise. The
+        // transition resolution is shared by all of that transition's
+        // destinations; None records incomplete source coverage.
+        let mut transitions: HashMap<usize, Option<Vec<usize>>> = HashMap::new();
         let mut coverage = vec![RoaringBitmap::new(); provenance.len()];
+        let mut pending = Vec::new();
         for destination in self.live_fragments.iter() {
-            let mut pending = vec![(destination, false)];
-            while let Some((fragment, expanded)) = pending.pop() {
-                if resolved.contains_key(&fragment) {
+            let producer = match (direct.get(&destination), self.ledger.producer(destination)) {
+                (Some(segments), _) => {
+                    for &segment in segments {
+                        coverage[segment].insert(destination);
+                    }
                     continue;
                 }
-                if let Some(segments) = direct.get(&fragment) {
-                    resolved.insert(fragment, Some(segments.clone()));
+                (None, Some(producer)) => producer,
+                (None, None) => continue,
+            };
+            pending.push((producer, false));
+            while let Some((index, expanded)) = pending.pop() {
+                if transitions.contains_key(&index) {
                     continue;
                 }
-                let Some(producer) = self.ledger.producer(fragment) else {
-                    resolved.insert(fragment, None);
-                    continue;
-                };
-                let transition = &self.ledger.transitions()[producer];
+                let sources = self.ledger.transitions()[index].sources();
                 if !expanded {
-                    pending.push((fragment, true));
-                    pending.extend(
-                        transition
-                            .sources()
-                            .iter()
-                            .map(|source| (source.id as u32, false)),
-                    );
+                    pending.push((index, true));
+                    pending.extend(sources.iter().filter_map(|source| {
+                        let source = source.id as u32;
+                        (!direct.contains_key(&source))
+                            .then(|| self.ledger.producer(source))
+                            .flatten()
+                            .map(|producer| (producer, false))
+                    }));
                     continue;
                 }
                 let mut segments = Vec::new();
-                let complete = transition.sources().iter().all(|source| {
-                    if let Some(Some(contributors)) = resolved.get(&(source.id as u32)) {
-                        segments.extend_from_slice(contributors);
-                        true
-                    } else {
-                        false
+                let complete = sources.iter().all(|source| {
+                    let source = source.id as u32;
+                    let contributors = direct.get(&source).or_else(|| {
+                        self.ledger
+                            .producer(source)
+                            .and_then(|producer| transitions.get(&producer))
+                            .and_then(|resolution| resolution.as_ref())
+                    });
+                    match contributors {
+                        Some(contributors) => {
+                            segments.extend_from_slice(contributors);
+                            true
+                        }
+                        None => false,
                     }
                 });
-                if complete {
+                let resolution = complete.then(|| {
                     segments.sort_unstable();
                     segments.dedup();
-                    resolved.insert(fragment, Some(segments));
-                } else {
-                    resolved.insert(fragment, None);
-                }
+                    segments
+                });
+                transitions.insert(index, resolution);
             }
-            if let Some(Some(segments)) = resolved.get(&destination) {
+            if let Some(Some(segments)) = transitions.get(&producer) {
                 for &segment in segments {
                     coverage[segment].insert(destination);
                 }
