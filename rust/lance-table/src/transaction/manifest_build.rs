@@ -15,7 +15,7 @@ use crate::feature_flags::{
     apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
     inherit_sticky_feature_flags,
 };
-use crate::format::overlay::TOMBSTONE_FIELD_ID;
+use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
     overlay::DataOverlayFile,
@@ -1212,6 +1212,36 @@ impl Transaction {
                 for fragment in existing_fragments {
                     let mut fragment = fragment.clone();
                     if let Some(new_overlays) = overlays_by_fragment.get(&fragment.id) {
+                        if next_row_id.is_some() {
+                            let mut covered_offsets = RoaringBitmap::new();
+                            for overlay in new_overlays {
+                                match &overlay.coverage {
+                                    OverlayCoverage::Shared(bitmap) => {
+                                        covered_offsets |= bitmap.as_ref();
+                                    }
+                                    OverlayCoverage::PerField(bitmaps) => {
+                                        for bitmap in bitmaps {
+                                            covered_offsets |= bitmap.as_ref();
+                                        }
+                                    }
+                                }
+                            }
+                            if !covered_offsets.is_empty() {
+                                let covered_offsets: Vec<usize> = covered_offsets
+                                    .iter()
+                                    .map(|offset| offset as usize)
+                                    .collect();
+                                // Scans interpret missing lineage metadata as version 1,
+                                // so using 1 as the fallback preserves the observable
+                                // version of every uncovered row.
+                                crate::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                                    &mut fragment,
+                                    &covered_offsets,
+                                    new_version,
+                                    1,
+                                )?;
+                            }
+                        }
                         // Appended (not replaced) so concurrently-written overlays
                         // survive; later entries are newer.
                         fragment
@@ -1570,8 +1600,8 @@ mod tests {
     use crate::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
-        default_build_config, make_stable_row_id_manifest, overlay_with_field,
-        sample_index_metadata, sample_manifest,
+        default_build_config, last_updated_at_versions, make_stable_row_id_manifest,
+        overlay_with_field, sample_index_metadata, sample_manifest,
     };
     use crate::transaction::{DataOverlayGroup, UpdateMode, validate_operation};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -2638,6 +2668,98 @@ mod tests {
         assert_eq!(frag(2).overlays.len(), 1);
         assert_eq!(frag(2).overlays[0].committed_version, 3);
         assert!(result.version > manifest.version);
+    }
+
+    #[test]
+    fn test_data_overlay_build_manifest_updates_row_lineage() {
+        let row_ids = RowIdSequence::from([10u64, 11, 12, 13].as_slice());
+        let version_meta = RowDatasetVersionMeta::from_sequence(
+            &RowDatasetVersionSequence::from_uniform_row_count(4, 1),
+        )
+        .unwrap();
+        let fragment = Fragment {
+            id: 1,
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids).into())),
+            physical_rows: Some(4),
+            last_updated_at_version_meta: Some(version_meta.clone()),
+            created_at_version_meta: Some(version_meta),
+        };
+        // Stable-row-id migrations can leave old fragments without explicit
+        // lineage metadata; scans expose those rows as version 1.
+        let untracked_row_ids = RowIdSequence::from([20u64, 21].as_slice());
+        let untracked_fragment = Fragment {
+            id: 2,
+            files: vec![],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&untracked_row_ids).into())),
+            physical_rows: Some(2),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let manifest = make_stable_row_id_manifest(vec![fragment, untracked_fragment]);
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataOverlay {
+                groups: vec![
+                    DataOverlayGroup {
+                        fragment_id: 1,
+                        overlays: vec![
+                            DataOverlayFile {
+                                data_file: DataFile::new_legacy_from_fields(
+                                    "dense.lance",
+                                    vec![1],
+                                    None,
+                                ),
+                                coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                                committed_version: 0,
+                            },
+                            DataOverlayFile {
+                                data_file: DataFile::new_legacy_from_fields(
+                                    "sparse.lance",
+                                    vec![1, 2],
+                                    None,
+                                ),
+                                coverage: OverlayCoverage::sparse(vec![
+                                    RoaringBitmap::from_iter([2u32]),
+                                    RoaringBitmap::from_iter([3u32]),
+                                ]),
+                                committed_version: 0,
+                            },
+                        ],
+                    },
+                    DataOverlayGroup {
+                        fragment_id: 2,
+                        overlays: vec![DataOverlayFile {
+                            data_file: DataFile::new_legacy_from_fields(
+                                "migrated.lance",
+                                vec![1],
+                                None,
+                            ),
+                            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([1u32])),
+                            committed_version: 0,
+                        }],
+                    },
+                ],
+            },
+            None,
+        );
+
+        let (result, _) = txn
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        assert_eq!(last_updated_at_versions(&result, 1), vec![5, 1, 5, 5]);
+        assert_eq!(last_updated_at_versions(&result, 2), vec![1, 5]);
+        assert!(
+            result.fragments[0]
+                .overlays
+                .iter()
+                .all(|overlay| overlay.committed_version == result.version)
+        );
     }
 
     #[test]

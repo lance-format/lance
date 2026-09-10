@@ -631,6 +631,9 @@ pub async fn open_scalar_index(
             index_store,
             &index_cache,
             load,
+            // Batch remappers bind external mapping readers to their store;
+            // reload them when the storage binding changes.
+            |_| async { Ok(None) },
         )
         .await
     } else {
