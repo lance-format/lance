@@ -417,6 +417,7 @@ impl Transaction {
                 current_indices,
                 transaction_file_path,
                 config,
+                read_version_state,
             );
         }
 

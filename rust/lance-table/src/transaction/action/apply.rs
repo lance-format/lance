@@ -22,7 +22,8 @@ use super::{CompositeOperation, Ref};
 use crate::format::{BasePath, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta};
 use crate::rowids::read_row_ids;
 use crate::rowids::version::build_version_meta;
-use crate::transaction::Transaction;
+use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
+use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -44,6 +45,7 @@ impl Transaction {
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestBuildConfig,
+        read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let current_manifest = current_manifest.ok_or_else(|| {
             Error::invalid_input(
@@ -57,12 +59,29 @@ impl Transaction {
             ));
         }
 
+        // Snapshot taken before the actions rewrite the list, so coverage can
+        // be compared against what each logical index looked like going in --
+        // the same point the legacy path snapshots at, before its operation
+        // arm runs. Only tables with a MemWAL index maintain coverage, so
+        // every other commit pays nothing.
+        let mem_wal_segments_before = current_indices
+            .iter()
+            .any(|index| index.name == MEM_WAL_INDEX_NAME)
+            .then(|| Self::logical_index_segments(&current_indices));
+
         let mut state = ApplyState::new(current_manifest);
         for action in composite_operation.iter_actions() {
             action.apply(&mut state)?;
         }
 
-        state.into_manifest(self, current_indices, transaction_file_path, config)
+        state.into_manifest(
+            self,
+            current_indices,
+            transaction_file_path,
+            config,
+            mem_wal_segments_before.as_ref(),
+            read_version_state,
+        )
     }
 }
 
@@ -151,6 +170,8 @@ impl<'a> ApplyState<'a> {
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
         config: &ManifestBuildConfig,
+        mem_wal_segments_before: Option<&LogicalIndexSegments>,
+        read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let current_manifest = self.current_manifest;
         let new_version = current_manifest.version + 1;
@@ -181,6 +202,20 @@ impl<'a> ApplyState<'a> {
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
         Transaction::normalize_fragments(&mut fragments)?;
+
+        // Applied once the final index list is known, so it sees exactly the
+        // indices this commit publishes rather than what any one action
+        // intended. Same position as on the legacy path: after the index list
+        // has been pruned, before the manifest is assembled.
+        if let Some(segments_before) = mem_wal_segments_before {
+            Transaction::apply_mem_wal_index_coverage(
+                &mut indices,
+                segments_before,
+                read_version_state,
+                new_version,
+            )?;
+        }
+
         let mut manifest = transaction.assemble_manifest(
             Some(current_manifest),
             schema,
@@ -573,11 +608,129 @@ fn duplicate_token_err(space: &str, token: u32) -> Error {
 mod tests {
     use super::*;
     use crate::format::DataFile;
-    use crate::transaction::Operation;
+    use crate::system_index::mem_wal::{
+        CompactedSsTable, IndexCatchupProgress, MemWalIndexDetails, load_mem_wal_index_details,
+        new_mem_wal_index_meta,
+    };
     use crate::transaction::action::test_support::{added_field, apply, backed_manifest};
-    use crate::transaction::action::{Action, AddDataFile, AddField, AddFragment};
-    use crate::transaction::test_support::default_build_config;
+    use crate::transaction::action::{
+        Action, AddDataFile, AddField, AddFragment, CompositeOperation, TombstoneFieldData,
+        UserAction,
+    };
+    use crate::transaction::test_support::{default_build_config, sample_index_metadata};
+    use crate::transaction::{DataReplacementGroup, Operation};
     use lance_file::version::ConcreteFileVersion;
+    use roaring::RoaringBitmap;
+    use rstest::rstest;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// MemWAL coverage invalidation is derived while the manifest is built, so
+    /// it has to run on the action path as well as the legacy one. A commit
+    /// that narrows an index below the version it read must lose that index's
+    /// catch-up entry, or the WAL pod goes on retiring SSTables against a
+    /// position the index no longer holds.
+    #[rstest]
+    #[case::legacy(false)]
+    #[case::actions(true)]
+    fn test_narrowing_an_index_invalidates_mem_wal_catchup_on_both_paths(
+        #[case] via_actions: bool,
+    ) {
+        let mut manifest = backed_manifest();
+        let mut second = manifest.fragments[0].clone();
+        second.id = 1;
+        second.files[0].path = "data/1.lance".into();
+        manifest.fragments = Arc::new(vec![manifest.fragments[0].clone(), second]);
+
+        let shard = Uuid::from_u128(7);
+        let existing = vec![
+            IndexMetadata {
+                fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
+                ..sample_index_metadata("idx")
+            },
+            new_mem_wal_index_meta(
+                manifest.version,
+                MemWalIndexDetails {
+                    compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+                    index_catchup: vec![IndexCatchupProgress::new(
+                        "idx".to_string(),
+                        vec![CompactedSsTable::new(shard, 5)],
+                    )],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        ];
+
+        // Replacing field 0's data in fragment 0 prunes that fragment from the
+        // index, which then no longer spans the version this commit read. The
+        // two forms below are the same change said twice.
+        let replacement = DataFile::new(
+            "data/0-new.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
+        let operation = if via_actions {
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserAction::new(
+                "replace field 0",
+                vec![
+                    Action::TombstoneFieldData(TombstoneFieldData {
+                        fragment: Ref::Committed(0),
+                        field_ids: vec![Ref::Committed(0)],
+                        data_change: true,
+                    }),
+                    Action::AddDataFile(AddDataFile {
+                        fragment: Ref::Committed(0),
+                        file: replacement,
+                        field_ids: vec![Ref::Committed(0)],
+                        data_change: true,
+                    }),
+                ],
+            )]))
+        } else {
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(0, replacement)],
+            }
+        };
+
+        let (_, indices) = Transaction::new(manifest.version, operation, None)
+            .build_manifest_with_read_version(
+                Some(&manifest),
+                existing.clone(),
+                "tx.txn",
+                &default_build_config(),
+                Some(ReadVersionState {
+                    manifest: &manifest,
+                    indices: &existing,
+                }),
+            )
+            .unwrap();
+
+        let narrowed = indices.iter().find(|index| index.name == "idx").unwrap();
+        assert_eq!(
+            narrowed.fragment_bitmap,
+            Some(RoaringBitmap::from_iter([1u32])),
+            "the replacement should have pruned fragment 0 from the index"
+        );
+
+        let details = load_mem_wal_index_details(
+            indices
+                .iter()
+                .find(|index| index.name == MEM_WAL_INDEX_NAME)
+                .expect("the MemWAL index should still be there")
+                .clone(),
+        )
+        .unwrap();
+        assert!(
+            details.index_catchup.is_empty(),
+            "an index that no longer covers the read version must lose its catch-up entry, \
+             but it kept {:?}",
+            details.index_catchup
+        );
+    }
 
     #[test]
     fn test_an_action_set_relocates_onto_a_newer_version() {
