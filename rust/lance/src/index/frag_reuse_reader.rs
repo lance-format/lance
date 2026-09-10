@@ -28,6 +28,11 @@ fn check_reader_path() -> Result<()> {
     Ok(())
 }
 
+/// Filter and rewrite the index listing for querying under a tagged history.
+///
+/// The returned coverage bitmaps are snapshot-derived query inputs and must
+/// never be persisted back to a manifest: stored segment metadata keeps its
+/// original provenance.
 pub(super) async fn load_indices(
     dataset: &Dataset,
     fri: &IndexMetadata,
@@ -87,6 +92,16 @@ pub(super) async fn load_indices(
     Ok(Arc::new(result.into_iter().flatten().collect()))
 }
 
+/// One segment's derived query-time inputs from the coverage backtrack.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SegmentPlanParts {
+    /// Live fragments this segment answers for in the current snapshot.
+    pub coverage: RoaringBitmap,
+    /// Fragments directly covered by other selected group members; translated
+    /// paths entering them belong to those siblings.
+    pub excluded: RoaringBitmap,
+}
+
 /// A validated FRI graph whose mapping payloads are opened only when needed.
 pub struct FragmentReuseIndex {
     ledger: Arc<FragReuseLedger>,
@@ -135,6 +150,27 @@ impl FragmentReuseIndex {
     /// A mapping requires complete source coverage; failure for one destination does
     /// not discard another destination's coverage. Every contributing segment is retained.
     pub fn segment_coverage(&self, provenance: &[RoaringBitmap]) -> Vec<RoaringBitmap> {
+        self.segment_plans(provenance)
+            .into_iter()
+            .map(|plan| plan.coverage)
+            .collect()
+    }
+
+    /// Resolve each segment's query coverage and sibling exclusions in one pass,
+    /// so "direct coverage wins" is owned by one algorithm.
+    ///
+    /// Coverage: each live fragment backtracks to the nearest available index
+    /// coverage. A mapping requires complete source coverage; failure for one
+    /// destination does not discard another destination's coverage. Every
+    /// contributing segment is retained.
+    ///
+    /// Exclusions: the fragments directly covered by other group members,
+    /// derived from the same `direct` map the backtrack builds. This is
+    /// deliberately an over-approximation of each segment's true sibling
+    /// contention: fragments that are not on a path this segment translates are
+    /// never checked per-hop, so extra members are inert. Do not "optimize"
+    /// this to exact per-path sets.
+    pub fn segment_plans(&self, provenance: &[RoaringBitmap]) -> Vec<SegmentPlanParts> {
         let mut direct: HashMap<u32, Vec<usize>> = HashMap::new();
         for (segment, bitmap) in provenance.iter().enumerate() {
             for fragment in bitmap {
@@ -206,7 +242,15 @@ impl FragmentReuseIndex {
                 }
             }
         }
-        coverage
+        let group_direct: RoaringBitmap = direct.keys().copied().collect();
+        provenance
+            .iter()
+            .zip(coverage)
+            .map(|(own, coverage)| SegmentPlanParts {
+                coverage,
+                excluded: &group_direct - own,
+            })
+            .collect()
     }
 
     /// Remap physical row IDs through supported lineage, stopping at live fragments.
@@ -1311,18 +1355,9 @@ mod tests {
         assert!(matches!(error, Error::NotSupported { .. }));
     }
 
-    #[rstest::rstest]
-    #[case::nearest_coverage(vec![vec![0], vec![1], vec![2, 3]], vec![vec![], vec![], vec![4, 5]])]
-    #[case::mixed_depths(vec![vec![0], vec![1], vec![2]], vec![vec![4, 5], vec![4, 5], vec![4, 5]])]
-    #[case::independent_destination(vec![vec![0], vec![4]], vec![vec![], vec![4]])]
-    #[case::direct_and_derived(vec![vec![0], vec![1], vec![4]], vec![vec![5], vec![5], vec![4]])]
-    #[tokio::test]
-    async fn coverage_resolves_each_destination_independently(
-        #[case] provenance: Vec<Vec<u32>>,
-        #[case] expected: Vec<Vec<u32>>,
-    ) {
-        // A,B -> C,D -> E,F. Each destination contains one row. Coverage is
-        // conservative for each mapping and requires both source fragments.
+    // A,B -> C,D -> E,F. Each destination contains one row. Coverage is
+    // conservative for each mapping and requires both source fragments.
+    async fn chain_reader() -> FragmentReuseIndex {
         let transitions = [(vec![0, 1], vec![2, 3]), (vec![2, 3], vec![4, 5])]
             .into_iter()
             .map(|(sources, destinations)| {
@@ -1362,12 +1397,25 @@ mod tests {
         let ledger = FragReuseLedger::decode(1, &details, |_| async { panic!("inline history") })
             .await
             .unwrap();
-        let reader = FragmentReuseIndex {
+        FragmentReuseIndex {
             ledger: Arc::new(ledger),
             live_fragments: Arc::new(RoaringBitmap::from_iter([4, 5])),
             // Coverage must never load mapping payloads.
             readers: vec![],
-        };
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::nearest_coverage(vec![vec![0], vec![1], vec![2, 3]], vec![vec![], vec![], vec![4, 5]])]
+    #[case::mixed_depths(vec![vec![0], vec![1], vec![2]], vec![vec![4, 5], vec![4, 5], vec![4, 5]])]
+    #[case::independent_destination(vec![vec![0], vec![4]], vec![vec![], vec![4]])]
+    #[case::direct_and_derived(vec![vec![0], vec![1], vec![4]], vec![vec![5], vec![5], vec![4]])]
+    #[tokio::test]
+    async fn coverage_resolves_each_destination_independently(
+        #[case] provenance: Vec<Vec<u32>>,
+        #[case] expected: Vec<Vec<u32>>,
+    ) {
+        let reader = chain_reader().await;
         let bitmaps = |values: Vec<Vec<u32>>| {
             values
                 .into_iter()
@@ -1378,6 +1426,35 @@ mod tests {
             reader.segment_coverage(&bitmaps(provenance)),
             bitmaps(expected)
         );
+    }
+
+    #[tokio::test]
+    async fn segment_plans_excludes_the_sibling_direct_union() {
+        let reader = chain_reader().await;
+        // Segments X, Y, Z with mixed direct and derived coverage.
+        let provenance = vec![
+            RoaringBitmap::from_iter([0]),
+            RoaringBitmap::from_iter([1]),
+            RoaringBitmap::from_iter([4]),
+        ];
+        let plans = reader.segment_plans(&provenance);
+        // The thin wrapper and the combined pass agree on coverage.
+        assert_eq!(
+            reader.segment_coverage(&provenance),
+            plans
+                .iter()
+                .map(|plan| plan.coverage.clone())
+                .collect::<Vec<_>>()
+        );
+        // Exclusions equal the old sibling-union formula: everything any group
+        // member covers directly, minus the segment's own provenance.
+        let group: RoaringBitmap = provenance.iter().flatten().collect();
+        for (plan, own) in plans.iter().zip(&provenance) {
+            assert_eq!(plan.excluded, &group - own);
+        }
+        assert_eq!(plans[0].excluded, RoaringBitmap::from_iter([1, 4]));
+        assert_eq!(plans[1].excluded, RoaringBitmap::from_iter([0, 4]));
+        assert_eq!(plans[2].excluded, RoaringBitmap::from_iter([0, 1]));
     }
 
     #[rstest::rstest]
