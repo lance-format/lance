@@ -50,7 +50,8 @@ For detailed conflict detection and resolution mechanisms, see the [Conflict Res
 The authoritative specification for transaction types is defined in [`protos/transaction.proto`](https://github.com/lancedb/lance/blob/main/protos/transaction.proto).
 
 Each transaction contains a `read_version` field indicating the table version from which the transaction was built,
-a `uuid` field uniquely identifying the transaction, and an `operation` field specifying one of the following transaction types:
+a `uuid` field uniquely identifying the transaction, and an `operation` field specifying one of the following transaction types.
+It may also carry `preconditions` declaring cells that must be unchanged relative to the read version (see [Preconditions](#preconditions)):
 
 In the following section, we will describe each transaction type and its compatibility with other transaction types. This
 compatibility is not always bi-directional. We are describing it from the perspective of the operation being committed. For example, we say that an Append is not compatible with an Overwrite which means that if we are trying to commit an Append, and an
@@ -555,6 +556,76 @@ Adds new base paths to the table, enabling reference to data files in additional
 An UpdateBases operation only modifies the base paths. As a result, it only conflicts with other
 UpdateBases operations and even then only conflicts if the two operations have base paths with the
 same id, name, or path.
+
+## Preconditions
+
+A transaction may declare that specific cells must be unchanged relative to its `read_version`
+when it commits. A cell is a `(field, row address)` pair; a precondition declares a set of cells as
+the cartesian product of a list of field ids and a set of physical row addresses.
+
+This supports read-compute-write workflows such as publishing a derived column `y = f(x)`: the
+staged values are only correct if the cells of `x` they were computed from still hold the same
+contents at commit time. Conflict detection alone cannot guard this: a transaction that reads `x`
+and writes `y` is compatible with a concurrent update of `x`, and rebasing over it would silently
+publish stale values.
+
+### Semantics
+
+- **Conjunctive composition.** `preconditions` is a repeated field; every entry must hold. If any
+  entry is violated, the commit fails; it is never rebased over the changed cells. The caller may
+  recompute against a newer version and retry.
+- **Absent or empty means no conditions.** A transaction without preconditions commits normally.
+- **Degenerate entries.** An entry with an empty `field_ids` or an empty `rows` list declares no
+  cells; producers must not emit them.
+- **Invalid encodings.** Consumers must reject transactions whose preconditions are malformed
+  (negative field ids, duplicate fragment entries, `bitmap` values that are not valid portable
+  Roaring bitmaps, `full` set to false) as corrupt.
+
+### What "unchanged" means
+
+"Unchanged" is defined conservatively and evaluated against the state at the transaction's
+`read_version` — not the latest version. Two checks must both pass.
+
+Field validity (schema): every field id declared in a precondition must still exist in the schema,
+with the same data type and nullability it had at the read version. A concurrent operation that
+removes a declared field — for example, `Project` can drop a field while retaining a data file that
+is shared with other live fields, leaving `files` untouched — changes the declared cells even when
+no manifest structure changed. A field name change does not affect cell contents and does not
+violate the precondition.
+
+Manifest structure (fragments and overlays): for each fragment appearing in a precondition's rows:
+
+- If the fragment no longer exists, the declared cells are changed. A concurrent rewrite that
+  relocates the declared rows counts as a change; transparent remapping through compaction is not
+  required.
+- If the fragment's data files differ from the read version, the declared cells are changed.
+- A change to the deletion vector does not count as a change: a deleted row is masked, so any staged
+  value on it is invisible to readers and does not need to be recomputed.
+- If any overlay affecting declared cells was added, modified, removed, or narrowed since the read
+  version, the declared cells are changed. An overlay that already existed at the read version and
+  is unchanged does not count as a change.
+
+Implementations may over-reject — declaring a cell changed when its contents were in fact
+preserved, for example at whole-fragment granularity for base data — but must never under-reject:
+a commit must not land when a declared cell actually changed or its field no longer exists.
+
+Row addresses are physical addresses valid at the `read_version`. Preconditions based on stable
+row ids are reserved for a future revision.
+
+### Encoding
+
+The authoritative schema is the `Transaction.Precondition` message in
+[`protos/transaction.proto`](https://github.com/lancedb/lance/blob/main/protos/transaction.proto):
+
+- `field_ids`: repeated int32 schema field ids.
+- `rows`: repeated per-fragment `RowSelection` entries:
+    - `fragment_id` (uint32): the fragment the selection applies to. Entries must not repeat the
+      same fragment within one precondition.
+    - `coverage` (exactly one of):
+        - `full` (bool): the entire fragment is selected.
+        - `bitmap` (bytes): the selected row offsets within the fragment, in the Roaring Bitmap
+          *portable* serialization. Consumers must reject bitmaps that are not valid
+          portable-serialized Roaring bitmaps.
 
 ## Conflict Resolution
 
