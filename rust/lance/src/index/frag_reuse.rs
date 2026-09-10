@@ -16,7 +16,7 @@ use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineConte
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use prost::Message;
 use roaring::RoaringBitmap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -130,11 +130,13 @@ impl CacheKey for FriQueryPlanKey<'_> {
 /// Build or fetch the snapshot's FRI query plan.
 ///
 /// Cached in the tagged (manifest-path scoped) namespace; concurrent opens
-/// coalesce on one build.
+/// coalesce on one build. Everything only needed to BUILD the plan (notably
+/// `load_indices` and its tagged coverage post-processing) runs inside the
+/// loader, so warm opens never recompute coverage.
 async fn fri_query_plan(
     dataset: &Dataset,
     fri: &IndexMetadata,
-    indices: &[IndexMetadata],
+    stored: &[IndexMetadata],
     mapping: &Arc<super::frag_reuse_reader::FragmentReuseIndex>,
 ) -> lance_core::Result<Arc<FriQueryPlan>> {
     dataset
@@ -145,34 +147,43 @@ async fn fri_query_plan(
                 fri_uuid: &fri.uuid,
             },
             || async {
-                // Resolve provenance here, before query coverage is rewritten.
-                // Callers hold metadata returned by load_indices and cannot
-                // supply this distinction.
-                let stored = super::load_all_indices(dataset).await?;
+                // The filtered listing carries the rewritten query coverage;
+                // `stored` keeps provenance from before that rewrite. Callers
+                // hold metadata returned by load_indices and cannot supply
+                // this distinction.
+                let indices = dataset.load_indices().await?;
+                let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
+                    stored.iter().map(|entry| (entry.uuid, entry)).collect();
+                // One pass over the filtered listing: group selected segments
+                // by logical index name and union each group's direct (stored)
+                // coverage once.
+                let mut filtered_by_uuid: HashMap<Uuid, &IndexMetadata> =
+                    HashMap::with_capacity(indices.len());
+                let mut group_coverage: HashMap<&str, RoaringBitmap> = HashMap::new();
+                for entry in indices.iter() {
+                    filtered_by_uuid.insert(entry.uuid, entry);
+                    if let Some(source) = stored_by_uuid.get(&entry.uuid)
+                        && let Some(bitmap) = &source.fragment_bitmap
+                    {
+                        *group_coverage.entry(entry.name.as_str()).or_default() |= bitmap;
+                    }
+                }
                 let mut segments = HashMap::with_capacity(stored.len());
                 for source in stored.iter() {
                     let plan = if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
                         SegmentRemappingPlan::Identity
-                    } else if let Some(entry) =
-                        indices.iter().find(|entry| entry.uuid == source.uuid)
+                    } else if let Some(entry) = filtered_by_uuid.get(&source.uuid)
                         && let Some(bitmap) = &entry.fragment_bitmap
                     {
                         let coverage = bitmap & dataset.fragment_bitmap.as_ref();
-                        // Other selected segments own their direct coverage. Drop
-                        // paths entering those fragments before later mappings can
-                        // merge them with this segment's contribution.
-                        let selected: HashSet<_> = indices
-                            .iter()
-                            .filter(|sibling| sibling.name == entry.name)
-                            .map(|sibling| sibling.uuid)
-                            .collect();
-                        let mut excluded_fragments = RoaringBitmap::new();
-                        for sibling in stored.iter().filter(|entry| selected.contains(&entry.uuid))
-                        {
-                            if let Some(bitmap) = &sibling.fragment_bitmap {
-                                excluded_fragments |= bitmap;
-                            }
-                        }
+                        // Other selected segments own their direct coverage.
+                        // Drop paths entering those fragments before later
+                        // mappings can merge them with this segment's
+                        // contribution.
+                        let mut excluded_fragments = group_coverage
+                            .get(entry.name.as_str())
+                            .cloned()
+                            .unwrap_or_default();
                         if let Some(bitmap) = &source.fragment_bitmap {
                             excluded_fragments -= bitmap;
                         }
@@ -197,8 +208,11 @@ pub(super) async fn open_row_id_remapping(
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> lance_core::Result<Option<(Uuid, ResolvedRemapping)>> {
-    let indices = dataset.load_indices().await?;
-    let Some(fri) = indices
+    // The cheap cached stored listing decides the generation; the filtered
+    // listing (whose tagged post-processing recomputes coverage) is only
+    // consulted inside the once-per-snapshot plan build.
+    let stored = super::load_all_indices(dataset).await?;
+    let Some(fri) = stored
         .iter()
         .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
     else {
@@ -212,8 +226,14 @@ pub(super) async fn open_row_id_remapping(
             )
         }));
     }
+    if fri.index_version != 1 {
+        return Err(Error::not_supported(format!(
+            "FRI index_version {} is unsupported. Please upgrade to a newer version",
+            fri.index_version
+        )));
+    }
     let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
-    let plan = fri_query_plan(dataset, fri, &indices, &mapping).await?;
+    let plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
     match plan.segments.get(&index.uuid) {
         None => Err(Error::not_supported(format!(
             "FRI remapping requires committed segment metadata for {}",

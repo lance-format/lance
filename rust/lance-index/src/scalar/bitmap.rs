@@ -541,7 +541,7 @@ impl BitmapIndex {
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
             let bitmap_bytes = binary_bitmaps.value(0);
-            let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
+            let mut bitmap = deserialize_bitmap(bitmap_bytes, BITMAP_LOOKUP_NAME)?;
 
             // Apply fragment remapping if needed
             if let Some(remapper) = &remapping {
@@ -3048,5 +3048,43 @@ mod tests {
             }
             _ => panic!("Expected Exact search result"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_load_with_remapping_rejects_corrupt_null_bitmap() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // A single null key whose serialized bitmap is garbage.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("keys", DataType::Int32, true),
+            Field::new("bitmaps", DataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int32Array::from(vec![None::<i32>])),
+                Arc::new(BinaryArray::from_vec(vec![b"not a bitmap"])),
+            ],
+        )
+        .unwrap();
+        let mut writer = store
+            .new_index_file(BITMAP_LOOKUP_NAME, schema)
+            .await
+            .unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let error = BitmapIndex::load_with_remapping(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Failed to deserialize bitmap"),
+            "{error}"
+        );
     }
 }

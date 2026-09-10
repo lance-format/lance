@@ -1644,4 +1644,25 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
             1
         );
     }
+
+    // Warm opens must not invoke load_indices (whose tagged post-processing
+    // recomputes coverage): replace the session metadata listing with one that
+    // keeps only the FRI entry, so any listing-derived resolution of the
+    // sibling would fail. The open must still succeed from the cached plan.
+    let metadata_key = IndexMetadataKey {
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: dataset.manifest_location.e_tag.as_deref(),
+    };
+    dataset
+        .index_cache
+        .insert_with_key(&metadata_key, Arc::new(vec![fri.clone()]))
+        .await;
+    let warm = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert!(
+        matches!(warm, Some((_, ResolvedRemapping::Batch(_)))),
+        "a warm open must resolve purely from the cached plan"
+    );
 }
