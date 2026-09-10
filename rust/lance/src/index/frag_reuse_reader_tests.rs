@@ -919,130 +919,135 @@ async fn legacy_scalar_lifecycle_never_enters_new_reader(
     #[case] external: bool,
     #[values(false, true)] defer_index_remap: bool,
 ) {
-    LEGACY_READER_ONLY
-        .scope((), async {
-            let batch = arrow_array::record_batch!(
-                ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
-                (
-                    "value",
-                    Int32,
-                    [
-                        Some(0),
-                        None,
-                        Some(2),
-                        Some(3),
-                        None,
-                        Some(2),
-                        Some(6),
-                        Some(7),
-                        None,
-                        Some(2),
-                        Some(10),
-                        Some(11)
-                    ]
+    lance_index::scalar::LEGACY_TRAFFIC_ONLY
+        .scope(
+            (),
+            LEGACY_READER_ONLY.scope((), async {
+                let batch = arrow_array::record_batch!(
+                    ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+                    (
+                        "value",
+                        Int32,
+                        [
+                            Some(0),
+                            None,
+                            Some(2),
+                            Some(3),
+                            None,
+                            Some(2),
+                            Some(6),
+                            Some(7),
+                            None,
+                            Some(2),
+                            Some(10),
+                            Some(11)
+                        ]
+                    )
                 )
-            )
-            .unwrap();
-            let mut dataset = Dataset::write(
-                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-                "memory://",
-                Some(WriteParams {
-                    max_rows_per_file: 3,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-            dataset
-                .create_index(
-                    &["value"],
-                    index_type,
-                    Some("value_idx".into()),
-                    &ScalarIndexParams::default(),
-                    true,
+                .unwrap();
+                let mut dataset = Dataset::write(
+                    RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                    "memory://",
+                    Some(WriteParams {
+                        max_rows_per_file: 3,
+                        ..Default::default()
+                    }),
                 )
                 .await
                 .unwrap();
-            assert!(assert_legacy_metadata(&dataset).await.is_none());
-            assert_legacy_scalar_queries(&dataset).await;
-            crate::dataset::optimize::compact_files(
-                &mut dataset,
-                crate::dataset::optimize::CompactionOptions {
-                    target_rows_per_fragment: 6,
-                    defer_index_remap,
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                assert_legacy_metadata(&dataset).await.is_some(),
-                defer_index_remap
-            );
-            if external && defer_index_remap {
-                externalize_legacy_history(&mut dataset).await;
-            }
-            assert_legacy_scalar_queries(&dataset).await;
-            let first = dataset.clone();
-            dataset.delete("id = 2").await.unwrap();
-            assert_legacy_scalar_queries(&dataset).await;
-            let appended =
-                arrow_array::record_batch!(("id", Int32, [12]), ("value", Int32, [Some(2)]))
+                dataset
+                    .create_index(
+                        &["value"],
+                        index_type,
+                        Some("value_idx".into()),
+                        &ScalarIndexParams::default(),
+                        true,
+                    )
+                    .await
                     .unwrap();
-            dataset
-                .append(
-                    RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                assert!(assert_legacy_metadata(&dataset).await.is_none());
+                assert_legacy_scalar_queries(&dataset).await;
+                crate::dataset::optimize::compact_files(
+                    &mut dataset,
+                    crate::dataset::optimize::CompactionOptions {
+                        target_rows_per_fragment: 6,
+                        defer_index_remap,
+                        ..Default::default()
+                    },
                     None,
                 )
                 .await
                 .unwrap();
-            assert_legacy_scalar_queries(&dataset).await;
-            crate::dataset::optimize::compact_files(
-                &mut dataset,
-                crate::dataset::optimize::CompactionOptions {
-                    target_rows_per_fragment: 100,
-                    defer_index_remap,
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap();
-            assert_legacy_scalar_queries(&dataset).await;
-            // Checkout shares the session cache, but must use its own FRI history.
-            let historical = dataset.checkout_version(first.version_id()).await.unwrap();
-            assert!(Arc::ptr_eq(&historical.session(), &dataset.session()));
-            assert_legacy_scalar_queries(&historical).await;
-            assert_legacy_scalar_queries(&dataset).await;
-            dataset.index_statistics("value_idx").await.unwrap();
-            if defer_index_remap {
+                assert_eq!(
+                    assert_legacy_metadata(&dataset).await.is_some(),
+                    defer_index_remap
+                );
+                if external && defer_index_remap {
+                    externalize_legacy_history(&mut dataset).await;
+                }
+                assert_legacy_scalar_queries(&dataset).await;
+                let first = dataset.clone();
+                dataset.delete("id = 2").await.unwrap();
+                assert_legacy_scalar_queries(&dataset).await;
+                let appended =
+                    arrow_array::record_batch!(("id", Int32, [12]), ("value", Int32, [Some(2)]))
+                        .unwrap();
                 dataset
-                    .index_statistics(FRAG_REUSE_INDEX_NAME)
+                    .append(
+                        RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                        None,
+                    )
                     .await
                     .unwrap();
-            }
-            let before_remap = dataset.version_id();
-            let result = crate::dataset::optimize::remapping::remap_column_index(
-                &mut dataset,
-                &["value"],
-                Some("value_idx".into()),
-            )
-            .await;
-            if defer_index_remap {
-                result.unwrap();
-            } else {
-                let error = result.unwrap_err();
-                assert!(matches!(error, Error::NotSupported { .. }));
-                assert!(error.to_string().contains("Fragment reuse index not found"));
-                assert_eq!(dataset.version_id(), before_remap);
-            }
-            assert_legacy_scalar_queries(&dataset).await;
-            crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+                assert_legacy_scalar_queries(&dataset).await;
+                dataset.optimize_indices(&Default::default()).await.unwrap();
+                assert_legacy_scalar_queries(&dataset).await;
+                crate::dataset::optimize::compact_files(
+                    &mut dataset,
+                    crate::dataset::optimize::CompactionOptions {
+                        target_rows_per_fragment: 100,
+                        defer_index_remap,
+                        ..Default::default()
+                    },
+                    None,
+                )
                 .await
                 .unwrap();
-            assert_legacy_scalar_queries(&dataset).await;
-        })
+                assert_legacy_scalar_queries(&dataset).await;
+                // Checkout shares the session cache, but must use its own FRI history.
+                let historical = dataset.checkout_version(first.version_id()).await.unwrap();
+                assert!(Arc::ptr_eq(&historical.session(), &dataset.session()));
+                assert_legacy_scalar_queries(&historical).await;
+                assert_legacy_scalar_queries(&dataset).await;
+                dataset.index_statistics("value_idx").await.unwrap();
+                if defer_index_remap {
+                    dataset
+                        .index_statistics(FRAG_REUSE_INDEX_NAME)
+                        .await
+                        .unwrap();
+                }
+                let before_remap = dataset.version_id();
+                let result = crate::dataset::optimize::remapping::remap_column_index(
+                    &mut dataset,
+                    &["value"],
+                    Some("value_idx".into()),
+                )
+                .await;
+                if defer_index_remap {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(matches!(error, Error::NotSupported { .. }));
+                    assert!(error.to_string().contains("Fragment reuse index not found"));
+                    assert_eq!(dataset.version_id(), before_remap);
+                }
+                assert_legacy_scalar_queries(&dataset).await;
+                crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+                    .await
+                    .unwrap();
+                assert_legacy_scalar_queries(&dataset).await;
+            }),
+        )
         .await;
 }
 
@@ -1189,117 +1194,127 @@ async fn legacy_vector_lifecycle_never_enters_new_reader(
     #[case] defer_index_remap: bool,
     #[case] external: bool,
 ) {
-    LEGACY_READER_ONLY
-        .scope((), async {
-            let vectors = arrow_array::FixedSizeListArray::from_iter_primitive::<
-                arrow_array::types::Float32Type,
-                _,
-                _,
-            >((0..12).map(|id| Some(vec![Some(id as f32); 4])), 4);
-            let batch = RecordBatch::try_from_iter([
-                (
-                    "id",
-                    Arc::new(arrow_array::Int32Array::from_iter_values(0..12))
-                        as arrow_array::ArrayRef,
-                ),
-                ("vector", Arc::new(vectors) as arrow_array::ArrayRef),
-            ])
-            .unwrap();
-            let mut dataset = Dataset::write(
-                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
-                "memory://",
-                Some(WriteParams {
-                    max_rows_per_file: 3,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-            let params = crate::index::vector::VectorIndexParams::ivf_flat(
-                1,
-                lance_linalg::distance::DistanceType::L2,
-            );
-            dataset
-                .create_index(
-                    &["vector"],
-                    IndexType::Vector,
-                    Some("vector_idx".into()),
-                    &params,
-                    true,
+    lance_index::scalar::LEGACY_TRAFFIC_ONLY
+        .scope(
+            (),
+            LEGACY_READER_ONLY.scope((), async {
+                let vectors = arrow_array::FixedSizeListArray::from_iter_primitive::<
+                    arrow_array::types::Float32Type,
+                    _,
+                    _,
+                >((0..12).map(|id| Some(vec![Some(id as f32); 4])), 4);
+                let batch = RecordBatch::try_from_iter([
+                    (
+                        "id",
+                        Arc::new(arrow_array::Int32Array::from_iter_values(0..12))
+                            as arrow_array::ArrayRef,
+                    ),
+                    ("vector", Arc::new(vectors) as arrow_array::ArrayRef),
+                ])
+                .unwrap();
+                let mut dataset = Dataset::write(
+                    RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                    "memory://",
+                    Some(WriteParams {
+                        max_rows_per_file: 3,
+                        ..Default::default()
+                    }),
                 )
                 .await
                 .unwrap();
-            assert!(assert_legacy_metadata(&dataset).await.is_none());
-            assert_legacy_vector_queries(&dataset).await;
-            crate::dataset::optimize::compact_files(
-                &mut dataset,
-                crate::dataset::optimize::CompactionOptions {
-                    target_rows_per_fragment: 6,
-                    defer_index_remap,
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                assert_legacy_metadata(&dataset).await.is_some(),
-                defer_index_remap
-            );
-            if external && defer_index_remap {
-                externalize_legacy_history(&mut dataset).await;
-            }
-            assert_legacy_vector_queries(&dataset).await;
-            let first = dataset.clone();
-            dataset.delete("id = 5").await.unwrap();
-            assert_legacy_vector_queries(&dataset).await;
-            let appended = batch.slice(11, 1);
-            dataset
-                .append(
-                    RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                let params = crate::index::vector::VectorIndexParams::ivf_flat(
+                    1,
+                    lance_linalg::distance::DistanceType::L2,
+                );
+                dataset
+                    .create_index(
+                        &["vector"],
+                        IndexType::Vector,
+                        Some("vector_idx".into()),
+                        &params,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(assert_legacy_metadata(&dataset).await.is_none());
+                assert_legacy_vector_queries(&dataset).await;
+                crate::dataset::optimize::compact_files(
+                    &mut dataset,
+                    crate::dataset::optimize::CompactionOptions {
+                        target_rows_per_fragment: 6,
+                        defer_index_remap,
+                        ..Default::default()
+                    },
                     None,
                 )
                 .await
                 .unwrap();
-            assert_legacy_vector_queries(&dataset).await;
-            crate::dataset::optimize::compact_files(
-                &mut dataset,
-                crate::dataset::optimize::CompactionOptions {
-                    target_rows_per_fragment: 100,
-                    defer_index_remap,
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap();
-            dataset.prewarm_index("vector_idx").await.unwrap();
-            assert_legacy_vector_queries(&dataset).await;
-            let historical = dataset.checkout_version(first.version_id()).await.unwrap();
-            assert!(Arc::ptr_eq(&dataset.session(), &historical.session()));
-            assert_legacy_vector_queries(&historical).await;
-            assert_legacy_vector_queries(&dataset).await;
-            dataset.index_statistics("vector_idx").await.unwrap();
-            let before_remap = dataset.version_id();
-            let result = crate::dataset::optimize::remapping::remap_column_index(
-                &mut dataset,
-                &["vector"],
-                Some("vector_idx".into()),
-            )
-            .await;
-            if defer_index_remap {
-                result.unwrap();
-            } else {
-                let error = result.unwrap_err();
-                assert!(matches!(error, Error::NotSupported { .. }));
-                assert!(error.to_string().contains("Fragment reuse index not found"));
-                assert_eq!(dataset.version_id(), before_remap);
-            }
-            crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+                assert_eq!(
+                    assert_legacy_metadata(&dataset).await.is_some(),
+                    defer_index_remap
+                );
+                if external && defer_index_remap {
+                    externalize_legacy_history(&mut dataset).await;
+                }
+                assert_legacy_vector_queries(&dataset).await;
+                let first = dataset.clone();
+                dataset.delete("id = 5").await.unwrap();
+                assert_legacy_vector_queries(&dataset).await;
+                let appended = batch.slice(11, 1);
+                dataset
+                    .append(
+                        RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_legacy_vector_queries(&dataset).await;
+                // Merge-all keeps a single segment, which the query helper
+                // expects when reopening the index by name.
+                dataset
+                    .optimize_indices(&lance_index::optimize::OptimizeOptions::merge(usize::MAX))
+                    .await
+                    .unwrap();
+                assert_legacy_vector_queries(&dataset).await;
+                crate::dataset::optimize::compact_files(
+                    &mut dataset,
+                    crate::dataset::optimize::CompactionOptions {
+                        target_rows_per_fragment: 100,
+                        defer_index_remap,
+                        ..Default::default()
+                    },
+                    None,
+                )
                 .await
                 .unwrap();
-            assert_legacy_vector_queries(&dataset).await;
-        })
+                dataset.prewarm_index("vector_idx").await.unwrap();
+                assert_legacy_vector_queries(&dataset).await;
+                let historical = dataset.checkout_version(first.version_id()).await.unwrap();
+                assert!(Arc::ptr_eq(&dataset.session(), &historical.session()));
+                assert_legacy_vector_queries(&historical).await;
+                assert_legacy_vector_queries(&dataset).await;
+                dataset.index_statistics("vector_idx").await.unwrap();
+                let before_remap = dataset.version_id();
+                let result = crate::dataset::optimize::remapping::remap_column_index(
+                    &mut dataset,
+                    &["vector"],
+                    Some("vector_idx".into()),
+                )
+                .await;
+                if defer_index_remap {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(matches!(error, Error::NotSupported { .. }));
+                    assert!(error.to_string().contains("Fragment reuse index not found"));
+                    assert_eq!(dataset.version_id(), before_remap);
+                }
+                crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+                    .await
+                    .unwrap();
+                assert_legacy_vector_queries(&dataset).await;
+            }),
+        )
         .await;
 }
 
@@ -1909,4 +1924,42 @@ async fn legacy_api_plugin_keeps_untouched_segments_available() {
             .unwrap(),
         1
     );
+}
+
+#[tokio::test]
+async fn legacy_traffic_guard_rejects_batch_entry_points() {
+    let mut dataset = fixture().await;
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = dataset.load_indices().await.unwrap();
+    let segment = indices
+        .iter()
+        .find(|index| index.name == "i_idx")
+        .unwrap()
+        .clone();
+    lance_index::scalar::LEGACY_TRAFFIC_ONLY
+        .scope((), async {
+            let error = crate::index::frag_reuse::open_row_id_remapping(
+                &dataset,
+                &segment,
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("entered batch row-ID remapping"),
+                "{error}"
+            );
+            let error = lance_index::scalar::check_batch_remapping_entry().unwrap_err();
+            assert!(
+                error.to_string().contains("entered batch row-ID remapping"),
+                "{error}"
+            );
+        })
+        .await;
 }

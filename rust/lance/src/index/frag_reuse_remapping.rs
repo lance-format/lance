@@ -93,6 +93,7 @@ impl QueryRowIdRemapper {
 #[async_trait]
 impl lance_index::scalar::BatchRowIdRemapper for QueryRowIdRemapper {
     async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        lance_index::scalar::check_batch_remapping_entry()?;
         Ok(self
             .mapping
             .remap_row_ids_excluding(row_ids, &self.excluded_fragments)

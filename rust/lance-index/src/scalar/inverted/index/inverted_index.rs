@@ -505,6 +505,7 @@ impl InvertedIndex {
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
         // for new index format, there is a metadata file and multiple partitions,
         // each partition is a separate index containing tokens, inverted list and docs.
         // for old index format, there is no metadata file, and it's just like a single partition

@@ -28,11 +28,33 @@ pub trait BatchRowIdRemapper: Send + Sync + std::fmt::Debug {
 // Bitmap compression can hide millions of rows. Bound temporary translation buffers.
 const BATCH_SIZE: usize = 64 * 1024;
 
+tokio::task_local! {
+    /// Armed by v0-lifecycle tests: any batch-remapping entry point reached
+    /// within this scope fails, proving legacy traffic never crosses into the
+    /// asynchronous translation code.
+    pub static LEGACY_TRAFFIC_ONLY: ();
+}
+
+/// Fail when a legacy-only scope reaches a batch-remapping entry point.
+///
+/// Only debug builds (which include every test profile) perform the check;
+/// release builds compile it away.
+pub fn check_batch_remapping_entry() -> Result<()> {
+    #[cfg(debug_assertions)]
+    if LEGACY_TRAFFIC_ONLY.try_with(|_| ()).is_ok() {
+        return Err(Error::internal(
+            "legacy-only operation entered batch row-ID remapping",
+        ));
+    }
+    Ok(())
+}
+
 /// Translate row IDs in input order, preserving duplicates and deleted positions.
 pub async fn remap_row_ids_async(
     remapper: &dyn BatchRowIdRemapper,
     row_ids: &[u64],
 ) -> Result<Vec<Option<u64>>> {
+    check_batch_remapping_entry()?;
     let mut result = Vec::with_capacity(row_ids.len());
     for batch in row_ids.chunks(BATCH_SIZE) {
         let mapped = remapper.remap_row_ids(batch).await?;
@@ -57,6 +79,7 @@ pub async fn remap_row_ids_preserving_layout_async(
     batch: RecordBatch,
     row_id_idx: usize,
 ) -> Result<(RecordBatch, Arc<dyn RowIdRemapper>)> {
+    check_batch_remapping_entry()?;
     let ids = batch
         .columns()
         .get(row_id_idx)
@@ -98,6 +121,7 @@ pub async fn remap_record_batch_async(
     batch: RecordBatch,
     row_id_idx: usize,
 ) -> Result<RecordBatch> {
+    check_batch_remapping_entry()?;
     let (batch, remapper) =
         remap_row_ids_preserving_layout_async(remapper, batch, row_id_idx).await?;
     remapper.remap_row_ids_record_batch(batch, row_id_idx)
@@ -108,6 +132,7 @@ pub async fn remap_row_addrs_tree_map_async(
     remapper: &dyn BatchRowIdRemapper,
     rows: &RowAddrTreeMap,
 ) -> Result<RowAddrTreeMap> {
+    check_batch_remapping_entry()?;
     let ids = rows.row_addrs().ok_or_else(|| Error::not_supported(
         "batch row-ID remapping requires explicit row addresses, not whole-fragment selections"
     ))?.map(u64::from);
@@ -119,6 +144,7 @@ pub async fn remap_row_ids_roaring_tree_map_async(
     remapper: &dyn BatchRowIdRemapper,
     rows: &RoaringTreemap,
 ) -> Result<RoaringTreemap> {
+    check_batch_remapping_entry()?;
     remap_iter(remapper, rows.iter()).await
 }
 

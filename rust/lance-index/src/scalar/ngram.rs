@@ -430,6 +430,7 @@ impl NGramIndex {
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
         let mut index = Self::from_store(store, None, index_cache).await?;
         index.list_reader = Arc::new(NGramPostingListReader {
             reader: index.list_reader.reader.clone(),

@@ -437,6 +437,7 @@ impl DocSet {
         is_legacy: bool,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
     ) -> Result<Self> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let (batch, frag_reuse_index) = match remapping {
             Some(remapping) => {

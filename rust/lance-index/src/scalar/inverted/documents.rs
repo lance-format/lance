@@ -1319,6 +1319,7 @@ impl PartitionDocuments {
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         quantized_scoring: bool,
     ) -> Result<Self> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
         let mut docs = Self::try_new(
             store,
             path,

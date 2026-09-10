@@ -239,6 +239,8 @@ pub(super) async fn open_row_id_remapping(
             fri.index_version
         )));
     }
+    // Everything below is v1-only code: legacy-only scopes must never get here.
+    lance_index::scalar::check_batch_remapping_entry()?;
     let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
     let plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
     match plan.segments.get(&index.uuid) {

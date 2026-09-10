@@ -122,6 +122,7 @@ impl BloomFilterIndex {
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
         let mut index = Self::load(store, None, index_cache).await?.as_ref().clone();
         index.batch_remapper = remapping;
         Ok(Arc::new(index))

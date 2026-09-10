@@ -521,6 +521,7 @@ impl ZoneMapIndex {
         index_cache: &LanceCache,
         use_seeds: bool,
     ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
         let index = Self::load(store, None, index_cache, use_seeds).await?;
         let mut index = Arc::into_inner(index)
             .ok_or_else(|| Error::internal("freshly loaded zone map index must be unshared"))?;

@@ -747,6 +747,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             concat_batches(&schema, batches.iter())?
         };
         if let Some(remapping) = &self.batch_remapper {
+            lance_index_core::remapping::check_batch_remapping_entry()?;
             let row_id_idx = batch.schema().index_of(ROW_ID)?;
             let (batch, remapper) =
                 remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
@@ -783,6 +784,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let metadata = self.metadata.clone();
         let distance_type = self.distance_type;
         if let Some(remapping) = &self.batch_remapper {
+            lance_index_core::remapping::check_batch_remapping_entry()?;
             let batch =
                 spawn_prewarm_materialization(move || compact_prewarm_batches(batches)).await?;
             let row_id_idx = batch.schema().index_of(ROW_ID)?;

@@ -111,6 +111,7 @@ impl LabelListIndex {
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
         let values_index =
             BitmapIndex::load_with_remapping(store.clone(), remapping.clone(), index_cache).await?;
         let list_nulls = read_list_nulls_with_remapping(store, remapping).await?;
