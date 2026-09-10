@@ -200,6 +200,11 @@ This includes operations such as compaction, defragmentation, and re-ordering.
 Rewrite operations change row addresses, requiring index updates.
 New fragment IDs must be reserved via `ReserveFragments` before executing a `Rewrite` transaction.
 
+A rewrite that defers index remapping publishes its address mapping in the
+same commit by replacing the [Fragment Reuse Index](../index/system/frag_reuse.md)
+entry in the manifest's index section. `append_fri_transitions` (below)
+appends the same kind of record in a separate commit.
+
 <details>
 <summary>Rewrite protobuf message</summary>
 
@@ -763,3 +768,19 @@ The reader follows a validation and synchronization protocol:
    - If canonical materialization cannot be established, or an observed size differs, return an error
 
 This protocol ensures that datasets using external manifest stores remain portable: copying the dataset directory preserves all data without requiring the external store.
+
+## Appending FRI Transitions
+
+`append_fri_transitions` (field 116) appends tagged transitions to the latest
+fragment reuse history. Its `transitions` field lists only the new mappings;
+it never carries the existing history. Committing this operation requires the
+tagged history capability (`FLAG_FRAGMENT_REUSE_INDEX`) and FRI
+`index_version` 1; the appended transitions must satisfy the lineage
+invariants in
+[FRI index versions](../index/system/frag_reuse.md#fri-index-versions).
+A rewrite normally publishes its transitions atomically by replacing the
+FRI entry in its own commit; this operation appends transitions after the
+fact, for mappings produced separately from the rewrite that they describe.
+When composite transactions become available, this operation is the
+sub-operation form: a rewrite composes with it to express the mapping as a
+semantic delta rather than an opaque entry replacement.
