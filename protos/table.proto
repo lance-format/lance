@@ -647,7 +647,7 @@ message FragmentReuseIndexDetails {
     repeated Transition transitions = 2;
   }
 
-  // Replaces whole source fragments without changing surviving row values.
+  // One transition from source fragments to destination fragments.
   message Transition {
     // Source fragments in scan order; counts include deleted rows.
     repeated FragmentDigest sources = 1;
