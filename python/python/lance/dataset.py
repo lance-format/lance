@@ -3726,6 +3726,14 @@ class LanceDataset(pa.dataset.Dataset):
             producing their Cartesian product. This reduces index build memory for
             records with multiple arrays but can sacrifice result accuracy for
             queries that constrain values across those arrays.
+        max_sub_docs_per_row: int, optional
+            This is for the ``INVERTED`` index on JSON columns. Maximum number of
+            flattened sub-documents one source row may produce. If unset, the
+            number is unlimited.
+        max_sub_docs_per_row_exceed_action: str, default "fail"
+            Action when ``max_sub_docs_per_row`` is exceeded. ``"fail"`` aborts
+            index ingestion with tuning guidance. ``"skip_row"`` omits the source
+            row from the index and continues.
         base_tokenizer: str, default "simple"
             This is for the ``INVERTED`` index. The base tokenizer to use. The
             value can be:

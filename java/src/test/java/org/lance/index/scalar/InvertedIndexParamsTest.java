@@ -64,6 +64,21 @@ class InvertedIndexParamsTest {
   }
 
   @Test
+  void maxSubDocsPerRowOptionsAreSerialized() {
+    for (MaxSubDocsPerRowExceedAction action : MaxSubDocsPerRowExceedAction.values()) {
+      ScalarIndexParams params =
+          InvertedIndexParams.builder()
+              .maxSubDocsPerRow(128)
+              .maxSubDocsPerRowExceedAction(action)
+              .build();
+
+      Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+      assertEquals(128, ((Number) json.get("max_sub_docs_per_row")).longValue());
+      assertEquals(action.toRustString(), json.get("max_sub_docs_per_row_exceed_action"));
+    }
+  }
+
+  @Test
   void blockSizeIsSerialized() {
     ScalarIndexParams params = InvertedIndexParams.builder().blockSize(128).build();
 

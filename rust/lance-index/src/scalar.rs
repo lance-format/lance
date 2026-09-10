@@ -47,7 +47,7 @@ pub mod seed;
 pub mod zoned;
 pub mod zonemap;
 
-pub use inverted::tokenizer::InvertedIndexParams;
+pub use inverted::tokenizer::{InvertedIndexParams, MaxSubDocsPerRowExceedAction};
 
 /// Convert a `Vec<`[`lance_index_core::scalar::IndexFile`]`>` to a
 /// `Vec<`[`lance_table::format::IndexFile`]`>`.

@@ -58,6 +58,8 @@ public final class InvertedIndexParams {
     private Boolean prefixOnly;
     private Integer blockSize = 128;
     private Boolean disableCrossArrayUnnest;
+    private Long maxSubDocsPerRow;
+    private MaxSubDocsPerRowExceedAction maxSubDocsPerRowExceedAction;
     private Boolean splitIdentifiers;
     private Boolean splitOnNumerics;
     private Boolean preserveOriginal;
@@ -322,6 +324,37 @@ public final class InvertedIndexParams {
     }
 
     /**
+     * Limit the number of flattened sub-documents emitted for one JSON row.
+     *
+     * <p>If unset, the number of sub-documents is unlimited.
+     *
+     * @param maxSubDocsPerRow maximum sub-documents per row, must be positive
+     * @return this builder
+     * @throws IllegalArgumentException if {@code maxSubDocsPerRow} is not positive
+     */
+    public Builder maxSubDocsPerRow(long maxSubDocsPerRow) {
+      if (maxSubDocsPerRow <= 0) {
+        throw new IllegalArgumentException("maxSubDocsPerRow must be positive");
+      }
+      this.maxSubDocsPerRow = maxSubDocsPerRow;
+      return this;
+    }
+
+    /**
+     * Configure the action taken when {@link #maxSubDocsPerRow(long)} is exceeded.
+     *
+     * <p>The default is {@link MaxSubDocsPerRowExceedAction#FAIL}.
+     *
+     * @param action action to take when the limit is exceeded
+     * @return this builder
+     */
+    public Builder maxSubDocsPerRowExceedAction(MaxSubDocsPerRowExceedAction action) {
+      this.maxSubDocsPerRowExceedAction =
+          Objects.requireNonNull(action, "maxSubDocsPerRowExceedAction must not be null");
+      return this;
+    }
+
+    /**
      * Configure whether code identifiers are split into subwords.
      *
      * <p>This option is valid only with the {@code code} analyzer.
@@ -520,6 +553,13 @@ public final class InvertedIndexParams {
       }
       if (disableCrossArrayUnnest != null) {
         params.put("disable_cross_array_unnest", disableCrossArrayUnnest);
+      }
+      if (maxSubDocsPerRow != null) {
+        params.put("max_sub_docs_per_row", maxSubDocsPerRow);
+      }
+      if (maxSubDocsPerRowExceedAction != null) {
+        params.put(
+            "max_sub_docs_per_row_exceed_action", maxSubDocsPerRowExceedAction.toRustString());
       }
       if (splitIdentifiers != null) {
         params.put("split_identifiers", splitIdentifiers);

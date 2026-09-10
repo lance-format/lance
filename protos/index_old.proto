@@ -57,6 +57,11 @@ message InvertedIndexDetails {
     LIST_ELEMENT = 1;
   }
 
+  enum MaxSubDocsPerRowExceedAction {
+    FAIL = 0;
+    SKIP_ROW = 1;
+  }
+
   message CodeTokenizerConfig {
     /* Split one lexical identifier into subwords, e.g. getUserName ->
      * get/user/name.
@@ -121,4 +126,12 @@ message InvertedIndexDetails {
   // If true, avoid cross-array unnesting during flattened JSON tokenization.
   // The default false value preserves exact Cartesian-product semantics.
   bool disable_cross_array_unnest = 17;
+  /* Maximum flattened sub-documents emitted for one JSON row. Absence means
+   * unlimited.
+   */
+  optional uint64 max_sub_docs_per_row = 18;
+  /* Action taken when max_sub_docs_per_row is exceeded. FAIL aborts index
+   * ingestion; SKIP_ROW omits the source row from the index.
+   */
+  MaxSubDocsPerRowExceedAction max_sub_docs_per_row_exceed_action = 19;
 }
