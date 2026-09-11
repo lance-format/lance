@@ -5798,6 +5798,187 @@ mod tests {
             );
         }
 
+        /// Commit a fresh `i_idx` delta segment built over the current
+        /// (translated) table state; `covered` optionally narrows the
+        /// committed bitmap to an under-claim.
+        async fn commit_delta_segment(dataset: &mut Dataset, covered: Option<&[u32]>) -> Uuid {
+            let params = ScalarIndexParams::default();
+            let mut delta =
+                crate::index::CreateIndexBuilder::new(dataset, &["i"], IndexType::BTree, &params)
+                    .name("i_idx_delta".into())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            delta.name = "i_idx".into();
+            if let Some(covered) = covered {
+                delta.fragment_bitmap = Some(covered.iter().copied().collect());
+            }
+            let uuid = delta.uuid;
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![delta],
+                            removed_indices: vec![],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            uuid
+        }
+
+        async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
+            lance_table::io::manifest::read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|idx| idx.name == name)
+            .collect()
+        }
+
+        /// FINDING (pinned): draining through `optimize_indices` merge does
+        /// not work on tagged tables yet. Two failure shapes, both pinned
+        /// here and in the in-module probe history:
+        ///
+        /// * A provenance-only segment whose translated coverage is fully
+        ///   taken over by a sibling is excluded from the query listing by
+        ///   direct-coverage-wins, so `merge_indices` cannot open it
+        ///   (`open_generic_index`: "does not exist") and silently skips the
+        ///   whole merge with a warning.
+        /// * A provenance-only segment still owning translated coverage IS
+        ///   openable, and an explicit merge combines its RAW pages (stale
+        ///   addresses in retired source fragments) with the sibling's,
+        ///   committing a segment that claims only the live DIRECT coverage:
+        ///   the translated destination coverage is dropped, silently
+        ///   degrading the index to scan fallback for those fragments
+        ///   (results stay correct, coverage regresses).
+        ///
+        /// Until the merge path resolves segments from stored metadata and
+        /// translates their addresses, draining requires an index rebuild
+        /// (see `end_to_end_lifecycle`) or fresh delta segments (see
+        /// `delta_drain_stages_partial_then_full`). When merge learns to
+        /// drain, this test fails: replace it with the real merge-drain
+        /// lifecycle.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn merge_drain_not_yet_supported_on_tagged_tables() {
+            use lance_index::optimize::OptimizeOptions;
+
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, _map_id) = make_tagged(&fixture).await;
+            // A partial delta: the old segment keeps exclusive translated
+            // coverage of destination 11, so it stays openable.
+            commit_delta_segment(&mut dataset, Some(&[10])).await;
+            let before: Vec<(Uuid, Option<roaring::RoaringBitmap>)> =
+                stored_segments(&dataset, "i_idx")
+                    .await
+                    .into_iter()
+                    .map(|s| (s.uuid, s.fragment_bitmap))
+                    .collect();
+            assert_eq!(before.len(), 2);
+            let all_rows = dataset.count_rows(None).await.unwrap();
+
+            // Default optimize is a no-op on this shape.
+            dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .unwrap();
+            let after: Vec<(Uuid, Option<roaring::RoaringBitmap>)> =
+                stored_segments(&dataset, "i_idx")
+                    .await
+                    .into_iter()
+                    .map(|s| (s.uuid, s.fragment_bitmap))
+                    .collect();
+            assert_eq!(after, before);
+
+            // An explicit merge runs, but the merged segment claims only the
+            // live direct coverage: destination 11 loses index coverage
+            // entirely instead of gaining a translated, directly-covering
+            // segment.
+            dataset
+                .optimize_indices(&OptimizeOptions::merge(2))
+                .await
+                .unwrap();
+            let merged = stored_segments(&dataset, "i_idx").await;
+            let coverage = merged
+                .iter()
+                .filter_map(|s| s.fragment_bitmap.as_ref())
+                .fold(roaring::RoaringBitmap::new(), |acc, b| acc | b);
+            assert!(
+                !coverage.contains(11),
+                "pinned failing behavior: the merge drops the translated \
+                 destination coverage instead of producing a directly-covering \
+                 translated segment; found {coverage:?}"
+            );
+            // Queries stay correct through scan fallback.
+            assert_eq!(dataset.count_rows(None).await.unwrap(), all_rows);
+            assert_eq!(dataset.count_rows(Some("i >= 4".into())).await.unwrap(), 4);
+        }
+
+        /// The staged drain the merge tests were after, via delta segments:
+        /// partial direct coverage retains the transition; completing the
+        /// coverage lets one maintenance run prune the superseded segment,
+        /// release the transition, and (aged) collect the row map.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn delta_drain_stages_partial_then_full() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, map_id) = make_tagged(&fixture).await;
+            let all_rows = dataset.count_rows(None).await.unwrap();
+
+            // Stage 1: only destination 10 gains direct coverage; the
+            // transition and the old segment must both stay.
+            commit_delta_segment(&mut dataset, Some(&[10])).await;
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 2);
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "destination 11 lacks direct coverage, so the transition stays"
+            );
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id.clone()]);
+
+            // Stage 2: destination 11 gains direct coverage too. One
+            // maintenance run prunes the superseded old segment and releases
+            // the transition.
+            let second = commit_delta_segment(&mut dataset, Some(&[11])).await;
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            let segments = stored_segments(&dataset, "i_idx").await;
+            assert_eq!(segments.len(), 2, "the two deltas remain");
+            assert!(segments.iter().any(|s| s.uuid == second));
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "with the old segment pruned, nothing needs the transition"
+            );
+            assert_eq!(dataset.count_rows(None).await.unwrap(), all_rows);
+
+            // Stage 3: the released row map ages out with its manifests.
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert!(fixture.list_fri_map_dirs().await.is_empty());
+            let reopened = fixture.open().await.unwrap();
+            assert_eq!(reopened.count_rows(None).await.unwrap(), all_rows);
+        }
+
         /// D-guard: a v0 dataset records no tagged entries and has no `_fri`
         /// directory; cleanup behaves exactly as before.
         #[tokio::test]
