@@ -471,7 +471,10 @@ pub(super) async fn add_columns(
         .await
 }
 
-async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
+pub(super) async fn cleanup_new_column_data_files(
+    fragments: &[FileFragment],
+    new_fragments: &[Fragment],
+) {
     let Some(first_fragment) = fragments.first() else {
         return;
     };
@@ -1610,6 +1613,79 @@ mod test {
             "cleanup must not modify external files"
         );
         dataset.validate().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fragment_add_columns_cleanup_owns_only_staged_files() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..2))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let external_dir = tempfile::tempdir()?;
+        let external_path = external_dir.path().join("blob.bin");
+        fs::write(&external_path, b"external")?;
+        let external_baseline_files = file_paths_in(external_dir.path());
+        let external_baseline_payload = fs::read(&external_path)?;
+
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                initial_bases: Some(vec![BasePath::new(
+                    1,
+                    external_dir.path().to_string_lossy().to_string(),
+                    Some("external".to_string()),
+                    false,
+                )]),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        let baseline_files = data_file_paths_in(test_uri);
+
+        let mut blob_builder = crate::BlobArrayBuilder::new(1);
+        blob_builder.push_uri(external_path.to_string_lossy())?;
+        let blob_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let blob_batch = RecordBatch::try_new(blob_schema.clone(), vec![blob_builder.finish()?])?;
+        let blob_reader = RecordBatchIterator::new(vec![Ok(blob_batch)], blob_schema);
+
+        let staged = fragments[0]
+            .add_columns_with_cleanup(
+                NewColumnTransform::Reader(Box::new(blob_reader)),
+                None,
+                None,
+            )
+            .await?;
+        assert!(data_file_paths_in(test_uri).len() > baseline_files.len());
+
+        staged.cleanup.cleanup().await;
+
+        assert_eq!(
+            data_file_paths_in(test_uri),
+            baseline_files,
+            "cleanup must remove only the staged fragment data"
+        );
+        assert_eq!(
+            file_paths_in(external_dir.path()),
+            external_baseline_files,
+            "cleanup must preserve files in external bases"
+        );
+        assert_eq!(fs::read(external_path)?, external_baseline_payload);
 
         Ok(())
     }
