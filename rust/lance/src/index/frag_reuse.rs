@@ -463,6 +463,10 @@ async fn read_fri_external_file(
 /// `Any` is decoded directly, so the envelope is parsed exactly once, by the
 /// ledger. Works for v0 entries too: legacy versions decode as lifted
 /// transitions.
+// The production caller went away when the sp-x-sp manifest diff was
+// replaced by merge-through-reassembly; the commit-path tests still verify
+// committed entries with it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn decode_frag_reuse_ledger(
     dataset: &Dataset,
     entry: &IndexMetadata,
@@ -477,33 +481,6 @@ pub(crate) async fn decode_frag_reuse_ledger(
         |file| read_fri_external_file(dataset, entry, file),
     )
     .await
-}
-
-/// The row-map ids of the stable-partition transitions in the dataset's
-/// committed FRI entry (empty when the entry is absent or v0). The conflict
-/// resolver diffs these identities between a rewrite's read version and the
-/// current manifest to detect a concurrent reordered rewrite that no
-/// transaction file can reveal. Identity, not count: a concurrent trim plus
-/// a concurrent stable-partition append can net a zero count change while
-/// still introducing an unvalidated transition.
-pub(crate) async fn stable_partition_map_ids(
-    dataset: &Dataset,
-) -> lance_core::Result<HashSet<String>> {
-    let stored = super::load_all_indices(dataset).await?;
-    let Some(entry) = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) else {
-        return Ok(HashSet::new());
-    };
-    let ledger = decode_frag_reuse_ledger(dataset, entry).await?;
-    Ok(ledger
-        .transitions()
-        .iter()
-        .filter_map(|transition| match transition.mapping() {
-            lance_table::system_index::frag_reuse::ledger::Mapping::StablePartition(partition) => {
-                Some(partition.map_id.clone())
-            }
-            _ => None,
-        })
-        .collect())
 }
 
 /// Extract a committed FRI entry's `FragmentReuseIndexDetails` content bytes
