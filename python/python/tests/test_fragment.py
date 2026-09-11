@@ -1547,3 +1547,22 @@ def test_fragment_scanner_batch_size_bytes(tmp_path: Path):
     small_budget = list(fragment.to_batches(batch_size_bytes=64 * 1024))
     assert len(small_budget) > len(default_batches)
     assert pa.Table.from_batches(small_budget) == fragment.to_table()
+
+
+def test_fragment_scanner_scan_stats_callback(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"a": range(200)}), tmp_path, max_rows_per_file=100
+    )
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 2
+
+    calls = []
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        calls.append(stats)
+
+    result = fragments[0].scanner(scan_stats_callback=scan_stats_callback).to_table()
+    assert result.num_rows == 100
+    assert len(calls) == 1, "Callback should have been called exactly once"
+    assert calls[0].bytes_read > 0, "Expected some bytes read"
+    assert calls[0].iops > 0, "Expected some I/O operations"

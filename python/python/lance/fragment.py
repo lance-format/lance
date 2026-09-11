@@ -54,7 +54,7 @@ if TYPE_CHECKING:
         ReaderLike,
         Transaction,
     )
-    from .lance import LanceSchema
+    from .lance import LanceSchema, ScanStatistics
     from .namespace import LanceNamespace
 
 
@@ -576,8 +576,17 @@ class LanceFragment(pa.dataset.Fragment):
         include_deleted_rows: Optional[bool] = None,
         batch_size_bytes: Optional[int] = None,
         strict_batch_size: Optional[bool] = None,
+        scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
     ) -> "LanceScanner":
-        """See Dataset::scanner for details"""
+        """See Dataset::scanner for details
+
+        Parameters
+        ----------
+        scan_stats_callback: Callable[[ScanStatistics], None], default None
+            A callback function that will be called with the scan statistics after the
+            scan is complete.  Errors raised by the callback will be logged but not
+            re-raised.
+        """
         filter_str = str(filter) if filter is not None else None
 
         columns_arg = {}
@@ -603,6 +612,7 @@ class LanceFragment(pa.dataset.Fragment):
             include_deleted_rows=include_deleted_rows,
             batch_size_bytes=batch_size_bytes,
             strict_batch_size=strict_batch_size,
+            scan_stats_callback=scan_stats_callback,
             **columns_arg,
         )
         from .dataset import LanceScanner
@@ -635,7 +645,7 @@ class LanceFragment(pa.dataset.Fragment):
             "_full_text_query": None,
             "_use_scalar_index": use_scalar_index,
             "_include_deleted_rows": include_deleted_rows,
-            "_scan_stats_callback": None,
+            "_scan_stats_callback": scan_stats_callback,
             "_strict_batch_size": (
                 strict_batch_size if strict_batch_size is not None else False
             ),
