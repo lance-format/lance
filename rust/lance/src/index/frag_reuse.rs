@@ -11,9 +11,9 @@ use lance_index::frag_reuse::{
     FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
 };
 use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, RowIdRemapper};
-use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
+use lance_table::format::{Fragment, IndexMetadata};
 use lance_table::transaction::{FragmentReuseRewrite, RewriteGroup};
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -539,6 +539,181 @@ pub(crate) async fn load_raw_frag_reuse_content(
     }
 }
 
+/// The source fragment's deleted row count as the manifest sees it right
+/// now. Materialized metadata is free; a deletion file whose count was never
+/// materialized is read once (rare -- the delete path materializes counts).
+async fn current_deleted_rows(dataset: &Dataset, frag: &Fragment) -> lance_core::Result<u64> {
+    match &frag.deletion_file {
+        None => Ok(0),
+        Some(deletion) => match deletion.num_deleted_rows {
+            Some(count) => Ok(count as u64),
+            None => Ok(
+                crate::io::deletion::read_dataset_deletion_file(dataset, frag.id, deletion)
+                    .await?
+                    .len() as u64,
+            ),
+        },
+    }
+}
+
+/// Validate job-side deletion folding with exact accounting.
+///
+/// A concurrent delete landed on a source after the rewrite job snapshotted
+/// it; instead of recomputing, the job translated each newly deleted source
+/// row through the transition's own row map and wrote destination deletion
+/// vectors for exactly those positions. Three equations, all equalities:
+///
+/// 1. per source, the rows of its CURRENT deletion vector whose row-map
+///    label is null (deleted at scan time) must number exactly the digest's
+///    scan-time deleted count -- this also pins the arithmetic that a delta
+///    row can never carry a null label, and implies the non-null rows number
+///    exactly the delta;
+/// 2. the destination deletion vectors must hold exactly the summed delta
+///    rows -- no extras, no misses;
+/// 3. the translated delta positions must equal the destination deletion
+///    vectors as a SET -- a count match with a position mismatch is one row
+///    wrongly dead plus one row resurrected.
+///
+/// IO shape: the labels are read with one coalesced request covering only
+/// the blocks the source deletion vectors touch
+/// ([`RowMapReader::translate_many`]), plus the reader's one tail read for
+/// the counts matrix; cost is proportional to the source deletion vector
+/// size. Translation itself is the reader stack's (`translate_in_block`
+/// through `translate_many`), not a reimplementation.
+async fn validate_folded_deletions(
+    dataset: &Dataset,
+    group: &RewriteGroup,
+    transition: &lance_table::format::pb::fragment_reuse_index_details::Transition,
+    source_deltas: &[u64],
+) -> lance_core::Result<()> {
+    use lance_index::frag_reuse::row_map::RowMapReader;
+    use lance_index::frag_reuse::stable_partition::MAPPING_FILE;
+    use lance_index::scalar::IndexStore;
+    use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance_table::format::pb::fragment_reuse_index_details::transition::Mapping;
+
+    let Some(Mapping::StablePartition(reference)) = &transition.mapping else {
+        // Ordered compaction has no row map to fold through; the writer
+        // records digests from commit-time metadata, so a delta here means
+        // a delete landed inside the commit itself. Recompute.
+        return Err(Error::not_supported(
+            "deletions landed on the sources of an ordered-compaction transition after its \
+             digests were taken; folding requires a stable-partition row map, so recompute \
+             the rewrite against the current version",
+        ));
+    };
+
+    // Open the row map exactly as the reader does (base-aware).
+    let base = match reference.base_id {
+        None => dataset.base.clone(),
+        Some(id) => dataset
+            .manifest
+            .base_paths
+            .get(&id)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "mapping {} references missing base {id}",
+                    reference.map_id
+                ))
+            })?
+            .extract_path(dataset.session.store_registry())?,
+    };
+    let directory = base.join("_fri").join(reference.map_id.as_str());
+    let store = dataset.object_store(reference.base_id).await?;
+    let metadata_cache = dataset.metadata_cache.file_metadata_cache(&directory);
+    let store = LanceIndexStore::new(store, directory, Arc::new(metadata_cache)).with_file_sizes(
+        HashMap::from([(MAPPING_FILE.to_string(), reference.map_size_bytes)]),
+    );
+    let reader = RowMapReader::open(store.open_index_file(MAPPING_FILE).await?).await?;
+    if reader.counts().num_destinations() as usize != transition.destinations.len() {
+        return Err(Error::invalid_input(format!(
+            "the row map addresses {} destinations but the transition lists {}",
+            reader.counts().num_destinations(),
+            transition.destinations.len()
+        )));
+    }
+
+    // Every row of every source's CURRENT deletion vector, as global rows in
+    // the row map's concatenated scan order.
+    let mut rows: Vec<u64> = Vec::new();
+    let mut row_source: Vec<usize> = Vec::new();
+    let mut start = 0u64;
+    for (source_index, digest) in transition.sources.iter().enumerate() {
+        let frag = &group.old_fragments[source_index];
+        if let Some(deletion) = &frag.deletion_file {
+            let deletion_vector =
+                crate::io::deletion::read_dataset_deletion_file(dataset, frag.id, deletion).await?;
+            for offset in deletion_vector.iter() {
+                if u64::from(offset) >= digest.physical_rows {
+                    return Err(Error::invalid_input(format!(
+                        "source fragment {} has a deleted row offset {offset} beyond its \
+                         {} physical rows",
+                        frag.id, digest.physical_rows
+                    )));
+                }
+                rows.push(start + u64::from(offset));
+                row_source.push(source_index);
+            }
+        }
+        start += digest.physical_rows;
+    }
+
+    let translations = reader.translate_many(&rows).await?;
+    let mut null_counts = vec![0u64; transition.sources.len()];
+    let mut translated: HashSet<(u16, u32)> = HashSet::new();
+    for (position, translation) in translations.iter().enumerate() {
+        match translation {
+            None => null_counts[row_source[position]] += 1,
+            Some((destination, offset)) => {
+                translated.insert((*destination, *offset));
+            }
+        }
+    }
+    // Equation 1: null-labeled rows are the scan-time deletions, exactly.
+    for (source_index, digest) in transition.sources.iter().enumerate() {
+        if null_counts[source_index] != digest.num_deleted_rows {
+            return Err(Error::invalid_input(format!(
+                "scan-time deletion accounting failed for source fragment {}: {} deleted \
+                 rows carry a null row-map label but the digest records {} scan-time \
+                 deletions",
+                digest.id, null_counts[source_index], digest.num_deleted_rows
+            )));
+        }
+    }
+
+    // The union of the destination deletion vectors.
+    let mut destination_set: HashSet<(u16, u32)> = HashSet::new();
+    let mut destination_total = 0u64;
+    for (destination_index, frag) in group.new_fragments.iter().enumerate() {
+        if let Some(deletion) = &frag.deletion_file {
+            let deletion_vector =
+                crate::io::deletion::read_dataset_deletion_file(dataset, frag.id, deletion).await?;
+            for offset in deletion_vector.iter() {
+                destination_total += 1;
+                destination_set.insert((destination_index as u16, offset));
+            }
+        }
+    }
+    // Equation 2: cardinality, exactly the summed deltas.
+    let expected: u64 = source_deltas.iter().sum();
+    if destination_total != expected {
+        return Err(Error::invalid_input(format!(
+            "destination deletion vectors hold {destination_total} rows but the sources \
+             gained {expected} deletions since the scan"
+        )));
+    }
+    // Equation 3: positions, as a set.
+    if translated != destination_set {
+        let missing = translated.difference(&destination_set).next();
+        let extra = destination_set.difference(&translated).next();
+        return Err(Error::invalid_input(format!(
+            "folded deletions do not land on the translated positions: missing translated \
+             position {missing:?}, unexpected destination deletion {extra:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Assemble the tagged FRI entry a stable-partition rewrite commits, and
 /// return it with the `dataset_version` of the entry it appended onto.
 ///
@@ -615,6 +790,11 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
     // caller: no id 0, and no id that is already live in the manifest (the
     // transition's sources are live and are covered by the same rule).
     let live_fragments: HashSet<u64> = dataset.fragments().iter().map(|frag| frag.id).collect();
+    let manifest_by_id: HashMap<u64, &Fragment> = dataset
+        .fragments()
+        .iter()
+        .map(|frag| (frag.id, frag))
+        .collect();
 
     for (group, transition) in covered_groups.iter().zip(transitions.iter()) {
         if group.old_fragments.len() != transition.sources.len() {
@@ -624,7 +804,40 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
                 group.old_fragments.len()
             )));
         }
-        for (frag, digest) in group.old_fragments.iter().zip(transition.sources.iter()) {
+        // Regime detection: the per-source delta between the scan-time
+        // digest and the CURRENT manifest. All deltas zero -> regime A,
+        // exactly the historical validation with no new IO. Any delta
+        // positive -> the folding regime: a concurrent delete landed on a
+        // source after the job snapshotted it, and the job answered by
+        // folding those rows into destination deletion vectors instead of
+        // recomputing; the fold is then validated row by row against the
+        // transition's own row map (see `validate_folded_deletions`). A
+        // source missing from the manifest contributes no delta: that
+        // commit fails later exactly as before (double consumption or
+        // fragment liveness).
+        let mut source_deltas: Vec<u64> = Vec::with_capacity(transition.sources.len());
+        for digest in transition.sources.iter() {
+            let current = match manifest_by_id.get(&digest.id) {
+                None => digest.num_deleted_rows,
+                Some(frag) => current_deleted_rows(dataset, frag).await?,
+            };
+            if current < digest.num_deleted_rows {
+                return Err(Error::invalid_input(format!(
+                    "source fragment {} records {current} deleted rows in the manifest, below \
+                     the {} its scan-time digest carries; a deletion vector cannot shrink",
+                    digest.id, digest.num_deleted_rows
+                )));
+            }
+            source_deltas.push(current - digest.num_deleted_rows);
+        }
+        let folding = source_deltas.iter().any(|&delta| delta > 0);
+
+        for (source_index, (frag, digest)) in group
+            .old_fragments
+            .iter()
+            .zip(transition.sources.iter())
+            .enumerate()
+        {
             // Materializing a data overlay breaks the reuse premise that a
             // rewrite moves addresses, never values: the destination holds
             // the overlaid values physically (and carries no overlay for
@@ -657,15 +870,37 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
                 .as_ref()
                 .and_then(|deletion| deletion.num_deleted_rows)
                 .unwrap_or(0) as u64;
-            if digest.id != frag.id
-                || digest.physical_rows != physical_rows
-                || digest.num_deleted_rows != num_deleted_rows
-            {
-                return Err(Error::invalid_input(format!(
-                    "transition source digest {:?} does not match old fragment {} \
-                     ({physical_rows} physical rows, {num_deleted_rows} deleted)",
-                    digest, frag.id
-                )));
+            if !folding {
+                // Regime A: exactly the historical binding.
+                if digest.id != frag.id
+                    || digest.physical_rows != physical_rows
+                    || digest.num_deleted_rows != num_deleted_rows
+                {
+                    return Err(Error::invalid_input(format!(
+                        "transition source digest {:?} does not match old fragment {} \
+                         ({physical_rows} physical rows, {num_deleted_rows} deleted)",
+                        digest, frag.id
+                    )));
+                }
+            } else {
+                // Regime B: the digest keeps the scan-time snapshot; the
+                // group must carry the source's CURRENT metadata.
+                if digest.id != frag.id || digest.physical_rows != physical_rows {
+                    return Err(Error::invalid_input(format!(
+                        "transition source digest {:?} does not match old fragment {} \
+                         ({physical_rows} physical rows)",
+                        digest, frag.id
+                    )));
+                }
+                let current = digest.num_deleted_rows + source_deltas[source_index];
+                if num_deleted_rows != current {
+                    return Err(Error::invalid_input(format!(
+                        "deletion folding requires the rewrite group to carry the source's \
+                         current metadata: fragment {} shows {num_deleted_rows} deleted rows \
+                         but the manifest records {current}",
+                        frag.id
+                    )));
+                }
             }
         }
         if group.new_fragments.len() != transition.destinations.len() {
@@ -697,8 +932,11 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
             // The digest claiming zero deletions is not enough: check the
             // fragment itself, or a destination carrying a deletion file
             // would commit a digest that undercounts its physical rows'
-            // liveness and later fail (or falsely pass) translation.
-            if frag.deletion_file.is_some() {
+            // liveness and later fail (or falsely pass) translation. Under
+            // the folding regime destinations MAY carry deletion vectors --
+            // they hold exactly the delta rows, validated position by
+            // position below.
+            if !folding && frag.deletion_file.is_some() {
                 return Err(Error::invalid_input(format!(
                     "destination fragment {} carries a deletion file; rewrite destinations                      must be written without deletions",
                     frag.id
@@ -739,6 +977,9 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
                 "a transition does not conserve rows: {live_source_rows} live source rows, \
                  {destination_rows} destination rows"
             )));
+        }
+        if folding {
+            validate_folded_deletions(dataset, group, transition, &source_deltas).await?;
         }
         // TODO(row-map totals): also validate the transition's row-map label
         // totals against the destination digests by tail-reading the map
@@ -2382,5 +2623,277 @@ mod tests {
             .map(|f| f.id)
             .collect();
         assert_eq!(fragments_after, fragments_before);
+    }
+
+    /// Post-scan-deletion folding harness: fixture, reserved ids, a prepared
+    /// transition, then an optional delta delete AFTER the row map was
+    /// built. `old_fragments` carries the CURRENT metadata, as the folding
+    /// regime requires.
+    struct FoldingHarness {
+        dataset: Dataset,
+        read_version: u64,
+        old_fragments: Vec<Fragment>,
+        destinations: Vec<Fragment>,
+        transition: Transition,
+    }
+
+    async fn folding_harness(delta_delete: Option<&str>) -> FoldingHarness {
+        let mut dataset = reader_tests::fixture().await;
+        reserve_fragments(&mut dataset, 30).await;
+        let (transition, destinations) = reader_tests::prepare(&dataset).await;
+        if let Some(predicate) = delta_delete {
+            dataset.delete(predicate).await.unwrap();
+        }
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        FoldingHarness {
+            read_version: dataset.manifest.version,
+            dataset,
+            old_fragments,
+            destinations,
+            transition,
+        }
+    }
+
+    /// The job folds delta rows: writes a destination deletion vector for
+    /// the given offsets, leaving the digest at its scan-time zero.
+    async fn fold_destination(harness: &mut FoldingHarness, destination: usize, offsets: &[u32]) {
+        let deletion_vector: lance_core::utils::deletion::DeletionVector =
+            offsets.iter().copied().collect();
+        let file = lance_table::io::deletion::write_deletion_file(
+            &harness.dataset.base,
+            harness.destinations[destination].id,
+            harness.read_version,
+            &deletion_vector,
+            &harness.dataset.object_store,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        harness.destinations[destination].deletion_file = Some(file);
+    }
+
+    async fn commit_fold(harness: FoldingHarness) -> lance_core::Result<Dataset> {
+        crate::dataset::write::CommitBuilder::new(Arc::new(harness.dataset))
+            .execute(Transaction::new(
+                harness.read_version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments: harness.old_fragments,
+                        new_fragments: harness.destinations,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
+                        transitions: vec![harness.transition],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+    }
+
+    /// Round 10 (1): two rows deleted on a source after the row map was
+    /// built; the job folds them into destination deletion vectors at their
+    /// translated positions and the commit passes exact accounting. Scans
+    /// and translated index queries both exclude the folded rows; the
+    /// ledger digests keep the scan-time counts.
+    #[tokio::test]
+    async fn folded_delta_deletions_commit_and_read_correctly() {
+        // Fixture values 0..8; fragment 0 holds 0..4. Parity partition:
+        // destination 0 takes evens, destination 1 takes odds, in scan
+        // order. Deleting values 1 and 2 after the scan translates to
+        // destination 1 offset 0 and destination 0 offset 1.
+        let mut harness = folding_harness(Some("i = 1 OR i = 2")).await;
+        fold_destination(&mut harness, 1, &[0]).await;
+        fold_destination(&mut harness, 0, &[1]).await;
+        let dataset = commit_fold(harness).await.unwrap();
+
+        assert_eq!(sorted_values(&dataset).await, vec![0, 3, 4, 5, 6, 7]);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 6);
+        assert_eq!(filtered_values(&dataset, "i = 1").await, Vec::<i32>::new());
+        assert_eq!(filtered_values(&dataset, "i = 2").await, Vec::<i32>::new());
+        assert_eq!(filtered_values(&dataset, "i = 3").await, vec![3]);
+        assert_eq!(filtered_values(&dataset, "i >= 4").await, vec![4, 5, 6, 7]);
+
+        // Digest semantics unchanged: scan-time counts, zero-deletion
+        // destinations, same row map.
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let entry = stored_fri(&stored);
+        let ledger = decode_entry(&dataset, &entry).await;
+        assert_eq!(ledger.transitions().len(), 1);
+        let recorded = &ledger.transitions()[0];
+        assert!(recorded.sources().iter().all(|d| d.num_deleted_rows == 0));
+        assert!(
+            recorded
+                .destinations()
+                .iter()
+                .all(|d| d.num_deleted_rows == 0)
+        );
+    }
+
+    /// Round 10 (2): no delta means regime A, and regime A still rejects a
+    /// destination carrying a deletion vector exactly as before.
+    #[tokio::test]
+    async fn regime_a_still_rejects_destination_deletion_files() {
+        let mut harness = folding_harness(None).await;
+        fold_destination(&mut harness, 0, &[0]).await;
+        let version = harness.read_version;
+        let dataset = harness.dataset.clone();
+        let error = commit_fold(harness).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("carries a deletion file"),
+            "{error}"
+        );
+        assert_eq!(dataset.latest_version_id().await.unwrap(), version);
+    }
+
+    /// Round 10 (3): folding only one of the two delta rows breaks the
+    /// cardinality equation.
+    #[tokio::test]
+    async fn folded_count_mismatch_rejected() {
+        let mut harness = folding_harness(Some("i = 1 OR i = 2")).await;
+        fold_destination(&mut harness, 1, &[0]).await;
+        let error = commit_fold(harness).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("hold 1 rows but the sources gained 2"),
+            "{error}"
+        );
+    }
+
+    /// Round 10 (4): right cardinality, one wrong offset -- one row wrongly
+    /// dead plus one row resurrected -- breaks the set equation.
+    #[tokio::test]
+    async fn folded_wrong_position_rejected() {
+        let mut harness = folding_harness(Some("i = 1 OR i = 2")).await;
+        fold_destination(&mut harness, 1, &[0]).await;
+        // Value 2 translates to destination 0 offset 1; offset 2 is wrong.
+        fold_destination(&mut harness, 0, &[2]).await;
+        let error = commit_fold(harness).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("translated positions"),
+            "{error}"
+        );
+    }
+
+    /// Round 10 (5a): a current deletion vector smaller than the scan-time
+    /// digest is corrupt (deletion vectors cannot shrink).
+    #[tokio::test]
+    async fn shrunken_source_deletion_vector_rejected() {
+        let mut dataset = reader_tests::fixture().await;
+        dataset.delete("i = 0 OR i = 1").await.unwrap();
+        reserve_fragments(&mut dataset, 30).await;
+        let (transition, destinations) = reader_tests::prepare(&dataset).await;
+        assert_eq!(transition.sources[0].num_deleted_rows, 2);
+        // Corruption stand-in: replace the source deletion vector with a
+        // smaller one.
+        let deletion_vector: lance_core::utils::deletion::DeletionVector =
+            [0u32].into_iter().collect();
+        let file = lance_table::io::deletion::write_deletion_file(
+            &dataset.base,
+            0,
+            dataset.manifest.version,
+            &deletion_vector,
+            &dataset.object_store,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut fragments: Vec<Fragment> = dataset.fragments().as_ref().clone();
+        fragments[0].deletion_file = Some(file);
+        Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
+        let indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        reader_tests::persist_fixture(&mut dataset, indices).await;
+
+        let harness = FoldingHarness {
+            read_version: dataset.latest_version_id().await.unwrap(),
+            old_fragments: dataset.fragments().iter().cloned().collect(),
+            destinations,
+            transition,
+            dataset,
+        };
+        let error = commit_fold(harness).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("cannot shrink"), "{error}");
+    }
+
+    /// Round 10 (5b): the null-label accounting is an exact equality. A
+    /// current deletion vector that gained rows but lost a scan-time
+    /// deletion has fewer null-labeled rows than the digest records, even
+    /// though its total makes the delta look positive; the same equality is
+    /// what forbids a delta row from ever carrying a null label.
+    #[tokio::test]
+    async fn scan_time_deletion_accounting_rejected() {
+        let mut dataset = reader_tests::fixture().await;
+        // Scan-time deletion: value 0 (fragment 0, offset 0) is a null
+        // label in the row map and counts 1 in the digest.
+        dataset.delete("i = 0").await.unwrap();
+        reserve_fragments(&mut dataset, 30).await;
+        let (transition, mut destinations) = reader_tests::prepare(&dataset).await;
+        assert_eq!(transition.sources[0].num_deleted_rows, 1);
+        // Corrupted current vector: drops the scan-time offset 0, adds
+        // offsets 1 and 2 (count 2, delta +1, so regime B engages).
+        let deletion_vector: lance_core::utils::deletion::DeletionVector =
+            [1u32, 2].into_iter().collect();
+        let file = lance_table::io::deletion::write_deletion_file(
+            &dataset.base,
+            0,
+            dataset.manifest.version,
+            &deletion_vector,
+            &dataset.object_store,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut fragments: Vec<Fragment> = dataset.fragments().as_ref().clone();
+        fragments[0].deletion_file = Some(file);
+        Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
+        let indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        reader_tests::persist_fixture(&mut dataset, indices).await;
+
+        let read_version = dataset.latest_version_id().await.unwrap();
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        // Fold something plausible for the +1 delta so the accounting
+        // equation, not the cardinality one, is what fires.
+        let deletion_vector: lance_core::utils::deletion::DeletionVector =
+            [0u32].into_iter().collect();
+        let file = lance_table::io::deletion::write_deletion_file(
+            &dataset.base,
+            destinations[1].id,
+            read_version,
+            &deletion_vector,
+            &dataset.object_store,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        destinations[1].deletion_file = Some(file);
+
+        let harness = FoldingHarness {
+            read_version,
+            old_fragments,
+            destinations,
+            transition,
+            dataset,
+        };
+        let error = commit_fold(harness).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("scan-time deletion accounting"),
+            "{error}"
+        );
     }
 }
