@@ -407,6 +407,24 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
+  // A condition that must hold for the commit to proceed.
+  message Precondition {
+    // The columns that must be unchanged.
+    repeated int32 field_ids = 1;
+
+    /* The rows that must be unchanged, in `RowAddrTreeMap` serialization:
+     * a u32 entry count followed by, per fragment, a u32 fragment id, a u32
+     * bitmap byte length, and a roaring bitmap of row offsets within that
+     * fragment. A zero bitmap length marks the entire fragment as selected.
+     */
+    bytes rows = 2;
+  }
+
+  // Conditions that must hold on the manifest a transaction lands on.
+  // If any precondition is violated by a concurrent transaction, the commit
+  // fails instead of rebasing the transaction over the changed data.
+  repeated Precondition preconditions = 5;
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;

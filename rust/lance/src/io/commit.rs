@@ -33,16 +33,19 @@ use lance_file::version::LanceFileVersion;
 
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
+use lance_select::RowAddrSelection;
 use lance_select::RowAddrTreeMap;
 use lance_table::feature_flags::ensure_can_write_manifest;
 use lance_table::format::{
     DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
-    is_detached_version, list_index_files_with_sizes, operation_may_change_schema, pb,
+    is_detached_version, list_index_files_with_sizes, operation_may_change_schema,
+    overlay::DataOverlayFile, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::read_manifest;
+use lance_table::transaction::Precondition;
 use rand::{Rng, rng};
 use roaring::RoaringBitmap;
 
@@ -1384,6 +1387,167 @@ async fn record_successful_commit(
     }
 }
 
+/// Whether a protected cell was touched by any fragment-level change between
+/// the read version and the current manifest.
+///
+/// Compares the structural pointers of the fragments the preconditions cover:
+/// data-file identity (a rewrite replaces files), deletion-file identity (a
+/// concurrent delete), and overlay changes (an overlay added, changed, or
+/// removed since the read version). Overlays that already existed at the read
+/// version and are unchanged do not violate: the values read then are the
+/// overlay's values, and they are still there. Fragment removal also
+/// violates — the removed row addresses no longer exist. Row relocation via
+/// compaction is rejected rather than remapped, matching the initial scope in
+/// #8976/#9043.
+pub(crate) fn is_precondition_violated(
+    precondition: &Precondition,
+    read_version_fragments: &HashMap<u64, &Fragment>,
+    current_fragments: &HashMap<u64, &Fragment>,
+) -> Result<bool> {
+    let protected_by_fragment = precondition.rows.iter().fold(
+        HashMap::<u32, RoaringBitmap>::new(),
+        |mut acc, (fragment_id, selection)| {
+            match selection {
+                // Full fragment: every offset is protected.
+                RowAddrSelection::Full => {
+                    acc.insert(*fragment_id, RoaringBitmap::full());
+                }
+                RowAddrSelection::Partial(offsets) => {
+                    let protected = acc.entry(*fragment_id).or_insert_with(RoaringBitmap::new);
+                    *protected |= offsets;
+                }
+            }
+            acc
+        },
+    );
+
+    for (fragment_id, protected_offsets) in &protected_by_fragment {
+        let fragment_id_u64 = u64::from(*fragment_id);
+        let before = read_version_fragments.get(&fragment_id_u64);
+        let after = current_fragments.get(&fragment_id_u64);
+        match (before, after) {
+            // Fragment removed entirely: the protected rows no longer exist.
+            (Some(_), None) => return Ok(true),
+            // Fragment created after the read version cannot contain rows the
+            // preconditions declared, which pointed at the read version.
+            (None, Some(_)) => continue,
+            // Neither manifest has the fragment: the protected rows never
+            // existed in this coordinate space, nothing to protect.
+            (None, None) => {}
+            (Some(before), Some(after)) => {
+                // A rewrite replaces the data files; every cell in the fragment
+                // is re-derived from a new snapshot, so protected or not it is
+                // no longer the cell that was read.
+                // A declared cell moves only when the file holding its field, or
+                // its column within that file, changes. A sibling column
+                // replacement that edits the same file's field list leaves it.
+                fn location(fragment: &Fragment, field: i32) -> Option<(&str, Option<i32>)> {
+                    fragment.files.iter().find_map(|file| {
+                        file.fields
+                            .iter()
+                            .position(|f| *f == field)
+                            .map(|pos| (file.path.as_str(), file.column_indices.get(pos).copied()))
+                    })
+                }
+                if precondition
+                    .field_ids
+                    .iter()
+                    .any(|field| location(before, *field) != location(after, *field))
+                {
+                    return Ok(true);
+                }
+                if before.deletion_file != after.deletion_file {
+                    return Ok(true);
+                }
+                if before.overlays != after.overlays {
+                    // Overlays added or changed since the read version supply
+                    // new values for their covered cells.
+                    for overlay in &after.overlays {
+                        if before.overlays.iter().any(|b| b == overlay) {
+                            // Unchanged since the read version: the values read
+                            // then are still there.
+                            continue;
+                        }
+                        if overlay_covers_protected(overlay, precondition, protected_offsets)? {
+                            return Ok(true);
+                        }
+                    }
+                    // Overlays removed or narrowed since the read version let
+                    // the base values they shadowed resurface — also a change
+                    // to those cells. Check the pre-change coverage: a narrowed
+                    // overlay no longer reports the rows it used to cover.
+                    for overlay in &before.overlays {
+                        if after.overlays.iter().any(|a| a == overlay) {
+                            continue;
+                        }
+                        if overlay_covers_protected(overlay, precondition, protected_offsets)? {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Whether an overlay supplies a value for any protected (field, row) cell.
+fn overlay_covers_protected(
+    overlay: &DataOverlayFile,
+    precondition: &Precondition,
+    protected_offsets: &RoaringBitmap,
+) -> Result<bool> {
+    for (field_pos, field_id) in overlay.data_file.fields.iter().enumerate() {
+        if !precondition.field_ids.contains(field_id) {
+            continue;
+        }
+        let covered = overlay.coverage_for_field(field_pos)?;
+        if !(protected_offsets & covered.as_ref()).is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Evaluate the transaction's preconditions against the current manifest.
+///
+/// Runs on every attempt, before rebase: a precondition answers "is the world I
+/// read still the world I'm publishing into?", which rebase's compatibility
+/// question ("can these two transactions be linearized?") does not cover — a
+/// concurrent delete can be absorbed by rebase while still changing the cells
+/// a derived column was computed from.
+pub(crate) fn evaluate_preconditions(
+    transaction: &Transaction,
+    read_version_manifest: &Manifest,
+    current_manifest: &Manifest,
+) -> Result<()> {
+    if transaction.preconditions.is_empty() {
+        return Ok(());
+    }
+    let read_fragments: HashMap<u64, &Fragment> = read_version_manifest
+        .fragments
+        .iter()
+        .map(|f| (f.id, f))
+        .collect();
+    let current_fragments: HashMap<u64, &Fragment> = current_manifest
+        .fragments
+        .iter()
+        .map(|f| (f.id, f))
+        .collect();
+    for precondition in &transaction.preconditions {
+        if is_precondition_violated(precondition, &read_fragments, &current_fragments)? {
+            return Err(Error::retryable_commit_conflict_source(
+                current_manifest.version,
+                lance_core::box_error(lance_core::Error::prerequisite_failed(format!(
+                    "cells covered by preconditions (fields {:?}) changed",
+                    precondition.field_ids
+                ))),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
@@ -1458,6 +1622,18 @@ pub(crate) async fn commit_transaction(
 
             ensure_can_write_manifest(&dataset.manifest)?;
 
+            // Precondition evaluation is orthogonal to rebase: a concurrent
+            // transaction can be absorbable (so rebase passes) while still
+            // invalidating the cells the transaction's values were computed
+            // from. Runs before rebase so a violating attempt is rejected
+            // before finish() spends IO on replay (finish_delete_update can
+            // write merged deletion files).
+            evaluate_preconditions(
+                &transaction,
+                read_version_dataset.manifest.as_ref(),
+                &dataset.manifest,
+            )?;
+
             // See if we can retry the commit. Try to account for all
             // transactions that have been committed since the read_version.
             // Use small amount of backoff to handle transactions that all
@@ -1473,6 +1649,15 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
+            if !transaction.preconditions.is_empty() {
+                // Defense in depth: CommitBuilder rejects this combination,
+                // but commit_transaction has non-builder callers.
+                return Err(Error::invalid_input_source(
+                    "commit preconditions are incompatible with strict overwrite \
+                     (Overwrite with num_retries = 0)"
+                        .into(),
+                ));
+            }
         }
 
         // Recomputed every attempt: the rebase above may have rewritten the
@@ -1739,6 +1924,7 @@ mod tests {
     use super::*;
 
     use crate::Dataset;
+    use crate::dataset::write::CommitBuilder;
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
@@ -3320,5 +3506,128 @@ mod tests {
             index_segment("idx_a", Some(RoaringBitmap::from_iter(5..10))),
         ];
         assert!(detect_overlapping_fragments(&disjoint).is_ok());
+    }
+
+    /// A data-file change on a protected fragment only counts for the fields
+    /// whose storage moved, so a sibling column replacement composes whether
+    /// it swaps a whole file or carves its fields out of a shared one.
+    #[test]
+    fn test_precondition_ignores_undeclared_column_files() {
+        let file =
+            |path: &str, fields: Vec<i32>| DataFile::new_legacy_from_fields(path, fields, None);
+        let precondition = |field: i32| {
+            let mut rows = RowAddrTreeMap::new();
+            rows.insert_fragment(0);
+            Precondition {
+                field_ids: vec![field],
+                rows,
+            }
+        };
+        let violated = |before: Vec<DataFile>, after: Vec<DataFile>, field: i32| {
+            let mut read = Fragment::new(0);
+            read.files = before;
+            let mut current = Fragment::new(0);
+            current.files = after;
+            is_precondition_violated(
+                &precondition(field),
+                &HashMap::from([(0, &read)]),
+                &HashMap::from([(0, &current)]),
+            )
+            .unwrap()
+        };
+        // Whole-file swap of the sibling column.
+        let separate = vec![file("a.lance", vec![0]), file("b.lance", vec![1])];
+        let swapped = vec![file("a.lance", vec![0]), file("b2.lance", vec![1])];
+        assert!(!violated(separate.clone(), swapped.clone(), 0));
+        assert!(violated(separate, swapped, 1));
+        // The sibling column carved out of a shared file.
+        let shared = vec![file("ab.lance", vec![0, 1])];
+        let carved = vec![file("ab.lance", vec![0]), file("b2.lance", vec![1])];
+        assert!(!violated(shared.clone(), carved.clone(), 0));
+        assert!(violated(shared, carved, 1));
+    }
+
+    #[tokio::test]
+    async fn test_precondition_violated_by_concurrent_delete() {
+        use roaring::RoaringTreemap;
+
+        // Version 1: one fragment with rows id = 0..10.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema);
+        let dataset = Dataset::write(
+            reader,
+            "memory://test_precondition_violated_by_concurrent_delete",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest.version, 1);
+        let fragment_id = dataset.manifest.fragments[0].id;
+
+        // A concurrent delete of rows 1 and 2 lands at version 2 before our
+        // commit runs. Deleting rows is compatible with an append, so without
+        // the precondition the commit would simply rebase over it.
+        let mut other = dataset.clone();
+        other.delete("id >= 1 AND id <= 2").await.unwrap();
+        assert_eq!(other.manifest.version, 2);
+
+        // Our append is based on version 1 and declares the deleted rows as a
+        // read dependency: the staged values were computed from those cells,
+        // which no longer hold the values we read.
+        let mut protected = RoaringTreemap::new();
+        for offset in [1_u64, 2] {
+            protected.insert((fragment_id << 32) | offset);
+        }
+        let mut appended_fragment = Fragment::new(100_000);
+        appended_fragment.physical_rows = Some(1);
+        let transaction = Transaction {
+            read_version: 1,
+            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+            operation: Operation::Append {
+                fragments: vec![appended_fragment],
+            },
+            tag: None,
+            transaction_properties: None,
+            preconditions: vec![Precondition {
+                field_ids: vec![0],
+                rows: RowAddrTreeMap::from(protected),
+            }],
+        };
+        let control = Transaction {
+            preconditions: Vec::new(),
+            ..transaction.clone()
+        };
+
+        let err = CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(transaction)
+            .await
+            .unwrap_err();
+        let Error::RetryableCommitConflict { source, .. } = err else {
+            panic!("expected RetryableCommitConflict, got: {err:?}");
+        };
+        let cause = source
+            .downcast_ref::<Error>()
+            .expect("expected PrerequisiteFailed cause");
+        assert!(
+            matches!(cause, Error::PrerequisiteFailed { .. }),
+            "expected PrerequisiteFailed, got: {cause:?}"
+        );
+
+        // Control: the same append without preconditions rebases over the
+        // delete and lands at version 3.
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(control)
+            .await
+            .unwrap();
+        assert_eq!(committed.manifest.version, 3);
     }
 }
