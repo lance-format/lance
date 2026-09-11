@@ -6429,6 +6429,12 @@ mod tests {
         rows: usize,
         vectors_per_row: usize,
     ) -> Dataset {
+        multivector_dataset_with(dir, &vec![vectors_per_row; rows]).await
+    }
+
+    /// A multivector table whose row `i` holds `lengths[i]` vectors, so uneven
+    /// and empty lists can be built as easily as uniform ones.
+    async fn multivector_dataset_with(dir: &std::path::Path, lengths: &[usize]) -> Dataset {
         use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
 
         let dimensions = 16;
@@ -6448,8 +6454,8 @@ mod tests {
 
         let mut builder =
             ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), dimensions));
-        for row in 0..rows {
-            for vector in 0..vectors_per_row {
+        for (row, &length) in lengths.iter().enumerate() {
+            for vector in 0..length {
                 for value in 0..dimensions {
                     builder
                         .values()
@@ -6465,6 +6471,53 @@ mod tests {
         Dataset::write(reader, dir.to_str().unwrap(), None)
             .await
             .unwrap()
+    }
+
+    /// Uneven lists are counted, not extrapolated from one of them.
+    ///
+    /// One row of ten vectors and ninety-nine empty ones hold ten vectors, not
+    /// a thousand, so this is still short of a 256-code codebook.
+    #[tokio::test]
+    async fn test_multivector_floor_counts_sparse_lists() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut lengths = vec![0_usize; 100];
+        lengths[0] = 10;
+        let mut dataset = multivector_dataset_with(test_dir.path(), &lengths).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::Cosine, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect("ten vectors should defer, not fail");
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
+        );
+    }
+
+    /// A column of empty lists holds no vectors at all.
+    #[tokio::test]
+    async fn test_multivector_floor_counts_empty_lists_as_none() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = multivector_dataset_with(test_dir.path(), &[0; 100]).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::Cosine, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect("no vectors should defer, not fail");
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty)
+        );
     }
 
     /// The partition cap counts a multivector row's whole list too.
