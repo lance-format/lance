@@ -32,9 +32,13 @@ pub fn validate_flags(manifest: &Manifest, indices: &[IndexMetadata]) -> Result<
     Ok(())
 }
 
-/// Cloning requires relocation of external mappings, which is not implemented yet.
+/// Deep-cloning a tagged history would need every referenced row-map file
+/// copied and its stable-partition references relocated, which no writer
+/// implements. Shallow clone does not consult this: it relocates the
+/// references in the `lance` crate instead (the decode machinery lives
+/// there), rejecting on its own any content it cannot fully interpret.
 /// A sticky flag alone need not mean that a mapping still exists.
-pub async fn ensure_clone_supported(
+pub async fn ensure_deep_clone_supported(
     store: &ObjectStore,
     location: &ManifestLocation,
     manifest: &Manifest,
@@ -45,7 +49,7 @@ pub async fn ensure_clone_supported(
     let indices = read_manifest_indexes(store, location, manifest).await?;
     if indices.iter().any(is_tagged) {
         return Err(Error::not_supported(
-            "Cloning tagged FRI requires row-map reference relocation. Please upgrade to a version supporting FRI clone",
+            "Deep-cloning tagged FRI requires copying row maps and relocating their references. Please upgrade to a version supporting FRI deep clone",
         ));
     }
     Ok(())

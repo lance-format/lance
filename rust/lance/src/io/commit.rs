@@ -364,6 +364,7 @@ async fn do_commit_new_dataset(
     let may_change_schema = operation_may_change_schema(&pb_transaction);
 
     let clone_source = if let Operation::Clone {
+        is_shallow,
         ref_version,
         ref_path,
         ..
@@ -374,7 +375,7 @@ async fn do_commit_new_dataset(
         // back to the destination store for same-store clones.
         let source_store = source_store.unwrap_or(object_store);
         let source_base_path =
-            ObjectStore::extract_path_from_uri(store_registry, ref_path.as_str())?;
+            ObjectStore::extract_path_from_uri(store_registry.clone(), ref_path.as_str())?;
         let source_manifest_location = commit_handler
             .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
@@ -386,13 +387,77 @@ async fn do_commit_new_dataset(
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
-        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
-            source_store,
-            &source_manifest_location,
-            &source_manifest,
-        )
-        .await?;
-        Some((source_store, source_manifest_location, source_manifest))
+        if !*is_shallow {
+            // Deep clone copies files without relocating row-map references;
+            // shallow clone relocates tagged FRI entries below instead.
+            lance_table::system_index::frag_reuse::metadata::ensure_deep_clone_supported(
+                source_store,
+                &source_manifest_location,
+                &source_manifest,
+            )
+            .await?;
+        }
+
+        // Prepare the cloned index metadata now: an uncloneable tagged FRI
+        // history must be rejected before anything is written to the target.
+        let indices = if let Some(index_section_pos) = source_manifest.index_section {
+            let reader = source_store.open(&source_manifest_location.path).await?;
+            let section: pb::IndexSection =
+                lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
+            section
+                .indices
+                .into_iter()
+                .map(IndexMetadata::try_from)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![]
+        };
+        let new_base_id = source_manifest
+            .base_paths
+            .keys()
+            .max()
+            .map(|id| *id + 1)
+            .unwrap_or(0);
+        let updated_indices = if *is_shallow {
+            let mut updated = Vec::with_capacity(indices.len());
+            for mut index in indices {
+                if lance_table::system_index::frag_reuse::metadata::is_tagged(&index) {
+                    // Restamp the entry's row-map references through the
+                    // clone's base mapping and move the entry itself into the
+                    // clone; the row-map files stay where they are.
+                    index = crate::index::frag_reuse::relocate_tagged_entry_for_shallow_clone(
+                        source_store,
+                        &source_base_path,
+                        &source_manifest,
+                        store_registry.clone(),
+                        &index,
+                        new_base_id,
+                        object_store,
+                        base_path,
+                    )
+                    .await?;
+                } else if index.base_id.is_none() {
+                    // Same rule as the data files in `Manifest::shallow_clone`:
+                    // only the source's own entries get the new base; entries
+                    // already stamped keep their ids, which carry over into
+                    // the clone's `base_paths` verbatim (a chained clone must
+                    // not restamp an origin-based index onto the middle hop).
+                    index.base_id = Some(new_base_id);
+                }
+                updated.push(index);
+            }
+            updated
+        } else {
+            // Deep clone: keep metadata but normalize base to local.
+            indices
+                .into_iter()
+                .map(|mut index| {
+                    index.base_id = None;
+                    index
+                })
+                .collect()
+        };
+        Some((source_manifest, new_base_id, updated_indices))
     } else {
         None
     };
@@ -411,16 +476,10 @@ async fn do_commit_new_dataset(
             branch_name,
             ..
         },
-        Some((source_store, source_manifest_location, source_manifest)),
+        Some((source_manifest, new_base_id, updated_indices)),
     ) = (&transaction.operation, clone_source)
     {
         if *is_shallow {
-            let new_base_id = source_manifest
-                .base_paths
-                .keys()
-                .max()
-                .map(|id| *id + 1)
-                .unwrap_or(0);
             let new_manifest = source_manifest.shallow_clone(
                 ref_name.clone(),
                 ref_path.clone(),
@@ -428,27 +487,10 @@ async fn do_commit_new_dataset(
                 branch_name.clone(),
                 transaction_file.clone(),
             );
-
-            let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = source_store.open(&source_manifest_location.path).await?;
-                let section: pb::IndexSection =
-                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-                section
-                    .indices
-                    .into_iter()
-                    .map(|index_pb| {
-                        let mut index = IndexMetadata::try_from(index_pb)?;
-                        index.base_id = Some(new_base_id);
-                        Ok(index)
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                vec![]
-            };
             (new_manifest, updated_indices)
         } else {
             // Deep clone: build a manifest that references local files (no external bases)
-            let mut new_manifest = source_manifest.clone();
+            let mut new_manifest = source_manifest;
             new_manifest.base_paths.clear();
             new_manifest.branch = None;
             new_manifest.tag = None;
@@ -466,22 +508,6 @@ async fn do_commit_new_dataset(
             }
             new_manifest.fragments = Arc::new(new_frags);
 
-            // Indices: keep metadata but normalize base to local
-            let mut updated_indices = Vec::new();
-            if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = source_store.open(&source_manifest_location.path).await?;
-                let section: pb::IndexSection =
-                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-                updated_indices = section
-                    .indices
-                    .into_iter()
-                    .map(|index_pb| {
-                        let mut index = IndexMetadata::try_from(index_pb)?;
-                        index.base_id = None;
-                        Ok(index)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-            }
             (new_manifest, updated_indices)
         }
     } else {
