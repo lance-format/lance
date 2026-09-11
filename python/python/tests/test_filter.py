@@ -76,6 +76,23 @@ def test_simple_predicates(dataset):
         assert dataset.to_table(filter=expr) == dataset.to_table().filter(expr)
 
 
+def test_pyarrow_predicate_with_default_row_id(tmp_path: Path):
+    table = pa.table({"uid": [1, 2, 3], "number": [10, 20, 10]})
+    lance.write_dataset(table, tmp_path)
+    dataset = lance.dataset(tmp_path, default_scan_options={"with_row_id": True})
+
+    actual = dataset.to_table(filter=pc.field("number") == 10)
+
+    expected = pa.table(
+        {
+            "uid": [1, 3],
+            "number": [10, 10],
+            "_rowid": pa.array([0, 2], pa.uint64()),
+        }
+    )
+    assert actual == expected
+
+
 def test_sql_predicates(dataset):
     # Predicate and expected number of rows
     predicates_nrows = [
