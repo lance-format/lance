@@ -149,6 +149,16 @@ impl ConcreteFileVersion {
         matches!(self, Self::V2_3)
     }
 
+    /// Whether this exact format uses the structural (v2.1+) decoder path.
+    ///
+    /// Structural files use page-level [`StructuralPageDecoder`] instances that
+    /// support exact byte-count queries via `decoded_bytes`. Non-structural (v2.0)
+    /// files use the legacy array-decoder path and must fall back to schema-based
+    /// estimates.
+    pub const fn is_structural(self) -> bool {
+        matches!(self, Self::V2_1 | Self::V2_2 | Self::V2_3)
+    }
+
     /// Decode the exact version string stored in a dataset manifest.
     ///
     /// Public selector aliases such as `legacy`, `0.3`, `stable`, and `next` are
