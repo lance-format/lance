@@ -453,6 +453,17 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
 #[derive(Debug, Default)]
 pub struct VariableEncoder {}
 
+/// The exact size of the buffer [`VariableEncoder`] produces for `block`.
+///
+/// Callers that must respect a codec input limit need the serialized length, which
+/// is larger than [`VariableWidthBlock::data_size`] by the header this encoder
+/// prepends. Keep in sync with the `compress` implementation below.
+pub fn variable_encoded_size(block: &VariableWidthBlock) -> u64 {
+    // bits-per-offset and bytes-start-offset, one word each.
+    let header_bytes = 2 * (block.bits_per_offset as u64 / 8);
+    header_bytes + block.offsets.len() as u64 + block.data.len() as u64
+}
+
 impl BlockCompressor for VariableEncoder {
     fn compress(&self, mut data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
         let bits_per_offset = match &data {
