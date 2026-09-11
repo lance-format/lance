@@ -484,10 +484,18 @@ pub struct TakeBuilder {
     missing_row_policy: MissingRowPolicy,
 }
 
+/// What a take does with a row id it cannot resolve to a live row.
+///
+/// Only consulted on a dataset that uses stable row ids: without them
+/// [`TakeBuilder::get_row_addrs`] reinterprets the ids as addresses verbatim
+/// and never looks at the policy, so setting `Error` there promises a check
+/// that does not happen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum MissingRowPolicy {
+pub enum MissingRowPolicy {
+    /// Drop it, returning fewer rows than were asked for.
     #[default]
     Ignore,
+    /// Fail the take, naming the first id that could not be resolved.
     Error,
 }
 
@@ -530,7 +538,9 @@ impl TakeBuilder {
         self
     }
 
-    pub(super) fn with_missing_row_policy(mut self, policy: MissingRowPolicy) -> Self {
+    /// How to handle a row id that resolves to no live row. See
+    /// [`MissingRowPolicy`].
+    pub fn with_missing_row_policy(mut self, policy: MissingRowPolicy) -> Self {
         self.missing_row_policy = policy;
         self
     }

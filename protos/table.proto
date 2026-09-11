@@ -752,6 +752,35 @@ message ShardManifest {
    * (drop-table 2PC). A SEALED manifest refuses claims at claim_epoch.
    */
   ShardStatus status = 15;
+
+  /* Stable row id ranges this shard has reserved from the base dataset and
+   * may still hand out, in the order they were taken. Empty when the shard has
+   * never reserved, or when the feature is off.
+   *
+   * More than one because a shard reserves its next range in the background
+   * while it is still drawing from the current one. A range drops out once it
+   * is exhausted.
+   */
+  repeated RowIdReservation row_id_reservations = 16;
+}
+
+/* A half-open range of stable row ids a shard holds exclusively, taken with an
+ * Operation::ReserveRowIds commit against the base dataset and persisted here
+ * before any id is issued from it.
+ *
+ * How far into the range a shard got is deliberately *not* recorded: writing it
+ * would mean a manifest commit per write. A successor derives it instead, from
+ * the highest id in the range it can find across its memtables, its SSTables
+ * (SsTable.max_row_id) and the overlapping base fragments. A range it cannot
+ * derive a position for is dropped rather than guessed at, which abandons ids
+ * but can never issue one twice.
+ */
+message RowIdReservation {
+  // First id in the range.
+  uint64 start = 1;
+
+  // One past the last id in the range.
+  uint64 end = 2;
 }
 
 // A shard field value stored as raw Arrow scalar bytes.
@@ -799,6 +828,15 @@ message SsTable {
 
      Absent also on a table with no primary key. */
   optional uint64 primary_key_bytes = 5;
+
+  /* Highest stable row id held by any row in this SSTable.
+
+     Recorded at flush so a successor can tell how far into a reserved range its
+     predecessor got without reading the SSTable back. Absent on an SSTable
+     written before this field existed and on a shard that does not assign
+     stable row ids -- in the first case a reader must treat the range as
+     underivable and abandon it, not read the missing value as zero. */
+  optional uint64 max_row_id = 6;
 }
 
 // A pointer to the latest SSTable compacted for a shard.

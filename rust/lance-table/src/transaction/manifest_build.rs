@@ -874,6 +874,24 @@ impl Transaction {
             Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
+            Operation::ReserveRowIds { num_row_ids } => {
+                final_fragments.extend(maybe_existing_fragments?.clone());
+                // Advance the *local* cursor, not `manifest.next_row_id`: the
+                // manifest field is overwritten from this local unconditionally
+                // at the end of `build_manifest`, so a bump written there would
+                // be clobbered.
+                let Some(next_row_id) = &mut next_row_id else {
+                    return Err(Error::not_supported_source(
+                        "ReserveRowIds requires a dataset that uses stable row ids".into(),
+                    ));
+                };
+                *next_row_id = next_row_id.checked_add(*num_row_ids).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "reserving {} row ids would overflow next_row_id ({})",
+                        num_row_ids, next_row_id
+                    ))
+                })?;
+            }
             Operation::Merge { fragments, .. } => {
                 let existing_fragments = maybe_existing_fragments?;
                 let mut merged_fragments = fragments.clone();

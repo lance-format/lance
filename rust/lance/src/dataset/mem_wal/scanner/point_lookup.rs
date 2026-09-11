@@ -29,14 +29,15 @@ use tracing::instrument;
 
 use crate::dataset::mem_wal::index::{IndexStore, MemTableVisibility};
 use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
-use crate::dataset::mem_wal::{TOMBSTONE, relax_non_pk_nullability};
+use crate::dataset::mem_wal::{TOMBSTONE, WAL_ROW_ID, relax_non_pk_nullability};
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
 use super::projection::{
-    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, force_schema, null_columns,
-    project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
+    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, cols_with_wal_row_id,
+    force_schema, null_columns, project_to_canonical, surface_wal_row_id,
+    validate_projection_names, wants_row_address, wants_row_id,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
@@ -687,9 +688,14 @@ impl LsmPointLookupPlanner {
                 // a deleted key (gen written before deletes existed lack it →
                 // `project_to_carry` synthesizes `false`).
                 let cols = cols_with_tombstone(&cols, dataset.schema().field(TOMBSTONE).is_some());
+                let cols = cols_with_wal_row_id(
+                    &cols,
+                    want_row_id && dataset.schema().field(WAL_ROW_ID).is_some(),
+                );
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());
-                Box::pin(scanner.create_plan()).await?
+                let plan = Box::pin(scanner.create_plan()).await?;
+                surface_wal_row_id(plan)?
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -708,6 +714,10 @@ impl LsmPointLookupPlanner {
                 // Carry `_tombstone` through so the post-coalesce filter can drop
                 // a deleted key; it survives the sort below.
                 let cols = cols_with_tombstone(&cols, schema.column_with_name(TOMBSTONE).is_some());
+                let cols = cols_with_wal_row_id(
+                    &cols,
+                    want_row_id && schema.column_with_name(WAL_ROW_ID).is_some(),
+                );
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());
                 // Expose `_rowid` (the BatchStore row offset, monotonic with
@@ -735,11 +745,12 @@ impl LsmPointLookupPlanner {
                 })?;
                 let newest: Arc<dyn ExecutionPlan> =
                     Arc::new(SortExec::new(ordering, raw).with_fetch(Some(1)));
-                // Per-source `_rowid` would collide with the base table's;
-                // NULL it before canonicalization (the value is internal to
-                // this arm). project_to_canonical drops it entirely when
-                // the user didn't request `_rowid` in the projection.
-                null_columns(newest, &[lance_core::ROW_ID])?
+                // Per-source `_rowid` is the batch-store row offset, not an
+                // identity: NULL it before canonicalization. Only then may
+                // `__wal_row_id` -- the stable id -- take the name; ordering
+                // matters, since the sort above still needs the offset.
+                let cleared = null_columns(newest, &[lance_core::ROW_ID])?;
+                surface_wal_row_id(cleared)?
             }
         };
         // Output carries `_tombstone` (canonical + the marker) so it survives

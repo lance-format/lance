@@ -862,6 +862,10 @@ impl PartialEq for Operation {
             }
             (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
+            (Self::ReserveRowIds { num_row_ids: a }, Self::ReserveRowIds { num_row_ids: b }) => {
+                a == b
+            }
+            (Self::ReserveRowIds { .. }, _) | (_, Self::ReserveRowIds { .. }) => false,
         }
     }
 }

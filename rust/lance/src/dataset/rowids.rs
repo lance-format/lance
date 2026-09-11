@@ -13,7 +13,11 @@ use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
     format::{Fragment, RowIdMeta},
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
+    transaction::{Operation, Transaction},
 };
+
+use crate::dataset::write::CommitBuilder;
+use std::ops::Range;
 use std::sync::Arc;
 
 pub(super) use validate::validate_stable_row_ids;
@@ -69,6 +73,49 @@ pub fn load_row_id_sequences<'a>(
             load_row_id_sequence(dataset, fragment).map_ok(move |seq| (fragment.id as u32, seq))
         })
         .buffer_unordered(dataset.object_store.io_parallelism())
+}
+
+/// Reserve `count` stable row ids, advancing the dataset's `next_row_id` past
+/// them so no future append can hand them out.
+///
+/// Returns the reserved half-open range and the dataset at the commit that took
+/// it. The caller owns the range outright: a writer can stamp these ids into
+/// rows long before they reach a fragment, which is what lets the WAL assign a
+/// row's id at insert time. Ids need not be contiguous, so a range that is
+/// never fully used is simply lost.
+///
+/// The commit is conflict-free against every concurrent operation except an
+/// overwrite or a restore.
+pub async fn reserve_row_ids(dataset: &Dataset, count: u64) -> Result<(Dataset, Range<u64>)> {
+    if count == 0 {
+        return Err(Error::invalid_input("cannot reserve 0 row ids".to_string()));
+    }
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::invalid_input(
+            "cannot reserve row ids on a dataset that does not use stable row ids".to_string(),
+        ));
+    }
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::ReserveRowIds { num_row_ids: count },
+        None,
+    );
+    let committed = CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute(transaction)
+        .await?;
+
+    // `next_row_id` after the commit is the exclusive end of the range this
+    // commit reserved; nothing else could have moved it, because the commit
+    // rebases onto whatever landed first and re-applies the bump.
+    let end = committed.manifest.next_row_id;
+    let start = end.checked_sub(count).ok_or_else(|| {
+        Error::internal(format!(
+            "reserving {} row ids left next_row_id at {}, which is below the reservation",
+            count, end
+        ))
+    })?;
+    Ok((committed, start..end))
 }
 
 pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
@@ -326,6 +373,162 @@ mod test {
         assert!(index.get(0).unwrap().is_none());
 
         assert_eq!(dataset.manifest().next_row_id, 0);
+    }
+
+    #[tokio::test]
+    async fn reserve_row_ids_advances_the_counter_and_pushes_appends_above_it() {
+        let batch = sequence_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let dataset = Dataset::write(
+            reader,
+            tmp_path,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest().next_row_id, 10);
+
+        let (dataset, reserved) = reserve_row_ids(&dataset, 1000).await.unwrap();
+        assert_eq!(reserved, 10..1010);
+        assert_eq!(dataset.manifest().next_row_id, 1010);
+
+        // A subsequent append starts above the reserved range rather than
+        // colliding with it.
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(
+            reader,
+            tmp_path,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest().next_row_id, 1020);
+
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        for id in reserved.clone() {
+            assert!(
+                index.get(id).unwrap().is_none(),
+                "reserved id {id} must not be handed to a row"
+            );
+        }
+        assert!(index.get(1010).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn reserve_row_ids_rejects_a_dataset_without_stable_row_ids() {
+        let batch = sequence_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let err = reserve_row_ids(&dataset, 10).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string().contains("stable row ids"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_row_ids_does_not_conflict_with_a_concurrent_append() {
+        let batch = sequence_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let dataset = Dataset::write(
+            reader,
+            tmp_path,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Both transactions read version 2; the append lands first and the
+        // reserve rebases onto it.
+        let append = Transaction::new(
+            dataset.manifest.version,
+            Operation::Append { fragments: vec![] },
+            None,
+        );
+        let appended = CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(append)
+            .await
+            .unwrap();
+
+        let (reserved_ds, reserved) = reserve_row_ids(&dataset, 64).await.unwrap();
+        assert!(reserved_ds.manifest.version > appended.manifest.version);
+        assert_eq!(reserved, 10..74);
+    }
+
+    /// An append that retries across a concurrent reserve must re-assign its
+    /// row ids from the rebased manifest rather than keep the ones its first
+    /// attempt computed -- otherwise it lands *inside* the reserved range.
+    ///
+    /// This holds because `build_manifest` assigns off a clone of the
+    /// transaction's fragments, so the transaction itself stays un-stamped. The
+    /// WAL's compaction path depends on the opposite property for fragments it
+    /// stamps itself, and the two only coexist because of that clone.
+    #[tokio::test]
+    async fn an_append_retrying_across_a_reserve_lands_above_the_reserved_range() {
+        let batch = sequence_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let dataset = Dataset::write(
+            reader,
+            tmp_path,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest().next_row_id, 10);
+
+        // Stage an append against the current version, then slip a reserve in
+        // underneath it so the append has to rebase.
+        let append = crate::dataset::InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted_stream(RecordBatchIterator::new(
+                vec![Ok(batch.clone())],
+                batch.schema(),
+            ))
+            .await
+            .unwrap();
+
+        let (_, reserved) = reserve_row_ids(&dataset, 500).await.unwrap();
+        assert_eq!(reserved, 10..510);
+
+        let appended = CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(append)
+            .await
+            .unwrap();
+
+        assert_eq!(appended.manifest().next_row_id, 520);
+        let index = get_row_id_index(&appended).await.unwrap().unwrap();
+        for id in reserved {
+            assert!(
+                index.get(id).unwrap().is_none(),
+                "retried append kept a stale id inside the reserved range"
+            );
+        }
+        for id in 510..520 {
+            assert!(index.get(id).unwrap().is_some());
+        }
     }
 
     #[tokio::test]

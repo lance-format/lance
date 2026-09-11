@@ -353,6 +353,36 @@ only conflicts with operations that modify the max fragment id. Here are the ope
 - Overwrite
 - Restore
 
+### ReserveRowIds
+
+Pre-allocates stable row IDs, advancing `next_row_id` past them without adding
+any fragments.
+This lets a writer stamp a row's ID into data it has not committed yet -- the
+MemWAL assigns a row its ID on the write path, long before the row reaches a
+base fragment.
+
+The reserved IDs are never handed back: a writer that crashes before using them
+leaks the chunk, which is harmless because row IDs need not be contiguous.
+Only valid on a table that already uses stable row IDs.
+
+<details>
+<summary>ReserveRowIds protobuf message</summary>
+
+```protobuf
+%%% proto.message.ReserveRowIds %%%
+```
+
+</details>
+
+#### ReserveRowIds Compatibility
+
+Like ReserveFragments, this only advances a counter in the manifest, so it
+conflicts only with operations that replace the manifest wholesale. Here are the
+operations that conflict with ReserveRowIds:
+
+- Overwrite
+- Restore
+
 ### Clone
 
 Creates a shallow or deep copy of the table.

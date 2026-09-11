@@ -28,9 +28,12 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
+use crate::dataset::mem_wal::WAL_ROW_ID;
+
 use super::projection::{
-    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
-    project_to_canonical, validate_projection_names, wants_row_id,
+    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, cols_with_wal_row_id,
+    null_columns, project_to_canonical, surface_wal_row_id, validate_projection_names,
+    wants_row_id,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
@@ -332,13 +335,14 @@ impl LsmVectorSearchPlanner {
                 None => knn,
             };
             // Lance's `fast_search()` and the active scan both produce a
-            // per-source `_rowid` that would collide with base row ids in the
-            // canonical output, so NULL it on non-base arms. The base arm keeps
-            // its real `_rowid` to drive the post-rerank take.
+            // per-source `_rowid` that is a physical position, not an identity,
+            // so NULL it on non-base arms and only then let `__wal_row_id` take
+            // the name. The base arm keeps its real `_rowid` to drive the
+            // post-rerank take.
             let after_null = if is_base {
                 knn
             } else {
-                null_columns(knn, &[lance_core::ROW_ID])?
+                surface_wal_row_id(null_columns(knn, &[lance_core::ROW_ID])?)?
             };
             // Normalize each source to the canonical output schema.
             let normalized = project_to_canonical(after_null, &canonical_schema)?;
@@ -478,6 +482,10 @@ impl LsmVectorSearchPlanner {
                 let mut scanner = dataset.scan();
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+                let cols = cols_with_wal_row_id(
+                    &cols,
+                    wants_row_id(projection) && dataset.schema().field(WAL_ROW_ID).is_some(),
+                );
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 if let Some(ref filter) = self.filter {
                     // See the base arm: `prefilter(true)` makes this a true
@@ -485,7 +493,9 @@ impl LsmVectorSearchPlanner {
                     scanner.filter_expr(filter.clone());
                     scanner.prefilter(true);
                 }
-                // No `with_row_id/address`: per-source IDs would collide with base.
+                // No `with_row_id/address`: the scanner's own `_rowid` is a
+                // physical position here. The stable id rides `__wal_row_id`
+                // above and is renamed at the end of the arm.
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
                 scanner.distance_range(self.distance_range.0, self.distance_range.1);
@@ -511,6 +521,10 @@ impl LsmVectorSearchPlanner {
                 // PK auto-included so the staleness filter retains its bloom hash key.
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
+                let cols = cols_with_wal_row_id(
+                    &cols,
+                    wants_row_id(projection) && schema.column_with_name(WAL_ROW_ID).is_some(),
+                );
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 if let Some(ref filter) = self.filter {
                     // Routed to filtered brute-force (see `plan_vector_search`):

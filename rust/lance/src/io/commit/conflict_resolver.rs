@@ -105,6 +105,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Overwrite { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::ReserveRowIds { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
@@ -329,8 +330,8 @@ impl<'a> TransactionRebase<'a> {
             }
             Operation::Merge { .. } => self.check_merge_txn(other_transaction, other_version),
             Operation::Restore { .. } => self.check_restore_txn(other_transaction, other_version),
-            Operation::ReserveFragments { .. } => {
-                self.check_reserve_fragments_txn(other_transaction, other_version)
+            Operation::ReserveFragments { .. } | Operation::ReserveRowIds { .. } => {
+                self.check_reservation_txn(other_transaction, other_version)
             }
             Operation::Project { .. } => self.check_project_txn(other_transaction, other_version),
             Operation::UpdateConfig { .. } => {
@@ -355,6 +356,7 @@ impl<'a> TransactionRebase<'a> {
             match &other_transaction.operation {
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
+| Operation::ReserveRowIds { .. }
                 | Operation::Clone { .. }
                 | Operation::Project { .. }
                 | Operation::Append { .. }
@@ -511,6 +513,7 @@ impl<'a> TransactionRebase<'a> {
             match &other_transaction.operation {
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
+                | Operation::ReserveRowIds { .. }
                 | Operation::Project { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -808,7 +811,8 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::ReserveFragments { .. } => Ok(()),
+                Operation::ReserveFragments { .. }
+| Operation::ReserveRowIds { .. } => Ok(()),
                 Operation::Project { .. } => Ok(()),
                 // Should be compatible with rewrite if it didn't move the rows
                 // we indexed. If it did, we could retry.
@@ -945,6 +949,7 @@ impl<'a> TransactionRebase<'a> {
                 // existing fragments or update fragments we don't touch.
                 Operation::Append { .. }
                 | Operation::ReserveFragments { .. }
+                | Operation::ReserveRowIds { .. }
                 | Operation::Project { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -1168,6 +1173,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Merge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::ReserveRowIds { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
             | Operation::UpdateBases { .. } => Ok(()),
@@ -1193,6 +1199,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Delete { .. }
             | Operation::Update { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::ReserveRowIds { .. }
             | Operation::Project { .. }
             | Operation::UpdateBases { .. }
             | Operation::Merge { .. }
@@ -1214,6 +1221,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::ReserveFragments { .. }
+| Operation::ReserveRowIds { .. }
                 // Both a column replacement and an overlay preserve physical row
                 // addresses; the overlay is newer and wins its covered cells.
                 | Operation::DataOverlay { .. }
@@ -1392,6 +1400,7 @@ impl<'a> TransactionRebase<'a> {
             Operation::Append { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::ReserveRowIds { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }
@@ -1496,6 +1505,7 @@ impl<'a> TransactionRebase<'a> {
                 }
             }
             Operation::ReserveFragments { .. }
+            | Operation::ReserveRowIds { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. } => Ok(()),
@@ -1534,6 +1544,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Merge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::ReserveRowIds { .. }
             | Operation::UpdateBases { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
@@ -1545,7 +1556,10 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
-    fn check_reserve_fragments_txn(
+    /// Covers both `ReserveFragments` and `ReserveRowIds`: each only bumps a
+    /// counter in the manifest, so the rules are identical -- conflict-free
+    /// against everything that does not replace the manifest wholesale.
+    fn check_reservation_txn(
         &mut self,
         other_transaction: &Transaction,
         other_version: u64,
@@ -1562,6 +1576,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::DataOverlay { .. }
             | Operation::Merge { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::ReserveRowIds { .. }
             | Operation::Update { .. }
             | Operation::Project { .. }
             | Operation::Clone { .. }
@@ -1588,6 +1603,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Rewrite { .. }
             | Operation::Clone { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::ReserveRowIds { .. }
             | Operation::UpdateBases { .. } => Ok(()),
             Operation::Merge { .. } | Operation::Project { .. } => {
                 // Need to recompute the schema
@@ -1653,6 +1669,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Merge { .. }
                 | Operation::Restore { .. }
                 | Operation::ReserveFragments { .. }
+                | Operation::ReserveRowIds { .. }
                 | Operation::Update { .. }
                 | Operation::Project { .. }
                 | Operation::UpdateMemWalState { .. }
@@ -1721,6 +1738,7 @@ impl<'a> TransactionRebase<'a> {
                 Operation::UpdateConfig { .. }
                 | Operation::Rewrite { .. }
                 | Operation::ReserveFragments { .. }
+                | Operation::ReserveRowIds { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Append { .. }
                 | Operation::Overwrite { .. }
@@ -1825,6 +1843,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Merge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::ReserveRowIds { .. }
             | Operation::Project { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
@@ -4957,6 +4976,7 @@ mod tests {
             | Operation::Overwrite { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::ReserveRowIds { .. }
             | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }

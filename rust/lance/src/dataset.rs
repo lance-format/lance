@@ -159,7 +159,7 @@ use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
-pub use take::TakeBuilder;
+pub use take::{MissingRowPolicy, TakeBuilder};
 use uuid::Uuid;
 pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, MergeStats, UncommittedMergeInsert,

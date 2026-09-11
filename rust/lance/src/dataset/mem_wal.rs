@@ -33,6 +33,7 @@
 //! monotonically increasing writer epochs in the shard manifest.
 
 mod api;
+pub mod compaction;
 mod hnsw;
 pub mod index;
 mod manifest;
@@ -73,6 +74,36 @@ pub const TOMBSTONE: &str = "_tombstone";
 /// exact-schema check.
 pub fn tombstone_field() -> ArrowField {
     ArrowField::new(TOMBSTONE, DataType::Boolean, false)
+}
+
+/// Column name for the mem_wal stable row id.
+///
+/// `__wal_row_id` is a *physical* column present in mem_wal memtables and
+/// SSTables, holding the stable row id the write path assigned to the row. Like
+/// [`TOMBSTONE`] it is owned end to end by lance and never named by a caller;
+/// unlike it, the column is surfaced at scan egress -- renamed to
+/// [`lance_core::ROW_ID`] when the projection asks for it, stripped otherwise.
+///
+/// The id is resolved on the write path and injected before the WAL append, so
+/// the log entry carries it and a replay restores it byte for byte. Nothing
+/// downstream of [`write::ShardWriter::put_with_row_ids`] ever mints one --
+/// not the flush, not compaction.
+pub const WAL_ROW_ID: &str = "__wal_row_id";
+
+/// The mem_wal row id field appended to the storage schema, after
+/// [`tombstone_field`].
+///
+/// Nullable, because a tombstone carries no id: a delete sentinel exists only
+/// to shadow a primary key, and compaction resolves the base row it supersedes
+/// by key rather than by id. Nullability also keeps
+/// [`write::build_tombstone_batch`](write) null-filling as it already does and
+/// keeps [`relax_non_pk_nullability`] a no-op over the column.
+///
+/// The nullability stops at storage: at scan egress the column is renamed to
+/// `_rowid` and rebound non-nullable, which is sound because the `NOT
+/// _tombstone` fold has already removed every tombstone by that point.
+pub fn wal_row_id_field() -> ArrowField {
+    ArrowField::new(WAL_ROW_ID, DataType::UInt64, true)
 }
 
 /// Derive a shard's *storage* schema from its *logical* (base table) schema by
@@ -120,11 +151,28 @@ pub fn relax_non_pk_nullability(
 /// path) is returned unchanged. Schema-level metadata and per-field metadata
 /// (e.g. the `lance-schema:unenforced-primary-key` marker) are preserved.
 pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
-    if base.column_with_name(TOMBSTONE).is_some() {
+    append_field_if_absent(base, TOMBSTONE, tombstone_field)
+}
+
+/// Extend a schema with the trailing `__wal_row_id` column, for a shard that
+/// assigns stable row ids. Applied after [`schema_with_tombstone`], so the two
+/// physical columns always appear in that order.
+///
+/// Idempotent, and metadata-preserving, for the same reasons.
+pub fn schema_with_wal_row_id(base: &ArrowSchema) -> Arc<ArrowSchema> {
+    append_field_if_absent(base, WAL_ROW_ID, wal_row_id_field)
+}
+
+fn append_field_if_absent(
+    base: &ArrowSchema,
+    name: &str,
+    field: impl FnOnce() -> ArrowField,
+) -> Arc<ArrowSchema> {
+    if base.column_with_name(name).is_some() {
         return Arc::new(base.clone());
     }
     let mut fields: Vec<ArrowField> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
-    fields.push(tombstone_field());
+    fields.push(field());
     Arc::new(ArrowSchema::new_with_metadata(
         fields,
         base.metadata().clone(),
@@ -132,6 +180,7 @@ pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
 }
 
 pub use api::{DatasetMemWalExt, InitializeMemWalBuilder, validate_maintained_indexes};
+pub use compaction::{PreAssignedRows, commit_preassigned_rows};
 pub use index::{MemIndexKind, MemTableVisibility};
 pub use manifest::ShardManifestStore;
 pub use memtable::scanner::MemTableScanner;

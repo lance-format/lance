@@ -55,8 +55,12 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::PkBlockFilterExec;
-use super::projection::{project_to_canonical, validate_projection_names};
+use super::projection::{
+    cols_with_wal_row_id, project_to_canonical, surface_wal_row_id, validate_projection_names,
+    wants_row_id,
+};
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
+use crate::dataset::mem_wal::WAL_ROW_ID;
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::index::scalar::inverted::{indexed_fts_document_granularities, resolve_fts_field};
 use crate::session::Session;
@@ -553,6 +557,11 @@ impl LsmFtsSearchPlanner {
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                // The WAL arms answer `_rowid` from `__wal_row_id`, so base
+                // opting in lines the union up rather than breaking it.
+                if wants_row_id(projection) {
+                    scanner.with_row_id();
+                }
                 if let Some(ref filter) = self.filter {
                     // `prefilter(true)` is required: without it the scanner
                     // post-filters the unfiltered BM25 top-k, dropping matching
@@ -580,6 +589,10 @@ impl LsmFtsSearchPlanner {
                 .await?;
                 let mut scanner = dataset.scan();
                 let cols = self.fts_scanner_projection(projection);
+                let cols = cols_with_wal_row_id(
+                    &cols,
+                    wants_row_id(projection) && dataset.schema().field(WAL_ROW_ID).is_some(),
+                );
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 if let Some(ref filter) = self.filter {
                     // See the base arm: `prefilter(true)` makes this a true
@@ -594,7 +607,7 @@ impl LsmFtsSearchPlanner {
                     bound_query = bound_query.limit(None);
                 }
                 scanner.full_text_search(bound_query)?;
-                scanner.create_plan().await
+                surface_wal_row_id(scanner.create_plan().await?)
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -611,6 +624,10 @@ impl LsmFtsSearchPlanner {
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
                 let cols = self.fts_scanner_projection(projection);
+                let cols = cols_with_wal_row_id(
+                    &cols,
+                    wants_row_id(projection) && schema.column_with_name(WAL_ROW_ID).is_some(),
+                );
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 if let Some(ref filter) = self.filter {
                     // Honored inside `plan_fts_search`: the materialized hits are
@@ -633,7 +650,7 @@ impl LsmFtsSearchPlanner {
                     bound_query = bound_query.limit(None);
                 }
                 scanner.full_text_search(bound_query)?;
-                scanner.create_plan().await
+                surface_wal_row_id(scanner.create_plan().await?)
             }
         }
     }

@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use bytes::Bytes;
 use lance_core::cache::LanceCache;
 use lance_core::utils::deletion::DeletionVector;
@@ -29,6 +31,7 @@ use super::super::index::MemIndexConfig;
 use super::super::memtable::MemTable;
 use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::mem_wal::WAL_ROW_ID;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
@@ -90,13 +93,14 @@ pub struct MemTableFlusher {
 /// appending store bumps these counters before it publishes the batch, so only
 /// a sealed one agrees with what a scan of it will see.
 #[derive(Clone, Copy)]
-struct FlushedSize {
+struct FlushedStats {
     in_memory_bytes: Option<u64>,
     physical_rows: Option<u64>,
     primary_key_bytes: Option<u64>,
+    max_row_id: Option<u64>,
 }
 
-impl FlushedSize {
+impl FlushedStats {
     /// Zero reads as unmeasured. An empty memtable is refused before a flush
     /// gets here, so a flushed generation always holds rows and a zero can only
     /// mean the accounting failed.
@@ -109,6 +113,7 @@ impl FlushedSize {
             // Zero means the table has no primary key, which is not a
             // measurement of one.
             primary_key_bytes: Some(memtable.pk_bytes() as u64).filter(|b| *b > 0),
+            max_row_id: max_row_id(memtable),
         }
     }
 
@@ -119,8 +124,31 @@ impl FlushedSize {
             in_memory_bytes: self.in_memory_bytes,
             physical_rows: self.physical_rows,
             primary_key_bytes: self.primary_key_bytes,
+            max_row_id: self.max_row_id,
         }
     }
+}
+
+/// Highest stable row id in `memtable`, or `None` on a shard that assigns none.
+///
+/// Recorded on the SSTable so a successor can derive how far into a reserved
+/// range its predecessor got without reading the generation back --
+/// `RowIdReservation` carries the range but not the position within it.
+///
+/// Nulls are skipped: a tombstone shadows a primary key and needs no id of its
+/// own. A generation of nothing but tombstones therefore reports `None`, the
+/// same as a shard with no ids at all, and means the same thing to a reader --
+/// this generation constrains no range.
+fn max_row_id(memtable: &MemTable) -> Option<u64> {
+    memtable
+        .batch_store()
+        .to_vec()
+        .iter()
+        .filter_map(|batch| {
+            let ids = batch.column_by_name(WAL_ROW_ID)?;
+            ids.as_primitive_opt::<UInt64Type>()?.iter().flatten().max()
+        })
+        .max()
 }
 
 impl MemTableFlusher {
@@ -271,7 +299,7 @@ impl MemTableFlusher {
 
         let random_hash = generate_random_hash();
         let generation = memtable.generation();
-        let size = FlushedSize::of(memtable);
+        let stats = FlushedStats::of(memtable);
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
         let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
 
@@ -313,7 +341,7 @@ impl MemTableFlusher {
                 generation,
                 &gen_folder_name,
                 covered_wal_entry_position,
-                size,
+                stats,
             )
             .await?;
 
@@ -323,7 +351,7 @@ impl MemTableFlusher {
         );
 
         Ok(FlushResult {
-            sstable: size.sstable(generation, gen_folder_name),
+            sstable: stats.sstable(generation, gen_folder_name),
             rows_flushed,
             covered_wal_entry_position,
         })
@@ -503,7 +531,7 @@ impl MemTableFlusher {
 
         let random_hash = generate_random_hash();
         let generation = memtable.generation();
-        let size = FlushedSize::of(memtable);
+        let stats = FlushedStats::of(memtable);
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
         let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
 
@@ -616,7 +644,7 @@ impl MemTableFlusher {
                 generation,
                 &gen_folder_name,
                 covered_wal_entry_position,
-                size,
+                stats,
             )
             .await?;
 
@@ -626,7 +654,7 @@ impl MemTableFlusher {
         );
 
         Ok(FlushResult {
-            sstable: size.sstable(generation, gen_folder_name),
+            sstable: stats.sstable(generation, gen_folder_name),
             rows_flushed: memtable.row_count(),
             covered_wal_entry_position,
         })
@@ -1166,14 +1194,14 @@ impl MemTableFlusher {
         generation: u64,
         gen_path: &str,
         covered_wal_entry_position: u64,
-        size: FlushedSize,
+        stats: FlushedStats,
     ) -> Result<ShardManifest> {
         let gen_path = gen_path.to_string();
 
         self.manifest_store
             .commit_update(epoch, |current| {
                 let mut sstables = current.sstables.clone();
-                sstables.push(size.sstable(generation, gen_path.clone()));
+                sstables.push(stats.sstable(generation, gen_path.clone()));
 
                 ShardManifest {
                     version: current.next_version(),
