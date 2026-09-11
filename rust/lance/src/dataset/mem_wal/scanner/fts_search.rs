@@ -118,6 +118,11 @@ fn requested_query_document_granularity(
                 }
                 Ok(())
             }
+            // BM25F blends the target columns per row, so combined_fields is
+            // row-granular by construction and carries no granularity field.
+            // Merging Row still catches a tree that mixes it with a
+            // list-element leaf.
+            IndexFtsQuery::CombinedFields(_) => merge(current, Some(DocumentGranularity::Row)),
         }
     }
 
@@ -156,6 +161,8 @@ fn set_query_document_granularity(
                 child.document_granularity = Some(document_granularity);
             }
         }
+        // Row-granular by construction, and it carries no field to set.
+        IndexFtsQuery::CombinedFields(_) => {}
     }
 }
 

@@ -239,6 +239,94 @@ pub fn idf(token_docs: usize, num_docs: usize) -> f32 {
     ((num_docs - token_docs as f32 + 0.5) / (token_docs as f32 + 0.5) + 1.0).ln()
 }
 
+/// BM25F scorer over a virtual field formed by combining several columns
+/// (Lucene `CombinedFieldQuery` / Elasticsearch `combined_fields`).
+///
+/// Where [`MemBM25Scorer`] / `IndexBM25Scorer` score one column against that
+/// column's own statistics, this scorer holds statistics blended across the
+/// target columns per the BM25F rules:
+/// - `doc_count` = `max_f docCount_f`
+/// - `avg_doc_length` = `sumTotalTermFreq' / doc_count`, where
+///   `sumTotalTermFreq' = Σ_f w_f · sumTotalTermFreq_f`
+/// - `doc_freq(t)` = `max_f docFreq_f(t)`
+///
+/// The caller supplies the blended term frequency `tf' = Σ_f w_f · tf_f(t, d)`
+/// and blended document length `dl' = Σ_f w_f · dl_f(d)` per candidate document;
+/// this type turns those into an IDF weight and a BM25 document weight. Lance's
+/// `(k1 + 1)` numerator is kept (a constant factor vs. Lucene that preserves
+/// ranking).
+#[derive(Debug, Clone)]
+pub struct CombinedFieldsBM25Scorer {
+    doc_count: usize,
+    avg_doc_length: f32,
+    doc_freq: HashMap<String, usize>,
+}
+
+impl CombinedFieldsBM25Scorer {
+    pub fn new(doc_count: usize, avg_doc_length: f32, doc_freq: HashMap<String, usize>) -> Self {
+        Self {
+            doc_count,
+            avg_doc_length,
+            doc_freq,
+        }
+    }
+
+    pub fn doc_count(&self) -> usize {
+        self.doc_count
+    }
+
+    pub fn avg_doc_length(&self) -> f32 {
+        self.avg_doc_length
+    }
+
+    /// Blended IDF for `term` over the virtual field. Returns `0.0` for a term
+    /// absent from every target column (`docFreq' == 0`), and for the inconsistent
+    /// statistics (`docFreq' > docCount'`) that drive `idf` negative or, once
+    /// `docFreq'` is large enough for the ratio to round to `-1`, to `-inf`. A
+    /// `-inf` weight times a zero document weight is `NaN`; see [`Self::doc_weight`]
+    /// for why no score may be non-finite.
+    pub fn query_weight(&self, term: &str) -> f32 {
+        match self.doc_freq.get(term).copied() {
+            Some(token_docs) if token_docs > 0 => {
+                let idf = idf(token_docs, self.doc_count);
+                if idf.is_finite() && idf > 0.0 {
+                    idf
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// BM25 term contribution for a document, given the blended term frequency
+    /// `tf'` and blended document length `dl'`.
+    ///
+    /// The result is always finite and within `[0, BM25_DOC_WEIGHT_UPPER_BOUND]`,
+    /// whatever reaches it. BM25 saturates the `tf'` factor at `K1 + 1` in exact
+    /// arithmetic, but the f32 evaluation can land above it: once `doc_norm` is
+    /// small relative to `ulp(tf')` the rounded `tf' + doc_norm` collapses back to
+    /// `tf'`, and `fl(fl((K1 + 1) · tf') / tf')` then rounds up. Large per-column
+    /// boosts can also push `tf'`, `dl'`, or `avgdl'` to infinity, and `Inf / Inf`
+    /// is `NaN`; one `NaN` contribution would poison a whole query's scores. The
+    /// clamp makes the ceiling hold by construction rather than by trusting the
+    /// query-level validation of the boosts.
+    pub fn doc_weight(&self, tf_prime: f32, dl_prime: f32) -> f32 {
+        if self.avg_doc_length <= 0.0 {
+            return 0.0;
+        }
+        let doc_norm = K1 * (1.0 - B + B * dl_prime / self.avg_doc_length);
+        let weight = (K1 + 1.0) * tf_prime / (tf_prime + doc_norm);
+        if weight.is_nan() {
+            // `Inf / Inf`, or a `NaN` that came in through `tf'` / `dl'` /
+            // `avgdl'`. There is no meaningful weight to report, and `clamp`
+            // would propagate the `NaN`.
+            return 0.0;
+        }
+        weight.clamp(0.0, BM25_DOC_WEIGHT_UPPER_BOUND)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +339,86 @@ mod tests {
         assert_eq!(doc_weight.to_bits(), 0x400c_ccce);
         assert!(doc_weight > K1 + 1.0);
         assert!(scorer.doc_weight_upper_bound().unwrap() >= doc_weight);
+    }
+
+    #[test]
+    fn test_combined_scorer_query_weight_matches_blended_idf() {
+        let doc_freq = HashMap::from([("rare".to_string(), 2), ("common".to_string(), 800)]);
+        let scorer = CombinedFieldsBM25Scorer::new(1000, 12.0, doc_freq);
+
+        // IDF uses the blended docFreq' over the blended docCount'.
+        assert_eq!(scorer.query_weight("rare"), idf(2, 1000));
+        assert_eq!(scorer.query_weight("common"), idf(800, 1000));
+        // A rarer term outweighs a common one.
+        assert!(scorer.query_weight("rare") > scorer.query_weight("common"));
+        // A term absent from every field contributes nothing.
+        assert_eq!(scorer.query_weight("missing"), 0.0);
+    }
+
+    /// No corpus statistics and no blended `(tf', dl')` may produce a non-finite
+    /// term score. A `NaN` would order arbitrarily in the top-k heap, and a weight
+    /// above [`BM25_DOC_WEIGHT_UPPER_BOUND`] would break any pruning bound derived
+    /// from that ceiling.
+    #[test]
+    fn test_combined_scorer_stays_finite_for_extreme_statistics() {
+        // `docFreq' > docCount'` drives `idf` negative and then to `-inf`.
+        let doc_freq = HashMap::from([
+            ("ok".to_string(), 1),
+            ("over".to_string(), 2_000),
+            ("way_over".to_string(), usize::MAX),
+        ]);
+        let blends = [
+            (1.0f32, 8.0f32),
+            (0.0, 0.0),
+            (f32::MAX, f32::MAX),
+            (f32::INFINITY, f32::INFINITY),
+            (f32::INFINITY, 8.0),
+            (8.0, f32::INFINITY),
+            (f32::NAN, f32::NAN),
+            (-1.0, -1.0),
+        ];
+        for avg_doc_length in [10.0f32, 0.0, f32::MAX, f32::INFINITY, f32::NAN, -1.0] {
+            let scorer = CombinedFieldsBM25Scorer::new(1000, avg_doc_length, doc_freq.clone());
+            for term in ["ok", "over", "way_over", "missing"] {
+                let query_weight = scorer.query_weight(term);
+                assert!(
+                    query_weight.is_finite() && query_weight >= 0.0,
+                    "query_weight({term}) = {query_weight:e}"
+                );
+                for (tf_prime, dl_prime) in blends {
+                    let score = query_weight * scorer.doc_weight(tf_prime, dl_prime);
+                    assert!(
+                        score.is_finite() && score >= 0.0,
+                        "score for {term} at tf'={tf_prime:e} dl'={dl_prime:e} \
+                         avgdl'={avg_doc_length:e} was {score:e}"
+                    );
+                }
+            }
+        }
+        // The unclamped reference: `idf` really does leave the usable range for
+        // these statistics, so the clamp in `query_weight` is important. In the
+        // `-inf` case multiplied by a zero `doc_weight` it would yield `NaN`.
+        assert!(idf(2_000, 1000) < 0.0);
+        assert_eq!(idf(usize::MAX, 1000), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_combined_scorer_doc_weight_saturates_and_penalizes_length() {
+        let scorer = CombinedFieldsBM25Scorer::new(1000, 10.0, HashMap::new());
+
+        // Matches the BM25 formula (with Lance's (k1 + 1) numerator).
+        let expected = {
+            let doc_norm = K1 * (1.0 - B + B * 20.0 / 10.0);
+            (K1 + 1.0) * 3.0 / (3.0 + doc_norm)
+        };
+        assert!((scorer.doc_weight(3.0, 20.0) - expected).abs() < 1e-6);
+        // More term frequency scores higher, saturating below (k1 + 1).
+        assert!(scorer.doc_weight(5.0, 20.0) > scorer.doc_weight(1.0, 20.0));
+        assert!(scorer.doc_weight(1000.0, 20.0) < K1 + 1.0);
+        // A longer document is penalized for the same term frequency.
+        assert!(scorer.doc_weight(3.0, 40.0) < scorer.doc_weight(3.0, 5.0));
+        // A degenerate (empty) corpus scores zero rather than dividing by zero.
+        let empty = CombinedFieldsBM25Scorer::new(0, 0.0, HashMap::new());
+        assert_eq!(empty.doc_weight(3.0, 20.0), 0.0);
     }
 }
