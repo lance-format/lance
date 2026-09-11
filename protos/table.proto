@@ -133,6 +133,11 @@ message Manifest {
    * * 1 << 8: reserved for datasets that may reference recognized V2 data files
    *   with different exact versions. Implementations that do not support the
    *   per-file exact-version contract must treat this bit as unknown.
+   * * 1 << 9: the table uses stable row ids and carries a fragment reuse index.
+   *   That index records how physical row addresses moved. The entries of an
+   *   index that stores stable row ids must not be remapped through it: a reader
+   *   that does so returns wrong rows, and a writer that does so while merging or
+   *   optimizing indices persists a corrupt index. Both must refuse the dataset.
    */
   uint64 reader_feature_flags = 9;
 

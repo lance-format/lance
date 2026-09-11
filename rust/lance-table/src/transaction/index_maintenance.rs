@@ -39,7 +39,7 @@ impl Transaction {
         for index in indices.iter_mut() {
             // Physical row addresses cannot follow moved rows into a new fragment.
             // Leave that fragment uncovered so the scanner reads it directly.
-            if index.results_are_row_addrs() {
+            if index.results_are_row_addrs()? {
                 continue;
             }
             let index_covers_modified_field = index.fields.iter().any(|field_id| {

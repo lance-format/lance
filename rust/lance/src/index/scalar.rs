@@ -572,7 +572,7 @@ pub async fn open_scalar_index(
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    let frag_reuse_index = dataset.open_frag_reuse_index(metrics).await?;
+    let frag_reuse_index = dataset.frag_reuse_index_for(index, metrics).await?;
 
     let index_cache = dataset
         .index_cache
@@ -613,7 +613,13 @@ pub(crate) async fn cached_scalar_index_container(
     dataset: &Dataset,
     uuid: &Uuid,
 ) -> Option<Arc<dyn ScalarIndex>> {
-    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let index_meta = dataset.load_index(uuid).await.ok().flatten()?;
+    let frag_reuse_uuid = dataset
+        .frag_reuse_index_for(&index_meta, &NoOpMetricsCollector)
+        .await
+        .ok()
+        .flatten()
+        .map(|index| index.uuid);
     let index_cache = dataset
         .index_cache
         .for_index(uuid, frag_reuse_uuid.as_ref());

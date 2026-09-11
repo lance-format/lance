@@ -11,8 +11,9 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_STABLE_ROW_IDS,
+    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
+    inherit_sticky_feature_flags,
 };
 use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
 use crate::format::{
@@ -24,6 +25,7 @@ use crate::io::{
     manifest::{read_manifest, read_manifest_indexes},
 };
 use crate::rowids::version::build_version_meta;
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
@@ -813,10 +815,18 @@ impl Transaction {
                 )?;
 
                 if next_row_id.is_some() {
-                    // We can re-use indices, but need to rewrite the fragment bitmaps
+                    // We can re-use indices, but need to rewrite the fragment bitmaps.
+                    // This holds with a fragment reuse index too: its load-time
+                    // coverage remap finds no rewritten fragment left in these
+                    // bitmaps and leaves them alone.
                     debug_assert!(rewritten_indices.is_empty());
                     for index in final_indices.iter_mut() {
-                        let results_are_row_addrs = index.results_are_row_addrs();
+                        // Not data coverage: the fragment reuse index's bitmap is
+                        // its chain's output, and the eager path leaves it alone too.
+                        if index.name == FRAG_REUSE_INDEX_NAME {
+                            continue;
+                        }
+                        let results_are_row_addrs = index.results_are_row_addrs()?;
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                             *fragment_bitmap = if results_are_row_addrs {
                                 // Stable row ids survive a rewrite, so a row-id-domain index
@@ -1356,6 +1366,17 @@ impl Transaction {
         {
             manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
             manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+        }
+        // Derived the same way. A build that applies the fragment reuse index to
+        // every index would remap stable row ids as if they were row addresses;
+        // reading returns wrong rows and optimizing indices persists them.
+        if manifest.uses_stable_row_ids()
+            && final_indices
+                .iter()
+                .any(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        {
+            manifest.reader_feature_flags |= FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
+            manifest.writer_feature_flags |= FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
         }
 
         if let Some(current_manifest) = current_manifest {
@@ -2299,6 +2320,145 @@ mod tests {
             .unwrap();
         assert_eq!(seq.version_at(0).unwrap(), 2);
         assert_eq!(seq.version_at(4).unwrap(), 2);
+    }
+
+    /// A deferred rewrite on a stable-row-id table: coverage moves by identifier
+    /// domain, the fragment reuse index entry is replaced rather than recomputed
+    /// (its bitmap is the chain's output and may straddle the group), and the
+    /// compatibility flag follows the index's presence.
+    #[test]
+    fn rewrite_build_manifest_with_frag_reuse_index_and_stable_row_ids() {
+        use crate::feature_flags::{FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_STABLE_ROW_IDS};
+        use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+        use uuid::Uuid;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        let fragment = |id: u64, row_ids: &[u64]| Fragment {
+            id,
+            files: vec![DataFile::new(
+                format!("{id}.lance"),
+                vec![0],
+                vec![0],
+                LanceFileVersion::Stable.resolve(),
+                None,
+                None,
+            )],
+            overlays: vec![],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(
+                write_row_ids(&RowIdSequence::from(row_ids)).into(),
+            )),
+            physical_rows: Some(row_ids.len()),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let index = |name: &str, type_name: &str, coverage: &[u32]| IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: name.to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter(coverage.iter().copied())),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: format!("type.googleapis.com/{type_name}"),
+                value: vec![],
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let mut manifest = Manifest::new(
+            lance_schema,
+            Arc::new(vec![
+                fragment(0, &[100, 101]),
+                fragment(1, &[102, 103]),
+                fragment(2, &[104]),
+            ]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
+        manifest.writer_feature_flags |= FLAG_STABLE_ROW_IDS;
+        manifest.next_row_id = 105;
+
+        let indices = vec![
+            index("stable", "lance.table.BTreeIndexDetails", &[0, 1, 2]),
+            index("addrs", "lance.table.ZoneMapIndexDetails", &[0, 1, 2]),
+            // Output of an earlier deferred rewrite that produced fragment 1 alone,
+            // so it straddles the group below.
+            index(
+                FRAG_REUSE_INDEX_NAME,
+                "lance.table.FragmentReuseIndexDetails",
+                &[1],
+            ),
+        ];
+        let new_frag_reuse_index = index(
+            FRAG_REUSE_INDEX_NAME,
+            "lance.table.FragmentReuseIndexDetails",
+            &[3],
+        );
+        let rewrite = |frag_reuse_index: Option<IndexMetadata>| {
+            Transaction::new(
+                manifest.version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments: vec![fragment(0, &[100, 101]), fragment(1, &[102, 103])],
+                        new_fragments: vec![fragment(3, &[100, 101, 102, 103])],
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index,
+                },
+                None,
+            )
+        };
+        let mut config = default_build_config();
+        config.use_stable_row_ids = true;
+
+        let (out, out_indices) = rewrite(Some(new_frag_reuse_index.clone()))
+            .build_manifest(Some(&manifest), indices.clone(), "txn", &config)
+            .unwrap();
+        let coverage = |name: &str| {
+            out_indices
+                .iter()
+                .find(|index| index.name == name)
+                .unwrap()
+                .fragment_bitmap
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(coverage("stable"), RoaringBitmap::from_iter([2, 3]));
+        assert_eq!(coverage("addrs"), RoaringBitmap::from_iter([2]));
+        assert_eq!(
+            out_indices
+                .iter()
+                .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+                .unwrap()
+                .uuid,
+            new_frag_reuse_index.uuid
+        );
+        assert_ne!(
+            out.reader_feature_flags & FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+            0
+        );
+        assert_ne!(
+            out.writer_feature_flags & FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+            0
+        );
+
+        // No fragment reuse index in the result: the flag is not set.
+        let (out, _) = rewrite(None)
+            .build_manifest(Some(&manifest), indices[..2].to_vec(), "txn", &config)
+            .unwrap();
+        assert_eq!(
+            out.reader_feature_flags & FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+            0
+        );
+        assert_eq!(
+            out.writer_feature_flags & FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+            0
+        );
     }
 
     #[test]

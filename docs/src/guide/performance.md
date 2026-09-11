@@ -331,6 +331,12 @@ is validated against the loaded manifest. Unmapped addresses may still have move
 whose history was trimmed, and mapped destinations may since have been removed, so callers that
 need a complete translation must verify coverage and destinations themselves.
 
+On a dataset with stable row IDs the FRI is written the same way and still describes physical
+row addresses. Indices whose entries are stable row IDs are not remapped through it, only their
+fragment coverage follows the rewritten fragments, while indices that store row addresses (zone
+map, bloom filter, FM) are remapped as usual. Such a dataset sets a reader feature flag, so Lance
+versions without this support refuse to open it rather than misread its indices.
+
 For details on the index format and usage patterns, see the
 [Fragment Reuse Index specification](../format/index/system/frag_reuse.md).
 

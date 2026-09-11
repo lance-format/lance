@@ -752,7 +752,9 @@ pub(crate) async fn optimize_vector_indices_v2(
     let distance_type = reference_index.metric_type();
     let num_partitions = ivf_model.num_partitions();
     let index_type = reference_index.sub_index_type();
-    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let frag_reuse_index = dataset
+        .frag_reuse_index_for_row_id_entries(&NoOpMetricsCollector)
+        .await?;
 
     let format_version = dataset_format_version(dataset);
 

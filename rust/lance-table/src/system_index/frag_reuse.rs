@@ -644,6 +644,33 @@ mod tests {
         );
     }
 
+    /// Stable row ids start at 0, so fragment 0's addresses are numerically the
+    /// first stable ids. The remapper cannot tell them apart: applied to
+    /// stable-id entries it rewrites them, which is why index loading gates on
+    /// the identifier domain.
+    #[test]
+    fn test_compact_fri_rewrites_colliding_stable_row_ids() {
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs: serialize_changed([addr(0, 0), addr(0, 2)]),
+                    old_frags: vec![digest(0, 3)],
+                    new_frags: vec![digest(7, 2)],
+                }],
+            }],
+        };
+        let fri = CompactFragReuseIndex::try_new(Uuid::new_v4(), details).unwrap();
+
+        // Stable ids 0, 1, 2 happen to equal fragment 0's addresses.
+        let mut stable_ids = vec![Some(0), Some(1), Some(2), Some(3)];
+        fri.remap_row_ids_in_place(&mut stable_ids);
+        assert_eq!(
+            stable_ids,
+            vec![Some(addr(7, 0)), None, Some(addr(7, 1)), Some(3)]
+        );
+    }
+
     #[test]
     fn test_compact_fri_rejects_invalid_changed_row_bitmap() {
         let details = FragReuseIndexDetails {

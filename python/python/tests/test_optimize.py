@@ -497,25 +497,41 @@ def test_index_remapping_multiple_rewrite_tasks(tmp_path: Path):
     assert index_frag_ids[0] in frag_ids
 
 
-def test_defer_index_remap(tmp_path: Path):
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_defer_index_remap(tmp_path: Path, enable_stable_row_ids: bool):
     base_dir = tmp_path / "dataset"
     data = pa.table({"i": range(6_000), "val": range(6_000)})
-    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
+    dataset = lance.write_dataset(
+        data,
+        base_dir,
+        max_rows_per_file=1_000,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
     dataset.create_scalar_index("i", "BTREE")
     options = dict(
         target_rows_per_fragment=2_000, defer_index_remap=True, num_threads=1
     )
 
     dataset.delete("i < 500")
+    row_ids_before = dataset.to_table(with_row_id=True).column("_rowid").to_pylist()
     dataset.optimize.compact_files(**options)
 
     dataset = lance.dataset(base_dir)
     indices = dataset.describe_indices()
     assert any(idx.name == "__lance_frag_reuse" for idx in indices)
+    row_ids_after = dataset.to_table(with_row_id=True).column("_rowid").to_pylist()
+    if enable_stable_row_ids:
+        assert row_ids_after == row_ids_before
+    # Stable ids 500..1000 collide with the rewritten fragment's addresses; the
+    # index must still answer with the ids.
+    assert dataset.to_table(filter="i < 510").num_rows == 10
 
 
 @pytest.mark.parametrize("use_commit_options", [True, False])
-def test_defer_index_remap_via_commit_options(tmp_path: Path, use_commit_options: bool):
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_defer_index_remap_via_commit_options(
+    tmp_path: Path, use_commit_options: bool, enable_stable_row_ids: bool
+):
     """Compaction.commit respects defer_index_remap passed in options.
 
     When options={"defer_index_remap": True} is supplied to Compaction.commit
@@ -524,7 +540,12 @@ def test_defer_index_remap_via_commit_options(tmp_path: Path, use_commit_options
     """
     base_dir = tmp_path / f"dataset_commit_opts_{use_commit_options}"
     data = pa.table({"i": range(6_000), "val": range(6_000)})
-    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
+    dataset = lance.write_dataset(
+        data,
+        base_dir,
+        max_rows_per_file=1_000,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
     dataset.create_scalar_index("i", "BTREE")
     dataset.delete("i < 500")
 

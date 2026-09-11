@@ -2034,7 +2034,9 @@ impl DatasetIndexExt for Dataset {
             let has_retired_coverage = segments
                 .iter()
                 .any(|segment| !(segment.fragment_bitmap() - &dataset_fragments).is_empty());
-            let frag_reuse_index = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+            let frag_reuse_index = self
+                .frag_reuse_index_for_row_id_entries(&NoOpMetricsCollector)
+                .await?;
             let requires_rebuild = frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
                 segments.iter().any(|segment| {
                     append::fragment_reuse_affects_segment(
@@ -2883,8 +2885,27 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
         name: &str,
     ) -> Result<LogicalVectorIndex>;
 
-    /// Opens the fragment reuse index
+    /// Opens the fragment reuse index. Use it for fragment coverage; index data
+    /// goes through [`Self::frag_reuse_index_for`], which honors the index's
+    /// identifier domain.
     async fn open_frag_reuse_index(
+        &self,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>>;
+
+    /// The fragment reuse index to remap `index`'s stored identifiers through, or
+    /// `None` when there is none or when `index` stores stable row ids, which the
+    /// fragment reuse index must not touch.
+    async fn frag_reuse_index_for(
+        &self,
+        index: &IndexMetadata,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>>;
+
+    /// [`Self::frag_reuse_index_for`] for an index being built or merged, whose
+    /// entries are the `_rowid` column and which has no metadata to classify yet:
+    /// stable row ids on this dataset, row addresses otherwise.
+    async fn frag_reuse_index_for_row_id_entries(
         &self,
         metrics: &dyn MetricsCollector,
     ) -> Result<Option<Arc<CompactFragReuseIndex>>>;
@@ -2926,7 +2947,14 @@ impl DatasetIndexInternalExt for Dataset {
         // Checking for cache existence is cheap so we just check the vector caches.
         // Scalar indices cache themselves inside `open_scalar_index` (the cache
         // key is a plugin detail), so there is no cheap scalar check here.
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
+        let index_meta = self
+            .load_index(uuid)
+            .await?
+            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
+        let frag_reuse_uuid = self
+            .frag_reuse_index_for(&index_meta, metrics)
+            .await?
+            .map(|index| index.uuid);
 
         // Check sized cache for IvfIndexState (v2+ indices).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
@@ -2953,10 +2981,6 @@ impl DatasetIndexInternalExt for Dataset {
         // We determine if this is a vector index by checking if INDEX_FILE_NAME exists in the
         // file list (available since file sizes tracking was added). If the file list is not
         // available (older indices), we fall back to checking file existence via HEAD request.
-        let index_meta = self
-            .load_index(uuid)
-            .await?
-            .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
 
         // Check if this is a vector index by looking at the files list
         let is_vector_index = if let Some(files) = &index_meta.files {
@@ -3005,11 +3029,12 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let index_meta = self
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
+        let frag_reuse_index = self.frag_reuse_index_for(&index_meta, metrics).await?;
+        let frag_reuse_uuid = frag_reuse_index.as_ref().map(|index| index.uuid);
         let object_store = self.object_store_for_index(&index_meta).await?;
 
         // Check sized cache first (v2+ indices with serializable state).
@@ -3017,7 +3042,6 @@ impl DatasetIndexInternalExt for Dataset {
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
-            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             return entry
                 .0
                 .reconstruct(
@@ -3035,7 +3059,6 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(cached.0.clone());
         }
 
-        let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
         let index_dir = self.indice_files_dir(&index_meta)?;
         let index_file = index_dir
             .clone()
@@ -3374,6 +3397,29 @@ impl DatasetIndexInternalExt for Dataset {
             Ok(Some(index))
         } else {
             Ok(None)
+        }
+    }
+
+    async fn frag_reuse_index_for(
+        &self,
+        index: &IndexMetadata,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
+        if index.stores_row_addrs(self.manifest.uses_stable_row_ids())? {
+            self.open_frag_reuse_index(metrics).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn frag_reuse_index_for_row_id_entries(
+        &self,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Arc<CompactFragReuseIndex>>> {
+        if self.manifest.uses_stable_row_ids() {
+            Ok(None)
+        } else {
+            self.open_frag_reuse_index(metrics).await
         }
     }
 

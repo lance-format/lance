@@ -31,6 +31,18 @@ The index accumulates a new **reuse version** every time a compaction is execute
 As long as all the scalar and vector indices are created after the specific reuse version,
 the indices are all caught up and the specific reuse version can be trimmed.
 
+## Stable Row IDs
+
+The index records movement of physical row addresses only. On a table with stable row IDs,
+an index whose entries are stable row IDs must not have the mappings applied to its entries;
+only its fragment coverage follows the rewritten fragments. An index whose entries are physical
+row addresses is remapped as on any other table.
+
+A table version that has stable row IDs and a Fragment Reuse Index sets
+`FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS` in both the reader and writer
+[feature flags](../../table/versioning.md#current-feature-flags), so an implementation that would
+apply the mappings to stable row IDs rejects the version instead.
+
 ## Impacts
 
 ### Conflict Resolution
