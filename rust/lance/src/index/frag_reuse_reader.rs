@@ -461,7 +461,34 @@ pub mod tests {
     }
 
     pub async fn prepare(dataset: &Dataset) -> (Transition, Vec<Fragment>) {
-        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+        prepare_partition(dataset, &source_ids, 10).await
+    }
+
+    /// [`prepare`] over a subset of fragments: scans `source_ids` in order,
+    /// alternates their rows across two uncommitted destinations numbered
+    /// from `dest_base_id`, and writes the row map for that partition.
+    pub async fn prepare_partition(
+        dataset: &Dataset,
+        source_ids: &[u64],
+        dest_base_id: u64,
+    ) -> (Transition, Vec<Fragment>) {
+        let source_fragments: Vec<Fragment> = source_ids
+            .iter()
+            .map(|id| {
+                dataset
+                    .fragments()
+                    .iter()
+                    .find(|f| f.id == *id)
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        let batch = {
+            let mut scan = dataset.scan();
+            scan.with_fragments(source_fragments.clone());
+            scan.try_into_batch().await.unwrap()
+        };
         let values = batch["i"].as_primitive::<Int32Type>();
         let labels: Vec<_> = values.iter().map(|v| (v.unwrap() % 2) as u16).collect();
         let mut destinations = Vec::new();
@@ -496,11 +523,11 @@ pub mod tests {
             destinations.extend(fragments);
         }
         for (i, fragment) in destinations.iter_mut().enumerate() {
-            fragment.id = 10 + i as u64;
+            fragment.id = dest_base_id + i as u64;
         }
         let mut source_rows = Vec::new();
         let mut sources = Vec::new();
-        for fragment in dataset.fragments().iter() {
+        for fragment in source_fragments.iter() {
             let deleted: Option<RoaringBitmap> = dataset
                 .get_fragment(fragment.id as usize)
                 .unwrap()

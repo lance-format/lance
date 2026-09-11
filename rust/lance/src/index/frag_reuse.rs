@@ -439,6 +439,54 @@ fn encode_length_delimited_field(tag: u32, bytes: &[u8]) -> Vec<u8> {
     output
 }
 
+/// Decode a committed FRI entry into its transition ledger, resolving any
+/// external content up front so the ledger's `read_external` never fires.
+/// Works for v0 entries too: legacy versions decode as lifted transitions.
+pub(crate) async fn decode_frag_reuse_ledger(
+    dataset: &Dataset,
+    entry: &IndexMetadata,
+) -> lance_core::Result<lance_table::system_index::frag_reuse::ledger::FragReuseLedger> {
+    let content = load_raw_frag_reuse_content(dataset, entry).await?;
+    let inline = prost_types::Any {
+        type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+        value: encode_length_delimited_field(1, &content),
+    };
+    lance_table::system_index::frag_reuse::ledger::FragReuseLedger::decode(
+        entry.index_version,
+        &inline,
+        |_| async {
+            Err(Error::invalid_input(
+                "re-wrapped FRI content is inline; no external read is possible",
+            ))
+        },
+    )
+    .await
+}
+
+/// The number of stable-partition transitions in the dataset's committed FRI
+/// entry (0 when the entry is absent or v0). The conflict resolver diffs this
+/// count between a rewrite's read version and the current manifest to detect
+/// a concurrent reordered rewrite that no transaction file can reveal.
+pub(crate) async fn stable_partition_transition_count(
+    dataset: &Dataset,
+) -> lance_core::Result<usize> {
+    let stored = super::load_all_indices(dataset).await?;
+    let Some(entry) = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) else {
+        return Ok(0);
+    };
+    let ledger = decode_frag_reuse_ledger(dataset, entry).await?;
+    Ok(ledger
+        .transitions()
+        .iter()
+        .filter(|transition| {
+            matches!(
+                transition.mapping(),
+                lance_table::system_index::frag_reuse::ledger::Mapping::StablePartition(_)
+            )
+        })
+        .count())
+}
+
 /// Extract a committed FRI entry's `FragmentReuseIndexDetails` content bytes
 /// verbatim, resolving an external reference but never reinterpreting the
 /// content: existing legacy versions and transitions keep their exact wire
@@ -794,16 +842,7 @@ mod tests {
     }
 
     async fn decode_entry(dataset: &Dataset, entry: &IndexMetadata) -> FragReuseLedger {
-        let content = load_raw_frag_reuse_content(dataset, entry).await.unwrap();
-        let inline = prost_types::Any {
-            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-            value: encode_length_delimited_field(1, &content),
-        };
-        FragReuseLedger::decode(entry.index_version, &inline, |_| async {
-            unreachable!("re-wrapped inline")
-        })
-        .await
-        .unwrap()
+        decode_frag_reuse_ledger(dataset, entry).await.unwrap()
     }
 
     /// One atomic Rewrite carries the whole recluster: fragments swapped, the
