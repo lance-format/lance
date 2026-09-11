@@ -212,22 +212,23 @@ public class FileReaderWriterTest {
   }
 
   @Test
-  void testWriteWithPageOptions(@TempDir Path tempDir) throws Exception {
+  void testWriteRejectsZeroMaxPageBytes(@TempDir Path tempDir) {
     String filePath = tempDir.resolve("page_options.lance").toString();
-    FileWriteOptions options =
-        FileWriteOptions.builder().dataCacheBytes(1024).maxPageBytes(2048).build();
+    FileWriteOptions options = FileWriteOptions.builder().maxPageBytes(0).build();
 
-    try (BufferAllocator allocator = new RootAllocator();
-        LanceFileWriter writer =
-            LanceFileWriter.open(
-                filePath, allocator, null, Optional.empty(), Collections.emptyMap(), options);
-        VectorSchemaRoot batch = createBatch(allocator)) {
-      writer.write(batch);
-    }
-
-    try (BufferAllocator allocator = new RootAllocator();
-        LanceFileReader reader = LanceFileReader.open(filePath, allocator)) {
-      assertEquals(100, reader.numRows());
+    try (BufferAllocator allocator = new RootAllocator()) {
+      IllegalArgumentException error =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  LanceFileWriter.open(
+                      filePath,
+                      allocator,
+                      null,
+                      Optional.empty(),
+                      Collections.emptyMap(),
+                      options));
+      assertTrue(error.getMessage().contains("max_page_bytes must be greater than 0, got 0"));
     }
   }
 

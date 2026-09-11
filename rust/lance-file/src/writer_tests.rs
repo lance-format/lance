@@ -1159,6 +1159,43 @@ mod tests {
         assert_eq!(total_page_num, 8)
     }
 
+    #[rstest]
+    #[case::schema_writer(false)]
+    #[case::lazy_writer(true)]
+    #[tokio::test]
+    async fn test_zero_max_page_bytes_rejected(#[case] lazy: bool) {
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let object_writer = object_store.create(&path).await.unwrap();
+        let options = FileWriterOptions {
+            max_page_bytes: Some(0),
+            ..Default::default()
+        };
+
+        let result = if lazy {
+            versions::create_lazy_writer(ConcreteFileVersion::V2_0, object_writer, options)
+        } else {
+            let schema = LanceSchema::try_from(&Schema::new(vec![Field::new(
+                "data",
+                DataType::UInt64,
+                false,
+            )]))
+            .unwrap();
+            versions::create_writer(ConcreteFileVersion::V2_0, object_writer, schema, options)
+        };
+
+        let error = result.err().expect("zero max_page_bytes should fail");
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("max_page_bytes must be greater than 0, got 0")
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_max_page_bytes_env_var() {
         let arrow_field = Field::new("data", DataType::UInt64, false);
