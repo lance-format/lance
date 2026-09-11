@@ -3567,7 +3567,16 @@ impl FragmentReader {
         let (unique_indices, restore_order) = if is_sorted_and_unique {
             (Cow::Borrowed(indices), None)
         } else {
-            let mut sorted_positions = (0..indices.len()).collect::<Vec<_>>();
+            let survives_deletion = |index| {
+                self.make_deletions_null
+                    || self
+                        .deletion_vec
+                        .as_ref()
+                        .is_none_or(|deletion_vec| !deletion_vec.contains(index))
+            };
+            let mut sorted_positions = (0..indices.len())
+                .filter(|position| survives_deletion(indices[*position]))
+                .collect::<Vec<_>>();
             sorted_positions.sort_unstable_by_key(|position| indices[*position]);
 
             let mut unique: Vec<u32> = Vec::with_capacity(indices.len());
@@ -3579,6 +3588,13 @@ impl FragmentReader {
                 }
                 restore_indices[position] = (unique.len() - 1) as u32;
             }
+            let restore_indices = restore_indices
+                .into_iter()
+                .zip(indices)
+                .filter_map(|(restore_index, &index)| {
+                    survives_deletion(index).then_some(restore_index)
+                })
+                .collect::<Vec<_>>();
             (Cow::Owned(unique), Some(UInt32Array::from(restore_indices)))
         };
 
@@ -6196,6 +6212,44 @@ mod tests {
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from(vec![121, 125, 128])
         );
+
+        // Unordered deleted rows are omitted while surviving rows retain request order.
+        let batch = fragment
+            .take_rows(
+                &[8, 2, 5, 4, 1],
+                dataset.schema(),
+                false,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(vec![128, 125, 121])
+        );
+
+        // Readers configured to materialize deletions retain their requested positions.
+        let mut reader = fragment
+            .open(
+                dataset.schema(),
+                FragReadConfig::default().with_row_id(true),
+            )
+            .await
+            .unwrap();
+        reader.with_make_deletions_null();
+        let batch = reader.take_as_batch(&[8, 2, 5, 4, 1], None).await.unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(vec![128, 122, 125, 124, 121])
+        );
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+        assert!(row_ids.is_valid(0));
+        assert!(row_ids.is_null(1));
+        assert!(row_ids.is_valid(2));
+        assert!(row_ids.is_null(3));
+        assert!(row_ids.is_valid(4));
 
         // Empty indices gives empty result
         let batch = fragment
