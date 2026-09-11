@@ -19,7 +19,9 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use arrow::compute::CastOptions;
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, new_null_array};
+use arrow_cast::cast_with_options;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use async_trait::async_trait;
 use lance_core::datatypes::{LANCE_FIELD_ID_KEY, Schema};
@@ -1635,8 +1637,13 @@ fn field_id_of(field: &ArrowField) -> Option<i32> {
 /// checked against the logical schema, so for them every column is present and
 /// this only appends `_tombstone`.
 ///
-/// A primary key the batch does not carry is an error — there is no value to
-/// invent — and so is a column whose type does not match the schema.
+/// A column whose type changed is cast, the same way `alter_columns` casts the
+/// base data, so a replayed row lands in the state it would have had if it had
+/// been written after the change. A cast that would lose information is an
+/// error, not a silent null.
+///
+/// A primary key the batch does not carry stays an error — there is no value to
+/// invent.
 fn conform_to_storage_schema(
     batch: RecordBatch,
     storage_schema: &Arc<ArrowSchema>,
@@ -1658,10 +1665,33 @@ fn conform_to_storage_schema(
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(storage_schema.fields().len());
     for field in storage_schema.fields() {
         let name = field.name();
-        if let Some(column) = field_id_of(field).and_then(|id| by_field_id.get(&id)) {
-            columns.push((*column).clone());
-        } else if let Some(column) = batch.column_by_name(name) {
-            columns.push(column.clone());
+        let carried = field_id_of(field)
+            .and_then(|id| by_field_id.get(&id).map(|c| (*c).clone()))
+            .or_else(|| batch.column_by_name(name).cloned());
+        if let Some(column) = carried {
+            columns.push(if column.data_type() == field.data_type() {
+                column
+            } else {
+                // `safe: false` so a lossy cast is an error rather than a
+                // column of nulls -- the same option `alter_columns` casts the
+                // base data under, so both halves of the table agree.
+                cast_with_options(
+                    &column,
+                    field.data_type(),
+                    &CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| {
+                    Error::invalid_input(format!(
+                        "column '{name}' was written as {} and the schema now declares {}, \
+                         which it cannot be cast to: {e}",
+                        column.data_type(),
+                        field.data_type(),
+                    ))
+                })?
+            });
         } else if name == TOMBSTONE {
             columns.push(Arc::new(BooleanArray::from(vec![false; n])));
         } else if pk_columns.iter().any(|c| c == name) {
@@ -4598,7 +4628,7 @@ pub fn new_shared_stats() -> SharedWriteStats {
 mod tests {
     use super::*;
     use crate::dataset::mem_wal::test_util::failing_memory_store;
-    use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, StringArray};
+    use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field};
     use lance_core::FenceReason;
     use rstest::rstest;
@@ -4831,26 +4861,112 @@ mod tests {
         );
     }
 
-    /// A column whose type changed is a conflict, not a drift to paper over.
+    /// A widened type is cast, matching what `alter_columns` did to the rows
+    /// already in the base table.
     #[test]
-    fn test_conform_refuses_a_retyped_column() {
-        let storage = schema_with_tombstone(&create_test_schema());
-        let retyped = RecordBatch::try_new(
+    fn test_conform_casts_a_widened_column() {
+        let widened = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("count", DataType::Int64, true),
+        ]);
+        let storage = schema_with_tombstone(&widened);
+
+        let narrow = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![
                 Field::new("id", DataType::Int32, false),
-                Field::new("name", DataType::Boolean, true),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("count", DataType::Int32, true),
             ])),
             vec![
                 Arc::new(Int32Array::from(vec![1])),
-                Arc::new(BooleanArray::from(vec![true])),
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int32Array::from(vec![7])),
             ],
         )
         .unwrap();
 
-        let error = conform_to_storage_schema(retyped, &storage, &["id".to_string()]).unwrap_err();
+        let out = conform_to_storage_schema(narrow, &storage, &["id".to_string()]).unwrap();
+        assert_eq!(out.schema(), storage);
+        let counts = out
+            .column_by_name("count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(counts.value(0), 7, "the value survives the widening");
+    }
+
+    /// A cast that would lose the value is an error, not a column of nulls.
+    #[test]
+    fn test_conform_refuses_a_lossy_retype() {
+        let numeric = schema_with_tombstone(&ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Int32, true),
+        ]));
+        let textual = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["not a number"])),
+            ],
+        )
+        .unwrap();
+
+        let error = conform_to_storage_schema(textual, &numeric, &["id".to_string()]).unwrap_err();
         assert!(
             matches!(error, Error::InvalidInput { .. }),
             "expected InvalidInput, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("name"),
+            "the error should name the column: {error}"
+        );
+    }
+
+    /// A field id outlives a rename, so matching on it keeps the column's rows
+    /// where matching on the name would null them.
+    #[test]
+    fn test_conform_follows_a_field_id_through_a_rename() {
+        fn with_id(field: ArrowField, id: i32) -> ArrowField {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(LANCE_FIELD_ID_KEY.to_string(), id.to_string());
+            field.with_metadata(metadata)
+        }
+
+        // The entry was written while field 1 was called `before`.
+        let entry = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                with_id(Field::new("id", DataType::Int32, false), 0),
+                with_id(Field::new("before", DataType::Utf8, true), 1),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["kept"])),
+            ],
+        )
+        .unwrap();
+
+        // The schema now calls field 1 `after`.
+        let storage = schema_with_tombstone(&ArrowSchema::new(vec![
+            with_id(Field::new("id", DataType::Int32, false), 0),
+            with_id(Field::new("after", DataType::Utf8, true), 1),
+        ]));
+
+        let out = conform_to_storage_schema(entry, &storage, &["id".to_string()]).unwrap();
+        let after = out
+            .column_by_name("after")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            after.value(0),
+            "kept",
+            "the id should carry the value to the new name; a name match would null it"
         );
     }
 
