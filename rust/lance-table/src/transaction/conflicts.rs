@@ -198,9 +198,18 @@ impl PartialEq for Operation {
                     && a_field == b_field
             }
             (
-                Self::DataReplacement { replacements: a },
-                Self::DataReplacement { replacements: b },
-            ) => a.len() == b.len() && a.iter().all(|r| b.contains(r)),
+                Self::DataReplacement {
+                    replacements: a,
+                    replaced_offsets: a_offsets,
+                },
+                Self::DataReplacement {
+                    replacements: b,
+                    replaced_offsets: b_offsets,
+                },
+            ) => {
+                compare_vec(a, b)
+                    && a_offsets.as_ref().map(|o| &o.0) == b_offsets.as_ref().map(|o| &o.0)
+            }
             // Handle all remaining combinations.
             // We spell out all combinations explicitly to prevent
             // us accidentally handling a new case in the wrong way.
