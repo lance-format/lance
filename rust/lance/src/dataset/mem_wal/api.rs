@@ -702,7 +702,7 @@ impl DatasetMemWalExt for Dataset {
             base_path,
             base_uri,
             config,
-            Arc::new(self.schema().into()),
+            Arc::new(super::arrow_schema_with_field_ids(self.schema())),
             index_configs,
         )
         .await

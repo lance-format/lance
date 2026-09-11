@@ -48,6 +48,10 @@ pub mod write;
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
+use lance_core::datatypes::{LANCE_FIELD_ID_KEY, Schema};
+
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
 /// Column name for the mem_wal tombstone (delete sentinel) marker.
@@ -119,6 +123,45 @@ pub fn relax_non_pk_nullability(
 /// Idempotent: a schema that already carries `_tombstone` (a reopen/replay
 /// path) is returned unchanged. Schema-level metadata and per-field metadata
 /// (e.g. the `lance-schema:unenforced-primary-key` marker) are preserved.
+/// The schema's Arrow form, with each field's id carried in its metadata.
+///
+/// `From<&Field> for ArrowField` drops the id, which leaves everything
+/// downstream matching on name alone. That holds until a column is renamed: the
+/// name is the part a rename changes and the id is the part it keeps, so a
+/// name-only match loses the column. Data files have always been addressed by
+/// id (`DataFile.fields` lists them); carrying it into the memtable's storage
+/// schema puts the fresh tier on the same footing, and Arrow IPC keeps field
+/// metadata, so every WAL entry written under this schema carries it too.
+///
+/// Scoped to the memtable path deliberately: emitting the id from the global
+/// Arrow conversion would change every schema Lance hands out, including for
+/// callers that compare schemas for equality.
+pub(crate) fn arrow_schema_with_field_ids(schema: &Schema) -> ArrowSchema {
+    let arrow: ArrowSchema = schema.into();
+    let ids: HashMap<&str, i32> = schema
+        .fields
+        .iter()
+        .map(|f| (f.name.as_str(), f.id))
+        .collect();
+    let fields: Vec<ArrowField> = arrow
+        .fields()
+        .iter()
+        .map(|field| {
+            let Some(id) = ids
+                .get(field.name().as_str())
+                .copied()
+                .filter(|id| *id >= 0)
+            else {
+                return field.as_ref().clone();
+            };
+            let mut metadata = field.metadata().clone();
+            metadata.insert(LANCE_FIELD_ID_KEY.to_string(), id.to_string());
+            field.as_ref().clone().with_metadata(metadata)
+        })
+        .collect();
+    ArrowSchema::new_with_metadata(fields, arrow.metadata().clone())
+}
+
 pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
     if base.column_with_name(TOMBSTONE).is_some() {
         return Arc::new(base.clone());
