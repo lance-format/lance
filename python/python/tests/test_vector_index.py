@@ -1301,6 +1301,17 @@ def test_create_ivf_rq_multi_bit_searches_l2_and_cosine():
         )
         assert result.num_rows == 10
 
+    quantized_refined = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": mat[0],
+            "k": 10,
+            "quantized_refine_factor": 4,
+        },
+        columns=["id"],
+    )
+    assert quantized_refined.num_rows == 10
+
     cosine_ds = lance.write_dataset(tbl, "memory://")
     cosine_ds = _assert_recall_at_least(cosine_ds, mat[1], metric="cosine")
     cosine_stats = cosine_ds.stats.index_stats("vector_idx")
@@ -2582,6 +2593,18 @@ def test_vector_index_invalid_approx_mode(indexed_dataset):
                 "q": np.random.randn(128),
                 "k": 10,
                 "approx_mode": "hacc",
+            }
+        )
+
+
+def test_vector_index_invalid_quantized_refine_factor(indexed_dataset):
+    with pytest.raises(ValueError, match="Quantized refine factor"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "quantized_refine_factor": 0,
             }
         )
 

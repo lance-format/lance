@@ -14,7 +14,10 @@ use crate::metrics::MetricsCollector;
 use crate::vector::graph::OrderedNode;
 use crate::vector::storage::{QueryResidual, QueryScratch, VectorStore};
 use crate::vector::{flat, hnsw};
-use crate::{prefilter::PreFilter, vector::Query};
+use crate::{
+    prefilter::PreFilter,
+    vector::{PartitionSearchResult, Query},
+};
 /// A sub index for IVF index
 pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     type QueryParams: Send + Sync + for<'a> From<&'a Query>;
@@ -71,6 +74,27 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         _scratch: &mut QueryScratch,
     ) -> Result<RecordBatch> {
         self.search(query, k, params, storage, prefilter, metrics)
+    }
+
+    /// Search the sub-index while preserving each result's partition-local
+    /// storage offset. Implementations that cannot expose stable offsets return
+    /// [`Error::NotSupported`].
+    #[allow(clippy::too_many_arguments)]
+    fn search_with_candidates_with_scratch(
+        &self,
+        _query: ArrayRef,
+        _candidate_limit: usize,
+        _params: Self::QueryParams,
+        _storage: &impl VectorStore,
+        _prefilter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+        _partition_id: u32,
+        _residual: Option<QueryResidual<'_>>,
+        _scratch: &mut QueryScratch,
+    ) -> Result<PartitionSearchResult> {
+        Err(Error::not_supported(
+            "partition-local candidate identities are not supported for this sub-index",
+        ))
     }
 
     /// Return true if this sub-index can accumulate candidates into a caller-owned heap.
