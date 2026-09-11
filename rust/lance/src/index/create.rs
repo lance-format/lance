@@ -3171,10 +3171,10 @@ mod tests {
         );
         assert_eq!(count_in_range(&dataset, &merged, 50, 100).await, 50);
 
-        // Phase 2 — retire fragment 0: delete >10% of its rows so compaction
-        // rewrites only frag 0 (frag 1 has no deletions and is at target size).
-        // The committed per-fragment segment now claims a fragment the dataset
-        // no longer has.
+        // Phase 2 — delete >10% of fragment 0's rows so compaction rewrites its
+        // data. Preserving row order in the ID-sorted manifest also relabels the
+        // untouched trailing fragment, so both committed segments must follow
+        // their stable row-id coverage to fresh fragment IDs.
         dataset.delete("id < 16").await.unwrap();
         crate::dataset::optimize::compact_files(
             &mut dataset,
@@ -3193,16 +3193,15 @@ mod tests {
             .collect();
         assert!(!live_frags.contains(0), "compaction should retire frag 0");
 
-        // Filtered merge: coverage drops the retired fragment but keeps the
-        // live one, and the merged page data does not leak the retired row ids
-        // (ids < 16 lived only in frag 0, so the range now returns nothing).
+        // Filtered merge: coverage follows the current fragments, and the
+        // merged page data does not leak the retired row ids (ids < 16 lived
+        // only in frag 0, so the range now returns nothing).
         let merged = dataset
             .merge_existing_index_segments(dataset.load_indices_by_name("id_btree").await.unwrap())
             .await
             .unwrap();
         let coverage = merged.fragment_bitmap.as_ref().unwrap();
-        assert!(!coverage.contains(0), "must drop retired frag 0");
-        assert!(coverage.contains(1), "must keep live frag 1");
+        assert_eq!(coverage, &live_frags);
         assert_eq!(
             count_in_range(&dataset, &merged, 0, 16).await,
             0,

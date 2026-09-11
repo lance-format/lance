@@ -696,21 +696,37 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     crate::dataset::versions::check_manifest_storage_version(manifest)
 }
 
-/// Reject a manifest in which two fragments share an id. Per-fragment state is
-/// keyed by fragment id — deletion file paths, cached row id sequences, row
-/// addresses — so a duplicate makes it ambiguous which rows that state describes.
+/// Reject a manifest in which fragment identities are ambiguous or out of order.
+/// Per-fragment state is keyed by fragment id — deletion file paths, cached row
+/// id sequences, row addresses — so a duplicate makes it ambiguous which rows
+/// that state describes.
 ///
 /// Runs after the legacy fixups above, so a dataset that needs a rollback for some
-/// other reason is diagnosed with that first. Relies on `build_manifest` leaving
-/// the fragments sorted by id.
+/// other reason is diagnosed with that first.
 fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
-    if let Some(pair) = manifest.fragments.windows(2).find(|p| p[0].id == p[1].id) {
+    let mut fragment_ids = HashSet::with_capacity(manifest.fragments.len());
+    if let Some(fragment) = manifest
+        .fragments
+        .iter()
+        .find(|fragment| !fragment_ids.insert(fragment.id))
+    {
         return Err(Error::invalid_input(format!(
             "The commit would produce two fragments with id {}. Fragment ids must be \
              unique. Datasets written by Lance 0.16 and earlier may already contain \
              duplicate ids; those have to be rewritten, or rolled back to a version \
              without the duplicate.",
-            pair[0].id
+            fragment.id
+        )));
+    }
+    if let Some(fragments) = manifest
+        .fragments
+        .windows(2)
+        .find(|fragments| fragments[0].id > fragments[1].id)
+    {
+        return Err(Error::invalid_input(format!(
+            "The commit would place fragment {} before lower fragment id {}. Fragment ids must \
+             remain sorted in increasing order",
+            fragments[0].id, fragments[1].id
         )));
     }
     Ok(())
@@ -1743,6 +1759,24 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    #[test]
+    fn test_check_fragment_ids_requires_sorted_order() {
+        let manifest = Manifest::new(
+            Schema::try_from(&ArrowSchema::empty()).unwrap(),
+            Arc::new(vec![Fragment::new(5), Fragment::new(2)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let error = check_fragment_ids(&manifest).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Fragment ids must remain sorted in increasing order")
+        );
+    }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler
