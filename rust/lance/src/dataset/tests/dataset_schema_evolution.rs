@@ -71,7 +71,7 @@ async fn test_add_sub_column_to_struct_col_unsupported(
     )]
     version: LanceFileVersion,
 ) {
-    let mut dataset = prepare_initial_dataset_with_struct_col(version, 3).await;
+    let mut dataset = Box::pin(prepare_initial_dataset_with_struct_col(version, 3)).await;
 
     // add 2 sub-column of animal
     let batch = prepare_sub_column_batch(3).await;
@@ -99,7 +99,7 @@ async fn test_add_sub_column_to_struct_col_unsupported(
 async fn test_add_sub_column_to_struct_col(
     #[values(LanceFileVersion::V2_2)] version: LanceFileVersion,
 ) {
-    let mut dataset = prepare_initial_dataset_with_struct_col(version, 3).await;
+    let mut dataset = Box::pin(prepare_initial_dataset_with_struct_col(version, 3)).await;
 
     // add 2 sub-columns of animal
     let batch = prepare_sub_column_batch(3).await;

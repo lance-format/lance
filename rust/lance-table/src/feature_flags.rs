@@ -55,6 +55,19 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 8;
+/// Some fragment stores its row id sequence as a hidden column of a data file
+/// rather than inline in the manifest (`RowIdMeta::Column`).
+///
+/// A reader without this bit sees an unset `row_id_sequence` oneof and would
+/// take the fragment to have no row ids at all, on a table whose manifest says
+/// every fragment has them. Both readers and writers must refuse the table.
+///
+/// Deliberately sits above [`FLAG_UNKNOWN`]: spilled row ids are not a released
+/// feature, so every released build already refuses the dataset without needing
+/// a change of its own. This build understands the bit only in debug builds or
+/// when [`ENABLE_UNSTABLE_SPILLED_ROW_IDS_ENV`] is set, mirroring
+/// [`FLAG_UNSTABLE_DATA_OVERLAY_FILES`].
+pub const FLAG_UNSTABLE_SPILLED_ROW_IDS: u64 = 1 << 9;
 
 // Supported flags stay below the unknown boundary; the mixed-version bit is
 // reserved at the boundary until its storage contract lands.
@@ -69,6 +82,11 @@ pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
 pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
+
+/// Environment variable that opts a release build into reading and writing row
+/// id sequences spilled to a hidden data file column before the feature is
+/// generally released.
+pub const ENABLE_UNSTABLE_SPILLED_ROW_IDS_ENV: &str = "LANCE_ENABLE_UNSTABLE_SPILLED_ROW_IDS";
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -139,6 +157,16 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_UNSTABLE_DATA_OVERLAY_FILES;
     }
 
+    let has_spilled_row_ids = manifest.fragments.iter().any(|frag| {
+        frag.row_id_meta
+            .as_ref()
+            .is_some_and(|meta| meta.column_file().is_some())
+    });
+    if has_spilled_row_ids {
+        manifest.reader_feature_flags |= FLAG_UNSTABLE_SPILLED_ROW_IDS;
+        manifest.writer_feature_flags |= FLAG_UNSTABLE_SPILLED_ROW_IDS;
+    }
+
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
@@ -174,6 +202,12 @@ fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
 }
 
+/// Whether this build understands row id sequences spilled to a data file
+/// column. Gated the same way as [`data_overlay_files_enabled`].
+pub fn spilled_row_ids_enabled() -> bool {
+    cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_SPILLED_ROW_IDS_ENV).is_some()
+}
+
 /// Clear `flag` from `flags` when its gating feature is not enabled in this
 /// build; leave it set otherwise. One call per unstable flag, so support for
 /// several unstable features chains cleanly.
@@ -186,18 +220,23 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// The feature-flag bits this build understands, given whether overlay support
 /// is enabled. Split out from [`supported_flags`] so the policy is testable
 /// without toggling the build profile or environment.
-fn supported_flags_when(overlay_enabled: bool) -> u64 {
+fn supported_flags_when(overlay_enabled: bool, spilled_row_ids: bool) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
         overlay_enabled,
     );
+    // Added rather than cleared: the bit is above `FLAG_UNKNOWN`, so it is not
+    // in the base set to begin with.
+    if spilled_row_ids {
+        supported |= FLAG_UNSTABLE_SPILLED_ROW_IDS;
+    }
     supported
 }
 
 fn supported_flags() -> u64 {
-    supported_flags_when(data_overlay_files_enabled())
+    supported_flags_when(data_overlay_files_enabled(), spilled_row_ids_enabled())
 }
 
 pub fn can_read_dataset(reader_flags: u64) -> bool {
@@ -323,13 +362,23 @@ mod tests {
     fn test_data_overlay_flag_release_gating() {
         // Release default (overlays disabled): the overlay flag is treated as
         // unknown so the dataset is refused, while other known flags still pass.
-        let supported = supported_flags_when(false);
+        let supported = supported_flags_when(false, false);
         assert_eq!(supported & FLAG_UNSTABLE_DATA_OVERLAY_FILES, 0);
         assert_eq!(FLAG_DELETION_FILES & !supported, 0);
         assert_ne!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
         // Enabled (debug or env opt-in): the overlay flag is understood.
-        let supported = supported_flags_when(true);
+        let supported = supported_flags_when(true, false);
         assert_eq!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
+    }
+
+    #[test]
+    fn test_spilled_row_ids_flag_release_gating() {
+        // The bit sits above `FLAG_UNKNOWN`, so a build that has not opted in
+        // refuses the dataset without any change of its own.
+        let supported = supported_flags_when(true, false);
+        assert_ne!(FLAG_UNSTABLE_SPILLED_ROW_IDS & !supported, 0);
+        let supported = supported_flags_when(true, true);
+        assert_eq!(FLAG_UNSTABLE_SPILLED_ROW_IDS & !supported, 0);
     }
 
     #[test]

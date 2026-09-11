@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod spill;
 mod validate;
 
 use super::Dataset;
@@ -16,6 +17,8 @@ use lance_table::{
 };
 use std::sync::Arc;
 
+pub use spill::DEFAULT_INLINE_ROW_IDS_MAX_BYTES;
+pub(crate) use spill::build_row_id_meta;
 pub(super) use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the given dataset and fragment.
@@ -52,6 +55,20 @@ async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<
                 .get_range(range)
                 .await?;
             read_row_ids(&data)
+        }
+        Some(row_id_meta @ RowIdMeta::Column(data_file)) => {
+            let data_file = data_file.clone();
+            let dataset_clone = dataset.clone();
+            let key = RowIdSequenceKey {
+                fragment_id: fragment.id,
+                row_id_meta,
+            };
+            dataset
+                .metadata_cache
+                .get_or_insert_with_key(key, || async move {
+                    spill::read_spilled_row_id_sequence(&dataset_clone, &data_file).await
+                })
+                .await
         }
     }
 }

@@ -89,7 +89,7 @@ use std::sync::Arc;
 
 use super::fragment::FileFragment;
 use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
-use super::rowids::load_row_id_sequences;
+use super::rowids::{build_row_id_meta, load_row_id_sequences};
 use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
@@ -249,6 +249,14 @@ pub struct CompactionOptions {
     /// not be remapped during this compaction operation. Instead, the fragment reuse index
     /// is updated and will be used to perform remapping later.
     pub defer_index_remap: bool,
+    /// Largest encoded row id sequence, in bytes, that a compacted fragment may
+    /// keep inline in the manifest. Anything larger is spilled to a hidden
+    /// column of a data file. Defaults to
+    /// [`DEFAULT_INLINE_ROW_IDS_MAX_BYTES`](crate::dataset::rowids::DEFAULT_INLINE_ROW_IDS_MAX_BYTES).
+    ///
+    /// Only has an effect on datasets that use stable row ids.
+    #[serde(default)]
+    pub inline_row_ids_max_bytes: Option<usize>,
     /// How the old-to-new row-address mapping used to remap indices is built.
     /// Defaults to [`IndexRemapMode::Direct`].
     #[serde(default)]
@@ -329,6 +337,7 @@ impl Default for CompactionOptions {
             batch_size: None,
             io_buffer_size: None,
             defer_index_remap: false,
+            inline_row_ids_max_bytes: None,
             index_remap_mode: IndexRemapMode::Direct,
             compaction_mode: None,
             enable_binary_copy: false,
@@ -2540,7 +2549,13 @@ async fn rewrite_files(
         } else {
             if dataset.manifest.uses_stable_row_ids() {
                 log::info!("Compaction task {}: rechunking stable row ids", task_id);
-                rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
+                rechunk_stable_row_ids(
+                    dataset.as_ref(),
+                    &mut new_fragments,
+                    &fragments,
+                    options.inline_row_ids_max_bytes,
+                )
+                .await?;
                 recalc_versions_for_rewritten_fragments(
                     dataset.as_ref(),
                     &mut new_fragments,
@@ -2589,6 +2604,7 @@ async fn rechunk_stable_row_ids(
     dataset: &Dataset,
     new_fragments: &mut [Fragment],
     old_fragments: &[Fragment],
+    inline_max_bytes: Option<usize>,
 ) -> Result<()> {
     let mut old_sequences = load_row_id_sequences(dataset, old_fragments)
         .try_collect::<Vec<_>>()
@@ -2639,9 +2655,7 @@ async fn rechunk_stable_row_ids(
     )?;
 
     for (fragment, sequence) in new_fragments.iter_mut().zip(new_sequences) {
-        // TODO: if large enough, serialize to separate file
-        let serialized = lance_table::rowids::write_row_ids(&sequence);
-        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
+        fragment.row_id_meta = Some(build_row_id_meta(dataset, &sequence, inline_max_bytes).await?);
     }
 
     Ok(())
@@ -2664,7 +2678,9 @@ async fn recalc_versions_for_rewritten_fragments(
         let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
             match row_id_meta {
                 RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
-                RowIdMeta::External(_file) => frag.physical_rows.unwrap_or(0) as u64,
+                RowIdMeta::External(_) | RowIdMeta::Column(_) => {
+                    frag.physical_rows.unwrap_or(0) as u64
+                }
             }
         } else {
             frag.physical_rows.unwrap_or(0) as u64
