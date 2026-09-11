@@ -5684,13 +5684,34 @@ mod tests {
             // `_fri` collection for the whole run instead of guessing.
             let future_entry = IndexMetadata {
                 index_version: 2,
-                ..entry
+                ..entry.clone()
             };
             let mut inspection = CleanupInspection::default();
             inspection
                 .frag_reuse_entries
                 .insert(uuid, (future_entry, true));
             assert!(!task.resolve_frag_reuse_map_ids(&mut inspection).await);
+
+            // So does an unknown envelope-level record inside a supported
+            // index_version: it may reference row maps this build cannot
+            // see, so no map may be treated as unreferenced this run.
+            let mut unknown_content = content.clone();
+            unknown_content.extend(reader_tests::field(9, b"future envelope record"));
+            let unknown_entry = IndexMetadata {
+                index_details: Some(Arc::new(prost_types::Any {
+                    type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                    value: reader_tests::field(1, &unknown_content),
+                })),
+                ..entry
+            };
+            let mut inspection = CleanupInspection::default();
+            inspection
+                .frag_reuse_entries
+                .insert(uuid, (unknown_entry, true));
+            assert!(
+                !task.resolve_frag_reuse_map_ids(&mut inspection).await,
+                "an unknown envelope record must disable _fri collection"
+            );
         }
 
         /// E: the full lifecycle, asserting every stage. A stable-partition

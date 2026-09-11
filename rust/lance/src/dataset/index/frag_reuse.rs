@@ -262,6 +262,14 @@ fn is_index_remap_caught_up(
     }
 }
 
+/// Conflict-source marker for a trim whose rebase derived nothing left to
+/// trim: a concurrent commit already satisfied it, so instead of writing an
+/// empty no-op manifest version the commit attempt aborts with a retryable
+/// conflict carrying this message, and [`cleanup_frag_reuse_index`] treats
+/// exactly that conflict as success.
+pub(crate) const TAGGED_TRIM_REBASED_TO_NOOP: &str =
+    "the tagged trim rebased to nothing to trim; a concurrent commit already satisfied it";
+
 /// The outcome of deriving a tagged trim against the current manifest.
 #[derive(Debug)]
 pub(crate) enum TaggedTrimOutcome {
@@ -340,6 +348,14 @@ pub(crate) async fn derive_superseded_segments(
         let mut kept_direct = RoaringBitmap::new();
         let mut kept_any = false;
         for segment in segments {
+            // A segment this build cannot serve (unknown type or newer index
+            // version) is opaque: its translated coverage is invisible, so it
+            // is never pruned, and it must not mask anyone -- the reader will
+            // not answer queries from it, so its bitmap covers nothing.
+            if !crate::index::index_is_usable(segment) {
+                kept_any = true;
+                continue;
+            }
             let Some(stored_bitmap) = segment.fragment_bitmap.as_ref() else {
                 // Unknown coverage cannot be reasoned about; always keep.
                 kept_any = true;
@@ -422,13 +438,26 @@ async fn cleanup_tagged_frag_reuse_index(dataset: &mut Dataset) -> lance_core::R
     };
 
     let transaction = Transaction::new(dataset.manifest.version, operation, None);
-    dataset
+    match dataset
         .apply_commit(
             transaction,
             &crate::dataset::ManifestWriteConfig::default().with_tagged_frag_reuse_trim(),
             &Default::default(),
         )
         .await
+    {
+        Ok(()) => Ok(()),
+        Err(error @ Error::RetryableCommitConflict { .. })
+            if error.to_string().contains(TAGGED_TRIM_REBASED_TO_NOOP) =>
+        {
+            // The rebase found nothing left to trim: a concurrent commit
+            // (e.g. an index catching up mid-trim) already satisfied this
+            // maintenance run, so succeed without writing a version.
+            dataset.checkout_latest().await?;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether a `CreateIndex` payload has the tagged-trim shape: exactly the
@@ -513,31 +542,44 @@ fn split_trim_elements(content: &[u8]) -> Result<Vec<TrimElement>> {
     Ok(elements)
 }
 
+/// One logical index's coverage as the trim sees it: provenance is the union
+/// of every stored segment bitmap (any segment, usable by this build or not,
+/// pins the records its addresses need), while direct coverage counts only
+/// segments this build can actually serve (`index_is_usable`) -- an unusable
+/// segment answers no query, so its bitmap must not mask anyone's need for a
+/// translation.
+#[derive(Default)]
+struct IndexGroupCoverage {
+    provenance: RoaringBitmap,
+    direct: RoaringBitmap,
+}
+
 /// Whether some index still needs this transition to translate its rows.
 ///
 /// RETAIN iff there is a logical index I (its stored segments grouped by
 /// name, system indices exempt) such that:
 /// * some segment's stored provenance bitmap intersects the transition's
 ///   sources (I holds addresses the transition moves), AND
-/// * some destination is not directly covered by any segment of I (I has not
-///   fully re-derived onto the transition's output).
+/// * some destination is not directly covered by any USABLE segment of I
+///   (I has not fully re-derived onto the transition's output in a form this
+///   build can serve).
 ///
 /// A segment without a stored bitmap imposes no constraint, mirroring the v0
 /// leniency for missing bitmaps.
 fn is_transition_needed(
     transition: &pb_fri::Transition,
-    index_groups: &HashMap<&str, RoaringBitmap>,
+    index_groups: &HashMap<&str, IndexGroupCoverage>,
 ) -> bool {
-    index_groups.values().any(|direct| {
+    index_groups.values().any(|group| {
         let sources_hit = transition
             .sources
             .iter()
-            .any(|source| direct.contains(source.id as u32));
+            .any(|source| group.provenance.contains(source.id as u32));
         sources_hit
             && transition
                 .destinations
                 .iter()
-                .any(|destination| !direct.contains(destination.id as u32))
+                .any(|destination| !group.direct.contains(destination.id as u32))
     })
 }
 
@@ -563,16 +605,22 @@ fn compute_tagged_retention(elements: &[TrimElement], indices: &[IndexMetadata])
         .collect();
     let chain_frag_bitmap = reuse_chain_frag_bitmap(&legacy_versions);
 
-    // Stored segments grouped by logical index name; each group's union of
-    // stored bitmaps is both its provenance and its direct coverage.
-    let mut index_groups: HashMap<&str, RoaringBitmap> = HashMap::new();
+    // Stored segments grouped by logical index name. Every segment's bitmap
+    // counts as provenance (pinning); only usable segments' bitmaps count as
+    // direct coverage (masking).
+    let mut index_groups: HashMap<&str, IndexGroupCoverage> = HashMap::new();
     for index in indices.iter() {
         if is_system_index(index) {
             continue;
         }
         let group = index_groups.entry(index.name.as_str()).or_default();
         match &index.fragment_bitmap {
-            Some(bitmap) => *group |= bitmap,
+            Some(bitmap) => {
+                group.provenance |= bitmap;
+                if crate::index::index_is_usable(index) {
+                    group.direct |= bitmap;
+                }
+            }
             None => warn!(
                 "Index {} ({}) missing fragment bitmap, it cannot pin tagged fragment reuse records, consider retraining the index",
                 index.name, index.uuid
@@ -1762,6 +1810,195 @@ mod tests {
                 "exactly the newest of the mutually redundant segments survives"
             );
             assert_eq!(sorted_values(&dataset).await, before);
+        }
+
+        /// An unknown envelope-level record may carry lineage this build
+        /// cannot see: both the splice parser and the ledger refuse, so the
+        /// trim never rewrites such a history.
+        #[tokio::test]
+        async fn unknown_envelope_record_refuses_trim() {
+            use prost::Message;
+            let transition = pb_fri::Transition {
+                sources: vec![digest(1)],
+                destinations: vec![digest(2)],
+                mapping: Some(pb_fri::transition::Mapping::StablePartition(
+                    pb_fri::StablePartition {
+                        map_id: Uuid::new_v4().to_string(),
+                        map_size_bytes: 1,
+                        base_id: None,
+                    },
+                )),
+            };
+            let mut content = pb_fri::InlineContent {
+                legacy_versions: vec![],
+                transitions: vec![transition],
+            }
+            .encode_to_vec();
+            prost::encoding::encode_key(
+                9,
+                prost::encoding::WireType::LengthDelimited,
+                &mut content,
+            );
+            prost::encoding::encode_varint(6, &mut content);
+            content.extend_from_slice(b"future");
+
+            let Err(error) = split_trim_elements(&content) else {
+                panic!("an unknown envelope record must refuse the splice")
+            };
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            let ledger =
+                crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(1, &content)
+                    .await
+                    .unwrap();
+            assert!(
+                ledger.has_unsupported_transitions(),
+                "the ledger must report envelope-level unknowns so every \
+                 maintenance path (and _fri GC) refuses consistently"
+            );
+        }
+
+        fn unusable_details() -> Option<Arc<prost_types::Any>> {
+            Some(Arc::new(prost_types::Any {
+                type_url: "/lance.index.FutureIndexDetails".into(),
+                value: vec![],
+            }))
+        }
+
+        /// Direct coverage from a segment this build cannot serve must not
+        /// mask a transition: only usable segments count as taking over a
+        /// destination, while any segment's provenance still pins.
+        #[test]
+        fn unusable_segments_do_not_mask_transition_coverage() {
+            let elements = vec![transition_element(&[1, 2], &[5, 6])];
+            let pinner = named_index("a_idx", 1, &[1, 2]);
+            let mut unusable_taker = named_index("a_idx", 2, &[5, 6]);
+            unusable_taker.index_details = unusable_details();
+            assert_eq!(
+                compute_tagged_retention(&elements, &[pinner.clone(), unusable_taker]),
+                vec![true],
+                "an unusable segment's bitmap must not stand in as direct coverage"
+            );
+            // The same takeover by a usable segment releases the transition.
+            assert_eq!(
+                compute_tagged_retention(&elements, &[pinner, named_index("a_idx", 2, &[5, 6])]),
+                vec![false]
+            );
+        }
+
+        /// Integration: an unusable segment claiming the destinations
+        /// neither prunes the usable old segment nor releases the
+        /// transition.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn unusable_segment_neither_masks_nor_prunes() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let old_segment = stored_segments(&dataset, "i_idx").await[0].clone();
+
+            // A segment of a type this build has no reader for, claiming the
+            // destinations directly (e.g. written by a newer Lance).
+            let unusable = IndexMetadata {
+                uuid: Uuid::new_v4(),
+                fields: old_segment.fields.clone(),
+                covering_fields: vec![],
+                name: "i_idx".into(),
+                dataset_version: dataset.manifest.version,
+                fragment_bitmap: Some([10u32, 11].into_iter().collect()),
+                index_details: unusable_details(),
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+            };
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![unusable],
+                            removed_indices: vec![],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            let segments = stored_segments(&dataset, "i_idx").await;
+            assert!(
+                segments.iter().any(|s| s.uuid == old_segment.uuid),
+                "the only segment this build can serve must not be pruned"
+            );
+            assert_eq!(segments.len(), 2, "the unusable segment is kept too");
+            assert!(
+                fri_entry(&dataset).await.is_some(),
+                "a destination covered only by an unusable segment keeps its transition"
+            );
+        }
+
+        async fn narrow_index_bitmap(dataset: &mut Dataset, name: &str, covered: &[u32]) {
+            let original = stored_segments(dataset, name).await[0].clone();
+            let mut narrowed = original.clone();
+            narrowed.fragment_bitmap = Some(covered.iter().copied().collect());
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![narrowed],
+                            removed_indices: vec![original],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// A trim whose rebase finds nothing left to trim (a concurrent
+        /// commit re-pinned the history mid-trim) must abort instead of
+        /// writing an empty no-op version.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn rebased_noop_trim_commits_no_version() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            // Drain: the trim would delete the entry.
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let mut stale = dataset.clone();
+            // Concurrent commit re-pins the history: the segment's coverage
+            // returns to the sources, so nothing is trimmable anymore.
+            narrow_index_bitmap(&mut dataset, "i_idx", &[0, 1]).await;
+            let expected_version = dataset.manifest.version;
+
+            cleanup_frag_reuse_index(&mut stale).await.unwrap();
+            assert_eq!(
+                stale.manifest.version, expected_version,
+                "the rebased no-op trim must not write a version"
+            );
+            assert!(
+                fri_entry(&stale).await.is_some(),
+                "the re-pinned history stays"
+            );
         }
 
         /// v0 guard: pruning only runs in the tagged branch; a v0 cleanup

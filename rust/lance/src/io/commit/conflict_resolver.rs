@@ -2210,15 +2210,20 @@ impl<'a> TransactionRebase<'a> {
             // mirroring the stable-partition rewrite's assemble-at-attempt:
             // a concurrent append's records are re-filtered in, a concurrent
             // trim's result is re-trimmed instead of spliced over. When
-            // nothing is left to trim after the rebase, the transaction
-            // degenerates to an empty (no-op) CreateIndex.
+            // nothing is left to trim after the rebase (a concurrent commit,
+            // such as an index catching up mid-trim, already satisfied it),
+            // the attempt aborts with a marker conflict instead of writing an
+            // empty no-op version; `cleanup_frag_reuse_index` treats exactly
+            // that conflict as success.
             if is_tagged_trim_operation(new_indices, removed_indices)
                 && dataset.manifest.version != self.transaction.read_version
             {
                 match derive_tagged_trim(dataset).await? {
                     TaggedTrimOutcome::NothingToTrim => {
-                        new_indices.clear();
-                        removed_indices.clear();
+                        return Err(Error::retryable_commit_conflict_source(
+                            dataset.manifest.version,
+                            crate::dataset::index::frag_reuse::TAGGED_TRIM_REBASED_TO_NOOP.into(),
+                        ));
                     }
                     TaggedTrimOutcome::Replace {
                         new_entry,
