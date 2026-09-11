@@ -4879,11 +4879,6 @@ mod tests {
 
     #[async_trait]
     impl object_store::ObjectStore for RecordingRangeObjectStore {
-        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-            self.head_requests.fetch_add(1, Ordering::Relaxed);
-            Ok(self.object_meta(location))
-        }
-
         async fn put_opts(
             &self,
             _location: &Path,
@@ -4906,6 +4901,9 @@ mod tests {
             location: &Path,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
+            if options.head {
+                self.head_requests.fetch_add(1, Ordering::Relaxed);
+            }
             let range = match options.range {
                 Some(GetRange::Bounded(range)) => range,
                 None => 0..self.data.len() as u64,
@@ -8096,7 +8094,7 @@ mod tests {
         let external_uri = format!("file://{}", external_path.display());
         let base_uri = format!("file://{}", external_base.display());
 
-        let mut blob_builder = BlobDescriptorArrayBuilder::new("blob", true);
+        let mut blob_builder = BlobDescriptorArrayBuilder::new("blob");
         blob_builder.push_external(external_uri, range).unwrap();
         let (field, blob_array) = blob_builder.finish().unwrap().into_parts();
         let schema = Arc::new(Schema::new(vec![field]));
