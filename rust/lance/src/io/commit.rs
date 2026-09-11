@@ -1438,7 +1438,22 @@ pub(crate) fn is_precondition_violated(
                 // A rewrite replaces the data files; every cell in the fragment
                 // is re-derived from a new snapshot, so protected or not it is
                 // no longer the cell that was read.
-                if before.files != after.files {
+                // A declared cell moves only when the file holding its field, or
+                // its column within that file, changes. A sibling column
+                // replacement that edits the same file's field list leaves it.
+                fn location(fragment: &Fragment, field: i32) -> Option<(&str, Option<i32>)> {
+                    fragment.files.iter().find_map(|file| {
+                        file.fields
+                            .iter()
+                            .position(|f| *f == field)
+                            .map(|pos| (file.path.as_str(), file.column_indices.get(pos).copied()))
+                    })
+                }
+                if precondition
+                    .field_ids
+                    .iter()
+                    .any(|field| location(before, *field) != location(after, *field))
+                {
                     return Ok(true);
                 }
                 if before.deletion_file != after.deletion_file {
@@ -3491,6 +3506,45 @@ mod tests {
             index_segment("idx_a", Some(RoaringBitmap::from_iter(5..10))),
         ];
         assert!(detect_overlapping_fragments(&disjoint).is_ok());
+    }
+
+    /// A data-file change on a protected fragment only counts for the fields
+    /// whose storage moved, so a sibling column replacement composes whether
+    /// it swaps a whole file or carves its fields out of a shared one.
+    #[test]
+    fn test_precondition_ignores_undeclared_column_files() {
+        let file =
+            |path: &str, fields: Vec<i32>| DataFile::new_legacy_from_fields(path, fields, None);
+        let precondition = |field: i32| {
+            let mut rows = RowAddrTreeMap::new();
+            rows.insert_fragment(0);
+            Precondition {
+                field_ids: vec![field],
+                rows,
+            }
+        };
+        let violated = |before: Vec<DataFile>, after: Vec<DataFile>, field: i32| {
+            let mut read = Fragment::new(0);
+            read.files = before;
+            let mut current = Fragment::new(0);
+            current.files = after;
+            is_precondition_violated(
+                &precondition(field),
+                &HashMap::from([(0, &read)]),
+                &HashMap::from([(0, &current)]),
+            )
+            .unwrap()
+        };
+        // Whole-file swap of the sibling column.
+        let separate = vec![file("a.lance", vec![0]), file("b.lance", vec![1])];
+        let swapped = vec![file("a.lance", vec![0]), file("b2.lance", vec![1])];
+        assert!(!violated(separate.clone(), swapped.clone(), 0));
+        assert!(violated(separate, swapped, 1));
+        // The sibling column carved out of a shared file.
+        let shared = vec![file("ab.lance", vec![0, 1])];
+        let carved = vec![file("ab.lance", vec![0]), file("b2.lance", vec![1])];
+        assert!(!violated(shared.clone(), carved.clone(), 0));
+        assert!(violated(shared, carved, 1));
     }
 
     #[tokio::test]
