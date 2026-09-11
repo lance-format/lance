@@ -837,7 +837,10 @@ impl<'a> CleanupTask<'a> {
             // entries. Like `_indices/`, scanned without a cutoff: references
             // from manifests removed by this pass are proof of deletability.
             // A dataset without a `_fri/` directory yields an empty stream.
-            streams.push(build_listing_stream(self.dataset.base.clone().join("_fri"), None));
+            streams.push(build_listing_stream(
+                self.dataset.base.clone().join("_fri"),
+                None,
+            ));
         }
         let unreferenced_files = stream::iter(streams).flatten().boxed();
 
