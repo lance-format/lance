@@ -104,9 +104,9 @@ mod take;
 /// [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 pub mod transaction {
     pub use lance_table::transaction::{
-        DataOverlayGroup, DataReplacementGroup, Operation, ReadVersionState, RewriteGroup,
-        RewrittenIndex, StablePartitionRewrite, Transaction, TransactionBuilder, UpdateMap,
-        UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
+        DataOverlayGroup, DataReplacementGroup, FragmentReuseRewrite, Operation, ReadVersionState,
+        RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry,
+        UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
         translate_schema_metadata_updates, validate_operation,
     };
 }

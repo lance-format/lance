@@ -416,7 +416,7 @@ impl Transaction {
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         // A tagged entry may only reach the manifest through the commit
         // path's assembly, which builds it from the rewrite's in-memory
-        // transition intent (`stable_partition`, carrying stable-partition or
+        // transition intent (`frag_reuse_rewrite`, carrying stable-partition or
         // ordered-compaction transitions) against the CURRENT manifest entry
         // at every attempt. A pre-assembled tagged entry without that intent
         // has bypassed binding, conservation and ledger validation, and its
@@ -426,15 +426,15 @@ impl Transaction {
         // commits, retries) funnels through.
         if let Operation::Rewrite {
             frag_reuse_index: Some(entry),
-            stable_partition,
+            frag_reuse_rewrite,
             ..
         } = &self.operation
             && is_tagged(entry)
-            && stable_partition.is_none()
+            && frag_reuse_rewrite.is_none()
         {
             return Err(Error::invalid_input(
                 "tagged fragment reuse entries must be assembled from the rewrite's \
-                 `stable_partition` transition intent by the commit path; a pre-assembled \
+                 `frag_reuse_rewrite` transition intent by the commit path; a pre-assembled \
                  tagged entry without intent bypasses validation and may splice away \
                  concurrent records",
             ));
@@ -854,7 +854,7 @@ impl Transaction {
                 groups,
                 rewritten_indices,
                 frag_reuse_index,
-                stable_partition,
+                frag_reuse_rewrite,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -874,7 +874,7 @@ impl Transaction {
                 // order-preserving groups take part in bitmap maintenance
                 // below.
                 let ordered_groups =
-                    Self::ordered_rewrite_groups(groups, stable_partition.as_ref())?;
+                    Self::ordered_rewrite_groups(groups, frag_reuse_rewrite.as_ref())?;
 
                 if next_row_id.is_some() {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
@@ -911,7 +911,7 @@ impl Transaction {
                 // coverage to keep it from serving stale values.
                 Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups);
 
-                if let Some(stable_partition) = stable_partition {
+                if let Some(frag_reuse_rewrite) = frag_reuse_rewrite {
                     // The stable-partition field is never serialized, so a
                     // concurrent transition cannot be seen through the other
                     // transaction file. Splicing an entry assembled against a
@@ -922,19 +922,19 @@ impl Transaction {
                         .iter()
                         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
                         .map(|idx| idx.dataset_version);
-                    if existing_version != stable_partition.base_entry_version {
+                    if existing_version != frag_reuse_rewrite.base_entry_version {
                         return Err(Error::invalid_input(format!(
                             "the {} index entry changed (version {:?}, this rewrite was built on {:?}): \
                              a concurrent rewrite landed, rebuild the stable-partition entry against \
                              the latest version and retry",
                             FRAG_REUSE_INDEX_NAME,
                             existing_version,
-                            stable_partition.base_entry_version,
+                            frag_reuse_rewrite.base_entry_version,
                         )));
                     }
                     if frag_reuse_index.is_none() {
                         return Err(Error::invalid_input(
-                            "a stable-partition rewrite must carry its assembled fragment reuse \
+                            "a rewrite carrying transition intent must carry its assembled fragment reuse \
                              index entry; commit through the lance commit path, which assembles it",
                         ));
                     }
@@ -1733,7 +1733,7 @@ mod tests {
                 groups: vec![],
                 rewritten_indices: vec![],
                 frag_reuse_index: None,
-                stable_partition: None,
+                frag_reuse_rewrite: None,
             },
             "rewrite_with_v0_entry" => {
                 let mut v0_entry = fri.clone();
@@ -1742,7 +1742,7 @@ mod tests {
                     groups: vec![],
                     rewritten_indices: vec![],
                     frag_reuse_index: Some(v0_entry),
-                    stable_partition: None,
+                    frag_reuse_rewrite: None,
                 }
             }
             _ => unreachable!(),
@@ -1763,7 +1763,7 @@ mod tests {
     #[case::tagged_table(true)]
     fn tagged_entry_without_intent_rejected(#[case] table_is_tagged: bool) {
         // A pre-assembled tagged entry that did not come from the commit
-        // path's assembly (no `stable_partition` intent) has bypassed
+        // path's assembly (no `frag_reuse_rewrite` intent) has bypassed
         // validation and may be stale; it must be rejected at the manifest
         // chokepoint regardless of the table's current state.
         let mut manifest = sample_manifest();
@@ -1785,7 +1785,7 @@ mod tests {
                 groups: vec![],
                 rewritten_indices: vec![],
                 frag_reuse_index: Some(entry),
-                stable_partition: None,
+                frag_reuse_rewrite: None,
             },
             None,
         );
@@ -1820,7 +1820,7 @@ mod tests {
                 groups: vec![],
                 rewritten_indices: vec![],
                 frag_reuse_index: Some(appended.clone()),
-                stable_partition: Some(crate::transaction::StablePartitionRewrite {
+                frag_reuse_rewrite: Some(crate::transaction::FragmentReuseRewrite {
                     transitions: vec![],
                     base_entry_version: Some(7),
                 }),
@@ -1849,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_partition_rewrite_guards_base_entry_version() {
+    fn frag_reuse_rewrite_guards_base_entry_version() {
         let mut manifest = sample_manifest();
         manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
         manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
@@ -1869,7 +1869,7 @@ mod tests {
                 groups: vec![],
                 rewritten_indices: vec![],
                 frag_reuse_index: Some(appended.clone()),
-                stable_partition: Some(crate::transaction::StablePartitionRewrite {
+                frag_reuse_rewrite: Some(crate::transaction::FragmentReuseRewrite {
                     transitions: vec![],
                     base_entry_version: None,
                 }),
@@ -1889,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_partition_rewrite_requires_assembled_entry() {
+    fn frag_reuse_rewrite_requires_assembled_entry() {
         let manifest = sample_manifest();
         let transaction = Transaction::new(
             manifest.version,
@@ -1897,7 +1897,7 @@ mod tests {
                 groups: vec![],
                 rewritten_indices: vec![],
                 frag_reuse_index: None,
-                stable_partition: Some(crate::transaction::StablePartitionRewrite {
+                frag_reuse_rewrite: Some(crate::transaction::FragmentReuseRewrite {
                     transitions: vec![],
                     base_entry_version: None,
                 }),

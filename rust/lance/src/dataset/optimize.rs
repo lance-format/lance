@@ -91,8 +91,7 @@ use super::fragment::FileFragment;
 use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
 use super::rowids::load_row_id_sequences;
 use super::transaction::{
-    Operation, RewriteGroup, RewrittenIndex, StablePartitionRewrite, Transaction,
-    TransactionBuilder,
+    FragmentReuseRewrite, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
 use super::versions;
@@ -3060,14 +3059,14 @@ pub async fn commit_compaction(
 
     // On a tagged table the transitions ride the in-memory rewrite intent;
     // the commit path assembles them onto the tagged entry at every attempt
-    // (see `build_stable_partition_rewrite_entry`), which also keeps a retry
+    // (see `build_frag_reuse_rewrite_entry`), which also keeps a retry
     // appending onto whatever a concurrent writer committed meanwhile.
     // Otherwise: no indexed/chain data touched -> no FRI (all-or-nothing,
     // see above).
-    let (frag_reuse_index, stable_partition) = if tagged_fri && options.defer_index_remap {
+    let (frag_reuse_index, frag_reuse_rewrite) = if tagged_fri && options.defer_index_remap {
         (
             None,
-            Some(StablePartitionRewrite {
+            Some(FragmentReuseRewrite {
                 transitions: tagged_transitions,
                 base_entry_version: None,
             }),
@@ -3101,7 +3100,7 @@ pub async fn commit_compaction(
             groups: rewrite_groups,
             rewritten_indices,
             frag_reuse_index,
-            stable_partition,
+            frag_reuse_rewrite,
         },
     )
     .transaction_properties(options.transaction_properties.clone())

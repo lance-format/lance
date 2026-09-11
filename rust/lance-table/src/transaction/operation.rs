@@ -88,13 +88,15 @@ pub enum Operation {
         rewritten_indices: Vec<RewrittenIndex>,
         /// The fragment reuse index to be created or updated to
         frag_reuse_index: Option<IndexMetadata>,
-        /// The stable-partition (reordered) part of this rewrite, if any.
-        /// In-memory only, like `frag_reuse_index`: never serialized into the
-        /// transaction file, because other writers' conflict decisions only
-        /// need the fragment sets in `groups`, which are exact either way. The
-        /// commit path assembles it into a tagged `frag_reuse_index` entry
-        /// before the manifest is built.
-        stable_partition: Option<StablePartitionRewrite>,
+        /// The tagged transitions this rewrite appends to the fragment reuse
+        /// entry, if any: a stable-partition (reordered) rewrite, or a
+        /// deferred compaction on an already-tagged table. In-memory only,
+        /// like `frag_reuse_index`: never serialized into the transaction
+        /// file, because other writers' conflict decisions only need the
+        /// fragment sets in `groups`, which are exact either way. The commit
+        /// path assembles it into a tagged `frag_reuse_index` entry before
+        /// the manifest is built.
+        frag_reuse_rewrite: Option<FragmentReuseRewrite>,
     },
     /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a
@@ -291,7 +293,7 @@ impl std::fmt::Display for Operation {
 /// row-level translation the reader applies (see
 /// `lance_table::system_index::frag_reuse::ledger`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct StablePartitionRewrite {
+pub struct FragmentReuseRewrite {
     /// The new transitions, one per covered rewrite group, in the order of
     /// the covered groups. Each transition's sources must match its group's
     /// old fragments in order, and its destinations the group's new
@@ -308,7 +310,7 @@ pub struct StablePartitionRewrite {
     pub base_entry_version: Option<u64>,
 }
 
-impl StablePartitionRewrite {
+impl FragmentReuseRewrite {
     /// The union of the transitions' source fragment ids. Rewrite groups
     /// covered by this set skip index-bitmap maintenance: their bitmaps keep
     /// the retired source ids as provenance.
@@ -320,7 +322,7 @@ impl StablePartitionRewrite {
     }
 }
 
-impl DeepSizeOf for StablePartitionRewrite {
+impl DeepSizeOf for FragmentReuseRewrite {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // prost messages do not implement DeepSizeOf; their serialized size
         // is a stable proxy for the heap they hold.

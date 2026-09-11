@@ -1699,7 +1699,7 @@ pub mod tests {
                         groups: vec![],
                         rewritten_indices: vec![],
                         frag_reuse_index: None,
-                        stable_partition: None,
+                        frag_reuse_rewrite: None,
                     },
                     None,
                 ),
