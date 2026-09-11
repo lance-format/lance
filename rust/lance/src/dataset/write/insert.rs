@@ -420,11 +420,10 @@ impl<'a> InsertBuilder<'a> {
                     .map(LanceFileVersion::resolve)
                     .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
             }
-            (_, WriteDestination::Dataset(dataset)) => {
-                // If appending to an existing dataset, always use the dataset version
-                let m = dataset.manifest.as_ref();
-                m.data_storage_format.lance_file_format()
-            }
+            (_, WriteDestination::Dataset(dataset)) => params
+                .data_storage_version
+                .map(LanceFileVersion::resolve)
+                .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format()),
             // Otherwise (no existing dataset) fallback to the default if the user didn't specify
             (_, WriteDestination::Uri(_)) => params.storage_version_or_default(),
         };
@@ -457,11 +456,143 @@ mod test {
     use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use lance_arrow::BLOB_META_KEY;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use lance_table::io::commit::{RenameCommitHandler, commit_handler_from_url};
 
     use crate::session::Session;
 
     use super::*;
+
+    fn int_batch(values: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn append_resolves_explicit_or_fallback_exact_version() {
+        let test_dir = TempStrDir::default();
+        let create_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(test_dir.as_str())
+            .with_params(&create_params)
+            .execute(vec![int_batch(vec![0])])
+            .await
+            .unwrap();
+
+        let fallback_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&fallback_params)
+            .execute(vec![int_batch(vec![1])])
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.fragments[1].files[0]
+                .file_version()
+                .unwrap(),
+            ConcreteFileVersion::V2_0
+        );
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+
+        let explicit_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&explicit_params)
+            .execute(vec![int_batch(vec![2])])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+        assert_eq!(
+            dataset.manifest.fragments[2].files[0]
+                .file_version()
+                .unwrap(),
+            ConcreteFileVersion::V2_1
+        );
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS,
+            0
+        );
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_exact_version_appends_derive_capability_from_final_manifest() {
+        let test_dir = TempStrDir::default();
+        let create_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        };
+        let original = Arc::new(
+            InsertBuilder::new(test_dir.as_str())
+                .with_params(&create_params)
+                .execute(vec![int_batch(vec![0])])
+                .await
+                .unwrap(),
+        );
+        let v2_1_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let v2_2_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let tx_v2_1 = InsertBuilder::new(original.clone())
+            .with_params(&v2_1_params)
+            .execute_uncommitted(vec![int_batch(vec![1])])
+            .await
+            .unwrap();
+        let tx_v2_2 = InsertBuilder::new(original.clone())
+            .with_params(&v2_2_params)
+            .execute_uncommitted(vec![int_batch(vec![2])])
+            .await
+            .unwrap();
+        let dataset = CommitBuilder::new(original.clone())
+            .execute(tx_v2_1)
+            .await
+            .unwrap();
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(tx_v2_2)
+            .await
+            .unwrap();
+
+        let versions = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.files[0].file_version().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            versions,
+            vec![
+                ConcreteFileVersion::V2_0,
+                ConcreteFileVersion::V2_1,
+                ConcreteFileVersion::V2_2
+            ]
+        );
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+    }
 
     #[tokio::test]
     async fn test_pass_session() {

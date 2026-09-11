@@ -626,9 +626,23 @@ pub async fn create_fragment_from_file(
     fragment_id: usize,
     physical_rows: Option<usize>,
 ) -> Result<Fragment> {
-    if file_version != dataset_version {
+    let same_family = matches!(
+        (file_version, dataset_version),
+        (ConcreteFileVersion::V1, ConcreteFileVersion::V1)
+            | (
+                ConcreteFileVersion::V2_0
+                    | ConcreteFileVersion::V2_1
+                    | ConcreteFileVersion::V2_2
+                    | ConcreteFileVersion::V2_3,
+                ConcreteFileVersion::V2_0
+                    | ConcreteFileVersion::V2_1
+                    | ConcreteFileVersion::V2_2
+                    | ConcreteFileVersion::V2_3
+            )
+    );
+    if !same_family {
         return Err(Error::invalid_input(format!(
-            "File version mismatch. Dataset version: {:?} Fragment version: {:?}",
+            "File version family mismatch. Dataset fallback: {:?} Fragment version: {:?}",
             dataset_version, file_version
         )));
     }

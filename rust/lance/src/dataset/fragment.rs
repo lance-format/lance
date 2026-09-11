@@ -3623,8 +3623,8 @@ mod tests {
     use super::*;
     use crate::{
         dataset::{
-            InsertBuilder,
-            transaction::{Operation, UpdateMode, UpdatedFragmentOffsets},
+            CommitBuilder, InsertBuilder,
+            transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets},
         },
         session::Session,
         utils::test::TestDatasetGenerator,
@@ -6842,26 +6842,24 @@ mod tests {
         mismatched_writer.write_batch(&new_data).await.unwrap();
         mismatched_writer.finish().await.unwrap();
 
-        let err = FileFragment::create_from_file("mismatched_file.lance", &dataset, 1, Some(128))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }));
-        assert!(err.to_string().contains("File version mismatch"));
+        let mismatched_frag =
+            FileFragment::create_from_file("mismatched_file.lance", &dataset, 0, Some(128))
+                .await
+                .unwrap();
+        assert_eq!(
+            mismatched_frag.files[0].file_version().unwrap(),
+            ConcreteFileVersion::V2_0
+        );
 
         let op = Operation::Append {
-            fragments: vec![frag],
+            fragments: vec![mismatched_frag],
         };
-        let dataset = Dataset::commit(
-            &dataset.uri,
-            op,
-            Some(dataset.version().version),
-            None,
-            None,
-            Default::default(),
-            false,
-        )
-        .await
-        .unwrap();
+        let transaction = Transaction::new_from_version(dataset.version().version, op);
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .with_storage_format(LanceFileVersion::V2_0)
+            .execute(transaction)
+            .await
+            .unwrap();
 
         assert_eq!(
             dataset

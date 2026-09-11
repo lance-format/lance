@@ -9,7 +9,7 @@ use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
-    format::{DataStorageFormat, is_detached_version},
+    format::{DataFile, DataStorageFormat, Fragment, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
@@ -59,6 +59,79 @@ pub struct CommitBuilder<'a> {
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
 pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(1800);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationVersionState {
+    Versionless,
+    NoFiles,
+    ReferencesTarget,
+    ReferencesOther,
+}
+
+fn data_files_version_state<'a>(
+    files: impl IntoIterator<Item = &'a DataFile>,
+    version: ConcreteFileVersion,
+) -> Result<OperationVersionState> {
+    let mut saw_file = false;
+    for file in files {
+        saw_file = true;
+        if file.file_version()? == version {
+            return Ok(OperationVersionState::ReferencesTarget);
+        }
+    }
+    Ok(if saw_file {
+        OperationVersionState::ReferencesOther
+    } else {
+        OperationVersionState::NoFiles
+    })
+}
+
+fn fragments_version_state<'a>(
+    fragments: impl IntoIterator<Item = &'a Fragment>,
+    version: ConcreteFileVersion,
+) -> Result<OperationVersionState> {
+    data_files_version_state(
+        fragments
+            .into_iter()
+            .flat_map(Fragment::referenced_lance_files),
+        version,
+    )
+}
+
+fn operation_version_state(
+    operation: &Operation,
+    version: ConcreteFileVersion,
+) -> Result<OperationVersionState> {
+    match operation {
+        Operation::Append { fragments }
+        | Operation::Overwrite { fragments, .. }
+        | Operation::Merge { fragments, .. } => fragments_version_state(fragments, version),
+        Operation::Rewrite { groups, .. } => fragments_version_state(
+            groups.iter().flat_map(|group| group.new_fragments.iter()),
+            version,
+        ),
+        Operation::Update {
+            updated_fragments,
+            new_fragments,
+            ..
+        } => fragments_version_state(
+            updated_fragments.iter().chain(new_fragments.iter()),
+            version,
+        ),
+        Operation::DataReplacement { replacements } => data_files_version_state(
+            replacements.iter().map(|replacement| &replacement.1),
+            version,
+        ),
+        Operation::DataOverlay { groups } => data_files_version_state(
+            groups
+                .iter()
+                .flat_map(|group| group.overlays.iter())
+                .map(|overlay| &overlay.data_file),
+            version,
+        ),
+        _ => Ok(OperationVersionState::Versionless),
+    }
+}
+
 impl<'a> CommitBuilder<'a> {
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
         Self {
@@ -98,8 +171,9 @@ impl<'a> CommitBuilder<'a> {
     /// This is only needed when creating a new empty table. If any data files are
     /// passed, the storage format will be inferred from the data files.
     ///
-    /// All data files must use the same storage format as the existing dataset.
-    /// If a different format is passed, an error will be returned.
+    /// For an existing dataset, the manifest fallback remains unchanged. If
+    /// prewritten fragments introduce another exact V2 version, the commit
+    /// derives the required mixed-version capability from the final manifest.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
         self.storage_format = Some(storage_format.resolve());
 
@@ -417,20 +491,24 @@ impl<'a> CommitBuilder<'a> {
         } else {
             self.use_stable_row_ids.unwrap_or(false)
         };
-        // Validate storage format matches existing dataset
-        if let Some(ds) = dest.dataset()
+
+        if let Some(dataset) = dest.dataset()
             && let Some(storage_format) = self.storage_format
+            && dataset.manifest.data_storage_format.lance_file_format() != storage_format
+            && !matches!(transaction.operation, Operation::Overwrite { .. })
+            && matches!(
+                operation_version_state(&transaction.operation, storage_format)?,
+                OperationVersionState::Versionless | OperationVersionState::ReferencesOther
+            )
         {
-            let passed_storage_format = DataStorageFormat::new(storage_format);
-            if ds.manifest.data_storage_format != passed_storage_format
-                && !matches!(transaction.operation, Operation::Overwrite { .. })
-            {
-                return Err(Error::invalid_input_source(format!(
-                    "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
-                    ds.manifest.data_storage_format,
-                    passed_storage_format
-                ).into()));
-            }
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Storage format mismatch. Existing dataset fallback is {:?}, but the commit requested {:?} without referencing data files in that version",
+                    dataset.manifest.data_storage_format,
+                    DataStorageFormat::new(storage_format)
+                )
+                .into(),
+            ));
         }
 
         let manifest_config = ManifestWriteConfig {
@@ -658,6 +736,26 @@ mod tests {
             tag: None,
             transaction_properties: None,
         }
+    }
+
+    #[test]
+    fn empty_file_writes_do_not_require_a_target_version() {
+        let operation = Operation::Update {
+            updated_fragments: vec![],
+            new_fragments: vec![],
+            removed_fragment_ids: vec![],
+            fields_modified: vec![],
+            compacted_sstables: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+
+        assert_eq!(
+            operation_version_state(&operation, ConcreteFileVersion::V2_2).unwrap(),
+            OperationVersionState::NoFiles
+        );
     }
 
     #[derive(Debug)]
