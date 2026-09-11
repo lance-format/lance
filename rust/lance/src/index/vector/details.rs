@@ -102,6 +102,16 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
                 if let Some(tps) = ivf.target_partition_size {
                     target_partition_size = tps as u64;
                 }
+                // The requested partition count is what a rebuild has to start
+                // from: a definition created for a table too small to train
+                // must come back at the count it asked for once the table
+                // grows, and re-derive the cap from the data it then has.
+                if let Some(num_partitions) = ivf.num_partitions {
+                    runtime_hints.insert(
+                        "lance.ivf.num_partitions".to_string(),
+                        num_partitions.to_string(),
+                    );
+                }
                 runtime_hints.insert("lance.ivf.max_iters".to_string(), ivf.max_iters.to_string());
                 runtime_hints.insert(
                     "lance.ivf.sample_rate".to_string(),
@@ -191,6 +201,9 @@ pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorI
     for stage in &mut params.stages {
         match stage {
             StageParams::Ivf(ivf) => {
+                if let Some(v) = parse(hints, "lance.ivf.num_partitions") {
+                    ivf.num_partitions = Some(v);
+                }
                 if let Some(v) = parse(hints, "lance.ivf.max_iters") {
                     ivf.max_iters = v;
                 }
@@ -1128,6 +1141,7 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             IvfBuildParams {
+                num_partitions: Some(12),
                 max_iters: 100,
                 sample_rate: 512,
                 shuffle_partition_batches: 2048,
@@ -1146,6 +1160,13 @@ mod tests {
 
         let any = vector_index_details(&params);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
+        assert_eq!(
+            details
+                .runtime_hints
+                .get("lance.ivf.num_partitions")
+                .map(|s| s.as_str()),
+            Some("12")
+        );
         assert_eq!(
             details
                 .runtime_hints
@@ -1221,6 +1242,7 @@ mod tests {
         let StageParams::Ivf(ivf) = &restored.stages[0] else {
             panic!()
         };
+        assert_eq!(ivf.num_partitions, Some(12));
         assert_eq!(ivf.max_iters, 100);
         assert_eq!(ivf.sample_rate, 512);
         assert_eq!(ivf.shuffle_partition_batches, 2048);
@@ -1231,6 +1253,22 @@ mod tests {
         assert_eq!(pq.max_iters, 75);
         assert_eq!(pq.sample_rate, 128);
         assert_eq!(pq.kmeans_redos, 3);
+
+        // An auto-sized build records no count, so restoring leaves the
+        // partition count to be derived from the data again.
+        let auto_sized = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::default(),
+            PQBuildParams::default(),
+        );
+        let auto_details = vector_index_details(&auto_sized)
+            .to_msg::<VectorIndexDetails>()
+            .unwrap();
+        assert!(
+            !auto_details
+                .runtime_hints
+                .contains_key("lance.ivf.num_partitions")
+        );
     }
 
     #[test]
@@ -1382,6 +1420,7 @@ mod tests {
         // Non-default values so the round-trip actually checks preservation
         // rather than coincidentally matching defaults.
         let ivf = IvfBuildParams {
+            num_partitions: Some(12),
             max_iters: 100,
             sample_rate: 512,
             target_partition_size: Some(2048),
@@ -1456,6 +1495,7 @@ mod tests {
         let StageParams::Ivf(ivf) = &restored.stages[0] else {
             panic!("first stage should be IVF for combo {:?}", combo);
         };
+        assert_eq!(ivf.num_partitions, Some(12));
         assert_eq!(ivf.max_iters, 100);
         assert_eq!(ivf.sample_rate, 512);
         assert_eq!(ivf.target_partition_size, Some(2048));
