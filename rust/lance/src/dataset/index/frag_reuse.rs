@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::DatasetIndexInternalExt;
-use crate::index::frag_reuse::{build_frag_reuse_index_metadata, load_frag_reuse_index_details};
+use crate::index::frag_reuse::{
+    build_frag_reuse_index_metadata, build_tagged_frag_reuse_entry,
+    decode_frag_reuse_ledger_from_content, load_frag_reuse_index_details,
+    load_raw_frag_reuse_content,
+};
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails, FragReuseVersion,
@@ -14,8 +19,10 @@ use lance_index::frag_reuse::{
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::IndexMetadata;
+use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
 use lance_table::io::manifest::read_manifest_indexes;
 use log::warn;
+use prost::Message;
 use roaring::RoaringBitmap;
 
 impl Dataset {
@@ -117,6 +124,12 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     else {
         return Ok(());
     };
+
+    // Hard fork by index_version: tagged histories trim per transition in
+    // fresh code below, while the v0 path stays exactly as it was.
+    if frag_reuse_index_meta.index_version != 0 {
+        return cleanup_tagged_frag_reuse_index(dataset).await;
+    }
 
     let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
 
@@ -247,6 +260,378 @@ fn is_index_remap_caught_up(
             Ok(true)
         }
     }
+}
+
+/// The outcome of deriving a tagged trim against the current manifest.
+#[derive(Debug)]
+pub(crate) enum TaggedTrimOutcome {
+    /// Every record is still needed, or there is no tagged entry to trim.
+    NothingToTrim,
+    /// Replace the current entry with the filtered history.
+    Replace {
+        new_entry: IndexMetadata,
+        current_entry: IndexMetadata,
+    },
+    /// Everything trimmed away: delete the entry outright. The manifest
+    /// feature flags stay set (they are sticky).
+    Delete { current_entry: IndexMetadata },
+}
+
+/// Trim a tagged FRI entry, deriving what to keep from the CURRENT manifest.
+///
+/// The derivation runs again inside the commit path on every retry (see the
+/// conflict resolver's `finish_create_index`), so a concurrent append lands in
+/// the re-derived entry instead of being spliced away.
+async fn cleanup_tagged_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
+    let operation = match derive_tagged_trim(dataset).await? {
+        TaggedTrimOutcome::NothingToTrim => return Ok(()),
+        TaggedTrimOutcome::Replace {
+            new_entry,
+            current_entry,
+        } => Operation::CreateIndex {
+            new_indices: vec![new_entry],
+            removed_indices: vec![current_entry],
+        },
+        TaggedTrimOutcome::Delete { current_entry } => Operation::CreateIndex {
+            new_indices: vec![],
+            removed_indices: vec![current_entry],
+        },
+    };
+
+    let transaction = Transaction::new(dataset.manifest.version, operation, None);
+    dataset
+        .apply_commit(
+            transaction,
+            &crate::dataset::ManifestWriteConfig::default().with_tagged_frag_reuse_trim(),
+            &Default::default(),
+        )
+        .await
+}
+
+/// Whether a `CreateIndex` payload has the tagged-trim shape: exactly the
+/// tagged FRI entry replaced, or removed outright. A v0 trim (v0 entry
+/// replacing a v0 entry) deliberately does not match.
+pub(crate) fn is_tagged_trim_operation(
+    new_indices: &[IndexMetadata],
+    removed_indices: &[IndexMetadata],
+) -> bool {
+    use lance_table::system_index::frag_reuse::metadata::is_tagged;
+    let [removed] = removed_indices else {
+        return false;
+    };
+    if removed.name != FRAG_REUSE_INDEX_NAME {
+        return false;
+    }
+    match new_indices {
+        [] => is_tagged(removed),
+        [entry] => is_tagged(entry),
+        _ => false,
+    }
+}
+
+/// One splice unit of the entry's content: a legacy version (field 1) or a
+/// transition (field 2), kept with its exact wire form so retained records
+/// are carried forward verbatim.
+enum TrimRecord {
+    LegacyVersion(FragReuseVersion),
+    Transition(pb_fri::Transition),
+}
+
+struct TrimElement {
+    raw: Vec<u8>,
+    record: TrimRecord,
+}
+
+fn split_trim_elements(content: &[u8]) -> Result<Vec<TrimElement>> {
+    use bytes::Buf;
+    use prost::encoding::{WireType, decode_key, decode_varint};
+
+    let corrupt = |message: String| Error::corrupt_file_named("FRI details", message);
+    let total = content.len();
+    let mut buf = bytes::Bytes::copy_from_slice(content);
+    let mut elements = Vec::new();
+    while buf.has_remaining() {
+        let start = total - buf.remaining();
+        let (tag, wire_type) = decode_key(&mut buf).map_err(|e| corrupt(e.to_string()))?;
+        // Fields 1 and 2 are the only known records and both are messages. An
+        // unknown record may participate in lineage in ways this client cannot
+        // reason about, so refuse to trim rather than silently dropping or
+        // blindly retaining it.
+        if wire_type != WireType::LengthDelimited || !matches!(tag, 1 | 2) {
+            return Err(Error::not_supported(format!(
+                "the tagged FRI history carries an unknown record (field {tag}); \
+                 upgrade to a newer version of Lance before trimming"
+            )));
+        }
+        let length = decode_varint(&mut buf).map_err(|e| corrupt(e.to_string()))?;
+        if length > buf.remaining() as u64 {
+            return Err(corrupt(format!(
+                "field {tag} length {length} exceeds remaining {} bytes",
+                buf.remaining()
+            )));
+        }
+        let payload = buf.split_to(length as usize);
+        let end = total - buf.remaining();
+        let record = match tag {
+            1 => TrimRecord::LegacyVersion(
+                pb_fri::Version::decode(payload)
+                    .map_err(|e| corrupt(e.to_string()))?
+                    .try_into()?,
+            ),
+            _ => TrimRecord::Transition(
+                pb_fri::Transition::decode(payload).map_err(|e| corrupt(e.to_string()))?,
+            ),
+        };
+        elements.push(TrimElement {
+            raw: content[start..end].to_vec(),
+            record,
+        });
+    }
+    Ok(elements)
+}
+
+/// Whether some index still needs this transition to translate its rows.
+///
+/// RETAIN iff there is a logical index I (its stored segments grouped by
+/// name, system indices exempt) such that:
+/// * some segment's stored provenance bitmap intersects the transition's
+///   sources (I holds addresses the transition moves), AND
+/// * some destination is not directly covered by any segment of I (I has not
+///   fully re-derived onto the transition's output).
+///
+/// A segment without a stored bitmap imposes no constraint, mirroring the v0
+/// leniency for missing bitmaps.
+fn is_transition_needed(
+    transition: &pb_fri::Transition,
+    index_groups: &HashMap<&str, RoaringBitmap>,
+) -> bool {
+    index_groups.values().any(|direct| {
+        let sources_hit = transition
+            .sources
+            .iter()
+            .any(|source| direct.contains(source.id as u32));
+        sources_hit
+            && transition
+                .destinations
+                .iter()
+                .any(|destination| !direct.contains(destination.id as u32))
+    })
+}
+
+/// Which elements of a tagged history are still needed, from the entry's
+/// digests and the stored index metadata alone (zero payload IO).
+///
+/// Legacy versions keep the exact v0 caught-up predicate; transitions use
+/// [`is_transition_needed`]; then transitive chain retention closes the set
+/// forward: a retained record's translation path walks through every
+/// downstream consumer of its destinations, so those records must survive
+/// too. Legacy versions retain at whole-version granularity (their groups
+/// stand or fall together, as in v0).
+fn compute_tagged_retention(elements: &[TrimElement], indices: &[IndexMetadata]) -> Vec<bool> {
+    // The v0 predicate's disjointness rule is scoped to the legacy chain, as
+    // in v0: an index touching only tagged-transition fragments holds nothing
+    // a legacy version remaps.
+    let legacy_versions: Vec<FragReuseVersion> = elements
+        .iter()
+        .filter_map(|element| match &element.record {
+            TrimRecord::LegacyVersion(version) => Some(version.clone()),
+            TrimRecord::Transition(_) => None,
+        })
+        .collect();
+    let chain_frag_bitmap = reuse_chain_frag_bitmap(&legacy_versions);
+
+    // Stored segments grouped by logical index name; each group's union of
+    // stored bitmaps is both its provenance and its direct coverage.
+    let mut index_groups: HashMap<&str, RoaringBitmap> = HashMap::new();
+    for index in indices.iter() {
+        if is_system_index(index) {
+            continue;
+        }
+        let group = index_groups.entry(index.name.as_str()).or_default();
+        match &index.fragment_bitmap {
+            Some(bitmap) => *group |= bitmap,
+            None => warn!(
+                "Index {} ({}) missing fragment bitmap, it cannot pin tagged fragment reuse records, consider retraining the index",
+                index.name, index.uuid
+            ),
+        }
+    }
+
+    let mut retained = vec![false; elements.len()];
+    for (position, element) in elements.iter().enumerate() {
+        match &element.record {
+            TrimRecord::LegacyVersion(version) => {
+                let check_results = indices
+                    .iter()
+                    .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
+                    .collect::<Vec<_>>();
+                if check_results
+                    .iter()
+                    .any(|r| matches!(r, Err(Error::InvalidInput { .. })))
+                {
+                    // If the check fails, the reuse version is likely corrupted,
+                    // do not retain it (v0 behavior).
+                    continue;
+                }
+                if !check_results.into_iter().all(|r| r.unwrap()) {
+                    retained[position] = true;
+                }
+            }
+            TrimRecord::Transition(transition) => {
+                retained[position] = is_transition_needed(transition, &index_groups);
+            }
+        }
+    }
+
+    // Transitive chain retention (forward closure over producer->consumer
+    // edges).
+    struct Node {
+        element: usize,
+        sources: Vec<u64>,
+        destinations: Vec<u64>,
+    }
+    let mut nodes = Vec::new();
+    for (position, element) in elements.iter().enumerate() {
+        match &element.record {
+            TrimRecord::LegacyVersion(version) => {
+                for group in version.groups.iter() {
+                    nodes.push(Node {
+                        element: position,
+                        sources: group.old_frags.iter().map(|f| f.id).collect(),
+                        destinations: group.new_frags.iter().map(|f| f.id).collect(),
+                    });
+                }
+            }
+            TrimRecord::Transition(transition) => nodes.push(Node {
+                element: position,
+                sources: transition.sources.iter().map(|d| d.id).collect(),
+                destinations: transition.destinations.iter().map(|d| d.id).collect(),
+            }),
+        }
+    }
+    let mut consumer_of: HashMap<u64, usize> = HashMap::new();
+    let mut element_nodes: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (node_index, node) in nodes.iter().enumerate() {
+        for source in &node.sources {
+            consumer_of.insert(*source, node_index);
+        }
+        element_nodes
+            .entry(node.element)
+            .or_default()
+            .push(node_index);
+    }
+    let mut node_retained = vec![false; nodes.len()];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for (node_index, node) in nodes.iter().enumerate() {
+        if retained[node.element] {
+            node_retained[node_index] = true;
+            queue.push_back(node_index);
+        }
+    }
+    while let Some(node_index) = queue.pop_front() {
+        for destination in nodes[node_index].destinations.clone() {
+            let Some(&consumer) = consumer_of.get(&destination) else {
+                continue;
+            };
+            if node_retained[consumer] {
+                continue;
+            }
+            node_retained[consumer] = true;
+            queue.push_back(consumer);
+            let element = nodes[consumer].element;
+            if !retained[element] {
+                retained[element] = true;
+                for &sibling in element_nodes[&element].iter() {
+                    if !node_retained[sibling] {
+                        node_retained[sibling] = true;
+                        queue.push_back(sibling);
+                    }
+                }
+            }
+        }
+    }
+
+    retained
+}
+
+/// Derive the trimmed tagged entry from the CURRENT manifest state.
+///
+/// Zero payload IO: retention is computed from the entry's digests and the
+/// stored index metadata alone. Row-map files released by trimming a
+/// stable-partition transition are collected separately by dataset cleanup.
+pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<TaggedTrimOutcome> {
+    let indices = read_manifest_indexes(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await?;
+    let Some(entry) = indices
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .cloned()
+    else {
+        return Ok(TaggedTrimOutcome::NothingToTrim);
+    };
+    if entry.index_version == 0 {
+        // Reachable only through a rebase whose entry was concurrently
+        // replaced by a v0 one; nothing tagged remains to trim.
+        return Ok(TaggedTrimOutcome::NothingToTrim);
+    }
+
+    let content = load_raw_frag_reuse_content(dataset, &entry).await?;
+    // Full ledger validation (lineage order, digest conservation, mapping
+    // presence) plus unsupported-transition detection before interpreting
+    // anything.
+    let ledger = decode_frag_reuse_ledger_from_content(entry.index_version, &content).await?;
+    if ledger.has_unsupported_transitions() {
+        return Err(Error::not_supported(
+            "the tagged FRI history carries transitions this client cannot interpret; \
+             upgrade to a newer version of Lance before trimming",
+        ));
+    }
+    let elements = split_trim_elements(&content)?;
+    let retained = compute_tagged_retention(&elements, &indices);
+
+    if retained.iter().all(|kept| *kept) {
+        return Ok(TaggedTrimOutcome::NothingToTrim);
+    }
+    if retained.iter().all(|kept| !*kept) {
+        return Ok(TaggedTrimOutcome::Delete {
+            current_entry: entry,
+        });
+    }
+
+    let mut new_content = Vec::new();
+    let mut fragment_bitmap = RoaringBitmap::new();
+    for (element, kept) in elements.iter().zip(retained.iter()) {
+        if !kept {
+            continue;
+        }
+        new_content.extend_from_slice(&element.raw);
+        match &element.record {
+            TrimRecord::LegacyVersion(version) => {
+                fragment_bitmap.extend(version.old_frag_ids().iter().map(|&id| id as u32));
+                fragment_bitmap.extend(version.new_frag_ids().iter().map(|&id| id as u32));
+            }
+            TrimRecord::Transition(transition) => {
+                for digest in transition
+                    .sources
+                    .iter()
+                    .chain(transition.destinations.iter())
+                {
+                    fragment_bitmap.insert(digest.id as u32);
+                }
+            }
+        }
+    }
+    // The filtered history must itself decode as a well-formed ledger.
+    decode_frag_reuse_ledger_from_content(entry.index_version, &new_content).await?;
+    let new_entry = build_tagged_frag_reuse_entry(dataset, new_content, fragment_bitmap).await?;
+    Ok(TaggedTrimOutcome::Replace {
+        new_entry,
+        current_entry: entry,
+    })
 }
 
 #[cfg(test)]
@@ -659,6 +1044,438 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    mod tagged_trim {
+        use super::super::*;
+        use crate::dataset::WriteParams;
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+        use crate::dataset::write::CommitBuilder;
+        use crate::index::DatasetIndexExt;
+        use crate::index::frag_reuse::{decode_frag_reuse_ledger, load_raw_frag_reuse_content};
+        use crate::index::frag_reuse_reader::tests as reader_tests;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+        use lance_index::IndexType;
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_table::format::Fragment;
+        use lance_table::system_index::frag_reuse::ledger::Mapping;
+        use lance_table::transaction::{RewriteGroup, StablePartitionRewrite};
+        use uuid::Uuid;
+
+        fn digest(id: u64) -> pb_fri::FragmentDigest {
+            pb_fri::FragmentDigest {
+                id,
+                physical_rows: 4,
+                num_deleted_rows: 0,
+            }
+        }
+
+        fn transition_element(sources: &[u64], destinations: &[u64]) -> TrimElement {
+            TrimElement {
+                raw: Vec::new(),
+                record: TrimRecord::Transition(pb_fri::Transition {
+                    sources: sources.iter().copied().map(digest).collect(),
+                    destinations: destinations.iter().copied().map(digest).collect(),
+                    mapping: Some(pb_fri::transition::Mapping::StablePartition(
+                        pb_fri::StablePartition {
+                            map_id: Uuid::new_v4().to_string(),
+                            map_size_bytes: 1,
+                            base_id: None,
+                        },
+                    )),
+                }),
+            }
+        }
+
+        fn legacy_element(dataset_version: u64, old: &[u64], new: &[u64]) -> TrimElement {
+            TrimElement {
+                raw: Vec::new(),
+                record: TrimRecord::LegacyVersion(super::reuse_version(dataset_version, old, new)),
+            }
+        }
+
+        fn named_index(name: &str, dataset_version: u64, covered: &[u32]) -> IndexMetadata {
+            let mut index = super::index_covering(dataset_version, covered);
+            index.name = name.into();
+            index
+        }
+
+        /// The per-transition retention rule (B1-B5, B7-B9): retain iff some
+        /// logical index still derives coverage from the transition's sources
+        /// while not directly covering every destination.
+        #[test]
+        fn transition_retention_rules() {
+            let elements = vec![transition_element(&[1, 2], &[5, 6])];
+            let retain =
+                |indices: &[IndexMetadata]| compute_tagged_retention(&elements, indices)[0];
+
+            // B1: a disjoint index does not block the trim.
+            assert!(!retain(&[named_index("a_idx", 1, &[3, 4])]));
+            // B2: still deriving from the sources, destinations uncovered.
+            assert!(retain(&[named_index("a_idx", 1, &[1, 2])]));
+            // B3: partial drain (one destination still uncovered) retains.
+            assert!(retain(&[named_index("a_idx", 1, &[1, 5])]));
+            // B4: full direct coverage across the index's segments trims,
+            // even while another segment still lists the sources.
+            assert!(!retain(&[
+                named_index("a_idx", 1, &[1, 2]),
+                named_index("a_idx", 2, &[5, 6]),
+            ]));
+            // B5: segments rebuilt onto the destinations (sources gone) trim.
+            assert!(!retain(&[named_index("a_idx", 2, &[5, 6])]));
+            // B7: one index caught up, another still hanging off the sources.
+            assert!(retain(&[
+                named_index("a_idx", 2, &[5, 6]),
+                named_index("b_idx", 1, &[1]),
+            ]));
+            // B8/B9: no indices left, nothing pins the record.
+            assert!(!retain(&[]));
+            // A missing bitmap imposes no constraint (v0 leniency).
+            let mut no_bitmap = named_index("a_idx", 1, &[]);
+            no_bitmap.fragment_bitmap = None;
+            assert!(!retain(std::slice::from_ref(&no_bitmap)));
+            // ... but a sibling segment with a bitmap still pins it.
+            assert!(retain(&[no_bitmap, named_index("a_idx", 1, &[1])]));
+            // System indices are exempt.
+            assert!(!retain(&[named_index(FRAG_REUSE_INDEX_NAME, 1, &[1, 2])]));
+        }
+
+        /// B6: chain retention. A segment hanging off the head of a chain
+        /// pins every downstream hop its translation path traverses; hops
+        /// upstream of where the segment enters are not needed.
+        #[test]
+        fn chain_retention_closes_forward() {
+            let elements = vec![
+                transition_element(&[1], &[2]),
+                transition_element(&[2], &[3]),
+            ];
+            // Enters at the head: both hops retained.
+            assert_eq!(
+                compute_tagged_retention(&elements, &[named_index("a_idx", 1, &[1])]),
+                vec![true, true]
+            );
+            // Enters mid-chain: only the downstream hop retained.
+            assert_eq!(
+                compute_tagged_retention(&elements, &[named_index("a_idx", 1, &[2])]),
+                vec![false, true]
+            );
+            // Fully retired: both trim together.
+            assert_eq!(
+                compute_tagged_retention(&elements, &[named_index("a_idx", 2, &[3])]),
+                vec![false, false]
+            );
+        }
+
+        /// Chain retention traverses lifted legacy groups too, and a legacy
+        /// version retains at whole-version granularity.
+        #[test]
+        fn chain_retention_spans_legacy_versions() {
+            let elements = vec![
+                legacy_element(10, &[1], &[2]),
+                transition_element(&[2], &[3]),
+            ];
+            // A stale index over the legacy sources pins the version (exact
+            // v0 predicate) and, transitively, the downstream transition.
+            assert_eq!(
+                compute_tagged_retention(&elements, &[named_index("a_idx", 5, &[1])]),
+                vec![true, true]
+            );
+            // Caught up past the legacy version and rebuilt onto the final
+            // fragments: everything trims.
+            assert_eq!(
+                compute_tagged_retention(&elements, &[named_index("a_idx", 11, &[3])]),
+                vec![false, false]
+            );
+
+            // Whole-version granularity: a version with two groups where a
+            // transition consumes the second group's output. An index pinning
+            // the FIRST group pins the version, whose second group then pins
+            // the downstream transition.
+            let elements = vec![
+                legacy_element(10, &[1, 5], &[2, 6]),
+                transition_element(&[6], &[7]),
+            ];
+            assert_eq!(
+                compute_tagged_retention(&elements, &[named_index("a_idx", 5, &[1])]),
+                vec![true, true]
+            );
+        }
+
+        async fn reserve_fragments(dataset: &mut Dataset, num_fragments: u32) {
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::ReserveFragments { num_fragments },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn commit_stable_partition(
+            dataset: Dataset,
+            source_ids: &[u64],
+            dest_base_id: u64,
+        ) -> Dataset {
+            let old_fragments: Vec<Fragment> = source_ids
+                .iter()
+                .map(|id| {
+                    dataset
+                        .fragments()
+                        .iter()
+                        .find(|f| f.id == *id)
+                        .unwrap()
+                        .clone()
+                })
+                .collect();
+            let (transition, destinations) =
+                reader_tests::prepare_partition(&dataset, source_ids, dest_base_id).await;
+            let read_version = dataset.manifest.version;
+            CommitBuilder::new(Arc::new(dataset))
+                .execute(Transaction::new(
+                    read_version,
+                    Operation::Rewrite {
+                        groups: vec![RewriteGroup {
+                            old_fragments,
+                            new_fragments: destinations,
+                        }],
+                        rewritten_indices: vec![],
+                        frag_reuse_index: None,
+                        stable_partition: Some(StablePartitionRewrite {
+                            transitions: vec![transition],
+                            base_entry_version: None,
+                        }),
+                    },
+                    None,
+                ))
+                .await
+                .unwrap()
+        }
+
+        async fn fri_entry(dataset: &Dataset) -> Option<IndexMetadata> {
+            crate::index::load_all_indices(dataset)
+                .await
+                .unwrap()
+                .iter()
+                .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                .cloned()
+        }
+
+        async fn sorted_values(dataset: &Dataset) -> Vec<i32> {
+            let batch = dataset.scan().try_into_batch().await.unwrap();
+            let mut values: Vec<i32> = batch["i"]
+                .as_primitive::<Int32Type>()
+                .iter()
+                .map(|value| value.unwrap())
+                .collect();
+            values.sort_unstable();
+            values
+        }
+
+        /// The full trim lifecycle on a tagged table: retained while the
+        /// index still derives from the sources, deleted outright once the
+        /// index is rebuilt over the destinations (C3), with the sticky
+        /// feature flags left set and the table still fully usable.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn trim_lifecycle_retains_then_deletes() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 20).await;
+            let before = sorted_values(&dataset).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let entry = fri_entry(&dataset).await.unwrap();
+            assert_eq!(entry.index_version, 1);
+
+            // Still deriving: the trim must be a no-op (no commit at all).
+            let version_before = dataset.manifest.version;
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(dataset.manifest.version, version_before);
+            assert_eq!(fri_entry(&dataset).await.unwrap().uuid, entry.uuid);
+
+            // Drain: rebuild the index over the destinations (the gate must
+            // admit user index maintenance on a tagged table).
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            // Fully drained: the entry is deleted outright.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(fri_entry(&dataset).await.is_none());
+            let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+            assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
+            assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
+
+            // The (still-flagged) table keeps working: reads, filtered reads,
+            // and new writes.
+            assert_eq!(sorted_values(&dataset).await, before);
+            assert_eq!(dataset.count_rows(Some("i >= 4".into())).await.unwrap(), 4);
+            let batch = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step_custom::<Int32Type>(100, 1))
+                .into_batch_rows(lance_datagen::RowCount::from(4))
+                .unwrap();
+            let dataset = crate::dataset::InsertBuilder::new(Arc::new(dataset))
+                .with_params(&WriteParams {
+                    mode: crate::dataset::WriteMode::Append,
+                    ..Default::default()
+                })
+                .execute(vec![batch])
+                .await
+                .unwrap();
+            assert_eq!(dataset.count_rows(None).await.unwrap(), 12);
+        }
+
+        /// A trim committed from a stale read must re-derive at commit time:
+        /// a stable-partition rewrite that landed in between keeps its
+        /// transition while the drained one is still released.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn trim_rebases_over_concurrent_stable_partition() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 40).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            // Drain the index onto the destinations.
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            // A second stable-partition rewrite lands after the trim's read.
+            let mut stale = dataset.clone();
+            let dataset = commit_stable_partition(dataset, &[10, 11], 20).await;
+            let current_entry = fri_entry(&dataset).await.unwrap();
+
+            // The stale trim would have deleted the entry; the rebase must
+            // keep the new transition instead.
+            cleanup_frag_reuse_index(&mut stale).await.unwrap();
+            let trimmed_entry = fri_entry(&stale).await.unwrap();
+            assert_ne!(trimmed_entry.uuid, current_entry.uuid);
+            let ledger = decode_frag_reuse_ledger(&stale, &trimmed_entry)
+                .await
+                .unwrap();
+            assert_eq!(ledger.transitions().len(), 1);
+            let kept = &ledger.transitions()[0];
+            assert_eq!(
+                kept.sources().iter().map(|d| d.id).collect::<Vec<_>>(),
+                vec![10, 11]
+            );
+            assert!(matches!(kept.mapping(), Mapping::StablePartition(_)));
+            // The drained transition's raw bytes are gone; the kept one's
+            // content is a verbatim suffix of the previous entry.
+            let previous = load_raw_frag_reuse_content(&stale, &current_entry)
+                .await
+                .unwrap();
+            let trimmed = load_raw_frag_reuse_content(&stale, &trimmed_entry)
+                .await
+                .unwrap();
+            assert!(previous.ends_with(&trimmed));
+            assert!(trimmed.len() < previous.len());
+        }
+
+        /// Trim vs. trim mirrors the v0 cleanup-vs-cleanup conflict.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn concurrent_trims_conflict() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let mut stale = dataset.clone();
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(fri_entry(&dataset).await.is_none());
+            assert!(matches!(
+                cleanup_frag_reuse_index(&mut stale).await,
+                Err(Error::RetryableCommitConflict { .. })
+            ));
+        }
+
+        /// Trim vs. tagged compaction: the freshly appended
+        /// ordered-compaction transition survives the rebased trim.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn trim_rebases_over_concurrent_tagged_compaction() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 40).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let mut stale = dataset.clone();
+            // A tagged compaction appends an ordered-compaction transition.
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 100,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let ledger = decode_frag_reuse_ledger(&dataset, &fri_entry(&dataset).await.unwrap())
+                .await
+                .unwrap();
+            assert_eq!(ledger.transitions().len(), 2);
+
+            cleanup_frag_reuse_index(&mut stale).await.unwrap();
+            let trimmed_entry = fri_entry(&stale).await.unwrap();
+            let ledger = decode_frag_reuse_ledger(&stale, &trimmed_entry)
+                .await
+                .unwrap();
+            assert_eq!(ledger.transitions().len(), 1);
+            assert!(matches!(
+                ledger.transitions()[0].mapping(),
+                Mapping::OrderedCompaction(_)
+            ));
+            assert_eq!(
+                ledger.transitions()[0]
+                    .sources()
+                    .iter()
+                    .map(|d| d.id)
+                    .collect::<Vec<_>>(),
+                vec![10, 11]
+            );
+        }
     }
 
     async fn row_addrs_by_i(dataset: &Dataset) -> HashMap<i32, u64> {

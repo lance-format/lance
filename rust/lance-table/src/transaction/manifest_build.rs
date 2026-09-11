@@ -440,6 +440,63 @@ impl Transaction {
             ));
         }
 
+        // A `CreateIndex` touching a tagged entry is only safe in one shape:
+        // the trim the maintenance path derives against the CURRENT entry at
+        // commit time -- exactly the FRI entry replaced (or removed outright),
+        // nothing else mixed in, and the removed identity matching the entry
+        // this manifest actually carries. The in-memory intent distinguishes
+        // that derivation from a hand-built entry, whose snapshot may be
+        // stale: splicing it would silently drop records a concurrent writer
+        // appended.
+        let trims_tagged_entry = if let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+            ..
+        } = &self.operation
+        {
+            let touches_fri = new_indices
+                .iter()
+                .chain(removed_indices.iter())
+                .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+            let tagged_involved = new_indices.iter().any(is_tagged)
+                || removed_indices.iter().any(is_tagged)
+                || (touches_fri && current_indices.iter().any(is_tagged));
+            if tagged_involved {
+                if !config.tagged_frag_reuse_trim {
+                    return Err(Error::invalid_input(
+                        "a tagged fragment reuse entry may only be replaced or removed by \
+                         the trim `cleanup_frag_reuse_index` derives against the current \
+                         entry at commit time; a hand-built entry may splice away \
+                         concurrent records",
+                    ));
+                }
+                let current_entry = current_indices
+                    .iter()
+                    .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+                let removed_matches_current = matches!(
+                    (removed_indices.as_slice(), current_entry),
+                    ([removed], Some(current))
+                        if removed.name == FRAG_REUSE_INDEX_NAME && removed.uuid == current.uuid
+                );
+                let new_is_tagged_entry_or_empty = match new_indices.as_slice() {
+                    [] => true,
+                    [entry] => is_tagged(entry),
+                    _ => false,
+                };
+                if !removed_matches_current || !new_is_tagged_entry_or_empty {
+                    return Err(Error::invalid_input(
+                        "a tagged fragment reuse trim must replace or remove exactly the \
+                         current FRI entry and carry nothing else; the entry it removes \
+                         no longer matches the current manifest, so it was derived \
+                         against a stale version",
+                    ));
+                }
+            }
+            tagged_involved
+        } else {
+            false
+        };
+
         // A rewrite carrying an already-assembled tagged entry (a
         // stable-partition rewrite, or a tagged compaction) appends to the
         // tagged history instead of misinterpreting it. A bare rewrite or
@@ -451,8 +508,27 @@ impl Transaction {
                 ..
             } if is_tagged(entry)
         );
+        // Creating, replacing, or dropping user indices leaves the tagged
+        // entry untouched (it is carried through unchanged), and draining
+        // index coverage onto a rewrite's destinations is exactly how tagged
+        // histories become trimmable -- so this shape is safe and necessary.
+        // Only a `CreateIndex` touching the FRI entry needs the trim rules
+        // above.
+        let maintains_user_indices = matches!(
+            &self.operation,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+                ..
+            } if new_indices
+                .iter()
+                .chain(removed_indices.iter())
+                .all(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
+        );
         if current_indices.iter().any(is_tagged)
             && !appends_tagged_entry
+            && !trims_tagged_entry
+            && !maintains_user_indices
             && !matches!(
                 self.operation,
                 Operation::Append { .. } | Operation::ReserveFragments { .. }
@@ -1696,7 +1772,6 @@ mod tests {
     #[rstest::rstest]
     #[case::delete("delete")]
     #[case::update("update")]
-    #[case::create_index("create_index")]
     #[case::config("config")]
     #[case::memwal("memwal")]
     #[case::bare_rewrite("bare_rewrite")]
@@ -1714,10 +1789,6 @@ mod tests {
                 predicate: "true".into(),
             },
             "update" => crate::transaction::test_support::update_txn(vec![]).operation,
-            "create_index" => Operation::CreateIndex {
-                new_indices: vec![sample_index_metadata("id_idx")],
-                removed_indices: vec![],
-            },
             "config" => Operation::UpdateConfig {
                 config_updates: None,
                 table_metadata_updates: None,
@@ -1846,6 +1917,169 @@ mod tests {
             new_manifest.reader_feature_flags & FLAG_FRAGMENT_REUSE_INDEX,
             0
         );
+    }
+
+    /// A tagged-table fixture for the CreateIndex gate: the manifest carries
+    /// the FRI flags and one tagged entry.
+    fn tagged_table_fixture() -> (Manifest, IndexMetadata) {
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        let mut current =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        current.fields.clear();
+        (manifest, current)
+    }
+
+    fn trim_build_config() -> ManifestBuildConfig {
+        let mut config = default_build_config();
+        config.tagged_frag_reuse_trim = true;
+        config
+    }
+
+    /// User index maintenance (create, replace, drop) leaves the tagged entry
+    /// untouched and must pass the gate: it is how coverage drains onto a
+    /// rewrite's destinations so histories become trimmable.
+    #[test]
+    fn tagged_history_allows_user_index_create_index() {
+        let (manifest, current) = tagged_table_fixture();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![sample_index_metadata("id_idx")],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let (_, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![current.clone()],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
+        // The tagged entry is carried through untouched.
+        assert!(final_indices.iter().any(|idx| idx.uuid == current.uuid));
+        assert!(final_indices.iter().any(|idx| idx.name == "id_idx"));
+    }
+
+    /// A CreateIndex replacing a tagged entry without the maintenance path's
+    /// derivation intent is a hand-built (possibly stale) trim: rejected.
+    #[test]
+    fn tagged_trim_without_intent_rejected() {
+        let (manifest, current) = tagged_table_fixture();
+        let mut replacement =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        replacement.fields.clear();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![replacement],
+                removed_indices: vec![current.clone()],
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![current],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("cleanup_frag_reuse_index"),
+            "{error}"
+        );
+    }
+
+    /// With the intent, exactly two shapes pass: the entry replaced, or the
+    /// entry removed outright (everything trimmed away; flags stay sticky).
+    #[rstest::rstest]
+    #[case::replace(true)]
+    #[case::remove(false)]
+    fn tagged_trim_with_intent_accepts_the_safe_shapes(#[case] replace: bool) {
+        let (manifest, current) = tagged_table_fixture();
+        let new_indices = if replace {
+            let mut replacement =
+                sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+            replacement.fields.clear();
+            vec![replacement]
+        } else {
+            vec![]
+        };
+        let expected_uuid = new_indices.first().map(|idx| idx.uuid);
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices: vec![current.clone()],
+            },
+            None,
+        );
+        let (new_manifest, final_indices) = transaction
+            .build_manifest(Some(&manifest), vec![current], "txn", &trim_build_config())
+            .unwrap();
+        let entries: Vec<_> = final_indices
+            .iter()
+            .filter(|idx| idx.name == crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
+            .collect();
+        assert_eq!(entries.first().map(|idx| idx.uuid), expected_uuid);
+        // Sticky bits survive even full removal.
+        assert_ne!(
+            new_manifest.reader_feature_flags & FLAG_FRAGMENT_REUSE_INDEX,
+            0
+        );
+    }
+
+    /// Even with the intent, a trim whose removed identity no longer matches
+    /// the current entry was derived against a stale version: rejected, so a
+    /// replay cannot splice away a concurrent append.
+    #[test]
+    fn tagged_trim_with_stale_identity_rejected() {
+        let (manifest, current) = tagged_table_fixture();
+        let mut stale = current.clone();
+        stale.uuid = Uuid::new_v4();
+        let mut replacement =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        replacement.fields.clear();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![replacement],
+                removed_indices: vec![stale],
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![current], "txn", &trim_build_config())
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("stale"), "{error}");
+    }
+
+    /// A trim mixing user indices into the same commit is not a shape the
+    /// maintenance path produces; rejected even with the intent.
+    #[test]
+    fn tagged_trim_mixed_with_user_indices_rejected() {
+        let (manifest, current) = tagged_table_fixture();
+        let mut replacement =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        replacement.fields.clear();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![replacement, sample_index_metadata("id_idx")],
+                removed_indices: vec![current.clone()],
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(Some(&manifest), vec![current], "txn", &trim_build_config())
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
     }
 
     #[test]

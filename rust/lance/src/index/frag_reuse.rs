@@ -447,12 +447,20 @@ pub(crate) async fn decode_frag_reuse_ledger(
     entry: &IndexMetadata,
 ) -> lance_core::Result<lance_table::system_index::frag_reuse::ledger::FragReuseLedger> {
     let content = load_raw_frag_reuse_content(dataset, entry).await?;
+    decode_frag_reuse_ledger_from_content(entry.index_version, &content).await
+}
+
+/// Decode already-loaded FRI content bytes into a transition ledger.
+pub(crate) async fn decode_frag_reuse_ledger_from_content(
+    index_version: i32,
+    content: &[u8],
+) -> lance_core::Result<lance_table::system_index::frag_reuse::ledger::FragReuseLedger> {
     let inline = prost_types::Any {
         type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-        value: encode_length_delimited_field(1, &content),
+        value: encode_length_delimited_field(1, content),
     };
     lance_table::system_index::frag_reuse::ledger::FragReuseLedger::decode(
-        entry.index_version,
+        index_version,
         &inline,
         |_| async {
             Err(Error::invalid_input(
@@ -765,6 +773,18 @@ pub(crate) async fn build_stable_partition_rewrite_entry(
         }
     }
 
+    let entry = build_tagged_frag_reuse_entry(dataset, content, fragment_bitmap).await?;
+    Ok((entry, base_entry_version))
+}
+
+/// Package assembled tagged FRI content bytes into a fresh manifest entry,
+/// spilling to an external details file above the inline threshold. The
+/// content must already be validated (a decodable ledger); this only encodes.
+pub(crate) async fn build_tagged_frag_reuse_entry(
+    dataset: &Dataset,
+    content: Vec<u8>,
+    fragment_bitmap: RoaringBitmap,
+) -> lance_core::Result<IndexMetadata> {
     let index_id = Uuid::new_v4();
     let details_value = if content.len() > 204800 {
         let file_path = dataset
@@ -781,10 +801,10 @@ pub(crate) async fn build_stable_partition_rewrite_entry(
         };
         encode_length_delimited_field(2, &external_file.encode_to_vec())
     } else {
-        assembled.value
+        encode_length_delimited_field(1, &content)
     };
 
-    let entry = IndexMetadata {
+    Ok(IndexMetadata {
         uuid: index_id,
         name: FRAG_REUSE_INDEX_NAME.to_string(),
         fields: vec![],
@@ -801,8 +821,7 @@ pub(crate) async fn build_stable_partition_rewrite_entry(
         // The row-map files live in their own directories referenced from the
         // transitions, not under this entry's uuid.
         files: None,
-    };
-    Ok((entry, base_entry_version))
+    })
 }
 
 #[cfg(test)]

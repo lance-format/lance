@@ -719,6 +719,13 @@ pub struct ManifestBuildConfig {
     /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
     /// sets `manifest.next_row_id` to the provided value before activating the flag.
     pub migration_next_row_id: Option<u64>,
+    /// This commit is a tagged fragment-reuse-index trim derived by the
+    /// maintenance path against the current manifest entry. In-memory only,
+    /// like the rewrite path's `stable_partition` intent: a hand-built
+    /// `CreateIndex` replacing a tagged entry has bypassed the trim's
+    /// retention derivation and may splice away records a concurrent writer
+    /// appended, so `build_manifest` rejects that shape without this intent.
+    pub tagged_frag_reuse_trim: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

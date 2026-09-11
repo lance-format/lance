@@ -713,11 +713,13 @@ pub mod tests {
 
     // Deferred compaction is no longer in this list: on a tagged table it
     // appends an ordered-compaction transition to the tagged entry (see the
-    // chained end-to-end test in `crate::index::frag_reuse`).
+    // chained end-to-end test in `crate::index::frag_reuse`). Cleanup is no
+    // longer in this list either: tagged trim is implemented (see
+    // `crate::dataset::index::frag_reuse::tests::tagged_trim`), and on this
+    // fixture it is a retaining no-op.
     #[rstest::rstest]
     #[case::eager_compaction("eager")]
     #[case::statistics("statistics")]
-    #[case::cleanup("cleanup")]
     #[case::shallow_clone("shallow")]
     #[case::deep_clone("deep")]
     #[tokio::test]
@@ -750,9 +752,6 @@ pub mod tests {
             .unwrap_err(),
             "statistics" => dataset
                 .index_statistics(FRAG_REUSE_INDEX_NAME)
-                .await
-                .unwrap_err(),
-            "cleanup" => crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
                 .await
                 .unwrap_err(),
             "shallow" => dataset
@@ -1672,23 +1671,19 @@ pub mod tests {
             base_id: None,
             files: None,
         };
-        dataset
-            .apply_commit(
-                Transaction::new(
-                    dataset.manifest.version,
-                    Operation::CreateIndex {
-                        new_indices: vec![fri.clone()],
-                        removed_indices: vec![],
-                    },
-                    None,
-                ),
-                &Default::default(),
-                &Default::default(),
-            )
-            .await
-            .unwrap();
-        let version = dataset.manifest.version;
+        // Installed by writing the manifest directly: the commit chokepoint
+        // (correctly) refuses a hand-built tagged entry, and no writer of this
+        // version can produce an index_version-2 entry.
         let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
+        indices.push(fri.clone());
+        {
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            manifest.reader_feature_flags |= flag;
+            manifest.writer_feature_flags |= flag;
+        }
+        persist_fixture(&mut dataset, indices).await;
+        let version = dataset.manifest.version;
         assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
         assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
         let error = dataset
@@ -1726,7 +1721,7 @@ pub mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("Upgrade"));
+        assert!(error.to_string().to_lowercase().contains("upgrade"));
         assert_eq!(dataset.manifest.version, version);
 
         dataset
