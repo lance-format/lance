@@ -77,6 +77,10 @@ struct ReferencedFiles {
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
+    /// Stable-partition row-map ids (`_fri/<map_id>/`) referenced by tagged
+    /// fragment-reuse-index entries. Resolved from
+    /// [`CleanupInspection::frag_reuse_entries`] before deletion decisions.
+    frag_reuse_map_ids: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -313,6 +317,10 @@ struct CleanupInspection {
     verified_files: ReferencedFiles,
     /// Track tagged old versions in case we want to raise a `CleanupError`.
     tagged_old_versions: HashSet<u64>,
+    /// Tagged fragment-reuse-index entries seen across manifests, deduped by
+    /// entry uuid so each is decoded at most once; the flag records whether
+    /// some retained (working-set) manifest carries the entry.
+    frag_reuse_entries: HashMap<uuid::Uuid, (IndexMetadata, bool)>,
     /// The earliest timestamp of all retained manifests.
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
     /// The latest timestamp of all manifests that will be removed.
@@ -661,6 +669,21 @@ impl<'a> CleanupTask<'a> {
             let uuid_str = index.uuid.to_string();
             referenced_files.index_uuids.insert(uuid_str);
         }
+
+        // Tagged FRI entries are recorded for row-map reference resolution
+        // (their content is decoded later, once per unique entry). A v0 entry
+        // cannot reference row maps, so v0-only datasets record nothing.
+        for index in indexes {
+            if index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME
+                && index.index_version != 0
+            {
+                let entry = inspection
+                    .frag_reuse_entries
+                    .entry(index.uuid)
+                    .or_insert_with(|| (index.clone(), false));
+                entry.1 |= in_working_set;
+            }
+        }
         Ok(())
     }
 
@@ -676,10 +699,73 @@ impl<'a> CleanupTask<'a> {
             deletion_files_removed = tracing::field::Empty
         )
     )]
+    /// Resolve the row-map ids referenced by the recorded tagged FRI entries
+    /// into the inspection's referenced (retained manifests) and verified
+    /// (expiring manifests) sets. Returns false when some entry cannot be
+    /// interpreted, in which case `_fri/` garbage collection is skipped for
+    /// this run: an uninterpretable entry may reference maps invisibly.
+    async fn resolve_frag_reuse_map_ids(&self, inspection: &mut CleanupInspection) -> bool {
+        let entries = std::mem::take(&mut inspection.frag_reuse_entries);
+        for (uuid, (entry, in_working_set)) in entries.iter() {
+            let map_ids = async {
+                let content =
+                    crate::index::frag_reuse::load_raw_frag_reuse_content(self.dataset, entry)
+                        .await?;
+                let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(
+                    entry.index_version,
+                    &content,
+                )
+                .await?;
+                if ledger.has_unsupported_transitions() {
+                    return Err(Error::not_supported(
+                        "the tagged FRI history carries transitions this client cannot interpret",
+                    ));
+                }
+                Ok::<Vec<String>, Error>(
+                    ledger
+                        .transitions()
+                        .iter()
+                        .filter_map(|transition| {
+                            match transition.mapping() {
+                            lance_table::system_index::frag_reuse::ledger::Mapping::StablePartition(
+                                partition,
+                            ) => Some(partition.map_id.clone()),
+                            _ => None,
+                        }
+                        })
+                        .collect(),
+                )
+            }
+            .await;
+            match map_ids {
+                Ok(map_ids) => {
+                    let target = if *in_working_set {
+                        &mut inspection.referenced_files
+                    } else {
+                        &mut inspection.verified_files
+                    };
+                    target.frag_reuse_map_ids.extend(map_ids);
+                }
+                Err(error) => {
+                    warn!(
+                        entry_uuid = %uuid,
+                        error = %error,
+                        "Cannot resolve the row-map references of a fragment reuse index \
+                         entry; skipping _fri garbage collection for this run"
+                    );
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     async fn delete_unreferenced_files(
         &self,
-        inspection: CleanupInspection,
+        mut inspection: CleanupInspection,
     ) -> Result<CleanupRunResult> {
+        let collect_frag_reuse_maps = self.resolve_frag_reuse_map_ids(&mut inspection).await;
+        let inspection = inspection;
         let cleanup_result = Mutex::new(CleanupRunResult::default());
         let deletes_files = self.action.deletes_files();
         let removes_empty_dirs = matches!(
@@ -735,7 +821,7 @@ impl<'a> CleanupTask<'a> {
         // would hide files that belong to newer deleted versions. See
         // [`CleanupInspection::listing_unmodified_since`].
         let unmodified_since = inspection.listing_unmodified_since();
-        let streams = vec![
+        let mut streams = vec![
             build_listing_stream(self.dataset.versions_dir(), unmodified_since),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
             build_listing_stream(self.dataset.data_dir(), unmodified_since),
@@ -746,6 +832,13 @@ impl<'a> CleanupTask<'a> {
             build_listing_stream(self.dataset.indices_dir(), None),
             build_listing_stream(self.dataset.deletions_dir(), unmodified_since),
         ];
+        if collect_frag_reuse_maps {
+            // Stable-partition row maps, referenced by map id from tagged FRI
+            // entries. Like `_indices/`, scanned without a cutoff: references
+            // from manifests removed by this pass are proof of deletability.
+            // A dataset without a `_fri/` directory yields an empty stream.
+            streams.push(build_listing_stream(self.dataset.base.clone().join("_fri"), None));
+        }
         let unreferenced_files = stream::iter(streams).flatten().boxed();
 
         let old_manifests = inspection.old_manifests.clone();
@@ -910,6 +1003,39 @@ impl<'a> CleanupTask<'a> {
                     size_bytes,
                 ));
             }
+        }
+        if relative_path.as_ref().starts_with("_fri") {
+            // Row maps are referenced by map id (`_fri/<map_id>/...`) from
+            // tagged FRI entries, resolved in `resolve_frag_reuse_map_ids`.
+            // The same lifecycle as `_indices/`: kept while some retained
+            // manifest references the map; deletable immediately when only
+            // expiring manifests reference it; an unreferenced map (a failed
+            // commit's orphan, or one released by an already-expired history)
+            // ages past the unverified-retention threshold first, which also
+            // protects a just-written map whose commit has not landed yet.
+            if let Some(map_id) = relative_path.parts().nth(1) {
+                if inspection
+                    .referenced_files
+                    .frag_reuse_map_ids
+                    .contains(map_id.as_ref())
+                {
+                    return Ok(None);
+                } else if !maybe_in_progress {
+                    return Ok(cleanup_file(path, CleanupFileKind::Index, true, size_bytes));
+                } else if inspection
+                    .verified_files
+                    .frag_reuse_map_ids
+                    .contains(map_id.as_ref())
+                {
+                    return Ok(cleanup_file(
+                        path,
+                        CleanupFileKind::Index,
+                        false,
+                        size_bytes,
+                    ));
+                }
+            }
+            return Ok(None);
         }
         if relative_path.as_ref().starts_with("_indices") {
             // Indices are referenced by UUID so we need to examine the UUID
@@ -5247,5 +5373,337 @@ mod tests {
         assert_eq!(remaining, vec![3]);
         assert_eq!(dataset.count_versions().await.unwrap(), 1);
         assert_eq!(dataset.versions().await.unwrap().len(), 1);
+    }
+
+    /// D-rows: `_fri/` row-map garbage collection.
+    mod frag_reuse_map_gc {
+        use super::*;
+        use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
+        use crate::dataset::write::CommitBuilder;
+        use crate::index::frag_reuse_reader::tests as reader_tests;
+        use arrow_array::types::Int32Type;
+        use chrono::TimeDelta;
+        use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_table::format::Fragment;
+        use lance_table::format::IndexMetadata;
+        use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+        use lance_table::transaction::{RewriteGroup, StablePartitionRewrite};
+        use prost::Message;
+
+        impl MockDatasetFixture {
+            /// The `_fri/<map_id>/` directories currently on disk.
+            async fn list_fri_map_dirs(&self) -> Vec<String> {
+                let registry = Arc::new(ObjectStoreRegistry::default());
+                let (os, path) = ObjectStore::from_uri_and_params(
+                    registry,
+                    &self.dataset_path,
+                    &self.os_params(),
+                )
+                .await
+                .unwrap();
+                let mut ids = std::collections::HashSet::new();
+                let mut stream = os.read_dir_all(&path.clone().join("_fri"), None);
+                loop {
+                    match stream.try_next().await {
+                        Ok(Some(meta)) => {
+                            let relative = remove_prefix(&meta.location, &path);
+                            if let Some(map_id) = relative.parts().nth(1) {
+                                ids.insert(map_id.as_ref().to_string());
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(Error::NotFound { .. }) => break,
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+                let mut ids: Vec<String> = ids.into_iter().collect();
+                ids.sort();
+                ids
+            }
+        }
+
+        async fn reserve_fragments(dataset: &mut Dataset, num_fragments: u32) {
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::ReserveFragments { num_fragments },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// A persisted dataset (mock store, recorded mtimes) with one
+        /// committed stable-partition rewrite; returns the map id of its
+        /// row map.
+        async fn make_tagged(fixture: &MockDatasetFixture) -> (Dataset, String) {
+            let data = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_reader_rows(
+                    lance_datagen::RowCount::from(4),
+                    lance_datagen::BatchCount::from(2),
+                );
+            Dataset::write(
+                data,
+                &fixture.dataset_path,
+                Some(WriteParams {
+                    store_params: Some(fixture.os_params()),
+                    commit_handler: Some(Arc::new(RenameCommitHandler)),
+                    mode: WriteMode::Create,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let mut dataset = *fixture.open().await.unwrap();
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            reserve_fragments(&mut dataset, 20).await;
+            let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+            let (transition, destinations) = reader_tests::prepare(&dataset).await;
+            let Some(pb_fri::transition::Mapping::StablePartition(mapping)) = &transition.mapping
+            else {
+                unreachable!()
+            };
+            let map_id = mapping.map_id.clone();
+            let read_version = dataset.manifest.version;
+            let dataset = CommitBuilder::new(Arc::new(dataset))
+                .execute(Transaction::new(
+                    read_version,
+                    Operation::Rewrite {
+                        groups: vec![RewriteGroup {
+                            old_fragments,
+                            new_fragments: destinations,
+                        }],
+                        rewritten_indices: vec![],
+                        frag_reuse_index: None,
+                        stable_partition: Some(StablePartitionRewrite {
+                            transitions: vec![transition],
+                            base_entry_version: None,
+                        }),
+                    },
+                    None,
+                ))
+                .await
+                .unwrap();
+            (dataset, map_id)
+        }
+
+        /// D1: a map referenced by a retained manifest survives cleanup, no
+        /// matter how old it is.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn referenced_map_is_kept() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (_, map_id) = make_tagged(&fixture).await;
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
+        }
+
+        /// D2: a map referenced only by expiring manifests goes away in the
+        /// same pass that removes them (the trim released it from the entry
+        /// first).
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn map_released_by_trim_is_collected_with_its_manifests() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, map_id) = make_tagged(&fixture).await;
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
+
+            // Drain the index onto the destinations, then trim: the entry is
+            // deleted, so only old manifests reference the map.
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            // Young files referenced by expiring manifests still wait for the
+            // unverified retention window unless verified; the reference from
+            // the removed manifest is that verification.
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert!(fixture.list_fri_map_dirs().await.is_empty());
+        }
+
+        /// D3 + D4: an unreferenced map (a failed commit's orphan) is kept
+        /// while young and collected once it ages past the unverified
+        /// retention threshold.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn orphan_map_ages_out() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (dataset, committed_map_id) = make_tagged(&fixture).await;
+
+            // A row map written at day 10 whose commit never lands.
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            let (orphan_transition, _) = reader_tests::prepare(&dataset).await;
+            let Some(pb_fri::transition::Mapping::StablePartition(mapping)) =
+                &orphan_transition.mapping
+            else {
+                unreachable!()
+            };
+            let orphan_map_id = mapping.map_id.clone();
+            let mut expected = vec![committed_map_id.clone(), orphan_map_id.clone()];
+            expected.sort();
+            assert_eq!(fixture.list_fri_map_dirs().await, expected);
+
+            // D3: unreferenced but young, kept.
+            fixture
+                .run_cleanup(utc_now() + TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(fixture.list_fri_map_dirs().await, expected);
+
+            // D4: unreferenced and old, collected; the referenced map stays.
+            MockClock::set_system_time(TimeDelta::try_days(20).unwrap().to_std().unwrap());
+            fixture
+                .run_cleanup(utc_now() + TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![committed_map_id]);
+        }
+
+        /// D5: reference resolution decodes external entry content too. The
+        /// integration tests above cover inline entries; this drives the
+        /// resolver directly over an entry whose details live in an external
+        /// file.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn reference_resolution_reads_external_entries() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (dataset, _) = make_tagged(&fixture).await;
+
+            let map_id = Uuid::new_v4().to_string();
+            let digest = |id: u64| pb_fri::FragmentDigest {
+                id,
+                physical_rows: 4,
+                num_deleted_rows: 0,
+            };
+            let content = {
+                let mut content = Vec::new();
+                let transition = pb_fri::Transition {
+                    sources: vec![digest(100)],
+                    destinations: vec![digest(101)],
+                    mapping: Some(pb_fri::transition::Mapping::StablePartition(
+                        pb_fri::StablePartition {
+                            map_id: map_id.clone(),
+                            map_size_bytes: 1,
+                            base_id: None,
+                        },
+                    )),
+                };
+                content.extend(reader_tests::field(2, &transition.encode_to_vec()));
+                content
+            };
+            let uuid = Uuid::new_v4();
+            let details_path = dataset
+                .indices_dir()
+                .join(uuid.to_string())
+                .join("frag_reuse_details.binpb");
+            let mut writer = dataset.object_store.create(&details_path).await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            writer.write_all(&content).await.unwrap();
+            writer.shutdown().await.unwrap();
+            let entry = IndexMetadata {
+                uuid,
+                fields: vec![],
+                covering_fields: vec![],
+                name: FRAG_REUSE_INDEX_NAME.into(),
+                dataset_version: dataset.manifest.version,
+                fragment_bitmap: None,
+                index_details: Some(Arc::new(prost_types::Any {
+                    type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                    value: reader_tests::field(
+                        2,
+                        &lance_table::format::pb::ExternalFile {
+                            path: "frag_reuse_details.binpb".into(),
+                            offset: 0,
+                            size: content.len() as u64,
+                        }
+                        .encode_to_vec(),
+                    ),
+                })),
+                index_version: 1,
+                created_at: None,
+                base_id: None,
+                files: None,
+            };
+
+            let task = CleanupTask::new(&dataset, CleanupPolicy::default(), CleanupAction::Execute);
+            let mut inspection = CleanupInspection::default();
+            inspection
+                .frag_reuse_entries
+                .insert(uuid, (entry.clone(), true));
+            assert!(task.resolve_frag_reuse_map_ids(&mut inspection).await);
+            assert!(
+                inspection
+                    .referenced_files
+                    .frag_reuse_map_ids
+                    .contains(&map_id)
+            );
+
+            // An uninterpretable entry (a future index_version) disables
+            // `_fri` collection for the whole run instead of guessing.
+            let future_entry = IndexMetadata {
+                index_version: 2,
+                ..entry
+            };
+            let mut inspection = CleanupInspection::default();
+            inspection
+                .frag_reuse_entries
+                .insert(uuid, (future_entry, true));
+            assert!(!task.resolve_frag_reuse_map_ids(&mut inspection).await);
+        }
+
+        /// D-guard: a v0 dataset records no tagged entries and has no `_fri`
+        /// directory; cleanup behaves exactly as before.
+        #[tokio::test]
+        async fn v0_dataset_is_untouched() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            fixture.create_some_data().await.unwrap();
+            fixture.overwrite_some_data().await.unwrap();
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            let removed = fixture
+                .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(removed.old_versions, 1);
+            assert!(fixture.list_fri_map_dirs().await.is_empty());
+        }
     }
 }
