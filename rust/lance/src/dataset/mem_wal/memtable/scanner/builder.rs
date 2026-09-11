@@ -17,7 +17,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
+use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, FtsQueryNode, Operator};
 use lance_index::scalar::inverted::{DOC_INDEX_FIELD, DocumentGranularity};
 use lance_linalg::distance::DistanceType;
 
@@ -25,7 +25,7 @@ use super::exec::{
     BTreeIndexExec, FtsIndexExec, MemTableBruteForceVectorExec, MemTableDedupScanExec,
     MemTableScanExec, SCORE_COLUMN, VectorIndexExec,
 };
-use crate::dataset::mem_wal::index::MemTableVisibility;
+use crate::dataset::mem_wal::index::{FtsQueryExpr, MemTableVisibility};
 use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -56,57 +56,20 @@ pub struct VectorQuery {
     pub distance_upper_bound: Option<f32>,
 }
 
-/// Full-text search query type.
-#[derive(Debug, Clone)]
-pub enum FtsQueryType {
-    /// Simple term match.
-    Match {
-        /// The search query string.
-        query: String,
-        /// The operator used to combine tokenized query terms.
-        operator: Operator,
-        /// Boost factor applied to the score.
-        boost: f32,
-    },
-    /// Phrase query with slop.
-    Phrase {
-        /// The phrase to search for.
-        query: String,
-        /// Maximum allowed distance between consecutive tokens.
-        slop: u32,
-    },
-    /// Boolean query with MUST/SHOULD/MUST_NOT.
-    Boolean {
-        /// Terms that must match and contribute to the score.
-        must: Vec<String>,
-        /// Terms that should match (adds to score).
-        should: Vec<String>,
-        /// Terms that must not match.
-        must_not: Vec<String>,
-    },
-    /// Fuzzy match query with typo tolerance.
-    Fuzzy {
-        /// The search query string.
-        query: String,
-        /// Maximum edit distance (Levenshtein distance).
-        /// None means auto-fuzziness based on token length.
-        fuzziness: Option<u32>,
-        /// Number of initial characters that must match exactly.
-        prefix_length: u32,
-        /// Maximum number of terms to expand to.
-        max_expansions: usize,
-        /// Boost factor applied to the score.
-        boost: f32,
-    },
-}
-
 /// Full-text search query parameters.
+///
+/// The query itself is an [`FtsQueryExpr`] — the same tree the in-memory
+/// inverted index evaluates — so every shape the index supports (nested
+/// boolean, boost with a negative clause, phrase, fuzzy) reaches it without a
+/// lossy intermediate form. Everything outside the tree here is execution
+/// policy rather than the query: which column, which document unit, and the
+/// recall/latency knobs.
 #[derive(Debug, Clone)]
 pub struct FtsQuery {
     /// Column name to search.
     pub column: String,
-    /// Query type.
-    pub query_type: FtsQueryType,
+    /// The query tree, evaluated as given by the memtable's inverted index.
+    pub expr: FtsQueryExpr,
     /// Logical document unit. Defaults to one document per dataset row.
     pub document_granularity: DocumentGranularity,
     /// WAND factor for early termination (0.0 to 1.0).
@@ -121,16 +84,25 @@ pub struct FtsQuery {
     pub include_tail: bool,
 }
 
-/// Default maximum number of fuzzy expansions.
-pub const DEFAULT_MAX_EXPANSIONS: usize = 50;
-
 /// Default WAND factor for full recall (no early termination).
 pub const DEFAULT_WAND_FACTOR: f32 = 1.0;
 
 impl FtsQuery {
+    /// Wrap an already-built query tree.
+    pub fn new(column: impl Into<String>, expr: FtsQueryExpr) -> Self {
+        Self {
+            column: column.into(),
+            expr,
+            document_granularity: DocumentGranularity::Row,
+            wand_factor: DEFAULT_WAND_FACTOR,
+            limit: None,
+            include_tail: true,
+        }
+    }
+
     /// Create a simple term match query.
     pub fn match_query(column: impl Into<String>, query: impl Into<String>) -> Self {
-        Self::match_query_with_operator(column, query, Operator::Or)
+        Self::new(column, FtsQueryExpr::match_query(query))
     }
 
     pub fn match_query_with_operator(
@@ -138,54 +110,36 @@ impl FtsQuery {
         query: impl Into<String>,
         operator: Operator,
     ) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Match {
-                query: query.into(),
-                operator,
-                boost: 1.0,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
-        }
+        Self::new(
+            column,
+            FtsQueryExpr::match_query_with_operator(query, operator),
+        )
     }
 
     /// Create a phrase query.
     pub fn phrase(column: impl Into<String>, query: impl Into<String>, slop: u32) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Phrase {
-                query: query.into(),
-                slop,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
-        }
+        Self::new(column, FtsQueryExpr::phrase_with_slop(query, slop))
     }
 
-    /// Create a Boolean query.
+    /// Create a Boolean query over plain terms. Nested clauses go through
+    /// [`Self::new`] with a tree built on [`FtsQueryExpr::boolean`].
     pub fn boolean(
         column: impl Into<String>,
         must: Vec<String>,
         should: Vec<String>,
         must_not: Vec<String>,
     ) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Boolean {
-                must,
-                should,
-                must_not,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
+        let mut builder = FtsQueryExpr::boolean();
+        for term in must {
+            builder = builder.must(FtsQueryExpr::match_query(term));
         }
+        for term in should {
+            builder = builder.should(FtsQueryExpr::match_query(term));
+        }
+        for term in must_not {
+            builder = builder.must_not(FtsQueryExpr::match_query(term));
+        }
+        Self::new(column, builder.build())
     }
 
     /// Create a fuzzy match query with auto-fuzziness.
@@ -195,20 +149,7 @@ impl FtsQuery {
     /// - 3-5 chars: 1 edit allowed
     /// - 6+ chars: 2 edits allowed
     pub fn fuzzy(column: impl Into<String>, query: impl Into<String>) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Fuzzy {
-                query: query.into(),
-                fuzziness: None,
-                prefix_length: 0,
-                max_expansions: DEFAULT_MAX_EXPANSIONS,
-                boost: 1.0,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
-        }
+        Self::new(column, FtsQueryExpr::fuzzy(query))
     }
 
     /// Create a fuzzy match query with specified edit distance.
@@ -217,20 +158,7 @@ impl FtsQuery {
         query: impl Into<String>,
         fuzziness: u32,
     ) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Fuzzy {
-                query: query.into(),
-                fuzziness: Some(fuzziness),
-                prefix_length: 0,
-                max_expansions: DEFAULT_MAX_EXPANSIONS,
-                boost: 1.0,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
-        }
+        Self::new(column, FtsQueryExpr::fuzzy_with_distance(query, fuzziness))
     }
 
     /// Create a fuzzy match query with full options.
@@ -241,20 +169,10 @@ impl FtsQuery {
         prefix_length: u32,
         max_expansions: usize,
     ) -> Self {
-        Self {
-            column: column.into(),
-            query_type: FtsQueryType::Fuzzy {
-                query: query.into(),
-                fuzziness,
-                prefix_length,
-                max_expansions,
-                boost: 1.0,
-            },
-            document_granularity: DocumentGranularity::Row,
-            wand_factor: DEFAULT_WAND_FACTOR,
-            limit: None,
-            include_tail: true,
-        }
+        Self::new(
+            column,
+            FtsQueryExpr::fuzzy_with_options(query, fuzziness, prefix_length, max_expansions),
+        )
     }
 
     /// Set the WAND factor for early termination.
@@ -283,24 +201,16 @@ impl FtsQuery {
         self.document_granularity = document_granularity;
         self
     }
-
-    fn with_boost(mut self, boost: f32) -> Self {
-        match &mut self.query_type {
-            FtsQueryType::Match { boost: b, .. } | FtsQueryType::Fuzzy { boost: b, .. } => {
-                *b = boost;
-            }
-            FtsQueryType::Phrase { .. } | FtsQueryType::Boolean { .. } => {}
-        }
-        self
-    }
 }
 
 /// Convert an index-level [`FullTextSearchQuery`] into the MemTable's local
 /// [`FtsQuery`], so the MemTable scanner shares the dataset `Scanner`'s FTS
-/// entry type. Supports match (exact `fuzziness == Some(0)` and fuzzy) and
-/// phrase leaf queries; the column must be bound on the query. Compound queries
-/// (boolean / boost / multi-match) cannot be modeled by the MemTable path and
-/// return a `not_supported` error rather than failing deep in planning.
+/// entry type.
+///
+/// Every shape the in-memory inverted index can evaluate is carried across:
+/// match (exact and fuzzy), phrase, boolean and boost, nested to any depth.
+/// Multi-match is the exception — it spans columns, and the memtable's indexes
+/// are per-column, so it has no single tree to evaluate and is refused.
 fn resolve_memtable_document_granularity(
     column: &str,
     requested: Option<DocumentGranularity>,
@@ -347,46 +257,125 @@ fn local_fts_query(query: FullTextSearchQuery, indexes: Option<&IndexStore>) -> 
             )
         })
     };
-    let local = match query.query {
-        IndexFtsQuery::Match(m) => {
-            let column = require_column(m.column)?;
-            let document_granularity =
-                resolve_memtable_document_granularity(&column, m.document_granularity, indexes)?;
-            let local = match m.fuzziness {
-                // Some(0) is an exact match in the index model.
-                Some(0) => FtsQuery::match_query_with_operator(column, m.terms, m.operator)
-                    .with_boost(m.boost),
-                _ if m.operator != Operator::Or => {
-                    return Err(Error::not_supported(
-                        "MemTable fuzzy full-text search only supports OR match operators"
-                            .to_string(),
-                    ));
+    let column = require_column(single_query_column(&query.query)?)?;
+    let document_granularity = resolve_memtable_document_granularity(
+        &column,
+        requested_document_granularity(&query.query)?,
+        indexes,
+    )?;
+    let expr = to_local_expr(&query.query)?;
+    Ok(FtsQuery::new(column, expr)
+        .with_document_granularity(document_granularity)
+        .with_wand_factor(wand_factor)
+        .with_limit(limit))
+}
+
+/// The single column the query targets, or `None` when it binds none. A query
+/// spanning several columns is refused before this — the memtable holds one
+/// inverted index per column, so there is no single index to evaluate against.
+fn single_query_column(query: &IndexFtsQuery) -> Result<Option<String>> {
+    let mut columns = query.columns().into_iter();
+    let first = columns.next();
+    if columns.next().is_some() {
+        return Err(Error::not_supported(
+            "MemTable full-text search is single-column; a query spanning several \
+             columns has no single in-memory index to evaluate against"
+                .to_string(),
+        ));
+    }
+    Ok(first)
+}
+
+/// The document granularity the query asks for, erroring if its leaves disagree
+/// — the memtable evaluates one index, so one granularity.
+fn requested_document_granularity(query: &IndexFtsQuery) -> Result<Option<DocumentGranularity>> {
+    fn visit(query: &IndexFtsQuery, current: &mut Option<DocumentGranularity>) -> Result<()> {
+        let requested = match query {
+            IndexFtsQuery::Match(m) => m.document_granularity,
+            IndexFtsQuery::Phrase(p) => p.document_granularity,
+            IndexFtsQuery::Boost(b) => {
+                visit(&b.positive, current)?;
+                return visit(&b.negative, current);
+            }
+            IndexFtsQuery::Boolean(b) => {
+                for child in b.must.iter().chain(&b.should).chain(&b.must_not) {
+                    visit(child, current)?;
                 }
-                fuzziness => FtsQuery::fuzzy_with_options(
-                    column,
-                    m.terms,
-                    fuzziness,
-                    m.prefix_length,
-                    m.max_expansions,
-                )
+                return Ok(());
+            }
+            IndexFtsQuery::MultiMatch(_) => {
+                return Err(Error::not_supported(
+                    "MemTable full-text search does not support multi-match queries".to_string(),
+                ));
+            }
+        };
+        match (*current, requested) {
+            (_, None) => {}
+            (None, Some(requested)) => *current = Some(requested),
+            (Some(current), Some(requested)) if current != requested => {
+                return Err(Error::invalid_input(
+                    "FTS queries cannot mix Row and ListElement document granularities".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut granularity = None;
+    visit(query, &mut granularity)?;
+    Ok(granularity)
+}
+
+/// Map an index-level query onto the tree the in-memory index evaluates.
+///
+/// Structural only — the column and document granularity are resolved once for
+/// the whole query by the caller, because the memtable searches a single index.
+fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
+    Ok(match query {
+        IndexFtsQuery::Match(m) => match m.fuzziness {
+            // `Some(0)` is an exact match in the index model.
+            Some(0) => FtsQueryExpr::match_query_with_operator(m.terms.clone(), m.operator)
                 .with_boost(m.boost),
-            };
-            local.with_document_granularity(document_granularity)
+            // The fuzzy path expands each term independently and unions the
+            // expansions, so it cannot also require every term to match.
+            _ if m.operator != Operator::Or => {
+                return Err(Error::not_supported(
+                    "MemTable fuzzy full-text search only supports OR match operators".to_string(),
+                ));
+            }
+            fuzziness => FtsQueryExpr::fuzzy_with_options(
+                m.terms.clone(),
+                fuzziness,
+                m.prefix_length,
+                m.max_expansions,
+            )
+            .with_boost(m.boost),
+        },
+        IndexFtsQuery::Phrase(p) => FtsQueryExpr::phrase_with_slop(p.terms.clone(), p.slop),
+        IndexFtsQuery::Boost(b) => FtsQueryExpr::boosting_with_negative(
+            to_local_expr(&b.positive)?,
+            to_local_expr(&b.negative)?,
+            b.negative_boost,
+        ),
+        IndexFtsQuery::Boolean(b) => {
+            let mut builder = FtsQueryExpr::boolean();
+            for child in &b.must {
+                builder = builder.must(to_local_expr(child)?);
+            }
+            for child in &b.should {
+                builder = builder.should(to_local_expr(child)?);
+            }
+            for child in &b.must_not {
+                builder = builder.must_not(to_local_expr(child)?);
+            }
+            builder.build()
         }
-        IndexFtsQuery::Phrase(p) => {
-            let column = require_column(p.column)?;
-            let document_granularity =
-                resolve_memtable_document_granularity(&column, p.document_granularity, indexes)?;
-            FtsQuery::phrase(column, p.terms, p.slop)
-                .with_document_granularity(document_granularity)
+        IndexFtsQuery::MultiMatch(_) => {
+            return Err(Error::not_supported(
+                "MemTable full-text search does not support multi-match queries".to_string(),
+            ));
         }
-        other => {
-            return Err(Error::not_supported(format!(
-                "MemTable full-text search supports match and phrase queries, got: {other}"
-            )));
-        }
-    };
-    Ok(local.with_wand_factor(wand_factor).with_limit(limit))
+    })
 }
 
 /// Scalar predicate for BTree index queries.
@@ -1801,10 +1790,66 @@ mod tests {
     /// `full_text_search` now takes a structured `FullTextSearchQuery` (matching
     /// the dataset `Scanner`); `local_fts_query` maps the supported leaf shapes
     /// and rejects compound queries and missing columns.
+    /// A boost query routed through the public entry point has to score the way
+    /// the compound scorer does — `positive - negative_boost * negative` — or
+    /// active rows rank differently from committed rows for the same query, and
+    /// can even differ in sign. Pins the formula, not just the ordering.
+    #[test]
+    fn public_boost_query_keeps_subtractive_scoring_in_memtable() {
+        use crate::dataset::mem_wal::index::FtsMemIndex;
+        use lance_index::scalar::inverted::query::{BoostQuery, MatchQuery};
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int32Array::from(vec![0, 1])),
+                Arc::new(arrow_array::StringArray::from(vec!["alpha", "alpha beta"])),
+            ],
+        )
+        .unwrap();
+        let index = FtsMemIndex::new(1, "text".to_string());
+        index.insert(&batch, 0).unwrap();
+
+        let leaf = |terms: &str| {
+            IndexFtsQuery::Match(
+                MatchQuery::new(terms.to_string()).with_column(Some("text".to_string())),
+            )
+        };
+        let negative_boost = 0.5;
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Boost(BoostQuery::new(
+            leaf("alpha"),
+            leaf("beta"),
+            Some(negative_boost),
+        )));
+        let local = local_fts_query(query, None).unwrap();
+
+        let score_of = |expr: &FtsQueryExpr| {
+            index
+                .search_query(expr)
+                .into_iter()
+                .find(|entry| entry.row_position == 1)
+                .unwrap()
+                .score
+        };
+        // Row 1 matches both clauses, so it is the one the demotion applies to.
+        let actual = score_of(&local.expr);
+        let positive = score_of(&FtsQueryExpr::match_query("alpha"));
+        let negative = score_of(&FtsQueryExpr::match_query("beta"));
+        assert!(
+            (actual - (positive - negative_boost * negative)).abs() < 1e-5,
+            "expected positive - {negative_boost} * negative = {}, got {actual}",
+            positive - negative_boost * negative
+        );
+    }
+
     #[test]
     fn local_fts_query_maps_leaf_shapes_and_rejects_the_rest() {
         use lance_index::scalar::inverted::query::{
-            BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery,
+            BooleanQuery, BoostQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
         };
 
         // Exact match (default fuzziness Some(0)) -> local Match, preserving the
@@ -1815,7 +1860,7 @@ mod tests {
         let local = local_fts_query(q, None).unwrap();
         assert_eq!(local.column, "text");
         assert!(
-            matches!(local.query_type, FtsQueryType::Match { query, operator, .. }
+            matches!(local.expr, FtsQueryExpr::Match { query, operator, .. }
                 if query == "hello" && operator == Operator::Or)
         );
 
@@ -1874,7 +1919,7 @@ mod tests {
         ));
         let local = local_fts_query(exact_and, None).unwrap();
         assert!(
-            matches!(local.query_type, FtsQueryType::Match { query, operator, boost }
+            matches!(local.expr, FtsQueryExpr::Match { query, operator, boost }
                 if query == "hello world" && operator == Operator::And && boost == 3.0)
         );
 
@@ -1888,7 +1933,7 @@ mod tests {
         ));
         let local = local_fts_query(fuzzy, None).unwrap();
         assert!(
-            matches!(local.query_type, FtsQueryType::Fuzzy { fuzziness, prefix_length, boost, .. }
+            matches!(local.expr, FtsQueryExpr::Fuzzy { fuzziness, prefix_length, boost, .. }
                 if fuzziness == Some(2) && prefix_length == 2 && boost == 2.5)
         );
 
@@ -1908,19 +1953,88 @@ mod tests {
             PhraseQuery::new("quick fox".to_string()).with_column(Some("text".to_string())),
         ));
         let local = local_fts_query(phrase, None).unwrap();
-        assert!(matches!(local.query_type, FtsQueryType::Phrase { .. }));
+        assert!(matches!(local.expr, FtsQueryExpr::Phrase { .. }));
 
-        // Compound (boolean) -> not supported.
+        // Compound (boolean) -> mapped onto the index's own tree, clause for
+        // clause, rather than refused.
+        let leaf = |terms: &str| {
+            IndexFtsQuery::Match(
+                MatchQuery::new(terms.to_string()).with_column(Some("text".to_string())),
+            )
+        };
         let boolean =
+            FullTextSearchQuery::new_query(IndexFtsQuery::Boolean(BooleanQuery::new(vec![
+                (Occur::Must, leaf("x")),
+                (Occur::MustNot, leaf("y")),
+            ])));
+        let local = local_fts_query(boolean, None).unwrap();
+        let FtsQueryExpr::Boolean {
+            must,
+            should,
+            must_not,
+        } = &local.expr
+        else {
+            panic!("expected a Boolean expr, got {:?}", local.expr);
+        };
+        assert!(should.is_empty());
+        assert!(
+            matches!(&must[..], [FtsQueryExpr::Match { query, .. }] if query == "x"),
+            "MUST clause lost: {must:?}"
+        );
+        assert!(
+            matches!(&must_not[..], [FtsQueryExpr::Match { query, .. }] if query == "y"),
+            "MUST_NOT clause lost: {must_not:?}"
+        );
+
+        // Boost -> positive and negative both carried, with the demotion factor.
+        let boost = FullTextSearchQuery::new_query(IndexFtsQuery::Boost(BoostQuery::new(
+            leaf("keep"),
+            leaf("demote"),
+            Some(0.25),
+        )));
+        let local = local_fts_query(boost, None).unwrap();
+        let FtsQueryExpr::Boost {
+            positive,
+            negative,
+            negative_boost,
+        } = &local.expr
+        else {
+            panic!("expected a Boost expr, got {:?}", local.expr);
+        };
+        assert!(matches!(positive.as_ref(), FtsQueryExpr::Match { query, .. } if query == "keep"));
+        let negative = negative.as_ref().expect("negative clause carried");
+        assert!(
+            matches!(negative.as_ref(), FtsQueryExpr::Match { query, .. } if query == "demote")
+        );
+        assert_eq!(*negative_boost, 0.25);
+
+        // Nested: a boolean whose clause is itself a boolean.
+        let nested =
             FullTextSearchQuery::new_query(IndexFtsQuery::Boolean(BooleanQuery::new(vec![(
                 Occur::Must,
-                IndexFtsQuery::Match(
-                    MatchQuery::new("x".to_string()).with_column(Some("text".to_string())),
-                ),
+                IndexFtsQuery::Boolean(BooleanQuery::new(vec![(Occur::Should, leaf("deep"))])),
             )])));
+        let local = local_fts_query(nested, None).unwrap();
+        let FtsQueryExpr::Boolean { must, .. } = &local.expr else {
+            panic!("expected a Boolean expr, got {:?}", local.expr);
+        };
         assert!(
-            local_fts_query(boolean, None).is_err(),
-            "boolean must be rejected"
+            matches!(&must[..], [FtsQueryExpr::Boolean { .. }]),
+            "nesting flattened: {must:?}"
+        );
+
+        // Multi-match spans columns -> still refused; the memtable holds one
+        // inverted index per column.
+        let multi = FullTextSearchQuery::new_query(IndexFtsQuery::MultiMatch(
+            MultiMatchQuery::try_new(
+                "x".to_string(),
+                vec!["text".to_string(), "other".to_string()],
+            )
+            .unwrap(),
+        ));
+        assert!(
+            local_fts_query(multi, None).is_err(),
+            "multi-match must be rejected"
         );
 
         // Missing column -> error.

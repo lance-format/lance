@@ -25,9 +25,9 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 
-use super::super::builder::{FtsQuery, FtsQueryType};
+use super::super::builder::FtsQuery;
 use super::newest_pk_positions;
-use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
+use crate::dataset::mem_wal::index::SearchOptions;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
@@ -80,7 +80,7 @@ impl Debug for FtsIndexExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FtsIndexExec")
             .field("column", &self.query.column)
-            .field("query_type", &self.query.query_type)
+            .field("expr", &self.query.expr)
             .field("readable_count", &self.readable_count)
             .field("with_row_id", &self.with_row_id)
             .finish()
@@ -223,42 +223,9 @@ impl FtsIndexExec {
             return vec![];
         };
 
-        // Convert FtsQueryType to FtsQueryExpr
-        let query_expr = match &self.query.query_type {
-            FtsQueryType::Match {
-                query,
-                operator,
-                boost,
-            } => FtsQueryExpr::match_query_with_operator(query, *operator).with_boost(*boost),
-            FtsQueryType::Phrase { query, slop } => FtsQueryExpr::phrase_with_slop(query, *slop),
-            FtsQueryType::Boolean {
-                must,
-                should,
-                must_not,
-            } => {
-                let mut builder = FtsQueryExpr::boolean();
-                for term in must {
-                    builder = builder.must(FtsQueryExpr::match_query(term));
-                }
-                for term in should {
-                    builder = builder.should(FtsQueryExpr::match_query(term));
-                }
-                for term in must_not {
-                    builder = builder.must_not(FtsQueryExpr::match_query(term));
-                }
-                builder.build()
-            }
-            FtsQueryType::Fuzzy {
-                query,
-                fuzziness,
-                prefix_length,
-                max_expansions,
-                boost,
-            } => {
-                FtsQueryExpr::fuzzy_with_options(query, *fuzziness, *prefix_length, *max_expansions)
-                    .with_boost(*boost)
-            }
-        };
+        // The scanner carries the tree the index evaluates, so there is nothing
+        // to translate here.
+        let query_expr = self.query.expr.clone();
 
         let all_rows_visible = self.batch_ranges.last().is_none_or(|last| {
             self.max_readable_row
@@ -612,14 +579,14 @@ impl DisplayAs for FtsIndexExec {
                 write!(
                     f,
                     "FtsIndexExec: column={}, query_type={:?}, with_row_id={}",
-                    self.query.column, self.query.query_type, self.with_row_id
+                    self.query.column, self.query.expr, self.with_row_id
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
                     "FtsIndexExec\ncolumn={}\nquery_type={:?}\nwith_row_id={}",
-                    self.query.column, self.query.query_type, self.with_row_id
+                    self.query.column, self.query.expr, self.with_row_id
                 )
             }
         }

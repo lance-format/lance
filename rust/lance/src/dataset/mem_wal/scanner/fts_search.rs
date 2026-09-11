@@ -206,21 +206,43 @@ fn validate_source_document_granularities(
     Ok(())
 }
 
+/// Reject the query shapes the active memtable arm cannot evaluate.
+///
+/// Only two remain. A fuzzy Match cannot also require every term: the fuzzy
+/// path expands each term independently and unions the expansions. And
+/// multi-match spans columns, while the memtable holds one inverted index per
+/// column, so there is no single index to search.
 fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
-    match &query.query {
-        IndexFtsQuery::Match(m) => {
-            if m.fuzziness != Some(0) && m.operator != Operator::Or {
-                return Err(Error::not_supported(
-                    "LSM fuzzy full-text search only supports OR match operators".to_string(),
-                ));
+    fn visit(query: &IndexFtsQuery) -> Result<()> {
+        match query {
+            IndexFtsQuery::Match(m) => {
+                if m.fuzziness != Some(0) && m.operator != Operator::Or {
+                    return Err(Error::not_supported(
+                        "LSM fuzzy full-text search only supports OR match operators".to_string(),
+                    ));
+                }
+                Ok(())
             }
-            Ok(())
+            IndexFtsQuery::Phrase(_) => Ok(()),
+            IndexFtsQuery::Boost(b) => {
+                visit(&b.positive)?;
+                visit(&b.negative)
+            }
+            IndexFtsQuery::Boolean(b) => {
+                for child in b.must.iter().chain(&b.should).chain(&b.must_not) {
+                    visit(child)?;
+                }
+                Ok(())
+            }
+            IndexFtsQuery::MultiMatch(_) => Err(Error::not_supported(
+                "LSM full-text search does not support multi-match queries: the memtable \
+                 holds one inverted index per column, so a cross-column query has no single \
+                 index to search"
+                    .to_string(),
+            )),
         }
-        IndexFtsQuery::Phrase(_) => Ok(()),
-        _ => Err(Error::not_supported(
-            "LSM full-text search only supports match and phrase leaf queries".to_string(),
-        )),
     }
+    visit(&query.query)
 }
 
 fn active_source_can_execute_fts(
@@ -1894,8 +1916,160 @@ mod tests {
         assert_eq!(ids, vec![1]);
     }
 
+    /// A boolean query has to reach the active memtable, not just the base
+    /// table, and every clause has to survive the trip: the MUST clause selects
+    /// and the MUST_NOT clause excludes, on memtable rows as much as base rows.
+    ///
+    /// Before this, `local_fts_query` refused any compound query outright, so a
+    /// memtable holding an FTS index on the searched column made the whole
+    /// query fail — and the LSM validator rejected it one layer up.
+    #[tokio::test]
+    async fn boolean_query_reaches_the_active_memtable() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::query::{
+            BooleanQuery, FtsQuery as IndexFtsQuery, MatchQuery, Occur,
+        };
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = write_dataset(
+            &base_uri,
+            vec![make_batch(
+                &schema,
+                &[1, 2],
+                &["lance rocks", "unrelated text"],
+            )],
+        )
+        .await;
+        base_ds
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        // Active memtable with its own FTS index on the searched column: one
+        // row the query should keep, one the MUST_NOT clause should drop.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let active_batch = make_batch(&schema, &[10, 11], &["lance memwal", "lance beta"]);
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: indexes,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let leaf = |terms: &str| IndexFtsQuery::from(MatchQuery::new(terms.to_string()));
+        let query =
+            FullTextSearchQuery::new_query(IndexFtsQuery::Boolean(BooleanQuery::new(vec![
+                (Occur::Must, leaf("lance")),
+                (Occur::MustNot, leaf("beta")),
+            ])));
+        let plan = planner
+            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .await
+            .expect("an active memtable with an FTS index must serve a boolean query");
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 10],
+            "id=1 from base and id=10 from the memtable match MUST 'lance'; \
+             id=2 lacks it and id=11 is excluded by MUST_NOT 'beta'"
+        );
+    }
+
+    /// Multi-match spans columns and the memtable holds one inverted index per
+    /// column, so it stays refused rather than silently searching one of them.
+    #[tokio::test]
+    async fn multi_match_query_is_refused_by_the_active_memtable() {
+        use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, MultiMatchQuery};
+
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let active_batch = make_batch(&schema, &[1], &["lance memwal"]);
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::MultiMatch(
+            MultiMatchQuery::try_new(
+                "lance".to_string(),
+                vec!["text".to_string(), "other".to_string()],
+            )
+            .unwrap(),
+        ));
+        let err = planner
+            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("multi-match"),
+            "unexpected error for multi-match query: {err}"
+        );
+    }
+
     /// The base arm must apply the filter as a true *prefilter*, not a
-    /// post-filter on the BM25 top-k. With `k = 1` and the higher-scoring base
+    /// post-filter on the BM25 top-k.""" With `k = 1` and the higher-scoring base
     /// doc failing the predicate, a post-filter would return zero rows; a
     /// prefilter restricts BM25 to matching rows and returns the lower-scoring
     /// match. Regression for a missing `scanner.prefilter(true)` on the base arm.
