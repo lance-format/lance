@@ -3100,6 +3100,26 @@ pub async fn commit_compaction(
             .iter()
             .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
         if tagged_at_commit {
+            // Materializing a data overlay breaks the reuse premise that a
+            // rewrite moves addresses, never values; on a tagged table the
+            // stale-index handling that v0 applies (dropping destination
+            // ids from swapped bitmaps) is a no-op because provenance never
+            // contains the destinations. Refuse rather than record a
+            // transition; see `build_frag_reuse_rewrite_entry` for the same
+            // rule on the stable-partition path.
+            if let Some(overlaid) = rewrite_groups
+                .iter()
+                .flat_map(|group| group.old_fragments.iter())
+                .find(|frag| !frag.overlays.is_empty())
+            {
+                return Err(Error::not_supported(format!(
+                    "source fragment {} carries data overlay files; deferred compaction on a \
+                     tagged fragment reuse table would materialize the overlaid values while \
+                     indices keep translated coverage over the old addresses. Compact the \
+                     overlays away or rebuild the covering indices eagerly first",
+                    overlaid.id
+                )));
+            }
             use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
             let transitions = frag_reuse_groups
                 .into_iter()

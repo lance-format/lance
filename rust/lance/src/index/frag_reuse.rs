@@ -625,6 +625,27 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
             )));
         }
         for (frag, digest) in group.old_fragments.iter().zip(transition.sources.iter()) {
+            // Materializing a data overlay breaks the reuse premise that a
+            // rewrite moves addresses, never values: the destination holds
+            // the overlaid values physically (and carries no overlay for
+            // the runtime staleness guard to see), while an index built
+            // before the overlay keeps the source in its bitmap as
+            // provenance and would serve the destination through
+            // translation. v0 handles this by dropping the DESTINATION ids
+            // from stale bitmaps, which is a no-op here because tagged
+            // provenance never contains them. Until provenance-side
+            // invalidation exists, refuse to record a transition over
+            // overlaid sources.
+            if !frag.overlays.is_empty() {
+                return Err(Error::not_supported(format!(
+                    "source fragment {} carries data overlay files; a rewrite recording \
+                     fragment reuse transitions would materialize the overlaid values while \
+                     indices keep translated coverage over the old addresses. Compact the \
+                     overlays away or rebuild the covering indices eagerly before this \
+                     rewrite",
+                    frag.id
+                )));
+            }
             let physical_rows = frag.physical_rows.ok_or_else(|| {
                 Error::invalid_input(format!(
                     "source fragment {} has no physical row count",
@@ -2135,5 +2156,231 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 9);
         assert_eq!(filtered_values(&dataset, "i = 8").await, vec![8]);
         assert_eq!(filtered_values(&dataset, "i >= 9").await, Vec::<i32>::new());
+    }
+
+    /// Round 8 (a): a stable-partition rewrite over a source carrying data
+    /// overlay files is refused. Materialization would bake the overlaid
+    /// values into the destination while indices keep translated coverage
+    /// over the old addresses, and the destination carries no overlay for
+    /// the runtime staleness guard to see.
+    #[tokio::test]
+    async fn overlaid_source_rejects_stable_partition_rewrite() {
+        let mut dataset = reader_tests::fixture().await;
+        reserve_fragments(&mut dataset, 30).await;
+        let (transition, destinations) = reader_tests::prepare(&dataset).await;
+        // Attach an overlay to source fragment 0 by manifest surgery: how
+        // the overlay got there is irrelevant to the rule under test.
+        let mut fragments: Vec<Fragment> = dataset.fragments().as_ref().clone();
+        fragments[0]
+            .overlays
+            .push(lance_table::format::overlay::DataOverlayFile {
+                data_file: lance_table::format::DataFile::new_legacy_from_fields(
+                    "overlay-0.lance",
+                    vec![0],
+                    None,
+                ),
+                coverage: lance_table::format::overlay::OverlayCoverage::dense(
+                    RoaringBitmap::from_iter([0u32]),
+                ),
+                committed_version: dataset.manifest.version,
+            });
+        Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
+        let indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        reader_tests::persist_fixture(&mut dataset, indices).await;
+
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let version = dataset.latest_version_id().await.unwrap();
+        let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(Transaction::new(
+                version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments: destinations,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
+                        transitions: vec![transition],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("overlay"), "{error}");
+        assert_eq!(dataset.latest_version_id().await.unwrap(), version);
+    }
+
+    /// Round 8 (b): deferred compaction on a tagged table refuses a source
+    /// carrying data overlay files instead of recording a transition. The
+    /// task is hand-built the way a distributed driver would replay one.
+    #[tokio::test]
+    async fn overlaid_source_rejects_tagged_compaction() {
+        let dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(
+                crate::utils::test::FragmentCount::from(2),
+                crate::utils::test::FragmentRowCount::from(4),
+            )
+            .await
+            .unwrap();
+        let schema = Arc::new(arrow_schema::Schema::from(dataset.schema()));
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(100..104))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+        let appended_id = dataset.fragments().last().unwrap().id;
+        dataset
+            .create_index(
+                &["i"],
+                lance_index::IndexType::Scalar,
+                Some("i_idx".into()),
+                &lance_index::scalar::ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        // Overlay on the appended fragment, attached before tagging (a
+        // tagged table cannot accept new overlays through the gate).
+        let mut fragments: Vec<Fragment> = dataset.fragments().as_ref().clone();
+        fragments
+            .iter_mut()
+            .find(|f| f.id == appended_id)
+            .unwrap()
+            .overlays
+            .push(lance_table::format::overlay::DataOverlayFile {
+                data_file: lance_table::format::DataFile::new_legacy_from_fields(
+                    "overlay-f.lance",
+                    vec![0],
+                    None,
+                ),
+                coverage: lance_table::format::overlay::OverlayCoverage::dense(
+                    RoaringBitmap::from_iter([0u32]),
+                ),
+                committed_version: dataset.manifest.version,
+            });
+        Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
+        let indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        reader_tests::persist_fixture(&mut dataset, indices).await;
+
+        // Tag through a rewrite of the clean fragments 0 and 1.
+        reserve_fragments(&mut dataset, 40).await;
+        let old_fragments: Vec<Fragment> = dataset
+            .fragments()
+            .iter()
+            .filter(|f| f.id < 2)
+            .cloned()
+            .collect();
+        let (transition, sp_destinations) =
+            reader_tests::prepare_partition(&dataset, &[0, 1], 10).await;
+        let read_version = dataset.manifest.version;
+        let mut dataset = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments: sp_destinations,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
+                        transitions: vec![transition],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+
+        // A replayed deferred-compaction task over the overlaid fragment.
+        let overlaid = dataset
+            .fragments()
+            .iter()
+            .find(|f| f.id == appended_id)
+            .unwrap()
+            .clone();
+        assert!(!overlaid.overlays.is_empty());
+        let txn = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![
+                RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(Int32Array::from_iter_values(100..104))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+        let Operation::Append {
+            fragments: new_fragments,
+        } = txn.operation
+        else {
+            unreachable!()
+        };
+        let mut row_addrs = RoaringTreemap::new();
+        for offset in 0..4u64 {
+            row_addrs.insert((appended_id << 32) + offset);
+        }
+        let mut serialized = Vec::new();
+        row_addrs.serialize_into(&mut serialized).unwrap();
+        let task = crate::dataset::optimize::RewriteResult {
+            metrics: Default::default(),
+            new_fragments,
+            read_version: dataset.manifest.version,
+            original_fragments: vec![overlaid],
+            row_addrs: Some(serialized),
+        };
+        let fragments_before: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+        let error = crate::dataset::optimize::commit_compaction(
+            &mut dataset,
+            vec![task],
+            Arc::new(crate::dataset::optimize::IgnoreRemap::default()),
+            &crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 100,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("overlay"), "{error}");
+        // No rewrite landed: the fragment list is untouched (only the
+        // internal id reservation may have advanced the version).
+        let fragments_after: Vec<u64> = dataset
+            .checkout_version(dataset.latest_version_id().await.unwrap())
+            .await
+            .unwrap()
+            .fragments()
+            .iter()
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(fragments_after, fragments_before);
     }
 }
