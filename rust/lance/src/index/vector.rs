@@ -21,10 +21,12 @@ mod fixture_test;
 
 use self::{ivf::*, pq::PQIndex};
 use arrow_array::Array;
+use arrow_array::cast::AsArray;
 use arrow_schema::{DataType, Schema};
 use builder::{IvfIndexBuilder, VectorIndexBuildSummary};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::TryStreamExt;
 use futures::stream;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
@@ -505,6 +507,165 @@ impl IndexParams for VectorIndexParams {
     }
 }
 
+/// Whether `column` holds at least `minimum` vectors to train a quantizer from.
+///
+/// The metadata-only row total settles anything already short of the floor, so
+/// the validity count runs only where its answer can change the verdict.
+///
+pub(crate) async fn has_vectors_to_train(
+    dataset: &Dataset,
+    column: &str,
+    minimum: usize,
+) -> Result<bool> {
+    let total = dataset.count_rows(None).await?;
+    if total < minimum && !is_multivector(dataset, column)? {
+        return Ok(false);
+    }
+    Ok(count_trainable_vectors(dataset, column, total, minimum).await? >= minimum)
+}
+
+/// Vectors in `column` available to train from.
+///
+/// A multivector row holds a list, so its rows bound the vectors from neither
+/// side — ten rows can carry a thousand, and an empty list carries none. Those
+/// are summed from the lists themselves; everything else counts the rows that
+/// hold a vector. Both callers compare the count with a threshold, so `enough`
+/// stops the walk as soon as the answer is settled.
+pub(crate) async fn count_trainable_vectors(
+    dataset: &Dataset,
+    column: &str,
+    total_rows: usize,
+    enough: usize,
+) -> Result<usize> {
+    if !is_multivector(dataset, column)? {
+        return count_non_null_vectors(dataset, column, total_rows).await;
+    }
+
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?;
+    let mut batches = scanner.try_into_stream().await?;
+    let mut vectors = 0_usize;
+    while let Some(batch) = batches.try_next().await? {
+        let lists = utils::get_column_from_batch(&batch, column)?;
+        let lists = lists.as_list::<i32>();
+        for row in 0..lists.len() {
+            if !lists.is_null(row) {
+                vectors = vectors.saturating_add(lists.value_length(row) as usize);
+            }
+        }
+        if vectors >= enough {
+            return Ok(vectors);
+        }
+    }
+    Ok(vectors)
+}
+
+fn is_multivector(dataset: &Dataset, column: &str) -> Result<bool> {
+    let (vector_type, _) = get_vector_type(dataset.schema(), column)?;
+    Ok(matches!(vector_type, DataType::List(_)))
+}
+
+/// Count the rows of `column` holding a vector.
+///
+/// A column that cannot hold nulls has one per row, so `total_rows` is the
+/// answer and nothing is read.
+async fn count_non_null_vectors(
+    dataset: &Dataset,
+    column: &str,
+    total_rows: usize,
+) -> Result<usize> {
+    let nullable = dataset
+        .schema()
+        .field(column)
+        .is_none_or(|field| field.nullable);
+    if !nullable {
+        return Ok(total_rows);
+    }
+
+    dataset
+        .count_rows(Some(format!("{column} IS NOT NULL")))
+        .await
+}
+
+/// The partition count a whole-table build can train.
+///
+/// A partition's centroid is what search ranks to choose partitions, so one
+/// built from a handful of vectors prunes nothing while still paying the
+/// quantizer's precision loss. The vectors available therefore cap the count,
+/// at `vectors_per_partition` each.
+async fn supported_num_partitions(
+    dataset: &Dataset,
+    column: &str,
+    stages: &[StageParams],
+    requested: usize,
+    mode: &str,
+) -> Result<usize> {
+    let total = dataset.count_rows(None).await?;
+    let enough = vectors_for_partitions(stages, requested);
+    let vectors = count_trainable_vectors(dataset, column, total, enough).await?;
+    if vectors >= enough {
+        return Ok(requested);
+    }
+
+    let supported = match vectors_per_partition(stages) {
+        Some(target) => requested.min(recommended_num_partitions(vectors, target)),
+        None => requested.min(vectors).max(1),
+    };
+    if supported < requested {
+        log::warn!(
+            "{mode}: training {supported} of the {requested} requested IVF partitions; \
+             column '{column}' holds {vectors} vectors"
+        );
+    }
+    Ok(supported)
+}
+
+/// Vectors needed before `partitions` can each train a quantizer of their own.
+///
+/// The upper edge of the reduced-partition band: below this a build trains
+/// fewer partitions than asked for.
+fn vectors_for_partitions(stages: &[StageParams], partitions: usize) -> usize {
+    partitions.saturating_mul(vectors_per_partition(stages).unwrap_or(1))
+}
+
+/// The vectors one partition's centroid should be fitted on, or `None` when the
+/// index stores vectors uncompressed.
+///
+/// A codebook's precision loss is paid on every vector, so a centroid fitted on
+/// a handful prunes nothing and still costs it. Without a codebook there is no
+/// precision to lose, and KMeans needing a vector per centroid is the only
+/// limit.
+fn vectors_per_partition(stages: &[StageParams]) -> Option<usize> {
+    vector_quantizer_minimum_rows(stages)?;
+    // IVF training fits each centroid on `sample_rate` vectors, which is also
+    // where KMeans starts warning (`k * 256` at the default rate). That number
+    // belongs to the IVF stage: an 8-bit codebook holds the same 256 entries by
+    // coincidence, and a 4-bit one asking only 16 vectors per partition would
+    // train centroids that prune nothing.
+    Some(
+        stages
+            .iter()
+            .find_map(|stage| match stage {
+                StageParams::Ivf(ivf) => Some(ivf.sample_rate),
+                _ => None,
+            })
+            .unwrap_or_else(|| IvfBuildParams::default().sample_rate)
+            .max(1),
+    )
+}
+
+/// Rows a vector index's quantizer needs before it can be trained.
+///
+/// One row per code, which is `2^num_bits` for PQ — 256 at the default 8 bits,
+/// and not 256 at any other setting. `None` for an index type whose stages name
+/// no quantizer with a row floor.
+pub(crate) fn vector_quantizer_minimum_rows(stages: &[StageParams]) -> Option<usize> {
+    stages.iter().find_map(|stage| match stage {
+        StageParams::PQ(pq) => 1_usize.checked_shl(pq.num_bits as u32),
+        _ => None,
+    })
+}
+
 /// Prepare the shared build inputs used by both direct local builds and
 /// staged shard builds.
 ///
@@ -568,7 +729,18 @@ async fn prepare_vector_segment_build(
                 centroids.len()
             )));
         }
-        (Some(num_partitions), _) => num_partitions,
+        (Some(num_partitions), Some(_)) => num_partitions,
+        // A partition's centroid is what search ranks to choose partitions, so
+        // one built from a handful of vectors prunes nothing and still costs
+        // the quantizer's precision. So the vectors available cap how many
+        // partitions a whole-table build trains, at the IVF sample rate each.
+        //
+        // A fragment subset keeps the count it was given: the segments of one
+        // logical index have to agree on it.
+        (Some(requested), None) if fragment_ids.is_none() => {
+            supported_num_partitions(dataset, column, stages, requested, mode).await?
+        }
+        (Some(num_partitions), None) => num_partitions,
         (None, Some(centroids)) => centroids.len(),
         (None, None) => {
             let num_rows = match fragment_ids {
@@ -1546,25 +1718,20 @@ pub(crate) async fn build_vector_index_incremental(
     }
 }
 
-/// Build an empty vector index without training on data
+/// Create a vector index that carries its definition and no data.
+///
+/// The parameters live in the index's `index_details` and the fragment bitmap
+/// is empty, so it covers no rows and has no file to open. `optimize_indices`
+/// trains it once the column holds enough vectors.
 #[instrument(level = "debug", skip_all)]
 pub(crate) async fn build_empty_vector_index(
     _dataset: &Dataset,
-    column: &str,
-    name: &str,
+    _column: &str,
+    _name: &str,
     _uuid: Uuid,
     _params: &VectorIndexParams,
 ) -> Result<Vec<IndexFile>> {
-    // For now, return a NotImplementedError to indicate this functionality
-    // is still being developed
-    Err(Error::not_supported_source(
-        format!(
-            "Creating empty vector indices with train=False is not yet implemented. \
-        Index '{}' for column '{}' cannot be created without training.",
-            name, column
-        )
-        .into(),
-    ))
+    Ok(Vec::new())
 }
 
 #[instrument(level = "debug", skip_all, fields(old_uuid = old_uuid.to_string(), new_uuid = new_uuid.to_string()))]
@@ -2324,11 +2491,11 @@ mod tests {
         let source_uri = format!("{}/source", test_dir.as_str());
         let target_uri = format!("{}/target", test_dir.as_str());
 
-        // Create source dataset with vector column (need at least 256 rows for PQ training)
+        // Ten partitions, each needing a codebook's worth of vectors.
         let source_reader = lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
             .col("vector", array::rand_vec::<Float32Type>(32.into()))
-            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+            .into_reader_rows(RowCount::from(2560), BatchCount::from(1));
         let mut source_dataset = Dataset::write(source_reader, &source_uri, None)
             .await
             .unwrap();

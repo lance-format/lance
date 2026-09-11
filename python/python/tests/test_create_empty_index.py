@@ -31,17 +31,31 @@ def test_create_empty_vector_index():
     data = pa.table({"vector": vectors})
     dataset = lance.write_dataset(data, "memory://")
 
-    # Currently, vector indices with train=False are not supported
-    try:
-        dataset.create_index(
-            "vector", "IVF_PQ", num_partitions=10, num_sub_vectors=8, train=False
-        )
-        # If we get here, the implementation has been added (unexpected for now)
-        assert False, (
-            "Expected NotImplementedError for train=False on vector index, "
-            "but succeeded"
-        )
-    except NotImplementedError as e:
-        # Expected error for unimplemented functionality
-        error_msg = str(e).lower()
-        assert "not yet implemented" in error_msg or "not implemented" in error_msg
+    dataset.create_index(
+        "vector", "IVF_PQ", num_partitions=10, num_sub_vectors=8, train=False
+    )
+
+    # Same shape the scalar case reports: listed, covering nothing yet.
+    indices = dataset.describe_indices()
+    assert len(indices) == 1
+    stats = dataset.stats.index_stats(indices[0].name)
+    assert stats["num_indexed_rows"] == 0
+    assert stats["num_unindexed_rows"] == dataset.count_rows()
+
+
+def test_create_vector_index_below_the_row_floor():
+    """A table too small to train the quantizer takes the index anyway."""
+    dim = 32
+    values = pc.random(100 * dim).cast(pa.float32())
+    vectors = pa.FixedSizeListArray.from_arrays(values, dim)
+    data = pa.table({"vector": vectors})
+    dataset = lance.write_dataset(data, "memory://")
+
+    # 100 vectors cannot train a 256-code codebook, and train defaults to True.
+    dataset.create_index("vector", "IVF_PQ", num_partitions=10, num_sub_vectors=8)
+
+    indices = dataset.describe_indices()
+    assert len(indices) == 1
+    stats = dataset.stats.index_stats(indices[0].name)
+    assert stats["num_indexed_rows"] == 0
+    assert stats["num_unindexed_rows"] == dataset.count_rows()

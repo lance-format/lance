@@ -10901,10 +10901,16 @@ mod test {
         data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
     ) {
+        const PARTITIONS: usize = 4;
+        // A partition is trained only when the data can give it a codebook's
+        // worth of vectors, so the fixture has to cover every partition it asks
+        // for; the cached-entry count below counts per partition.
+        const ROWS: usize = PARTITIONS * 256;
+
         let vec_params = vec![
             // TODO: re-enable diskann test when we can tune to get reproducible results.
             // VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
-            VectorIndexParams::ivf_pq(4, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(PARTITIONS, 8, 2, MetricType::L2, 2),
         ];
         for params in vec_params {
             use lance_arrow::FixedSizeListArrayExt;
@@ -10927,14 +10933,14 @@ mod test {
 
             // vectors are [1, 1, 1, ...] [2, 2, 2, ...]
             let vector_values: Float32Array =
-                (0..32 * 512).map(|v| (v / 32) as f32 + 1.0).collect();
+                (0..32 * ROWS).map(|v| (v / 32) as f32 + 1.0).collect();
             let vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
 
             let batches = vec![
                 RecordBatch::try_new(
                     schema.clone(),
                     vec![
-                        Arc::new(Int32Array::from_iter_values(0..512)),
+                        Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
                         Arc::new(vectors.clone()),
                     ],
                 )
@@ -11036,7 +11042,7 @@ mod test {
                 RecordBatch::try_new(
                     schema.clone(),
                     vec![
-                        Arc::new(Int32Array::from_iter_values(512..1024)),
+                        Arc::new(Int32Array::from_iter_values(ROWS as i32..2 * ROWS as i32)),
                         Arc::new(vectors),
                     ],
                 )
@@ -11066,7 +11072,7 @@ mod test {
                 .await
                 .unwrap();
 
-            dataset.delete("i < 512").await.unwrap();
+            dataset.delete(&format!("i < {ROWS}")).await.unwrap();
 
             let mut scan = dataset.scan();
             scan.nearest("vec", &key, 5).unwrap();
@@ -11085,7 +11091,9 @@ mod test {
             let batch = &results[0];
 
             // It should not pick up any results from the first fragment
-            let expected_i = BTreeSet::from_iter(vec![512, 513, 514, 515, 516]);
+            let first = ROWS as i32;
+            let expected_i =
+                BTreeSet::from_iter(vec![first, first + 1, first + 2, first + 3, first + 4]);
             let column_i = batch.column_by_name("i").unwrap();
             let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
                 .values()
