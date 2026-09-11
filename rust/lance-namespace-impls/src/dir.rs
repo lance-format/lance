@@ -38,7 +38,7 @@ use lance_index::vector::{
 };
 use lance_index::{IndexType, is_system_index};
 use lance_io::object_store::throttle::is_throttle_error;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, ReadDirOptions};
 use lance_linalg::distance::MetricType;
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
 use object_store::ObjectStoreExt;
@@ -1157,42 +1157,73 @@ impl DirectoryNamespace {
         None
     }
 
+    /// Page size requested from [`ObjectStore::read_dir_page`] while scanning the namespace
+    /// directory for tables. Only bounds the cost of one backend request on stores that push
+    /// pagination down (S3, GCS, Azure); `list_directory_tables` always walks every page.
+    const LIST_DIRECTORY_PAGE_SIZE: usize = 1000;
+
     /// List tables using directory scanning (fallback method)
     async fn list_directory_tables(&self) -> Result<Vec<String>> {
-        let entries = self
-            .object_store
-            .read_dir(self.base_path.clone())
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to list directory: {:?}", e),
-                })
-            })?;
-
-        let candidates: Vec<String> = entries
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .trim_end_matches('/')
-                    .strip_suffix(".lance")
-                    .map(|name| name.to_string())
-            })
-            .collect();
-
-        // Each candidate needs its own `check_table_status` round trip (a `read_dir` probe
-        // for a deregistration marker), so this is linear in the number of listed entries;
-        // run a bounded number concurrently rather than one at a time.
-        let mut stream =
-            futures::stream::iter(candidates.into_iter().map(|table_name| async move {
-                let status = self.check_table_status(&table_name).await?;
-                Ok::<Option<String>, Error>((!status.is_deregistered).then_some(table_name))
-            }))
-            .buffered(manifest::DECLARED_FILTER_CONCURRENCY);
-
         let mut tables = Vec::new();
-        while let Some(result) = stream.next().await {
-            if let Some(table_name) = result? {
-                tables.push(table_name);
+        let mut page_token = None;
+
+        loop {
+            let page = self
+                .object_store
+                .read_dir_page(
+                    self.base_path.clone(),
+                    ReadDirOptions {
+                        page_token,
+                        // Only a hint to backends with a paginated list API (S3, GCS, Azure):
+                        // it bounds the cost of one request, not the number of tables returned.
+                        // Every other backend still lists (and pages through) the whole
+                        // directory here regardless, same as `read_dir` always did.
+                        limit: Some(Self::LIST_DIRECTORY_PAGE_SIZE),
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to list directory: {:?}", e),
+                    })
+                })?;
+
+            let candidates: Vec<String> = page
+                .result
+                .common_prefixes
+                .iter()
+                .chain(page.result.objects.iter().map(|o| &o.location))
+                .filter_map(|p| {
+                    p.filename()?
+                        .trim_end_matches('/')
+                        .strip_suffix(".lance")
+                        .map(|name| name.to_string())
+                })
+                .collect();
+
+            // Each candidate needs its own `check_table_status` round trip (a `read_dir` probe
+            // for a deregistration marker), so this is linear in the number of listed entries;
+            // run a bounded number concurrently rather than one at a time.
+            let mut stream =
+                futures::stream::iter(candidates.into_iter().map(|table_name| async move {
+                    let status = self.check_table_status(&table_name).await?;
+                    Ok::<Option<String>, Error>((!status.is_deregistered).then_some(table_name))
+                }))
+                .buffered(manifest::DECLARED_FILTER_CONCURRENCY);
+
+            while let Some(result) = stream.next().await {
+                if let Some(table_name) = result? {
+                    tables.push(table_name);
+                }
+            }
+
+            // A page can come back holding fewer children than the requested limit and still
+            // be followed by more (a backend can spend its page budget on keys a delimiter
+            // collapses away, or cap a page on its own besides) — walk until the token is
+            // `None`, not until a page comes back short.
+            page_token = page.page_token;
+            if page_token.is_none() {
+                break;
             }
         }
 
