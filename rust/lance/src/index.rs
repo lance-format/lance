@@ -6188,6 +6188,83 @@ mod tests {
         assert_eq!(trained_partitions(&dataset).await, vec![8]);
     }
 
+    /// Appending to an index that is still a definition, on a table that still
+    /// cannot train, is a no-op rather than an error, and stays one when
+    /// repeated: a caller that optimizes on a schedule relies on the commit
+    /// each call makes.
+    #[tokio::test]
+    async fn test_append_to_a_definition_that_still_cannot_train() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 100).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // Twice, so the second call sees whatever the first one left behind.
+        for attempt in 0..2 {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("append {attempt} on a definition must not fail: {error}")
+                });
+            let indices = dataset.load_indices().await.unwrap();
+            assert_eq!(indices.len(), 1);
+            assert!(
+                indices[0]
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(roaring::RoaringBitmap::is_empty),
+                "100 vectors still cannot train a 256-code quantizer"
+            );
+        }
+    }
+
+    /// Compaction leaves an index that covers nothing alone. It has no file to
+    /// remap, and an empty fragment bitmap cannot intersect a rewrite group, so
+    /// the remapper skips it instead of opening a file that is not there.
+    #[tokio::test]
+    async fn test_compaction_skips_a_definition_only_index() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 100).await;
+
+        let params = VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // A second fragment, so compaction has two to rewrite into one.
+        let mut dataset = append_vectors(test_dir.path(), 100).await;
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 200);
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(
+            indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty),
+            "the index should still be a definition covering nothing"
+        );
+    }
+
     /// A reader over one batch of `rows` random 16-dimensional vectors.
     fn vector_reader(rows: usize) -> impl arrow_array::RecordBatchReader + Send + 'static {
         let dimensions = 16;
