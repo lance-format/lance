@@ -681,14 +681,26 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
+    let session_ctx = get_session_context(&options);
+    execute_plan_with_session_context(plan, options, &session_ctx)
+}
+
+/// Executes a plan with an existing session context.
+///
+/// This is useful when resources created outside the physical plan, such as
+/// replay spill files, must share the context's memory or disk managers with
+/// operators in the plan. `options` must describe the supplied context.
+pub fn execute_plan_with_session_context(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+    session_ctx: &SessionContext,
+) -> Result<SendableRecordBatchStream> {
     if !options.skip_logging {
         debug!(
             "Executing plan:\n{}",
             DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
         );
     }
-
-    let session_ctx = get_session_context(&options);
 
     // Coalesce to a single partition if the optimizer left more than one.
     // EnforceDistribution may remove RepartitionExec(1) nodes when the parent
@@ -708,7 +720,7 @@ pub fn execute_plan(
         Arc::new(CoalescePartitionsExec::new(plan))
     };
 
-    let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
+    let stream = plan.execute(0, get_task_context(session_ctx, &options))?;
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
@@ -1121,7 +1133,9 @@ impl ExecutionPlan for StrictBatchSizeExec {
 /// batch actually needs to be sliced — batches that are already within the
 /// target range pass through at zero cost.
 ///
-/// If a single row exceeds `max_bytes`, execution fails with an error.
+/// An indivisible row larger than `max_bytes` passes through as a single-row
+/// batch. The downstream operator's memory pool remains the source of truth for
+/// whether that row can be processed safely.
 #[derive(Clone, Debug)]
 pub struct HardCapBatchSizeExec {
     input: Arc<dyn ExecutionPlan>,
@@ -1181,22 +1195,18 @@ impl ExecutionPlan for HardCapBatchSizeExec {
             0,
             max_bytes,
         );
-        // Check that no single-row batch exceeds the limit.
-        let validated = rechunked.map(move |result| {
-            let batch = result?;
-            if batch.num_rows() == 1 && batch.get_array_memory_size() > max_bytes {
-                return Err(DataFusionError::External(Box::new(Error::invalid_input(
-                    format!(
-                        "a single row is {} bytes which exceeds the maximum allowed batch \
-                         size of {} bytes",
-                        batch.get_array_memory_size(),
-                        max_bytes,
-                    ),
-                ))));
+        let rechunked = rechunked.map(move |result| {
+            if let Ok(batch) = &result {
+                let batch_bytes = batch.get_array_memory_size();
+                if batch.num_rows() == 1 && batch_bytes > max_bytes {
+                    warn!(
+                        "HardCapBatchSizeExec cannot split a single-row batch of {batch_bytes} bytes, which exceeds the maximum batch size of {max_bytes} bytes; passing it through unchanged"
+                    );
+                }
             }
-            Ok(batch)
+            result
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, validated)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rechunked)))
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -1359,6 +1369,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.mem_pool_size(), 50 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_hard_cap_passes_through_oversized_single_row() {
+        let value = "x".repeat(1024);
+        let batch = arrow_array::record_batch!(("value", Utf8, [value.as_str()])).unwrap();
+        let max_bytes = 64;
+        assert!(batch.get_array_memory_size() > max_bytes);
+
+        let input = Arc::new(OneShotExec::from_batch(batch.clone()));
+        let exec = HardCapBatchSizeExec::new(input, max_bytes);
+        let context = SessionContext::new().task_ctx();
+        let mut output = exec.execute(0, context).unwrap();
+
+        assert_eq!(output.next().await.unwrap().unwrap(), batch);
+        assert!(output.next().await.is_none());
     }
 
     /// A marker a node reads from the session-config extensions at execute time.
