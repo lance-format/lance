@@ -630,6 +630,15 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
             covered_groups.len()
         )));
     }
+    // Destination ids must be finalized before assembly: the commit path's
+    // `fragments_with_ids` treats id 0 as unassigned and renumbers it, which
+    // would strand the recorded destination id (and, with a live fragment 0,
+    // translate into unrelated rows). The flow reserves fresh ids through
+    // ReserveFragments; enforce that invariant here instead of trusting the
+    // caller: no id 0, and no id that is already live in the manifest (the
+    // transition's sources are live and are covered by the same rule).
+    let live_fragments: HashSet<u64> = dataset.fragments().iter().map(|frag| frag.id).collect();
+
     for (group, transition) in covered_groups.iter().zip(transitions.iter()) {
         if group.old_fragments.len() != transition.sources.len() {
             return Err(Error::invalid_input(format!(
@@ -673,6 +682,20 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
             .iter()
             .zip(transition.destinations.iter())
         {
+            if frag.id == 0 {
+                return Err(Error::invalid_input(
+                    "destination fragment id 0 is unassigned (the commit path renumbers it); \
+                     reserve ids with ReserveFragments and assign them before the rewrite is \
+                     assembled",
+                ));
+            }
+            if live_fragments.contains(&frag.id) {
+                return Err(Error::invalid_input(format!(
+                    "destination fragment id {} is already live in the dataset; a rewrite \
+                     destination must use a freshly reserved id",
+                    frag.id
+                )));
+            }
             // The digest claiming zero deletions is not enough: check the
             // fragment itself, or a destination carrying a deletion file
             // would commit a digest that undercounts its physical rows'
@@ -860,6 +883,7 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
 mod tests {
     use super::*;
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+    use crate::index::DatasetIndexExt;
     use crate::index::frag_reuse_reader::tests as reader_tests;
     use crate::utils::test::DatagenExt;
     use arrow_array::cast::AsArray;
@@ -1907,5 +1931,232 @@ mod tests {
             error.to_string().contains("carries a deletion file"),
             "{error}"
         );
+    }
+
+    /// Round 6 item 1: the commit path renumbers destination id 0
+    /// (`fragments_with_ids` treats it as unassigned), which would strand
+    /// the recorded destination id; assembly must reject it up front.
+    #[tokio::test]
+    async fn unassigned_destination_id_rejected_at_commit() {
+        let mut dataset = reader_tests::fixture().await;
+        reserve_fragments(&mut dataset, 30).await;
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (mut transition, mut destinations) = reader_tests::prepare(&dataset).await;
+        destinations[0].id = 0;
+        transition.destinations[0].id = 0;
+        let read_version = dataset.manifest.version;
+        let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments: destinations,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
+                        transitions: vec![transition],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("unassigned"), "{error}");
+        assert_eq!(dataset.latest_version_id().await.unwrap(), read_version);
+    }
+
+    /// Round 6 item 1: a destination id colliding with a fragment that is
+    /// live in the manifest (here one of the rewrite's own sources) is
+    /// rejected; destinations must use freshly reserved ids.
+    #[tokio::test]
+    async fn live_destination_id_rejected_at_commit() {
+        let mut dataset = reader_tests::fixture().await;
+        reserve_fragments(&mut dataset, 30).await;
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (mut transition, mut destinations) = reader_tests::prepare(&dataset).await;
+        destinations[0].id = 1;
+        transition.destinations[0].id = 1;
+        let read_version = dataset.manifest.version;
+        let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments: destinations,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
+                        transitions: vec![transition],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("already live"), "{error}");
+    }
+
+    async fn indexed_three_fragment_dataset() -> Dataset {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(
+                crate::utils::test::FragmentCount::from(3),
+                crate::utils::test::FragmentRowCount::from(4),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                lance_index::IndexType::Scalar,
+                Some("i_idx".into()),
+                &lance_index::scalar::ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+    }
+
+    /// Tag the table by rewriting fragment 0 only, leaving 1 and 2 as
+    /// indexed compaction candidates.
+    async fn tag_fragment_zero(mut dataset: Dataset) -> Dataset {
+        reserve_fragments(&mut dataset, 40).await;
+        let old_fragments: Vec<Fragment> = dataset
+            .fragments()
+            .iter()
+            .filter(|f| f.id == 0)
+            .cloned()
+            .collect();
+        let (transition, destinations) = reader_tests::prepare_partition(&dataset, &[0], 10).await;
+        let read_version = dataset.manifest.version;
+        crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments: destinations,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
+                        transitions: vec![transition],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+            .unwrap()
+    }
+
+    /// Round 6 item 2: a source fragment with a deletion file whose count
+    /// was never materialized in the manifest. The digests and the rewrite
+    /// group must be built from the same normalized metadata, so the commit
+    /// succeeds and conservation uses the real deleted count.
+    #[tokio::test]
+    async fn deferred_compaction_materializes_missing_deletion_counts() {
+        let mut dataset = indexed_three_fragment_dataset().await;
+        dataset.delete("i = 5").await.unwrap();
+        // Strip the materialized count, as a legacy writer may leave it.
+        let mut fragments: Vec<Fragment> = dataset.fragments().as_ref().clone();
+        let deletion = fragments
+            .iter_mut()
+            .find(|f| f.id == 1)
+            .unwrap()
+            .deletion_file
+            .as_mut()
+            .unwrap();
+        assert!(deletion.num_deleted_rows.is_some());
+        deletion.num_deleted_rows = None;
+        Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
+        let indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        reader_tests::persist_fixture(&mut dataset, indices).await;
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .find(|f| f.id == 1)
+                .unwrap()
+                .deletion_file
+                .as_ref()
+                .unwrap()
+                .num_deleted_rows
+                .is_none()
+        );
+
+        let mut dataset = tag_fragment_zero(dataset).await;
+
+        // Deferred compaction over everything, including the fragment with
+        // the unmaterialized deletion count.
+        let metrics = crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 100,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.fragments_removed, 4);
+        assert_eq!(metrics.fragments_added, 2);
+
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let entry = stored_fri(&stored);
+        let ledger = decode_entry(&dataset, &entry).await;
+        assert_eq!(ledger.transitions().len(), 3);
+        assert!(ledger.consumer(1).is_some());
+        // Conservation held with the real deleted count: 12 rows minus one.
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 11);
+        assert_eq!(filtered_values(&dataset, "i = 5").await, Vec::<i32>::new());
+        assert_eq!(filtered_values(&dataset, "i = 4").await, vec![4]);
+    }
+
+    /// Round 6 item 2: heavy deletions (three of four rows) flow through
+    /// the same normalized digests; conservation and translation stay
+    /// correct. A source with EVERY row deleted cannot be produced through
+    /// the public API (the delete path drops fully-deleted fragments from
+    /// the manifest); `normalize_source_fragments` keeping such a fragment
+    /// is covered by a unit test next to it in `optimize`.
+    #[tokio::test]
+    async fn deferred_compaction_consumes_heavily_deleted_source() {
+        let mut dataset = indexed_three_fragment_dataset().await;
+        dataset.delete("i >= 9").await.unwrap();
+        let mut dataset = tag_fragment_zero(dataset).await;
+
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 100,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let entry = stored_fri(&stored);
+        let ledger = decode_entry(&dataset, &entry).await;
+        assert!(ledger.consumer(2).is_some());
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 9);
+        assert_eq!(filtered_values(&dataset, "i = 8").await, vec![8]);
+        assert_eq!(filtered_values(&dataset, "i >= 9").await, Vec::<i32>::new());
     }
 }

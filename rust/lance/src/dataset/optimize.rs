@@ -2907,8 +2907,17 @@ pub async fn commit_compaction(
 
     for task in completed_tasks {
         metrics += task.metrics;
+        // One source of truth: the deferred branch normalizes the source
+        // metadata (materialized physical and deleted row counts) and BOTH
+        // the rewrite group and the reuse digests are built from it, so the
+        // commit-side binding validation compares like with like.
+        let old_fragments = if index_remapper.is_none() && options.defer_index_remap {
+            normalize_source_fragments(dataset, &task.original_fragments).await?
+        } else {
+            task.original_fragments.clone()
+        };
         let rewrite_group = RewriteGroup {
-            old_fragments: task.original_fragments.clone(),
+            old_fragments: old_fragments.clone(),
             new_fragments: task.new_fragments.clone(),
         };
 
@@ -2975,8 +2984,7 @@ pub async fn commit_compaction(
             // Record every group; track whether any touches indexed/chain
             // data. Ids beyond the row-address range cannot appear in any
             // index bitmap, so they are uncovered by definition.
-            if task
-                .original_fragments
+            if old_fragments
                 .iter()
                 .any(|f| u32::try_from(f.id).is_ok_and(|id| indexed_frags.contains(id)))
             {
@@ -2988,11 +2996,9 @@ pub async fn commit_compaction(
                 )
             })?;
             // Digest construction must not panic on incomplete metadata (the
-            // tasks may be replayed results planned elsewhere), and a
-            // deletion file whose count was never materialized has to be
-            // counted from the deletion vector: these digests are what row
-            // conservation is later validated against.
-            let sources = migrate_fragments(dataset, &task.original_fragments, false).await?;
+            // tasks may be replayed results planned elsewhere); the counts
+            // were materialized by `normalize_source_fragments` above, from
+            // the same list the rewrite group carries.
             let digest =
                 |frag: &Fragment| -> Result<lance_table::system_index::frag_reuse::FragDigest> {
                     Ok(lance_table::system_index::frag_reuse::FragDigest {
@@ -3020,7 +3026,7 @@ pub async fn commit_compaction(
                 };
             frag_reuse_groups.push(FragReuseGroup {
                 changed_row_addrs,
-                old_frags: sources.iter().map(digest).collect::<Result<_>>()?,
+                old_frags: old_fragments.iter().map(digest).collect::<Result<_>>()?,
                 new_frags: task
                     .new_fragments
                     .iter()
@@ -3175,6 +3181,40 @@ pub async fn commit_compaction(
     }
 
     Ok(metrics)
+}
+
+/// Materialize the counts the fragment reuse digests and conservation
+/// validation depend on, without changing the fragment list. Unlike
+/// [`migrate_fragments`], fully-deleted fragments are KEPT: the rewrite
+/// group must still remove them from the manifest and the recorded
+/// transition must still consume them (they contribute zero live rows), so
+/// a silently shortened list would desynchronize the digests, the group and
+/// the manifest.
+async fn normalize_source_fragments(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+) -> Result<Vec<Fragment>> {
+    let mut normalized = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let mut fragment = fragment.clone();
+        if fragment.physical_rows.is_none() {
+            let file_fragment = FileFragment::new(Arc::new(dataset.clone()), fragment.clone());
+            fragment.physical_rows = Some(file_fragment.physical_rows().await?);
+        }
+        if fragment
+            .deletion_file
+            .as_ref()
+            .is_some_and(|deletion| deletion.num_deleted_rows.is_none())
+        {
+            let deletion_file = fragment.deletion_file.as_ref().unwrap();
+            let count = read_dataset_deletion_file(dataset, fragment.id, deletion_file)
+                .await?
+                .len();
+            fragment.deletion_file.as_mut().unwrap().num_deleted_rows = Some(count);
+        }
+        normalized.push(fragment);
+    }
+    Ok(normalized)
 }
 
 /// Remove rewritten files after fragment-id reservation fails. Reservation
@@ -10415,5 +10455,43 @@ mod tests {
         scanner.filter("val = 0").unwrap().project(&["id"]).unwrap();
         let batch = scanner.try_into_batch().await.unwrap();
         assert_eq!(batch.num_rows(), 0, "stale value 0 must no longer match");
+    }
+
+    /// Round 6: unlike `migrate_fragments`, the reuse-record normalization
+    /// must keep a fully-deleted fragment: the rewrite group still removes
+    /// it from the manifest and the transition still consumes it (zero live
+    /// rows), so a silently shortened source list would desynchronize the
+    /// digests, the group and the manifest.
+    #[tokio::test]
+    async fn test_normalize_source_fragments_keeps_fully_deleted() {
+        use lance_table::format::{DeletionFile, DeletionFileType};
+        let dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let mut fragment = Fragment::new(7);
+        fragment.physical_rows = Some(4);
+        fragment.deletion_file = Some(DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(4),
+            base_id: None,
+        });
+        let normalized = normalize_source_fragments(&dataset, &[fragment])
+            .await
+            .unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].id, 7);
+        assert_eq!(normalized[0].physical_rows, Some(4));
+        assert_eq!(
+            normalized[0]
+                .deletion_file
+                .as_ref()
+                .unwrap()
+                .num_deleted_rows,
+            Some(4)
+        );
     }
 }
