@@ -20,14 +20,14 @@ pub mod utils;
 mod fixture_test;
 
 use self::{ivf::*, pq::PQIndex};
-use arrow_array::cast::AsArray;
 use arrow_array::Array;
+use arrow_array::cast::AsArray;
 use arrow_schema::{DataType, Schema};
 use builder::{IvfIndexBuilder, VectorIndexBuildSummary};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::stream;
 use futures::TryStreamExt;
+use futures::stream;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::frag_reuse::CompactFragReuseIndex;
