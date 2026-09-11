@@ -6568,5 +6568,198 @@ mod tests {
                 "{error}"
             );
         }
+
+        /// A tagged table with one stable-partition transition (fragments
+        /// 10 and 11) built through the real commit path.
+        async fn tagged_fixture() -> Dataset {
+            let mut dataset = ram_fixture(2, 4).await;
+            reserve(&mut dataset, 40).await;
+            let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+            let (transition, destinations) = prepare(&dataset).await;
+            let version = dataset.manifest.version;
+            commit_sp(
+                dataset,
+                version,
+                sp_rewrite(old_fragments, destinations, vec![transition]),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn append_rows(dataset: &Dataset, values: std::ops::Range<i32>) -> Dataset {
+            let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(values))])
+                    .unwrap();
+            InsertBuilder::new(Arc::new(dataset.clone()))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                })
+                .execute(vec![batch])
+                .await
+                .unwrap()
+        }
+
+        /// The transition and destination a tagged deferred compaction of
+        /// `source_ids` would carry: the same digests and changed_row_addrs
+        /// the writer records, with an ordered-compaction mapping.
+        async fn oc_parts(
+            dataset: &Dataset,
+            source_ids: &[u64],
+            dest_id: u64,
+        ) -> (Transition, Vec<Fragment>) {
+            let old_fragments: Vec<Fragment> = source_ids
+                .iter()
+                .map(|id| {
+                    dataset
+                        .fragments()
+                        .iter()
+                        .find(|f| f.id == *id)
+                        .unwrap()
+                        .clone()
+                })
+                .collect();
+            let batch = {
+                let mut scan = dataset.scan();
+                scan.with_fragments(old_fragments.clone());
+                scan.try_into_batch().await.unwrap()
+            };
+            let txn = InsertBuilder::new(Arc::new(dataset.clone()))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                })
+                .execute_uncommitted(vec![batch])
+                .await
+                .unwrap();
+            let Operation::Append { mut fragments } = txn.operation else {
+                unreachable!()
+            };
+            assert_eq!(fragments.len(), 1);
+            fragments[0].id = dest_id;
+            let mut changed_row_addrs = RoaringTreemap::new();
+            for frag in &old_fragments {
+                for offset in 0..frag.physical_rows.unwrap() as u64 {
+                    changed_row_addrs.insert((frag.id << 32) + offset);
+                }
+            }
+            let mut serialized = Vec::new();
+            changed_row_addrs.serialize_into(&mut serialized).unwrap();
+            let digests = |fragments: &[Fragment]| {
+                fragments
+                    .iter()
+                    .map(|f| FragmentDigest::from(&FragDigest::from(f)))
+                    .collect::<Vec<_>>()
+            };
+            let transition = Transition {
+                sources: digests(&old_fragments),
+                destinations: digests(&fragments),
+                mapping: Some(transition::Mapping::OrderedCompaction(
+                    lance_table::format::pb::fragment_reuse_index_details::OrderedCompaction {
+                        changed_row_addrs: serialized,
+                    },
+                )),
+            };
+            (transition, fragments)
+        }
+
+        /// Tagged-compaction row, direction 1: a stable-partition rewrite
+        /// lands while a tagged deferred compaction of disjoint fragments is
+        /// in flight; the compaction rebases onto the appended entry (its
+        /// transitions are ordered compactions, so the SP-vs-SP diff must
+        /// not fire) and both records survive.
+        #[tokio::test]
+        async fn tagged_compaction_rebases_over_concurrent_sp() {
+            let dataset = tagged_fixture().await;
+            let mut dataset = append_rows(&dataset, 100..104).await;
+            reserve(&mut dataset, 20).await;
+            let appended_id = dataset.fragments().last().unwrap().id;
+
+            let b_old = vec![dataset.fragments().last().unwrap().clone()];
+            let (b_transition, b_destinations) = oc_parts(&dataset, &[appended_id], 55).await;
+            let read_version = dataset.manifest.version;
+
+            let writer_a = dataset.clone();
+            let a_old: Vec<Fragment> = writer_a
+                .fragments()
+                .iter()
+                .filter(|f| f.id != appended_id)
+                .cloned()
+                .collect();
+            let (a_transition, a_destinations) = prepare_partition(&writer_a, &[10, 11], 50).await;
+            let a_version = writer_a.manifest.version;
+            commit_sp(
+                writer_a,
+                a_version,
+                sp_rewrite(a_old, a_destinations, vec![a_transition]),
+            )
+            .await
+            .unwrap();
+
+            let committed = commit_sp(
+                dataset,
+                read_version,
+                sp_rewrite(b_old, b_destinations, vec![b_transition]),
+            )
+            .await
+            .unwrap();
+            let (entry, ledger) = fri_ledger(&committed).await;
+            assert_eq!(entry.index_version, 1);
+            assert_eq!(count_mappings(&ledger), (2, 1));
+            assert!(ledger.consumer(appended_id as u32).is_some());
+            let mut expected: Vec<i32> = (0..8).collect();
+            expected.extend(100..104);
+            assert_eq!(sorted_values(&committed).await, expected);
+        }
+
+        /// Tagged-compaction row, direction 2: a tagged deferred compaction
+        /// lands while a stable-partition rewrite of disjoint fragments is
+        /// in flight; the rewrite rebases onto the entry containing the
+        /// compaction's transition and both records survive.
+        #[tokio::test]
+        async fn sp_rebases_over_concurrent_tagged_compaction() {
+            let dataset = tagged_fixture().await;
+            let mut dataset = append_rows(&dataset, 100..104).await;
+            reserve(&mut dataset, 20).await;
+            let appended_id = dataset.fragments().last().unwrap().id;
+
+            let b_old: Vec<Fragment> = dataset
+                .fragments()
+                .iter()
+                .filter(|f| f.id != appended_id)
+                .cloned()
+                .collect();
+            let (b_transition, b_destinations) = prepare_partition(&dataset, &[10, 11], 50).await;
+            let read_version = dataset.manifest.version;
+
+            let writer_a = dataset.clone();
+            let a_old = vec![writer_a.fragments().last().unwrap().clone()];
+            let (a_transition, a_destinations) = oc_parts(&writer_a, &[appended_id], 55).await;
+            let a_version = writer_a.manifest.version;
+            commit_sp(
+                writer_a,
+                a_version,
+                sp_rewrite(a_old, a_destinations, vec![a_transition]),
+            )
+            .await
+            .unwrap();
+
+            let committed = commit_sp(
+                dataset,
+                read_version,
+                sp_rewrite(b_old, b_destinations, vec![b_transition]),
+            )
+            .await
+            .unwrap();
+            let (entry, ledger) = fri_ledger(&committed).await;
+            assert_eq!(entry.index_version, 1);
+            assert_eq!(count_mappings(&ledger), (2, 1));
+            assert!(ledger.consumer(10).is_some());
+            assert!(ledger.consumer(appended_id as u32).is_some());
+            let mut expected: Vec<i32> = (0..8).collect();
+            expected.extend(100..104);
+            assert_eq!(sorted_values(&committed).await, expected);
+        }
     }
 }

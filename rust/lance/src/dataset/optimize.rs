@@ -91,7 +91,8 @@ use super::fragment::FileFragment;
 use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
 use super::rowids::load_row_id_sequences;
 use super::transaction::{
-    Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+    Operation, RewriteGroup, RewrittenIndex, StablePartitionRewrite, Transaction,
+    TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
 use super::versions;
@@ -957,18 +958,28 @@ pub async fn compact_files_with_planner(
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
-    if dataset.manifest.writer_feature_flags & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
-        != 0
+    let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
+
+    // A tagged FRI history is maintained by appending transitions to the
+    // tagged entry, which only the deferred-remap commit path does; eager
+    // remapping would rewrite provenance the tagged reader depends on.
+    // Checked before any file is rewritten (commit_compaction re-checks for
+    // callers that commit externally planned results).
+    if !compaction_plan.options.defer_index_remap
+        && dataset.manifest.writer_feature_flags
+            & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
+            != 0
         && crate::index::load_all_indices(dataset)
             .await?
             .iter()
             .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
     {
         return Err(Error::not_supported(
-            "Compaction of FRI index_version 1 requires an upgraded writer",
+            "Compacting a table with a tagged fragment reuse history requires \
+             defer_index_remap; set defer_index_remap, or upgrade to a writer that \
+             remaps tagged histories eagerly",
         ));
     }
-    let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
 
     // If nothing to compact, don't make a commit.
     if compaction_plan.tasks().is_empty() {
@@ -2773,6 +2784,23 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
+    // A tagged FRI history stores row translation in the manifest entry and
+    // depends on index bitmaps keeping their retired provenance, so a
+    // compaction on a tagged table can only commit by appending transitions
+    // (the deferred path below). Refuse the eager path up front, before any
+    // remapping work runs into the commit gate.
+    let tagged_fri = load_all_indices(dataset)
+        .await?
+        .iter()
+        .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
+    if tagged_fri && !options.defer_index_remap {
+        return Err(Error::not_supported(
+            "Compacting a table with a tagged fragment reuse history requires \
+             defer_index_remap; set defer_index_remap, or upgrade to a writer that \
+             remaps tagged histories eagerly",
+        ));
+    }
+
     // Before anything is written or committed. The condition is the planner's,
     // not `has_address_style`: a dataset whose only index is one this build
     // cannot read captures no row addresses at all, which is exactly the plan
@@ -2842,6 +2870,9 @@ pub async fn commit_compaction(
     let mut remap_group_inputs: Vec<GroupInput> = Vec::new();
     let mut direct_row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
+    let mut tagged_transitions: Vec<
+        lance_table::format::pb::fragment_reuse_index_details::Transition,
+    > = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
     // Write an FRI only when the compaction touches data an index must later
@@ -2851,7 +2882,12 @@ pub async fn commit_compaction(
     // compaction, never per group -- a partial FRI is unsound: a concurrent reindex
     // can make a skipped fragment indexed and the conflict resolver's FRI-present
     // path won't re-check it.
-    let indexed_frags: RoaringBitmap = if options.defer_index_remap {
+    //
+    // A tagged table skips this decision: it always records a transition,
+    // both because the reader resolves addresses through the recorded
+    // lineage and because the commit gate only admits a rewrite that appends
+    // to the tagged entry.
+    let indexed_frags: RoaringBitmap = if options.defer_index_remap && !tagged_fri {
         let mut covered = RoaringBitmap::new();
         for bm in load_index_fragmaps(dataset).await? {
             covered |= bm;
@@ -2949,15 +2985,37 @@ pub async fn commit_compaction(
                     "defer_index_remap requires row_addrs but none were provided".to_string(),
                 )
             })?;
-            frag_reuse_groups.push(FragReuseGroup {
-                changed_row_addrs,
-                old_frags: task.original_fragments.iter().map(|f| f.into()).collect(),
-                new_frags: task.new_fragments.iter().map(|f| f.into()).collect(),
-            });
+            if tagged_fri {
+                // On a tagged table the group becomes an ordered-compaction
+                // transition appended to the tagged entry: the same digests
+                // and changed_row_addrs bitmap the v0 writer records, carried
+                // as the transition's mapping instead of a legacy version.
+                use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+                use lance_table::system_index::frag_reuse::FragDigest;
+                let digests = |fragments: &[Fragment]| {
+                    fragments
+                        .iter()
+                        .map(|f| pb_fri::FragmentDigest::from(&FragDigest::from(f)))
+                        .collect::<Vec<_>>()
+                };
+                tagged_transitions.push(pb_fri::Transition {
+                    sources: digests(&task.original_fragments),
+                    destinations: digests(&task.new_fragments),
+                    mapping: Some(pb_fri::transition::Mapping::OrderedCompaction(
+                        pb_fri::OrderedCompaction { changed_row_addrs },
+                    )),
+                });
+            } else {
+                frag_reuse_groups.push(FragReuseGroup {
+                    changed_row_addrs,
+                    old_frags: task.original_fragments.iter().map(|f| f.into()).collect(),
+                    new_frags: task.new_fragments.iter().map(|f| f.into()).collect(),
+                });
 
-            task.new_fragments.iter().for_each(|frag| {
-                new_fragment_bitmap.insert(frag.id as u32);
-            });
+                task.new_fragments.iter().for_each(|frag| {
+                    new_fragment_bitmap.insert(frag.id as u32);
+                });
+            }
         }
         rewrite_groups.push(rewrite_group);
     }
@@ -3000,16 +3058,34 @@ pub async fn commit_compaction(
         Vec::new()
     };
 
-    // No indexed/chain data touched -> no FRI (all-or-nothing, see above).
-    let frag_reuse_index = if options.defer_index_remap && any_group_indexed {
-        Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?)
+    // On a tagged table the transitions ride the in-memory rewrite intent;
+    // the commit path assembles them onto the tagged entry at every attempt
+    // (see `build_stable_partition_rewrite_entry`), which also keeps a retry
+    // appending onto whatever a concurrent writer committed meanwhile.
+    // Otherwise: no indexed/chain data touched -> no FRI (all-or-nothing,
+    // see above).
+    let (frag_reuse_index, stable_partition) = if tagged_fri && options.defer_index_remap {
+        (
+            None,
+            Some(StablePartitionRewrite {
+                transitions: tagged_transitions,
+                base_entry_version: None,
+            }),
+        )
+    } else if options.defer_index_remap && any_group_indexed {
+        (
+            Some(
+                build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?,
+            ),
+            None,
+        )
     } else {
         if options.defer_index_remap {
             log::debug!(
                 "skipping fragment-reuse index: no rewritten fragments were covered by an index"
             );
         }
-        None
+        (None, None)
     };
 
     let transaction = TransactionBuilder::new(
@@ -3025,7 +3101,7 @@ pub async fn commit_compaction(
             groups: rewrite_groups,
             rewritten_indices,
             frag_reuse_index,
-            stable_partition: None,
+            stable_partition,
         },
     )
     .transaction_properties(options.transaction_properties.clone())

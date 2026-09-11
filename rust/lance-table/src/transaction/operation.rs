@@ -280,14 +280,15 @@ impl std::fmt::Display for Operation {
     }
 }
 
-/// A stable-partition (reordered) rewrite's contribution to an
-/// [`Operation::Rewrite`] commit.
+/// The tagged transitions an [`Operation::Rewrite`] appends to the fragment
+/// reuse index entry: stable-partition (reordered) rewrites, and deferred
+/// compactions on a table whose entry is already tagged (their transitions
+/// carry an ordered-compaction mapping instead).
 ///
-/// Unlike compaction, the covered groups redistribute rows across their
-/// destinations, so index fragment bitmaps must not be swapped from old to
-/// new fragments: the retired source ids stay in the bitmaps as provenance
-/// and the transitions appended to the tagged fragment reuse index entry
-/// record the row-level translation (see
+/// Under a tagged history, index fragment bitmaps must not be swapped from
+/// old to new fragments for the covered groups: the retired source ids stay
+/// in the bitmaps as provenance and the appended transitions record the
+/// row-level translation the reader applies (see
 /// `lance_table::system_index::frag_reuse::ledger`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StablePartitionRewrite {

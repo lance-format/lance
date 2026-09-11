@@ -711,9 +711,11 @@ pub mod tests {
         assert!(error.to_string().contains("Please upgrade"));
     }
 
+    // Deferred compaction is no longer in this list: on a tagged table it
+    // appends an ordered-compaction transition to the tagged entry (see the
+    // chained end-to-end test in `crate::index::frag_reuse`).
     #[rstest::rstest]
     #[case::eager_compaction("eager")]
-    #[case::deferred_compaction("deferred")]
     #[case::statistics("statistics")]
     #[case::cleanup("cleanup")]
     #[case::shallow_clone("shallow")]
@@ -736,11 +738,10 @@ pub mod tests {
         persist_fixture(&mut dataset, indices).await;
         let version = dataset.manifest.version;
         let error = match operation {
-            "eager" | "deferred" => crate::dataset::optimize::compact_files(
+            "eager" => crate::dataset::optimize::compact_files(
                 &mut dataset,
                 crate::dataset::optimize::CompactionOptions {
                     target_rows_per_fragment: 100,
-                    defer_index_remap: operation == "deferred",
                     ..Default::default()
                 },
                 None,

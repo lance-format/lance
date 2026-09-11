@@ -802,7 +802,7 @@ mod tests {
         FragmentDigest, StablePartition, Transition, transition,
     };
     use lance_table::system_index::frag_reuse::FragDigest;
-    use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
+    use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
     use lance_table::system_index::frag_reuse::metadata::is_tagged;
     use lance_table::transaction::{Operation, Transaction};
     use roaring::RoaringTreemap;
@@ -1234,6 +1234,103 @@ mod tests {
         assert_eq!(
             load_raw_frag_reuse_content(&dataset, &entry).await.unwrap(),
             expected
+        );
+    }
+
+    /// Task-chain end to end: a deferred compaction after the atomic
+    /// stable-partition commit appends an ordered-compaction transition to
+    /// the tagged entry (not a legacy version), and index queries translate
+    /// through the two-hop chain (stable partition, then compaction).
+    #[tokio::test]
+    async fn deferred_compaction_chains_onto_stable_partition() {
+        let mut dataset = reader_tests::fixture().await;
+        reserve_fragments(&mut dataset, 20).await;
+        let before = sorted_values(&dataset).await;
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (transition, destinations) = reader_tests::prepare(&dataset).await;
+        let read_version = dataset.manifest.version;
+        let mut dataset = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments: destinations,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    stable_partition: Some(StablePartitionRewrite {
+                        transitions: vec![transition],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let sp_entry = stored_fri(&stored);
+        let sp_content = load_raw_frag_reuse_content(&dataset, &sp_entry)
+            .await
+            .unwrap();
+
+        let metrics = crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 100,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 1);
+
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let entry = stored_fri(&stored);
+        assert_eq!(entry.index_version, 1);
+        assert!(is_tagged(&entry));
+        // Appended, not re-encoded: the stable-partition record is intact
+        // byte for byte and the compaction rides a transition, not a legacy
+        // version.
+        let content = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+        assert!(content.starts_with(&sp_content));
+        let ledger = decode_entry(&dataset, &entry).await;
+        assert_eq!(ledger.transitions().len(), 2);
+        assert!(matches!(
+            ledger.transitions()[0].mapping(),
+            Mapping::StablePartition(_)
+        ));
+        assert!(matches!(
+            ledger.transitions()[1].mapping(),
+            Mapping::OrderedCompaction(_)
+        ));
+        // Lineage: the compaction consumed the stable partition's
+        // destinations.
+        assert!(ledger.consumer(10).is_some());
+        assert!(ledger.consumer(11).is_some());
+        assert!(ledger.consumer(0).is_some());
+        // Index provenance is still the original coverage.
+        let scalar = stored.iter().find(|idx| idx.name == "i_idx").unwrap();
+        assert_eq!(
+            scalar.fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter([0u32, 1])
+        );
+
+        // Reads translate through both hops.
+        assert_eq!(sorted_values(&dataset).await, before);
+        assert_eq!(
+            dataset.count_rows(Some("i = 3".to_string())).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("i >= 4".to_string()))
+                .await
+                .unwrap(),
+            4
         );
     }
 }
