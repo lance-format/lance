@@ -48,7 +48,6 @@ use lance_core::datatypes::{
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 use lance_io::traits::Reader;
-use lance_io::utils::CachedFileSize;
 
 const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
@@ -1350,7 +1349,6 @@ enum BlobFileState {
 struct BlobSource {
     object_store: Arc<ObjectStore>,
     path: Path,
-    file_size: CachedFileSize,
     scheduler: OnceCell<FileScheduler>,
     pending_reads: Mutex<PendingBlobReads>,
 }
@@ -1361,7 +1359,6 @@ impl BlobSource {
         Self {
             object_store,
             path,
-            file_size: CachedFileSize::unknown(),
             scheduler: OnceCell::new(),
             pending_reads: Mutex::new(PendingBlobReads::default()),
         }
@@ -1381,12 +1378,12 @@ impl BlobSource {
         let scheduler = self
             .scheduler
             .get_or_try_init(|| async {
-                ScanScheduler::new(
+                let reader = self.object_store.open(&self.path).await?;
+                let scheduler = ScanScheduler::new(
                     self.object_store.clone(),
                     SchedulerConfig::max_bandwidth(self.object_store.as_ref()),
-                )
-                .open_file(&self.path, &self.file_size)
-                .await
+                );
+                Ok::<_, Error>(scheduler.open_reader(reader.into()))
             })
             .await?;
 
@@ -3119,9 +3116,10 @@ async fn execute_blob_read_plan(
     let mut bytes = vec![Bytes::new(); task.reads.len()];
     if let Some(first_range) = physical_ranges.first() {
         let scheduler = execution.scheduler_for(&task.source);
-        let file_scheduler = scheduler
-            .open_file(&task.source.path, &task.source.file_size)
-            .await?;
+        // The plan already bounds physical reads; probing the backing object's
+        // size would add a metadata request without validating the blob slice.
+        let reader = task.source.object_store.open(&task.source.path).await?;
+        let file_scheduler = scheduler.open_reader(reader.into());
         let priority = first_range.start;
         let physical_range_count = physical_ranges.len();
         let returned = file_scheduler
@@ -4500,7 +4498,9 @@ mod tests {
     };
     use crate::{
         Dataset,
-        blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, PackedBlobWriter, blob_field},
+        blob::{
+            BlobArrayBuilder, BlobDescriptorArrayBuilder, BlobRange, PackedBlobWriter, blob_field,
+        },
         dataset::{
             CommitBuilder, ExternalBlobMode, WriteMode, WriteParams,
             scanner::MaterializationStyle,
@@ -4799,6 +4799,7 @@ mod tests {
     struct RecordingRangeObjectStore {
         data: Bytes,
         gate: Option<Arc<Semaphore>>,
+        head_requests: AtomicUsize,
         requested_ranges: std::sync::Mutex<Vec<Range<u64>>>,
         started_blob_requests: AtomicUsize,
         active_blob_requests: AtomicUsize,
@@ -4811,6 +4812,7 @@ mod tests {
             Self {
                 data,
                 gate: None,
+                head_requests: AtomicUsize::new(0),
                 requested_ranges: std::sync::Mutex::new(Vec::new()),
                 started_blob_requests: AtomicUsize::new(0),
                 active_blob_requests: AtomicUsize::new(0),
@@ -4823,6 +4825,7 @@ mod tests {
             Self {
                 data,
                 gate: Some(gate),
+                head_requests: AtomicUsize::new(0),
                 requested_ranges: std::sync::Mutex::new(Vec::new()),
                 started_blob_requests: AtomicUsize::new(0),
                 active_blob_requests: AtomicUsize::new(0),
@@ -4876,6 +4879,11 @@ mod tests {
 
     #[async_trait]
     impl object_store::ObjectStore for RecordingRangeObjectStore {
+        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+            self.head_requests.fetch_add(1, Ordering::Relaxed);
+            Ok(self.object_meta(location))
+        }
+
         async fn put_opts(
             &self,
             _location: &Path,
@@ -6809,17 +6817,64 @@ mod tests {
         assert_eq!(chunks[1].as_ref(), b"bc");
         assert_eq!(chunks[2].as_ref(), b"de");
         assert!(chunks[3].is_empty());
-        assert_eq!(inner.requested_blob_ranges(), vec![1..7]);
+        assert_eq!(inner.requested_ranges(), vec![1..7]);
+        assert_eq!(inner.head_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn test_blob_file_read_range_rejects_out_of_bounds() {
-        let (store, _) = recording_range_store(Bytes::from_static(b"abcdef"));
+        let (store, inner) = recording_range_store(Bytes::from_static(b"abcdef"));
         let path = Path::from("blobs/test.bin");
         let blob = BlobFile::new_packed(store, path, 0, 4);
 
         let err = blob.read_range(1..5).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
         assert!(err.to_string().contains("exceeds blob size"));
+        assert!(inner.requested_ranges().is_empty());
+        assert_eq!(inner.head_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    #[case::partial(3)]
+    #[case::empty(0)]
+    #[tokio::test]
+    async fn test_blob_range_reads_reject_truncated_backing_object(#[case] truncated_size: u64) {
+        let test_dir = TempDir::default();
+        let file_path = test_dir.std_path().join("blob.bin");
+        std::fs::write(&file_path, b"abcdefgh").unwrap();
+        let path = Path::from_absolute_path(&file_path).unwrap();
+        let blob = BlobFile::new_packed(Arc::new(ObjectStore::local()), path, 2, 4);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .unwrap()
+            .set_len(truncated_size)
+            .unwrap();
+
+        let error = blob.read_range(0..4).await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("failed to fill whole buffer"),
+            "{error}"
+        );
+
+        let error = execute_blob_entries(
+            vec![BlobEntry {
+                selection_index: 0,
+                row_address: 0,
+                file: blob,
+                requested_range: Some(BlobReadRange::new(0, 4)),
+            }],
+            1,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("failed to fill whole buffer"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -7576,9 +7631,6 @@ mod tests {
 
         let (store, inner) = recording_range_store(Bytes::from(vec![7; WINDOW_SIZE as usize]));
         let source = Arc::new(BlobSource::new(store, Path::from("blobs/large.bin")));
-        source
-            .file_size
-            .set(std::num::NonZeroU64::new(VALUE_SIZE).unwrap());
         let entries = vec![BlobEntry {
             selection_index: 0,
             row_address: 10,
@@ -7595,7 +7647,8 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].data.len(), WINDOW_SIZE as usize);
-        let physical_ranges = inner.requested_blob_ranges();
+        let physical_ranges = inner.requested_ranges();
+        assert_eq!(inner.head_requests.load(Ordering::Relaxed), 0);
         assert_eq!(physical_ranges, vec![0..WINDOW_SIZE]);
         assert_eq!(
             physical_ranges
@@ -7607,19 +7660,34 @@ mod tests {
         assert!(!physical_ranges.contains(&(0..VALUE_SIZE)));
     }
 
+    #[rstest]
+    #[case::inline(BlobKind::Inline, 1024 * 1024, 1024 * 1024)]
+    #[case::packed(BlobKind::Packed, 0, 1024 * 1024)]
+    #[case::dedicated(BlobKind::Dedicated, 0, 1)]
     #[tokio::test]
-    async fn test_read_blob_ranges_avoids_whole_value_read_amplification_end_to_end() {
-        const VALUE_SIZE: usize = 8 * 1024 * 1024;
-        const WINDOW_SIZE: u64 = 100 * 1024;
+    async fn test_read_blob_ranges_avoids_whole_value_read_amplification_end_to_end(
+        #[case] kind: BlobKind,
+        #[case] inline_threshold: usize,
+        #[case] dedicated_threshold: usize,
+    ) {
+        const VALUE_SIZE: usize = 256 * 1024;
+        const WINDOW_SIZE: u64 = 4 * 1024;
+        const OFFSET: u64 = 64 * 1024;
 
         let test_dir = TempStrDir::default();
-        let mut blob_builder = BlobArrayBuilder::new(1);
-        blob_builder.push_bytes(vec![0xA5; VALUE_SIZE]).unwrap();
+        let mut blob_builder = BlobArrayBuilder::new(4);
+        for value in 0xA5..0xA9 {
+            blob_builder.push_bytes(vec![value; VALUE_SIZE]).unwrap();
+        }
         let mut blob_field = blob_field("blob", false);
         let mut metadata = blob_field.metadata().clone();
         metadata.insert(
             BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
-            "1".to_string(),
+            dedicated_threshold.to_string(),
+        );
+        metadata.insert(
+            BLOB_INLINE_SIZE_THRESHOLD_META_KEY.to_string(),
+            inline_threshold.to_string(),
         );
         blob_field = blob_field.with_metadata(metadata);
         let schema = Arc::new(Schema::new(vec![blob_field]));
@@ -7634,6 +7702,7 @@ mod tests {
                 &test_dir,
                 Some(WriteParams {
                     data_storage_version: Some(LanceFileVersion::V2_2),
+                    max_rows_per_file: 2,
                     ..Default::default()
                 }),
             )
@@ -7641,29 +7710,44 @@ mod tests {
             .unwrap(),
         );
 
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let indices = [3, 0, 2, 1];
+        let blobs = dataset
+            .take_blobs_by_indices(&indices, "blob")
+            .await
+            .unwrap();
+        for blob in &blobs {
+            assert_eq!(blob.as_ref().unwrap().kind(), kind);
+        }
         let _ = dataset.object_store.io_stats_incremental();
         let results = dataset
             .read_blob_ranges("blob")
             .unwrap()
-            .with_row_indices([BlobRangeRequest::new(0, 4 * 1024 * 1024, WINDOW_SIZE)])
+            .with_row_indices(indices.map(|row| BlobRangeRequest::new(row, OFFSET, WINDOW_SIZE)))
             .execute()
             .await
             .unwrap();
         let stats = dataset.object_store.io_stats_incremental();
 
-        assert_eq!(results.len(), 1);
-        let data = results[0].data.as_ref().unwrap();
-        assert_eq!(data.len(), WINDOW_SIZE as usize);
-        assert!(data.iter().all(|byte| *byte == 0xA5));
-        let blob_payload_ranges = stats
-            .requests
-            .iter()
-            .filter(|request| request.path.as_ref().ends_with(".blob"))
-            .filter_map(|request| request.range.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            blob_payload_ranges,
-            vec![4 * 1024 * 1024..4 * 1024 * 1024 + WINDOW_SIZE]
+        assert_eq!(results.len(), indices.len());
+        for ((result, row), blob) in results.iter().zip(indices).zip(blobs) {
+            let data = result.data.as_ref().unwrap();
+            assert_eq!(data.as_ref(), vec![0xA5 + row as u8; WINDOW_SIZE as usize]);
+            let blob = blob.unwrap();
+            let range = blob.position + OFFSET..blob.position + OFFSET + WINDOW_SIZE;
+            assert!(
+                stats.requests.iter().any(|request| {
+                    request.path == blob.source.path && request.range.as_ref() == Some(&range)
+                }),
+                "{stats:?}"
+            );
+        }
+        assert!(
+            stats
+                .requests
+                .iter()
+                .all(|request| { request.method != "get_opts" || request.range.is_some() }),
+            "{stats:?}"
         );
     }
 
@@ -7994,8 +8078,14 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::whole_object(None, b"mapped")]
+    #[case::slice(Some(BlobRange { offset: 1, size: 4 }), b"appe")]
     #[tokio::test]
-    async fn test_blob_v2_external_mapped_to_registered_base() {
+    async fn test_blob_v2_external_mapped_to_registered_base(
+        #[case] range: Option<BlobRange>,
+        #[case] expected: &[u8],
+    ) {
         let test_dir = TempDir::default();
         let dataset_uri = test_dir.std_path().join("dataset");
         let external_base = test_dir.std_path().join("external_base");
@@ -8006,10 +8096,10 @@ mod tests {
         let external_uri = format!("file://{}", external_path.display());
         let base_uri = format!("file://{}", external_base.display());
 
-        let mut blob_builder = BlobArrayBuilder::new(1);
-        blob_builder.push_uri(external_uri).unwrap();
-        let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
-        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let mut blob_builder = BlobDescriptorArrayBuilder::new("blob", true);
+        blob_builder.push_external(external_uri, range).unwrap();
+        let (field, blob_array) = blob_builder.finish().unwrap().into_parts();
+        let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
 
@@ -8056,8 +8146,16 @@ mod tests {
         assert_eq!(blobs.len(), 1);
         assert_eq!(
             blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
-            b"mapped"
+            expected
         );
+        let results = dataset
+            .read_blob_ranges("blob")
+            .unwrap()
+            .with_row_indices([BlobRangeRequest::new(0, 1, 2)])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(results[0].data.as_deref(), Some(&expected[1..3]));
     }
 
     #[tokio::test]
