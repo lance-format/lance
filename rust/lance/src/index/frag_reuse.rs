@@ -42,26 +42,42 @@ pub async fn load_frag_reuse_index_details(
             Ok(Arc::new(FragReuseIndexDetails::try_from(content.clone())?))
         }
         Some(Content::External(external_file)) => {
-            let file_path = dataset
-                .indices_dir()
-                .join(index.uuid.to_string())
-                .join(external_file.path.clone());
-
             // the file content will be cached in the index cache later
             // so we do not put it to the file cache
-            let range = external_file.offset as usize
-                ..(external_file.offset as usize + external_file.size as usize);
-            let data = dataset
-                .object_store
-                .open(&file_path)
-                .await?
-                .get_range(range)
-                .await?;
+            let data = read_fri_external_file(dataset, index, external_file).await?;
 
             let pb_sequence = InlineContent::decode(data)?;
             Ok(Arc::new(FragReuseIndexDetails::try_from(pb_sequence)?))
         }
     }
+}
+
+/// Resolve an FRI entry's external details bytes, honoring the entry's base:
+/// a shallow-cloned entry's `details.binpb` lives in the SOURCE dataset, so
+/// the path and store come from the entry's `base_id` (like every other
+/// base-aware index file) instead of the current dataset root.
+async fn read_fri_external_file(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+    file: &ExternalFile,
+) -> lance_core::Result<bytes::Bytes> {
+    let end = file
+        .offset
+        .checked_add(file.size)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| Error::corrupt_file_named("FRI details", "external FRI range overflow"))?;
+    let path = dataset
+        .indice_files_dir(index)?
+        .join(index.uuid.to_string())
+        .join(file.path.as_str());
+    dataset
+        .object_store_for_index(index)
+        .await?
+        .open(&path)
+        .await?
+        .get_range(file.offset as usize..end)
+        .await
+        .map_err(Error::from)
 }
 
 /// open fragment reuse index based on its metadata details
