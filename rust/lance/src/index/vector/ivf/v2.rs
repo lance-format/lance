@@ -2652,18 +2652,18 @@ mod tests {
     // while 20 neighbors provide a useful recall oracle.
     const PQ_MATRIX_NUM_ROWS: usize = 320;
     const PQ_MATRIX_K: usize = 20;
-    const PQ_MATRIX_NUM_BITS: usize = 8;
     const LIGHTWEIGHT_PQ_PARTITIONS: usize = 2;
+    const LIGHTWEIGHT_IVF_SAMPLE_RATE: usize = 16;
     // An 8-bit PQ codebook has 256 codes and needs a training vector for each,
     // so this is the smallest valid fixture, shared by the 8-bit and 4-bit
     // runtime cases.
     const LIGHTWEIGHT_PQ_ROWS: usize = 256;
     const LIGHTWEIGHT_PQ_SUB_VECTORS: usize = 4;
 
-    /// Partitions a fixture of `rows` supports at `num_bits`, capped by the
-    /// count the build asked for.
-    fn supported_partitions(rows: usize, num_bits: usize, requested: usize) -> usize {
-        requested.min(rows / (1usize << num_bits)).max(1)
+    /// Partitions a fixture of `rows` supports when each centroid is fitted on
+    /// `sample_rate` vectors, capped by the count the build asked for.
+    fn supported_partitions(rows: usize, sample_rate: usize, requested: usize) -> usize {
+        requested.min(rows / sample_rate).max(1)
     }
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
@@ -3460,7 +3460,7 @@ mod tests {
 
         let mut ivf_params = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
         ivf_params.max_iters = 2;
-        ivf_params.sample_rate = 16;
+        ivf_params.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
         let pq_params = lightweight_pq_params_with_bits(num_bits);
         let expected_num_sub_vectors = pq_params.num_sub_vectors;
         let params = if use_hnsw {
@@ -3489,8 +3489,11 @@ mod tests {
         let expected_index_type = if use_hnsw { "IVF_HNSW_PQ" } else { "IVF_PQ" };
         let expected_sub_index = if use_hnsw { "HNSW" } else { "PQ" };
         assert_eq!(stats["index_type"], expected_index_type);
-        let expected_partitions =
-            supported_partitions(LIGHTWEIGHT_PQ_ROWS, num_bits, LIGHTWEIGHT_PQ_PARTITIONS);
+        let expected_partitions = supported_partitions(
+            LIGHTWEIGHT_PQ_ROWS,
+            LIGHTWEIGHT_IVF_SAMPLE_RATE,
+            LIGHTWEIGHT_PQ_PARTITIONS,
+        );
         assert_eq!(stats["indices"][0]["num_partitions"], expected_partitions);
         assert_eq!(
             stats["indices"][0]["sub_index"]["index_type"],
@@ -5206,7 +5209,7 @@ mod tests {
         ivf_params.sample_rate = PQ_MATRIX_NUM_ROWS;
         let pq_params = PQBuildParams {
             num_sub_vectors: 4,
-            num_bits: PQ_MATRIX_NUM_BITS,
+            num_bits: 8,
             max_iters: 2,
             sample_rate: 1,
             ..Default::default()
@@ -5228,8 +5231,9 @@ mod tests {
         let test_uri = test_dir.as_str();
         let params = pq_matrix_params(nlist, distance_type, version.clone());
         let batch = pq_matrix_batch::<Float32Type>(PQ_MATRIX_NUM_ROWS);
+        // `pq_matrix_params` fits each centroid on the whole fixture.
         let expected_partitions =
-            supported_partitions(PQ_MATRIX_NUM_ROWS, PQ_MATRIX_NUM_BITS, nlist);
+            supported_partitions(PQ_MATRIX_NUM_ROWS, PQ_MATRIX_NUM_ROWS, nlist);
         let schema = batch.schema();
         let query = batch["vector"].as_fixed_size_list().value(0);
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);

@@ -592,8 +592,7 @@ async fn count_non_null_vectors(
 /// A partition's centroid is what search ranks to choose partitions, so one
 /// built from a handful of vectors prunes nothing while still paying the
 /// quantizer's precision loss. The vectors available therefore cap the count,
-/// at a codebook's worth each; without a quantizer the only limit is KMeans
-/// needing a vector per centroid.
+/// at `vectors_per_partition` each.
 async fn supported_num_partitions(
     dataset: &Dataset,
     column: &str,
@@ -608,7 +607,7 @@ async fn supported_num_partitions(
         return Ok(requested);
     }
 
-    let supported = match vector_quantizer_minimum_rows(stages) {
+    let supported = match vectors_per_partition(stages) {
         Some(target) => requested.min(recommended_num_partitions(vectors, target)),
         None => requested.min(vectors).max(1),
     };
@@ -626,7 +625,33 @@ async fn supported_num_partitions(
 /// The upper edge of the reduced-partition band: below this a build trains
 /// fewer partitions than asked for.
 fn vectors_for_partitions(stages: &[StageParams], partitions: usize) -> usize {
-    partitions.saturating_mul(vector_quantizer_minimum_rows(stages).unwrap_or(1))
+    partitions.saturating_mul(vectors_per_partition(stages).unwrap_or(1))
+}
+
+/// The vectors one partition's centroid should be fitted on, or `None` when the
+/// index stores vectors uncompressed.
+///
+/// A codebook's precision loss is paid on every vector, so a centroid fitted on
+/// a handful prunes nothing and still costs it. Without a codebook there is no
+/// precision to lose, and KMeans needing a vector per centroid is the only
+/// limit.
+fn vectors_per_partition(stages: &[StageParams]) -> Option<usize> {
+    vector_quantizer_minimum_rows(stages)?;
+    // IVF training fits each centroid on `sample_rate` vectors, which is also
+    // where KMeans starts warning (`k * 256` at the default rate). That number
+    // belongs to the IVF stage: an 8-bit codebook holds the same 256 entries by
+    // coincidence, and a 4-bit one asking only 16 vectors per partition would
+    // train centroids that prune nothing.
+    Some(
+        stages
+            .iter()
+            .find_map(|stage| match stage {
+                StageParams::Ivf(ivf) => Some(ivf.sample_rate),
+                _ => None,
+            })
+            .unwrap_or_else(|| IvfBuildParams::default().sample_rate)
+            .max(1),
+    )
 }
 
 /// Rows a vector index's quantizer needs before it can be trained.
@@ -705,13 +730,10 @@ async fn prepare_vector_segment_build(
             )));
         }
         (Some(num_partitions), Some(_)) => num_partitions,
-        // A partition needs a codebook's worth of vectors to summarise, and its
-        // centroid is what search ranks to choose partitions: one built from a
-        // handful of vectors prunes nothing and still costs the quantizer's
-        // precision. So the vectors available cap how many partitions a
-        // whole-table build trains, at the same `num_centroids` per partition
-        // that KMeans warns below. Without a quantizer the only limit is
-        // KMeans needing a vector per centroid.
+        // A partition's centroid is what search ranks to choose partitions, so
+        // one built from a handful of vectors prunes nothing and still costs
+        // the quantizer's precision. So the vectors available cap how many
+        // partitions a whole-table build trains, at the IVF sample rate each.
         //
         // A fragment subset keeps the count it was given: the segments of one
         // logical index have to agree on it.

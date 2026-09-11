@@ -3786,6 +3786,7 @@ mod tests {
         hnsw::builder::HnswBuildParams,
         ivf::IvfBuildParams,
         kmeans::{KMeansParams, train_kmeans},
+        pq::builder::PQBuildParams,
         sq::builder::SQBuildParams,
     };
     use lance_io::{
@@ -6110,8 +6111,85 @@ mod tests {
         assert_eq!(trained_partitions(&dataset).await, vec![8]);
     }
 
-    /// Build a dataset of `rows` random vectors, one fragment.
-    async fn small_vector_dataset(dir: &std::path::Path, rows: usize) -> Dataset {
+    /// The cap counts the vectors IVF fits a centroid on, not codebook entries.
+    #[tokio::test]
+    async fn test_partition_cap_ignores_the_codebook_size() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 300).await;
+
+        // A 4-bit codebook holds 16 entries, but a partition still wants the
+        // 256 vectors IVF training samples for one centroid.
+        let params = VectorIndexParams::ivf_pq(8, 4, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // 300 / 256 = 1.
+        assert_eq!(trained_partitions(&dataset).await, vec![1]);
+    }
+
+    /// Sampling fewer vectors per centroid makes more partitions supportable.
+    #[tokio::test]
+    async fn test_partition_cap_follows_the_configured_sample_rate() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 300).await;
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams {
+                num_partitions: Some(8),
+                sample_rate: 64,
+                ..Default::default()
+            },
+            PQBuildParams {
+                num_sub_vectors: 4,
+                num_bits: 8,
+                ..Default::default()
+            },
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // 300 / 64 = 4.
+        assert_eq!(trained_partitions(&dataset).await, vec![4]);
+    }
+
+    /// A definition keeps the partition count it asked for, so the index the
+    /// table grows into is the one that was requested.
+    #[tokio::test]
+    async fn test_deferred_index_trains_the_requested_partitions() {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset = small_vector_dataset(test_dir.path(), 100).await;
+
+        let params = VectorIndexParams::ivf_pq(8, 8, 4, DistanceType::L2, 1);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(roaring::RoaringBitmap::is_empty),
+            "100 vectors cannot train a 256-code quantizer, so nothing is covered yet"
+        );
+
+        // 3100 vectors clear 8 * 256, so the requested count is trainable.
+        let mut dataset = append_vectors(test_dir.path(), 3000).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(trained_partitions(&dataset).await, vec![8]);
+    }
+
+    /// A reader over one batch of `rows` random 16-dimensional vectors.
+    fn vector_reader(rows: usize) -> impl arrow_array::RecordBatchReader + Send + 'static {
         let dimensions = 16;
         let field = Field::new(
             "vector",
@@ -6126,8 +6204,12 @@ mod tests {
         let vectors =
             arrow_array::FixedSizeListArray::try_new_from_values(values, dimensions).unwrap();
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
-        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-        Dataset::write(reader, dir.to_str().unwrap(), None)
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema)
+    }
+
+    /// Build a dataset of `rows` random vectors, one fragment.
+    async fn small_vector_dataset(dir: &std::path::Path, rows: usize) -> Dataset {
+        Dataset::write(vector_reader(rows), dir.to_str().unwrap(), None)
             .await
             .unwrap()
     }
@@ -6201,23 +6283,8 @@ mod tests {
 
     /// Append `rows` more random vectors as a new fragment.
     async fn append_vectors(dir: &std::path::Path, rows: usize) -> Dataset {
-        let dimensions = 16;
-        let field = Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                dimensions,
-            ),
-            false,
-        );
-        let schema = Arc::new(Schema::new(vec![field]));
-        let values = generate_random_array(rows * dimensions as usize);
-        let vectors =
-            arrow_array::FixedSizeListArray::try_new_from_values(values, dimensions).unwrap();
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
-        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
         Dataset::write(
-            reader,
+            vector_reader(rows),
             dir.to_str().unwrap(),
             Some(WriteParams {
                 mode: WriteMode::Append,
