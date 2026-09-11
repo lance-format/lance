@@ -6032,7 +6032,14 @@ def test_json_inverted_match_query(tmp_path):
         stem=True,
         lower_case=True,
         remove_stop_words=True,
+        disable_cross_array_unnest=True,
+        max_sub_docs_per_row=128,
+        max_sub_docs_per_row_exceed_action="skip_row",
     )
+    details = dataset.describe_indices()[0].details
+    assert details["disable_cross_array_unnest"] is True
+    assert details["max_sub_docs_per_row"] == 128
+    assert details["max_sub_docs_per_row_exceed_action"] == "skip_row"
 
     # Test match query with token exceeding max_token_length
     results = dataset.to_table(
@@ -6048,7 +6055,7 @@ def test_json_inverted_match_query(tmp_path):
 
     # Test language match
     results = dataset.to_table(
-        full_text_query=MatchQuery("Language,str,english", "json_col")
+        full_text_query=MatchQuery("Language[*],str,english", "json_col")
     )
     assert results.num_rows == 3
 

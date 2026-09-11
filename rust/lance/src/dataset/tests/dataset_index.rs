@@ -6609,6 +6609,89 @@ async fn prepare_json_dataset() -> (Dataset, String) {
 }
 
 #[tokio::test]
+async fn test_json_inverted_flattened_sub_docs() {
+    let json_col = "json_field".to_string();
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new(&json_col, DataType::Utf8, false).with_metadata(metadata),
+    ]));
+    let make_batch = |id, json| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![id])) as ArrayRef,
+                Arc::new(StringArray::from(vec![json])) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    let indexed_batch = make_batch(
+        0,
+        r#"{"cart":[{"product_type":"sneakers","attributes":{"color":"white"}},{"product_type":"t-shirt","attributes":{"color":"blue"}},{"product_type":"hat","attributes":{"color":"red"}}]}"#,
+    );
+    let stream = RecordBatchIterator::new(vec![Ok(indexed_batch)], schema.clone());
+    let mut dataset = Dataset::write(stream, "memory://", None).await.unwrap();
+
+    dataset
+        .create_index(
+            &[&json_col],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .lance_tokenizer("json".to_string())
+                .stem(false)
+                .remove_stop_words(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let appended_batch = make_batch(
+        1,
+        r#"{"cart":[{"product_type":"t-shirt","attributes":{"color":"blue"}},{"product_type":"sneakers","attributes":{"color":"red"}}]}"#,
+    );
+    let stream = RecordBatchIterator::new(vec![Ok(appended_batch)], schema);
+    dataset.append(stream, None).await.unwrap();
+
+    let cases = [
+        ("cart[1].attributes.color,str,red", Operator::Or, vec![1]),
+        ("cart[*].attributes.color,str,red", Operator::Or, vec![0, 1]),
+        (
+            "cart[*].product_type,str,sneakers;cart[*].attributes.color,str,red",
+            Operator::And,
+            vec![1],
+        ),
+    ];
+    for (terms, operator, expected_ids) in cases {
+        let query = FullTextSearchQuery {
+            query: FtsQuery::Match(
+                MatchQuery::new(terms.to_string())
+                    .with_column(Some(json_col.clone()))
+                    .with_operator(operator),
+            ),
+            limit: Some(2),
+            wand_factor: None,
+        };
+        let batch = dataset
+            .scan()
+            .full_text_search(query)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut ids = batch["id"].as_primitive::<UInt64Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids, "query={terms}");
+    }
+}
+
+#[tokio::test]
 async fn test_json_inverted_fuzziness_query() {
     let (mut dataset, json_col) = prepare_json_dataset().await;
 
@@ -6968,7 +7051,7 @@ async fn test_json_inverted_multimatch_query() {
             match_queries: vec![
                 MatchQuery::new("Title,str,harrypotter".to_string())
                     .with_column(Some(json_col.clone())),
-                MatchQuery::new("Language,str,english".to_string())
+                MatchQuery::new("Language[*],str,english".to_string())
                     .with_column(Some(json_col.clone())),
             ],
         }),
@@ -7010,7 +7093,7 @@ async fn test_json_inverted_boolean_query() {
             should: vec![],
             must: vec![
                 FtsQuery::Match(
-                    MatchQuery::new("Language,str,english".to_string())
+                    MatchQuery::new("Language[*],str,english".to_string())
                         .with_column(Some(json_col.clone())),
                 ),
                 FtsQuery::Match(

@@ -58,10 +58,14 @@ use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::scalar::inverted::query::{FtsQuery, Operator, Tokens};
-use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
+use lance_index::scalar::inverted::query::{
+    FtsQuery, Operator, Tokens, effective_json_query_operator,
+};
+use lance_index::scalar::inverted::tokenizer::document_tokenizer::{
+    DocType, JsonTokenizerMode, LanceTokenizer,
+};
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
-use lance_tokenizer::TokenStream;
+use lance_tokenizer::{Token, TokenStream};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -995,6 +999,7 @@ pub struct FtsMemIndex {
     resolved_field: OnceLock<ResolvedFtsField>,
 
     tokenizer_pool: Arc<TokenizerPool>,
+    flattened_sub_docs: bool,
     /// Writer-only tokenizer slot. Held under a Mutex purely so `insert`
     /// can take `&self`. Single-writer assumption means this is uncontested.
     writer_tokenizer: Mutex<Box<dyn LanceTokenizer>>,
@@ -1130,6 +1135,7 @@ impl QueryLocalFtsIndex {
                 params: self.inner.params.clone(),
                 resolved_field,
                 tokenizer_pool: self.inner.tokenizer_pool.clone(),
+                flattened_sub_docs: self.inner.flattened_sub_docs,
                 writer_tokenizer: Mutex::new(self.inner.tokenizer_pool.acquire()),
                 state: ArcSwap::from(IndexState::empty()),
                 freeze_threshold_rows: self.inner.freeze_threshold_rows,
@@ -1274,6 +1280,8 @@ impl FtsMemIndex {
         pool: TokenizerPool,
         background_maintenance: bool,
     ) -> Self {
+        let flattened_sub_docs =
+            pool.template.json_tokenizer_mode() == Some(JsonTokenizerMode::FlattenedSubDocs);
         let writer_tokenizer = pool.template.box_clone();
         Self {
             field_id,
@@ -1281,6 +1289,7 @@ impl FtsMemIndex {
             params,
             resolved_field: OnceLock::new(),
             tokenizer_pool: Arc::new(pool),
+            flattened_sub_docs,
             writer_tokenizer: Mutex::new(writer_tokenizer),
             state: ArcSwap::from(IndexState::empty()),
             freeze_threshold_rows: Self::DEFAULT_FREEZE_THRESHOLD_ROWS,
@@ -1516,37 +1525,39 @@ impl FtsMemIndex {
         let preserve_zero_token_documents =
             self.params.get_document_granularity().is_list_element();
         let mut index_document = |key: DocumentKey, text: &str| -> Result<()> {
-            let document_position = document_position_start + documents.len() as u64;
-            let (num_tokens, retained_term) = match allowed_terms {
-                Some(allowed_terms) => index_text_filtered(
-                    text,
-                    document_position,
-                    tokenizer,
-                    &mut term_builders,
-                    allowed_terms,
-                )?,
-                None => (
-                    index_text(text, document_position, tokenizer, &mut term_builders)?,
-                    false,
-                ),
-            };
-            let belongs_in_corpus = preserve_zero_token_documents || num_tokens > 0;
-            if allowed_terms.is_some() && belongs_in_corpus {
-                query_local_corpus_doc_count = query_local_corpus_doc_count
-                    .checked_add(1)
-                    .ok_or_else(|| Error::internal("query-local FTS document count overflow"))?;
-                query_local_corpus_total_tokens = query_local_corpus_total_tokens
-                    .checked_add(num_tokens as u64)
-                    .ok_or_else(|| Error::internal("query-local FTS total token count overflow"))?;
-            }
-            let retain_document = if allowed_terms.is_some() {
-                retained_term
-            } else {
-                belongs_in_corpus
-            };
-            if retain_document {
-                documents.push(DocumentMetadata { key, num_tokens });
-                total_tokens += num_tokens as u64;
+            for (sub_doc_index, tokens) in tokenizer
+                .token_streams_for_doc(text)?
+                .into_iter()
+                .enumerate()
+            {
+                let document_position = document_position_start + documents.len() as u64;
+                let (num_tokens, retained_term) =
+                    index_tokens(tokens, document_position, &mut term_builders, allowed_terms)?;
+                let belongs_in_corpus = preserve_zero_token_documents || num_tokens > 0;
+                if allowed_terms.is_some() && belongs_in_corpus {
+                    query_local_corpus_doc_count =
+                        query_local_corpus_doc_count.checked_add(1).ok_or_else(|| {
+                            Error::internal("query-local FTS document count overflow")
+                        })?;
+                    query_local_corpus_total_tokens = query_local_corpus_total_tokens
+                        .checked_add(num_tokens as u64)
+                        .ok_or_else(|| {
+                            Error::internal("query-local FTS total token count overflow")
+                        })?;
+                }
+                let retain_document = if allowed_terms.is_some() {
+                    retained_term
+                } else {
+                    belongs_in_corpus
+                };
+                if retain_document {
+                    let mut key = key.clone();
+                    if self.flattened_sub_docs {
+                        key.doc_index.push(sub_doc_index as u32);
+                    }
+                    documents.push(DocumentMetadata { key, num_tokens });
+                    total_tokens += num_tokens as u64;
+                }
             }
             Ok(())
         };
@@ -1667,8 +1678,11 @@ impl FtsMemIndex {
                     }
                     let st = index.state.load_full();
                     let tokens = index.analyze_for_search(&query.terms);
+                    let operator = index.effective_match_operator(&tokens, query.operator);
                     let rows = index
-                        .search_match_with_scorer(&st, &tokens, query.operator, scorer)
+                        .collapse_sub_docs(
+                            index.search_match_with_scorer(&st, &tokens, operator, scorer),
+                        )
                         .into_iter()
                         .map(|entry| (entry.row_position, entry.score))
                         .collect();
@@ -1678,7 +1692,9 @@ impl FtsMemIndex {
                     let st = index.state.load_full();
                     let tokens = index.analyze_for_search(&query.terms);
                     let rows = index
-                        .search_phrase_with_scorer(&st, &tokens, query.slop, scorer)
+                        .collapse_sub_docs(
+                            index.search_phrase_with_scorer(&st, &tokens, query.slop, scorer),
+                        )
                         .into_iter()
                         .map(|entry| (entry.row_position, entry.score))
                         .collect();
@@ -1809,7 +1825,8 @@ impl FtsMemIndex {
     pub fn search(&self, term: &str) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.analyze_for_search(term);
-        self.search_match(&st, &tokens, Operator::Or, None, true, true)
+        let operator = self.effective_match_operator(&tokens, Operator::Or);
+        self.collapse_sub_docs(self.search_match(&st, &tokens, operator, None, true, true))
     }
 
     /// Search for documents containing an exact phrase, optionally allowing
@@ -1817,7 +1834,7 @@ impl FtsMemIndex {
     pub fn search_phrase(&self, phrase: &str, slop: u32) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.analyze_for_search(phrase);
-        self.search_phrase_tokens(&st, &tokens, slop, true)
+        self.collapse_sub_docs(self.search_phrase_tokens(&st, &tokens, slop, true))
     }
 
     /// Freeze the current mutable tail into an immutable partition, so a
@@ -1855,7 +1872,14 @@ impl FtsMemIndex {
     ) -> Vec<FtsEntry> {
         let st = self.state.load_full();
         let tokens = self.tokenize_for_search(query);
-        self.search_fuzzy_tokens(&st, &tokens, fuzziness, 0, max_expansions, true)
+        self.collapse_sub_docs(self.search_fuzzy_tokens(
+            &st,
+            &tokens,
+            fuzziness,
+            0,
+            max_expansions,
+            true,
+        ))
     }
 
     /// BM25 OR-search over the query tokens, scored with one corpus-wide
@@ -2319,14 +2343,27 @@ impl FtsMemIndex {
                 boost,
             } => {
                 let tokens = self.analyze_for_search(query);
-                let mut results =
-                    self.search_match(st, &tokens, *operator, limit, include_tail, tail_skip);
+                let operator = self.effective_match_operator(&tokens, *operator);
+                let search_limit = if self.flattened_sub_docs { None } else { limit };
+                let mut results = self.collapse_sub_docs(self.search_match(
+                    st,
+                    &tokens,
+                    operator,
+                    search_limit,
+                    include_tail,
+                    tail_skip,
+                ));
                 apply_boost(&mut results, *boost);
                 results
             }
             FtsQueryExpr::Phrase { query, slop, boost } => {
                 let tokens = self.analyze_for_search(query);
-                let mut results = self.search_phrase_tokens(st, &tokens, *slop, include_tail);
+                let mut results = self.collapse_sub_docs(self.search_phrase_tokens(
+                    st,
+                    &tokens,
+                    *slop,
+                    include_tail,
+                ));
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -2338,14 +2375,14 @@ impl FtsMemIndex {
                 boost,
             } => {
                 let tokens = self.tokenize_for_search(query);
-                let mut results = self.search_fuzzy_tokens(
+                let mut results = self.collapse_sub_docs(self.search_fuzzy_tokens(
                     st,
                     &tokens,
                     *fuzziness,
                     *prefix_length,
                     *max_expansions,
                     include_tail,
-                );
+                ));
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -2512,6 +2549,39 @@ impl FtsMemIndex {
         Tokens::with_positions(tokens, positions, DocType::Text)
     }
 
+    fn effective_match_operator(&self, tokens: &Tokens, operator: Operator) -> Operator {
+        effective_json_query_operator(
+            self.flattened_sub_docs
+                .then_some(JsonTokenizerMode::FlattenedSubDocs),
+            tokens,
+            operator,
+        )
+    }
+
+    fn collapse_sub_docs(&self, entries: Vec<FtsEntry>) -> Vec<FtsEntry> {
+        if !self.flattened_sub_docs {
+            return entries;
+        }
+
+        let mut rows = HashMap::<DocumentKey, FtsEntry>::with_capacity(entries.len());
+        for mut entry in entries {
+            if let Some(doc_index) = entry.doc_index.as_mut() {
+                doc_index.pop();
+                if doc_index.is_empty() {
+                    entry.doc_index = None;
+                }
+            }
+            rows.entry(entry.key())
+                .and_modify(|existing| {
+                    if entry.score > existing.score {
+                        existing.score = entry.score;
+                    }
+                })
+                .or_insert(entry);
+        }
+        rows.into_values().collect()
+    }
+
     // ------------------------------------------------------------------
     // Flush to Lance inverted index format
     // ------------------------------------------------------------------
@@ -2578,10 +2648,15 @@ impl FtsMemIndex {
         let mut original_to_doc_id: HashMap<DocumentKey, u32> =
             HashMap::with_capacity(entries.len());
         for (key, num_tokens) in &entries {
-            let doc_id = if !key.doc_index.is_empty() {
-                docs.append_with_doc_index(key.row_position, *num_tokens, &key.doc_index)?
+            let doc_index = if self.flattened_sub_docs {
+                &key.doc_index[..key.doc_index.len() - 1]
             } else {
+                key.doc_index.as_slice()
+            };
+            let doc_id = if doc_index.is_empty() {
                 docs.append(key.row_position, *num_tokens)
+            } else {
+                docs.append_with_doc_index(key.row_position, *num_tokens, doc_index)?
             };
             original_to_doc_id.insert(key.clone(), doc_id);
         }
@@ -2761,40 +2836,15 @@ impl BatchTermBuilder {
     }
 }
 
-fn index_text(
-    text: &str,
+fn index_tokens(
+    tokens: Vec<Token>,
     document_position: u64,
-    tokenizer: &mut dyn LanceTokenizer,
     term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
-) -> Result<u32> {
-    index_text_with_predicate(text, document_position, tokenizer, term_builders, |_| true)
-        .map(|(num_tokens, _)| num_tokens)
-}
-
-fn index_text_filtered(
-    text: &str,
-    document_position: u64,
-    tokenizer: &mut dyn LanceTokenizer,
-    term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
-    allowed_terms: &FxHashSet<String>,
+    allowed_terms: Option<&FxHashSet<String>>,
 ) -> Result<(u32, bool)> {
-    index_text_with_predicate(text, document_position, tokenizer, term_builders, |term| {
-        allowed_terms.contains(term)
-    })
-}
-
-#[inline]
-fn index_text_with_predicate(
-    text: &str,
-    document_position: u64,
-    tokenizer: &mut dyn LanceTokenizer,
-    term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
-    mut retain_term: impl FnMut(&str) -> bool,
-) -> Result<(u32, bool)> {
-    let mut stream = tokenizer.token_stream_for_doc(text);
     let mut num_tokens = 0u32;
     let mut retained_term = false;
-    while let Some(token) = stream.next() {
+    for token in tokens {
         let position = u32::try_from(token.position).map_err(|_| {
             Error::invalid_input(format!(
                 "token position overflow for document_position={document_position}: token_position={}",
@@ -2802,7 +2852,7 @@ fn index_text_with_predicate(
             ))
         })?;
         let term = token.text.as_str();
-        if retain_term(term) {
+        if allowed_terms.is_none_or(|allowed_terms| allowed_terms.contains(term)) {
             retained_term = true;
             if let Some(builder) = term_builders.get_mut(term) {
                 builder.observe(document_position, position);

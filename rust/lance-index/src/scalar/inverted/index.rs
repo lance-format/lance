@@ -65,6 +65,7 @@ use super::documents::{
 use super::encoding::{MAX_POSTING_BLOCK_SIZE, PositionBlockBuilder};
 use super::impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData, ImpactSkipDataBuilder};
 use super::iter::PostingListIterator;
+use super::tokenizer::document_tokenizer::JsonTokenizerMode;
 use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
 use super::{DocumentGranularity, InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{

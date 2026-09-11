@@ -2649,6 +2649,9 @@ impl Dataset {
                         "split_on_numerics",
                         "preserve_original",
                         "index_operators",
+                        "disable_cross_array_unnest",
+                        "max_sub_docs_per_row",
+                        "max_sub_docs_per_row_exceed_action",
                         "memory_limit",
                         "num_workers",
                         "format_version",
@@ -2681,6 +2684,24 @@ impl Dataset {
                         params = params
                             .block_size(block_size.extract()?)
                             .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    }
+                    if let Some(disable_cross_array_unnest) =
+                        kwargs.get_item("disable_cross_array_unnest")?
+                    {
+                        params = params
+                            .disable_cross_array_unnest(disable_cross_array_unnest.extract()?);
+                    }
+                    if let Some(max_sub_docs_per_row) = kwargs.get_item("max_sub_docs_per_row")? {
+                        params = params
+                            .max_sub_docs_per_row(max_sub_docs_per_row.extract()?)
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                    }
+                    if let Some(action) = kwargs.get_item("max_sub_docs_per_row_exceed_action")? {
+                        let action: String = action.extract()?;
+                        params =
+                            params.max_sub_docs_per_row_exceed_action(action.parse().map_err(
+                                |err: lance_core::Error| PyValueError::new_err(err.to_string()),
+                            )?);
                     }
                     if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
                         params = params.memory_limit_mb(memory_limit.extract()?);

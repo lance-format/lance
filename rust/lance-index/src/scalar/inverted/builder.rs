@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{InvertedIndexParams, index::*};
-use crate::scalar::inverted::document_tokenizer::DocType;
+use crate::scalar::inverted::document_tokenizer::{DocType, JsonTokenizerMode};
 use crate::scalar::inverted::json::JsonTextStream;
 use crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
@@ -32,6 +32,7 @@ use lance_select::RowSetOps;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -205,6 +206,12 @@ impl InvertedIndexBuilder {
         }
     }
 
+    fn infer_lance_tokenizer(&mut self, doc_type: DocType) {
+        if self.params.lance_tokenizer.is_none() {
+            self.params.lance_tokenizer = Some(doc_type.as_ref().to_string());
+        }
+    }
+
     pub fn with_posting_tail_codec(mut self, posting_tail_codec: PostingTailCodec) -> Self {
         self.format_version = InvertedListFormatVersion::from_posting_tail_codec_and_block_size(
             posting_tail_codec,
@@ -231,6 +238,10 @@ impl InvertedIndexBuilder {
         self
     }
 
+    pub(crate) fn params(&self) -> &InvertedIndexParams {
+        &self.params
+    }
+
     pub async fn update(
         &mut self,
         new_data: SendableRecordBatchStream,
@@ -242,11 +253,13 @@ impl InvertedIndexBuilder {
         let doc_col = schema.field(0).name();
 
         // infer lance_tokenizer based on document type
-        if self.params.lance_tokenizer.is_none() {
-            let schema = new_data.schema();
-            let field = schema.column_with_name(doc_col).expect_ok()?.1;
-            let doc_type = DocType::try_from(field)?;
-            self.params.lance_tokenizer = Some(doc_type.as_ref().to_string());
+        let field = schema.column_with_name(doc_col).expect_ok()?.1;
+        let doc_type = DocType::try_from(field)?;
+        self.infer_lance_tokenizer(doc_type);
+        if self.params.lance_tokenizer.as_deref() == Some("json")
+            && self.params.json_tokenizer_mode.is_none()
+        {
+            self.params.json_tokenizer_mode = Some(JsonTokenizerMode::FlattenedSubDocs);
         }
 
         let new_data = document_input(new_data, doc_col)?;
@@ -276,11 +289,9 @@ impl InvertedIndexBuilder {
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
 
-        if self.params.lance_tokenizer.is_none() {
-            let field = schema.column_with_name(doc_col).expect_ok()?.1;
-            let doc_type = DocType::try_from(field)?;
-            self.params.lance_tokenizer = Some(doc_type.as_ref().to_string());
-        }
+        let field = schema.column_with_name(doc_col).expect_ok()?.1;
+        let doc_type = DocType::try_from(field)?;
+        self.infer_lance_tokenizer(doc_type);
 
         let mut files = self
             .merge_existing_segments(dest_store, old_segments, old_data_filter.as_ref())
@@ -1576,106 +1587,87 @@ impl IndexWorker {
         document: DocumentSource<'_>,
         doc_index: &[u32],
     ) -> Result<()> {
+        let doc = match document {
+            DocumentSource::Text(doc) => Cow::Borrowed(doc),
+            DocumentSource::StringList(elements) => {
+                Cow::Owned(Self::materialize_string_list(elements))
+            }
+        };
+        self.total_doc_length += doc.len();
         let with_position = self.has_position();
+        let sub_docs = self.tokenizer.token_streams_for_doc(doc.as_ref())?;
+        for tokens in sub_docs {
+            self.process_tokenized_doc(row_id, tokens, with_position, doc_index)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn process_tokenized_doc(
+        &mut self,
+        row_id: u64,
+        tokens: Vec<lance_tokenizer::Token>,
+        with_position: bool,
+        doc_index: &[u32],
+    ) -> Result<()> {
         let builder_was_empty = self.builder.docs.is_empty();
         let old_temporary_memory_size = self.temporary_memory_size();
         let old_token_memory_size = self.builder.tokens.memory_size() as u64;
         let doc_id = self.builder.docs.len() as u32;
         let mut token_num: u32 = 0;
-        let mut doc_length_bytes = 0usize;
         let mut posting_memory_delta = 0i64;
+        if self.token_ids.capacity() < self.last_token_count {
+            self.token_ids
+                .reserve(self.last_token_count - self.token_ids.capacity());
+        }
+        self.token_ids.clear();
+
         if with_position {
-            {
-                if self.token_ids.capacity() < self.last_token_count {
-                    self.token_ids
-                        .reserve(self.last_token_count - self.token_ids.capacity());
-                }
-                self.token_ids.clear();
-                let tokenizer = &mut self.tokenizer;
-                let builder = &mut self.builder;
-                let token_ids = &mut self.token_ids;
-                let memory_size = &mut self.memory_size;
-                let posting_tail_codec = builder.posting_tail_codec;
+            let builder = &mut self.builder;
+            let token_ids = &mut self.token_ids;
+            let memory_size = &mut self.memory_size;
+            let posting_tail_codec = builder.posting_tail_codec;
+            let block_size = builder.block_size;
 
-                let block_size = builder.block_size;
-                let mut process_text = |text: &str| -> Result<()> {
-                    doc_length_bytes += text.len();
-                    let mut token_stream = tokenizer.token_stream_for_doc(text);
-                    while token_stream.advance() {
-                        let token = token_stream.token();
-                        let position = Self::checked_token_position(row_id, token.position)?;
-                        let token_id = builder.tokens.get_or_add(&token.text);
-                        if token_id as usize == builder.posting_lists.len() {
-                            let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
-                                * std::mem::size_of::<PostingListBuilder>())
-                                as u64;
-                            builder.posting_lists.push(
-                                PostingListBuilder::new_with_posting_tail_codec_and_block_size(
-                                    true,
-                                    posting_tail_codec,
-                                    block_size,
-                                ),
-                            );
-                            let new_posting_lists_overhead_size = (builder.posting_lists.capacity()
-                                * std::mem::size_of::<PostingListBuilder>())
-                                as u64;
-                            Self::adjust_tracked_value(
-                                memory_size,
-                                old_posting_lists_overhead_size,
-                                new_posting_lists_overhead_size,
-                            );
-                        }
-                        let posting_list = &mut builder.posting_lists[token_id as usize];
-                        let old_posting_memory_size = posting_list.size();
-                        if posting_list.add_occurrence(doc_id, position)? {
-                            token_ids.push(token_id);
-                        }
-                        let new_posting_memory_size = posting_list.size();
-                        posting_memory_delta +=
-                            new_posting_memory_size as i64 - old_posting_memory_size as i64;
-                        token_num += 1;
-                    }
-                    Ok(())
-                };
-
-                match document {
-                    DocumentSource::Text(doc) => {
-                        process_text(doc)?;
-                    }
-                    DocumentSource::StringList(elements) => {
-                        let doc = Self::materialize_string_list(elements);
-                        process_text(&doc)?;
-                    }
+            for token in tokens {
+                let position = Self::checked_token_position(row_id, token.position)?;
+                let token_id = builder.tokens.get_or_add(&token.text);
+                if token_id as usize == builder.posting_lists.len() {
+                    let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
+                        * std::mem::size_of::<PostingListBuilder>())
+                        as u64;
+                    builder.posting_lists.push(
+                        PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                            true,
+                            posting_tail_codec,
+                            block_size,
+                        ),
+                    );
+                    let new_posting_lists_overhead_size = (builder.posting_lists.capacity()
+                        * std::mem::size_of::<PostingListBuilder>())
+                        as u64;
+                    Self::adjust_tracked_value(
+                        memory_size,
+                        old_posting_lists_overhead_size,
+                        new_posting_lists_overhead_size,
+                    );
                 }
+                let posting_list = &mut builder.posting_lists[token_id as usize];
+                let old_posting_memory_size = posting_list.size();
+                if posting_list.add_occurrence(doc_id, position)? {
+                    token_ids.push(token_id);
+                }
+                let new_posting_memory_size = posting_list.size();
+                posting_memory_delta +=
+                    new_posting_memory_size as i64 - old_posting_memory_size as i64;
+                token_num += 1;
             }
         } else {
-            {
-                if self.token_ids.capacity() < self.last_token_count {
-                    self.token_ids
-                        .reserve(self.last_token_count - self.token_ids.capacity());
-                }
-                self.token_ids.clear();
-
-                let tokenizer = &mut self.tokenizer;
-                let builder = &mut self.builder;
-                let token_ids = &mut self.token_ids;
-                let mut process_text = |text: &str| {
-                    doc_length_bytes += text.len();
-                    let mut token_stream = tokenizer.token_stream_for_doc(text);
-                    while token_stream.advance() {
-                        let token_id = builder.tokens.get_or_add(&token_stream.token().text);
-                        token_ids.push(token_id);
-                        token_num += 1;
-                    }
-                };
-
-                match document {
-                    DocumentSource::Text(doc) => process_text(doc),
-                    DocumentSource::StringList(elements) => {
-                        let doc = Self::materialize_string_list(elements);
-                        process_text(&doc);
-                    }
-                }
+            for token in tokens {
+                let token_id = self.builder.tokens.get_or_add(&token.text);
+                self.token_ids.push(token_id);
+                token_num += 1;
             }
         }
         self.adjust_tracked_memory_size(
@@ -1728,7 +1720,6 @@ impl IndexWorker {
             old_doc_memory_size,
             self.builder.docs.memory_size() as u64,
         );
-        self.total_doc_length += doc_length_bytes;
 
         if with_position {
             for &token_id in &self.token_ids {
@@ -1793,7 +1784,6 @@ impl IndexWorker {
         {
             self.flush().await?;
         }
-
         Ok(())
     }
 
