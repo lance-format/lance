@@ -3320,7 +3320,7 @@ impl Dataset {
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
         ensure_can_write_manifest(&src_ds.manifest)?;
-        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
+        lance_table::system_index::frag_reuse::metadata::ensure_deep_clone_supported(
             &src_ds.object_store,
             &src_ds.manifest_location,
             &src_ds.manifest,
