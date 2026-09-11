@@ -10,6 +10,7 @@ use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
+use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -365,14 +366,18 @@ fn shared_prefilter_future(
     .boxed()
 }
 
-pub(crate) fn build_prefilter(
+/// Resolve a prefilter source into the future that yields its mask, ANDing in
+/// the external row-address mask when the scan carries one.
+///
+/// The external mask restricts index-side scoring to the masked rows (mirroring
+/// the ANN path). It is independent of `overlay_block`, which the prefilter
+/// applies separately to drop index entries staled by a data overlay.
+fn prefilter_mask_future(
     context: Arc<datafusion::execution::TaskContext>,
     partition: usize,
     prefilter_source: &PreFilterSource,
-    ds: Arc<Dataset>,
-    index_meta: &[IndexMetadata],
-    masks: PreFilterMasks,
-) -> Result<Arc<DatasetPreFilter>> {
+    external_mask: Option<Arc<RowAddrMask>>,
+) -> Result<Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>> {
     let mut shared_filter = None;
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
@@ -407,12 +412,8 @@ pub(crate) fn build_prefilter(
         }
         PreFilterSource::None => None,
     };
-    // Combine the external row-address mask (logical AND) with whatever the
-    // filter produced, so an FTS prefilter restricts BM25 scoring to masked rows
-    // (mirrors the ANN path). Independent of `overlay_block`, which the prefilter
-    // applies separately to drop index entries staled by a data overlay.
-    let mut prefilter = if let Some(shared_filter) = shared_filter {
-        let shared_filter = match masks.external_mask {
+    if let Some(shared_filter) = shared_filter {
+        let shared_filter = match external_mask {
             Some(mask) => async move {
                 Ok(Arc::new(
                     mask.as_ref().clone() & shared_filter.await?.as_ref().clone(),
@@ -421,20 +422,52 @@ pub(crate) fn build_prefilter(
             .boxed(),
             None => shared_filter,
         };
-        DatasetPreFilter::new_with_filter_future(ds, index_meta, Some(shared_filter))
-    } else {
-        let prefilter_loader = match masks.external_mask {
-            Some(mask) => {
-                Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
-            }
-            None => prefilter_loader,
-        };
-        DatasetPreFilter::new(ds, index_meta, prefilter_loader)
+        return Ok(Some(shared_filter));
+    }
+    let prefilter_loader = match external_mask {
+        Some(mask) => {
+            Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
+        }
+        None => prefilter_loader,
     };
+    Ok(prefilter_loader.map(|loader| {
+        async move { loader.load().await.map(Arc::new) }
+            .in_current_span()
+            .boxed()
+    }))
+}
+
+pub(crate) fn build_prefilter(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    index_meta: &[IndexMetadata],
+    masks: PreFilterMasks,
+) -> Result<Arc<DatasetPreFilter>> {
+    let filter = prefilter_mask_future(context, partition, prefilter_source, masks.external_mask)?;
+    let mut prefilter = DatasetPreFilter::new_with_filter_future(ds, index_meta, filter);
     if let Some(overlay_block) = masks.overlay_block {
         prefilter = prefilter.with_overlay_block(overlay_block);
     }
     Ok(Arc::new(prefilter))
+}
+
+/// Build a prefilter restricted to `fragments` rather than to the union of
+/// `index_meta`'s fragment bitmaps. See
+/// [`DatasetPreFilter::new_restricted_to_fragments`].
+pub(crate) fn build_prefilter_restricted_to_fragments(
+    context: Arc<datafusion::execution::TaskContext>,
+    partition: usize,
+    prefilter_source: &PreFilterSource,
+    ds: Arc<Dataset>,
+    fragments: RoaringBitmap,
+    external_mask: Option<Arc<RowAddrMask>>,
+) -> Result<Arc<DatasetPreFilter>> {
+    let filter = prefilter_mask_future(context, partition, prefilter_source, external_mask)?;
+    Ok(Arc::new(DatasetPreFilter::new_restricted_to_fragments(
+        ds, fragments, filter,
+    )))
 }
 
 // Utility to convert an input (containing row ids) into a prefilter
