@@ -66,10 +66,10 @@ train. It is a request, not a description of the index that was built: a build
 trains fewer partitions when the data cannot support the count asked for, so the
 number of partitions an index holds is read from the index itself and not from
 here. It is absent when no count was requested, in which case the partitioning was
-derived from the data and an engine rebuilding the index derives it again. A
-segment that covers no fragments carries these details with no index files, so a
-recorded count is the only statement of the partitioning the index is to be built
-with once its column holds enough vectors to train.
+derived from the data and an engine rebuilding the index derives it again. Where
+a segment covers no fragments and carries no index files, a recorded count is the
+only statement of the partitioning the index is to be built with once its column
+holds enough vectors to train.
 
 A recorded count is at least 1. A writer that cannot represent the count it was
 given records nothing rather than a truncated value, and a reader treats 0 as no
