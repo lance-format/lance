@@ -3092,8 +3092,10 @@ pub async fn commit_compaction(
     // state this handle has (the id reservations above advanced it), not
     // from a sample taken when the compaction started: another writer may
     // have tagged the table in between. The remaining race onto the manifest
-    // CAS itself is caught by the commit gate, which rejects a v0 entry on a
-    // tagged table.
+    // CAS itself is handled by the rebase, which converts a v0-shaped intent
+    // into tagged transitions when the current entry turns out tagged (see
+    // `finish_rewrite`); the commit gate still rejects a v0 entry spliced by
+    // a writer without that conversion.
     let (frag_reuse_index, frag_reuse_rewrite) = if options.defer_index_remap && any_group_indexed {
         let tagged_at_commit = load_all_indices(dataset)
             .await?

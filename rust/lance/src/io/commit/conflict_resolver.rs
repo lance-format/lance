@@ -2284,6 +2284,72 @@ impl<'a> TransactionRebase<'a> {
             ..
         } = &mut self.transaction.operation
         {
+            // A compaction that shaped itself for a v0 table can lose the
+            // race to a concurrent commit that made the table tagged (a
+            // stable-partition lift, or a tagged compaction). The two record
+            // forms are informationally equivalent -- a legacy reuse group
+            // is exactly an ordered-compaction transition, with the same
+            // digest ordering and changed_row_addrs semantics -- so instead
+            // of dying at the tagged gate, the retry CONVERTS: this
+            // transaction's newly appended legacy version (the last one in
+            // its in-memory intent entry) becomes ordered-compaction
+            // transitions handed to the tagged assembly below, which appends
+            // onto the CURRENT entry with full revalidation and a refreshed
+            // base version. The stale versions the v0 intent entry carried
+            // are dropped: the current entry is the authoritative history,
+            // concurrent trims included. A genuine v0 table never enters
+            // this branch (the current entry is not tagged there), keeping
+            // pure v0 behavior untouched; writers predating tagged support
+            // are fenced off by the writer feature flag before this point.
+            if frag_reuse_rewrite.is_none()
+                && frag_reuse_index
+                    .as_ref()
+                    .is_some_and(|entry| entry.index_version == 0)
+            {
+                let current_is_tagged = crate::index::load_all_indices(dataset)
+                    .await?
+                    .iter()
+                    .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                    .is_some_and(lance_table::system_index::frag_reuse::metadata::is_tagged);
+                if current_is_tagged {
+                    let v0_entry = frag_reuse_index.as_ref().unwrap();
+                    let details = load_frag_reuse_index_details(dataset, v0_entry).await?;
+                    let appended = details.versions.last().ok_or_else(|| {
+                        Error::internal(
+                            "a rewrite carrying a fragment reuse entry appended no reuse version"
+                                .to_string(),
+                        )
+                    })?;
+                    use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+                    let transitions = appended
+                        .groups
+                        .iter()
+                        .map(|group| pb_fri::Transition {
+                            sources: group
+                                .old_frags
+                                .iter()
+                                .map(pb_fri::FragmentDigest::from)
+                                .collect(),
+                            destinations: group
+                                .new_frags
+                                .iter()
+                                .map(pb_fri::FragmentDigest::from)
+                                .collect(),
+                            mapping: Some(pb_fri::transition::Mapping::OrderedCompaction(
+                                pb_fri::OrderedCompaction {
+                                    changed_row_addrs: group.changed_row_addrs.clone(),
+                                },
+                            )),
+                        })
+                        .collect();
+                    *frag_reuse_rewrite = Some(crate::dataset::transaction::FragmentReuseRewrite {
+                        transitions,
+                        base_entry_version: None,
+                    });
+                    *frag_reuse_index = None;
+                }
+            }
+
             if let Some(frag_reuse_rewrite) = frag_reuse_rewrite {
                 // Assembled (and re-assembled after a conflict) against the
                 // FRI entry committed at the version this attempt builds on,
@@ -7328,6 +7394,255 @@ mod tests {
             expected.extend(100..104);
             expected.extend(200..204);
             assert_eq!(sorted_values(&verify).await, expected);
+        }
+
+        /// A v0 table with one committed legacy reuse version and two
+        /// indexed two-row fragments left as compaction candidates (the
+        /// four-row fragments are not candidates at target 4).
+        async fn disk_v0_fixture_with_history_and_small_fragments(uri: &str) -> Dataset {
+            let dataset = disk_fixture(uri, 2, 4).await;
+            let dataset = append_rows(&dataset, 100..102).await;
+            let mut dataset = append_rows(&dataset, 102..104).await;
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            // Real v0 deferred compaction of the first pair: the legacy
+            // history the later lift must preserve.
+            crate::dataset::optimize::compact_files(
+                &mut dataset,
+                deferred_compaction_options(),
+                None,
+            )
+            .await
+            .unwrap();
+            let (entry, ledger) = fri_ledger(&dataset).await;
+            assert_eq!(entry.index_version, 0);
+            assert_eq!(count_mappings(&ledger), (0, 1));
+            // Fresh candidates, re-indexed (replace) so a deferred
+            // compaction of them must record reuse.
+            let dataset = append_rows(&dataset, 200..202).await;
+            let mut dataset = append_rows(&dataset, 202..204).await;
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            reserve(&mut dataset, 60).await;
+            dataset
+        }
+
+        fn small_fragment_ids(dataset: &Dataset) -> Vec<u64> {
+            dataset
+                .fragments()
+                .iter()
+                .filter(|f| f.physical_rows.unwrap() < 4)
+                .map(|f| f.id)
+                .collect()
+        }
+
+        fn expected_fixture_values() -> Vec<i32> {
+            let mut expected: Vec<i32> = (0..8).collect();
+            expected.extend(100..104);
+            expected.extend(200..204);
+            expected
+        }
+
+        /// Round 9 (1): a deferred compaction shaped for the v0 table loses
+        /// the race to a concurrent stable-partition lift. The retry
+        /// converts its legacy version into an ordered-compaction transition
+        /// and commits with no caller-visible error; the lifted legacy
+        /// history is preserved and the compaction lands as a transition,
+        /// not a legacy version.
+        #[tokio::test]
+        async fn v0_compaction_converts_over_concurrent_sp_lift() {
+            let dir = TempStrDir::default();
+            let main = disk_v0_fixture_with_history_and_small_fragments(dir.as_str()).await;
+
+            // The compactor opens while the table is still v0.
+            let mut compactor = fresh_session(dir.as_str()).await;
+            let small_ids = small_fragment_ids(&compactor);
+            assert_eq!(small_ids.len(), 2);
+
+            // Concurrent stable-partition lift of the four-row originals.
+            let sp_old: Vec<Fragment> = main
+                .fragments()
+                .iter()
+                .filter(|f| f.id < 2)
+                .cloned()
+                .collect();
+            let (transition, destinations) = prepare_partition(&main, &[0, 1], 30).await;
+            let version = main.manifest.version;
+            commit_sp(
+                main,
+                version,
+                tagged_rewrite(sp_old, destinations, vec![transition]),
+            )
+            .await
+            .unwrap();
+
+            // The stale writer still decides the v0 shape and must convert
+            // during the in-loop rebase.
+            let metrics = crate::dataset::optimize::compact_files(
+                &mut compactor,
+                deferred_compaction_options(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(metrics.fragments_removed, 2);
+            assert_eq!(metrics.fragments_added, 1);
+
+            let verify = fresh_session(dir.as_str()).await;
+            let (entry, ledger) = fri_ledger(&verify).await;
+            assert_eq!(entry.index_version, 1);
+            // Lifted legacy compaction + converted compaction + the lift.
+            assert_eq!(ledger.transitions().len(), 3);
+            assert_eq!(count_mappings(&ledger), (1, 2));
+            for id in small_ids {
+                assert!(ledger.consumer(id as u32).is_some());
+            }
+            assert_eq!(sorted_values(&verify).await, expected_fixture_values());
+        }
+
+        /// Round 9 (2): the same conversion when the commit that tagged the
+        /// table was itself a tagged compaction (an ordered-compaction
+        /// rewrite lifting the entry), not a stable-partition rewrite.
+        #[tokio::test]
+        async fn v0_compaction_converts_over_concurrent_tagged_compaction() {
+            let dir = TempStrDir::default();
+            let main = disk_v0_fixture_with_history_and_small_fragments(dir.as_str()).await;
+
+            let mut compactor = fresh_session(dir.as_str()).await;
+            let small_ids = small_fragment_ids(&compactor);
+
+            // The intervening tagged compaction consumes the four-row
+            // originals through an ordered-compaction transition.
+            let oc_old: Vec<Fragment> = main
+                .fragments()
+                .iter()
+                .filter(|f| f.id < 2)
+                .cloned()
+                .collect();
+            let (oc_transition, oc_destinations) = oc_parts(&main, &[0, 1], 40).await;
+            let version = main.manifest.version;
+            commit_sp(
+                main,
+                version,
+                tagged_rewrite(oc_old, oc_destinations, vec![oc_transition]),
+            )
+            .await
+            .unwrap();
+
+            crate::dataset::optimize::compact_files(
+                &mut compactor,
+                deferred_compaction_options(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let verify = fresh_session(dir.as_str()).await;
+            let (entry, ledger) = fri_ledger(&verify).await;
+            assert_eq!(entry.index_version, 1);
+            assert_eq!(ledger.transitions().len(), 3);
+            assert_eq!(count_mappings(&ledger), (0, 3));
+            for id in small_ids {
+                assert!(ledger.consumer(id as u32).is_some());
+            }
+            assert_eq!(sorted_values(&verify).await, expected_fixture_values());
+        }
+
+        /// Round 9 (3): the concurrent lift consumed the compaction's own
+        /// candidates; the overlap conflicts before any conversion. The
+        /// class is the v0-legacy retryable conflict: at check time the
+        /// resolver has no dataset state and both committed shapes are
+        /// plain rewrites in their transaction files, so a v0-shaped loser
+        /// cannot be classified differently from a pure v0 race without
+        /// breaking v0 invariance (see the v0 x v0 guard below).
+        #[tokio::test]
+        async fn v0_compaction_overlap_with_sp_still_conflicts() {
+            let dir = TempStrDir::default();
+            let main = disk_v0_fixture_with_history_and_small_fragments(dir.as_str()).await;
+
+            let mut compactor = fresh_session(dir.as_str()).await;
+            let small_ids = small_fragment_ids(&compactor);
+
+            // The lift rewrites exactly the compaction's candidates.
+            let sp_old: Vec<Fragment> = main
+                .fragments()
+                .iter()
+                .filter(|f| small_ids.contains(&f.id))
+                .cloned()
+                .collect();
+            let (transition, destinations) = prepare_partition(&main, &small_ids, 30).await;
+            let version = main.manifest.version;
+            commit_sp(
+                main,
+                version,
+                tagged_rewrite(sp_old, destinations, vec![transition]),
+            )
+            .await
+            .unwrap();
+
+            let error = crate::dataset::optimize::compact_files(
+                &mut compactor,
+                deferred_compaction_options(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+        }
+
+        /// Round 9 (4): a pure v0 x v0 compaction race keeps legacy
+        /// behavior exactly -- the loser fails with the legacy retryable
+        /// conflict, no conversion runs, and the entry stays v0.
+        #[tokio::test]
+        async fn v0_compaction_race_keeps_legacy_behavior() {
+            let dir = TempStrDir::default();
+            disk_v0_fixture_with_history_and_small_fragments(dir.as_str()).await;
+
+            let mut loser = fresh_session(dir.as_str()).await;
+            let mut winner = fresh_session(dir.as_str()).await;
+            crate::dataset::optimize::compact_files(
+                &mut winner,
+                deferred_compaction_options(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let error = crate::dataset::optimize::compact_files(
+                &mut loser,
+                deferred_compaction_options(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+
+            let verify = fresh_session(dir.as_str()).await;
+            let (entry, ledger) = fri_ledger(&verify).await;
+            assert_eq!(entry.index_version, 0);
+            assert_eq!(count_mappings(&ledger), (0, 2));
         }
     }
 }
