@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_core::cache::{CacheBackend, LanceCache, QuickCacheBackend};
+use lance_core::cache::{CacheBackend, LanceCache, QuickCacheBackend, QuickCacheShardPolicy};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
@@ -17,6 +17,10 @@ use crate::session::index_caches::GlobalIndexCache;
 
 use self::index_extension::IndexExtension;
 
+/// Automatic index caches favor one shared budget because they commonly hold
+/// a small number of large, unequal partition entries.
+const AUTOMATIC_INDEX_CACHE_SHARD_POLICY: QuickCacheShardPolicy = QuickCacheShardPolicy::Single;
+
 pub(crate) mod caches;
 pub mod index_caches;
 pub(crate) mod index_extension;
@@ -26,7 +30,10 @@ pub(crate) mod index_extension;
 pub enum CacheSpec {
     /// Use the Lance-level default capacity for the tier.
     Default,
-    /// Use the default in-memory backend with this capacity.
+    /// Use the default in-memory backend with this weighted-entry capacity.
+    ///
+    /// This is not an RSS limit: active queries and in-progress loaders can
+    /// retain memory in addition to resident cache entries.
     Size(usize),
     /// Use an already constructed backend.
     Backend(Arc<dyn CacheBackend>),
@@ -106,8 +113,9 @@ impl Session {
     ///
     /// Parameters:
     ///
-    /// - ***index_cache_size***: the size of the index cache, backed by
-    ///   [`QuickCacheBackend`].
+    /// - ***index_cache_size***: the weighted-entry budget of the index cache,
+    ///   backed by a single-shard [`QuickCacheBackend`]. The budget is shared
+    ///   by all indices in the session and is not a process RSS limit.
     /// - ***metadata_cache_size***: the size of the metadata cache, backed by
     ///   [`QuickCacheBackend`].
     /// - ***store_registry***: the object store registry to use when opening
@@ -119,12 +127,14 @@ impl Session {
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
         Self {
-            index_cache: GlobalIndexCache(LanceCache::with_backend(Arc::new(
-                QuickCacheBackend::with_capacity(index_cache_size),
-            ))),
-            metadata_cache: GlobalMetadataCache(LanceCache::with_backend(Arc::new(
-                QuickCacheBackend::with_capacity(metadata_cache_size),
-            ))),
+            index_cache: GlobalIndexCache(Self::build_automatic_quick_cache(
+                index_cache_size,
+                AUTOMATIC_INDEX_CACHE_SHARD_POLICY,
+            )),
+            metadata_cache: GlobalMetadataCache(Self::build_automatic_quick_cache(
+                metadata_cache_size,
+                QuickCacheShardPolicy::Recommended,
+            )),
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
@@ -142,9 +152,10 @@ impl Session {
     ) -> Self {
         Self {
             index_cache: GlobalIndexCache(LanceCache::with_backend(index_cache_backend)),
-            metadata_cache: GlobalMetadataCache(LanceCache::with_backend(Arc::new(
-                QuickCacheBackend::with_capacity(metadata_cache_size),
-            ))),
+            metadata_cache: GlobalMetadataCache(Self::build_automatic_quick_cache(
+                metadata_cache_size,
+                QuickCacheShardPolicy::Recommended,
+            )),
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
@@ -180,7 +191,7 @@ impl Session {
     ///
     /// Each [`CacheSpec`] controls one tier. [`CacheSpec::Default`] uses that
     /// tier's Lance-level default capacity, [`CacheSpec::Size`] uses the
-    /// default in-memory backend with an explicit capacity, and
+    /// default in-memory backend with an explicit weighted-entry budget, and
     /// [`CacheSpec::Backend`] uses a caller-provided backend. This keeps size
     /// and backend selection mutually exclusive.
     ///
@@ -211,8 +222,16 @@ impl Session {
         metadata_cache: CacheSpec,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
-        let index_cache = Self::build_cache(index_cache, DEFAULT_INDEX_CACHE_SIZE);
-        let metadata_cache = Self::build_cache(metadata_cache, DEFAULT_METADATA_CACHE_SIZE);
+        let index_cache = Self::build_cache(
+            index_cache,
+            DEFAULT_INDEX_CACHE_SIZE,
+            AUTOMATIC_INDEX_CACHE_SHARD_POLICY,
+        );
+        let metadata_cache = Self::build_cache(
+            metadata_cache,
+            DEFAULT_METADATA_CACHE_SIZE,
+            QuickCacheShardPolicy::Recommended,
+        );
         Self {
             index_cache: GlobalIndexCache(index_cache),
             metadata_cache: GlobalMetadataCache(metadata_cache),
@@ -222,16 +241,26 @@ impl Session {
         }
     }
 
-    fn build_cache(spec: CacheSpec, default_size: usize) -> LanceCache {
+    fn build_cache(
+        spec: CacheSpec,
+        default_size: usize,
+        shard_policy: QuickCacheShardPolicy,
+    ) -> LanceCache {
         match spec {
-            CacheSpec::Default => {
-                LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(default_size)))
-            }
-            CacheSpec::Size(size) => {
-                LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(size)))
-            }
+            CacheSpec::Default => Self::build_automatic_quick_cache(default_size, shard_policy),
+            CacheSpec::Size(size) => Self::build_automatic_quick_cache(size, shard_policy),
             CacheSpec::Backend(backend) => LanceCache::with_backend(backend),
         }
+    }
+
+    fn build_automatic_quick_cache(
+        capacity: usize,
+        shard_policy: QuickCacheShardPolicy,
+    ) -> LanceCache {
+        LanceCache::with_backend(Arc::new(QuickCacheBackend::with_shard_policy(
+            capacity,
+            shard_policy,
+        )))
     }
 
     /// Register a new index extension.
@@ -332,6 +361,7 @@ impl Default for Session {
 mod tests {
     use super::*;
     use lance_core::cache::{CacheKey, UnsizedCacheKey};
+    use lance_core::deepsize::Context;
     use lance_index::vector::VectorIndex;
     use std::borrow::Cow;
     use tokio::io::AsyncWriteExt;
@@ -361,6 +391,50 @@ mod tests {
         }
     }
 
+    struct DeclaredWeight(usize);
+
+    impl DeepSizeOf for DeclaredWeight {
+        fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+            self.0
+        }
+    }
+
+    struct WeightedKey(u64);
+
+    impl CacheKey for WeightedKey {
+        type ValueType = DeclaredWeight;
+
+        fn key(&self) -> Cow<'_, str> {
+            self.0.to_string().into()
+        }
+
+        fn type_name() -> &'static str {
+            "DeclaredWeight"
+        }
+    }
+
+    async fn assert_fitting_working_set_is_resident(session: &Session, gibibytes: &[usize]) {
+        for (index, gibibytes) in gibibytes.iter().copied().enumerate() {
+            session
+                .index_cache
+                .insert_with_key(
+                    &WeightedKey(index as u64),
+                    Arc::new(DeclaredWeight(gibibytes << 30)),
+                )
+                .await;
+        }
+        for index in 0..gibibytes.len() {
+            assert!(
+                session
+                    .index_cache
+                    .get_with_key(&WeightedKey(index as u64))
+                    .await
+                    .is_some(),
+                "entry {index} should remain resident"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_disable_index_cache() {
         let no_cache = Session::new(0, 0, Default::default());
@@ -370,6 +444,45 @@ mod tests {
                 .get_unsized_with_key(&TestUnsizedKey("abc"))
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_index_caches_use_one_shared_weight_budget() {
+        assert_eq!(
+            AUTOMATIC_INDEX_CACHE_SHARD_POLICY,
+            QuickCacheShardPolicy::Single
+        );
+
+        let session = Session::new(8 << 30, 0, Default::default());
+        assert_fitting_working_set_is_resident(&session, &[3, 2, 2]).await;
+
+        let session = Session::with_cache_backends(
+            CacheSpec::Size(8 << 30),
+            CacheSpec::Size(0),
+            Default::default(),
+        );
+        assert_fitting_working_set_is_resident(&session, &[3, 2, 2]).await;
+
+        let session = Session::with_cache_backends(
+            CacheSpec::Default,
+            CacheSpec::Size(0),
+            Default::default(),
+        );
+        assert_fitting_working_set_is_resident(&session, &[2, 1, 1]).await;
+
+        let session = Session::default();
+        let shared_session = session.clone();
+        session
+            .index_cache
+            .insert_with_key(&TestKey("shared-session"), Arc::new(vec![7]))
+            .await;
+        assert!(
+            shared_session
+                .index_cache
+                .get_with_key(&TestKey("shared-session"))
+                .await
+                .is_some()
         );
     }
 
