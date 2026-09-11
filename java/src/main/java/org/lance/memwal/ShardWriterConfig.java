@@ -99,7 +99,12 @@ public class ShardWriterConfig {
     return this;
   }
 
-  /** Batch size used when scanning the WAL manifest. */
+  /**
+   * Retains a legacy manifest scan batch size without changing scan behavior.
+   *
+   * @deprecated Manifest scan concurrency is managed internally.
+   */
+  @Deprecated
   public ShardWriterConfig withManifestScanBatchSize(long manifestScanBatchSize) {
     Preconditions.checkArgument(
         manifestScanBatchSize >= 0,
@@ -167,6 +172,12 @@ public class ShardWriterConfig {
     return maxUnflushedMemtableBytes;
   }
 
+  /**
+   * Returns the legacy manifest scan batch size supplied to this configuration.
+   *
+   * @deprecated Manifest scan concurrency is managed internally.
+   */
+  @Deprecated
   public Optional<Long> manifestScanBatchSize() {
     return manifestScanBatchSize;
   }
