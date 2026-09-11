@@ -65,6 +65,7 @@ use uuid::Uuid;
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
+use crate::index::vector::coarse_quantizer::CoarseQuantizerFingerprint;
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::{Error, Result};
 use lance_arrow::*;
@@ -137,6 +138,72 @@ fn normalize_query_for_index(index: &dyn VectorIndex, query: Query) -> DataFusio
         .0;
     query.key = key;
     Ok(query)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct IvfRoutingGroup {
+    representative_uuid: Uuid,
+    member_uuids: Vec<Uuid>,
+}
+
+fn routing_groups(indices: &[IndexMetadata]) -> Vec<IvfRoutingGroup> {
+    let mut group_by_fingerprint =
+        HashMap::<CoarseQuantizerFingerprint, usize>::with_capacity(indices.len());
+    let mut groups = Vec::<IvfRoutingGroup>::with_capacity(indices.len());
+
+    for index in indices {
+        let Some(fingerprint) = CoarseQuantizerFingerprint::from_metadata(index) else {
+            groups.push(IvfRoutingGroup {
+                representative_uuid: index.uuid,
+                member_uuids: vec![index.uuid],
+            });
+            continue;
+        };
+
+        if let Some(group_index) = group_by_fingerprint.get(&fingerprint).copied() {
+            groups[group_index].member_uuids.push(index.uuid);
+        } else {
+            group_by_fingerprint.insert(fingerprint, groups.len());
+            groups.push(IvfRoutingGroup {
+                representative_uuid: index.uuid,
+                member_uuids: vec![index.uuid],
+            });
+        }
+    }
+
+    groups
+}
+
+fn partition_batch(
+    uuid: Uuid,
+    partitions: &UInt32Array,
+    dist_q_c: &Float32Array,
+) -> DataFusionResult<RecordBatch> {
+    let mut part_list_builder = ListBuilder::new(UInt32Builder::new()).with_field(Field::new(
+        "item",
+        DataType::UInt32,
+        false,
+    ));
+    part_list_builder.append_value(partitions.iter());
+    let partition_col = part_list_builder.finish();
+
+    let mut dist_q_c_list_builder = ListBuilder::new(Float32Builder::new()).with_field(Field::new(
+        "item",
+        DataType::Float32,
+        false,
+    ));
+    dist_q_c_list_builder.append_value(dist_q_c.iter());
+    let dist_q_c_col = dist_q_c_list_builder.finish();
+
+    let uuid_col = StringArray::from(vec![uuid.to_string()]);
+    Ok(RecordBatch::try_new(
+        KNN_PARTITION_SCHEMA.clone(),
+        vec![
+            Arc::new(partition_col),
+            Arc::new(dist_q_c_col),
+            Arc::new(uuid_col),
+        ],
+    )?)
 }
 
 /// [ExecutionPlan] compute vector distance from a query vector.
@@ -1114,11 +1181,7 @@ pub fn new_knn_exec(
     overlay_block: Option<RowAddrMask>,
     external_mask: Option<Arc<RowAddrMask>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let ivf_node = ANNIvfPartitionExec::try_new(
-        dataset.clone(),
-        indices.iter().map(|idx| idx.uuid).collect_vec(),
-        query.clone(),
-    )?;
+    let ivf_node = ANNIvfPartitionExec::try_new(dataset.clone(), indices, query.clone())?;
 
     let mut sub_index = ANNIvfSubIndexExec::try_new(
         Arc::new(ivf_node),
@@ -1141,18 +1204,17 @@ pub fn new_knn_exec(
 ///
 /// It searches the partition IDs using the input query.
 ///
-/// It searches all index deltas in parallel.  For each delta it returns a
-/// single batch with the partition IDs and the delta index `uuid`:
+/// Segments with the same supported coarse-quantizer fingerprint are grouped.
+/// Partition ranking runs once per group and its result is reused by every
+/// member. Segments without a valid identity form independent groups. For each
+/// segment this node returns one batch with partition IDs and the index `uuid`:
 ///
 /// The number of partitions returned is at most `maximum_nprobes`.  If
 /// `maximum_nprobes` is not set, it will return all partitions.  The partitions
 /// are returned in sorted order from closest to farthest.
 ///
-/// Typically, all partition ids will be identical for each delta index (since delta
-/// indices have identical partitions) but the downstream nodes do not rely on this.
-///
-/// TODO: We may want to search the partitions once instead of once per delta index
-/// since the centroids are the same.
+/// The downstream nodes do not rely on partition IDs being identical across
+/// deltas, so missing or incompatible fingerprints preserve the original path.
 ///
 /// ```text
 /// {
@@ -1170,20 +1232,25 @@ pub struct ANNIvfPartitionExec {
     /// The UUIDs of the indices to search.
     pub index_uuids: Vec<Uuid>,
 
+    routing_groups: Vec<IvfRoutingGroup>,
+
     pub properties: Arc<PlanProperties>,
 
     pub metrics: ExecutionPlanMetricsSet,
 }
 
 impl ANNIvfPartitionExec {
-    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<Uuid>, query: Query) -> Result<Self> {
+    pub fn try_new(dataset: Arc<Dataset>, indices: &[IndexMetadata], query: Query) -> Result<Self> {
         let dataset_schema = dataset.schema();
         get_vector_type(dataset_schema, &query.column)?;
-        if index_uuids.is_empty() {
+        if indices.is_empty() {
             return Err(Error::execution(
                 "ANNIVFPartitionExec node: no index found for query".to_string(),
             ));
         }
+
+        let index_uuids = indices.iter().map(|index| index.uuid).collect();
+        let routing_groups = routing_groups(indices);
 
         let schema = KNN_PARTITION_SCHEMA.clone();
         let properties = Arc::new(PlanProperties::new(
@@ -1197,6 +1264,7 @@ impl ANNIvfPartitionExec {
             dataset,
             query,
             index_uuids,
+            routing_groups,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -1281,21 +1349,26 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
         let ds = self.dataset.clone();
+        let routing_groups = self.routing_groups.clone();
         let metrics = Arc::new(AnnPartitionMetrics::new(&self.metrics, partition));
         metrics.deltas_searched.add(self.index_uuids.len());
         let metrics_clone = metrics.clone();
 
-        let stream = stream::iter(self.index_uuids.clone())
-            .map(move |uuid| {
+        let concurrency = routing_groups.len().min(target_partitions).max(1);
+        let stream = stream::iter(routing_groups)
+            .map(move |group| {
                 let query = query.clone();
                 let ds = ds.clone();
                 let metrics = metrics.clone();
                 async move {
                     let index = ds
-                        .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
+                        .open_vector_index(
+                            &query.column,
+                            &group.representative_uuid,
+                            &metrics.index_metrics,
+                        )
                         .await?;
-                    // Normalize cosine queries once before partition ranking.
-                    let query = normalize_query_for_index(index.as_ref(), query.clone())?;
+                    let query = normalize_query_for_index(index.as_ref(), query)?;
 
                     metrics.partitions_ranked.add(index.total_partitions());
 
@@ -1304,30 +1377,20 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         find_partitions_on_cpu(index, query).await?
                     };
 
-                    let mut part_list_builder = ListBuilder::new(UInt32Builder::new())
-                        .with_field(Field::new("item", DataType::UInt32, false));
-                    part_list_builder.append_value(partitions.iter());
-                    let partition_col = part_list_builder.finish();
-
-                    let mut dist_q_c_list_builder = ListBuilder::new(Float32Builder::new())
-                        .with_field(Field::new("item", DataType::Float32, false));
-                    dist_q_c_list_builder.append_value(dist_q_c.iter());
-                    let dist_q_c_col = dist_q_c_list_builder.finish();
-
-                    let uuid_col = StringArray::from(vec![uuid.to_string()]);
-                    let batch = RecordBatch::try_new(
-                        KNN_PARTITION_SCHEMA.clone(),
-                        vec![
-                            Arc::new(partition_col),
-                            Arc::new(dist_q_c_col),
-                            Arc::new(uuid_col),
-                        ],
-                    )?;
-                    metrics.baseline_metrics.record_output(batch.num_rows());
-                    Ok::<_, DataFusionError>(batch)
+                    group
+                        .member_uuids
+                        .into_iter()
+                        .map(|uuid| {
+                            let batch = partition_batch(uuid, &partitions, &dist_q_c)?;
+                            metrics.baseline_metrics.record_output(batch.num_rows());
+                            Ok(batch)
+                        })
+                        .collect::<DataFusionResult<Vec<_>>>()
                 }
             })
-            .buffered(self.index_uuids.len().min(target_partitions).max(1))
+            .buffered(concurrency)
+            .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
+            .try_flatten()
             .finally(move || {
                 // Partition ranking reads centroids from memory, so this is
                 // typically zero; flushed for symmetry with ANNSubIndex.
@@ -2564,6 +2627,7 @@ mod tests {
     use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::pb::VectorIndexDetails;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, PreparedPartitionSearchHandle};
@@ -2598,6 +2662,56 @@ mod tests {
             dist_q_c: 0.0,
             approx_mode: Default::default(),
         }
+    }
+
+    fn prepared_metrics() -> Arc<AnnIndexMetrics> {
+        Arc::new(AnnIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0))
+    }
+
+    #[test]
+    fn test_coarse_quantizer_groups_are_fail_closed() {
+        fn metadata(uuid: Uuid, fingerprint: Option<Vec<u8>>) -> IndexMetadata {
+            let details = VectorIndexDetails {
+                coarse_quantizer_fingerprint: fingerprint,
+                ..Default::default()
+            };
+            IndexMetadata {
+                uuid,
+                name: "vector_idx".to_string(),
+                fields: vec![0],
+                covering_fields: vec![],
+                dataset_version: 1,
+                fragment_bitmap: None,
+                index_details: Some(Arc::new(prost_types::Any::from_msg(&details).unwrap())),
+                index_version: 1,
+                created_at: None,
+                base_id: None,
+                files: None,
+            }
+        }
+
+        let first_uuid = Uuid::new_v4();
+        let second_uuid = Uuid::new_v4();
+        let third_uuid = Uuid::new_v4();
+        let fourth_uuid = Uuid::new_v4();
+        let fingerprint = vec![7; 32];
+        let mut other = fingerprint.clone();
+        other[0] = 8;
+        let indices = vec![
+            metadata(first_uuid, Some(fingerprint.clone())),
+            metadata(second_uuid, Some(fingerprint)),
+            metadata(third_uuid, Some(other)),
+            metadata(fourth_uuid, None),
+            metadata(Uuid::new_v4(), Some(vec![7; 31])),
+        ];
+        let groups = routing_groups(&indices);
+
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0].representative_uuid, first_uuid);
+        assert_eq!(groups[0].member_uuids, vec![first_uuid, second_uuid]);
+        assert_eq!(groups[1].member_uuids, vec![third_uuid]);
+        assert_eq!(groups[2].member_uuids, vec![fourth_uuid]);
+        assert_eq!(groups[3].member_uuids, vec![indices[4].uuid]);
     }
 
     #[test]
@@ -3192,10 +3306,6 @@ mod tests {
             !ordinary_segment.needs_partition_row_ids(),
             "a user filter cannot take the no-filter fast path, so partition coverage is unused"
         );
-    }
-
-    fn prepared_metrics() -> Arc<AnnIndexMetrics> {
-        Arc::new(AnnIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0))
     }
 
     type PreparedIndexState = (
@@ -4478,7 +4588,7 @@ mod tests {
             );
             assert_eq!(
                 stats.all_counts.get(PARTITIONS_RANKED_METRIC).unwrap(),
-                &(100 * num_deltas)
+                &100
             );
             assert_find_partitions_elapsed_recorded(&stats);
         }

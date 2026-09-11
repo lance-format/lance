@@ -229,6 +229,14 @@ message VectorIndexDetails {
    * Unrecognized keys must be silently ignored by all runtimes.
    */
   map<string, string> runtime_hints = 9;
+
+  /*
+   * Content-derived identity of this segment's final IVF coarse-routing state.
+   * Readers may reuse routing only for identical, well-formed values. It is
+   * absent for legacy or unsupported routers. The current encoding is a
+   * 32-byte SHA-256 digest.
+   */
+  optional bytes coarse_quantizer_fingerprint = 10;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.

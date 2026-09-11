@@ -9,12 +9,13 @@ use super::{
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
 use super::{
-    builder::{ExistingIndex, IvfIndexBuilder, index_type_string},
+    builder::{ExistingIndex, IvfIndexBuilder, VectorIndexBuildSummary, index_type_string},
     utils::PartitionLoadLock,
 };
 use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::vector::coarse_quantizer::{common_fingerprint, with_fingerprint};
 use crate::index::vector::open_index_file;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
@@ -642,14 +643,14 @@ fn existing_index_sources(
 
 // TODO: move to `lance-index` crate.
 ///
-/// Returns (new_uuid, num_indices_merged, files)
+/// Returns the new segment UUID and its build summary.
 pub(crate) async fn optimize_vector_indices(
     dataset: Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     logical_index: &LogicalIvfView<'_>,
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize, Vec<IndexFile>)> {
+) -> Result<(Uuid, VectorIndexBuildSummary)> {
     let existing_indices = logical_index.indices().cloned().collect::<Vec<_>>();
     // Sanity check the indices
     if existing_indices.is_empty() {
@@ -726,7 +727,14 @@ pub(crate) async fn optimize_vector_indices(
 
     // never change the index version,
     // because we won't update the legacy vector index format
-    Ok((new_uuid, merged, files))
+    Ok((
+        new_uuid,
+        VectorIndexBuildSummary {
+            indices_merged: merged,
+            files,
+            coarse_quantizer_fingerprint: None,
+        },
+    ))
 }
 
 pub(crate) async fn optimize_vector_indices_v2(
@@ -735,7 +743,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     vector_column: &str,
     existing_indices: &[ExistingIndex],
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize, Vec<IndexFile>)> {
+) -> Result<(Uuid, VectorIndexBuildSummary)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::index(
@@ -970,7 +978,7 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
     };
 
-    Ok((new_uuid, summary.indices_merged, summary.files))
+    Ok((new_uuid, summary))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2518,6 +2526,7 @@ async fn merge_segments_with_row_filters(
         }
     }
 
+    index_details = with_fingerprint(index_details, common_fingerprint(&segments))?;
     let index_version = infer_source_index_version(&segments)?;
     let segment_uuid = Uuid::new_v4();
     let final_dir = indices_dir.clone().join(segment_uuid.to_string());

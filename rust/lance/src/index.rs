@@ -1302,10 +1302,11 @@ pub(crate) async fn remap_index(
             .await?;
 
             CreatedIndex {
-                index_details: prost_types::Any::from_msg(
-                    &lance_index::pb::VectorIndexDetails::default(),
-                )
-                .unwrap(),
+                index_details: matched
+                    .index_details
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_else(vector_index_details_default),
                 index_version,
                 files: table_files_to_index(files),
             }
@@ -6337,6 +6338,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));
+    }
+
+    #[tokio::test]
+    async fn test_remap_vector_index_preserves_details() {
+        let data = gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(Dimension::from(8)))
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_flat(1, DistanceType::L2);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let index = dataset.load_indices().await.unwrap()[0].clone();
+        let result = remap_index(&dataset, &index.uuid, &RowAddrRemap::empty())
+            .await
+            .unwrap();
+        let RemapResult::Remapped(remapped) = result else {
+            panic!("vector index should be remapped");
+        };
+
+        assert_eq!(remapped.index_details, *index.index_details.unwrap());
     }
 
     /// The `fields.len() > 1` rejection in `remap_index`, which had no dedicated

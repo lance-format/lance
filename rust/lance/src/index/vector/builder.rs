@@ -89,6 +89,7 @@ use crate::index::append::build_old_data_filter;
 use crate::index::vector::bounded_partition_stream::{
     BoundedPartitionStream, Budgeted, OrderedPartitionResults, WeightedJob,
 };
+use crate::index::vector::coarse_quantizer::CoarseQuantizerFingerprint;
 use crate::index::vector::utils::infer_vector_dim;
 
 use super::v2::IVFIndex;
@@ -332,9 +333,11 @@ struct FreshPartitionInput {
 
 type UnindexedStream = Box<dyn Stream<Item = Result<RecordBatch>> + Send + Unpin + 'static>;
 
+#[derive(Debug)]
 pub struct VectorIndexBuildSummary {
     pub indices_merged: usize,
     pub files: Vec<IndexFile>,
+    pub(crate) coarse_quantizer_fingerprint: Option<CoarseQuantizerFingerprint>,
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
@@ -489,6 +492,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(VectorIndexBuildSummary {
             indices_merged: self.merged_num,
             files,
+            coarse_quantizer_fingerprint: self
+                .ivf
+                .as_ref()
+                .and_then(|ivf| CoarseQuantizerFingerprint::from_model(ivf, self.distance_type)),
         })
     }
 

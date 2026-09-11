@@ -484,13 +484,13 @@ impl<'a> CreateIndexBuilder<'a> {
 
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
-                let files = if train {
+                let (files, coarse_quantizer_fingerprint) = if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = effective_fragments.as_deref() {
                         if vector_params_have_precomputed_ivf(vec_params) {
                             // For distributed indexing, build only on specified fragments
                             // This creates temporary index metadata without committing
-                            let (segment_uuid, files) = Box::pin(build_distributed_vector_index(
+                            let (segment_uuid, summary) = Box::pin(build_distributed_vector_index(
                                 self.dataset,
                                 column,
                                 &index_name,
@@ -502,9 +502,9 @@ impl<'a> CreateIndexBuilder<'a> {
                             ))
                             .await?;
                             output_index_uuid = segment_uuid;
-                            files
+                            (summary.files, summary.coarse_quantizer_fingerprint)
                         } else {
-                            Box::pin(build_filtered_vector_index(
+                            let summary = Box::pin(build_filtered_vector_index(
                                 self.dataset,
                                 column,
                                 &index_name,
@@ -514,11 +514,12 @@ impl<'a> CreateIndexBuilder<'a> {
                                 fragments,
                                 self.progress.clone(),
                             ))
-                            .await?
+                            .await?;
+                            (summary.files, summary.coarse_quantizer_fingerprint)
                         }
                     } else {
                         // Standard full dataset indexing
-                        Box::pin(build_vector_index(
+                        let summary = Box::pin(build_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -527,21 +528,28 @@ impl<'a> CreateIndexBuilder<'a> {
                             fri,
                             self.progress.clone(),
                         ))
-                        .await?
+                        .await?;
+                        (summary.files, summary.coarse_quantizer_fingerprint)
                     }
                 } else {
                     // Create empty vector index
-                    build_empty_vector_index(
-                        self.dataset,
-                        column,
-                        &index_name,
-                        index_id,
-                        vec_params,
+                    (
+                        build_empty_vector_index(
+                            self.dataset,
+                            column,
+                            &index_name,
+                            index_id,
+                            vec_params,
+                        )
+                        .await?,
+                        None,
                     )
-                    .await?
                 };
                 CreatedIndex {
-                    index_details: vector_index_details(vec_params),
+                    index_details: vector_index_details(
+                        vec_params,
+                        coarse_quantizer_fingerprint,
+                    ),
                     index_version,
                     files: table_files_to_index(files),
                 }
@@ -1020,6 +1028,7 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 mod tests {
     use super::*;
     use crate::dataset::{WriteMode, WriteParams};
+    use crate::index::vector::coarse_quantizer::CoarseQuantizerFingerprint;
     use crate::index::{DatasetIndexExt, IndexSegment};
     use crate::utils::test::covering;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -3567,7 +3576,7 @@ mod tests {
                     uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params)),
+                    Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),
                     source_dataset_version,
                     vec![],
@@ -3593,7 +3602,7 @@ mod tests {
                     Uuid::new_v4(),
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params)),
+                    Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),
                     dataset.manifest.version + 1,
                     vec![],
@@ -3624,10 +3633,7 @@ mod tests {
             );
         let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
-        let params = VectorIndexParams::with_ivf_flat_params(
-            DistanceType::L2,
-            prepare_vector_ivf(&dataset, "vector").await,
-        );
+        let params = VectorIndexParams::ivf_flat(4, DistanceType::L2);
 
         let committed = dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
@@ -3645,6 +3651,7 @@ mod tests {
         let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].uuid, committed.uuid);
+        assert!(CoarseQuantizerFingerprint::from_metadata(&loaded[0]).is_some());
         assert!(
             loaded[0]
                 .files

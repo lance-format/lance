@@ -10,7 +10,7 @@
 //! A DataFusion `PhysicalExtensionCodec` can call these functions in `try_encode`
 //! and `try_decode` to support distributed execution (planner → executor).
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema as ArrowSchema};
@@ -23,6 +23,7 @@ use lance_table::format::pb as table_pb;
 use uuid::Uuid;
 
 use crate::Dataset;
+use crate::index::DatasetIndexExt;
 use crate::pb;
 
 use super::knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec};
@@ -197,7 +198,24 @@ pub async fn ann_ivf_partition_exec_from_proto(
                 format!("Invalid UUID in AnnIvfPartitionExecProto: {e}").into(),
             )
         })?;
-    ANNIvfPartitionExec::try_new(dataset, index_uuids, query)
+    let mut indices_by_uuid = dataset
+        .load_indices()
+        .await?
+        .iter()
+        .cloned()
+        .map(|index| (index.uuid, index))
+        .collect::<HashMap<_, _>>();
+    let indices = index_uuids
+        .into_iter()
+        .map(|uuid| {
+            indices_by_uuid.remove(&uuid).ok_or_else(|| {
+                Error::not_found(format!(
+                    "ANNIvfPartitionExec index metadata for UUID {uuid}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ANNIvfPartitionExec::try_new(dataset, &indices, query)
 }
 
 // =============================================================================
@@ -474,12 +492,7 @@ mod tests {
             approx_mode: ApproxMode::Normal,
         };
 
-        let exec = ANNIvfPartitionExec::try_new(
-            dataset.clone(),
-            indices.iter().map(|idx| idx.uuid).collect(),
-            query,
-        )
-        .unwrap();
+        let exec = ANNIvfPartitionExec::try_new(dataset.clone(), &indices, query).unwrap();
 
         let proto = ann_ivf_partition_exec_to_proto(&exec).await.unwrap();
         assert_eq!(proto.index_uuids.len(), indices.len());

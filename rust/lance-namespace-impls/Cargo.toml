@@ -71,7 +71,7 @@ roaring.workspace = true
 uuid.workspace = true
 
 # Shared credential vending dependencies
-sha2 = { version = "0.10", optional = true }
+sha2 = { workspace = true, optional = true }
 base64 = { version = "0.22", optional = true }
 
 # AWS credential vending dependencies (optional, enabled by "credential-vendor-aws" feature)

@@ -205,6 +205,7 @@ rstest = "0.26.1"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 semver = "1.0"
+sha2 = "0.10"
 serial_test = "3"
 snafu = "0.9"
 syn = { version = "2.0.37", features = ["full"] }

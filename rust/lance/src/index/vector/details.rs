@@ -35,6 +35,7 @@ use lance_index::vector::sq::builder::SQBuildParams;
 use super::{StageParams, VectorIndexParams};
 use crate::dataset::Dataset;
 use crate::index::open_index_proto;
+use crate::index::vector::coarse_quantizer::CoarseQuantizerFingerprint;
 use crate::{Error, Result};
 
 // Private structs for JSON serialization of VectorIndexDetails.
@@ -82,8 +83,11 @@ enum CompressionDetailsJson {
     },
 }
 
-/// Build a `VectorIndexDetails` proto from build params at index creation time.
-pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
+/// Build vector metadata from the requested parameters and final routing identity.
+pub fn vector_index_details(
+    params: &VectorIndexParams,
+    fingerprint: Option<CoarseQuantizerFingerprint>,
+) -> prost_types::Any {
     let metric_type = match params.metric_type {
         lance_linalg::distance::DistanceType::L2 => VectorMetricType::L2,
         lance_linalg::distance::DistanceType::Cosine => VectorMetricType::Cosine,
@@ -162,6 +166,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         hnsw_index_config,
         compression,
         runtime_hints,
+        coarse_quantizer_fingerprint: fingerprint.map(|value| value.to_bytes()),
     };
     prost_types::Any::from_msg(&details).unwrap()
 }
@@ -558,6 +563,7 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
         hnsw_index_config: None,
         compression,
         runtime_hints: Default::default(),
+        coarse_quantizer_fingerprint: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -697,6 +703,7 @@ async fn convert_v3_metadata_to_details(
         hnsw_index_config,
         compression,
         runtime_hints: Default::default(),
+        coarse_quantizer_fingerprint: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -746,6 +753,7 @@ mod tests {
             hnsw_index_config: hnsw,
             compression,
             runtime_hints: Default::default(),
+            coarse_quantizer_fingerprint: None,
         };
         prost_types::Any::from_msg(&details).unwrap()
     }
@@ -895,6 +903,7 @@ mod tests {
                 hnsw_index_config: None,
                 compression: None,
                 runtime_hints: Default::default(),
+                coarse_quantizer_fingerprint: None,
             };
             prost_types::Any::from_msg(&d).unwrap()
         };
@@ -1138,7 +1147,7 @@ mod tests {
             },
         );
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params, None);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details
@@ -1254,7 +1263,7 @@ mod tests {
         );
         params.skip_transpose = true;
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params, None);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details.runtime_hints.get("lance.hnsw.prefetch_distance"),
@@ -1307,7 +1316,7 @@ mod tests {
         };
         let params = VectorIndexParams::ivf_hnsw(DistanceType::L2, IvfBuildParams::default(), hnsw);
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params, None);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details.runtime_hints.get("lance.hnsw.prefetch_distance"),
@@ -1345,7 +1354,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params, None);
         let json = vector_details_as_json(&any).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["runtime_hints"]["lance.ivf.max_iters"], "100");
@@ -1440,7 +1449,7 @@ mod tests {
 
         let params = build_roundtrip_params(combo, metric);
 
-        let any = vector_index_details(&params);
+        let any = vector_index_details(&params, None);
         let restored = vector_params_from_details(&any)
             .expect("non-empty details should round-trip to params");
 
