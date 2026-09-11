@@ -98,12 +98,12 @@ Index segments are created and updated through a transactional process:
 2. **Prepare the metadata**: Create an `IndexMetadata` message with:
    - `uuid`: The newly generated UUID
    - `name`: The index name (must match existing segments if adding to an existing index)
-   - `fields`: The columns the index depends on: the keyed column(s) it is searched on, followed
-     by any merely-carried columns named in `covering_fields`. `fields[0]` is always a keyed column.
-   - `covering_fields`: The trailing subset of `fields` whose values the index carries but is not
-     keyed on, letting a query that only projects those columns be answered without a fragment take.
-     Empty for an index that carries no extra columns. Declaring a column here does not by itself
-     make it servable -- see [Serving carried columns](#serving-carried-columns).
+   - `fields`: The columns the index is keyed on, in key order.
+   - `covering_fields`: An independent declaration of the columns whose values the index carries,
+     letting a query that only projects those columns be answered without a fragment take. A field
+     may appear in both lists when the index carries a value it is also keyed on. Empty for an index
+     that carries no extra columns. Declaring a column here does not by itself make it servable --
+     see [Serving carried columns](#serving-carried-columns).
    - `fragment_bitmap`: The set of fragment IDs covered by this segment
    - `index_details`: Index-specific configuration and parameters
    - `version`: The format version of this index type
@@ -115,9 +115,9 @@ Index segments are created and updated through a transactional process:
 
 When updating a column in place (without deleting the row), the engine must remove the
 affected fragment IDs from the `fragment_bitmap` field of any index segment whose `fields`
-include that column — whether the index is keyed on it or merely carries it. This marks
-those fragments as needing re-indexing without invalidating the entire segment and prevents
-invalid data from being read from the index.
+or `covering_fields` include that column. This marks those fragments as needing re-indexing
+without invalidating the entire segment and prevents invalid data from being read from the
+index.
 
 ## Index Compatibility
 
@@ -134,6 +134,19 @@ Before using an index segment, engines must verify they support it:
 
 When an engine cannot use an index segment, it should fall back to scanning the
 fragments that would have been covered by that segment.
+
+### Covering-field contracts
+
+A manifest that uses independent key and covering declarations must set
+`FLAG_COVERED_INDEX_METADATA` and `FLAG_INDEPENDENT_COVERING_FIELDS` in both its reader
+and writer feature flags. In this contract, `fields` contains only the key fields and
+`covering_fields` separately contains the carried fields. The lists have no positional
+relationship and may overlap. The index dependency set is their union.
+
+For backwards compatibility, a manifest with `FLAG_COVERED_INDEX_METADATA` but without
+`FLAG_INDEPENDENT_COVERING_FIELDS` uses the legacy contract: `covering_fields` is a
+trailing suffix of `fields`, and the preceding entries are the key fields. Readers must
+select the contract from the manifest flags before interpreting any `IndexMetadata`.
 
 ### Serving carried columns
 
@@ -172,12 +185,12 @@ When loading an index:
 The `IndexMetadata` message contains important information about the index segment:
 
 - `uuid`: the unique identifier of the index segment.
-- `fields`: the columns the index depends on: the keyed column(s) the index is searched on, followed
-  by any columns it merely carries, as named in `covering_fields`. `fields[0]` is always a keyed column.
-- `covering_fields`: the trailing subset of `fields` whose values the index carries alongside its own
-  data but is not keyed on. Empty for an index that carries no extra columns. This declaration is
-  not authoritative for what the segment can serve -- see
-  [Serving carried columns](#serving-carried-columns).
+- `fields`: the columns the index is keyed on, in key order.
+- `covering_fields`: the independently declared columns whose values the index carries alongside
+  its own data. A field may also occur in `fields`. Empty for an index that carries no extra
+  columns. This declaration is not authoritative for what the segment can serve -- see
+  [Serving carried columns](#serving-carried-columns) and the legacy interpretation under
+  [Covering-field contracts](#covering-field-contracts).
 - `fragment_bitmap`: the set of fragment IDs covered by this index segment.
 - `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.
@@ -218,10 +231,9 @@ There are four situations to consider:
 3. **A fragment has had one of the index's columns updated in place.** This cannot be detected
    just by examining metadata. To prevent reading invalid data, the engine should filter out any
    row addresses that are not in the index's current `fragment_bitmap`.
-   The column need not be one the index is keyed on: every column in `fields` counts, including
-   the merely-carried ones named in `covering_fields`. A carried column can be updated while the
-   keyed column is untouched, and a segment left covering that fragment would answer from an
-   obsolete carried value.
+   The column need not be one the index is keyed on: every column in the union of `fields` and
+   `covering_fields` counts. A carried column can be updated while the keyed column is untouched,
+   and a segment left covering that fragment would answer from an obsolete carried value.
 4. **A fragment has an updated value in an [overlay file](../table/data_overlay_file.md).**
    This can be detected by checking if any of the fragments in the index's `fragment_bitmap`
    have overlay files. For each overlay whose `committed_version` is greater than the index
@@ -229,9 +241,10 @@ There are four situations to consider:
    so its covered rows must be excluded from index results. Excluded rows are re-evaluated
    against their current (overlaid) values on the flat path — dropping them without
    re-evaluation would silently lose rows that match under the new value. Exclusion is
-   field-aware: only overlays covering a column in the index's `fields` matter — keyed or
-   merely carried. Restricting this to the keyed column would leave a fragment covered after
-   an overlay updated a carried one, and the index would then serve a stale carried value.
+   field-aware: only overlays covering a column in the union of the index's `fields` and
+   `covering_fields` matter. Restricting this to the keyed columns would leave a fragment
+   covered after an overlay updated a carried one, and the index would then serve a stale
+   carried value.
    You may exclude just the affected rows or the whole fragment; the latter is simpler and
    safer but re-evaluates more rows than necessary.
    See [Data Overlay Files](../table/data_overlay_file.md#index-integration)
@@ -268,8 +281,8 @@ logical identifier that remains constant even when rows are moved during compact
 **Benefits:**
 
 - No remapping needed after compaction
-- Updates only invalidate the index if data in one of its `fields` changes — the keyed
-  column(s) or any column named in `covering_fields`
+- Updates only invalidate the index if data in the union of its `fields` and
+  `covering_fields` changes
 
 **Tradeoffs:**
 

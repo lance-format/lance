@@ -147,12 +147,10 @@ restricted to field `F`, of every overlay whose `committed_version >
 index.dataset_version`. The exclusion is **field-aware**: an overlay that touches
 only unrelated columns does not exclude anything from the index on `F`.
 
-`F` here ranges over every field in the index's `fields`, not only the ones it is
-keyed on. An index that carries columns it is not keyed on (see
-[`covering_fields`](../index/index.md#serving-carried-columns)) depends on those
-columns too: an overlay updating a merely-carried column leaves the keyed value
-correct while making the carried value stale, so it must exclude those rows just
-the same.
+`F` here ranges over the union of the index's `fields` and `covering_fields`
+(see [Serving carried columns](../index/index.md#serving-carried-columns)).
+An overlay updating a merely-carried column leaves the keyed value correct while
+making the carried value stale, so it must exclude those rows just the same.
 
 The query then proceeds as:
 

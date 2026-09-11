@@ -31,15 +31,16 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 1 << 5;
 /// Debug builds always understand it so tests exercise the path.
 pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 1 << 6;
 /// Some index declares covering columns: `IndexMetadata.covering_fields` names
-/// columns the index carries values for but is not keyed on.
+/// columns the index carries values for, whether or not it is also keyed on
+/// them.
 ///
-/// Covering makes `fields` mean "keyed columns followed by carried columns"
-/// rather than "the columns this index is searched on". A reader without this
-/// bit still selects a vector index by testing membership of `fields`, so it
-/// would answer a query on a merely-carried column with an index keyed on a
-/// different column and return wrong neighbours with no error. A writer without
-/// it would maintain the index as though every entry of `fields` were keyed.
-/// Both must refuse the table.
+/// Without [`FLAG_INDEPENDENT_COVERING_FIELDS`], covering makes `fields` mean
+/// "keyed columns followed by carried columns" rather than "the columns this
+/// index is searched on". A reader without this bit still selects a vector index
+/// by testing membership of `fields`, so it would answer a query on a
+/// merely-carried column with an index keyed on a different column and return
+/// wrong neighbours with no error. A writer without it would maintain the index
+/// as though every entry of `fields` were keyed. Both must refuse the table.
 ///
 /// This takes the bit reclaimed from the retired MemWAL index-catchup flag
 /// (<https://github.com/lance-format/lance/pull/8680>), which is the boundary the
@@ -53,6 +54,16 @@ pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
 /// Reserved for datasets that reference recognized V2 data files with
 /// different exact versions.
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
+/// Index key fields and covering fields are declared independently.
+///
+/// When this flag is set, `IndexMetadata.fields` contains only the columns the
+/// index is keyed on and `IndexMetadata.covering_fields` separately contains
+/// the columns whose values the index carries. A field may occur in both lists.
+///
+/// Reserved ahead of its implementation. This build treats the bit as unknown,
+/// so it cannot open a table and apply the legacy trailing-suffix contract to
+/// independent declarations.
+pub const FLAG_INDEPENDENT_COVERING_FIELDS: u64 = 1 << 11;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 8;
 
@@ -63,6 +74,10 @@ const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // at or above the boundary that build shipped with (bit 7).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
 const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS == FLAG_UNKNOWN);
+// Keep the independent declaration reserved until its implementation lands.
+// If the unknown boundary moves past this bit first, the build must mask it out
+// of `supported_flags_when` explicitly.
+const _: () = assert!(FLAG_INDEPENDENT_COVERING_FIELDS >= FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
@@ -294,6 +309,13 @@ mod tests {
 
     use super::*;
     use crate::format::BasePath;
+
+    #[test]
+    fn test_independent_covering_fields_flag_is_reserved() {
+        let flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+        assert!(!can_read_dataset(flags));
+        assert!(!can_write_dataset(flags));
+    }
 
     #[test]
     fn test_read_check() {

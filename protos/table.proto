@@ -123,16 +123,23 @@ message Manifest {
    * * 1 << 6: data overlay files are present (see DataOverlayFile). Readers that do
    *   not understand overlays must refuse the dataset, since ignoring an overlay
    *   would silently return stale base values.
-   * * 1 << 7: some index declares covering columns, so IndexMetadata.fields means
-   *   the keyed columns followed by the carried ones named in covering_fields (see
-   *   IndexMetadata). Readers that do not understand it must refuse the dataset,
-   *   since selecting an index by membership of fields would answer a query on a
-   *   merely-carried column with an index keyed on a different column. Writers must
-   *   refuse it too: one that treats every entry of fields as keyed would maintain
-   *   the index against the wrong dependency set.
+   * * 1 << 7: some index declares covering columns. Without 1 << 11,
+   *   IndexMetadata.fields contains the keyed columns followed by the carried
+   *   columns named in covering_fields (see IndexMetadata). Readers that do not
+   *   understand covering columns must refuse the dataset, since selecting an
+   *   index by membership of fields would answer a query on a merely-carried
+   *   column with an index keyed on a different column. Writers must refuse it
+   *   too: one that treats every entry of fields as keyed would maintain the
+   *   index against the wrong dependency set.
    * * 1 << 8: reserved for datasets that may reference recognized V2 data files
    *   with different exact versions. Implementations that do not support the
    *   per-file exact-version contract must treat this bit as unknown.
+   * * 1 << 11: IndexMetadata.fields and covering_fields are independent
+   *   declarations. This bit requires 1 << 7 in both the reader and writer
+   *   flags. Fields contains only the columns the index is keyed on, while
+   *   covering_fields contains the columns whose values it carries. A field may
+   *   occur in both lists. Implementations that only support the trailing-suffix
+   *   contract must refuse the dataset.
    */
   uint64 reader_feature_flags = 9;
 
@@ -267,10 +274,14 @@ message IndexMetadata {
   // Unique ID of an index. It is unique across all the dataset versions.
   UUID uuid = 1;
 
-  /* The columns to build the index. These refer to file.Field.id.
+  /* The columns the index is keyed on, in key order. These refer to file.Field.id.
    *
-   * fields[0] is always a column the index is keyed on. Trailing entries may
-   * instead be merely carried, not keyed on -- see `covering_fields` below.
+   * When the manifest has feature flag 1 << 11, this list contains only key
+   * fields. `covering_fields` independently declares the values the index
+   * carries.
+   *
+   * Without feature flag 1 << 11, the legacy contract applies: carried fields
+   * are also present as a trailing suffix of this list.
    */
   repeated int32 fields = 2;
 
@@ -330,19 +341,21 @@ message IndexMetadata {
    */
   repeated IndexFile files = 10;
 
-  /* The subset of `fields` whose values this index co-locates alongside its own
-   * data, so a query projecting only those columns can be answered from the
-   * index without a take against the base table.
+  /* The fields whose values this index co-locates alongside its own data, so a
+   * query projecting only those columns can be answered from the index without
+   * a take against the base table.
    *
-   * Must be a suffix of `fields`: the columns the index is keyed on come first,
-   * the columns it merely carries come last, and at least one keyed column
-   * always remains. Empty for an index that carries no extra columns, which is
-   * every index written before this field existed.
+   * When the manifest has feature flag 1 << 11, this declaration is independent
+   * of `fields` and has no positional relationship to it. A field may occur in
+   * both lists when the index carries a value it is also keyed on. Consumers
+   * must use the union of `fields` and `covering_fields` as the index dependency
+   * set.
    *
-   * Carried columns are listed in `fields` as well. That is deliberate: every
-   * consumer that reads `fields` as the index's dependency set -- staleness,
-   * commit conflict detection, schema evolution guards -- then covers them with
-   * no change and no way to forget one.
+   * Without feature flag 1 << 11, the legacy contract applies: this list must
+   * be a suffix of `fields`, and at least one key field must precede it.
+   *
+   * Empty for an index that carries no extra columns, which is every index
+   * written before this field existed.
    *
    * This declaration is not authoritative for what the segment can actually
    * serve. The segment's own storage schema is: a reader must confirm the
