@@ -232,12 +232,15 @@ message VectorIndexDetails {
 
   /* The number of IVF partitions this index was asked to train.
    *
+   * A request, not a description of the index that was built: a build trains
+   * fewer partitions when the data cannot support the count asked for, so the
+   * partitions an index holds are read from the index itself.
+   *
    * Absent when no count was requested, in which case the partitioning was
-   * derived from the data and a rebuild derives it again. Present when a caller
-   * named a count: a rebuild starts from that count, and may still train fewer
-   * partitions when the data cannot support them.
+   * derived from the data and a rebuild derives it again. Takes precedence over
+   * `target_partition_size` when both are set.
    */
-  optional uint32 num_partitions = 10;
+  optional uint32 target_num_partitions = 10;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.

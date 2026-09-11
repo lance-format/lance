@@ -61,17 +61,19 @@ message. These are the parameters an engine needs to rebuild the index without
 reading the index files: the distance metric, the quantization scheme, and the
 partitioning the index was asked for.
 
-`num_partitions` records the IVF partition count the index was asked to train. It
-is absent when no count was requested, in which case the partitioning was derived
-from the data and an engine rebuilding the index derives it again. When present, a
-rebuild starts from that count, and may still train fewer partitions when the data
-cannot support them. A segment that covers no fragments carries these details with
-no index files, so a recorded count is the only statement of the partitioning the
-index is to be built with once its column holds enough vectors to train.
+`target_num_partitions` records the IVF partition count the index was asked to
+train. It is a request, not a description of the index that was built: a build
+trains fewer partitions when the data cannot support the count asked for, so the
+number of partitions an index holds is read from the index itself and not from
+here. It is absent when no count was requested, in which case the partitioning was
+derived from the data and an engine rebuilding the index derives it again. A
+segment that covers no fragments carries these details with no index files, so a
+recorded count is the only statement of the partitioning the index is to be built
+with once its column holds enough vectors to train.
 
 `target_partition_size` records the target number of vectors per partition, and is
-0 when unset. An engine that is given neither value derives the partitioning from
-the data alone.
+0 when unset. `target_num_partitions` takes precedence when both are set. An engine
+given neither derives the partitioning from the data alone.
 
 `runtime_hints` carries optional build preferences that do not affect index
 structure, keyed by reverse-DNS name. Unrecognized keys must be silently ignored.
