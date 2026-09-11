@@ -813,6 +813,17 @@ def test_index_take_batch_size(tmp_path):
     assert len(batches) == 21
 
 
+def test_btree_rejects_zero_zone_size(tmp_path):
+    """A zero-sized BTree zone must be rejected."""
+    dataset = lance.write_dataset(pa.table({"value": [1, 2, 3]}), tmp_path)
+
+    with pytest.raises(ValueError, match="zone_size"):
+        dataset.create_scalar_index(
+            "value",
+            index_type=IndexConfig("btree", {"zone_size": 0}),
+        )
+
+
 def test_all_null_chunk(tmp_path):
     def gen_string(idx: int):
         if idx % 2 == 0:
