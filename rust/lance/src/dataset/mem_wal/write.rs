@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, new_null_array};
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use async_trait::async_trait;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{LANCE_FIELD_ID_KEY, Schema};
 use lance_core::{Error, Result};
 use lance_index::mem_wal::ShardManifest;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -1601,11 +1601,32 @@ fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String,
         .collect()
 }
 
-/// Re-label `batch` to the storage schema, matching columns by **name**.
+/// The lance field id an Arrow field carries, if it carries one.
+///
+/// Lance already reads this key when converting Arrow to its own schema; the
+/// memtable's storage schema carries it so that a WAL entry, which is Arrow IPC
+/// and so keeps field metadata, stays addressable by id rather than by name
+/// alone. Base data files have always been addressed this way
+/// (`DataFile.fields` is a list of ids); this brings the fresh tier alongside.
+fn field_id_of(field: &ArrowField) -> Option<i32> {
+    field
+        .metadata()
+        .get(LANCE_FIELD_ID_KEY)
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|id| *id >= 0)
+}
+
+/// Re-label `batch` to the storage schema, matching columns by **field id**
+/// where both sides carry one, and by **name** otherwise.
 ///
 /// A column the schema declares and the batch does not carry is filled with
 /// typed nulls; `_tombstone` is filled with `false`. A column the batch carries
 /// and the schema does not declare is dropped.
+///
+/// Ids are tried first because a rename keeps the id and changes the name, so a
+/// name match would null the new name and drop the old one — the column's values
+/// lost. Entries written before ids were carried have none, and fall back to the
+/// name match, which is why both tiers exist.
 ///
 /// Both cases are what a replayed WAL entry looks like after the table's schema
 /// moved: an entry predates a column added since, and carries one dropped
@@ -1622,10 +1643,24 @@ fn conform_to_storage_schema(
     pk_columns: &[String],
 ) -> Result<RecordBatch> {
     let n = batch.num_rows();
+    // A field id survives a rename; a name does not. Matching on it first is
+    // what keeps a renamed column's values attached to the column, instead of
+    // nulling the new name and dropping the old one. Absent on entries written
+    // before ids were carried, which is why the name match below remains.
+    let by_field_id: HashMap<i32, &ArrayRef> = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| field_id_of(f).map(|id| (id, batch.column(i))))
+        .collect();
+
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(storage_schema.fields().len());
     for field in storage_schema.fields() {
         let name = field.name();
-        if let Some(column) = batch.column_by_name(name) {
+        if let Some(column) = field_id_of(field).and_then(|id| by_field_id.get(&id)) {
+            columns.push((*column).clone());
+        } else if let Some(column) = batch.column_by_name(name) {
             columns.push(column.clone());
         } else if name == TOMBSTONE {
             columns.push(Arc::new(BooleanArray::from(vec![false; n])));
