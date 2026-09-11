@@ -326,13 +326,13 @@ fn check_manifest_storage_contract(
     manifest: &mut Manifest,
     mode: StorageContractMode,
 ) -> Result<()> {
-    let declared_fallback = manifest.data_storage_format.lance_file_format();
+    let default_version = manifest.data_storage_format.lance_file_format();
     let mixed_enabled = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0
         && manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
 
-    if mixed_enabled && declared_fallback == ConcreteFileVersion::V1 {
+    if mixed_enabled && default_version == ConcreteFileVersion::V1 {
         return Err(Error::invalid_input(
-            "Dataset has mixed data-file-version capability enabled, which requires a V2 fallback, but the manifest fallback is V1",
+            "Dataset has mixed data-file-version capability enabled, which requires a V2 default, but the manifest default is V1",
         ));
     }
 
@@ -340,7 +340,7 @@ fn check_manifest_storage_contract(
     let mut saw_v2 = false;
     let mut first_file_version = None;
     let mut first_mismatch = None;
-    let mut first_non_fallback = None;
+    let mut first_non_default = None;
     let fields_by_id = field_column_requirements(manifest);
     let mut validated_lists = HashSet::new();
 
@@ -365,8 +365,8 @@ fn check_manifest_storage_contract(
                 Some(_) => {}
             }
 
-            if !mixed_enabled && file_version != declared_fallback && first_non_fallback.is_none() {
-                first_non_fallback = Some((data_file.path.clone(), fragment.id, file_version));
+            if !mixed_enabled && file_version != default_version && first_non_default.is_none() {
+                first_non_default = Some((data_file.path.clone(), fragment.id, file_version));
             }
 
             validate_file_column_indices(
@@ -379,11 +379,11 @@ fn check_manifest_storage_contract(
         }
     }
 
-    // Released Lance 0.16 could persist a V1 fallback while referencing both V1
+    // Released Lance 0.16 could persist a V1 default while referencing both V1
     // and V2 files. Keep those snapshots readable, but never publish a new
     // manifest with that state.
     if matches!(mode, StorageContractMode::Read)
-        && declared_fallback == ConcreteFileVersion::V1
+        && default_version == ConcreteFileVersion::V1
         && !mixed_enabled
         && saw_v1
         && saw_v2
@@ -391,8 +391,8 @@ fn check_manifest_storage_contract(
         return Ok(());
     }
 
-    let mut fallback = declared_fallback;
-    if declared_fallback == ConcreteFileVersion::V1 {
+    let mut effective_version = default_version;
+    if default_version == ConcreteFileVersion::V1 {
         if let Some((first_version, other_version)) = first_mismatch {
             return Err(Error::internal(format!(
                 "The dataset contains a mixture of file versions. You will need to rollback to an earlier version: All data files must have the same version. Detected both {first_version} and {other_version}"
@@ -401,12 +401,12 @@ fn check_manifest_storage_contract(
         if let Some(actual) = first_file_version
             && actual != ConcreteFileVersion::V1
         {
-            fallback = actual;
-            first_non_fallback = None;
+            effective_version = actual;
+            first_non_default = None;
             if matches!(mode, StorageContractMode::Finalize) {
                 log::warn!(
                     "Data storage version {} is less than the actual file version {}. This has been automatically updated.",
-                    declared_fallback,
+                    default_version,
                     actual
                 );
                 manifest.data_storage_format = DataStorageFormat::new(actual);
@@ -425,16 +425,16 @@ fn check_manifest_storage_contract(
             "Dataset has mixed data-file-version capability enabled but references V1 data files",
         ));
     }
-    if let Some((path, fragment_id, file_version)) = first_non_fallback {
-        if file_version == ConcreteFileVersion::V1 || fallback == ConcreteFileVersion::V1 {
+    if let Some((path, fragment_id, file_version)) = first_non_default {
+        if file_version == ConcreteFileVersion::V1 || effective_version == ConcreteFileVersion::V1 {
             return Err(Error::invalid_input(format!(
-                "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest fallback is {fallback}; V1 and V2 storage versions cannot be mixed"
+                "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest default is {effective_version}; V1 and V2 storage versions cannot be mixed"
             )));
         }
         match mode {
             StorageContractMode::Read => {
                 return Err(Error::invalid_input(format!(
-                    "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest fallback is {fallback} and mixed data-file-version capability is not enabled"
+                    "Data file '{path}' in fragment {fragment_id} has version {file_version}, but the manifest default is {effective_version} and mixed data-file-version capability is not enabled"
                 )));
             }
             StorageContractMode::Commit => {}

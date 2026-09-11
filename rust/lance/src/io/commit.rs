@@ -3142,7 +3142,7 @@ mod tests {
         let err = check_storage_version(&mut manifest).unwrap_err();
 
         assert!(matches!(err, Error::InvalidInput { .. }));
-        assert!(err.to_string().contains("requires a V2 fallback"), "{err}");
+        assert!(err.to_string().contains("requires a V2 default"), "{err}");
     }
 
     #[test]
