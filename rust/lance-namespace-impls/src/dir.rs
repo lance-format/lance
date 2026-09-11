@@ -1159,7 +1159,6 @@ impl DirectoryNamespace {
 
     /// List tables using directory scanning (fallback method)
     async fn list_directory_tables(&self) -> Result<Vec<String>> {
-        let mut tables = Vec::new();
         let entries = self
             .object_store
             .read_dir(self.base_path.clone())
@@ -1170,21 +1169,31 @@ impl DirectoryNamespace {
                 })
             })?;
 
-        for entry in entries {
-            let path = entry.trim_end_matches('/');
-            if !path.ends_with(".lance") {
-                continue;
+        let candidates: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .trim_end_matches('/')
+                    .strip_suffix(".lance")
+                    .map(|name| name.to_string())
+            })
+            .collect();
+
+        // Each candidate needs its own `check_table_status` round trip (a `read_dir` probe
+        // for a deregistration marker), so this is linear in the number of listed entries;
+        // run a bounded number concurrently rather than one at a time.
+        let mut stream =
+            futures::stream::iter(candidates.into_iter().map(|table_name| async move {
+                let status = self.check_table_status(&table_name).await?;
+                Ok::<Option<String>, Error>((!status.is_deregistered).then_some(table_name))
+            }))
+            .buffered(manifest::DECLARED_FILTER_CONCURRENCY);
+
+        let mut tables = Vec::new();
+        while let Some(result) = stream.next().await {
+            if let Some(table_name) = result? {
+                tables.push(table_name);
             }
-
-            let table_name = &path[..path.len() - 6];
-
-            // Use atomic check to skip deregistered tables.
-            let status = self.check_table_status(table_name).await?;
-            if status.is_deregistered {
-                continue;
-            }
-
-            tables.push(table_name.to_string());
         }
 
         Ok(tables)
