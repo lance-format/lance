@@ -229,6 +229,15 @@ message VectorIndexDetails {
    * Unrecognized keys must be silently ignored by all runtimes.
    */
   map<string, string> runtime_hints = 9;
+
+  /* The number of IVF partitions this index was asked to train.
+   *
+   * Absent when no count was requested, in which case the partitioning was
+   * derived from the data and a rebuild derives it again. Present when a caller
+   * named a count: a rebuild starts from that count, and may still train fewer
+   * partitions when the data cannot support them.
+   */
+  optional uint32 num_partitions = 10;
 }
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.

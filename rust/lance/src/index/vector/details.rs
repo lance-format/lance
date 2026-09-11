@@ -162,6 +162,7 @@ pub fn vector_index_details(params: &VectorIndexParams) -> prost_types::Any {
         hnsw_index_config,
         compression,
         runtime_hints,
+        num_partitions: None,
     };
     prost_types::Any::from_msg(&details).unwrap()
 }
@@ -564,6 +565,7 @@ fn convert_legacy_proto_to_details(proto: &pb::Index) -> Result<prost_types::Any
         hnsw_index_config: None,
         compression,
         runtime_hints: Default::default(),
+        num_partitions: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -703,6 +705,7 @@ async fn convert_v3_metadata_to_details(
         hnsw_index_config,
         compression,
         runtime_hints: Default::default(),
+        num_partitions: None,
     };
     Ok(prost_types::Any::from_msg(&details).unwrap())
 }
@@ -752,6 +755,7 @@ mod tests {
             hnsw_index_config: hnsw,
             compression,
             runtime_hints: Default::default(),
+            num_partitions: None,
         };
         prost_types::Any::from_msg(&details).unwrap()
     }
@@ -901,6 +905,7 @@ mod tests {
                 hnsw_index_config: None,
                 compression: None,
                 runtime_hints: Default::default(),
+                num_partitions: None,
             };
             prost_types::Any::from_msg(&d).unwrap()
         };
