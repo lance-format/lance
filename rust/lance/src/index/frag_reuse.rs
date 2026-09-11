@@ -12,9 +12,7 @@ use lance_index::frag_reuse::{
 };
 use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, RowIdRemapper};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
-use lance_table::format::pb::fragment_reuse_index_details::{
-    self as pb_fri, Content, InlineContent,
-};
+use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use lance_table::format::{IndexMetadata, Manifest};
 use lance_table::transaction::{FragmentReuseRewrite, RewriteGroup};
@@ -381,7 +379,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
 ) -> lance_core::Result<IndexMetadata> {
     let index_id = uuid::Uuid::new_v4();
     let new_index_details_proto = InlineContent::from(&new_index_details);
-    let proto = if new_index_details_proto.encoded_len() > 204800 {
+    let proto = if new_index_details_proto.encoded_len() > FRAG_REUSE_INLINE_DETAILS_LIMIT {
         let file_path = dataset
             .indices_dir()
             .join(index_id.to_string())
@@ -554,8 +552,9 @@ pub(crate) async fn load_raw_frag_reuse_content(
 
 /// [`load_raw_frag_reuse_content`] with the external read abstracted: callers
 /// outside a live `Dataset` (the shallow-clone relocation reads the SOURCE
-/// dataset's entry before the clone exists) supply their own resolution.
-async fn extract_raw_frag_reuse_content<F, Fut>(
+/// dataset's entry before the clone exists; the parent's cleanup reads a
+/// BRANCH manifest's entry) supply their own resolution.
+pub(crate) async fn extract_raw_frag_reuse_content<F, Fut>(
     details: &prost_types::Any,
     read_external: F,
 ) -> lance_core::Result<Vec<u8>>
@@ -931,7 +930,7 @@ async fn encode_tagged_frag_reuse_details(
     index_id: Uuid,
     content: Vec<u8>,
 ) -> lance_core::Result<Vec<u8>> {
-    if content.len() > 204800 {
+    if content.len() > FRAG_REUSE_INLINE_DETAILS_LIMIT {
         let file_path = indices_dir
             .join(index_id.to_string())
             .join(FRAG_REUSE_DETAILS_FILE_NAME);
@@ -952,12 +951,24 @@ async fn encode_tagged_frag_reuse_details(
     }
 }
 
+/// Details above this size spill to an external `details.binpb` file.
+pub(crate) const FRAG_REUSE_INLINE_DETAILS_LIMIT: usize = 204800;
+
+/// `InlineContent.Transition.stable_partition` (proto field 4).
+const STABLE_PARTITION_FIELD: u32 = 4;
+/// `StablePartition.base_id` (proto field 3, varint).
+const STABLE_PARTITION_BASE_ID_FIELD: u32 = 3;
+
 /// Rewrite each stable-partition mapping's `base_id` through `remap`, leaving
-/// every record it does not rewrite in its exact wire form (legacy versions
-/// and ordered-compaction transitions carry no base references). An unknown
-/// envelope record is refused: it may participate in base resolution in ways
+/// every other byte in its exact wire form. The rewrite is a surgical
+/// wire-level patch (no protobuf decode/re-encode), so unknown NESTED fields
+/// -- extensions of `StablePartition` or `FragmentDigest` this writer does
+/// not know, exactly the shape `base_id` itself was added in -- survive
+/// byte-identically instead of being silently stripped. An unknown envelope
+/// record is still refused: it may participate in base resolution in ways
 /// this writer cannot see, so a history it cannot fully parse must not be
-/// relocated (mirrors the trim's obligation).
+/// relocated (mirrors the trim's obligation). Unknown fields INSIDE a
+/// transition are refused earlier, by the ledger gate the caller runs.
 fn relocate_stable_partition_bases(
     content: &[u8],
     remap: impl Fn(Option<u32>) -> lance_core::Result<Option<u32>>,
@@ -987,28 +998,134 @@ fn relocate_stable_partition_bases(
         }
         let payload = buf.split_to(length as usize);
         let end = total - buf.remaining();
-        if tag == 1 {
-            // Legacy versions reference no bases; verbatim.
+        if tag == 2
+            && let Some(patched) = patch_transition_stable_partition(&payload, &remap)?
+        {
+            output.extend_from_slice(&encode_length_delimited_field(2, &patched));
+        } else {
+            // Legacy versions and transitions without a stable-partition
+            // mapping (ordered compaction) reference no bases; verbatim.
             output.extend_from_slice(&content[start..end]);
-            continue;
         }
-        let mut transition =
-            pb_fri::Transition::decode(payload).map_err(|e| corrupt(e.to_string()))?;
-        match &mut transition.mapping {
-            Some(pb_fri::transition::Mapping::StablePartition(partition)) => {
-                partition.base_id = remap(partition.base_id)?;
-                output.extend_from_slice(&encode_length_delimited_field(
-                    2,
-                    &transition.encode_to_vec(),
+    }
+    Ok(output)
+}
+
+/// Patch a transition's stable-partition submessage in place, copying every
+/// other field's bytes verbatim (whatever their field number or wire type).
+/// Returns `None` when the transition carries no stable-partition mapping.
+fn patch_transition_stable_partition(
+    raw: &[u8],
+    remap: &impl Fn(Option<u32>) -> lance_core::Result<Option<u32>>,
+) -> lance_core::Result<Option<Vec<u8>>> {
+    use bytes::Buf;
+    use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
+
+    let corrupt = |message: String| Error::corrupt_file_named("FRI details", message);
+    let total = raw.len();
+    let mut buf = bytes::Bytes::copy_from_slice(raw);
+    let mut output = Vec::with_capacity(raw.len() + 8);
+    let mut found = false;
+    while buf.has_remaining() {
+        let start = total - buf.remaining();
+        let (tag, wire_type) = decode_key(&mut buf).map_err(|e| corrupt(e.to_string()))?;
+        if tag == STABLE_PARTITION_FIELD {
+            if wire_type != WireType::LengthDelimited {
+                return Err(corrupt("stable partition mapping must be a message".into()));
+            }
+            let length = decode_varint(&mut buf).map_err(|e| corrupt(e.to_string()))?;
+            if length > buf.remaining() as u64 {
+                return Err(corrupt(format!(
+                    "stable partition length {length} exceeds remaining {} bytes",
+                    buf.remaining()
+                )));
+            }
+            let payload = buf.split_to(length as usize);
+            if found {
+                // The ledger gate rejects this before relocation runs.
+                return Err(corrupt(
+                    "transition contains multiple stable-partition mappings".into(),
                 ));
             }
-            // No base references; keep the exact wire form.
-            Some(pb_fri::transition::Mapping::OrderedCompaction(_)) => {
-                output.extend_from_slice(&content[start..end]);
+            found = true;
+            let patched = patch_stable_partition_base(&payload, remap)?;
+            output.extend_from_slice(&encode_length_delimited_field(
+                STABLE_PARTITION_FIELD,
+                &patched,
+            ));
+        } else {
+            if wire_type == WireType::LengthDelimited {
+                let length = decode_varint(&mut buf).map_err(|e| corrupt(e.to_string()))?;
+                if length > buf.remaining() as u64 {
+                    return Err(corrupt(format!(
+                        "field {tag} length {length} exceeds remaining {} bytes",
+                        buf.remaining()
+                    )));
+                }
+                buf.advance(length as usize);
+            } else {
+                skip_field(wire_type, tag, &mut buf, DecodeContext::default())
+                    .map_err(|e| corrupt(e.to_string()))?;
             }
-            // The ledger validation run before relocation rejects these.
-            None => return Err(corrupt("transition has no mapping".into())),
+            let end = total - buf.remaining();
+            output.extend_from_slice(&raw[start..end]);
         }
+    }
+    Ok(found.then_some(output))
+}
+
+/// Drop the submessage's `base_id` field wherever it occurs (proto3
+/// last-one-wins yields the effective current value) and re-emit the
+/// remapped value at the end; every other byte is preserved verbatim.
+fn patch_stable_partition_base(
+    raw: &[u8],
+    remap: &impl Fn(Option<u32>) -> lance_core::Result<Option<u32>>,
+) -> lance_core::Result<Vec<u8>> {
+    use bytes::Buf;
+    use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
+
+    let corrupt = |message: String| Error::corrupt_file_named("FRI details", message);
+    let total = raw.len();
+    let mut buf = bytes::Bytes::copy_from_slice(raw);
+    let mut output = Vec::with_capacity(raw.len() + 8);
+    let mut existing = None;
+    while buf.has_remaining() {
+        let start = total - buf.remaining();
+        let (tag, wire_type) = decode_key(&mut buf).map_err(|e| corrupt(e.to_string()))?;
+        if tag == STABLE_PARTITION_BASE_ID_FIELD {
+            if wire_type != WireType::Varint {
+                return Err(corrupt("stable partition base_id must be a varint".into()));
+            }
+            let value = decode_varint(&mut buf).map_err(|e| corrupt(e.to_string()))?;
+            existing =
+                Some(u32::try_from(value).map_err(|_| {
+                    corrupt(format!("stable partition base_id {value} overflows u32"))
+                })?);
+        } else {
+            if wire_type == WireType::LengthDelimited {
+                let length = decode_varint(&mut buf).map_err(|e| corrupt(e.to_string()))?;
+                if length > buf.remaining() as u64 {
+                    return Err(corrupt(format!(
+                        "field {tag} length {length} exceeds remaining {} bytes",
+                        buf.remaining()
+                    )));
+                }
+                buf.advance(length as usize);
+            } else {
+                skip_field(wire_type, tag, &mut buf, DecodeContext::default())
+                    .map_err(|e| corrupt(e.to_string()))?;
+            }
+            let end = total - buf.remaining();
+            output.extend_from_slice(&raw[start..end]);
+        }
+    }
+    if let Some(base_id) = remap(existing)? {
+        prost::encoding::encode_key(
+            STABLE_PARTITION_BASE_ID_FIELD,
+            WireType::Varint,
+            &mut output,
+        );
+        prost::encoding::encode_varint(u64::from(base_id), &mut output);
     }
     Ok(output)
 }
@@ -1028,6 +1145,10 @@ fn relocate_stable_partition_bases(
 /// A history this writer cannot fully interpret (unsupported transitions or
 /// unknown records) is refused with `NotSupported` before anything is
 /// written, per the spec's writer obligation.
+///
+/// Returns the relocated entry and, when the details spilled to an external
+/// file in the target, that file's path so a failed clone commit can delete
+/// it again.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn relocate_tagged_entry_for_shallow_clone(
     source_store: &ObjectStore,
@@ -1038,7 +1159,7 @@ pub(crate) async fn relocate_tagged_entry_for_shallow_clone(
     new_base_id: u32,
     target_store: &ObjectStore,
     target_base: &Path,
-) -> lance_core::Result<IndexMetadata> {
+) -> lance_core::Result<(IndexMetadata, Option<Path>)> {
     let details = entry
         .index_details
         .as_ref()
@@ -1071,6 +1192,11 @@ pub(crate) async fn relocate_tagged_entry_for_shallow_clone(
                 } else {
                     path
                 };
+                // Foreign bases are opened with default store params:
+                // per-base source credentials are not plumbed through the
+                // clone commit path. Documented limitation shared with deep
+                // clone's base reads (see
+                // <https://github.com/lance-format/lance/issues/6093>).
                 let (store, _) = ObjectStore::from_uri_and_params(
                     registry,
                     &base_path.path,
@@ -1124,30 +1250,36 @@ pub(crate) async fn relocate_tagged_entry_for_shallow_clone(
     decode_frag_reuse_ledger_from_content(entry.index_version, &relocated).await?;
 
     let index_id = Uuid::new_v4();
-    let details_value = encode_tagged_frag_reuse_details(
-        target_store,
-        target_base.clone().join(crate::dataset::INDICES_DIR),
-        index_id,
-        relocated,
-    )
-    .await?;
-    Ok(IndexMetadata {
-        uuid: index_id,
-        name: entry.name.clone(),
-        fields: entry.fields.clone(),
-        covering_fields: entry.covering_fields.clone(),
-        dataset_version: entry.dataset_version,
-        fragment_bitmap: entry.fragment_bitmap.clone(),
-        index_details: Some(Arc::new(prost_types::Any {
-            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-            value: details_value,
-        })),
-        index_version: entry.index_version,
-        created_at: entry.created_at,
-        // The relocated entry lives in the clone.
-        base_id: None,
-        files: entry.files.clone(),
-    })
+    let target_indices_dir = target_base.clone().join(crate::dataset::INDICES_DIR);
+    let spilled = (relocated.len() > FRAG_REUSE_INLINE_DETAILS_LIMIT).then(|| {
+        target_indices_dir
+            .clone()
+            .join(index_id.to_string())
+            .join(FRAG_REUSE_DETAILS_FILE_NAME)
+    });
+    let details_value =
+        encode_tagged_frag_reuse_details(target_store, target_indices_dir, index_id, relocated)
+            .await?;
+    Ok((
+        IndexMetadata {
+            uuid: index_id,
+            name: entry.name.clone(),
+            fields: entry.fields.clone(),
+            covering_fields: entry.covering_fields.clone(),
+            dataset_version: entry.dataset_version,
+            fragment_bitmap: entry.fragment_bitmap.clone(),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                value: details_value,
+            })),
+            index_version: entry.index_version,
+            created_at: entry.created_at,
+            // The relocated entry lives in the clone.
+            base_id: None,
+            files: entry.files.clone(),
+        },
+        spilled,
+    ))
 }
 
 #[cfg(test)]
@@ -2986,6 +3118,297 @@ mod tests {
             // Nothing was created at the target.
             assert!(Dataset::open(clone_uri.as_str()).await.is_err());
             assert_eq!(dataset.manifest.version, version);
+        }
+
+        /// The `_indices/<uuid>/` directories under the dataset's own base.
+        async fn list_index_dirs(dataset: &Dataset) -> Vec<String> {
+            let prefix = dataset.base.clone().join(crate::dataset::INDICES_DIR);
+            let mut ids = HashSet::new();
+            let mut stream = dataset.object_store.read_dir_all(&prefix, None);
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(meta)) => {
+                        let relative = meta
+                            .location
+                            .as_ref()
+                            .strip_prefix(prefix.as_ref())
+                            .unwrap()
+                            .trim_start_matches('/');
+                        ids.insert(relative.split('/').next().unwrap().to_string());
+                    }
+                    Ok(None) => break,
+                    Err(Error::NotFound { .. }) => break,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            let mut ids: Vec<String> = ids.into_iter().collect();
+            ids.sort();
+            ids
+        }
+
+        /// Owner-required regression: the PARENT's cleanup must not delete
+        /// `_fri/` row maps a branch still translates through.
+        ///
+        /// 1. Tagged source (stable-partition mapping), `create_branch` a
+        ///    child (the branch carries a relocated entry stamped to the
+        ///    parent base).
+        /// 2. The source rebuilds its index and trims its FRI history away.
+        /// 3. The source's cleanup expires the older versions.
+        /// 4. The child's indexed queries still succeed, opening the
+        ///    source's row map. Retaining the branch-point manifest alone is
+        ///    not enough: the map ids must be collected into the referenced
+        ///    set explicitly.
+        ///
+        /// The control case runs the same drain without a branch: nothing
+        /// references the map and cleanup collects it.
+        #[rstest::rstest]
+        #[case::branch_pins_the_map(true)]
+        #[case::no_branch_releases_the_map(false)]
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn parent_cleanup_spares_row_maps_a_branch_translates_through(
+            #[case] with_branch: bool,
+        ) {
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let mut parent = disk_fixture(source_dir.as_str()).await;
+            reserve_fragments(&mut parent, 20).await;
+            let before = sorted_values(&parent).await;
+            let source_ids: Vec<u64> = parent.fragments().iter().map(|f| f.id).collect();
+            let mut parent = commit_stable_partition(parent, &source_ids, 10).await;
+            let map_dirs = list_fri_map_dirs(&parent).await;
+            assert_eq!(map_dirs.len(), 1);
+
+            let child_uri = if with_branch {
+                let version = parent.manifest.version;
+                let child = parent.create_branch("child", version, None).await.unwrap();
+                // The branch's relocated entry reads the parent's row map in
+                // place, through the base stamped at branch creation.
+                let stored = crate::index::load_all_indices(&child).await.unwrap();
+                let entry = stored_fri(&stored);
+                assert_eq!(entry.base_id, None);
+                let ledger = decode_entry(&child, &entry).await;
+                assert_eq!(stable_partition_bases(&ledger), vec![Some(0)]);
+                Some(child.uri().to_string())
+            } else {
+                None
+            };
+
+            // The parent drains: index rebuilt over the destinations, tagged
+            // history trimmed away entirely.
+            parent
+                .create_index(
+                    &["i"],
+                    lance_index::IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &lance_index::scalar::ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut parent)
+                .await
+                .unwrap();
+            let stored = crate::index::load_all_indices(&parent).await.unwrap();
+            assert!(!stored.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME));
+
+            // Expire every old parent version.
+            crate::dataset::cleanup::cleanup_old_versions(
+                &parent,
+                crate::dataset::cleanup::CleanupPolicyBuilder::default()
+                    .before_timestamp(
+                        chrono::Utc::now() + chrono::TimeDelta::try_seconds(10).unwrap(),
+                    )
+                    .delete_unverified(true)
+                    .error_if_tagged_old_versions(false)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+            if let Some(child_uri) = child_uri {
+                // The branch pins the row map, and the child (opened fresh,
+                // no warm caches) still translates through it.
+                assert_eq!(list_fri_map_dirs(&parent).await, map_dirs);
+                let child = Dataset::open(child_uri.as_str()).await.unwrap();
+                assert_eq!(sorted_values(&child).await, before);
+                assert_eq!(filtered_values(&child, "i = 3").await, vec![3]);
+                assert_eq!(filtered_values(&child, "i >= 4").await, vec![4, 5, 6, 7]);
+            } else {
+                // Control: nothing references the map; the same cleanup
+                // collects it.
+                assert!(list_fri_map_dirs(&parent).await.is_empty());
+            }
+        }
+
+        /// The relocation must not silently strip nested unknown fields:
+        /// `base_id` is patched at the wire level, so extensions inside the
+        /// stable-partition submessage or a fragment digest (exactly the
+        /// shape `base_id` itself was added in) survive byte-identically.
+        #[tokio::test]
+        async fn clone_preserves_unknown_nested_wire_fields() {
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_uri = format!("{}/clone", clone_dir.as_str());
+            let mut dataset = disk_fixture(source_dir.as_str()).await;
+            let before = sorted_values(&dataset).await;
+            let (transition, destinations) = reader_tests::prepare(&dataset).await;
+
+            // Re-encode the transition by hand, planting unknown subfields
+            // inside the first source digest and the stable-partition
+            // submessage.
+            let Some(transition::Mapping::StablePartition(partition)) = &transition.mapping else {
+                unreachable!()
+            };
+            let mut partition_bytes = partition.encode_to_vec();
+            partition_bytes.extend(reader_tests::field(9, b"stable-partition-extension"));
+            let build_transition = |partition_bytes: &[u8]| {
+                let mut raw = Vec::new();
+                for (position, digest) in transition.sources.iter().enumerate() {
+                    let mut digest_bytes = digest.encode_to_vec();
+                    if position == 0 {
+                        digest_bytes.extend(reader_tests::field(9, b"digest-extension"));
+                    }
+                    raw.extend(reader_tests::field(1, &digest_bytes));
+                }
+                for digest in transition.destinations.iter() {
+                    raw.extend(reader_tests::field(2, &digest.encode_to_vec()));
+                }
+                raw.extend(reader_tests::field(4, partition_bytes));
+                reader_tests::field(2, &raw)
+            };
+            let content = build_transition(&partition_bytes);
+            reader_tests::install(&mut dataset, content, destinations, false).await;
+            let indices = crate::index::load_all_indices(&dataset)
+                .await
+                .unwrap()
+                .as_ref()
+                .clone();
+            reader_tests::persist_fixture(&mut dataset, indices).await;
+
+            let version = dataset.manifest.version;
+            let clone = dataset
+                .shallow_clone(clone_uri.as_str(), version, None)
+                .await
+                .unwrap();
+
+            // Byte-exact expectation: everything identical except the
+            // stable-partition submessage gains `base_id = 0` (field 3,
+            // varint) appended after its preserved unknown field.
+            let mut expected_partition = partition_bytes.clone();
+            expected_partition.extend([0x18, 0x00]);
+            let expected = build_transition(&expected_partition);
+            let stored = crate::index::load_all_indices(&clone).await.unwrap();
+            let entry = stored_fri(&stored);
+            let clone_content = load_raw_frag_reuse_content(&clone, &entry).await.unwrap();
+            assert_eq!(clone_content, expected);
+
+            // The relocated history still resolves and translates.
+            let ledger = decode_entry(&clone, &entry).await;
+            assert_eq!(stable_partition_bases(&ledger), vec![Some(0)]);
+            assert_eq!(sorted_values(&clone).await, before);
+            assert_eq!(filtered_values(&clone, "i = 3").await, vec![3]);
+        }
+
+        /// Parity with `deep_clone`: shallow-cloning onto a URI where a
+        /// dataset already lives fails before anything is written there, so
+        /// a tagged clone cannot pollute a live dataset's `_indices/` with
+        /// staged details.
+        #[tokio::test]
+        async fn clone_onto_existing_dataset_rejected() {
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let target_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let target_uri = format!("{}/occupied", target_dir.as_str());
+            let mut dataset = disk_fixture(source_dir.as_str()).await;
+            // External details: without the pre-check, the relocation would
+            // stage a spilled details file into the occupied target.
+            commit_big_v0_entry(&mut dataset).await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+
+            let occupied = lance_datagen::gen_batch()
+                .col("j", lance_datagen::array::step::<Int32Type>())
+                .into_dataset(
+                    target_uri.as_str(),
+                    crate::utils::test::FragmentCount::from(1),
+                    crate::utils::test::FragmentRowCount::from(4),
+                )
+                .await
+                .unwrap();
+            let occupied_version = occupied.manifest.version;
+            assert!(list_index_dirs(&occupied).await.is_empty());
+
+            let version = dataset.manifest.version;
+            let error = dataset
+                .shallow_clone(target_uri.as_str(), version, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::DatasetAlreadyExists { .. }),
+                "{error}"
+            );
+            // Nothing was staged in the occupied dataset.
+            assert!(list_index_dirs(&occupied).await.is_empty());
+            let reopened = Dataset::open(target_uri.as_str()).await.unwrap();
+            assert_eq!(reopened.manifest.version, occupied_version);
+        }
+
+        /// A clone commit that conclusively fails must delete the details
+        /// file it staged in the target, alongside its transaction file.
+        /// Driven through the internal commit path: the public
+        /// `shallow_clone` rejects an occupied target before staging, so the
+        /// racing case is simulated by committing the same clone twice.
+        #[tokio::test]
+        async fn failed_clone_commit_cleans_staged_details() {
+            let source_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_dir = lance_core::utils::tempfile::TempStrDir::default();
+            let clone_uri = format!("{}/clone", clone_dir.as_str());
+            let mut dataset = disk_fixture(source_dir.as_str()).await;
+            commit_big_v0_entry(&mut dataset).await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+
+            let version = dataset.manifest.version;
+            let clone = dataset
+                .shallow_clone(clone_uri.as_str(), version, None)
+                .await
+                .unwrap();
+            // Exactly the relocated entry's spilled details dir.
+            let staged = list_index_dirs(&clone).await;
+            assert_eq!(staged.len(), 1);
+
+            let transaction = Transaction::new(
+                version,
+                Operation::Clone {
+                    is_shallow: true,
+                    ref_name: None,
+                    ref_version: version,
+                    ref_path: dataset.uri().to_string(),
+                    branch_name: None,
+                },
+                None,
+            );
+            let error = crate::io::commit::commit_new_dataset(
+                &dataset.object_store,
+                None,
+                dataset.commit_handler.as_ref(),
+                &clone.base,
+                &transaction,
+                &Default::default(),
+                clone.manifest_location.naming_scheme,
+                dataset.metadata_cache.as_ref(),
+                dataset.session.store_registry(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::DatasetAlreadyExists { .. }),
+                "{error}"
+            );
+            // The retry's staged details file was deleted again; only the
+            // committed clone's remains.
+            assert_eq!(list_index_dirs(&clone).await, staged);
         }
     }
 }

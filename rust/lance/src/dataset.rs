@@ -3265,6 +3265,23 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
+        // Prevent cloning into an existing target dataset (parity with
+        // `deep_clone`) before anything is written there: a tagged clone
+        // stages its relocated FRI details in the target's `_indices/`
+        // ahead of the manifest commit, which must not pollute a live
+        // dataset. The check goes through the same store and commit handler
+        // the commit below writes through.
+        let target_base =
+            ObjectStore::extract_path_from_uri(self.session.store_registry(), target_path)?;
+        if self
+            .commit_handler
+            .resolve_latest_location(&target_base, &self.object_store)
+            .await
+            .is_ok()
+        {
+            return Err(Error::dataset_already_exists(target_path.to_string()));
+        }
+
         let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
         let source_location = self.branch_location().find_branch(ref_name.as_deref())?;
         let clone_op = Operation::Clone {

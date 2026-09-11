@@ -321,6 +321,14 @@ struct CleanupInspection {
     /// entry uuid so each is decoded at most once; the flag records whether
     /// some retained (working-set) manifest carries the entry.
     frag_reuse_entries: HashMap<uuid::Uuid, (IndexMetadata, bool)>,
+    /// Tagged FRI entry uuids per manifest version, so a branch rescue that
+    /// retains a parent manifest can flip its entries into the working set
+    /// (their row maps become referenced instead of merely verified).
+    frag_reuse_entry_versions: HashMap<u64, Vec<uuid::Uuid>>,
+    /// Set when a branch manifest's FRI history could not be interpreted:
+    /// `_fri/` garbage collection is skipped for the run rather than risking
+    /// row maps the branch references invisibly.
+    skip_frag_reuse_gc: bool,
     /// The earliest timestamp of all retained manifests.
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
     /// The latest timestamp of all manifests that will be removed.
@@ -682,6 +690,11 @@ impl<'a> CleanupTask<'a> {
                     .entry(index.uuid)
                     .or_insert_with(|| (index.clone(), false));
                 entry.1 |= in_working_set;
+                inspection
+                    .frag_reuse_entry_versions
+                    .entry(manifest.version)
+                    .or_default()
+                    .push(index.uuid);
             }
         }
         Ok(())
@@ -764,7 +777,8 @@ impl<'a> CleanupTask<'a> {
         &self,
         mut inspection: CleanupInspection,
     ) -> Result<CleanupRunResult> {
-        let collect_frag_reuse_maps = self.resolve_frag_reuse_map_ids(&mut inspection).await;
+        let collect_frag_reuse_maps = !inspection.skip_frag_reuse_gc
+            && self.resolve_frag_reuse_map_ids(&mut inspection).await;
         let inspection = inspection;
         let cleanup_result = Mutex::new(CleanupRunResult::default());
         let deletes_files = self.action.deletes_files();
@@ -1355,6 +1369,7 @@ impl<'a> CleanupTask<'a> {
                 })
                 .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                     self.process_branch_referenced_manifests(
+                        &branch_location.path,
                         location,
                         *root_version_number,
                         &inspection,
@@ -1365,8 +1380,107 @@ impl<'a> CleanupTask<'a> {
         Ok(inspection.into_inner().unwrap())
     }
 
+    /// The `_fri/<map_id>/` row maps a branch manifest's tagged FRI entry
+    /// resolves into THIS dataset's base: stable-partition mappings whose
+    /// `base_id` names the parent (a branch clone's relocated entry keeps
+    /// reading the parent's row maps in place). The entry's own details are
+    /// read base-aware, exactly as a reader on the branch would.
+    async fn branch_frag_reuse_parent_map_ids(
+        &self,
+        branch_root: &Path,
+        manifest: &Manifest,
+        entry: &IndexMetadata,
+    ) -> Result<Vec<String>> {
+        use lance_table::system_index::frag_reuse::ledger::Mapping;
+
+        let details = entry
+            .index_details
+            .as_ref()
+            .filter(|details| details.type_url.ends_with("FragmentReuseIndexDetails"))
+            .ok_or_else(|| Error::index("Index details is not for the fragment reuse index"))?;
+        let content =
+            crate::index::frag_reuse::extract_raw_frag_reuse_content(details, |file| async move {
+                let end = file
+                    .offset
+                    .checked_add(file.size)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| {
+                        Error::corrupt_file_named("FRI details", "external FRI range overflow")
+                    })?;
+                let (store, indices_dir) = match entry.base_id {
+                    None => (None, branch_root.clone().join(crate::dataset::INDICES_DIR)),
+                    Some(id) => {
+                        let base_path = manifest.base_paths.get(&id).ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "base_path id {} not found for index {}",
+                                id, entry.uuid
+                            ))
+                        })?;
+                        let path = base_path.extract_path(self.dataset.session.store_registry())?;
+                        let dir = if base_path.is_dataset_root {
+                            path.join(crate::dataset::INDICES_DIR)
+                        } else {
+                            path
+                        };
+                        let store = if base_path.path == self.dataset.uri {
+                            None
+                        } else {
+                            // Foreign bases are opened with default store
+                            // params; per-base credentials are not plumbed
+                            // through cleanup (see
+                            // <https://github.com/lance-format/lance/issues/6093>).
+                            Some(
+                                lance_io::object_store::ObjectStore::from_uri_and_params(
+                                    self.dataset.session.store_registry(),
+                                    &base_path.path,
+                                    &Default::default(),
+                                )
+                                .await?
+                                .0,
+                            )
+                        };
+                        (store, dir)
+                    }
+                };
+                let path = indices_dir
+                    .join(entry.uuid.to_string())
+                    .join(file.path.as_str());
+                let store = store.as_deref().unwrap_or(&self.dataset.object_store);
+                store
+                    .open(&path)
+                    .await?
+                    .get_range(file.offset as usize..end)
+                    .await
+                    .map_err(Error::from)
+            })
+            .await?;
+        let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(
+            entry.index_version,
+            &content,
+        )
+        .await?;
+        if ledger.has_unsupported_transitions() {
+            return Err(Error::not_supported(
+                "the branch's tagged FRI history carries transitions this client cannot interpret",
+            ));
+        }
+        Ok(ledger
+            .transitions()
+            .iter()
+            .filter_map(|transition| match transition.mapping() {
+                Mapping::StablePartition(partition) => partition
+                    .base_id
+                    .and_then(|id| manifest.base_paths.get(&id))
+                    .filter(|base_path| base_path.path == self.dataset.uri)
+                    .map(|_| partition.map_id.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
     async fn process_branch_referenced_manifests(
         &self,
+        branch_root: &Path,
         location: ManifestLocation,
         referenced_version: u64,
         inspection: &Mutex<CleanupInspection>,
@@ -1375,6 +1489,35 @@ impl<'a> CleanupTask<'a> {
             read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+
+        // Resolve tagged FRI references into the parent before taking the
+        // lock (content reads are async). A history this client cannot
+        // interpret disables `_fri/` GC for the whole run: it may reference
+        // parent row maps invisibly.
+        let mut branch_parent_map_ids: Vec<String> = Vec::new();
+        let mut fri_unresolvable = false;
+        for index in indexes.iter() {
+            if index.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME
+                && index.index_version != 0
+            {
+                match self
+                    .branch_frag_reuse_parent_map_ids(branch_root, &manifest, index)
+                    .await
+                {
+                    Ok(map_ids) => branch_parent_map_ids.extend(map_ids),
+                    Err(error) => {
+                        warn!(
+                            entry_uuid = %index.uuid,
+                            error = %error,
+                            "Cannot resolve the row-map references of a branch's fragment \
+                             reuse index entry; skipping _fri garbage collection for this run"
+                        );
+                        fri_unresolvable = true;
+                    }
+                }
+            }
+        }
+
         let mut inspection = inspection.lock().unwrap();
         let mut is_referenced = false;
 
@@ -1439,12 +1582,39 @@ impl<'a> CleanupTask<'a> {
                 }
             }
         }
+        if fri_unresolvable {
+            inspection.skip_frag_reuse_gc = true;
+        }
+        // The branch's relocated FRI entry keeps translating through row
+        // maps that live in the parent's `_fri/`; those maps are part of the
+        // working set for as long as the branch's history references them.
+        for map_id in branch_parent_map_ids {
+            inspection.verified_files.frag_reuse_map_ids.remove(&map_id);
+            inspection
+                .referenced_files
+                .frag_reuse_map_ids
+                .insert(map_id);
+            is_referenced = true;
+        }
         if is_referenced {
             inspection
                 .old_manifests
                 .retain(|_path, version_number| *version_number != referenced_version);
             // Kept on disk, so its record stays too.
             inspection.retired_records.remove(&referenced_version);
+            // The rescued parent manifest's own FRI entries join the working
+            // set with it: their row maps become referenced, not merely
+            // verified, when `resolve_frag_reuse_map_ids` decodes them.
+            if let Some(uuids) = inspection
+                .frag_reuse_entry_versions
+                .get(&referenced_version)
+            {
+                for uuid in uuids.clone() {
+                    if let Some(entry) = inspection.frag_reuse_entries.get_mut(&uuid) {
+                        entry.1 = true;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -3105,6 +3275,7 @@ mod tests {
                 .insert(root_version, "root-identity".to_string());
         }
         task.process_branch_referenced_manifests(
+            &branch.base,
             branch.manifest_location.clone(),
             root_version,
             &inspection,

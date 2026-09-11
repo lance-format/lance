@@ -167,6 +167,18 @@ async fn cleanup_transaction_file(
     }
 }
 
+/// Best-effort removal of files a shallow clone staged in the target before
+/// its commit conclusively failed (the relocated FRI entry's spilled
+/// `details.binpb`). Never called when the commit outcome is unknown: the
+/// clone may have landed and still need them.
+async fn cleanup_spilled_clone_files(object_store: &ObjectStore, spilled_files: &[Path]) {
+    for path in spilled_files {
+        if let Err(e) = object_store.delete(path).await {
+            log::warn!("Failed to clean up staged clone file '{}': {}", path, e);
+        }
+    }
+}
+
 /// Who owns the manifest at a version, checked after a failed commit attempt.
 #[derive(Debug)]
 enum CommitOutcome {
@@ -363,6 +375,9 @@ async fn do_commit_new_dataset(
     // copy would tie the verdict to the payload size instead.
     let may_change_schema = operation_may_change_schema(&pb_transaction);
 
+    // Files a shallow clone writes into the target before the manifest
+    // commit; deleted again when the commit conclusively fails.
+    let mut spilled_clone_files: Vec<Path> = Vec::new();
     let clone_source = if let Operation::Clone {
         is_shallow,
         ref_version,
@@ -425,17 +440,20 @@ async fn do_commit_new_dataset(
                     // Restamp the entry's row-map references through the
                     // clone's base mapping and move the entry itself into the
                     // clone; the row-map files stay where they are.
-                    index = crate::index::frag_reuse::relocate_tagged_entry_for_shallow_clone(
-                        source_store,
-                        &source_base_path,
-                        &source_manifest,
-                        store_registry.clone(),
-                        &index,
-                        new_base_id,
-                        object_store,
-                        base_path,
-                    )
-                    .await?;
+                    let (relocated, spilled) =
+                        crate::index::frag_reuse::relocate_tagged_entry_for_shallow_clone(
+                            source_store,
+                            &source_base_path,
+                            &source_manifest,
+                            store_registry.clone(),
+                            &index,
+                            new_base_id,
+                            object_store,
+                            base_path,
+                        )
+                        .await?;
+                    index = relocated;
+                    spilled_clone_files.extend(spilled);
                 } else if index.base_id.is_none() {
                     // Same rule as the data files in `Manifest::shallow_clone`:
                     // only the source's own entries get the new base; entries
@@ -463,7 +481,13 @@ async fn do_commit_new_dataset(
     };
 
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, base_path, &pb_transaction).await?
+        match write_transaction_file(object_store, base_path, &pb_transaction).await {
+            Ok(transaction_file) => transaction_file,
+            Err(err) => {
+                cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
+                return Err(err);
+            }
+        }
     } else {
         String::new()
     };
@@ -585,6 +609,7 @@ async fn do_commit_new_dataset(
                 }
             }
             cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+            cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
             Err(crate::Error::dataset_already_exists(base_path.to_string()))
         }
         Err(CommitError::OtherError(err)) => {
@@ -623,6 +648,7 @@ async fn do_commit_new_dataset(
                 }
             }
             cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+            cleanup_spilled_clone_files(object_store, &spilled_clone_files).await;
             Err(err)
         }
     }
