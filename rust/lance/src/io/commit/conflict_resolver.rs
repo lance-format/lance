@@ -6619,9 +6619,40 @@ mod tests {
         /// fragments are compaction candidates, so a real `compact_files`
         /// stays disjoint from a stable-partition rewrite of 10 and 11.
         async fn disk_tagged_fixture_with_small_fragments(uri: &str) -> Dataset {
-            let dataset = make_tagged(disk_fixture(uri, 2, 4).await).await;
+            // Order matters: the two-row fragments are appended and indexed
+            // BEFORE the tagging rewrite, so deferred compaction of them
+            // must record a transition (uncovered fragments would commit a
+            // plain rewrite instead; see
+            // `uncovered_deferred_compaction_commits_plain_rewrite`).
+            let dataset = disk_fixture(uri, 2, 4).await;
             let dataset = append_rows(&dataset, 100..102).await;
             let mut dataset = append_rows(&dataset, 102..104).await;
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            reserve(&mut dataset, 40).await;
+            let old_fragments: Vec<Fragment> = dataset
+                .fragments()
+                .iter()
+                .filter(|f| f.id < 2)
+                .cloned()
+                .collect();
+            let (transition, destinations) = prepare_partition(&dataset, &[0, 1], 10).await;
+            let version = dataset.manifest.version;
+            let mut dataset = commit_sp(
+                dataset,
+                version,
+                tagged_rewrite(old_fragments, destinations, vec![transition]),
+            )
+            .await
+            .unwrap();
             reserve(&mut dataset, 20).await;
             dataset
         }

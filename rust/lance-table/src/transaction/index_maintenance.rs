@@ -324,7 +324,7 @@ impl Transaction {
         let Some(frag_reuse_rewrite) = frag_reuse_rewrite else {
             return Ok(groups.to_vec());
         };
-        let sources = frag_reuse_rewrite.reordered_sources();
+        let sources = frag_reuse_rewrite.reordered_sources()?;
         let mut ordered = Vec::new();
         for group in groups {
             let covered = group

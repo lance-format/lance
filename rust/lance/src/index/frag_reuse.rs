@@ -673,6 +673,16 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
             .iter()
             .zip(transition.destinations.iter())
         {
+            // The digest claiming zero deletions is not enough: check the
+            // fragment itself, or a destination carrying a deletion file
+            // would commit a digest that undercounts its physical rows'
+            // liveness and later fail (or falsely pass) translation.
+            if frag.deletion_file.is_some() {
+                return Err(Error::invalid_input(format!(
+                    "destination fragment {} carries a deletion file; rewrite destinations                      must be written without deletions",
+                    frag.id
+                )));
+            }
             let physical_rows = frag.physical_rows.ok_or_else(|| {
                 Error::invalid_input(format!(
                     "destination fragment {} has no physical row count",
@@ -799,6 +809,9 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
             .iter()
             .chain(transition.destinations.iter())
         {
+            // In-range by construction: the ledger decode above already
+            // validated every digest id against the row-address fragment
+            // bound (the one authoritative enforcement point).
             fragment_bitmap.insert(digest.id as u32);
         }
     }
@@ -846,10 +859,12 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::frag_reuse_reader::tests as reader_tests;
     use crate::utils::test::DatagenExt;
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int32Type;
+    use arrow_array::{Int32Array, RecordBatch};
     use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
     use lance_table::format::Fragment;
     use lance_table::format::pb::fragment_reuse_index_details::{
@@ -1702,5 +1717,195 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains(&first_map_id), "{error}");
         assert_eq!(dataset.latest_version_id().await.unwrap(), version);
+    }
+
+    /// Round 5 item 4: deferred compaction of fragments no index covers and
+    /// no lineage reaches commits a plain rewrite on a tagged table -- no
+    /// new transition, the entry untouched -- instead of growing the history
+    /// with records no reader ever has to translate.
+    #[tokio::test]
+    async fn uncovered_deferred_compaction_commits_plain_rewrite() {
+        let mut dataset = reader_tests::fixture().await;
+        reserve_fragments(&mut dataset, 20).await;
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (transition, destinations) = reader_tests::prepare(&dataset).await;
+        let read_version = dataset.manifest.version;
+        let dataset = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments: destinations,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
+                        transitions: vec![transition],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+
+        // Two two-row fragments outside every bitmap: with a target of four
+        // rows they are the only compaction candidates.
+        let schema = Arc::new(arrow_schema::Schema::from(dataset.schema()));
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(100..102))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+        let mut dataset = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![
+                RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(Int32Array::from_iter_values(102..104))],
+                )
+                .unwrap(),
+            ])
+            .await
+            .unwrap();
+
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let entry_before = stored_fri(&stored);
+        let before = sorted_values(&dataset).await;
+
+        let metrics = crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 4,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 1);
+
+        // The entry is byte-for-byte the one from before the compaction.
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let entry = stored_fri(&stored);
+        assert_eq!(entry.uuid, entry_before.uuid);
+        let ledger = decode_entry(&dataset, &entry).await;
+        assert_eq!(ledger.transitions().len(), 1);
+        assert_eq!(sorted_values(&dataset).await, before);
+        assert_eq!(filtered_values(&dataset, "i = 3").await, vec![3]);
+        assert_eq!(
+            filtered_values(&dataset, "i >= 100").await,
+            (100..104).collect::<Vec<_>>()
+        );
+    }
+
+    /// Round 5 item 7: detached commits skip the rebase pipeline, so nothing
+    /// would assemble or validate transition intent, and a detached manifest
+    /// is outside the version chain where an appended history has meaning.
+    /// Both intent-carrying and tagged-entry-carrying rewrites are refused.
+    #[tokio::test]
+    async fn detached_commit_rejects_transition_intent_and_tagged_entries() {
+        let dataset = reader_tests::fixture().await;
+        let version = dataset.manifest.version;
+        let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_detached(true)
+            .execute(Transaction::new(
+                version,
+                Operation::Rewrite {
+                    groups: vec![],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    frag_reuse_rewrite: Some(FragmentReuseRewrite {
+                        transitions: vec![],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("Detached commits"), "{error}");
+
+        let entry = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: FRAG_REUSE_INDEX_NAME.to_string(),
+            fields: vec![],
+            covering_fields: vec![],
+            dataset_version: version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                value: encode_length_delimited_field(1, &[]),
+            })),
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .with_detached(true)
+            .execute(Transaction::new(
+                version,
+                Operation::Rewrite {
+                    groups: vec![],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: Some(entry),
+                    frag_reuse_rewrite: None,
+                },
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("Detached commits"), "{error}");
+    }
+
+    /// Round 5 item 9: a destination fragment carrying a deletion file is
+    /// rejected by the binding even when its digest claims zero deletions.
+    #[tokio::test]
+    async fn destination_with_deletion_file_rejected() {
+        let dataset = reader_tests::fixture().await;
+        let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+        let (transition, mut destinations) = reader_tests::prepare(&dataset).await;
+        destinations[0].deletion_file = Some(lance_table::format::DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: lance_table::format::DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+        });
+        let error = build_frag_reuse_rewrite_entry(
+            &dataset,
+            &FragmentReuseRewrite {
+                transitions: vec![transition],
+                base_entry_version: None,
+            },
+            &[RewriteGroup {
+                old_fragments,
+                new_fragments: destinations,
+            }],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("carries a deletion file"),
+            "{error}"
+        );
     }
 }

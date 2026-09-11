@@ -314,10 +314,23 @@ impl FragmentReuseRewrite {
     /// The union of the transitions' source fragment ids. Rewrite groups
     /// covered by this set skip index-bitmap maintenance: their bitmaps keep
     /// the retired source ids as provenance.
-    pub fn reordered_sources(&self) -> RoaringBitmap {
+    ///
+    /// Fragment ids in the reuse domain are bounded by the row-address
+    /// fragment space (u32); the ledger's digest validation is the
+    /// authoritative enforcement, but it only runs during entry assembly, so
+    /// an out-of-range id is rejected here too rather than silently
+    /// truncated into an alias of another fragment.
+    pub fn reordered_sources(&self) -> lance_core::Result<RoaringBitmap> {
         self.transitions
             .iter()
-            .flat_map(|transition| transition.sources.iter().map(|source| source.id as u32))
+            .flat_map(|transition| transition.sources.iter().map(|source| source.id))
+            .map(|id| {
+                u32::try_from(id).map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "transition source fragment id {id} is outside the row-address range"
+                    ))
+                })
+            })
             .collect()
     }
 }
