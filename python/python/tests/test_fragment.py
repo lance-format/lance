@@ -323,7 +323,7 @@ def test_mixed_fragment_versions(tmp_path):
 
     # Attempt to commit
     operation = lance.LanceOperation.Overwrite(ds.schema, fragments)
-    with pytest.raises(OSError, match="All data files must have the same version"):
+    with pytest.raises(OSError, match="Dataset snapshot mixes V1 and V2 data files"):
         lance.LanceDataset.commit(ds.uri, operation)
 
 

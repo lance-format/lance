@@ -130,9 +130,10 @@ message Manifest {
    *   merely-carried column with an index keyed on a different column. Writers must
    *   refuse it too: one that treats every entry of fields as keyed would maintain
    *   the index against the wrong dependency set.
-   * * 1 << 8: reserved for datasets that may reference recognized V2 data files
-   *   with different exact versions. Implementations that do not support the
-   *   per-file exact-version contract must treat this bit as unknown.
+   * * 1 << 8: the dataset may reference recognized V2 data files with different
+   *   exact versions. Readers and writers must use each DataFile's version
+   *   instead of treating data_format.version as a snapshot-wide identity.
+   *   This bit is paired in the reader and writer feature words and is one-way.
    */
   uint64 reader_feature_flags = 9;
 
@@ -183,10 +184,15 @@ message Manifest {
   message DataStorageFormat {
     // The format of the data files (e.g. "lance")
     string file_format = 1;
-    /* The max format version of the data files. The format of the version can vary by
+    /* The default format version used when writing data files. Write operations
+     * that do not select an exact version use this value. This setting does not
+     * constrain index or other file types. The version syntax is defined by
      * file_format and is not required to follow semver.
      *
-     * Every file in this version of the dataset has the same file_format version.
+     * Unless the mixed data-file-version capability is set, every referenced
+     * data file must use this version. When the capability is set, referenced
+     * data files may use other recognized exact V2 versions, and each DataFile's
+     * version is authoritative for decoding.
      */
     string version = 2;
   }

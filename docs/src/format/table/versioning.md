@@ -31,7 +31,8 @@ they should return an "unsupported" error on any read or write operation.
 | 32       | `FLAG_DISABLE_TRANSACTION_FILE` | No              | Yes             | Transactions are recorded in the manifest rather than in a separate transaction file.                       |
 | 64       | `FLAG_UNSTABLE_DATA_OVERLAY_FILES` | Yes          | Yes             | Fragments may carry data overlay files. Unstable: release builds reject it unless explicitly opted in.      |
 | 128      | `FLAG_COVERED_INDEX_METADATA`   | Yes             | Yes             | Some index declares covering columns (`IndexMetadata.covering_fields`), so `fields` means keyed columns followed by carried ones. An implementation without this flag selects an index by membership of `fields` and would answer a query on a merely-carried column with an index keyed on a different one. |
+| 256      | `FLAG_MIXED_DATA_FILE_VERSIONS` | Yes             | Yes             | The snapshot may reference recognized V2 data files with different exact versions. Both bits must be set and remain set on later versions. |
 
 </div>
 
-Flags with bit values 256 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error.
+Flags with bit values 512 and above are unknown and will cause implementations to reject the dataset with an "unsupported" error. The paired mixed-version reader and writer bits must either both be set or both be clear; a half-set manifest is invalid.

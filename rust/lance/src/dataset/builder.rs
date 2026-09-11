@@ -5,6 +5,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use lance_core::cache::CacheBackend;
 
 use super::refs::{Branches, Ref, Refs, check_valid_branch, normalize_branch, standardize_branch};
+use super::versions;
 use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE, ReadParams, WriteParams};
 use crate::dataset::branch_location::BranchLocation;
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
@@ -870,6 +871,7 @@ impl DatasetBuilder {
     ) -> Result<Dataset> {
         let (manifest, location) = if let Some(mut manifest) = manifest {
             ensure_can_read_manifest(&manifest)?;
+            versions::check_manifest_storage_version(&mut manifest)?;
             let location = commit_handler
                 .resolve_version_location(&base_path, manifest.version, &object_store.inner)
                 .await?;

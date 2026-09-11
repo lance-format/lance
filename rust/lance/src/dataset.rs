@@ -797,6 +797,8 @@ impl Dataset {
 
         ensure_can_read_manifest(&manifest)?;
 
+        versions::check_manifest_storage_version(&mut manifest)?;
+
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
         if let Some(index_offset) = manifest.index_section
@@ -4191,6 +4193,8 @@ pub(crate) async fn write_manifest_file(
             config.disable_transaction_file,
         )?;
     }
+
+    versions::finalize_manifest_storage_version(manifest)?;
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 

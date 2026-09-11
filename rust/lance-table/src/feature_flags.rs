@@ -50,19 +50,18 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 1 << 6;
 /// that exposure comes with the reclamation and is inherited by whichever flag
 /// takes the bit.
 pub const FLAG_COVERED_INDEX_METADATA: u64 = 1 << 7;
-/// Reserved for datasets that reference recognized V2 data files with
-/// different exact versions.
+/// A dataset may reference recognized V2 data files with different exact
+/// versions. Readers and writers must both understand the per-file version
+/// contract before either can safely access the dataset.
 pub const FLAG_MIXED_DATA_FILE_VERSIONS: u64 = 1 << 8;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 8;
+pub const FLAG_UNKNOWN: u64 = 1 << 9;
 
-// Supported flags stay below the unknown boundary; the mixed-version bit is
-// reserved at the boundary until its storage contract lands.
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
 // at or above the boundary that build shipped with (bit 7).
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
-const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS == FLAG_UNKNOWN);
+const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
@@ -515,11 +514,29 @@ mod tests {
     }
 
     #[test]
-    fn writer_gate_rejects_reserved_mixed_capability() {
+    fn paired_validation_rejects_half_set_mixed_version_capability() {
+        for (reader, writer) in [
+            (FLAG_MIXED_DATA_FILE_VERSIONS, 0),
+            (0, FLAG_MIXED_DATA_FILE_VERSIONS),
+        ] {
+            let mut manifest = empty_manifest();
+            manifest.reader_feature_flags = reader;
+            manifest.writer_feature_flags = writer;
+
+            let err = validate_paired_feature_flags(&manifest).unwrap_err();
+
+            assert!(err.to_string().contains("mixed data-file-version"), "{err}");
+        }
+    }
+
+    #[test]
+    fn writer_gate_accepts_mixed_capability_and_rejects_unknown_flags() {
         let mut manifest = empty_manifest();
         manifest.reader_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
         manifest.writer_feature_flags = FLAG_MIXED_DATA_FILE_VERSIONS;
+        ensure_can_write_manifest(&manifest).unwrap();
 
+        manifest.writer_feature_flags |= FLAG_UNKNOWN;
         let err = ensure_can_write_manifest(&manifest).unwrap_err();
         assert!(matches!(err, Error::NotSupported { .. }));
         assert!(err.to_string().contains("cannot be written"), "{err}");
@@ -541,14 +558,12 @@ mod tests {
         )
     }
 
-    /// A build that does not know the bit must refuse the table rather than
-    /// continue with legacy semantics.
     #[test]
-    fn mixed_capability_remains_at_the_unknown_boundary() {
+    fn mixed_capability_is_below_the_unknown_boundary() {
         assert!(can_read_dataset(FLAG_COVERED_INDEX_METADATA));
         assert!(can_write_dataset(FLAG_COVERED_INDEX_METADATA));
-        assert!(!can_read_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
-        assert!(!can_write_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
-        assert_eq!(FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_UNKNOWN);
+        assert!(can_read_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
+        assert!(can_write_dataset(FLAG_MIXED_DATA_FILE_VERSIONS));
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
     }
 }

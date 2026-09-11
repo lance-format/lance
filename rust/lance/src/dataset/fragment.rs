@@ -1528,16 +1528,24 @@ impl FileFragment {
             }
         }
 
-        if let Err(error) = Fragment::try_infer_version(std::slice::from_ref(&self.metadata)) {
-            let first_file = self.metadata.files.first().ok_or_else(|| {
-                Error::internal("mixed file versions reported for an empty fragment")
-            })?;
-            return Err(Error::corrupt_file(
-                self.dataset
-                    .data_file_dir(first_file)?
-                    .join(first_file.path.as_str()),
-                format!("Fragment contains mixed file versions: {error}"),
-            ));
+        let mut saw_v1 = false;
+        let mut saw_v2 = false;
+        for data_file in self.metadata.referenced_lance_files() {
+            match data_file.file_version()? {
+                ConcreteFileVersion::V1 => saw_v1 = true,
+                ConcreteFileVersion::V2_0
+                | ConcreteFileVersion::V2_1
+                | ConcreteFileVersion::V2_2
+                | ConcreteFileVersion::V2_3 => saw_v2 = true,
+            }
+            if saw_v1 && saw_v2 {
+                return Err(Error::corrupt_file(
+                    self.dataset
+                        .data_file_dir(data_file)?
+                        .join(data_file.path.as_str()),
+                    "Fragment mixes V1 and V2 data files",
+                ));
+            }
         }
 
         for data_file in &self.metadata.files {
