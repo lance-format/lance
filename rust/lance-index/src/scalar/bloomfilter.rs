@@ -535,8 +535,11 @@ impl ScalarIndex for BloomFilterIndex {
             probability: self.probability,
         };
 
-        let processor = BloomFilterProcessor::new(params.clone())?;
-        let trainer = ZoneTrainer::new(processor, params.number_of_items)?;
+        let factory_params = params.clone();
+        let trainer = ZoneTrainer::new(
+            move || BloomFilterProcessor::new(factory_params.clone()),
+            params.number_of_items,
+        )?;
         let (updated_blocks, new_null_rows) = rebuild_zones(&self.zones, trainer, new_data).await?;
 
         // Merge existing and new null rows.  If the existing index had no null bitmap
@@ -791,8 +794,11 @@ impl BloomFilterIndexBuilder {
     /// contain the value column followed by `_rowaddr`, matching the order emitted by
     /// the scalar index training pipeline.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
-        let processor = BloomFilterProcessor::new(self.params.clone())?;
-        let trainer = ZoneTrainer::new(processor, self.params.number_of_items)?;
+        let params = self.params.clone();
+        let trainer = ZoneTrainer::new(
+            move || BloomFilterProcessor::new(params.clone()),
+            self.params.number_of_items,
+        )?;
         let (blocks, null_rows) = trainer.train(batches_source).await?;
         self.blocks = blocks;
         self.null_rows = Some(null_rows);
