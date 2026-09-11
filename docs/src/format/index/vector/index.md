@@ -61,23 +61,21 @@ message. These are the parameters an engine needs to rebuild the index without
 reading the index files: the distance metric, the quantization scheme, and the
 partitioning the index was asked for.
 
-`target_num_partitions` records the IVF partition count the index was asked to
-train. It is a request, not a description of the index that was built: a build
-trains fewer partitions when the data cannot support the count asked for, so the
-number of partitions an index holds is read from the index itself and not from
-here. It is absent when no count was requested, in which case the partitioning was
-derived from the data and an engine rebuilding the index derives it again. Where
-a segment covers no fragments and carries no index files, a recorded count is the
-only statement of the partitioning the index is to be built with once its column
-holds enough vectors to train.
-
-A recorded count is at least 1. A writer that cannot represent the count it was
-given records nothing rather than a truncated value, and a reader treats 0 as no
-request, so a partitioning is never derived from a count of zero.
+`target_num_partitions` records the IVF partition count requested for building or
+rebuilding the index. The count an index actually holds may differ from it and is
+read from the index files. Where a segment covers no fragments and carries no
+index files, this field preserves an explicit partition-count request that has no
+built index to read it from.
 
 `target_partition_size` records the target number of vectors per partition, and is
-0 when unset. `target_num_partitions` takes precedence when both are set. An engine
-given neither derives the partitioning from the data alone.
+0 when unset. A positive `target_num_partitions` takes precedence over it. Absent
+or zero means no explicit count is available: a rebuild uses
+`target_partition_size` when that is positive, and the engine's own sizing
+otherwise. Absence does not imply the original build used automatic sizing, since
+a writer that predates this field records no count either way.
+
+Writers record only positive, representable counts, and omit a count they cannot
+represent rather than truncating it.
 
 `runtime_hints` carries optional build preferences that do not affect index
 structure, keyed by reverse-DNS name. Unrecognized keys must be silently ignored.
