@@ -277,12 +277,135 @@ pub(crate) enum TaggedTrimOutcome {
     Delete { current_entry: IndexMetadata },
 }
 
+/// Segments of a logical index whose whole contribution is already served
+/// directly by other retained segments of the same index.
+///
+/// A segment X is superseded when every fragment of its VALID COVERAGE --
+/// (stored bitmap ∩ live fragments) ∪ (the destinations X reaches through the
+/// transition chain, exactly as the reader derives them via `load_indices`) --
+/// is directly covered by kept segments of the same logical index. Both
+/// halves matter: a segment still directly covering a live fragment nobody
+/// else covers is NOT superseded even if all its translated destinations are
+/// taken over.
+///
+/// Safe by direct-coverage-wins: the reader already masks X's contribution
+/// for every fragment another segment covers directly, so removing a
+/// qualifying X cannot change any query result.
+///
+/// Deterministic fixed point for mutual redundancy: segments are confirmed
+/// newest-first (dataset_version, then uuid), and a segment is prunable only
+/// against the direct coverage of segments already confirmed KEPT -- so of
+/// two segments fully covering each other, the newest survives, and at least
+/// one segment of every logical index always remains.
+pub(crate) async fn derive_superseded_segments(
+    dataset: &Dataset,
+) -> lance_core::Result<Vec<IndexMetadata>> {
+    let stored = read_manifest_indexes(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await?;
+    // The reader's own coverage derivation (translated through the ledger,
+    // direct-coverage-wins applied); not reimplemented here.
+    use crate::index::DatasetIndexExt;
+    let derived = dataset.load_indices().await?;
+    let derived_by_uuid: HashMap<uuid::Uuid, &RoaringBitmap> = derived
+        .iter()
+        .filter_map(|idx| {
+            idx.fragment_bitmap
+                .as_ref()
+                .map(|bitmap| (idx.uuid, bitmap))
+        })
+        .collect();
+    let live = dataset.fragment_bitmap.as_ref();
+
+    let mut groups: HashMap<&str, Vec<&IndexMetadata>> = HashMap::new();
+    for index in stored.iter() {
+        if is_system_index(index) {
+            continue;
+        }
+        groups.entry(index.name.as_str()).or_default().push(index);
+    }
+
+    let mut removals = Vec::new();
+    for segments in groups.into_values() {
+        let mut segments = segments;
+        // Newest first; uuid as a stable tie-break.
+        segments.sort_by(|a, b| {
+            b.dataset_version
+                .cmp(&a.dataset_version)
+                .then_with(|| b.uuid.cmp(&a.uuid))
+        });
+        let mut kept_direct = RoaringBitmap::new();
+        let mut kept_any = false;
+        for segment in segments {
+            let Some(stored_bitmap) = segment.fragment_bitmap.as_ref() else {
+                // Unknown coverage cannot be reasoned about; always keep.
+                kept_any = true;
+                continue;
+            };
+            let direct_live = stored_bitmap & live;
+            let mut valid = direct_live;
+            if let Some(translated) = derived_by_uuid.get(&segment.uuid) {
+                valid |= *translated & live;
+            }
+            if kept_any && valid.is_subset(&kept_direct) {
+                removals.push(segment.clone());
+            } else {
+                kept_any = true;
+                kept_direct |= stored_bitmap & live;
+            }
+        }
+    }
+    Ok(removals)
+}
+
+/// Remove superseded segments, re-deriving on every attempt: a conflicting
+/// concurrent commit (e.g. index maintenance under the same name) refreshes
+/// the dataset and the removal set is recomputed against the new state.
+async fn prune_superseded_segments(dataset: &mut Dataset) -> lance_core::Result<()> {
+    const MAX_ATTEMPTS: usize = 5;
+    let mut last_conflict = None;
+    for _ in 0..MAX_ATTEMPTS {
+        let removals = derive_superseded_segments(dataset).await?;
+        if removals.is_empty() {
+            return Ok(());
+        }
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: removals,
+            },
+            None,
+        );
+        match dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error @ Error::RetryableCommitConflict { .. }) => {
+                dataset.checkout_latest().await?;
+                last_conflict = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_conflict.expect("loop only exits with a recorded conflict"))
+}
+
 /// Trim a tagged FRI entry, deriving what to keep from the CURRENT manifest.
 ///
 /// The derivation runs again inside the commit path on every retry (see the
 /// conflict resolver's `finish_create_index`), so a concurrent append lands in
 /// the re-derived entry instead of being spliced away.
 async fn cleanup_tagged_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
+    // Superseded segments go first, so the trim below derives against the
+    // pruned world and can release transitions that only those segments
+    // needed, in the same maintenance invocation.
+    prune_superseded_segments(dataset).await?;
+
     let operation = match derive_tagged_trim(dataset).await? {
         TaggedTrimOutcome::NothingToTrim => return Ok(()),
         TaggedTrimOutcome::Replace {
@@ -1474,6 +1597,203 @@ mod tests {
                     .map(|d| d.id)
                     .collect::<Vec<_>>(),
                 vec![10, 11]
+            );
+        }
+
+        /// Commit a fresh `i_idx` delta segment built over the current
+        /// (translated) table state. `covered` narrows the committed bitmap
+        /// to an under-claim, standing in for a segment that directly covers
+        /// only part of the destinations.
+        async fn commit_delta_segment(
+            dataset: &mut Dataset,
+            covered: Option<&[u32]>,
+        ) -> uuid::Uuid {
+            let params = ScalarIndexParams::default();
+            let mut delta =
+                crate::index::CreateIndexBuilder::new(dataset, &["i"], IndexType::BTree, &params)
+                    .name("i_idx_delta".into())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            delta.name = "i_idx".into();
+            if let Some(covered) = covered {
+                delta.fragment_bitmap = Some(covered.iter().copied().collect());
+            }
+            let uuid = delta.uuid;
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![delta],
+                            removed_indices: vec![],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            uuid
+        }
+
+        async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
+            read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|idx| idx.name == name)
+            .collect()
+        }
+
+        /// Full takeover: a delta directly covering everything the old
+        /// segment reaches through the chain supersedes it. The prune runs
+        /// in the same maintenance invocation as the trim, which then
+        /// releases the transition only the pruned segment needed -- and
+        /// query results are identical before and after (direct-coverage-wins
+        /// already masked the pruned segment's contribution).
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn superseded_segment_pruned_then_transition_released() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let old_segment = &stored_segments(&dataset, "i_idx").await[0].clone();
+            let delta = commit_delta_segment(&mut dataset, None).await;
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 2);
+
+            let before_all = sorted_values(&dataset).await;
+            let before_filtered = dataset.count_rows(Some("i >= 4".into())).await.unwrap();
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+
+            // The old segment is pruned, the delta survives...
+            let segments = stored_segments(&dataset, "i_idx").await;
+            assert_eq!(
+                segments.iter().map(|s| s.uuid).collect::<Vec<_>>(),
+                vec![delta]
+            );
+            assert_ne!(segments[0].uuid, old_segment.uuid);
+            // ... and the same invocation's trim released the transition
+            // only the pruned segment needed (the entry is fully drained).
+            assert!(fri_entry(&dataset).await.is_none());
+            // Safety: pruning changed no query result.
+            assert_eq!(sorted_values(&dataset).await, before_all);
+            assert_eq!(
+                dataset.count_rows(Some("i >= 4".into())).await.unwrap(),
+                before_filtered
+            );
+        }
+
+        /// A segment still directly covering a live fragment nobody else
+        /// covers is NOT superseded, even with all its translated
+        /// destinations taken over.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn live_direct_coverage_prevents_pruning() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 20).await;
+            // Only fragment 1 is repartitioned; the old segment keeps live
+            // direct coverage of fragment 0.
+            let mut dataset = commit_stable_partition(dataset, &[1], 10).await;
+            commit_delta_segment(&mut dataset, Some(&[10, 11])).await;
+
+            assert!(
+                derive_superseded_segments(&dataset)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a segment with exclusive live direct coverage must be kept"
+            );
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 2);
+        }
+
+        /// Partial takeover: one destination still lacks direct coverage, so
+        /// the old segment stays (and so does the transition).
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn partial_takeover_keeps_segment_and_transition() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            commit_delta_segment(&mut dataset, Some(&[10])).await;
+
+            assert!(
+                derive_superseded_segments(&dataset)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 2);
+            assert!(
+                fri_entry(&dataset).await.is_some(),
+                "destination 11 lacks direct coverage, so the transition stays"
+            );
+        }
+
+        /// Mutual redundancy: of segments fully covering each other, exactly
+        /// one survives, deterministically the newest.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn mutual_redundancy_keeps_single_newest_segment() {
+            let mut dataset = reader_tests::fixture().await;
+            reserve_fragments(&mut dataset, 20).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            let mut dataset = commit_stable_partition(dataset, &source_ids, 10).await;
+            let _delta1 = commit_delta_segment(&mut dataset, None).await;
+            let delta2 = commit_delta_segment(&mut dataset, None).await;
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 3);
+
+            let before = sorted_values(&dataset).await;
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            let segments = stored_segments(&dataset, "i_idx").await;
+            assert_eq!(
+                segments.iter().map(|s| s.uuid).collect::<Vec<_>>(),
+                vec![delta2],
+                "exactly the newest of the mutually redundant segments survives"
+            );
+            assert_eq!(sorted_values(&dataset).await, before);
+        }
+
+        /// v0 guard: pruning only runs in the tagged branch; a v0 cleanup
+        /// leaves redundant segments alone.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn v0_cleanup_never_prunes_segments() {
+            let mut dataset = reader_tests::fixture().await;
+            commit_delta_segment(&mut dataset, None).await;
+            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 2);
+
+            // A v0 FRI entry via deferred compaction on the untagged table.
+            dataset.delete("i < 2").await.unwrap();
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 100,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let entry = fri_entry(&dataset).await.unwrap();
+            assert_eq!(entry.index_version, 0);
+
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(
+                stored_segments(&dataset, "i_idx").await.len(),
+                2,
+                "the v0 path must not prune segments"
             );
         }
     }
