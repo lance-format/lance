@@ -6799,7 +6799,9 @@ class ScannerBuilder:
                 # after a lance round-trip).  We replace any top-level field
                 # whose type tree contains such a type with an int8 placeholder
                 # so that ordinal field references in the filter remain correct.
-                for field in self.ds.schema:
+                # Filters are evaluated against the stored dataset fields.  The
+                # public schema may also contain scan-time fields such as _rowid.
+                for field in self.ds._ds.schema:
                     if _needs_substrait_placeholder(field.type):
                         pos = counter
                         counter += 1
