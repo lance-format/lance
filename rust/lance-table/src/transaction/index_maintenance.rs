@@ -13,7 +13,7 @@ use crate::format::overlay::staleness::collect_overlay_stale_frags;
 use crate::format::{Fragment, IndexMetadata};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
-use crate::transaction::{RewriteGroup, RewrittenIndex, StablePartitionRewrite, Transaction};
+use crate::transaction::{FragmentReuseRewrite, RewriteGroup, RewrittenIndex, Transaction};
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
@@ -319,12 +319,12 @@ impl Transaction {
     /// must be entirely reordered or entirely order-preserving.
     pub(super) fn ordered_rewrite_groups(
         groups: &[RewriteGroup],
-        stable_partition: Option<&StablePartitionRewrite>,
+        frag_reuse_rewrite: Option<&FragmentReuseRewrite>,
     ) -> Result<Vec<RewriteGroup>> {
-        let Some(stable_partition) = stable_partition else {
+        let Some(frag_reuse_rewrite) = frag_reuse_rewrite else {
             return Ok(groups.to_vec());
         };
-        let sources = stable_partition.reordered_sources();
+        let sources = frag_reuse_rewrite.reordered_sources()?;
         let mut ordered = Vec::new();
         for group in groups {
             let covered = group
@@ -336,7 +336,7 @@ impl Transaction {
                 ordered.push(group.clone());
             } else if covered != group.old_fragments.len() {
                 return Err(Error::invalid_input(
-                    "a rewrite group mixes stable-partition and order-preserving source fragments",
+                    "a rewrite group mixes transition-covered and order-preserving source fragments",
                 ));
             }
         }
@@ -508,7 +508,7 @@ mod tests {
             physical_rows: 4,
             num_deleted_rows: 0,
         };
-        let stable_partition = StablePartitionRewrite {
+        let frag_reuse_rewrite = FragmentReuseRewrite {
             transitions: vec![pb_fri::Transition {
                 sources: vec![digest(0), digest(1)],
                 destinations: vec![digest(10), digest(10)],
@@ -517,14 +517,14 @@ mod tests {
             base_entry_version: None,
         };
         let ordered =
-            Transaction::ordered_rewrite_groups(&groups, Some(&stable_partition)).unwrap();
+            Transaction::ordered_rewrite_groups(&groups, Some(&frag_reuse_rewrite)).unwrap();
         assert_eq!(ordered.len(), 1);
         assert_eq!(ordered[0].old_fragments[0].id, 2);
 
         // A group straddling reordered and order-preserving sources is
         // rejected.
         let mixed = vec![group(&[1, 2], &[10])];
-        assert!(Transaction::ordered_rewrite_groups(&mixed, Some(&stable_partition)).is_err());
+        assert!(Transaction::ordered_rewrite_groups(&mixed, Some(&frag_reuse_rewrite)).is_err());
     }
 
     #[test]

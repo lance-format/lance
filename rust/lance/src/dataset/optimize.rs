@@ -91,8 +91,7 @@ use super::fragment::FileFragment;
 use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
 use super::rowids::load_row_id_sequences;
 use super::transaction::{
-    Operation, RewriteGroup, RewrittenIndex, StablePartitionRewrite, Transaction,
-    TransactionBuilder,
+    FragmentReuseRewrite, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
 use super::versions;
@@ -103,7 +102,7 @@ use super::{
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, index_is_usable, load_all_indices};
+use crate::index::{DatasetIndexInternalExt, index_is_usable, load_all_indices};
 use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
@@ -2870,9 +2869,6 @@ pub async fn commit_compaction(
     let mut remap_group_inputs: Vec<GroupInput> = Vec::new();
     let mut direct_row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
-    let mut tagged_transitions: Vec<
-        lance_table::format::pb::fragment_reuse_index_details::Transition,
-    > = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
     // Write an FRI only when the compaction touches data an index must later
@@ -2883,19 +2879,23 @@ pub async fn commit_compaction(
     // can make a skipped fragment indexed and the conflict resolver's FRI-present
     // path won't re-check it.
     //
-    // A tagged table skips this decision: it always records a transition,
-    // both because the reader resolves addresses through the recorded
-    // lineage and because the commit gate only admits a rewrite that appends
-    // to the tagged entry.
-    let indexed_frags: RoaringBitmap = if options.defer_index_remap && !tagged_fri {
+    // The same rule applies on tagged tables: a transition for fragments no
+    // index covers and no lineage reaches would grow the history for rows no
+    // reader ever has to translate, with no trim to reclaim it; when nothing
+    // is covered the commit is a plain rewrite, which the tagged-table gate
+    // admits exactly for this uncovered shape.
+    let indexed_frags: RoaringBitmap = if options.defer_index_remap {
         let mut covered = RoaringBitmap::new();
         for bm in load_index_fragmaps(dataset).await? {
             covered |= bm;
         }
-        if let Some(bm) = dataset
-            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+        // The stored listing works for v0 and tagged entries alike (the
+        // filtered listing post-processes coverage on tagged tables).
+        if let Some(bm) = load_all_indices(dataset)
             .await?
-            .and_then(|fri| fri.fragment_bitmap)
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .and_then(|fri| fri.fragment_bitmap.clone())
         {
             covered |= bm;
         }
@@ -2907,8 +2907,17 @@ pub async fn commit_compaction(
 
     for task in completed_tasks {
         metrics += task.metrics;
+        // One source of truth: the deferred branch normalizes the source
+        // metadata (materialized physical and deleted row counts) and BOTH
+        // the rewrite group and the reuse digests are built from it, so the
+        // commit-side binding validation compares like with like.
+        let old_fragments = if index_remapper.is_none() && options.defer_index_remap {
+            normalize_source_fragments(dataset, &task.original_fragments).await?
+        } else {
+            task.original_fragments.clone()
+        };
         let rewrite_group = RewriteGroup {
-            old_fragments: task.original_fragments.clone(),
+            old_fragments: old_fragments.clone(),
             new_fragments: task.new_fragments.clone(),
         };
 
@@ -2972,11 +2981,12 @@ pub async fn commit_compaction(
                 }
             }
         } else if options.defer_index_remap {
-            // Record every group; track whether any touches indexed/chain data.
-            if task
-                .original_fragments
+            // Record every group; track whether any touches indexed/chain
+            // data. Ids beyond the row-address range cannot appear in any
+            // index bitmap, so they are uncovered by definition.
+            if old_fragments
                 .iter()
-                .any(|f| indexed_frags.contains(f.id as u32))
+                .any(|f| u32::try_from(f.id).is_ok_and(|id| indexed_frags.contains(id)))
             {
                 any_group_indexed = true;
             }
@@ -2985,36 +2995,51 @@ pub async fn commit_compaction(
                     "defer_index_remap requires row_addrs but none were provided".to_string(),
                 )
             })?;
-            if tagged_fri {
-                // On a tagged table the group becomes an ordered-compaction
-                // transition appended to the tagged entry: the same digests
-                // and changed_row_addrs bitmap the v0 writer records, carried
-                // as the transition's mapping instead of a legacy version.
-                use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
-                use lance_table::system_index::frag_reuse::FragDigest;
-                let digests = |fragments: &[Fragment]| {
-                    fragments
-                        .iter()
-                        .map(|f| pb_fri::FragmentDigest::from(&FragDigest::from(f)))
-                        .collect::<Vec<_>>()
+            // Digest construction must not panic on incomplete metadata (the
+            // tasks may be replayed results planned elsewhere); the counts
+            // were materialized by `normalize_source_fragments` above, from
+            // the same list the rewrite group carries.
+            let digest =
+                |frag: &Fragment| -> Result<lance_table::system_index::frag_reuse::FragDigest> {
+                    Ok(lance_table::system_index::frag_reuse::FragDigest {
+                        id: frag.id,
+                        physical_rows: frag.physical_rows.ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "fragment {} has no physical row count for the fragment reuse record",
+                                frag.id
+                            ))
+                        })?,
+                        num_deleted_rows: frag
+                            .deletion_file
+                            .as_ref()
+                            .map(|deletion| {
+                                deletion.num_deleted_rows.ok_or_else(|| {
+                                    Error::invalid_input(format!(
+                                        "fragment {} has a deletion file without a materialized row count",
+                                        frag.id
+                                    ))
+                                })
+                            })
+                            .transpose()?
+                            .unwrap_or(0),
+                    })
                 };
-                tagged_transitions.push(pb_fri::Transition {
-                    sources: digests(&task.original_fragments),
-                    destinations: digests(&task.new_fragments),
-                    mapping: Some(pb_fri::transition::Mapping::OrderedCompaction(
-                        pb_fri::OrderedCompaction { changed_row_addrs },
-                    )),
-                });
-            } else {
-                frag_reuse_groups.push(FragReuseGroup {
-                    changed_row_addrs,
-                    old_frags: task.original_fragments.iter().map(|f| f.into()).collect(),
-                    new_frags: task.new_fragments.iter().map(|f| f.into()).collect(),
-                });
-
-                task.new_fragments.iter().for_each(|frag| {
-                    new_fragment_bitmap.insert(frag.id as u32);
-                });
+            frag_reuse_groups.push(FragReuseGroup {
+                changed_row_addrs,
+                old_frags: old_fragments.iter().map(digest).collect::<Result<_>>()?,
+                new_frags: task
+                    .new_fragments
+                    .iter()
+                    .map(digest)
+                    .collect::<Result<_>>()?,
+            });
+            for frag in task.new_fragments.iter() {
+                new_fragment_bitmap.insert(u32::try_from(frag.id).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "compacted fragment id {} is outside the row-address range",
+                        frag.id
+                    ))
+                })?);
             }
         }
         rewrite_groups.push(rewrite_group);
@@ -3058,31 +3083,64 @@ pub async fn commit_compaction(
         Vec::new()
     };
 
-    // On a tagged table the transitions ride the in-memory rewrite intent;
-    // the commit path assembles them onto the tagged entry at every attempt
-    // (see `build_stable_partition_rewrite_entry`), which also keeps a retry
-    // appending onto whatever a concurrent writer committed meanwhile.
-    // Otherwise: no indexed/chain data touched -> no FRI (all-or-nothing,
-    // see above).
-    let (frag_reuse_index, stable_partition) = if tagged_fri && options.defer_index_remap {
-        (
-            None,
-            Some(StablePartitionRewrite {
-                transitions: tagged_transitions,
-                base_entry_version: None,
-            }),
-        )
-    } else if options.defer_index_remap && any_group_indexed {
-        (
-            Some(
-                build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?,
-            ),
-            None,
-        )
+    // No indexed/chain data touched -> no record at all (all-or-nothing, see
+    // above); the commit is a plain rewrite the tagged gate admits for this
+    // uncovered shape. Otherwise the record's form -- a v0 entry, or tagged
+    // transitions riding the in-memory rewrite intent that
+    // `build_frag_reuse_rewrite_entry` assembles onto the entry at every
+    // commit attempt -- is decided HERE, at commit time, from the freshest
+    // state this handle has (the id reservations above advanced it), not
+    // from a sample taken when the compaction started: another writer may
+    // have tagged the table in between. The remaining race onto the manifest
+    // CAS itself is caught by the commit gate, which rejects a v0 entry on a
+    // tagged table.
+    let (frag_reuse_index, frag_reuse_rewrite) = if options.defer_index_remap && any_group_indexed {
+        let tagged_at_commit = load_all_indices(dataset)
+            .await?
+            .iter()
+            .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
+        if tagged_at_commit {
+            use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+            let transitions = frag_reuse_groups
+                .into_iter()
+                .map(|group| pb_fri::Transition {
+                    sources: group
+                        .old_frags
+                        .iter()
+                        .map(pb_fri::FragmentDigest::from)
+                        .collect(),
+                    destinations: group
+                        .new_frags
+                        .iter()
+                        .map(pb_fri::FragmentDigest::from)
+                        .collect(),
+                    mapping: Some(pb_fri::transition::Mapping::OrderedCompaction(
+                        pb_fri::OrderedCompaction {
+                            changed_row_addrs: group.changed_row_addrs,
+                        },
+                    )),
+                })
+                .collect();
+            (
+                None,
+                Some(FragmentReuseRewrite {
+                    transitions,
+                    base_entry_version: None,
+                }),
+            )
+        } else {
+            (
+                Some(
+                    build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap)
+                        .await?,
+                ),
+                None,
+            )
+        }
     } else {
         if options.defer_index_remap {
             log::debug!(
-                "skipping fragment-reuse index: no rewritten fragments were covered by an index"
+                "skipping fragment reuse record: no rewritten fragments are covered by an index or the reuse lineage"
             );
         }
         (None, None)
@@ -3101,7 +3159,7 @@ pub async fn commit_compaction(
             groups: rewrite_groups,
             rewritten_indices,
             frag_reuse_index,
-            stable_partition,
+            frag_reuse_rewrite,
         },
     )
     .transaction_properties(options.transaction_properties.clone())
@@ -3123,6 +3181,40 @@ pub async fn commit_compaction(
     }
 
     Ok(metrics)
+}
+
+/// Materialize the counts the fragment reuse digests and conservation
+/// validation depend on, without changing the fragment list. Unlike
+/// [`migrate_fragments`], fully-deleted fragments are KEPT: the rewrite
+/// group must still remove them from the manifest and the recorded
+/// transition must still consume them (they contribute zero live rows), so
+/// a silently shortened list would desynchronize the digests, the group and
+/// the manifest.
+async fn normalize_source_fragments(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+) -> Result<Vec<Fragment>> {
+    let mut normalized = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let mut fragment = fragment.clone();
+        if fragment.physical_rows.is_none() {
+            let file_fragment = FileFragment::new(Arc::new(dataset.clone()), fragment.clone());
+            fragment.physical_rows = Some(file_fragment.physical_rows().await?);
+        }
+        if fragment
+            .deletion_file
+            .as_ref()
+            .is_some_and(|deletion| deletion.num_deleted_rows.is_none())
+        {
+            let deletion_file = fragment.deletion_file.as_ref().unwrap();
+            let count = read_dataset_deletion_file(dataset, fragment.id, deletion_file)
+                .await?
+                .len();
+            fragment.deletion_file.as_mut().unwrap().num_deleted_rows = Some(count);
+        }
+        normalized.push(fragment);
+    }
+    Ok(normalized)
 }
 
 /// Remove rewritten files after fragment-id reservation fails. Reservation
@@ -3150,6 +3242,7 @@ mod tests {
     use crate::dataset::WriteDestination;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
+    use crate::index::DatasetIndexExt;
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -10362,5 +10455,43 @@ mod tests {
         scanner.filter("val = 0").unwrap().project(&["id"]).unwrap();
         let batch = scanner.try_into_batch().await.unwrap();
         assert_eq!(batch.num_rows(), 0, "stale value 0 must no longer match");
+    }
+
+    /// Round 6: unlike `migrate_fragments`, the reuse-record normalization
+    /// must keep a fully-deleted fragment: the rewrite group still removes
+    /// it from the manifest and the transition still consumes it (zero live
+    /// rows), so a silently shortened source list would desynchronize the
+    /// digests, the group and the manifest.
+    #[tokio::test]
+    async fn test_normalize_source_fragments_keeps_fully_deleted() {
+        use lance_table::format::{DeletionFile, DeletionFileType};
+        let dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let mut fragment = Fragment::new(7);
+        fragment.physical_rows = Some(4);
+        fragment.deletion_file = Some(DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(4),
+            base_id: None,
+        });
+        let normalized = normalize_source_fragments(&dataset, &[fragment])
+            .await
+            .unwrap();
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].id, 7);
+        assert_eq!(normalized[0].physical_rows, Some(4));
+        assert_eq!(
+            normalized[0]
+                .deletion_file
+                .as_ref()
+                .unwrap()
+                .num_deleted_rows,
+            Some(4)
+        );
     }
 }

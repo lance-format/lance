@@ -933,7 +933,7 @@ mod tests {
         use arrow_array::types::Int32Type;
         use lance_index::IndexType;
         use lance_index::scalar::ScalarIndexParams;
-        use lance_table::transaction::{RewriteGroup, StablePartitionRewrite};
+        use lance_table::transaction::{FragmentReuseRewrite, RewriteGroup};
 
         async fn reserve_fragments(dataset: &mut Dataset, num_fragments: u32) {
             dataset
@@ -979,7 +979,7 @@ mod tests {
                         }],
                         rewritten_indices: vec![],
                         frag_reuse_index: None,
-                        stable_partition: Some(StablePartitionRewrite {
+                        frag_reuse_rewrite: Some(FragmentReuseRewrite {
                             transitions: vec![transition],
                             base_entry_version: None,
                         }),

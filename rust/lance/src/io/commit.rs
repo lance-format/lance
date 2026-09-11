@@ -1125,6 +1125,27 @@ pub(crate) async fn do_commit_detached_transaction(
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
+    // Detached commits skip the rebase pipeline, so a rewrite's transition
+    // intent would never be assembled or validated (a dummy intent plus a
+    // hand-built entry would satisfy the manifest chokepoint unvalidated).
+    // A detached manifest is also outside the main version chain, where an
+    // appended fragment-reuse history has no meaning. Reject both shapes
+    // outright.
+    if let Operation::Rewrite {
+        frag_reuse_index,
+        frag_reuse_rewrite,
+        ..
+    } = &transaction.operation
+        && (frag_reuse_rewrite.is_some()
+            || frag_reuse_index
+                .as_ref()
+                .is_some_and(lance_table::system_index::frag_reuse::metadata::is_tagged))
+    {
+        return Err(Error::not_supported(
+            "Detached commits cannot carry fragment reuse transition intent or a tagged \
+             fragment reuse entry; commit the rewrite on the main version chain",
+        ));
+    }
     let pb_transaction = pb::Transaction::from(transaction);
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline

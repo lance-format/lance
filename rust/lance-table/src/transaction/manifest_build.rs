@@ -416,7 +416,7 @@ impl Transaction {
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         // A tagged entry may only reach the manifest through the commit
         // path's assembly, which builds it from the rewrite's in-memory
-        // transition intent (`stable_partition`, carrying stable-partition or
+        // transition intent (`frag_reuse_rewrite`, carrying stable-partition or
         // ordered-compaction transitions) against the CURRENT manifest entry
         // at every attempt. A pre-assembled tagged entry without that intent
         // has bypassed binding, conservation and ledger validation, and its
@@ -426,15 +426,15 @@ impl Transaction {
         // commits, retries) funnels through.
         if let Operation::Rewrite {
             frag_reuse_index: Some(entry),
-            stable_partition,
+            frag_reuse_rewrite,
             ..
         } = &self.operation
             && is_tagged(entry)
-            && stable_partition.is_none()
+            && frag_reuse_rewrite.is_none()
         {
             return Err(Error::invalid_input(
                 "tagged fragment reuse entries must be assembled from the rewrite's \
-                 `stable_partition` transition intent by the commit path; a pre-assembled \
+                 `frag_reuse_rewrite` transition intent by the commit path; a pre-assembled \
                  tagged entry without intent bypasses validation and may splice away \
                  concurrent records",
             ));
@@ -525,10 +525,54 @@ impl Transaction {
                 .chain(removed_indices.iter())
                 .all(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
         );
+        // A rewrite that carries neither an entry nor transition intent is
+        // still safe on a tagged table when no current index -- including
+        // the fragment reuse entry itself, whose bitmap holds the recorded
+        // lineage -- covers any rewritten fragment: it cannot invalidate
+        // stored provenance or the lineage, and bitmap maintenance below is
+        // a no-op for fragments no bitmap contains. Deferred compaction of
+        // never-covered data commits this shape instead of growing the
+        // history with untrimmable transitions. Fragment ids beyond the
+        // row-address range (u32) can never appear in an index bitmap, so
+        // they are uncovered by definition.
+        // The allowance only holds for histories this writer understands
+        // (index_version 1): a future entry version may change what its
+        // bitmap means, so nothing is inferred from it. Empty rewrites stay
+        // rejected: they have no legitimate purpose on a tagged table.
+        let rewrites_only_uncovered_fragments = match &self.operation {
+            Operation::Rewrite {
+                frag_reuse_index: None,
+                frag_reuse_rewrite: None,
+                rewritten_indices,
+                groups,
+            } if rewritten_indices.is_empty()
+                && !groups.is_empty()
+                && current_indices
+                    .iter()
+                    .filter(|index| index.name == FRAG_REUSE_INDEX_NAME)
+                    .all(|index| matches!(index.index_version, 0 | 1)) =>
+            {
+                let rewritten: RoaringBitmap = groups
+                    .iter()
+                    .flat_map(|group| group.old_fragments.iter())
+                    .filter_map(|frag| u32::try_from(frag.id).ok())
+                    .collect();
+                current_indices.iter().all(|index| {
+                    // Unknown coverage is not empty coverage: without a
+                    // bitmap the entry could cover anything, so refuse.
+                    index
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| bitmap.is_disjoint(&rewritten))
+                })
+            }
+            _ => false,
+        };
         if current_indices.iter().any(is_tagged)
             && !appends_tagged_entry
             && !trims_tagged_entry
             && !maintains_user_indices
+            && !rewrites_only_uncovered_fragments
             && !matches!(
                 self.operation,
                 Operation::Append { .. } | Operation::ReserveFragments { .. }
@@ -930,7 +974,7 @@ impl Transaction {
                 groups,
                 rewritten_indices,
                 frag_reuse_index,
-                stable_partition,
+                frag_reuse_rewrite,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
@@ -950,7 +994,7 @@ impl Transaction {
                 // order-preserving groups take part in bitmap maintenance
                 // below.
                 let ordered_groups =
-                    Self::ordered_rewrite_groups(groups, stable_partition.as_ref())?;
+                    Self::ordered_rewrite_groups(groups, frag_reuse_rewrite.as_ref())?;
 
                 if next_row_id.is_some() {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
@@ -987,7 +1031,7 @@ impl Transaction {
                 // coverage to keep it from serving stale values.
                 Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups);
 
-                if let Some(stable_partition) = stable_partition {
+                if let Some(frag_reuse_rewrite) = frag_reuse_rewrite {
                     // The stable-partition field is never serialized, so a
                     // concurrent transition cannot be seen through the other
                     // transaction file. Splicing an entry assembled against a
@@ -998,19 +1042,19 @@ impl Transaction {
                         .iter()
                         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
                         .map(|idx| idx.dataset_version);
-                    if existing_version != stable_partition.base_entry_version {
+                    if existing_version != frag_reuse_rewrite.base_entry_version {
                         return Err(Error::invalid_input(format!(
                             "the {} index entry changed (version {:?}, this rewrite was built on {:?}): \
                              a concurrent rewrite landed, rebuild the stable-partition entry against \
                              the latest version and retry",
                             FRAG_REUSE_INDEX_NAME,
                             existing_version,
-                            stable_partition.base_entry_version,
+                            frag_reuse_rewrite.base_entry_version,
                         )));
                     }
                     if frag_reuse_index.is_none() {
                         return Err(Error::invalid_input(
-                            "a stable-partition rewrite must carry its assembled fragment reuse \
+                            "a rewrite carrying transition intent must carry its assembled fragment reuse \
                              index entry; commit through the lance commit path, which assembles it",
                         ));
                     }
@@ -1799,12 +1843,18 @@ mod tests {
                 compacted_sstables: vec![],
             },
             // A rewrite carrying no entry, or a v0 entry, would splice away
-            // the tagged history; only a tagged entry may replace one.
+            // the tagged history; only a tagged entry may replace one. The
+            // bare rewrite touches fragment 0, which the entry's bitmap
+            // covers (a bare rewrite of only uncovered fragments is allowed,
+            // see `tagged_history_allows_rewrite_of_uncovered_fragments`).
             "bare_rewrite" => Operation::Rewrite {
-                groups: vec![],
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(0)],
+                    new_fragments: vec![Fragment::new(10)],
+                }],
                 rewritten_indices: vec![],
                 frag_reuse_index: None,
-                stable_partition: None,
+                frag_reuse_rewrite: None,
             },
             "rewrite_with_v0_entry" => {
                 let mut v0_entry = fri.clone();
@@ -1813,7 +1863,7 @@ mod tests {
                     groups: vec![],
                     rewritten_indices: vec![],
                     frag_reuse_index: Some(v0_entry),
-                    stable_partition: None,
+                    frag_reuse_rewrite: None,
                 }
             }
             _ => unreachable!(),
@@ -1834,7 +1884,7 @@ mod tests {
     #[case::tagged_table(true)]
     fn tagged_entry_without_intent_rejected(#[case] table_is_tagged: bool) {
         // A pre-assembled tagged entry that did not come from the commit
-        // path's assembly (no `stable_partition` intent) has bypassed
+        // path's assembly (no `frag_reuse_rewrite` intent) has bypassed
         // validation and may be stale; it must be rejected at the manifest
         // chokepoint regardless of the table's current state.
         let mut manifest = sample_manifest();
@@ -1856,7 +1906,7 @@ mod tests {
                 groups: vec![],
                 rewritten_indices: vec![],
                 frag_reuse_index: Some(entry),
-                stable_partition: None,
+                frag_reuse_rewrite: None,
             },
             None,
         );
@@ -1870,6 +1920,70 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("must be assembled"), "{error}");
+    }
+
+    #[test]
+    fn tagged_history_allows_rewrite_of_uncovered_fragments() {
+        // Deferred compaction of never-covered fragments commits a plain
+        // rewrite (no entry, no intent): it cannot invalidate provenance or
+        // the recorded lineage, so the tagged gate admits it.
+        let mut manifest = sample_manifest_with_fragments(0..6);
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        let mut fri = sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        fri.fields.clear();
+        assert_eq!(
+            fri.fragment_bitmap.as_ref().unwrap(),
+            &roaring::RoaringBitmap::from_iter([0u32])
+        );
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(5)],
+                    new_fragments: vec![Fragment::new(10)],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+                frag_reuse_rewrite: None,
+            },
+            None,
+        );
+        let (_, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![fri.clone()],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
+        // The tagged entry rides through untouched.
+        assert!(final_indices.iter().any(|idx| idx.uuid == fri.uuid));
+    }
+
+    #[test]
+    fn out_of_range_transition_source_id_rejected() {
+        // Fragment ids in the reuse domain are bounded by the row-address
+        // fragment space; an oversized id must error instead of silently
+        // truncating into an alias of another fragment.
+        let rewrite = crate::transaction::FragmentReuseRewrite {
+            transitions: vec![
+                crate::format::pb::fragment_reuse_index_details::Transition {
+                    sources: vec![
+                        crate::format::pb::fragment_reuse_index_details::FragmentDigest {
+                            id: u64::from(u32::MAX) + 1,
+                            physical_rows: 4,
+                            num_deleted_rows: 0,
+                        },
+                    ],
+                    destinations: vec![],
+                    mapping: None,
+                },
+            ],
+            base_entry_version: None,
+        };
+        let error = rewrite.reordered_sources().unwrap_err();
+        assert!(error.to_string().contains("row-address range"), "{error}");
     }
 
     #[test]
@@ -1891,7 +2005,7 @@ mod tests {
                 groups: vec![],
                 rewritten_indices: vec![],
                 frag_reuse_index: Some(appended.clone()),
-                stable_partition: Some(crate::transaction::StablePartitionRewrite {
+                frag_reuse_rewrite: Some(crate::transaction::FragmentReuseRewrite {
                     transitions: vec![],
                     base_entry_version: Some(7),
                 }),
@@ -2083,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_partition_rewrite_guards_base_entry_version() {
+    fn frag_reuse_rewrite_guards_base_entry_version() {
         let mut manifest = sample_manifest();
         manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
         manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
@@ -2103,7 +2217,7 @@ mod tests {
                 groups: vec![],
                 rewritten_indices: vec![],
                 frag_reuse_index: Some(appended.clone()),
-                stable_partition: Some(crate::transaction::StablePartitionRewrite {
+                frag_reuse_rewrite: Some(crate::transaction::FragmentReuseRewrite {
                     transitions: vec![],
                     base_entry_version: None,
                 }),
@@ -2123,7 +2237,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_partition_rewrite_requires_assembled_entry() {
+    fn frag_reuse_rewrite_requires_assembled_entry() {
         let manifest = sample_manifest();
         let transaction = Transaction::new(
             manifest.version,
@@ -2131,7 +2245,7 @@ mod tests {
                 groups: vec![],
                 rewritten_indices: vec![],
                 frag_reuse_index: None,
-                stable_partition: Some(crate::transaction::StablePartitionRewrite {
+                frag_reuse_rewrite: Some(crate::transaction::FragmentReuseRewrite {
                     transitions: vec![],
                     base_entry_version: None,
                 }),

@@ -99,13 +99,13 @@ impl PartialEq for Operation {
                     groups: a_groups,
                     rewritten_indices: a_indices,
                     frag_reuse_index: a_frag_reuse_index,
-                    stable_partition: a_stable_partition,
+                    frag_reuse_rewrite: a_stable_partition,
                 },
                 Self::Rewrite {
                     groups: b_groups,
                     rewritten_indices: b_indices,
                     frag_reuse_index: b_frag_reuse_index,
-                    stable_partition: b_stable_partition,
+                    frag_reuse_rewrite: b_stable_partition,
                 },
             ) => {
                 compare_vec(a_groups, b_groups)
@@ -1039,7 +1039,7 @@ mod tests {
             groups: vec![],
             rewritten_indices: vec![],
             frag_reuse_index: None,
-            stable_partition: None,
+            frag_reuse_rewrite: None,
         };
         assert_ne!(overlay(1), rewrite);
     }

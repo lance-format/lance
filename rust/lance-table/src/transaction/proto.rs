@@ -180,7 +180,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     groups,
                     rewritten_indices,
                     frag_reuse_index: None,
-                    stable_partition: None,
+                    frag_reuse_rewrite: None,
                 }
             }
             Some(pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
@@ -562,7 +562,7 @@ impl From<&Transaction> for pb::Transaction {
                 groups,
                 rewritten_indices,
                 frag_reuse_index: _,
-                stable_partition: _,
+                frag_reuse_rewrite: _,
             } => pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 groups: groups
                     .iter()
@@ -842,7 +842,7 @@ mod tests {
                 groups: vec![],
                 rewritten_indices: vec![],
                 frag_reuse_index: None,
-                stable_partition: Some(crate::transaction::StablePartitionRewrite {
+                frag_reuse_rewrite: Some(crate::transaction::FragmentReuseRewrite {
                     transitions: vec![
                         crate::format::pb::fragment_reuse_index_details::Transition::default(),
                     ],
@@ -855,11 +855,11 @@ mod tests {
         match decoded.operation {
             Operation::Rewrite {
                 frag_reuse_index,
-                stable_partition,
+                frag_reuse_rewrite,
                 ..
             } => {
                 assert!(frag_reuse_index.is_none());
-                assert!(stable_partition.is_none());
+                assert!(frag_reuse_rewrite.is_none());
             }
             other => panic!("expected Rewrite, got {other:?}"),
         }
