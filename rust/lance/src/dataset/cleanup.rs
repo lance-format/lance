@@ -5693,6 +5693,111 @@ mod tests {
             assert!(!task.resolve_frag_reuse_map_ids(&mut inspection).await);
         }
 
+        /// E: the full lifecycle, asserting every stage. A stable-partition
+        /// commit installs the tagged entry and its row map; an index rebuild
+        /// over the destinations simulates the drain and drops the old
+        /// segment; the trim then deletes the fully drained entry; a young
+        /// cleanup keeps the map (still referenced by retained manifests);
+        /// an aged cleanup removes those manifests and the map with them,
+        /// leaving a working table.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn end_to_end_lifecycle() {
+            use crate::index::frag_reuse::decode_frag_reuse_ledger;
+            use lance_table::system_index::frag_reuse::ledger::Mapping;
+
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, map_id) = make_tagged(&fixture).await;
+
+            // Stage 1: the tagged entry holds one stable-partition
+            // transition referencing the on-disk row map, and the old index
+            // segment still hangs off the sources.
+            let entry = dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .expect("the stable-partition commit installs the entry");
+            assert_eq!(entry.index_version, 1);
+            let ledger = decode_frag_reuse_ledger(&dataset, &entry).await.unwrap();
+            assert_eq!(ledger.transitions().len(), 1);
+            let Mapping::StablePartition(partition) = ledger.transitions()[0].mapping() else {
+                panic!("expected a stable-partition transition");
+            };
+            assert_eq!(partition.map_id, map_id);
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id.clone()]);
+            let old_segment = dataset
+                .load_index_by_name("i_idx")
+                .await
+                .unwrap()
+                .expect("fixture index");
+
+            // Stage 2: the trim retains the entry while the segment still
+            // derives from the sources.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+
+            // Stage 3: drain -- rebuild the index over the destinations,
+            // dropping the old segment.
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            let rebuilt = dataset
+                .load_index_by_name("i_idx")
+                .await
+                .unwrap()
+                .expect("rebuilt index");
+            assert_ne!(rebuilt.uuid, old_segment.uuid);
+
+            // Stage 4: the trim now deletes the fully drained entry.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert!(
+                dataset
+                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            // Stage 5: a young cleanup keeps the map -- the manifests that
+            // reference it are still retained.
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
+
+            // Stage 6: once aged, the referencing manifests expire and the
+            // map goes with them; the table keeps working.
+            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+            fixture
+                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
+                .await
+                .unwrap();
+            assert!(fixture.list_fri_map_dirs().await.is_empty());
+            let reopened = fixture.open().await.unwrap();
+            assert_eq!(reopened.count_rows(None).await.unwrap(), 8);
+            assert_eq!(
+                reopened
+                    .count_rows(Some("i >= 4".to_string()))
+                    .await
+                    .unwrap(),
+                4
+            );
+        }
+
         /// D-guard: a v0 dataset records no tagged entries and has no `_fri`
         /// directory; cleanup behaves exactly as before.
         #[tokio::test]
