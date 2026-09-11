@@ -209,13 +209,16 @@ impl StructuralFieldScheduler for StructuralStructScheduler {
 
     fn initialize<'a>(
         &'a mut self,
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
+        // Struct children share the parent's row coordinates 1:1 (see
+        // `schedule_ranges`), so every child gets the same ranges.
         let children_initialization = self
             .children
             .iter_mut()
-            .map(|child| child.initialize(filter, context))
+            .map(|child| child.initialize(requested_ranges, filter, context))
             .collect::<FuturesUnordered<_>>();
         async move {
             children_initialization

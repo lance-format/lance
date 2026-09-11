@@ -1123,9 +1123,43 @@ impl DecodeBatchScheduler {
         column_infos: &[Arc<ColumnInfo>],
         file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
         num_rows: u64,
+        decoder_plugins: Arc<DecoderPlugins>,
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<LanceCache>,
+        filter: &FilterExpression,
+        decoder_config: &DecoderConfig,
+    ) -> Result<Self> {
+        Self::try_new_with_ranges(
+            schema,
+            column_indices,
+            column_infos,
+            file_buffer_positions_and_sizes,
+            num_rows,
+            decoder_plugins,
+            io,
+            cache,
+            None,
+            filter,
+            decoder_config,
+        )
+        .await
+    }
+
+    /// Creates a decode scheduler and initializes only pages overlapping known ranges.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_new_with_ranges<'a>(
+        schema: &'a Schema,
+        column_indices: &[u32],
+        column_infos: &[Arc<ColumnInfo>],
+        file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
+        num_rows: u64,
         _decoder_plugins: Arc<DecoderPlugins>,
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
+        // The top-level row ranges that will be scheduled, if known. This lets
+        // the structural path initialize only the pages those ranges touch.
+        // `None` preserves `try_new`'s eager initialization behavior.
+        requested_ranges: Option<&[Range<u64>]>,
         filter: &FilterExpression,
         decoder_config: &DecoderConfig,
     ) -> Result<Self> {
@@ -1153,7 +1187,9 @@ impl DecodeBatchScheduler {
                 strategy.create_structural_field_scheduler(&root_field, &mut column_iter)?;
 
             let context = SchedulerContext::new(io, cache.clone());
-            root_scheduler.initialize(filter, &context).await?;
+            root_scheduler
+                .initialize(requested_ranges, filter, &context)
+                .await?;
 
             Ok(Self {
                 root_scheduler: RootScheduler::Structural(root_scheduler),
@@ -1421,29 +1457,22 @@ impl DecodeBatchScheduler {
         sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
         scheduler: Arc<dyn EncodingsIo>,
     ) {
-        debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
         if indices.is_empty() {
             return;
         }
         trace!("Scheduling take of {} rows", indices.len());
-        let ranges = Self::indices_to_ranges(indices);
-        self.schedule_ranges(&ranges, filter, sink, scheduler)
-    }
-
-    // coalesce continuous indices if possible (the input indices must be sorted and non-empty)
-    fn indices_to_ranges(indices: &[u64]) -> Vec<Range<u64>> {
-        let mut ranges = Vec::new();
-        let mut start = indices[0];
-
-        for window in indices.windows(2) {
-            if window[1] != window[0] + 1 {
-                ranges.push(start..window[0] + 1);
-                start = window[1];
+        let ranges = match RequestedRows::indices_to_ranges(indices) {
+            Ok(ranges) => ranges,
+            Err(error) => {
+                if let Err(SendError { .. }) = sink.send(Err(error)) {
+                    debug!(
+                        "schedule_take could not report invalid indices because the decoder was dropped"
+                    );
+                }
+                return;
             }
-        }
-
-        ranges.push(start..*indices.last().unwrap() + 1);
-        ranges
+        };
+        self.schedule_ranges(&ranges, filter, sink, scheduler)
     }
 }
 
@@ -2076,6 +2105,47 @@ impl RequestedRows {
         }
         self
     }
+
+    fn into_ranges(self) -> Result<Vec<Range<u64>>> {
+        match self {
+            Self::Ranges(ranges) => Ok(ranges),
+            Self::Indices(indices) => Self::indices_to_ranges(&indices),
+        }
+    }
+
+    // coalesce continuous indices if possible (the input indices must be sorted)
+    fn indices_to_ranges(indices: &[u64]) -> Result<Vec<Range<u64>>> {
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ranges = Vec::with_capacity(indices.len());
+        let mut start = indices[0];
+
+        for (index, pair) in indices.windows(2).enumerate() {
+            if pair[0] >= pair[1] {
+                return Err(Error::invalid_input(format!(
+                    "Requested row indices are not strictly increasing at index {index}: {} then {}",
+                    pair[0], pair[1]
+                )));
+            }
+            let end = pair[0]
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("Requested row index cannot equal u64::MAX"))?;
+            if pair[1] != end {
+                ranges.push(start..end);
+                start = pair[1];
+            }
+        }
+
+        let end = indices
+            .last()
+            .copied()
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| Error::invalid_input("Requested row index cannot equal u64::MAX"))?;
+        ranges.push(start..end);
+        Ok(ranges)
+    }
 }
 
 /// Configuration for decoder behavior
@@ -2252,13 +2322,14 @@ async fn create_scheduler_decoder(
     config: SchedulerDecoderConfig,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
     let num_rows = requested_rows.num_rows();
+    let is_range_request = matches!(&requested_rows, RequestedRows::Ranges(_));
 
     let is_structural = column_infos[0].is_structural();
     let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
     let spawn_structural_batch_decode_tasks = match mode.ok().as_deref() {
         Some("always") => true,
         Some("never") => false,
-        _ => matches!(requested_rows, RequestedRows::Ranges(_)),
+        _ => is_range_request,
     };
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -2277,8 +2348,10 @@ async fn create_scheduler_decoder(
     // The scheduler's `initialize` may perform I/O to load column metadata
     // unless that metadata is already in the cache.  This metadata loading
     // happens as part of this call and should be parallelized if reading
-    // multiple files.
-    let mut decode_scheduler = DecodeBatchScheduler::try_new(
+    // multiple files.  We pass the rows we are about to schedule so that the
+    // structural path only initializes the pages those rows touch.
+    let requested_ranges = requested_rows.into_ranges()?;
+    let mut decode_scheduler = DecodeBatchScheduler::try_new_with_ranges(
         target_schema.as_ref(),
         &column_indices,
         &column_infos,
@@ -2287,6 +2360,7 @@ async fn create_scheduler_decoder(
         config.decoder_plugins,
         config.io.clone(),
         config.cache,
+        Some(&requested_ranges),
         &filter,
         &config.decoder_config,
     )
@@ -2303,28 +2377,14 @@ async fn create_scheduler_decoder(
         .unwrap_or_else(|| num_rows <= inline_scheduling_threshold());
 
     if inline_scheduling {
-        match requested_rows {
-            RequestedRows::Ranges(ranges) => {
-                decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-            }
-            RequestedRows::Indices(indices) => {
-                decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
-            }
-        }
+        decode_scheduler.schedule_ranges(&requested_ranges, &filter, tx, config.io);
         Ok(decode_stream)
     } else {
         // Spawn the (still synchronous) scheduling work so that decoder
         // messages can stream into the channel while the consumer is
         // already pulling from the decode stream.
         let scheduling = async move {
-            match requested_rows {
-                RequestedRows::Ranges(ranges) => {
-                    decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-                }
-                RequestedRows::Indices(indices) => {
-                    decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
-                }
-            }
+            decode_scheduler.schedule_ranges(&requested_ranges, &filter, tx, config.io)
         };
         let scheduler_handle = tokio::task::spawn(scheduling);
         Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
@@ -2411,14 +2471,17 @@ pub fn schedule_and_decode_blocking(
         return Ok(Box::new(RecordBatchIterator::new(vec![], arrow_schema)));
     }
 
+    let requested_rows = requested_rows.trim_empty_ranges();
     let num_rows = requested_rows.num_rows();
     let is_structural = column_infos[0].is_structural();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     // Initialize the scheduler.  This is still "asynchronous" but we run it with a current-thread
-    // runtime.
-    let mut decode_scheduler = WAITER_RT.block_on(DecodeBatchScheduler::try_new(
+    // runtime.  Pass the rows we are about to schedule so the structural path
+    // only initializes the pages those rows touch.
+    let requested_ranges = requested_rows.into_ranges()?;
+    let mut decode_scheduler = WAITER_RT.block_on(DecodeBatchScheduler::try_new_with_ranges(
         target_schema.as_ref(),
         &column_indices,
         &column_infos,
@@ -2427,19 +2490,13 @@ pub fn schedule_and_decode_blocking(
         config.decoder_plugins,
         config.io.clone(),
         config.cache,
+        Some(&requested_ranges),
         &filter,
         &config.decoder_config,
     ))?;
 
     // Schedule the requested rows
-    match requested_rows {
-        RequestedRows::Ranges(ranges) => {
-            decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-        }
-        RequestedRows::Indices(indices) => {
-            decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
-        }
-    }
+    decode_scheduler.schedule_ranges(&requested_ranges, &filter, tx, config.io);
 
     // Drain the scheduler queue into a vec of decode messages
     let mut messages = Vec::new();
@@ -2772,8 +2829,14 @@ impl FilterExpression {
 }
 
 pub trait StructuralFieldScheduler: Send + std::fmt::Debug {
+    /// Loads the per-page metadata this column needs before scheduling.
+    ///
+    /// When `requested_ranges` is present, only pages overlapping those
+    /// top-level row ranges are initialized. `None` initializes the complete
+    /// field.
     fn initialize<'a>(
         &'a mut self,
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>>;
@@ -3032,6 +3095,25 @@ pub async fn decode_batch(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn requested_row_indices_convert_to_checked_ranges() {
+        let requested_rows = RequestedRows::Indices(vec![1, 2, 5, 8, 9]);
+        let ranges = requested_rows.into_ranges().unwrap();
+        assert_eq!(ranges, [1..3, 5..6, 8..10]);
+
+        let error = RequestedRows::Indices(vec![2, 2])
+            .into_ranges()
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("not strictly increasing"));
+
+        let error = RequestedRows::Indices(vec![u64::MAX])
+            .into_ranges()
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("u64::MAX"));
+    }
 
     #[derive(Debug)]
     struct FailingPageDecoder {
@@ -3292,21 +3374,21 @@ mod tests {
     #[test]
     fn test_coalesce_indices_to_ranges_with_single_index() {
         let indices = vec![1];
-        let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
+        let ranges = RequestedRows::indices_to_ranges(&indices).unwrap();
         assert_eq!(ranges, vec![1..2]);
     }
 
     #[test]
     fn test_coalesce_indices_to_ranges() {
         let indices = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
+        let ranges = RequestedRows::indices_to_ranges(&indices).unwrap();
         assert_eq!(ranges, vec![1..10]);
     }
 
     #[test]
     fn test_coalesce_indices_to_ranges_with_gaps() {
         let indices = vec![1, 2, 3, 5, 6, 7, 9];
-        let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
+        let ranges = RequestedRows::indices_to_ranges(&indices).unwrap();
         assert_eq!(ranges, vec![1..4, 5..8, 9..10]);
     }
 
