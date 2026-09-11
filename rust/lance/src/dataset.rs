@@ -69,6 +69,8 @@ pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
+mod data_file;
+mod data_file_part;
 pub mod delta;
 pub mod files;
 pub mod fragment;
@@ -113,6 +115,9 @@ pub mod updater;
 mod utils;
 pub(crate) mod versions;
 pub mod write;
+
+pub use data_file::DataFileTarget;
+pub use data_file_part::DataFilePart;
 
 pub(crate) use take::row_offsets_to_row_addresses;
 
@@ -834,16 +839,17 @@ impl Dataset {
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let transaction: Transaction =
-                lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
-
-            let metadata_cache = session.metadata_cache.for_dataset(uri);
-            let metadata_key = TransactionKey {
-                version: manifest_location.version,
-            };
-            metadata_cache
-                .insert_with_key(&metadata_key, Arc::new(transaction))
-                .await;
+            if let Some(transaction) =
+                decode_inline_transaction(message_data, manifest_location.version)
+            {
+                let metadata_cache = session.metadata_cache.for_dataset(uri);
+                let metadata_key = TransactionKey {
+                    version: manifest_location.version,
+                };
+                metadata_cache
+                    .insert_with_key(&metadata_key, Arc::new(transaction))
+                    .await;
+            }
         }
 
         populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
@@ -4108,6 +4114,31 @@ impl ManifestWriteConfig {
             storage_format: self.storage_format.clone(),
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
+        }
+    }
+}
+
+/// Decode an inline transaction section for opportunistic caching.
+///
+/// Returns `None` instead of failing when the transaction cannot be decoded:
+/// the section may have been written by a newer version of Lance with an
+/// operation type this version does not know, and that must not prevent
+/// opening the dataset. Paths that need the transaction contents surface the
+/// error at their call sites instead.
+fn decode_inline_transaction(message_data: &[u8], version: u64) -> Option<Transaction> {
+    match lance_table::format::pb::Transaction::decode(message_data)
+        .map_err(Error::from)
+        .and_then(Transaction::try_from)
+    {
+        Ok(transaction) => Some(transaction),
+        Err(err) => {
+            log::warn!(
+                "Failed to decode the inline transaction of version {}; \
+                 it may have been written by a newer version of Lance: {}",
+                version,
+                err
+            );
+            None
         }
     }
 }

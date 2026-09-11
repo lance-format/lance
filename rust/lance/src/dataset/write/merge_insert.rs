@@ -3036,6 +3036,12 @@ impl MergeInsertJob {
     /// * `schema` - Optional schema of the source data. If None, uses the dataset's schema
     /// * `verbose` - If true, provides more detailed information in the plan output
     ///
+    /// A schema says nothing about how the source would be wrapped, so this always
+    /// reports the streaming shape: the source is stood in for by an empty one-shot
+    /// stream. The wrapping affects the plan, so use [`Self::analyze_plan_batches`]
+    /// or [`Self::analyze_plan_provider`] when that matters. Those execute the merge
+    /// to collect metrics and may write data files; this method writes nothing.
+    ///
     /// # Errors
     ///
     /// Returns Error::NotSupported if the merge insert configuration doesn't support
@@ -3049,7 +3055,7 @@ impl MergeInsertJob {
 
         // Check if we can use create_plan
         if !self.can_use_create_plan(&schema).await? {
-            return Err(Error::not_supported_source("This merge insert configuration does not support explain_plan. Only full-schema merge insert operations without a scalar-index execution path are currently supported.".into()));
+            return Err(Error::not_supported_source("This merge insert configuration does not support explain_plan: either the source schema is not one the plan path accepts, or the join takes the scalar-index execution path.".into()));
         }
 
         // Create an empty batch with the provided schema to pass to create_plan
@@ -3084,19 +3090,69 @@ impl MergeInsertJob {
     ///
     /// * `source` - The source data stream that would be used in the merge insert
     ///
+    /// A stream reports no statistics, so the plan this returns is the streaming
+    /// one. Callers holding materialized data or a source that reports statistics
+    /// should use [`Self::analyze_plan_batches`] or [`Self::analyze_plan_provider`],
+    /// which report the plan those sources actually run.
+    ///
     /// # Errors
     ///
-    /// Returns Error::NotSupported if the merge insert configuration doesn't support
-    /// the fast path required for plan generation.
+    /// See [`Self::analyze_plan_provider`], which this delegates to.
     pub async fn analyze_plan(&self, source: SendableRecordBatchStream) -> Result<String> {
+        self.analyze_plan_provider(one_shot_provider(source)?).await
+    }
+
+    /// [`Self::analyze_plan`] for materialized batches.
+    ///
+    /// Mirrors [`Self::execute_batches`]: the batches are wrapped in a
+    /// [`MemTable`], so the reported plan is the one an in-memory source actually
+    /// runs. That plan can differ from the streaming one, because the join picks
+    /// its collected side from the statistics each source reports.
+    ///
+    /// Under [`SourceDedupeBehavior::FirstSeen`] the source is deduplicated ahead
+    /// of the join and re-wrapped in a stream, so the reported plan is the
+    /// streaming one and the in-memory node does not appear in it.
+    ///
+    /// An empty `batches` still reports an in-memory source, but it carries no
+    /// schema for the provider to use, so the support check runs against the
+    /// dataset's; see [`Self::analyze_plan_provider`].
+    ///
+    /// [`MemTable`]: datafusion::datasource::MemTable
+    pub async fn analyze_plan_batches(&self, batches: Vec<RecordBatch>) -> Result<String> {
+        self.analyze_plan_provider(self.batches_to_provider(batches)?)
+            .await
+    }
+
+    /// [`Self::analyze_plan`] from a re-scannable [`TableProvider`].
+    ///
+    /// Mirrors [`Self::execute_provider`]. Under
+    /// [`SourceDedupeBehavior::FirstSeen`] the provider is re-wrapped in a stream
+    /// before the join, so its own node does not appear in the reported plan.
+    ///
+    /// The support check runs against `provider.schema()`, which is the source
+    /// schema the caller supplied. For a provider built from an empty batch list
+    /// that schema is the dataset's, so a source whose declared schema the dataset
+    /// does not have is reported rather than rejected. `execute_batches` builds its
+    /// provider the same way, so the two agree.
+    ///
+    /// # Errors
+    ///
+    /// * `Error::NotSupported` when the configuration cannot use the plan path.
+    ///   `can_use_create_plan` decides that, and its own doc comment lists the
+    ///   source shapes it accepts.
+    /// * `Error::invalid_input` from the support check, e.g. a non-nullable dataset
+    ///   column the source does not supply.
+    /// * Any error from building or executing the plan. This method runs the merge
+    ///   to collect metrics, so I/O and source-deduplication failures surface here.
+    pub async fn analyze_plan_provider(&self, provider: Arc<dyn TableProvider>) -> Result<String> {
         // Check if we can use create_plan
-        if !self.can_use_create_plan(source.schema().as_ref()).await? {
-            return Err(Error::not_supported_source("This merge insert configuration does not support analyze_plan. Only full-schema merge insert operations without a scalar-index execution path are currently supported.".into()));
+        if !self.can_use_create_plan(provider.schema().as_ref()).await? {
+            return Err(Error::not_supported_source("This merge insert configuration does not support plan reporting: either the source schema is not one the plan path accepts, or the join takes the scalar-index execution path.".into()));
         }
 
         // Clone self since create_plan consumes the job
         let cloned_job = self.clone();
-        let plan = cloned_job.create_plan(one_shot_provider(source)?).await?;
+        let plan = cloned_job.create_plan(provider).await?;
 
         // Use the analyze_plan function from lance_datafusion, but strip out the wrapper lines
         let options = LanceExecutionOptions::default();
@@ -9210,6 +9266,211 @@ mod tests {
         ).await.unwrap();
     }
 
+    /// #4583 use case 3: which side of the merge_insert hash join gets buffered
+    /// is decided by the source's statistics, not by the order `create_plan`
+    /// writes the join in. `create_plan` always puts the target on the left, so
+    /// without a swap the target is always the build side.
+    ///
+    /// The target here is one row past DataFusion's
+    /// `hash_join_single_partition_threshold_rows`, and `FilteredReadExec`
+    /// reports no `total_byte_size`, so the target cannot pass the collect
+    /// threshold. That leaves the source: a materialized one reports exact
+    /// statistics and fits under the threshold, so `JoinSelection` swaps it onto
+    /// the build side and rewrites `Right` into `Left`. A one-shot stream reports
+    /// `Absent` for everything, neither side qualifies for `CollectLeft`, and the
+    /// plan falls back to a partitioned join whose build side is still the target.
+    ///
+    /// The one-shot provider used below stands in for every non-materialized
+    /// source: `stream_source_to_provider` sends the default path through
+    /// `spilling_table_provider`, which also hands back a `StreamingTable` and so
+    /// reports the same absent statistics.
+    ///
+    /// This is about which side is buffered, not about how much the target reads.
+    /// The target scan projects `other` either way, because the row-rewrite fill
+    /// reads it from the target side of the join.
+    ///
+    /// Both expectations characterise DataFusion's choice rather than any Lance
+    /// logic, and Lance sets no `hash_join_single_partition_threshold*` of its own,
+    /// so this rides on DataFusion's defaults (1 MiB / 128 Ki rows). A DataFusion
+    /// upgrade that changes them fails this test without anything in Lance
+    /// regressing, which is the point: the plan shape is what merge_insert's memory
+    /// use depends on, so a silent change to it should not go unnoticed.
+    #[tokio::test]
+    async fn test_plan_join_build_side_follows_source_statistics() {
+        fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
+            if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+                return Some(join);
+            }
+            for child in plan.children() {
+                if let Some(join) = find_hash_join(child.as_ref()) {
+                    return Some(join);
+                }
+            }
+            None
+        }
+
+        fn sides(join: &HashJoinExec) -> (String, String) {
+            let render = |plan: &Arc<dyn ExecutionPlan>| {
+                format!(
+                    "{}",
+                    datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+                )
+            };
+            (render(join.left()), render(join.right()))
+        }
+
+        // One row past datafusion.optimizer.hash_join_single_partition_threshold_rows.
+        const TARGET_ROWS: u64 = 128 * 1024 + 1;
+
+        let target = lance_datagen::gen_batch()
+            .with_seed(Seed::from(1))
+            .col("key", array::step::<UInt32Type>())
+            .col("value", array::step::<UInt32Type>())
+            .col("other", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(TARGET_ROWS), BatchCount::from(1));
+        let ds = Arc::new(Dataset::write(target, "memory://", None).await.unwrap());
+
+        // Partial schema: the source omits `other`, so the row-rewrite fill makes
+        // the target scan read it. In the streaming half below, where the target is
+        // the build side, that means it is held for every buffered row. This test
+        // asserts which side is the build side, not the projection.
+        let source = record_batch!(
+            ("key", UInt32, [0, 1, 2, 3]),
+            ("value", UInt32, [10, 11, 12, 13])
+        )
+        .unwrap();
+
+        let new_job = || {
+            crate::dataset::MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+        };
+
+        let materialized: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(source.schema(), vec![vec![source.clone()]])
+                .unwrap(),
+        );
+        let plan = new_job().create_plan(materialized).await.unwrap();
+        let join =
+            find_hash_join(plan.as_ref()).expect("materialized source must plan a hash join");
+        let (build, probe) = sides(join);
+        assert_eq!(
+            (*join.partition_mode(), *join.join_type()),
+            (PartitionMode::CollectLeft, JoinType::Left),
+            "the target is past the collect threshold and the source is not, so the inputs \
+             are swapped and Right is rewritten to Left. build side was:\n{build}"
+        );
+        assert!(
+            build.contains("DataSourceExec") && !build.contains("LanceRead"),
+            "the source must be the collected side:\n{build}"
+        );
+        assert!(
+            probe.contains("LanceRead"),
+            "the target must be the probe side, which is the side a hash join offers its \
+             dynamic filter to:\n{probe}"
+        );
+
+        let reader = RecordBatchIterator::new([Ok(source.clone())], source.schema());
+        let stream_plan = new_job()
+            .create_plan(one_shot_provider(reader_to_stream(Box::new(reader))).unwrap())
+            .await
+            .unwrap();
+        let join =
+            find_hash_join(stream_plan.as_ref()).expect("stream source must plan a hash join");
+        let (build, probe) = sides(join);
+        assert_eq!(
+            (*join.partition_mode(), *join.join_type()),
+            (PartitionMode::Partitioned, JoinType::Right),
+            "the target is past the collect threshold and the source reports no statistics, \
+             so neither side qualifies and both are hash-repartitioned. build side was:\n{build}"
+        );
+        assert!(
+            build.contains("LanceRead"),
+            "the target stays the build side, so every one of its rows is \
+             buffered:\n{build}"
+        );
+        assert!(
+            probe.contains("StreamingTableExec"),
+            "the source stays the probe side:\n{probe}"
+        );
+    }
+
+    /// `analyze_plan` is a diagnostic, so it has to report the plan the source it
+    /// was handed would actually run. The batches entry point must therefore not
+    /// fall back to the streaming plan: with the row counts used below the join
+    /// collects the materialized source and rewrites the join type, and a stream
+    /// gets neither. Which side wins is a size comparison, not a property of the
+    /// entry point; see the fixture comment.
+    #[tokio::test]
+    async fn test_analyze_plan_reports_the_given_source_shape() {
+        let data = lance_datagen::gen_batch()
+            .with_seed(Seed::from(1))
+            .col("key", array::step::<UInt32Type>())
+            .col("value", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+        let ds = Arc::new(Dataset::write(data, "memory://", None).await.unwrap());
+
+        // The source covers the dataset's schema, so nothing is filled from the
+        // target side. Two rows
+        // against the target's 64 keeps the source the smaller side, which is what
+        // makes the join collect it here; both sides are under DataFusion's collect
+        // threshold, so the choice comes from comparing row counts. Raise the source
+        // above 64 and the join collects the target instead.
+        let source =
+            record_batch!(("key", UInt32, [1, 100]), ("value", UInt32, [999, 999])).unwrap();
+
+        let new_job = || {
+            crate::dataset::MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(crate::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+        };
+
+        let materialized = new_job()
+            .analyze_plan_batches(vec![source.clone()])
+            .await
+            .unwrap();
+        assert!(
+            materialized.contains("DataSourceExec") && !materialized.contains("StreamingTableExec"),
+            "materialized batches must be reported as an in-memory source:\n{materialized}"
+        );
+        assert!(
+            materialized.contains("join_type=Left"),
+            "collecting the source, which is the smaller side here, rewrites the join type:\n{materialized}"
+        );
+
+        // The provider entry is public too, and the batches entry is a thin wrapper
+        // over it, so pin it directly rather than only through that wrapper.
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(source.schema(), vec![vec![source.clone()]])
+                .unwrap(),
+        );
+        let from_provider = new_job().analyze_plan_provider(provider).await.unwrap();
+        assert!(
+            from_provider.contains("DataSourceExec") && from_provider.contains("join_type=Left"),
+            "a provider with exact statistics reports the same shape as its batches:\n{from_provider}"
+        );
+
+        let reader = RecordBatchIterator::new([Ok(source.clone())], source.schema());
+        let streaming = new_job()
+            .analyze_plan(reader_to_stream(Box::new(reader)))
+            .await
+            .unwrap();
+        assert!(
+            streaming.contains("StreamingTableExec") && !streaming.contains("DataSourceExec"),
+            "a stream must still be reported as a stream:\n{streaming}"
+        );
+        assert!(
+            streaming.contains("join_type=Right"),
+            "nothing is swapped without source statistics:\n{streaming}"
+        );
+    }
+
     #[tokio::test]
     async fn test_fast_path_update_only() {
         let data = lance_datagen::gen_batch()
@@ -14793,6 +15054,109 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .try_build()
             .unwrap();
         let (new_dataset, _) = job.execute_reader(source).await.unwrap();
+        let blobs = new_dataset
+            .take_blobs_by_indices(&[0, 1, 2], "blobs")
+            .await
+            .unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"foo"
+        );
+        assert_eq!(
+            blobs[1].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"baz"
+        );
+        assert_eq!(
+            blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"qux"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_with_complete_blob_v2_preserves_schema() {
+        use arrow_schema::Schema as ArrowSchema;
+        use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
+        use lance_core::datatypes::BLOB_V2_LOGICAL_FIELDS;
+
+        let test_dir = TempStrDir::default();
+        let blob_field = Field::new(
+            "blobs",
+            DataType::Struct(BLOB_V2_LOGICAL_FIELDS.clone()),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            ARROW_EXT_NAME_KEY.to_string(),
+            BLOB_V2_EXT_NAME.to_string(),
+        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            blob_field,
+            Field::new("id", DataType::Int64, true),
+            Field::new("other", DataType::Int64, true),
+        ]));
+        let make_batch = |blob_values: &[&[u8]], ids, others| {
+            let blobs: arrow_array::ArrayRef = Arc::new(
+                StructArray::try_new(
+                    BLOB_V2_LOGICAL_FIELDS.clone(),
+                    vec![
+                        Arc::new(arrow_array::LargeBinaryArray::from_iter(
+                            blob_values.iter().map(|value| Some(*value)),
+                        )),
+                        Arc::new(StringArray::from(vec![None::<&str>; blob_values.len()])),
+                        Arc::new(UInt64Array::from(vec![None::<u64>; blob_values.len()])),
+                        Arc::new(UInt64Array::from(vec![None::<u64>; blob_values.len()])),
+                    ],
+                    None,
+                )
+                .unwrap(),
+            );
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    blobs,
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int64Array::from(others)),
+                ],
+            )
+            .unwrap()
+        };
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(
+                    vec![Ok(make_batch(&[b"foo", b"bar"], vec![0, 1], vec![10, 20]))],
+                    schema.clone(),
+                ),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let source = Box::new(RecordBatchIterator::new(
+            vec![Ok(make_batch(
+                &[b"baz", b"qux"],
+                vec![1, 2],
+                vec![200, 300],
+            ))],
+            schema,
+        ));
+
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        let (new_dataset, _) = job.execute_reader(source).await.unwrap();
+        let dataset_schema = ArrowSchema::from(new_dataset.schema());
+        let DataType::Struct(blob_children) =
+            dataset_schema.field_with_name("blobs").unwrap().data_type()
+        else {
+            panic!("expected complete logical blob struct after merge insert");
+        };
+        assert_eq!(blob_children.as_ref(), BLOB_V2_LOGICAL_FIELDS.as_ref());
         let blobs = new_dataset
             .take_blobs_by_indices(&[0, 1, 2], "blobs")
             .await

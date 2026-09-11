@@ -45,7 +45,6 @@ pub struct CommitBuilder<'a> {
     store_params: Option<ObjectStoreParams>,
     object_store: Option<Arc<ObjectStore>>,
     source_store: Option<Arc<ObjectStore>>,
-    source_commit_handler: Option<Arc<dyn CommitHandler>>,
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
@@ -71,7 +70,6 @@ impl<'a> CommitBuilder<'a> {
             store_params: None,
             object_store: None,
             source_store: None,
-            source_commit_handler: None,
             session: None,
             detached: false,
             commit_config: Default::default(),
@@ -131,15 +129,12 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Pass the dataset being cloned from.
+    /// Pass the object store of the dataset being cloned from.
     ///
-    /// Only used by `Operation::Clone`: the source manifest is resolved through
-    /// the dataset's commit handler and read through its object store. This is
-    /// required when the source and destination use different manifest stores.
-    pub fn with_source_dataset(mut self, source: &Dataset) -> Self {
-        self.source_store = Some(source.object_store.clone());
-        self.source_commit_handler = Some(source.commit_handler.clone());
-        self
+    /// The source dataset's commit handler is not used.
+    #[deprecated(since = "12.0.0-beta.12", note = "use with_source_store instead")]
+    pub fn with_source_dataset(self, source: &Dataset) -> Self {
+        self.with_source_store(source.object_store.clone())
     }
 
     /// Pass a commit handler to use for the dataset.
@@ -311,9 +306,8 @@ impl<'a> CommitBuilder<'a> {
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
             .unwrap_or_default();
 
-        // Store and handler used to read the source manifest for a clone.
+        // Store used to read the source manifest for a clone (see with_source_store).
         let source_store = self.source_store.clone();
-        let source_commit_handler = self.source_commit_handler.clone();
 
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
@@ -486,7 +480,6 @@ impl<'a> CommitBuilder<'a> {
             commit_new_dataset(
                 object_store.as_ref(),
                 source_store.as_deref(),
-                source_commit_handler.as_deref(),
                 commit_handler.as_ref(),
                 &base_path,
                 &transaction,
@@ -620,9 +613,7 @@ mod tests {
     use lance_table::format::{
         DataFile, Fragment, IndexMetadata, Manifest, Transaction as TableTransaction,
     };
-    use lance_table::io::commit::{
-        CommitError, ConditionalPutCommitHandler, ManifestLocation, ManifestWriter,
-    };
+    use lance_table::io::commit::{CommitError, ManifestLocation, ManifestWriter};
     use std::time::Duration;
 
     use object_store::throttle::ThrottleConfig;
@@ -691,90 +682,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             Err(CommitError::CommitConflict)
         }
-    }
-
-    #[derive(Debug)]
-    struct DestinationOnlyCommitHandler;
-
-    #[async_trait::async_trait]
-    impl CommitHandler for DestinationOnlyCommitHandler {
-        async fn resolve_version_location(
-            &self,
-            _base_path: &object_store::path::Path,
-            _version: u64,
-            _object_store: &dyn object_store::ObjectStore,
-        ) -> Result<ManifestLocation> {
-            Err(Error::invalid_input(
-                "destination commit handler cannot resolve source versions",
-            ))
-        }
-
-        async fn commit(
-            &self,
-            manifest: &mut Manifest,
-            indices: Option<Vec<IndexMetadata>>,
-            base_path: &object_store::path::Path,
-            object_store: &ObjectStore,
-            manifest_writer: ManifestWriter,
-            naming_scheme: ManifestNamingScheme,
-            transaction: Option<TableTransaction>,
-        ) -> std::result::Result<ManifestLocation, CommitError> {
-            ConditionalPutCommitHandler
-                .commit(
-                    manifest,
-                    indices,
-                    base_path,
-                    object_store,
-                    manifest_writer,
-                    naming_scheme,
-                    transaction,
-                )
-                .await
-        }
-    }
-
-    #[tokio::test]
-    async fn test_clone_uses_source_dataset_commit_handler() {
-        let session = Arc::new(Session::default());
-        let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "i",
-                DataType::Int32,
-                false,
-            )])),
-            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
-        )
-        .unwrap();
-        let source = InsertBuilder::new("memory://clone-source-handler/source")
-            .with_params(&WriteParams {
-                session: Some(session.clone()),
-                ..Default::default()
-            })
-            .execute(vec![batch])
-            .await
-            .unwrap();
-        let version = source.version().version;
-        let transaction = Transaction::new(
-            version,
-            Operation::Clone {
-                is_shallow: true,
-                ref_name: None,
-                ref_version: version,
-                ref_path: source.uri().to_string(),
-                branch_name: None,
-            },
-            None,
-        );
-
-        let cloned = CommitBuilder::new("memory://clone-source-handler/target")
-            .with_session(session)
-            .with_commit_handler(Arc::new(DestinationOnlyCommitHandler))
-            .with_source_dataset(&source)
-            .execute(transaction)
-            .await
-            .unwrap();
-
-        assert_eq!(cloned.count_rows(None).await.unwrap(), 10);
     }
 
     #[tokio::test]

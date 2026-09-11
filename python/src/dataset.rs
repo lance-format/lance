@@ -589,6 +589,25 @@ impl MergeInsertBuilder {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
+    /// [`Self::analyze_plan`] for fully-materialized data.
+    ///
+    /// Routed to the same in-memory table `execute_batches` uses, so the reported
+    /// plan is the one such a source actually runs.
+    pub fn analyze_plan_batches(&mut self, new_data: &Bound<PyAny>) -> PyResult<String> {
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        rt().block_on(None, job.analyze_plan_batches(batches))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
     /// Mark MemWAL SSTables as compacted into the base table.
     ///
     /// Call this when executing a merge_insert that compacts MemWAL SSTables.

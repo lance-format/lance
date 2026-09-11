@@ -349,7 +349,6 @@ pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
     source_store: Option<&ObjectStore>,
-    source_commit_handler: Option<&dyn CommitHandler>,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
@@ -374,10 +373,9 @@ async fn do_commit_new_dataset(
         // from the destination store when cloning across object stores/accounts. Falls
         // back to the destination store for same-store clones.
         let source_store = source_store.unwrap_or(object_store);
-        let source_commit_handler = source_commit_handler.unwrap_or(commit_handler);
         let source_base_path =
             ObjectStore::extract_path_from_uri(store_registry, ref_path.as_str())?;
-        let source_manifest_location = source_commit_handler
+        let source_manifest_location = commit_handler
             .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
         let source_manifest = Dataset::load_manifest(
@@ -626,7 +624,6 @@ async fn record_new_dataset_commit(
 pub(crate) async fn commit_new_dataset(
     object_store: &ObjectStore,
     source_store: Option<&ObjectStore>,
-    source_commit_handler: Option<&dyn CommitHandler>,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
@@ -638,7 +635,6 @@ pub(crate) async fn commit_new_dataset(
     do_commit_new_dataset(
         object_store,
         source_store,
-        source_commit_handler,
         commit_handler,
         base_path,
         transaction,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import json
 import logging
 import os
 import platform
@@ -1191,10 +1192,10 @@ def test_create_ivf_rq_index():
         "vector",
         index_type="IVF_RQ",
         num_partitions=4,
-        num_bits=1,
     )
     assert ds.describe_indices()[0].field_names == ["vector"]
     stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["sub_index"]["num_bits"] == 5
     assert stats["indices"][0]["sub_index"]["packed"] is True
 
     with pytest.raises(
@@ -1232,6 +1233,13 @@ def test_create_ivf_rq_index():
     assert res.num_rows == 10
     assert res["_distance"].to_numpy().min() == 0.0
     assert res["_distance"].to_numpy().max() == 0.0
+
+
+def test_build_rq_model_default_num_bits():
+    from lance.lance import indices
+
+    model = json.loads(indices.build_rq_model(dimension=8))
+    assert model["num_bits"] == 5
 
 
 def test_create_ivf_rq_skip_transpose():

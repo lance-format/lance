@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use std::{fmt::Debug, sync::atomic::AtomicU64};
+use tokio::task::JoinSet;
 use tracing::instrument;
 
 // The legacy bitpacking block size. Position streams still use this block size;
@@ -419,7 +420,7 @@ impl InvertedIndexBuilder {
         let tokenized_count = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = async_channel::bounded(num_workers);
         let dest_store = dest_store.clone_arc();
-        let mut index_tasks = Vec::with_capacity(num_workers);
+        let mut index_tasks = JoinSet::new();
         for _ in 0..num_workers {
             let tokenizer = tokenizer.clone();
             let receiver: async_channel::Receiver<RecordBatch> = receiver.clone();
@@ -427,7 +428,7 @@ impl InvertedIndexBuilder {
             let id_alloc = id_alloc.clone();
             let progress = self.progress.clone();
             let tokenized_count = tokenized_count.clone();
-            index_tasks.push(tokio::task::spawn(async move {
+            index_tasks.spawn(async move {
                 let mut worker =
                     IndexWorker::new(tokenizer, dest_store, id_alloc, worker_config).await?;
                 while let Ok(batch) = receiver.recv().await {
@@ -441,7 +442,7 @@ impl InvertedIndexBuilder {
                         .await?;
                 }
                 worker.finish().await
-            }));
+            });
         }
 
         let index_build = async {
@@ -455,7 +456,17 @@ impl InvertedIndexBuilder {
             let mut last_num_rows = 0;
             let mut total_num_rows = 0;
             let start = std::time::Instant::now();
-            while let Some(batch) = stream.try_next().await? {
+            loop {
+                let batch = match stream.try_next().await {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => break,
+                    Err(err) => {
+                        drop(stream);
+                        drop(sender);
+                        index_tasks.shutdown().await;
+                        return Err(err.into());
+                    }
+                };
                 let num_rows = batch.num_rows();
 
                 if sender.send(batch).await.is_err() {
@@ -485,8 +496,18 @@ impl InvertedIndexBuilder {
             let start = std::time::Instant::now();
             let mut tail_partitions = Vec::new();
             let mut files = Vec::new();
-            for index_task in index_tasks {
-                let output = index_task.await??;
+            while let Some(index_task) = index_tasks.join_next().await {
+                let output = match index_task {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(err)) => {
+                        index_tasks.shutdown().await;
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        index_tasks.shutdown().await;
+                        return Err(err.into());
+                    }
+                };
                 self.new_partitions.extend(output.partitions);
                 files.extend(output.files);
                 if let Some(tail_partition) = output.tail_partition {
@@ -2439,8 +2460,9 @@ mod tests {
     use std::any::Any;
     use std::fmt::{Display, Formatter};
     use std::ops::Range;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     fn make_doc_batch(doc: &str, row_id: u64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -4108,6 +4130,38 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct LateCallbackDetectingProgress {
+        calls: AtomicUsize,
+        first_callback_started: Arc<Notify>,
+        release_first_callback: Arc<Notify>,
+        update_returned: Arc<AtomicBool>,
+        callback_after_return: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl IndexBuildProgress for LateCallbackDetectingProgress {
+        async fn stage_start(&self, _stage: &str, _total: Option<u64>, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stage_progress(&self, _stage: &str, _completed: u64) -> Result<()> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.update_returned.load(Ordering::SeqCst) {
+                self.callback_after_return.notify_one();
+            }
+            if call == 0 {
+                self.first_callback_started.notify_one();
+                self.release_first_callback.notified().await;
+            }
+            Ok(())
+        }
+
+        async fn stage_complete(&self, _stage: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn test_builder_reports_progress_stages() -> Result<()> {
         let index_dir = TempDir::default();
@@ -4893,6 +4947,64 @@ mod tests {
         assert!(
             result.to_string().contains("injected progress failure"),
             "unexpected error: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_index_joins_workers_before_returning_stream_error() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let first_callback_started = Arc::new(Notify::new());
+        let release_first_callback = Arc::new(Notify::new());
+        let update_returned = Arc::new(AtomicBool::new(false));
+        let callback_after_return = Arc::new(Notify::new());
+        let progress = Arc::new(LateCallbackDetectingProgress {
+            calls: AtomicUsize::new(0),
+            first_callback_started: first_callback_started.clone(),
+            release_first_callback: release_first_callback.clone(),
+            update_returned: update_returned.clone(),
+            callback_after_return: callback_after_return.clone(),
+        });
+
+        let first_batch = make_doc_batch("hello world", 0);
+        let second_batch = make_doc_batch("goodbye world", 1);
+        let schema = first_batch.schema();
+        let source = stream::iter(vec![Ok(first_batch), Ok(second_batch)]).chain(stream::once({
+            let first_callback_started = first_callback_started.clone();
+            async move {
+                first_callback_started.notified().await;
+                Err(datafusion::error::DataFusionError::Execution(
+                    "injected stream failure".to_owned(),
+                ))
+            }
+        }));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, source));
+        let params = InvertedIndexParams::default().num_workers(1);
+        let mut builder = InvertedIndexBuilder::new(params).with_progress(progress);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            builder.update_index(stream, store.as_ref()),
+        )
+        .await
+        .expect("update_index should not hang")
+        .expect_err("stream failure should be returned");
+        assert!(
+            result.to_string().contains("injected stream failure"),
+            "unexpected error: {result}"
+        );
+
+        update_returned.store(true, Ordering::SeqCst);
+        release_first_callback.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), callback_after_return.notified())
+                .await
+                .is_err(),
+            "detached worker invoked progress after update_index returned"
         );
     }
 

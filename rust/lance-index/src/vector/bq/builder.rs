@@ -25,7 +25,7 @@ use crate::vector::bq::transform::{
     SCALE_FACTORS_FIELD,
 };
 use crate::vector::bq::{
-    RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits,
+    RABIT_DEFAULT_NUM_BITS, RQBuildParams, RQRotationType, rabit_binary_code_bytes, rabit_ex_bits,
     rotation::{apply_fast_rotation, fast_rotation_signs_len, random_fast_rotation_signs},
     validate_rq_num_bits,
 };
@@ -33,7 +33,7 @@ use crate::vector::quantizer::{Quantization, Quantizer, QuantizerBuildParams};
 
 /// Build parameters for RabitQuantizer.
 ///
-/// num_bits: the number of bits per dimension.
+/// num_bits: the number of bits per dimension. Defaults to 5.
 pub struct RabitBuildParams {
     pub num_bits: u8,
     pub rotation_type: RQRotationType,
@@ -42,7 +42,7 @@ pub struct RabitBuildParams {
 impl Default for RabitBuildParams {
     fn default() -> Self {
         Self {
-            num_bits: 1,
+            num_bits: RABIT_DEFAULT_NUM_BITS,
             rotation_type: RQRotationType::default(),
         }
     }
@@ -962,6 +962,11 @@ mod tests {
     use rstest::rstest;
 
     use crate::vector::bq::storage::RABIT_BLOCKED_EX_CODE_COLUMN;
+
+    #[test]
+    fn test_rabit_build_params_default_num_bits() {
+        assert_eq!(RabitBuildParams::default().num_bits, 5);
+    }
 
     fn reference_best_ex_rescale_factor(abs_normalized: &[f32], ex_bits: u8) -> f32 {
         let max_value = abs_normalized

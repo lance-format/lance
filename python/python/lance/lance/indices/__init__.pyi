@@ -69,7 +69,7 @@ def transform_vectors(
 ): ...
 def build_rq_model(
     dimension: int,
-    num_bits: int = 1,
+    num_bits: int = 5,
     dtype: str = "float32",
 ) -> str: ...
 

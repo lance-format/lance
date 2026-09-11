@@ -25,6 +25,7 @@ rand_xoshiro = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 lance-testing.workspace = true
+rstest.workspace = true
 
 [lib]
 bench = false

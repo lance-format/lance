@@ -8,6 +8,7 @@ import random
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import lance
 import numpy as np
@@ -106,6 +107,28 @@ def test_sql_predicates(dataset):
 
     for expr, expected_num_rows in predicates_nrows:
         assert dataset.to_table(filter=expr).num_rows == expected_num_rows
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us"])
+@pytest.mark.parametrize("timezone", [None, "UTC", "America/New_York"])
+def test_timestamp_pyarrow_predicates(tmp_path: Path, unit: str, timezone: str | None):
+    # PyArrow filters reach Lance as Substrait, where the timestamp literal used to be
+    # decoded in the wrong unit.
+    tz = ZoneInfo(timezone) if timezone else None
+    start = datetime(2021, 1, 1, tzinfo=tz)
+    ts_type = pa.timestamp(unit, timezone)
+    table = pa.table(
+        {"ts": pa.array([start + timedelta(hours=i) for i in range(100)], ts_type)}
+    )
+    dataset = lance.write_dataset(table, tmp_path / f"{unit}_{timezone}")
+
+    cutoff = pa.scalar(start + timedelta(hours=50), ts_type)
+    for expr in [
+        pc.field("ts") > cutoff,
+        pc.field("ts") < cutoff,
+        pc.field("ts") == cutoff,
+    ]:
+        assert dataset.to_table(filter=expr) == table.filter(expr)
 
 
 def test_sql_current_date(tmp_path: Path):

@@ -29,8 +29,8 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::vector::ivf::{
-    VectorSegmentCompatibility, index_type_for_segmented_optimize, optimize_vector_indices,
-    select_segment_for_single_rebalance, vector_segment_compatibility,
+    SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
+    optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
 };
 use super::vector::{LogicalVectorIndex, fresh_vector_segment_params};
 use super::{CreateIndexBuilder, DatasetIndexInternalExt};
@@ -960,22 +960,20 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             if unindexed.is_empty() && options.num_indices_to_merge == Some(0) {
                 return Ok(None);
             }
-            if unindexed.is_empty()
-                && options.num_indices_to_merge.is_none()
-                && select_segment_for_single_rebalance(&ivf_view)?.is_none()
-            {
-                return Ok(None);
-            }
-
-            let use_single_segment_rebalance = logical_index.num_segments() > 1
-                && options.num_indices_to_merge.is_none()
-                && unindexed.is_empty();
-
-            if use_single_segment_rebalance {
-                let Some(selected_segment_id) = select_segment_for_single_rebalance(&ivf_view)?
-                else {
-                    return Ok(None);
+            let steady_state_rebalance =
+                if unindexed.is_empty() && options.num_indices_to_merge.is_none() {
+                    let Some(rebalance) = select_steady_state_rebalance(&ivf_view, compatibility)?
+                    else {
+                        return Ok(None);
+                    };
+                    Some(rebalance)
+                } else {
+                    None
                 };
+
+            if let Some(SteadyStateRebalance::Segment(selected_segment_id)) = steady_state_rebalance
+                && logical_index.num_segments() > 1
+            {
                 let removed_segment = old_indices
                 .iter()
                 .copied()
@@ -1564,7 +1562,10 @@ mod tests {
 
         let initial_fragments = dataset.get_fragments();
         assert_eq!(initial_fragments.len(), 2);
-        let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        // Two partitions per segment: summed over the segments they are under
+        // the join threshold, which must not tempt a steady-state merge of
+        // segments whose centroids differ.
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
         let mut initial_segments = Vec::with_capacity(initial_fragments.len());
         for fragment in &initial_fragments {
             initial_segments.push(
@@ -2284,7 +2285,7 @@ mod tests {
     /// vector index used to fall through to `optimize_vector_indices` and write
     /// a new UUID directory + manifest even though nothing had changed. The
     /// no-op gate inside `merge_indices_with_unindexed_frags` should bail out
-    /// once `select_segment_for_single_rebalance` returns `None`.
+    /// once `select_steady_state_rebalance` returns `None`.
     #[tokio::test]
     async fn test_optimize_indices_append_is_noop_on_steady_state() {
         const DIM: usize = 64;

@@ -72,8 +72,12 @@ This protocol mirrors fragment ID assignment and ensures row IDs are unique acro
 
 Stable row IDs are a dataset-level feature recorded in the table manifest.
 
-- Stable row IDs **must be enabled when the dataset is first created**.
-- Currently, they **cannot be turned on later** for an existing dataset. Attempts to write with `enable_stable_row_ids = true` against a dataset that was created without stable row IDs will not change the dataset's configuration.
+- Stable row IDs may be enabled when a dataset is created or by migrating an existing dataset.
+- An ordinary write with `enable_stable_row_ids = true` does not migrate an existing dataset. Use the stable row ID migration operation instead; the Rust API exposes it as `Dataset::migrate_to_stable_row_ids`.
+- Before migrating a dataset whose current manifest has no writer version, use the current Lance writer to commit an ordinary no-op deletion with predicate `false`, then reopen the latest version. This metadata-upgrade commit recomputes the authoritative physical row count for every fragment. Do not invoke stable row ID migration directly on such a legacy manifest: affected releases may have recorded stale counts, which would produce incomplete row ID sequences.
+- Before migration, stop all index builds and index commits, drop every secondary index so no index entry remains in the dataset metadata, and keep index creation quiesced until migration completes. An in-flight index commit from a pre-migration snapshot can otherwise attach stale physical row addresses after activation. Recreate indices after migration.
+- Quiesce data-modifying writers during migration. The migration uses a single atomic merge commit and does not retry when a concurrent write causes a conflict; the caller must retry the migration.
+- Migration assigns an ID to every physical row position, including deleted positions, and atomically enables the feature and advances `next_row_id`. Migrating a dataset that already uses stable row IDs is a no-op.
 - When stable row IDs are disabled, the `_rowid` column (if requested) is not stable and should not be used as a persistent identifier.
 
 Row-level version tracking (`_row_created_at_version`, `_row_last_updated_at_version`) and the row ID index described below are only available when stable row IDs are enabled.
@@ -181,11 +185,14 @@ The implementation selects the most compact encoding based on the value range, c
 
 </details>
 
-#### Inline vs External Storage
+#### Inline and External Storage
 
-Row ID sequences are stored either inline in the fragment metadata or in external files.
-Sequences smaller than ~200KB are stored inline to avoid additional I/O, while larger sequences are written to external files referenced by path and offset.
-This threshold balances manifest size against the overhead of separate file reads.
+`DataFragment` defines inline and external metadata fields as valid wire alternatives for row ID sequences and row version sequences.
+These fields do not currently imply a size-based switching threshold.
+Current Lance writers store all three sequence types inline in the fragment metadata regardless of their encoded size and do not emit the external alternatives.
+
+Current Lance readers can load externally stored row ID sequences.
+The format also permits external created-at and last-updated-at version sequences, but current Lance readers cannot load them; this is an implementation limitation, not an invalid encoding.
 
 <details>
 <summary>DataFragment row_id_sequence field</summary>
@@ -360,4 +367,3 @@ WHERE _row_created_at_version <= {begin_version}
 ```
 
 This query excludes newly inserted rows by requiring `_row_created_at_version <= {begin_version}`, ensuring only pre-existing rows that were subsequently updated are returned.
-

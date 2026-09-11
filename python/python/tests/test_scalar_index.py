@@ -1543,13 +1543,22 @@ def test_indexed_filter_with_fts_index(tmp_path):
 
 
 def test_fts_ngram_tokenizer(tmp_path):
-    data = pa.table({"text": ["hello world", "lance database", "lance is cool"]})
-    ds = lance.write_dataset(data, tmp_path)
+    data = pa.table(
+        {"text": ["hello world", "lance database", "lance is cool", "theatre", "other"]}
+    )
+    ds = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
     ds.create_scalar_index("text", index_type="INVERTED", base_tokenizer="ngram")
 
     results = ds.to_table(full_text_query="lan")
     assert results.num_rows == 2
     assert set(results["text"].to_pylist()) == {"lance database", "lance is cool"}
+
+    results = ds.to_table(full_text_query="the")
+    assert set(results["text"].to_pylist()) == {"theatre", "other"}
+
+    params = ds.stats.index_stats("text_idx")["indices"][0]["params"]
+    assert params["stem"] is False
+    assert params["remove_stop_words"] is False
 
     results = ds.to_table(full_text_query="nce")  # spellchecker:disable-line
     assert results.num_rows == 2

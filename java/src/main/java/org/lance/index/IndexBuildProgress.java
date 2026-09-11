@@ -22,8 +22,10 @@ public interface IndexBuildProgress {
    * Reports that a stage has started.
    *
    * <p>Implementations must be thread-safe. Lance may invoke callbacks concurrently from native
-   * runtime threads. Callbacks may re-enter the same {@code Dataset} through JNI methods. An
-   * exception thrown by this method terminates the index operation.
+   * runtime threads. Callbacks may re-enter read-only methods on the same {@code Dataset} through
+   * JNI. Conflicting write re-entry from a callback is rejected; unrelated concurrent callers keep
+   * their normal wait behavior. Concurrent create/merge index builds on the same Dataset handle are
+   * serialized. An exception thrown by this method terminates the index operation.
    *
    * @param stage stable, index-type-specific stage name
    * @param total number of work units, or empty when the total is unknown

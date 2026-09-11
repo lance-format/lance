@@ -70,36 +70,72 @@ impl PartitionTransformer {
         self.with_distance = with_distance;
         self
     }
-}
-impl Transformer for PartitionTransformer {
-    #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
-    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        if !(batch.column_by_name(&self.output_column).is_none()
-            || self.with_distance && batch.column_by_name(CENTROID_DIST_COLUMN).is_none())
-        {
-            // If the output columns are already present, we don't need to compute it again.
-            return Ok(batch.clone());
+
+    fn with_distances_to_chosen_partitions(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let fsl = self.input_vectors(batch)?;
+        let part_ids = batch
+            .column_by_name(&self.output_column)
+            .expect("checked by the caller")
+            .as_primitive::<UInt32Type>();
+        let mut dists = Vec::with_capacity(fsl.len());
+        for (vector, part_id) in fsl.iter().zip(part_ids.iter()) {
+            let (Some(vector), Some(part_id)) = (vector, part_id) else {
+                dists.push(None);
+                continue;
+            };
+            let centroid = self.centroids.slice(part_id as usize, 1);
+            let dist = self.distance_type.arrow_batch_func()(vector.as_ref(), &centroid)?;
+            dists.push(Some(dist.value(0)));
         }
+        let loss = dists
+            .iter()
+            .map(|d| d.unwrap_or_default() as f64)
+            .sum::<f64>();
+        let batch = batch.drop_column(CENTROID_DIST_COLUMN)?.try_with_column(
+            CENTROID_DIST_FIELD.clone(),
+            Arc::new(Float32Array::from(dists)),
+        )?;
+        Ok(batch.add_metadata(LOSS_METADATA_KEY.to_owned(), loss.to_string())?)
+    }
 
-        // clear the columns if any of them is present
-        let batch = batch
-            .drop_column(PART_ID_COLUMN)?
-            .drop_column(CENTROID_DIST_COLUMN)?;
-
+    fn input_vectors<'a>(&self, batch: &'a RecordBatch) -> Result<&'a FixedSizeListArray> {
         let arr = batch.column_by_name(&self.input_column).ok_or_else(|| {
             lance_core::Error::index(format!(
                 "PartitionTransformer: column {} not found in the RecordBatch",
                 self.input_column
             ))
         })?;
-
-        let fsl = arr.as_fixed_size_list_opt().ok_or_else(|| {
+        arr.as_fixed_size_list_opt().ok_or_else(|| {
             lance_core::Error::index(format!(
                 "PartitionTransformer: column {} is not a FixedSizeListArray: {}",
                 self.input_column,
                 arr.data_type(),
             ))
-        })?;
+        })
+    }
+}
+impl Transformer for PartitionTransformer {
+    #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let has_part_ids = batch.column_by_name(&self.output_column).is_some();
+        let needs_dists =
+            self.with_distance && batch.column_by_name(CENTROID_DIST_COLUMN).is_none();
+        if has_part_ids && !needs_dists {
+            // If the output columns are already present, we don't need to compute it again.
+            return Ok(batch.clone());
+        }
+        if has_part_ids {
+            // The caller chose every row's partition (a join placing rows where
+            // there is room): keep it and measure the distance to that centroid
+            // rather than reassign the row to its nearest one.
+            return self.with_distances_to_chosen_partitions(batch);
+        }
+
+        // clear the columns if any of them is present
+        let batch = batch
+            .drop_column(PART_ID_COLUMN)?
+            .drop_column(CENTROID_DIST_COLUMN)?;
+        let fsl = self.input_vectors(&batch)?;
 
         let (part_ids, dists) = match &self.index {
             Some(index) => fsl
@@ -174,5 +210,261 @@ impl Transformer for PartitionFilter {
         let part_ids = arr.as_primitive::<UInt32Type>();
         let indices = UInt32Array::from(self.filter_row_ids(part_ids.values()));
         Ok(batch.take(&indices)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::{Int32Array, cast::AsArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance_arrow::FixedSizeListArrayExt;
+
+    const VECTOR_COLUMN: &str = "v";
+
+    /// Two centroids far enough apart that assignment is unambiguous regardless
+    /// of accumulation precision.
+    fn centroids() -> FixedSizeListArray {
+        FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0, 0.0, 100.0, 100.0]), 2)
+            .unwrap()
+    }
+
+    fn transformer() -> PartitionTransformer {
+        PartitionTransformer::new(centroids(), DistanceType::L2, VECTOR_COLUMN)
+    }
+
+    fn vector_batch(vectors: Vec<Vec<f32>>) -> RecordBatch {
+        let fsl = FixedSizeListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>(
+            vectors.into_iter().map(|v| Some(v.into_iter().map(Some))),
+            2,
+        );
+        let schema = Schema::new(vec![Field::new(
+            VECTOR_COLUMN,
+            fsl.data_type().clone(),
+            true,
+        )]);
+        RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap()
+    }
+
+    fn part_ids_of(batch: &RecordBatch) -> Vec<Option<u32>> {
+        batch
+            .column_by_name(PART_ID_COLUMN)
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .iter()
+            .collect()
+    }
+
+    fn loss_of(batch: &RecordBatch) -> f64 {
+        batch
+            .schema_ref()
+            .metadata()
+            .get(LOSS_METADATA_KEY)
+            .expect("loss metadata should be attached")
+            .parse()
+            .unwrap()
+    }
+
+    /// A vector assigned to the wrong partition is never searched in the right
+    /// one, so this is the assertion the whole file exists for.
+    #[test]
+    fn test_assigns_the_nearest_centroid() {
+        let batch = vector_batch(vec![vec![1.0, -1.0], vec![99.0, 101.0], vec![2.0, 2.0]]);
+
+        let output = transformer().transform(&batch).unwrap();
+
+        assert_eq!(part_ids_of(&output), vec![Some(0), Some(1), Some(0)]);
+        // The vector column survives untouched next to the new partition column.
+        assert_eq!(
+            output.column_by_name(VECTOR_COLUMN).unwrap(),
+            batch.column_by_name(VECTOR_COLUMN).unwrap()
+        );
+    }
+
+    /// Loss is the accumulated centroid distance and is read back by the
+    /// shuffler, so it has to be attached even when nothing is off-centroid.
+    #[test]
+    fn test_loss_is_zero_when_vectors_sit_on_centroids() {
+        let batch = vector_batch(vec![vec![0.0, 0.0], vec![100.0, 100.0]]);
+
+        let output = transformer().transform(&batch).unwrap();
+
+        assert_eq!(loss_of(&output), 0.0);
+    }
+
+    #[test]
+    fn test_loss_accumulates_across_rows() {
+        let batch = vector_batch(vec![vec![3.0, 4.0], vec![100.0, 100.0]]);
+
+        let loss = loss_of(&transformer().transform(&batch).unwrap());
+
+        assert!(
+            loss > 0.0,
+            "loss should reflect the off-centroid row: {loss}"
+        );
+    }
+
+    #[test]
+    fn test_centroid_distance_is_opt_in() {
+        let batch = vector_batch(vec![vec![1.0, 1.0]]);
+
+        let without = transformer().transform(&batch).unwrap();
+        assert!(without.column_by_name(CENTROID_DIST_COLUMN).is_none());
+
+        let with = transformer().with_distance(true).transform(&batch).unwrap();
+        let dists = with
+            .column_by_name(CENTROID_DIST_COLUMN)
+            .expect("distance column requested")
+            .as_primitive::<arrow_array::types::Float32Type>();
+        assert_eq!(dists.len(), 1);
+        assert!(dists.value(0) > 0.0);
+    }
+
+    /// Recomputing over an already-assigned batch would waste the work and could
+    /// disagree with the ids the caller already wrote.
+    #[test]
+    fn test_keeps_chosen_partitions_and_measures_their_distance() {
+        // A caller that chose partition 1 for a vector nearest to partition 0
+        // gets the distance to partition 1, not a new assignment.
+        let batch = vector_batch(vec![vec![1.0, 1.0]])
+            .try_with_column(
+                PART_ID_FIELD.clone(),
+                Arc::new(UInt32Array::from(vec![1_u32])),
+            )
+            .unwrap();
+        let output = transformer().with_distance(true).transform(&batch).unwrap();
+        assert_eq!(part_ids_of(&output), vec![Some(1)]);
+        let dists = output
+            .column_by_name(CENTROID_DIST_COLUMN)
+            .unwrap()
+            .as_primitive::<arrow_array::types::Float32Type>();
+        assert!((dists.value(0) - 99.0_f32 * 99.0 * 2.0).abs() < 1e-3);
+        assert!((loss_of(&output) - 99.0_f64 * 99.0 * 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_is_noop_when_partitions_already_present() {
+        let assigned = transformer()
+            .transform(&vector_batch(vec![vec![1.0, 1.0]]))
+            .unwrap();
+
+        let output = transformer().transform(&assigned).unwrap();
+
+        assert_eq!(output, assigned);
+    }
+
+    /// Partitions present but distances missing is the one case that still has to
+    /// recompute, otherwise `with_distance` silently returns a batch without the
+    /// column it promised.
+    #[test]
+    fn test_recomputes_when_distance_requested_but_absent() {
+        let assigned = transformer()
+            .transform(&vector_batch(vec![vec![1.0, 1.0]]))
+            .unwrap();
+        assert!(assigned.column_by_name(CENTROID_DIST_COLUMN).is_none());
+
+        let output = transformer()
+            .with_distance(true)
+            .transform(&assigned)
+            .unwrap();
+
+        assert!(output.column_by_name(CENTROID_DIST_COLUMN).is_some());
+        assert_eq!(part_ids_of(&output), vec![Some(0)]);
+    }
+
+    #[test]
+    fn test_reports_missing_vector_column() {
+        let batch = RecordBatch::try_new(
+            Schema::new(vec![Field::new("other", DataType::Int32, false)]).into(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let message = transformer().transform(&batch).unwrap_err().to_string();
+
+        assert!(message.contains(VECTOR_COLUMN), "{message}");
+        assert!(message.contains("not found"), "{message}");
+    }
+
+    #[test]
+    fn test_reports_non_vector_column() {
+        let batch = RecordBatch::try_new(
+            Schema::new(vec![Field::new(VECTOR_COLUMN, DataType::Int32, false)]).into(),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let message = transformer().transform(&batch).unwrap_err().to_string();
+
+        assert!(message.contains("is not a FixedSizeListArray"), "{message}");
+        assert!(message.contains("Int32"), "{message}");
+    }
+
+    fn partitioned_batch(part_ids: Vec<u32>, tags: Vec<i32>) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new(PART_ID_COLUMN, DataType::UInt32, false),
+            Field::new("tag", DataType::Int32, false),
+        ]);
+        RecordBatch::try_new(
+            schema.into(),
+            vec![
+                Arc::new(UInt32Array::from(part_ids)),
+                Arc::new(Int32Array::from(tags)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// A sharded build only writes the partitions in its own range. Keeping a row
+    /// outside the range would put it in the wrong shard's file; dropping one
+    /// inside it loses the vector from the index entirely.
+    #[test]
+    fn test_partition_filter_keeps_only_the_requested_range() {
+        let batch = partitioned_batch(vec![0, 3, 1, 7, 2], vec![10, 13, 11, 17, 12]);
+
+        let output = PartitionFilter::new(PART_ID_COLUMN, 1..3)
+            .transform(&batch)
+            .unwrap();
+
+        let kept: Vec<u32> = output
+            .column_by_name(PART_ID_COLUMN)
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(kept, vec![1, 2]);
+        // The filter has to carry every other column along with it.
+        let tags: Vec<i32> = output
+            .column_by_name("tag")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(tags, vec![11, 12]);
+    }
+
+    #[test]
+    fn test_partition_filter_can_keep_nothing() {
+        let batch = partitioned_batch(vec![0, 5], vec![1, 2]);
+
+        let output = PartitionFilter::new(PART_ID_COLUMN, 9..10)
+            .transform(&batch)
+            .unwrap();
+
+        assert_eq!(output.num_rows(), 0);
+        assert_eq!(output.schema(), batch.schema());
+    }
+
+    #[test]
+    fn test_partition_filter_reports_missing_column() {
+        let batch = partitioned_batch(vec![0], vec![1]);
+
+        let message = PartitionFilter::new("absent", 0..1)
+            .transform(&batch)
+            .unwrap_err()
+            .to_string();
+
+        assert!(message.contains("absent"), "{message}");
     }
 }
