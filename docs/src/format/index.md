@@ -22,7 +22,7 @@ The layers are designed so that only table readers, table writers, and index rea
 
 ### File Format
 
-The Lance file format is optimized for cloud object storage and highly selective reads. It avoids Parquet-style row groups, uses structural encodings for efficient random access, and keeps statistics and search structures out of the file format so those concerns can evolve independently as indices.
+The Lance file format is optimized for cloud object storage and highly selective reads. It avoids Parquet-style row groups, uses structural encodings for efficient random access, and keeps statistics and search structures out of the file format so those concerns can evolve independently as indices. Rather than baking a fixed set of encodings into the specification, the file format defines a lightweight container: encodings are self-describing extensions, so new and better encodings can be added over time without changing the container itself. See [Encodings as Extensions](file/index.md#encodings-as-extensions-not-built-ins) for details.
 
 ### Table Format
 
