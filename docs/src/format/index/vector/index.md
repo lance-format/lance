@@ -71,6 +71,10 @@ segment that covers no fragments carries these details with no index files, so a
 recorded count is the only statement of the partitioning the index is to be built
 with once its column holds enough vectors to train.
 
+A recorded count is at least 1. A writer that cannot represent the count it was
+given records nothing rather than a truncated value, and a reader treats 0 as no
+request, so a partitioning is never derived from a count of zero.
+
 `target_partition_size` records the target number of vectors per partition, and is
 0 when unset. `target_num_partitions` takes precedence when both are set. An engine
 given neither derives the partitioning from the data alone.

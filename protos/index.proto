@@ -239,6 +239,10 @@ message VectorIndexDetails {
    * Absent when no count was requested, in which case the partitioning was
    * derived from the data and a rebuild derives it again. Takes precedence over
    * `target_partition_size` when both are set.
+   *
+   * A recorded count is at least 1, and a writer that cannot represent the
+   * count it was given records nothing rather than a truncated value. Readers
+   * treat 0 as no request.
    */
   optional uint32 target_num_partitions = 10;
 }
