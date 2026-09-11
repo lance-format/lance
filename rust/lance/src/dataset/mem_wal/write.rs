@@ -1389,6 +1389,9 @@ async fn replay_memtable_from_wal(
     manifest: &ShardManifest,
     base_generation: u64,
     mut make_memtable: impl FnMut(u64, usize) -> Result<MemTable>,
+    // Conforming a replayed entry needs these: a primary key the entry does not
+    // carry cannot be filled with a null.
+    pk_columns: &[String],
     flusher: &MemTableFlusher,
     wal_flusher: &WalFlusher,
     index_configs: &[MemIndexConfig],
@@ -1432,7 +1435,7 @@ async fn replay_memtable_from_wal(
                     let batches = entry
                         .batches
                         .into_iter()
-                        .map(|b| ensure_tombstone_column(b, &storage_schema))
+                        .map(|b| conform_to_storage_schema(b, &storage_schema, pk_columns))
                         .collect::<Result<Vec<_>>>()?;
 
                     // Seal + flush on the same criteria the live path uses, measured
@@ -1598,24 +1601,50 @@ fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String,
         .collect()
 }
 
-/// Re-label `batch` to the storage schema, injecting `_tombstone = false` when
-/// absent — callers pass logical-shaped batches, and WAL entries written before
-/// deletes existed lack the column.
+/// Re-label `batch` to the storage schema, matching columns by **name**.
 ///
-/// A batch that already carries `_tombstone` is re-labeled too, so an entry
-/// written under an older storage schema replays into the current one.
-fn ensure_tombstone_column(
+/// A column the schema declares and the batch does not carry is filled with
+/// typed nulls; `_tombstone` is filled with `false`. A column the batch carries
+/// and the schema does not declare is dropped.
+///
+/// Both cases are what a replayed WAL entry looks like after the table's schema
+/// moved: an entry predates a column added since, and carries one dropped
+/// since. Matching by position instead would reject the first outright and
+/// store the second under its neighbour's name. Live writes reach here already
+/// checked against the logical schema, so for them every column is present and
+/// this only appends `_tombstone`.
+///
+/// A primary key the batch does not carry is an error — there is no value to
+/// invent — and so is a column whose type does not match the schema.
+fn conform_to_storage_schema(
     batch: RecordBatch,
     storage_schema: &Arc<ArrowSchema>,
+    pk_columns: &[String],
 ) -> Result<RecordBatch> {
     let n = batch.num_rows();
-    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    if batch.schema().column_with_name(TOMBSTONE).is_none() {
-        columns.push(Arc::new(BooleanArray::from(vec![false; n])));
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(storage_schema.fields().len());
+    for field in storage_schema.fields() {
+        let name = field.name();
+        if let Some(column) = batch.column_by_name(name) {
+            columns.push(column.clone());
+        } else if name == TOMBSTONE {
+            columns.push(Arc::new(BooleanArray::from(vec![false; n])));
+        } else if pk_columns.iter().any(|c| c == name) {
+            return Err(Error::invalid_input(format!(
+                "batch is missing primary key column '{}' declared by the storage schema",
+                name
+            )));
+        } else {
+            // Non-primary-key columns are nullable in the storage schema
+            // whatever the base table declares (`relax_non_pk_nullability`), so
+            // a null stands in for a value the entry never held.
+            columns.push(new_null_array(field.data_type(), n));
+        }
     }
     RecordBatch::try_new(storage_schema.clone(), columns).map_err(|e| {
         Error::invalid_input(format!(
-            "failed to inject _tombstone column (does the batch match the base table schema?): {}",
+            "failed to conform a batch to the storage schema \
+             (does the batch match the base table schema?): {}",
             e
         ))
     })
@@ -2371,6 +2400,7 @@ impl ShardWriter {
             manifest,
             manifest.current_generation,
             make_bound_memtable,
+            &pk_columns,
             &flusher,
             &wal_flusher,
             index_configs,
@@ -2639,7 +2669,9 @@ impl ShardWriter {
                 // `_tombstone`.
                 let batches = batches
                     .into_iter()
-                    .map(|b| ensure_tombstone_column(b, &writer_state.schema))
+                    .map(|b| {
+                        conform_to_storage_schema(b, &writer_state.schema, &writer_state.pk_columns)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 self.put_memtable(batches, state, writer_state, backpressure)
                     .await
@@ -2764,7 +2796,9 @@ impl ShardWriter {
                 // Mirrors `put`.
                 let batches = batches
                     .into_iter()
-                    .map(|b| ensure_tombstone_column(b, &writer_state.schema))
+                    .map(|b| {
+                        conform_to_storage_schema(b, &writer_state.schema, &writer_state.pk_columns)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 self.put_memtable_no_wait(batches, state, writer_state, backpressure)
                     .await
@@ -4651,10 +4685,11 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_tombstone_column_injects_false() {
+    fn test_conform_injects_tombstone_false() {
         let base = create_test_schema();
         let storage = schema_with_tombstone(&base);
-        let out = ensure_tombstone_column(create_test_batch(&base, 0, 3), &storage).unwrap();
+        let pk = ["id".to_string()];
+        let out = conform_to_storage_schema(create_test_batch(&base, 0, 3), &storage, &pk).unwrap();
         assert_eq!(out.schema(), storage);
         let ts = out
             .column_by_name(TOMBSTONE)
@@ -4667,8 +4702,121 @@ mod tests {
             "put injects _tombstone = false"
         );
         // Idempotent: a batch already carrying the column passes through.
-        let again = ensure_tombstone_column(out.clone(), &storage).unwrap();
+        let again = conform_to_storage_schema(out.clone(), &storage, &pk).unwrap();
         assert_eq!(again.schema(), out.schema());
+    }
+
+    /// A WAL entry written before a column was added still replays: the column
+    /// it never held becomes null rather than a width mismatch.
+    #[test]
+    fn test_conform_fills_a_column_added_since_the_entry() {
+        let pk = ["id".to_string()];
+        let entry = create_test_batch(&create_test_schema(), 0, 2);
+
+        let widened = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("added_later", DataType::Int64, true),
+        ]);
+        let storage = schema_with_tombstone(&widened);
+
+        let out = conform_to_storage_schema(entry, &storage, &pk).unwrap();
+        assert_eq!(out.schema(), storage);
+        assert_eq!(out.num_rows(), 2);
+        let added = out.column_by_name("added_later").unwrap();
+        assert_eq!(added.null_count(), 2, "the new column replays as all-null");
+        let ids = out
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[0, 1], "the entry's own columns survive");
+    }
+
+    /// A WAL entry written before a column was dropped still replays: the
+    /// column the schema no longer declares is left behind, and the columns
+    /// that remain keep their own values rather than their neighbour's.
+    #[test]
+    fn test_conform_drops_a_column_removed_since_the_entry() {
+        let pk = ["id".to_string()];
+        let wide = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("dropped_later", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let entry = RecordBatch::try_new(
+            Arc::new(wide),
+            vec![
+                Arc::new(Int32Array::from(vec![7, 8])),
+                Arc::new(StringArray::from(vec!["gone", "gone"])),
+                Arc::new(StringArray::from(vec!["kept-7", "kept-8"])),
+            ],
+        )
+        .unwrap();
+
+        let storage = schema_with_tombstone(&create_test_schema());
+        let out = conform_to_storage_schema(entry, &storage, &pk).unwrap();
+        assert_eq!(out.schema(), storage);
+        let names = out
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            (names.value(0), names.value(1)),
+            ("kept-7", "kept-8"),
+            "positional re-labelling would have stored `dropped_later` as `name`"
+        );
+    }
+
+    /// A primary key is the one column a null cannot stand in for.
+    #[test]
+    fn test_conform_refuses_an_entry_missing_a_primary_key() {
+        let storage = schema_with_tombstone(&create_test_schema());
+        let keyless = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "name",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["a"]))],
+        )
+        .unwrap();
+
+        let error = conform_to_storage_schema(keyless, &storage, &["id".to_string()]).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("id"),
+            "the error should name the missing key: {error}"
+        );
+    }
+
+    /// A column whose type changed is a conflict, not a drift to paper over.
+    #[test]
+    fn test_conform_refuses_a_retyped_column() {
+        let storage = schema_with_tombstone(&create_test_schema());
+        let retyped = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Boolean, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(BooleanArray::from(vec![true])),
+            ],
+        )
+        .unwrap();
+
+        let error = conform_to_storage_schema(retyped, &storage, &["id".to_string()]).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
     }
 
     #[test]
