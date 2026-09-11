@@ -463,28 +463,31 @@ pub(crate) async fn decode_frag_reuse_ledger(
     .await
 }
 
-/// The number of stable-partition transitions in the dataset's committed FRI
-/// entry (0 when the entry is absent or v0). The conflict resolver diffs this
-/// count between a rewrite's read version and the current manifest to detect
-/// a concurrent reordered rewrite that no transaction file can reveal.
-pub(crate) async fn stable_partition_transition_count(
+/// The row-map ids of the stable-partition transitions in the dataset's
+/// committed FRI entry (empty when the entry is absent or v0). The conflict
+/// resolver diffs these identities between a rewrite's read version and the
+/// current manifest to detect a concurrent reordered rewrite that no
+/// transaction file can reveal. Identity, not count: a concurrent trim plus
+/// a concurrent stable-partition append can net a zero count change while
+/// still introducing an unvalidated transition.
+pub(crate) async fn stable_partition_map_ids(
     dataset: &Dataset,
-) -> lance_core::Result<usize> {
+) -> lance_core::Result<HashSet<String>> {
     let stored = super::load_all_indices(dataset).await?;
     let Some(entry) = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) else {
-        return Ok(0);
+        return Ok(HashSet::new());
     };
     let ledger = decode_frag_reuse_ledger(dataset, entry).await?;
     Ok(ledger
         .transitions()
         .iter()
-        .filter(|transition| {
-            matches!(
-                transition.mapping(),
-                lance_table::system_index::frag_reuse::ledger::Mapping::StablePartition(_)
-            )
+        .filter_map(|transition| match transition.mapping() {
+            lance_table::system_index::frag_reuse::ledger::Mapping::StablePartition(partition) => {
+                Some(partition.map_id.clone())
+            }
+            _ => None,
         })
-        .count())
+        .collect())
 }
 
 /// Extract a committed FRI entry's `FragmentReuseIndexDetails` content bytes
@@ -563,6 +566,18 @@ pub(crate) async fn build_stable_partition_rewrite_entry(
     stable_partition: &StablePartitionRewrite,
     groups: &[RewriteGroup],
 ) -> lance_core::Result<(IndexMetadata, Option<u64>)> {
+    // The spec excludes tagged histories on stable-row-id tables: the FRI is
+    // address-based, and under stable row ids a rewrite's rows keep their
+    // ids, so there is no address translation to record. The planner blocks
+    // the deferred-compaction combination already; this covers a hand-built
+    // rewrite committed directly.
+    if dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::not_supported(
+            "Tagged fragment reuse histories are address-based and excluded on \
+             stable-row-id datasets; this rewrite cannot carry transition intent here",
+        ));
+    }
+
     let transitions = &stable_partition.transitions;
     if transitions.is_empty() {
         return Err(Error::invalid_input(
@@ -794,6 +809,7 @@ pub(crate) async fn build_stable_partition_rewrite_entry(
 mod tests {
     use super::*;
     use crate::index::frag_reuse_reader::tests as reader_tests;
+    use crate::utils::test::DatagenExt;
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int32Type;
     use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
@@ -902,19 +918,12 @@ mod tests {
         let ledger = decode_entry(&dataset, &entry).await;
         assert_eq!(ledger.transitions().len(), 1);
 
-        // Reads are row-identical, unfiltered and through the translated index.
+        // Reads are row-identical, unfiltered and through the translated
+        // index -- asserted on the returned VALUES, not just counts, so a
+        // wrong-but-live translation cannot pass.
         assert_eq!(sorted_values(&dataset).await, before);
-        assert_eq!(
-            dataset.count_rows(Some("i = 3".to_string())).await.unwrap(),
-            1
-        );
-        assert_eq!(
-            dataset
-                .count_rows(Some("i >= 4".to_string()))
-                .await
-                .unwrap(),
-            4
-        );
+        assert_eq!(filtered_values(&dataset, "i = 3").await, vec![3]);
+        assert_eq!(filtered_values(&dataset, "i >= 4").await, vec![4, 5, 6, 7]);
 
         // A second stable-partition rewrite passes the tagged gate and
         // appends onto the v1 entry, preserving its bytes verbatim.
@@ -1319,18 +1328,107 @@ mod tests {
             &RoaringBitmap::from_iter([0u32, 1])
         );
 
-        // Reads translate through both hops.
+        // Reads translate through both hops -- asserted on the returned
+        // VALUES, not just counts, so a wrong-but-live translation cannot
+        // pass.
         assert_eq!(sorted_values(&dataset).await, before);
-        assert_eq!(
-            dataset.count_rows(Some("i = 3".to_string())).await.unwrap(),
-            1
-        );
-        assert_eq!(
-            dataset
-                .count_rows(Some("i >= 4".to_string()))
-                .await
-                .unwrap(),
-            4
-        );
+        assert_eq!(filtered_values(&dataset, "i = 3").await, vec![3]);
+        assert_eq!(filtered_values(&dataset, "i >= 4").await, vec![4, 5, 6, 7]);
+    }
+
+    async fn filtered_values(dataset: &Dataset, predicate: &str) -> Vec<i32> {
+        let mut scan = dataset.scan();
+        scan.filter(predicate).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut values: Vec<i32> = batch["i"]
+            .as_primitive::<Int32Type>()
+            .iter()
+            .map(|value| value.unwrap())
+            .collect();
+        values.sort_unstable();
+        values
+    }
+
+    /// A pre-assembled tagged entry without `stable_partition` intent has
+    /// bypassed assembly and validation; the commit chokepoint rejects it
+    /// even though the empty-conflicts finish path passes it through
+    /// unchanged. With intent, the same commit works (the atomic e2e above).
+    #[tokio::test]
+    async fn tagged_entry_without_intent_rejected_at_commit() {
+        let mut dataset = reader_tests::fixture().await;
+        let entry = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: FRAG_REUSE_INDEX_NAME.to_string(),
+            fields: vec![],
+            covering_fields: vec![],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                value: encode_length_delimited_field(1, &[]),
+            })),
+            index_version: 1,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let error = dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::Rewrite {
+                        groups: vec![],
+                        rewritten_indices: vec![],
+                        frag_reuse_index: Some(entry),
+                        stable_partition: None,
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("must be assembled"), "{error}");
+    }
+
+    /// The spec excludes tagged histories on stable-row-id tables; a
+    /// hand-built rewrite carrying transition intent is refused at assembly,
+    /// before anything is written or committed.
+    #[tokio::test]
+    async fn stable_partition_rejected_on_stable_row_id_dataset() {
+        let dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                crate::utils::test::FragmentCount::from(2),
+                crate::utils::test::FragmentRowCount::from(4),
+                Some(crate::dataset::WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(dataset.manifest.uses_stable_row_ids());
+        let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(Transaction::new(
+                dataset.manifest.version,
+                Operation::Rewrite {
+                    groups: vec![],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                    stable_partition: Some(StablePartitionRewrite {
+                        transitions: vec![],
+                        base_entry_version: None,
+                    }),
+                },
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("stable-row-id"), "{error}");
     }
 }

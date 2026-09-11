@@ -414,9 +414,35 @@ impl Transaction {
         config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        // A tagged entry may only reach the manifest through the commit
+        // path's assembly, which builds it from the rewrite's in-memory
+        // transition intent (`stable_partition`, carrying stable-partition or
+        // ordered-compaction transitions) against the CURRENT manifest entry
+        // at every attempt. A pre-assembled tagged entry without that intent
+        // has bypassed binding, conservation and ledger validation, and its
+        // snapshot may be stale -- splicing it would silently drop records a
+        // concurrent writer appended -- so it is rejected at this chokepoint,
+        // which every commit entrance (CommitBuilder, apply_commit, detached
+        // commits, retries) funnels through.
+        if let Operation::Rewrite {
+            frag_reuse_index: Some(entry),
+            stable_partition,
+            ..
+        } = &self.operation
+            && is_tagged(entry)
+            && stable_partition.is_none()
+        {
+            return Err(Error::invalid_input(
+                "tagged fragment reuse entries must be assembled from the rewrite's \
+                 `stable_partition` transition intent by the commit path; a pre-assembled \
+                 tagged entry without intent bypasses validation and may splice away \
+                 concurrent records",
+            ));
+        }
+
         // A rewrite carrying an already-assembled tagged entry (a
-        // stable-partition rewrite, or a future tagged compaction) appends to
-        // the tagged history instead of misinterpreting it. A bare rewrite or
+        // stable-partition rewrite, or a tagged compaction) appends to the
+        // tagged history instead of misinterpreting it. A bare rewrite or
         // one carrying a v0 entry would misinterpret, so those stay rejected.
         let appends_tagged_entry = matches!(
             &self.operation,
@@ -1730,6 +1756,49 @@ mod tests {
             error.to_string().contains("Tagged FRI history maintenance"),
             "{error}"
         );
+    }
+
+    #[rstest::rstest]
+    #[case::untagged_table(false)]
+    #[case::tagged_table(true)]
+    fn tagged_entry_without_intent_rejected(#[case] table_is_tagged: bool) {
+        // A pre-assembled tagged entry that did not come from the commit
+        // path's assembly (no `stable_partition` intent) has bypassed
+        // validation and may be stale; it must be rejected at the manifest
+        // chokepoint regardless of the table's current state.
+        let mut manifest = sample_manifest();
+        let mut current_indices = vec![];
+        if table_is_tagged {
+            manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            let mut current =
+                sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+            current.fields.clear();
+            current_indices.push(current);
+        }
+        let mut entry =
+            sample_index_metadata(crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME);
+        entry.fields.clear();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(entry),
+                stable_partition: None,
+            },
+            None,
+        );
+        let error = transaction
+            .build_manifest(
+                Some(&manifest),
+                current_indices,
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("must be assembled"), "{error}");
     }
 
     #[test]

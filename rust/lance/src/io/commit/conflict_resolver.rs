@@ -4,7 +4,7 @@
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{
     build_frag_reuse_index_metadata, build_stable_partition_rewrite_entry,
-    load_frag_reuse_index_details, stable_partition_transition_count,
+    load_frag_reuse_index_details, stable_partition_map_ids,
 };
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
@@ -1106,7 +1106,19 @@ impl<'a> TransactionRebase<'a> {
                         // the CURRENT manifest entry every attempt, so the
                         // trimmed entry is reloaded, our transition
                         // re-appended, and the result revalidated there.
-                        (Some(_), true) if stable_partition.is_some() => Ok(()),
+                        (Some(_), true) if stable_partition.is_some() => {
+                            // Same mixture sanity as the v0 arm: an FRI
+                            // replacement commits alone. A CreateIndex mixing
+                            // it with user indices is a shape this resolver
+                            // does not reason about (the user-index straddle
+                            // check below never runs for it), so refuse it
+                            // instead of guessing.
+                            if new_indices.len() != 1 || removed_indices.len() != 1 {
+                                return Err(self
+                                    .incompatible_conflict_err(other_transaction, other_version));
+                            }
+                            Ok(())
+                        }
                         // If the rewrite produces a frag_reuse_index, but frag_reuse_index was cleaned up
                         // in the other transaction, the frag_reuse_index produced by the rewrite should
                         // be cleaned up in the same way as a part of the rebase.
@@ -2271,17 +2283,20 @@ impl<'a> TransactionRebase<'a> {
             if let Some(stable_partition) = stable_partition {
                 // A concurrent stable-partition rewrite is invisible in its
                 // transaction file (the field is in-memory only), so detect
-                // it from the manifests themselves: more stable-partition
-                // transitions in the current entry than at our read version
-                // means one landed in between. This diff is live across
-                // processes and sessions, unlike the in-memory
-                // `frag_reuse_index` comparison the v0 rule relies on.
-                // Appending both blindly is only sound when the partitions
-                // are disjoint, and that auto-merge is not implemented, so
-                // the caller must rebuild against the latest version.
-                // Concurrent ordered-compaction transitions (tagged
-                // compaction, or a v0 compaction's legacy version) do not
-                // trip this: reassembly below appends onto their entry.
+                // it from the manifests themselves: a stable-partition
+                // transition in the current entry whose row-map identity did
+                // not exist at our read version landed in between. Identity,
+                // not count -- a concurrent trim plus a concurrent append can
+                // net a zero count change while still introducing an
+                // unvalidated transition. This diff is live across processes
+                // and sessions, unlike the in-memory `frag_reuse_index`
+                // comparison the v0 rule relies on. Appending both blindly is
+                // only sound when the partitions are disjoint, and that
+                // auto-merge is not implemented, so the caller must rebuild
+                // against the latest version. Concurrent ordered-compaction
+                // transitions (tagged compaction, or a v0 compaction's
+                // legacy version) do not trip this: reassembly below appends
+                // onto their entry.
                 // TODO(sp-x-sp): auto-merge disjoint concurrent
                 // stable-partition rewrites (the double-consumption rule in
                 // `check_rewrite_txn` already proves disjointness) instead
@@ -2301,9 +2316,9 @@ impl<'a> TransactionRebase<'a> {
                     let read_dataset = dataset
                         .checkout_version(self.transaction.read_version)
                         .await?;
-                    let read_count = stable_partition_transition_count(&read_dataset).await?;
-                    let current_count = stable_partition_transition_count(dataset).await?;
-                    if current_count > read_count {
+                    let read_map_ids = stable_partition_map_ids(&read_dataset).await?;
+                    let current_map_ids = stable_partition_map_ids(dataset).await?;
+                    if !current_map_ids.is_subset(&read_map_ids) {
                         return Err(Error::retryable_commit_conflict_source(
                             dataset.manifest.version,
                             "A concurrent stable-partition rewrite appended to the fragment \
@@ -5842,9 +5857,11 @@ mod tests {
         use crate::index::DatasetIndexExt;
         use crate::index::frag_reuse::{
             build_frag_reuse_index_metadata, build_new_frag_reuse_index, decode_frag_reuse_ledger,
-            load_raw_frag_reuse_content,
+            load_raw_frag_reuse_content, stable_partition_map_ids,
         };
-        use crate::index::frag_reuse_reader::tests::{prepare, prepare_partition};
+        use crate::index::frag_reuse_reader::tests::{
+            field, persist_fixture, prepare, prepare_partition,
+        };
         use crate::session::Session;
         use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
         use arrow_array::Int32Array;
@@ -5864,6 +5881,7 @@ mod tests {
         use lance_table::system_index::frag_reuse::FragDigest;
         use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
         use lance_table::transaction::StablePartitionRewrite;
+        use prost::Message;
         use roaring::{RoaringBitmap, RoaringTreemap};
 
         async fn ram_fixture(frag_count: u32, rows_per_fragment: u32) -> Dataset {
@@ -6571,8 +6589,7 @@ mod tests {
 
         /// A tagged table with one stable-partition transition (fragments
         /// 10 and 11) built through the real commit path.
-        async fn tagged_fixture() -> Dataset {
-            let mut dataset = ram_fixture(2, 4).await;
+        async fn make_tagged(mut dataset: Dataset) -> Dataset {
             reserve(&mut dataset, 40).await;
             let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
             let (transition, destinations) = prepare(&dataset).await;
@@ -6584,6 +6601,31 @@ mod tests {
             )
             .await
             .unwrap()
+        }
+
+        async fn tagged_fixture() -> Dataset {
+            make_tagged(ram_fixture(2, 4).await).await
+        }
+
+        /// An on-disk tagged fixture (fragments 10 and 11, four rows each,
+        /// values 0..8) plus two two-row appended fragments (100..102 and
+        /// 102..104): with `target_rows_per_fragment: 4` only the appended
+        /// fragments are compaction candidates, so a real `compact_files`
+        /// stays disjoint from a stable-partition rewrite of 10 and 11.
+        async fn disk_tagged_fixture_with_small_fragments(uri: &str) -> Dataset {
+            let dataset = make_tagged(disk_fixture(uri, 2, 4).await).await;
+            let dataset = append_rows(&dataset, 100..102).await;
+            let mut dataset = append_rows(&dataset, 102..104).await;
+            reserve(&mut dataset, 20).await;
+            dataset
+        }
+
+        fn deferred_compaction_options() -> crate::dataset::optimize::CompactionOptions {
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 4,
+                defer_index_remap: true,
+                ..Default::default()
+            }
         }
 
         async fn append_rows(dataset: &Dataset, values: std::ops::Range<i32>) -> Dataset {
@@ -6760,6 +6802,318 @@ mod tests {
             let mut expected: Vec<i32> = (0..8).collect();
             expected.extend(100..104);
             assert_eq!(sorted_values(&committed).await, expected);
+        }
+
+        /// FIX 2: identity, not count. Between the read version and the
+        /// current manifest one stable-partition transition was replaced by
+        /// another (a trim racing a concurrent rewrite): the count is
+        /// unchanged, so only the row-map identity diff can catch it.
+        #[tokio::test]
+        async fn sp_vs_sp_detects_swapped_transition_with_equal_count() {
+            let mut dataset = ram_fixture(2, 4).await;
+            reserve(&mut dataset, 40).await;
+            let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+            let (transition, destinations) = prepare(&dataset).await;
+            let version = dataset.manifest.version;
+            let mut dataset = commit_sp(
+                dataset,
+                version,
+                sp_rewrite(old_fragments, destinations, vec![transition.clone()]),
+            )
+            .await
+            .unwrap();
+            let read_version = dataset.manifest.version;
+
+            // Swap the committed transition's row-map identity directly in
+            // the manifest; trim is not implemented yet, so this simulates
+            // its effect netting a zero count change.
+            let mut swapped = transition;
+            let Some(transition::Mapping::StablePartition(mapping)) = &mut swapped.mapping else {
+                unreachable!()
+            };
+            mapping.map_id = Uuid::new_v4().to_string();
+            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            let indices: Vec<IndexMetadata> = stored
+                .iter()
+                .map(|idx| {
+                    if idx.name == FRAG_REUSE_INDEX_NAME {
+                        let mut replaced = idx.clone();
+                        replaced.uuid = Uuid::new_v4();
+                        replaced.index_details = Some(Arc::new(prost_types::Any {
+                            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
+                            value: field(1, &field(2, &swapped.encode_to_vec())),
+                        }));
+                        replaced
+                    } else {
+                        idx.clone()
+                    }
+                })
+                .collect();
+            persist_fixture(&mut dataset, indices).await;
+
+            let read_dataset = dataset.checkout_version(read_version).await.unwrap();
+            let read_ids = stable_partition_map_ids(&read_dataset).await.unwrap();
+            let current_ids = stable_partition_map_ids(&dataset).await.unwrap();
+            // Same count, different identity: a count heuristic passes this.
+            assert_eq!(read_ids.len(), current_ids.len());
+            assert_ne!(read_ids, current_ids);
+
+            let b_old: Vec<Fragment> = read_dataset.fragments().iter().cloned().collect();
+            let (b_transition, b_destinations) =
+                prepare_partition(&read_dataset, &[10, 11], 30).await;
+            let rebase = TransactionRebase::try_new(
+                &read_dataset,
+                Transaction::new(
+                    read_version,
+                    sp_rewrite(b_old, b_destinations, vec![b_transition]),
+                    None,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+            let error = rebase.finish(&dataset).await.unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("concurrent stable-partition rewrite"),
+                "{error}"
+            );
+        }
+
+        /// FIX 3a, order 1: a real deferred `compact_files` planned before a
+        /// concurrent stable-partition rewrite landed (fresh sessions, on
+        /// disk) rebases onto the appended entry and both records survive.
+        #[tokio::test]
+        async fn real_deferred_compaction_rebases_over_concurrent_sp_fresh_session() {
+            let dir = TempStrDir::default();
+            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+
+            // The compactor opens BEFORE the rewrite commits: its plan and
+            // its commit read-version anchor at the pre-rewrite snapshot.
+            let mut compactor = fresh_session(dir.as_str()).await;
+
+            let sp_writer = fresh_session(dir.as_str()).await;
+            let b_old: Vec<Fragment> = sp_writer
+                .fragments()
+                .iter()
+                .filter(|f| f.id == 10 || f.id == 11)
+                .cloned()
+                .collect();
+            let (b_transition, b_destinations) = prepare_partition(&sp_writer, &[10, 11], 50).await;
+            let read_version = sp_writer.manifest.version;
+            commit_sp(
+                sp_writer,
+                read_version,
+                sp_rewrite(b_old, b_destinations, vec![b_transition]),
+            )
+            .await
+            .unwrap();
+
+            let metrics = crate::dataset::optimize::compact_files(
+                &mut compactor,
+                deferred_compaction_options(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(metrics.fragments_removed, 2);
+            assert_eq!(metrics.fragments_added, 1);
+
+            let verify = fresh_session(dir.as_str()).await;
+            let (entry, ledger) = fri_ledger(&verify).await;
+            assert_eq!(entry.index_version, 1);
+            assert_eq!(count_mappings(&ledger), (2, 1));
+            let mut expected: Vec<i32> = (0..8).collect();
+            expected.extend(100..104);
+            assert_eq!(sorted_values(&verify).await, expected);
+        }
+
+        /// FIX 3a, order 2: a stable-partition rewrite whose read version
+        /// predates a real deferred `compact_files` commit (fresh sessions,
+        /// on disk) rebases onto the entry holding the compaction's
+        /// transition and both records survive.
+        #[tokio::test]
+        async fn sp_rebases_over_real_deferred_compaction_fresh_session() {
+            let dir = TempStrDir::default();
+            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+
+            let sp_writer = fresh_session(dir.as_str()).await;
+            let b_old: Vec<Fragment> = sp_writer
+                .fragments()
+                .iter()
+                .filter(|f| f.id == 10 || f.id == 11)
+                .cloned()
+                .collect();
+            let (b_transition, b_destinations) = prepare_partition(&sp_writer, &[10, 11], 50).await;
+            let read_version = sp_writer.manifest.version;
+
+            let mut compactor = fresh_session(dir.as_str()).await;
+            crate::dataset::optimize::compact_files(
+                &mut compactor,
+                deferred_compaction_options(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let committed = commit_sp(
+                sp_writer,
+                read_version,
+                sp_rewrite(b_old, b_destinations, vec![b_transition]),
+            )
+            .await
+            .unwrap();
+
+            let verify = fresh_session(dir.as_str()).await;
+            assert_eq!(verify.manifest.version, committed.manifest.version);
+            let (entry, ledger) = fri_ledger(&verify).await;
+            assert_eq!(entry.index_version, 1);
+            assert_eq!(count_mappings(&ledger), (2, 1));
+            let mut expected: Vec<i32> = (0..8).collect();
+            expected.extend(100..104);
+            assert_eq!(sorted_values(&verify).await, expected);
+        }
+
+        /// FIX 3b, disjoint: a real deferred `compact_files` and a
+        /// tagged-compaction rewrite of other fragments both land; the entry
+        /// holds both ordered-compaction transitions.
+        #[tokio::test]
+        async fn tagged_compactions_disjoint_both_land_fresh_session() {
+            let dir = TempStrDir::default();
+            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+
+            let oc_writer = fresh_session(dir.as_str()).await;
+            let b_old: Vec<Fragment> = oc_writer
+                .fragments()
+                .iter()
+                .filter(|f| f.id == 10 || f.id == 11)
+                .cloned()
+                .collect();
+            let (b_transition, b_destinations) = oc_parts(&oc_writer, &[10, 11], 55).await;
+            let read_version = oc_writer.manifest.version;
+
+            let mut compactor = fresh_session(dir.as_str()).await;
+            crate::dataset::optimize::compact_files(
+                &mut compactor,
+                deferred_compaction_options(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let committed = commit_sp(
+                oc_writer,
+                read_version,
+                sp_rewrite(b_old, b_destinations, vec![b_transition]),
+            )
+            .await
+            .unwrap();
+
+            let verify = fresh_session(dir.as_str()).await;
+            assert_eq!(verify.manifest.version, committed.manifest.version);
+            let (entry, ledger) = fri_ledger(&verify).await;
+            assert_eq!(entry.index_version, 1);
+            assert_eq!(count_mappings(&ledger), (1, 2));
+            assert!(ledger.consumer(10).is_some());
+            let mut expected: Vec<i32> = (0..8).collect();
+            expected.extend(100..104);
+            assert_eq!(sorted_values(&verify).await, expected);
+        }
+
+        /// FIX 3b, overlapping: two real deferred `compact_files` racing over
+        /// the same candidates; the loser fails retryable through the
+        /// double-consumption rule.
+        #[tokio::test]
+        async fn tagged_compactions_overlapping_retryable_fresh_session() {
+            let dir = TempStrDir::default();
+            disk_tagged_fixture_with_small_fragments(dir.as_str()).await;
+
+            let mut loser = fresh_session(dir.as_str()).await;
+            let mut winner = fresh_session(dir.as_str()).await;
+            crate::dataset::optimize::compact_files(
+                &mut winner,
+                deferred_compaction_options(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let error = crate::dataset::optimize::compact_files(
+                &mut loser,
+                deferred_compaction_options(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains("consumed fragments"), "{error}");
+        }
+
+        /// FIX 4a: a CreateIndex mixing an FRI replacement with user indices
+        /// is a shape the resolver does not reason about; a stable-partition
+        /// rewrite refuses it as incompatible, same as the v0 arm.
+        #[tokio::test]
+        async fn sp_rejects_mixed_fri_create_index() {
+            let dataset = test_dataset(8, 2).await;
+            let index_meta = |name: &str| IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: name.to_string(),
+                fields: vec![],
+                covering_fields: vec![],
+                dataset_version: 1,
+                fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+            };
+            let ours = Transaction::new(
+                1,
+                sp_rewrite(
+                    vec![dataset.fragments()[0].clone()],
+                    vec![Fragment::new(10)],
+                    vec![Transition {
+                        sources: vec![FragmentDigest {
+                            id: 0,
+                            physical_rows: 4,
+                            num_deleted_rows: 0,
+                        }],
+                        destinations: vec![FragmentDigest {
+                            id: 10,
+                            physical_rows: 4,
+                            num_deleted_rows: 0,
+                        }],
+                        mapping: Some(transition::Mapping::StablePartition(StablePartition {
+                            map_id: Uuid::new_v4().to_string(),
+                            map_size_bytes: 1,
+                            base_id: None,
+                        })),
+                    }],
+                ),
+                None,
+            );
+            let mut rebase = TransactionRebase::try_new(&dataset, ours, None)
+                .await
+                .unwrap();
+            let theirs = Transaction::new(
+                0,
+                Operation::CreateIndex {
+                    new_indices: vec![index_meta(FRAG_REUSE_INDEX_NAME), index_meta("u_idx")],
+                    removed_indices: vec![index_meta(FRAG_REUSE_INDEX_NAME)],
+                },
+                None,
+            );
+            let error = rebase.check_txn(&theirs, 2).unwrap_err();
+            assert!(error.to_string().contains("incompatible"), "{error}");
         }
     }
 }
