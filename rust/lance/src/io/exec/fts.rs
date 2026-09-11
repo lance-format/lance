@@ -1696,6 +1696,30 @@ pub struct CrossColumnCompoundQueryExec {
 }
 
 impl CrossColumnCompoundQueryExec {
+    /// The exact, ordered index segments selected for each query column.
+    ///
+    /// Distributed planners must preserve every column's selection rather than
+    /// pairing segment ordinals across columns. Returns `None` if a future
+    /// selection strategy requires asynchronous resolution.
+    pub fn column_segments(&self) -> Option<Vec<(&str, &[IndexMetadata])>> {
+        self.columns
+            .iter()
+            .map(|selection| {
+                selection
+                    .segment_selection
+                    .preset_segments()
+                    .map(|segments| (selection.column.as_str(), segments))
+            })
+            .collect()
+    }
+
+    /// Caller-supplied row domain, applied in addition to deletions and the
+    /// prefilter. Distributed planners must intersect it with each worker's
+    /// domain; replacing it could re-admit rows excluded by the caller.
+    pub fn external_mask(&self) -> Option<&Arc<RowAddrMask>> {
+        self.external_mask.as_ref()
+    }
+
     pub fn new_with_segments(
         dataset: Arc<Dataset>,
         query: FtsQuery,
@@ -6549,6 +6573,19 @@ mod tests {
             ],
         )
         .unwrap();
+        let selections = exec.column_segments().unwrap();
+        assert_eq!(
+            selections
+                .iter()
+                .map(|(column, _)| *column)
+                .collect::<Vec<_>>(),
+            ["title", "body"]
+        );
+        assert_eq!(selections[0].1, selections[1].1);
+        assert!(exec.external_mask().is_none());
+        let mask = Arc::new(lance_select::mask::RowAddrMask::allow_nothing());
+        let exec = exec.with_external_mask(Some(mask.clone()));
+        assert!(Arc::ptr_eq(exec.external_mask().unwrap(), &mask));
         let display = format!(
             "{}",
             datafusion::physical_plan::displayable(&exec).one_line()
