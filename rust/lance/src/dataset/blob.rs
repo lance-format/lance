@@ -7739,14 +7739,15 @@ mod tests {
                 }),
                 "{stats:?}"
             );
+            assert!(
+                stats
+                    .requests
+                    .iter()
+                    .filter(|request| request.path == blob.source.path)
+                    .all(|request| request.method != "get_opts" || request.range.is_some()),
+                "{stats:?}"
+            );
         }
-        assert!(
-            stats
-                .requests
-                .iter()
-                .all(|request| { request.method != "get_opts" || request.range.is_some() }),
-            "{stats:?}"
-        );
     }
 
     #[tokio::test]
@@ -8094,10 +8095,14 @@ mod tests {
         let external_uri = format!("file://{}", external_path.display());
         let base_uri = format!("file://{}", external_base.display());
 
-        let mut blob_builder = BlobDescriptorArrayBuilder::new("blob");
-        blob_builder.push_external(external_uri, range).unwrap();
-        let (field, blob_array) = blob_builder.finish().unwrap().into_parts();
-        let schema = Arc::new(Schema::new(vec![field]));
+        let blob_array = complete_blob_v2_array(
+            vec![None],
+            vec![Some(external_uri)],
+            vec![range.map(|r| r.offset)],
+            vec![range.map(|r| r.size)],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![complete_blob_v2_field("blob", true)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
 
@@ -8140,6 +8145,8 @@ mod tests {
             "objects/mapped.bin"
         );
 
+        let external_store = dataset.object_store(Some(1)).await.unwrap();
+        let _ = external_store.io_stats_incremental();
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
         assert_eq!(
@@ -8154,6 +8161,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results[0].data.as_deref(), Some(&expected[1..3]));
+        let stats = external_store.io_stats_incremental();
+        let size_queries = stats
+            .requests
+            .iter()
+            .filter(|request| request.method == "get_opts" && request.range.is_none())
+            .count();
+        // A descriptor without a length still needs one size query per selection.
+        let expected_size_queries = if desc.column(2).as_primitive::<UInt64Type>().value(0) == 0 {
+            2
+        } else {
+            0
+        };
+        assert_eq!(size_queries, expected_size_queries, "{stats:?}");
     }
 
     #[tokio::test]
