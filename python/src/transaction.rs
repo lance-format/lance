@@ -495,6 +495,9 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     rewritten_indices,
                     // TODO: pass frag_reuse_index when available
                     frag_reuse_index: None,
+                    // Never carried through the bindings: the commit path
+                    // assembles it in-process.
+                    frag_reuse_rewrite: None,
                 };
                 Ok(Self(op))
             }

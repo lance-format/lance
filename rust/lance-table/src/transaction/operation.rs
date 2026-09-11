@@ -88,6 +88,15 @@ pub enum Operation {
         rewritten_indices: Vec<RewrittenIndex>,
         /// The fragment reuse index to be created or updated to
         frag_reuse_index: Option<IndexMetadata>,
+        /// The tagged transitions this rewrite appends to the fragment reuse
+        /// entry, if any: a stable-partition (reordered) rewrite, or a
+        /// deferred compaction on an already-tagged table. In-memory only,
+        /// like `frag_reuse_index`: never serialized into the transaction
+        /// file, because other writers' conflict decisions only need the
+        /// fragment sets in `groups`, which are exact either way. The commit
+        /// path assembles it into a tagged `frag_reuse_index` entry before
+        /// the manifest is built.
+        frag_reuse_rewrite: Option<FragmentReuseRewrite>,
     },
     /// Replace data in a column in the dataset with new data. This is used for
     /// null column population where we replace an entirely null column with a
@@ -270,6 +279,70 @@ impl std::fmt::Display for Operation {
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
         }
+    }
+}
+
+/// The tagged transitions an [`Operation::Rewrite`] appends to the fragment
+/// reuse index entry: stable-partition (reordered) rewrites, and deferred
+/// compactions on a table whose entry is already tagged (their transitions
+/// carry an ordered-compaction mapping instead).
+///
+/// Under a tagged history, index fragment bitmaps must not be swapped from
+/// old to new fragments for the covered groups: the retired source ids stay
+/// in the bitmaps as provenance and the appended transitions record the
+/// row-level translation the reader applies (see
+/// `lance_table::system_index::frag_reuse::ledger`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FragmentReuseRewrite {
+    /// The new transitions, one per covered rewrite group, in the order of
+    /// the covered groups. Each transition's sources must match its group's
+    /// old fragments in order, and its destinations the group's new
+    /// fragments in order; the commit path validates the binding before it
+    /// assembles the tagged entry.
+    pub transitions: Vec<crate::format::pb::fragment_reuse_index_details::Transition>,
+    /// `dataset_version` of the fragment reuse index entry the assembled
+    /// entry appended onto (`None` when this rewrite creates the entry). The
+    /// transaction field is never serialized, so a concurrent transition
+    /// cannot be detected from another transaction file; instead the
+    /// manifest build fails when the manifest's entry no longer matches this
+    /// base, because splicing would silently drop the concurrent transition.
+    /// The commit path re-assembles against the latest entry on retry.
+    pub base_entry_version: Option<u64>,
+}
+
+impl FragmentReuseRewrite {
+    /// The union of the transitions' source fragment ids. Rewrite groups
+    /// covered by this set skip index-bitmap maintenance: their bitmaps keep
+    /// the retired source ids as provenance.
+    ///
+    /// Fragment ids in the reuse domain are bounded by the row-address
+    /// fragment space (u32); the ledger's digest validation is the
+    /// authoritative enforcement, but it only runs during entry assembly, so
+    /// an out-of-range id is rejected here too rather than silently
+    /// truncated into an alias of another fragment.
+    pub fn reordered_sources(&self) -> lance_core::Result<RoaringBitmap> {
+        self.transitions
+            .iter()
+            .flat_map(|transition| transition.sources.iter().map(|source| source.id))
+            .map(|id| {
+                u32::try_from(id).map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "transition source fragment id {id} is outside the row-address range"
+                    ))
+                })
+            })
+            .collect()
+    }
+}
+
+impl DeepSizeOf for FragmentReuseRewrite {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        // prost messages do not implement DeepSizeOf; their serialized size
+        // is a stable proxy for the heap they hold.
+        self.transitions
+            .iter()
+            .map(prost::Message::encoded_len)
+            .sum()
     }
 }
 
