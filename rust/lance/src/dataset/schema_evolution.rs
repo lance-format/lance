@@ -738,7 +738,7 @@ pub(super) async fn alter_columns(
     let mut tightens_nullability = false;
 
     let mut next_field_id = dataset.manifest.max_field_id() + 1;
-    let version = dataset.manifest.data_storage_format.lance_file_format();
+    let fallback_version = dataset.manifest.data_storage_format.lance_file_format();
 
     for alteration in alterations {
         let field_src = dataset.schema().field(&alteration.path).ok_or_else(|| {
@@ -767,8 +767,40 @@ pub(super) async fn alter_columns(
         }
 
         if let Some(data_type) = &alteration.data_type {
-            if !(can_cast_types(&field_src.data_type(), data_type)
-                && super::versions::is_upcast_downcast(version, &field_src.data_type(), data_type))
+            let cast_supported = can_cast_types(&field_src.data_type(), data_type);
+            let mut saw_file = false;
+            for data_file in dataset
+                .manifest
+                .fragments
+                .iter()
+                .flat_map(Fragment::referenced_lance_files)
+            {
+                saw_file = true;
+                let file_version = data_file.file_version()?;
+                if !cast_supported
+                    || !super::versions::is_upcast_downcast(
+                        file_version,
+                        &field_src.data_type(),
+                        data_type,
+                    )
+                {
+                    return Err(Error::invalid_input(format!(
+                        "Cannot cast column \"{}\" from {:?} to {:?} for data file '{}' using exact version {}",
+                        alteration.path,
+                        field_src.data_type(),
+                        data_type,
+                        data_file.path,
+                        file_version
+                    )));
+                }
+            }
+            if !saw_file
+                && (!cast_supported
+                    || !super::versions::is_upcast_downcast(
+                        fallback_version,
+                        &field_src.data_type(),
+                        data_type,
+                    ))
             {
                 return Err(Error::invalid_input(format!(
                     "Cannot cast column \"{}\" from {:?} to {:?}",
@@ -1034,10 +1066,35 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         }
     }
 
-    let version = dataset.manifest.data_storage_format.lance_file_format();
     let columns_to_remove = dataset.manifest.schema.project(columns)?;
-    let new_schema =
-        super::versions::exclude_schema(version, &dataset.manifest.schema, &columns_to_remove)?;
+    let fallback_version = dataset.manifest.data_storage_format.lance_file_format();
+    let new_schema = super::versions::exclude_schema(
+        fallback_version,
+        &dataset.manifest.schema,
+        &columns_to_remove,
+    )?;
+    for data_file in dataset
+        .manifest
+        .fragments
+        .iter()
+        .flat_map(Fragment::referenced_lance_files)
+    {
+        let file_version = data_file.file_version()?;
+        let file_schema = super::versions::exclude_schema(
+            file_version,
+            &dataset.manifest.schema,
+            &columns_to_remove,
+        )?;
+        if file_schema != new_schema {
+            return Err(Error::not_supported_source(
+                format!(
+                    "Dropping these columns has different metadata semantics for data file '{}' using exact version {}",
+                    data_file.path, file_version
+                )
+                .into(),
+            ));
+        }
+    }
 
     if new_schema.fields.is_empty() {
         return Err(Error::invalid_input(
@@ -1177,7 +1234,7 @@ mod test {
         }
     }
 
-    use crate::dataset::WriteParams;
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use arrow_array::{
         ArrayRef, Int32Array, ListArray, RecordBatchIterator, StringArray, StructArray,
     };
@@ -2798,6 +2855,29 @@ mod test {
         let list_value = list_array.value(0);
         let struct_array = list_value.as_any().downcast_ref::<StructArray>().unwrap();
         assert!(struct_array.column_by_name("city").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_exact_versions_reject_ambiguous_nested_drop() -> Result<()> {
+        let dataset = prepare_dataset(LanceFileVersion::V2_0).await?;
+        let batch = dataset.scan().try_into_batch().await?;
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&params)
+            .execute(vec![batch])
+            .await?;
+
+        let error = dataset
+            .drop_columns(&["people.item.city"])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("different metadata semantics"));
 
         Ok(())
     }

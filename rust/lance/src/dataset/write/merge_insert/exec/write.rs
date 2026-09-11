@@ -962,7 +962,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             // Keep a copy so failures after the write can clean up routed files.
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
-                dataset.manifest.data_storage_format.lance_file_format(),
+                params.write_version(&dataset),
                 Some(&dataset),
                 dataset.object_store.clone(),
                 &dataset.base,
