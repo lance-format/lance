@@ -13,9 +13,9 @@ use super::{
 };
 use crate::{
     decoder::{
-        DecodedArray, FilterExpression, LoadedPageShard, NextDecodeTask, PageEncoding,
-        ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder,
-        StructuralFieldScheduler, StructuralSchedulingJob,
+        CANDIDATE_BATCH_SIZES, DecodedArray, FilterExpression, LoadedPageShard, NextDecodeTask,
+        PageEncoding, ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask,
+        StructuralFieldDecoder, StructuralFieldScheduler, StructuralSchedulingJob,
     },
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
     format::pb,
@@ -362,7 +362,6 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
     }
 
     fn plan_decoded_bytes(&self, rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
-        use crate::decoder::CANDIDATE_BATCH_SIZES;
         let mut out = [0u64; 8];
         for child in &self.children {
             let child_bytes = child.plan_decoded_bytes(rows_remaining)?;
@@ -1128,5 +1127,52 @@ mod tests {
             .collect::<Vec<_>>();
         check_round_trip_encoding_of_data(struct_arrays, &TestCases::default(), HashMap::new())
             .await;
+    }
+
+    // --------------------------------------------------------------------------
+    // plan_decoded_bytes tests (commit 4)
+    // --------------------------------------------------------------------------
+
+    #[test]
+    fn test_plan_decoded_bytes_struct_sums_children() {
+        use crate::decoder::{CANDIDATE_BATCH_SIZES, StructuralFieldDecoder};
+        use crate::encodings::logical::primitive::StructuralPrimitiveFieldDecoder;
+        use std::sync::Arc;
+
+        // Build a decoder for Struct<a: Int32, b: Utf8> by constructing
+        // StructuralStructDecoder via its field_to_decoder method (exercised
+        // through StructuralStructDecoder::new).
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]);
+        let decoder = super::StructuralStructDecoder::new(fields, false, false).unwrap();
+
+        let rows_remaining = 100_u64;
+        let out = decoder.plan_decoded_bytes(rows_remaining).unwrap();
+
+        // Verify that all candidates are non-decreasing (since more rows = more bytes)
+        for (i, window) in out.windows(2).enumerate() {
+            assert!(
+                window[1] >= window[0],
+                "candidate[{}] should be >= candidate[{i}]",
+                i + 1
+            );
+        }
+
+        // Verify that the struct output equals the sum of child outputs.
+        let int32_field = Arc::new(Field::new("a", DataType::Int32, false));
+        let utf8_field = Arc::new(Field::new("b", DataType::Utf8, false));
+        let child_a = StructuralPrimitiveFieldDecoder::new(&int32_field, false);
+        let child_b = StructuralPrimitiveFieldDecoder::new(&utf8_field, false);
+        let a_out = child_a.plan_decoded_bytes(rows_remaining).unwrap();
+        let b_out = child_b.plan_decoded_bytes(rows_remaining).unwrap();
+        for (i, (&o, (&a, &b))) in out.iter().zip(a_out.iter().zip(b_out.iter())).enumerate() {
+            assert_eq!(o, a + b, "struct candidate[{i}] must equal sum of children");
+        }
+
+        // Int32 child candidate[0] = 1 row × 4 bytes = 4; Utf8 is schema-estimated.
+        assert_eq!(a_out[0], 4, "Int32 candidate[0] = 4 bytes");
+        assert_eq!(CANDIDATE_BATCH_SIZES.len(), 8);
     }
 }
