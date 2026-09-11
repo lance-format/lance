@@ -327,5 +327,9 @@ harness = false
 name = "hamming"
 harness = false
 
+[[bench]]
+name = "hamming_ivf_training"
+harness = false
+
 [lints]
 workspace = true
