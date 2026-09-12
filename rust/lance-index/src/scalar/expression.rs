@@ -185,16 +185,111 @@ impl MultiQueryParser {
         self.parsers.push(other);
     }
 
-    /// Pick the first underlying parser whose `is_valid_reference` accepts `expr`.
+    /// Collect every underlying parser whose `is_valid_reference` accepts `expr`.
+    ///
+    /// Reference validation ("does this index handle this column / JSON path?")
+    /// and capability matching ("can this index serve this query shape?") are
+    /// two distinct decisions.  `is_valid_reference` only sees the column
+    /// reference, not the operator, so it cannot answer the second question.
+    /// Committing to the first accepting parser here would, for example, route
+    /// `x > 7` to a bloom filter (which only serves equality) even though a
+    /// btree on the same column could accelerate the range.
+    ///
+    /// We therefore keep *all* parsers that accept the reference and defer the
+    /// capability decision to the `visit_*` calls on the returned
+    /// [`MultiQueryParserView`], which try each candidate in registration order.
+    ///
+    /// All parsers that accept the same reference describe the same underlying
+    /// value, so they agree on its data type; we report the first one.
     pub fn select(
         &self,
         expr: &Expr,
         data_type: &DataType,
-    ) -> Option<(&dyn ScalarQueryParser, DataType)> {
-        self.parsers.iter().find_map(|p| {
-            p.is_valid_reference(expr, data_type)
-                .map(|dt| (p.as_ref(), dt))
-        })
+    ) -> Option<(MultiQueryParserView<'_>, DataType)> {
+        let mut parsers = Vec::new();
+        let mut reference_type = None;
+        for parser in &self.parsers {
+            if let Some(dt) = parser.is_valid_reference(expr, data_type) {
+                reference_type.get_or_insert(dt);
+                parsers.push(parser.as_ref());
+            }
+        }
+        reference_type.map(|dt| (MultiQueryParserView { parsers }, dt))
+    }
+}
+
+/// A borrowed view over the subset of a [`MultiQueryParser`]'s parsers whose
+/// `is_valid_reference` accepted a particular column reference.
+///
+/// It behaves exactly like the parent [`MultiQueryParser`] — every `visit_*`
+/// method fans out to its parsers with the same "first match wins" semantics —
+/// but operates on a borrowed subset rather than owning the parsers.  Selecting
+/// the reference-valid subset up front, then deferring the capability decision
+/// to the `visit_*` calls, lets a column carrying several indexes (e.g. a bloom
+/// filter that only serves equality alongside a btree that serves ranges) pick
+/// the right index per query instead of being locked to whichever parser was
+/// registered first.
+#[derive(Debug)]
+pub struct MultiQueryParserView<'a> {
+    parsers: Vec<&'a dyn ScalarQueryParser>,
+}
+
+impl ScalarQueryParser for MultiQueryParserView<'_> {
+    fn visit_between(
+        &self,
+        column: &str,
+        low: &Bound<ScalarValue>,
+        high: &Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_between(column, low, high))
+    }
+    fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_in_list(column, in_list))
+    }
+    fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_is_bool(column, value))
+    }
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_is_null(column))
+    }
+    fn visit_comparison(
+        &self,
+        column: &str,
+        value: &ScalarValue,
+        op: &Operator,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_comparison(column, value, op))
+    }
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_scalar_function(column, data_type, func, args))
+    }
+    fn visit_like(
+        &self,
+        column: &str,
+        like: &Like,
+        pattern: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_like(column, like, pattern))
     }
 }
 
@@ -2095,7 +2190,7 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
 fn maybe_indexed_column<'b>(
     expr: &Expr,
     index_info: &'b dyn IndexInformationProvider,
-) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
+) -> Option<(String, DataType, MultiQueryParserView<'b>)> {
     // First try to extract the full nested column path for get_field expressions
     if let Some(nested_path) = extract_nested_column_path(expr)
         && let Some((data_type, multi)) = index_info.get_index(&nested_path)
@@ -4222,6 +4317,66 @@ mod tests {
 
         // Query against an unindexed path must not bind to either index.
         check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
+    }
+
+    /// Regression test for https://github.com/lance-format/lance/issues/7091.
+    ///
+    /// When a column carries both a bloom filter (equality only) and a btree
+    /// (ranges) index, parser selection must not commit to a single index based
+    /// on the column reference alone.  With the bloom filter registered first,
+    /// a range query like `size > 7` would otherwise be intercepted by the
+    /// bloom parser (which returns `None` for ranges) and fall back to a full
+    /// scan, even though the btree can serve it.
+    #[test]
+    fn test_multi_index_defers_to_operator_capability() {
+        // Register the bloom filter *first* so the pre-fix "first valid
+        // reference wins" behavior would route every query to it.
+        let mut multi = MultiQueryParser::single(Box::new(BloomFilterQueryParser::new(
+            "size_bloom_idx".to_string(),
+            "BloomFilter".to_string(),
+            false,
+        )));
+        multi.add(Box::new(SargableQueryParser::new(
+            "size_btree_idx".to_string(),
+            "BTree".to_string(),
+            false,
+        )));
+
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "size",
+            ColInfo::with_multi(DataType::Float32, Box::new(multi)),
+        )]);
+
+        // `size > 7`: bloom can't serve ranges, so the btree must pick it up.
+        check(
+            &index_info,
+            "size > 7",
+            Some(IndexedExpression::index_query(
+                "size".to_string(),
+                "size_btree_idx".to_string(),
+                "BTree".to_string(),
+                Arc::new(SargableQuery::Range(
+                    Bound::Excluded(ScalarValue::Float32(Some(7.0))),
+                    Bound::Unbounded,
+                )),
+            )),
+            false,
+        );
+
+        // `size = 7`: the bloom filter is registered first and serves equality,
+        // so it still wins for the query shape it supports.
+        check(
+            &index_info,
+            "size = 7",
+            Some(IndexedExpression::index_query_with_recheck(
+                "size".to_string(),
+                "size_bloom_idx".to_string(),
+                "BloomFilter".to_string(),
+                Arc::new(BloomFilterQuery::Equals(ScalarValue::Float32(Some(7.0)))),
+                false,
+            )),
+            false,
+        );
     }
 
     #[test]
