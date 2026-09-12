@@ -9,8 +9,97 @@ use arrow::compute::cast;
 use arrow_array::{ArrayRef, cast::AsArray};
 use arrow_schema::{DataType, TimeUnit};
 use datafusion_common::ScalarValue;
+use half::f16;
 
 const MS_PER_DAY: i64 = 86400000;
+
+/// The exact tie between the largest finite `f16` and the value that would
+/// follow it. A tie goes to the even mantissa, which there is the one that does
+/// not exist, so this magnitude and anything above it rounds to an infinity.
+const F16_OVERFLOW_THRESHOLD: f64 = 65520.0;
+
+/// The finite `f16` nearest `value`, with a tie going to the even mantissa.
+///
+/// Neither of `half`'s conversions is correctly rounded, in two different ways:
+/// the software path truncates the low 32 bits of the `f64` mantissa before it
+/// rounds ([half-rs#151]), and the x86 hardware path rounds through `f32` first
+/// ([half-rs#116]). Both land within one step of the right answer, so this starts
+/// from the software path, which at least does not vary by target, and then looks
+/// at the two neighbours. Widening `f16` to `f64` is exact, so comparing the three
+/// distances in `f64` decides exactly.
+///
+/// The caller must have excluded the overflow range first. Truncation only ever
+/// shrinks the magnitude, so below the threshold the starting point is finite.
+///
+/// [half-rs#151]: https://github.com/VoidStarKat/half-rs/issues/151
+/// [half-rs#116]: https://github.com/VoidStarKat/half-rs/issues/116
+fn nearest_finite_f16(value: f64) -> f16 {
+    let start = f16::from_f64_const(value);
+    debug_assert!(
+        start.is_finite(),
+        "caller must reject the overflow range before calling: {value}"
+    );
+    let mut best = start;
+    let mut best_distance = (value - start.to_f64()).abs();
+    let start_bits = start.to_bits();
+    // Stepping the bit pattern by one walks to the adjacent magnitude on either
+    // side of `start`, for negatives as well. Stepping off an end lands on an
+    // infinity or a NaN, which is not a candidate.
+    for candidate in [start_bits.wrapping_sub(1), start_bits.wrapping_add(1)].map(f16::from_bits) {
+        if !candidate.is_finite() {
+            continue;
+        }
+        let distance = (value - candidate.to_f64()).abs();
+        let wins =
+            distance < best_distance || (distance == best_distance && candidate.to_bits() & 1 == 0);
+        if wins {
+            best = candidate;
+            best_distance = distance;
+        }
+    }
+    best
+}
+
+/// Coerce a float to `f16`, rejecting a finite value that leaves the `f16` range
+/// rather than saturating it to an infinity.
+///
+/// A value inside the range lands on the `f16` grid and is inexact in a way that
+/// shows: past 2048 the grid is coarser than the integers, so `= 2049` matches
+/// rows holding 2048. The `Float32` and `Float64` arms below are inexact too, on
+/// a finer grid, and that is not what the rejection is for.
+///
+/// The rejection is for the literal changing kind. Saturated to an infinity,
+/// `= 100000` matches rows that really hold infinity; collapsed to zero,
+/// `= 1e-30` matches real zeros. The cost is the queries where saturating would
+/// have been right: `< 100000` errors instead of returning every finite row.
+/// This function cannot see the operator, so it cannot allow saturation only
+/// where it is harmless, and an error the caller reports beats a wrong row set.
+/// An infinite or NaN input converts faithfully and is kept.
+///
+/// `Float64` to `Float32` still saturates. Reaching that takes a literal above
+/// 1e38, while `f16` overflows at 65520, which an ordinary literal passes.
+fn coerce_to_f16(value: f64) -> Option<f16> {
+    if value.is_nan() {
+        return Some(f16::NAN);
+    }
+    if value.is_infinite() {
+        return Some(if value.is_sign_positive() {
+            f16::INFINITY
+        } else {
+            f16::NEG_INFINITY
+        });
+    }
+    if value.abs() >= F16_OVERFLOW_THRESHOLD {
+        return None;
+    }
+    let nearest = nearest_finite_f16(value);
+    // `f16::ZERO == f16::NEG_ZERO`, and so does `-0.0 == 0.0`, so a signed zero
+    // literal keeps its sign here and only a genuinely nonzero value is rejected.
+    if nearest == f16::ZERO && value != 0.0 {
+        return None;
+    }
+    Some(nearest)
+}
 
 // This is slightly tedious but when we convert expressions from SQL strings to logical
 // datafusion expressions there is no type coercion that happens.  In other words "x = 7"
@@ -47,6 +136,9 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             DataType::UInt64 => {
                 val.and_then(|v| u64::try_from(v).map(|v| ScalarValue::UInt64(Some(v))).ok())
             }
+            DataType::Float16 => {
+                val.and_then(|v| coerce_to_f16(v as f64).map(|v| ScalarValue::Float16(Some(v))))
+            }
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(f32::from(v)))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(f64::from(v)))),
             _ => None,
@@ -69,6 +161,9 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             }
             DataType::UInt64 => {
                 val.and_then(|v| u64::try_from(v).map(|v| ScalarValue::UInt64(Some(v))).ok())
+            }
+            DataType::Float16 => {
+                val.and_then(|v| coerce_to_f16(v as f64).map(|v| ScalarValue::Float16(Some(v))))
             }
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(f32::from(v)))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(f64::from(v)))),
@@ -98,6 +193,9 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             // These conversions are inherently lossy as the full range of i32 cannot
             // be represented in f32.  However, there is no f32::TryFrom(i32) and its not
             // clear users would want that anyways
+            DataType::Float16 => {
+                val.and_then(|v| coerce_to_f16(v as f64).map(|v| ScalarValue::Float16(Some(v))))
+            }
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
             _ => None,
@@ -126,6 +224,9 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
                 val.and_then(|v| u64::try_from(v).map(|v| ScalarValue::UInt64(Some(v))).ok())
             }
             // See above warning about lossy float conversion
+            DataType::Float16 => {
+                val.and_then(|v| coerce_to_f16(v as f64).map(|v| ScalarValue::Float16(Some(v))))
+            }
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
             DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => value.cast_to(ty).ok(),
@@ -152,6 +253,9 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             DataType::UInt16 => val.map(|v| ScalarValue::UInt16(Some(u16::from(v)))),
             DataType::UInt32 => val.map(|v| ScalarValue::UInt32(Some(u32::from(v)))),
             DataType::UInt64 => val.map(|v| ScalarValue::UInt64(Some(u64::from(v)))),
+            DataType::Float16 => {
+                val.and_then(|v| coerce_to_f16(v as f64).map(|v| ScalarValue::Float16(Some(v))))
+            }
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(f32::from(v)))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(f64::from(v)))),
             _ => None,
@@ -171,6 +275,9 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             DataType::UInt16 => Some(value.clone()),
             DataType::UInt32 => val.map(|v| ScalarValue::UInt32(Some(u32::from(v)))),
             DataType::UInt64 => val.map(|v| ScalarValue::UInt64(Some(u64::from(v)))),
+            DataType::Float16 => {
+                val.and_then(|v| coerce_to_f16(v as f64).map(|v| ScalarValue::Float16(Some(v))))
+            }
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(f32::from(v)))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(f64::from(v)))),
             _ => None,
@@ -195,6 +302,9 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             DataType::UInt32 => Some(value.clone()),
             DataType::UInt64 => val.map(|v| ScalarValue::UInt64(Some(u64::from(v)))),
             // See above warning about lossy float conversion
+            DataType::Float16 => {
+                val.and_then(|v| coerce_to_f16(v as f64).map(|v| ScalarValue::Float16(Some(v))))
+            }
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
             _ => None,
@@ -223,16 +333,31 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             }
             DataType::UInt64 => Some(value.clone()),
             // See above warning about lossy float conversion
+            DataType::Float16 => {
+                val.and_then(|v| coerce_to_f16(v as f64).map(|v| ScalarValue::Float16(Some(v))))
+            }
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
             _ => None,
         },
+        ScalarValue::Float16(val) => match ty {
+            DataType::Float16 => Some(value.clone()),
+            DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v.to_f32()))),
+            DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v.to_f64()))),
+            _ => None,
+        },
         ScalarValue::Float32(val) => match ty {
+            DataType::Float16 => {
+                val.and_then(|v| coerce_to_f16(f64::from(v)).map(|v| ScalarValue::Float16(Some(v))))
+            }
             DataType::Float32 => Some(value.clone()),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(f64::from(v)))),
             _ => None,
         },
         ScalarValue::Float64(val) => match ty {
+            DataType::Float16 => {
+                val.and_then(|v| coerce_to_f16(v).map(|v| ScalarValue::Float16(Some(v))))
+            }
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
             DataType::Float64 => Some(value.clone()),
             _ => None,
@@ -856,6 +981,197 @@ mod tests {
             ),
             Some(ScalarValue::LargeBinary(Some(vec![1, 2, 3])))
         );
+    }
+
+    /// Every numeric literal type reaches `Float16`. SQL only produces `Int64`
+    /// and `Float64`, but `safe_coerce_scalar` is public and the index layer
+    /// feeds it whatever the planner already coerced, including `Float16`
+    /// itself.
+    #[rstest::rstest]
+    #[case::int8(ScalarValue::Int8(Some(-2)))]
+    #[case::int16(ScalarValue::Int16(Some(-2)))]
+    #[case::int32(ScalarValue::Int32(Some(-2)))]
+    #[case::int64(ScalarValue::Int64(Some(-2)))]
+    #[case::float32(ScalarValue::Float32(Some(-2.0)))]
+    #[case::float64(ScalarValue::Float64(Some(-2.0)))]
+    #[case::float16(ScalarValue::Float16(Some(f16::from_f32(-2.0))))]
+    fn numeric_literals_coerce_to_f16(#[case] value: ScalarValue) {
+        assert_eq!(
+            safe_coerce_scalar(&value, &DataType::Float16),
+            Some(ScalarValue::Float16(Some(f16::from_f32(-2.0)))),
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::uint8(ScalarValue::UInt8(Some(2)))]
+    #[case::uint16(ScalarValue::UInt16(Some(2)))]
+    #[case::uint32(ScalarValue::UInt32(Some(2)))]
+    #[case::uint64(ScalarValue::UInt64(Some(2)))]
+    fn unsigned_literals_coerce_to_f16(#[case] value: ScalarValue) {
+        assert_eq!(
+            safe_coerce_scalar(&value, &DataType::Float16),
+            Some(ScalarValue::Float16(Some(f16::from_f32(2.0)))),
+        );
+    }
+
+    /// A `Float16` literal also has to reach the wider float columns, so a
+    /// predicate written against one column type still filters another.
+    #[test]
+    fn test_f16_literal_widens() {
+        let half = ScalarValue::Float16(Some(f16::from_f32(0.5)));
+        assert_eq!(
+            safe_coerce_scalar(&half, &DataType::Float32),
+            Some(ScalarValue::Float32(Some(0.5))),
+        );
+        assert_eq!(
+            safe_coerce_scalar(&half, &DataType::Float64),
+            Some(ScalarValue::Float64(Some(0.5))),
+        );
+        assert_eq!(safe_coerce_scalar(&half, &DataType::Int32), None);
+    }
+
+    /// Rounding inside the `f16` range is accepted; leaving the range is not.
+    /// Expected values are spelled as bits so a change in how the input is
+    /// rounded fails here rather than being recomputed by the same library call
+    /// the code under test uses.
+    #[rstest::rstest]
+    // 0.1 has no exact binary form, so it lands on the nearest f16, 0x2E66.
+    #[case::rounds(0.1, Some(0x2E66))]
+    // Past 2048 the f16 grid is coarser than the integers: 2049 is the exact
+    // midpoint of 2048 and 2050, and the tie goes to the even mantissa. This is
+    // the case the doc comment cites for `= 2049` matching rows holding 2048.
+    #[case::odd_integer_ties_down(2049.0, Some(0x6800))]
+    // Above that midpoint 2050 is the nearer neighbour, and the coercion picks it.
+    // `half`'s own conversion returns 2048 here, which is the defect
+    // `nearest_finite_f16` exists to correct.
+    #[case::just_above_a_tie(2049.001, Some(0x6801))]
+    #[case::largest_finite(65504.0, Some(0x7BFF))]
+    // Rounds down to the largest finite f16 rather than overflowing.
+    #[case::just_under_overflow(65519.0, Some(0x7BFF))]
+    #[case::smallest_subnormal(6e-8, Some(0x0001))]
+    // 65520 is the first value that rounds to infinity, not 65504.
+    #[case::overflow_threshold(65520.0, None)]
+    #[case::overflow(70000.0, None)]
+    #[case::negative_overflow(-70000.0, None)]
+    #[case::f32_max(f32::MAX as f64, None)]
+    // Underflows to zero rather than silently matching real zeros.
+    #[case::underflow(1e-30, None)]
+    #[case::negative_underflow(-1e-30, None)]
+    fn test_f16_range_edges(#[case] input: f64, #[case] expected: Option<u16>) {
+        let coerced = safe_coerce_scalar(&ScalarValue::Float64(Some(input)), &DataType::Float16);
+        match expected {
+            Some(bits) => assert_eq!(
+                coerced,
+                Some(ScalarValue::Float16(Some(f16::from_bits(bits)))),
+            ),
+            None => assert_eq!(coerced, None),
+        }
+    }
+
+    /// A literal that is already infinite or NaN converts faithfully. Only a
+    /// finite value that overflowed is rejected.
+    #[test]
+    fn test_f16_keeps_non_finite_literals() {
+        for (input, expected) in [
+            (f64::INFINITY, f16::INFINITY),
+            (f64::NEG_INFINITY, f16::NEG_INFINITY),
+        ] {
+            assert_eq!(
+                safe_coerce_scalar(&ScalarValue::Float64(Some(input)), &DataType::Float16),
+                Some(ScalarValue::Float16(Some(expected))),
+            );
+        }
+        let nan = safe_coerce_scalar(&ScalarValue::Float64(Some(f64::NAN)), &DataType::Float16);
+        assert!(matches!(nan, Some(ScalarValue::Float16(Some(v))) if v.is_nan()));
+    }
+
+    /// Both zeros survive as themselves. Signed-zero comparison semantics are a
+    /// separate problem (#5868); coercion must at least not erase the sign.
+    #[test]
+    fn test_f16_keeps_zero_sign() {
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Float64(Some(-0.0)), &DataType::Float16),
+            Some(ScalarValue::Float16(Some(f16::NEG_ZERO))),
+        );
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Float64(Some(0.0)), &DataType::Float16),
+            Some(ScalarValue::Float16(Some(f16::ZERO))),
+        );
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Int64(Some(0)), &DataType::Float16),
+            Some(ScalarValue::Float16(Some(f16::ZERO))),
+        );
+    }
+
+    /// Sweep every rounding decision the conversion can make instead of trusting
+    /// the handful of points named above: for each adjacent pair of finite `f16`
+    /// values, the exact midpoint and the two `f64` values either side of it. A
+    /// misrounding anywhere in the range shows up here, which is how the
+    /// `2049.001` case was found in the first place.
+    ///
+    /// The expectation is stated, not recomputed: below the midpoint the lower
+    /// neighbour, above it the upper one, at it the even mantissa.
+    #[test]
+    fn test_f16_rounds_to_nearest_even_across_the_whole_range() {
+        fn coerce(value: f64) -> Option<f16> {
+            match safe_coerce_scalar(&ScalarValue::Float64(Some(value)), &DataType::Float16) {
+                Some(ScalarValue::Float16(Some(v))) => Some(v),
+                // Rejected, which the underflow side of the range expects.
+                None => None,
+                other => panic!("expected a Float16 literal for {value}, got {other:?}"),
+            }
+        }
+        // A nonzero literal that lands on zero is rejected rather than coerced,
+        // so the smallest pair expects `None` on its lower side.
+        fn want(expected: f16, input: f64) -> Option<f16> {
+            if expected == f16::ZERO && input != 0.0 {
+                None
+            } else {
+                Some(expected)
+            }
+        }
+
+        // 0x7BFF is the largest finite f16, so pairing each bit pattern with the
+        // next covers every adjacent finite pair on the positive side. Negatives
+        // are covered by the symmetry check below.
+        for lower_bits in 0..0x7BFFu16 {
+            let lower = f16::from_bits(lower_bits);
+            let upper = f16::from_bits(lower_bits + 1);
+            // Both operands are f16 widened to f64, so the average is exact.
+            let midpoint = (lower.to_f64() + upper.to_f64()) / 2.0;
+            let below = f64::from_bits(midpoint.to_bits() - 1);
+            let above = f64::from_bits(midpoint.to_bits() + 1);
+
+            assert_eq!(coerce(below), want(lower, below), "just below {midpoint}");
+            assert_eq!(coerce(above), want(upper, above), "just above {midpoint}");
+            let even = if lower.to_bits() & 1 == 0 {
+                lower
+            } else {
+                upper
+            };
+            assert_eq!(coerce(midpoint), want(even, midpoint), "at {midpoint}");
+        }
+    }
+
+    /// Sign is not part of the rounding decision, so negating the input negates
+    /// the result. This is what lets the sweep above cover only positives.
+    #[rstest::rstest]
+    #[case(0.1)]
+    #[case(2049.001)]
+    #[case(65504.0)]
+    #[case(6e-8)]
+    #[case(70000.0)]
+    #[case(1e-30)]
+    fn test_f16_coercion_is_sign_symmetric(#[case] magnitude: f64) {
+        let positive =
+            safe_coerce_scalar(&ScalarValue::Float64(Some(magnitude)), &DataType::Float16);
+        let negative =
+            safe_coerce_scalar(&ScalarValue::Float64(Some(-magnitude)), &DataType::Float16);
+        let flipped = match positive {
+            Some(ScalarValue::Float16(Some(v))) => Some(ScalarValue::Float16(Some(-v))),
+            other => other,
+        };
+        assert_eq!(negative, flipped);
     }
 
     #[test]

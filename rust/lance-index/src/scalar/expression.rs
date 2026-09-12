@@ -2670,6 +2670,10 @@ mod tests {
         parser: Box<MultiQueryParser>,
     }
 
+    fn f16_scalar(value: f32) -> ScalarValue {
+        ScalarValue::Float16(Some(half::f16::from_f32(value)))
+    }
+
     impl ColInfo {
         fn new(data_type: DataType, parser: Box<dyn ScalarQueryParser>) -> Self {
             Self {
@@ -2929,6 +2933,68 @@ mod tests {
 
         assert_eq!(plan.index_query, expected.scalar_query);
         assert!(plan.refine_expr.is_none());
+    }
+
+    /// A `Float16` column must reach its scalar index like any other numeric
+    /// column. This is the second, quieter face of the coercion gap: `maybe_scalar`
+    /// runs `safe_coerce_scalar` on a literal the planner has *already* coerced,
+    /// so without a `ScalarValue::Float16` source arm the whole predicate silently
+    /// becomes a refine filter. The rows stay correct, which is why only the plan
+    /// catches it.
+    ///
+    /// This drives `Planner::parse_filter` rather than `check_with_schema` on
+    /// purpose. `check_with_schema` builds the expression with
+    /// `create_logical_expr`, which does no type coercion, so the literal would
+    /// still be `Float64` here and would exercise the `Float64` to `Float16`
+    /// target arm instead. Production coerces first, in `resolve_value`, and only
+    /// this order needs the source arm.
+    #[rstest]
+    #[case("temp = 1.0", SargableQuery::Equals(f16_scalar(1.0)))]
+    #[case("temp = 1", SargableQuery::Equals(f16_scalar(1.0)))]
+    #[case(
+        "temp < 1.0",
+        SargableQuery::Range(Bound::Unbounded, Bound::Excluded(f16_scalar(1.0)))
+    )]
+    #[case(
+        // Four elements so DataFusion's `ShortenInListSimplifier` leaves the list
+        // alone; at three or fewer over a bare column it becomes an `OR` chain and
+        // stops exercising `maybe_scalar_list`.
+        "temp IN (1.0, 2.5, 3.0, 4.0)",
+        SargableQuery::IsIn(vec![
+            f16_scalar(1.0),
+            f16_scalar(2.5),
+            f16_scalar(3.0),
+            f16_scalar(4.0),
+        ])
+    )]
+    fn test_float16_column_reaches_its_index(#[case] expr: &str, #[case] expected: SargableQuery) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "temp",
+            ColInfo::new(
+                DataType::Float16,
+                Box::new(SargableQueryParser::new(
+                    "temp_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("temp", DataType::Float16, true)]);
+
+        let planner = Planner::new(Arc::new(schema));
+        let filter = planner.parse_filter(expr).unwrap();
+        let plan = planner
+            .create_filter_plan(filter, &index_info, true)
+            .unwrap();
+        let wanted = IndexedExpression::index_query(
+            "temp".to_string(),
+            "temp_idx".to_string(),
+            "BTree".to_string(),
+            Arc::new(expected),
+        );
+
+        assert_eq!(plan.index_query, wanted.scalar_query, "predicate: {expr}");
+        assert!(plan.refine_expr.is_none(), "predicate: {expr}");
     }
 
     #[test]
