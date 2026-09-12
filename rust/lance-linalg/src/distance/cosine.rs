@@ -24,7 +24,7 @@ use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 #[allow(unused_imports)]
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 
-use super::{Dot, norm_l2::norm_l2};
+use super::{Dot, assert_batch_layout, assert_equal_lengths, norm_l2::norm_l2};
 use super::{Normalize, dot::dot};
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 use crate::distance::BatchKind;
@@ -61,6 +61,7 @@ pub trait Cosine: Dot + Normalize {
         batch: &'a [Self],
         dimension: usize,
     ) -> Box<dyn Iterator<Item = f32> + 'a> {
+        assert_batch_layout(x.len(), batch.len(), dimension);
         let x_norm = norm_l2(x);
 
         Box::new(
@@ -108,6 +109,7 @@ mod bf16_kernel {
 
 impl Cosine for bf16 {
     fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -164,6 +166,7 @@ mod kernel {
 
 impl Cosine for f16 {
     fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         match *SIMD_SUPPORT {
             #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
             SimdSupport::Neon => unsafe {
@@ -565,6 +568,7 @@ mod f32_baseline {
 impl Cosine for f32 {
     #[inline]
     fn cosine_fast(x: &[Self], x_norm: Self, other: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), other.len());
         // Trait methods cannot carry `#[target_feature]` attributes, so the body
         // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
         // to an AVX2 inner kernel on capable hosts, or a portable scalar fallback.
@@ -573,6 +577,7 @@ impl Cosine for f32 {
 
     #[inline]
     fn cosine_with_norms(x: &[Self], x_norm: Self, y_norm: Self, y: &[Self]) -> Self {
+        assert_equal_lengths(x.len(), y.len());
         // Trait methods cannot carry `#[target_feature]` attributes, so the body
         // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
         // to an AVX2 inner kernel on capable hosts, or a portable scalar fallback.
@@ -584,9 +589,7 @@ impl Cosine for f32 {
         batch: &'a [Self],
         dimension: usize,
     ) -> Box<dyn Iterator<Item = f32> + 'a> {
-        // Preserve the original `chunks_exact` validation before constructing
-        // a specialized iterator.
-        let _ = batch.chunks_exact(dimension);
+        assert_batch_layout(x.len(), batch.len(), dimension);
         let x_norm = norm_l2(x);
 
         // On a build whose baseline already guarantees AVX2, avoid the
@@ -636,9 +639,10 @@ impl Cosine for f32 {
         // once per vector without materializing the full batch.
         #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
         {
-            if dimension == 8 && x.len() >= 8 {
-                // SAFETY: both loads read from the verified eight-element key,
-                // and x86_64 guarantees SSE.
+            if dimension == 8 {
+                // SAFETY: `assert_batch_layout` above established
+                // `x.len() == dimension == 8`, so both loads stay in bounds, and
+                // x86_64 guarantees SSE.
                 return Box::new(unsafe { CosineBatch8Iter::new(x, x_norm, batch) });
             }
 
@@ -844,6 +848,7 @@ impl ExactSizeIterator for CosineBatchIter<'_> {
 impl Cosine for f64 {
     #[inline]
     fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
+        assert_equal_lengths(x.len(), y.len());
         // Trait methods cannot carry `#[target_feature]` attributes, so the body
         // lives in a free function that runtime-dispatches via `*SIMD_SUPPORT`
         // to an AVX2 inner kernel on capable hosts, or a portable scalar fallback.
@@ -1419,6 +1424,141 @@ mod tests {
     use approx::assert_relative_eq;
     use num_traits::AsPrimitive;
     use proptest::prelude::*;
+
+    /// A key that does not match `dimension`, a batch that is not a whole number
+    /// of vectors, or a zero `dimension`, has to stop at the boundary. Covers the
+    /// trait default through `f64` and the `f32` override.
+    #[rstest::rstest]
+    #[case::key_longer_than_dimension(32, 64, 16, "must match dimension")]
+    #[case::key_shorter_than_dimension(8, 64, 16, "must match dimension")]
+    #[case::batch_remainder(16, 63, 16, "divisible by dimension")]
+    #[case::zero_dimension(16, 64, 0, "greater than zero")]
+    fn cosine_batch_rejects_bad_layout(
+        #[case] key_len: usize,
+        #[case] batch_len: usize,
+        #[case] dimension: usize,
+        #[case] expected: &str,
+    ) {
+        let key = vec![1.0f32; key_len];
+        let batch = vec![1.0f32; batch_len];
+        let message = panic_message(|| {
+            cosine_distance_batch(&key, &batch, dimension).count();
+        });
+        assert!(message.contains(expected), "f32: {message}");
+
+        let key = vec![1.0f64; key_len];
+        let batch = vec![1.0f64; batch_len];
+        let message = panic_message(|| {
+            cosine_distance_batch(&key, &batch, dimension).count();
+        });
+        assert!(message.contains(expected), "f64: {message}");
+    }
+
+    /// Returns the panic message, so a case can assert which contract was
+    /// violated instead of accepting any panic from the same call.
+    fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+        let payload = std::panic::catch_unwind(f).expect_err("expected a panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default()
+    }
+
+    /// `DistanceType::func()` hands out `cosine_distance`, so pin the free
+    /// function too rather than only the trait method it forwards to.
+    #[test]
+    fn cosine_distance_rejects_mismatched_lengths() {
+        let long = [1.0f32; 16];
+        let short = [1.0f32; 15];
+        assert!(
+            panic_message(|| {
+                cosine_distance(&long, &short);
+            })
+            .contains("equal lengths")
+        );
+    }
+
+    /// A mismatch has to stop at the boundary rather than reach a kernel that
+    /// takes one length and reads both vectors with it.
+    ///
+    /// The f32 cases assert the two lengths as well as `equal lengths`, because
+    /// an f32 kernel tail hands `dot` a shorter pair and `dot` emits the same
+    /// message with different numbers. The f64 cases assert them too, where the
+    /// numbers are redundant, since no f64 tail calls `dot`.
+    #[test]
+    fn cosine_rejects_mismatched_lengths() {
+        let long_f32 = [1.0f32; 16];
+        let short_f32 = [1.0f32; 15];
+        for (message, expected) in [
+            (
+                panic_message(|| {
+                    f32::cosine_fast(&long_f32, 1.0, &short_f32);
+                }),
+                "left=16, right=15",
+            ),
+            (
+                panic_message(|| {
+                    f32::cosine_fast(&short_f32, 1.0, &long_f32);
+                }),
+                "left=15, right=16",
+            ),
+            (
+                panic_message(|| {
+                    f32::cosine_with_norms(&long_f32, 1.0, 1.0, &short_f32);
+                }),
+                "left=16, right=15",
+            ),
+        ] {
+            assert!(message.contains("equal lengths"), "f32: {message}");
+            assert!(message.contains(expected), "f32: {message}");
+        }
+
+        let long_f64 = [1.0f64; 16];
+        let short_f64 = [1.0f64; 15];
+        for (message, expected) in [
+            (
+                panic_message(|| {
+                    f64::cosine_fast(&long_f64, 1.0, &short_f64);
+                }),
+                "left=16, right=15",
+            ),
+            (
+                panic_message(|| {
+                    f64::cosine_fast(&short_f64, 1.0, &long_f64);
+                }),
+                "left=15, right=16",
+            ),
+        ] {
+            assert!(message.contains("equal lengths"), "f64: {message}");
+            assert!(message.contains(expected), "f64: {message}");
+        }
+
+        // Half precision asserts the contract only, not where it was enforced.
+        // With `fp16kernels` off, which is the default, `cosine_fast` here routes
+        // to `cosine_scalar`, and that hands `dot` the same two slices, so the
+        // entry assert and `dot`'s produce the same message.
+        let long_f16 = [f16::from_f32(1.0); 16];
+        let short_f16 = [f16::from_f32(1.0); 15];
+        let long_bf16 = [bf16::from_f32(1.0); 16];
+        let short_bf16 = [bf16::from_f32(1.0); 15];
+        for message in [
+            panic_message(|| {
+                f16::cosine_fast(&long_f16, 1.0, &short_f16);
+            }),
+            panic_message(|| {
+                f16::cosine_fast(&short_f16, 1.0, &long_f16);
+            }),
+            panic_message(|| {
+                bf16::cosine_fast(&long_bf16, 1.0, &short_bf16);
+            }),
+            panic_message(|| {
+                bf16::cosine_fast(&short_bf16, 1.0, &long_bf16);
+            }),
+        ] {
+            assert!(message.contains("equal lengths"), "half: {message}");
+        }
+    }
 
     fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
         let xy = x
