@@ -416,7 +416,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ///
     ///
     pub async fn load_partition(&self, part_id: usize) -> Result<Q::Storage> {
-        let range = self.ivf.row_range(part_id);
+        let range = self.ivf.try_row_range(part_id)?;
         Q::Storage::load_partition(
             &self.reader,
             range,
