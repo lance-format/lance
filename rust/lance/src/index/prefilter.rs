@@ -197,44 +197,55 @@ impl DatasetPreFilter {
 
         let dataset_clone = dataset.clone();
         let restrict_for_load = restrict_to.clone();
-        let key = crate::session::caches::RowAddrMaskKey {
-            version: dataset.manifest().version,
-            restrict_hash,
+        let load_mask = move || {
+            async move {
+                let row_ids_and_deletions =
+                    load_row_ids_and_deletions(&dataset_clone, restrict_for_load.as_ref()).await?;
+
+                // The process of computing the final mask is CPU-bound, so we spawn it
+                // on a blocking thread.
+                let allow_list = spawn_cpu(move || {
+                    Result::Ok(row_ids_and_deletions.into_iter().fold(
+                        RowAddrTreeMap::new(),
+                        |mut allow_list, (row_ids, deletion_vector)| {
+                            let seq = if let Some(deletion_vector) = deletion_vector {
+                                let mut row_ids = row_ids.as_ref().clone();
+                                row_ids.mask(deletion_vector.to_sorted_iter()).unwrap();
+                                Cow::<RowIdSequence>::Owned(row_ids)
+                            } else {
+                                Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
+                            };
+                            let treemap = RowAddrTreeMap::from(seq.as_ref());
+                            allow_list |= treemap;
+                            allow_list
+                        },
+                    ))
+                })
+                .await?;
+
+                Ok(RowAddrMask::from_allowed(allow_list))
+            }
         };
-        dataset
-            .metadata_cache
-            .as_ref()
-            .get_or_insert_with_key(key, move || {
-                async move {
-                    let row_ids_and_deletions =
-                        load_row_ids_and_deletions(&dataset_clone, restrict_for_load.as_ref())
-                            .await?;
 
-                    // The process of computing the final mask is CPU-bound, so we spawn it
-                    // on a blocking thread.
-                    let allow_list = spawn_cpu(move || {
-                        Result::Ok(row_ids_and_deletions.into_iter().fold(
-                            RowAddrTreeMap::new(),
-                            |mut allow_list, (row_ids, deletion_vector)| {
-                                let seq = if let Some(deletion_vector) = deletion_vector {
-                                    let mut row_ids = row_ids.as_ref().clone();
-                                    row_ids.mask(deletion_vector.to_sorted_iter()).unwrap();
-                                    Cow::<RowIdSequence>::Owned(row_ids)
-                                } else {
-                                    Cow::<RowIdSequence>::Borrowed(row_ids.as_ref())
-                                };
-                                let treemap = RowAddrTreeMap::from(seq.as_ref());
-                                allow_list |= treemap;
-                                allow_list
-                            },
-                        ))
-                    })
-                    .await?;
-
-                    Ok(RowAddrMask::from_allowed(allow_list))
-                }
-            })
-            .await
+        // The metadata cache is namespaced by dataset URI only, and a dataset
+        // dropped and recreated at the same URI restarts its version history
+        // at 1, so the mask key must carry the manifest e-tag to keep
+        // generations apart. Without one the entry must not be shared at all,
+        // mirroring how `get_row_id_index` treats `RowIdIndexKey`.
+        if let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() {
+            let key = crate::session::caches::RowAddrMaskKey {
+                version: dataset.manifest().version,
+                restrict_hash,
+                e_tag: Some(e_tag),
+            };
+            dataset
+                .metadata_cache
+                .as_ref()
+                .get_or_insert_with_key(key, load_mask)
+                .await
+        } else {
+            load_mask().await.map(Arc::new)
+        }
     }
 
     /// Sets the deleted fragment IDs to block during search.
@@ -680,5 +691,89 @@ mod test {
                 .await
                 .unwrap();
         assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(0));
+    }
+
+    // Regression test: `RowAddrMaskKey` is scoped by `{version, restrict_hash}`
+    // alone, but the metadata cache it lives in is namespaced by dataset URI
+    // only. A dataset dropped and recreated at the same URI restarts its
+    // version history at 1, so the new incarnation reaches the old
+    // incarnation's cached key and is served the previous generation's
+    // allow-list. Stable row ids restart near 0 in both generations, so rows
+    // beyond the old generation's id range silently vanish from every indexed
+    // query. `RowIdIndexKey` guards the row-id index against exactly this with
+    // the manifest e-tag; the mask must not share entries across generations
+    // either.
+    #[tokio::test]
+    async fn test_deletion_mask_stale_after_dataset_recreated_at_same_uri() {
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let tmp = TempStrDir::default();
+        let tmp_str = tmp.as_str();
+        // Shared so the cache stays warm across the drop, as it would for a
+        // host that keeps one session open for the lifetime of the process.
+        let session = Arc::new(crate::session::Session::default());
+
+        let write = |rows: i32| {
+            let test_data = BatchGenerator::new()
+                .col(Box::new(IncrementingInt32::new().named("x")))
+                .batch(rows);
+            let params = WriteParams {
+                enable_stable_row_ids: true,
+                session: Some(session.clone()),
+                ..Default::default()
+            };
+            async move {
+                Dataset::write(test_data, tmp_str, Some(params))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Incarnation A: 10 rows, stable ids 0..=9. Deleting x = 9 lands at
+        // version 2 with a cached allow-list of ids 0..=8.
+        let mut ds = write(10).await;
+        let ds = (*ds.delete("x = 9").await.unwrap().new_dataset).clone();
+        assert_eq!(ds.manifest.version, 2);
+        // On unix the commit result carries the object store's e-tag for the
+        // manifest, so this exercises the e-tag-keyed cache branch; pin that
+        // so the test cannot silently degrade to the no-e-tag bypass. On
+        // Windows the rename-based commit handler discards e-tags by design
+        // ("re-name can change e-tag"), and this test then covers the bypass
+        // branch instead.
+        if cfg!(unix) {
+            assert!(
+                ds.manifest_location.e_tag.is_some(),
+                "unix local commits carry an e-tag; without one this test would \
+                 exercise the cache bypass instead of the e-tag-keyed path"
+            );
+        }
+        let fragments = RoaringBitmap::from_iter(0..1);
+        let mask = DatasetPreFilter::create_deletion_mask(Arc::new(ds.clone()), fragments.clone())
+            .expect("mask present: dataset has a deletion file")
+            .await
+            .unwrap();
+        let expected_a = RowAddrTreeMap::from_iter(0..9);
+        assert_eq!(mask.allow_list(), Some(&expected_a));
+
+        drop(ds);
+        std::fs::remove_dir_all(tmp_str).unwrap();
+
+        // Incarnation B: 20 rows, stable ids 0..=19, also reaching version 2.
+        // Longer than A so a stale hit is observable: the reincarnation's own
+        // allow-list must cover ids 9..=18, which never existed in A.
+        let mut ds = write(20).await;
+        let ds = (*ds.delete("x = 19").await.unwrap().new_dataset).clone();
+        assert_eq!(ds.manifest.version, 2);
+        let mask = DatasetPreFilter::create_deletion_mask(Arc::new(ds), fragments)
+            .expect("mask present: dataset has a deletion file")
+            .await
+            .unwrap();
+        let expected_b = RowAddrTreeMap::from_iter(0..19);
+        assert_eq!(
+            mask.allow_list(),
+            Some(&expected_b),
+            "deletion mask must reflect the recreated dataset, not the previous \
+             incarnation cached at the same URI and version"
+        );
     }
 }
