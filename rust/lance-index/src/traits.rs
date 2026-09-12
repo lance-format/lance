@@ -23,6 +23,8 @@ pub struct IndexCriteria<'a> {
     pub fts_document_granularity: Option<DocumentGranularity>,
     /// If true, only consider indices that support exact equality
     pub must_support_exact_equality: bool,
+    /// If true, only consider indices that support MinHash similarity search
+    pub must_support_minhash: bool,
 }
 
 impl<'a> IndexCriteria<'a> {
@@ -60,6 +62,12 @@ impl<'a> IndexCriteria<'a> {
     /// or an index like a bloom filter
     pub fn supports_exact_equality(mut self) -> Self {
         self.must_support_exact_equality = true;
+        self
+    }
+
+    /// Only consider MinHash LSH indices
+    pub fn supports_minhash(mut self) -> Self {
+        self.must_support_minhash = true;
         self
     }
 }

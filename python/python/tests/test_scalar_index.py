@@ -20,6 +20,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
+from lance.dataset import ScannerBuilder
 from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
@@ -27,6 +28,7 @@ from lance.query import (
     DocumentGranularity,
     FullTextOperator,
     MatchQuery,
+    MinHashQuery,
     MultiMatchQuery,
     Occur,
     PhraseQuery,
@@ -3048,6 +3050,71 @@ def test_bloomfilter_deletion_handling(tmp_path: Path):
     assert ds.to_table(filter="value = 0").num_rows == 0
     ids = ds.to_table(filter="value = 1")["id"].to_pylist()
     assert ids == [0, 2, 4, 6, 8]
+
+
+def test_minhash_lsh_index():
+    base = "the quick brown fox jumps over the lazy dog and runs away very fast"
+    near = "the quick brown fox jumps over the lazy dog and runs away very quickly"
+    texts = [
+        base,
+        near,
+        "completely unrelated sentence about columnar storage in lance files",
+        base,
+        None,
+        "another unrelated row that talks about vector indices and recall",
+    ]
+    tbl = pa.table({"id": list(range(len(texts))), "text": texts})
+    ds = lance.write_dataset(tbl, "memory://minhash", max_rows_per_file=2)
+    assert len(ds.get_fragments()) == 3
+    ds.create_scalar_index(
+        "text",
+        IndexConfig(
+            index_type="minhashlsh",
+            parameters={"num_hashes": 64, "num_bands": 16, "shingle_size": 2},
+        ),
+    )
+    stats = ds.stats.index_stats("text_idx")
+    assert stats["index_type"] == "MinHashLsh"
+    assert stats["indices"][0]["num_docs"] == 5
+    assert stats["indices"][0]["num_hashes"] == 64
+
+    query = MinHashQuery(base, "text")
+    plan = ds.scanner(nearest=query, limit=3).explain_plan()
+    assert "MinHashSearch: column=text, limit=3" in plan
+
+    result = ds.to_table(nearest=query, limit=3, columns=["id"])
+    assert result.column_names == ["id", "_distance"]
+    assert result["id"].to_pylist() == [0, 3, 1]
+    distances = result["_distance"].to_pylist()
+    assert distances[0] == 0.0 and distances[1] == 0.0
+    assert 0.0 < distances[2] < 0.5
+
+    # limit defaults to 10, filters prefilter the candidates
+    assert ds.to_table(nearest=query).num_rows == 3
+    filtered = ds.to_table(nearest=query, limit=3, filter="id > 0", prefilter=True)
+    assert filtered["id"].to_pylist() == [3, 1]
+
+    with pytest.raises(Exception, match="No MinHash LSH index found for column id"):
+        ds.to_table(nearest=MinHashQuery(base, "id"), limit=3)
+
+    # Rows appended after the index was built are scored on the fly
+    ds = lance.write_dataset(
+        pa.table({"id": [6, 7], "text": [base, "nothing alike"]}),
+        ds,
+        mode="append",
+    )
+    plan = ds.scanner(nearest=query, limit=3).explain_plan()
+    assert "MinHashFlatSearch" in plan
+    assert ds.to_table(nearest=query, limit=3, columns=["id"])["id"].to_pylist() == [
+        0,
+        3,
+        6,
+    ]
+    assert ds.to_table(nearest=query, limit=3, columns=["id"], fast_search=True)[
+        "id"
+    ].to_pylist() == [0, 3, 1]
+    with pytest.raises(TypeError):
+        ScannerBuilder(ds).minhash_search("not a query")  # type: ignore[arg-type]
 
 
 def test_json_index():

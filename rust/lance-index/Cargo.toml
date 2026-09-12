@@ -34,6 +34,7 @@ geoarrow-array = { workspace = true, optional = true }
 geoarrow-schema = { workspace = true, optional = true }
 geo-types = { workspace = true, optional = true }
 half.workspace = true
+hex.workspace = true
 itertools.workspace = true
 jieba-rs = { workspace = true, optional = true }
 jsonb.workspace = true
@@ -67,6 +68,7 @@ serde.workspace = true
 smallvec = "1.15"
 tokio.workspace = true
 tracing.workspace = true
+twox-hash.workspace = true
 tempfile.workspace = true
 crossbeam-queue.workspace = true
 bytes.workspace = true

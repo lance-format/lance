@@ -419,6 +419,9 @@ class _Dataset:
         order_by: Optional[List[Any]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
         substrait_aggregate: Optional[bytes] = None,
+        row_addr_allowlist: Optional[bytes] = None,
+        row_addr_blocklist: Optional[bytes] = None,
+        minhash_query: Optional[Dict[str, str]] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(

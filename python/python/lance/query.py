@@ -3,6 +3,7 @@
 
 
 import abc
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -280,3 +281,31 @@ class BooleanQuery(FullTextQuery):
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.BOOLEAN
+
+
+@dataclass
+class MinHashQuery:
+    """A MinHash similarity search over a column with a MinHash LSH index.
+
+    Pass it as ``nearest`` to :meth:`LanceDataset.to_table` or
+    :meth:`LanceDataset.scanner`. The result carries a ``_distance`` column
+    equal to ``1 - estimated Jaccard similarity`` between the query text and
+    each row, ordered ascending; the number of rows is the scan ``limit``
+    (default 10).
+
+    Parameters
+    ----------
+    text : str
+        The query text. It is tokenized and shingled exactly like the indexed
+        rows, using the tokenizer stored in the index.
+    column : str
+        The column that has the MinHash LSH index.
+
+    Examples
+    --------
+    >>> ds.to_table(nearest=MinHashQuery("some near duplicate text", "text"),
+    ...             limit=10)  # doctest: +SKIP
+    """
+
+    text: str
+    column: str

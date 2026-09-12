@@ -809,6 +809,41 @@ fn filter_index_segments_by_ids(
     Ok(filtered)
 }
 
+/// Ask the scalar index plugin whether the parameters of `incoming` segments
+/// let them join `existing` ones (for example, MinHash signatures are only
+/// comparable across segments built with the same hashing parameters).
+/// Complements [`validate_segment_index_details`], which only checks that
+/// segments share a details type. Vector indices and details without a plugin
+/// are not checked.
+pub(crate) fn validate_segment_params_compatible(
+    existing: &[IndexMetadata],
+    incoming: &[IndexMetadata],
+) -> Result<()> {
+    let Some(reference) = incoming
+        .iter()
+        .chain(existing.iter())
+        .find_map(|segment| segment.index_details.as_ref())
+    else {
+        return Ok(());
+    };
+    let details = IndexDetails(reference.clone());
+    let Ok(plugin) = details.get_plugin() else {
+        return Ok(());
+    };
+    let existing_details: Vec<&prost_types::Any> = existing
+        .iter()
+        .filter_map(|segment| segment.index_details.as_deref())
+        .collect();
+    let incoming_details: Vec<&prost_types::Any> = incoming
+        .iter()
+        .filter_map(|segment| segment.index_details.as_deref())
+        .collect();
+    plugin.validate_new_segments_against_existing(&existing_details, &incoming_details)
+}
+
+/// Every segment of one commit must carry index details of the same type;
+/// whether their parameters are compatible is the plugin's call, see
+/// [`validate_segment_params_compatible`].
 fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
     let mut type_url = None::<&str>;
     for segment in segments {
@@ -925,6 +960,13 @@ fn segment_has_rtree_details(segment: &IndexMetadata) -> bool {
         .index_details
         .as_ref()
         .is_some_and(|details| details.type_url.ends_with("RTreeIndexDetails"))
+}
+
+fn segment_has_minhashlsh_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("MinHashLshIndexDetails"))
 }
 
 fn segment_has_ngram_details(segment: &IndexMetadata) -> bool {
@@ -1138,6 +1180,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
         "FMIndex" | "FM" => IndexType::Fm.to_string(),
+        "MinHashLsh" => IndexType::MinHashLsh.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
@@ -1942,6 +1985,7 @@ impl DatasetIndexExt for Dataset {
         let all_label_list = source_segments.iter().all(segment_has_label_list_details);
         let all_rtree = source_segments.iter().all(segment_has_rtree_details);
         let all_ngram = source_segments.iter().all(segment_has_ngram_details);
+        let all_minhashlsh = source_segments.iter().all(segment_has_minhashlsh_details);
         if !all_vector
             && !all_inverted
             && !all_bitmap
@@ -1952,12 +1996,15 @@ impl DatasetIndexExt for Dataset {
             && !all_label_list
             && !all_rtree
             && !all_ngram
+            && !all_minhashlsh
         {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
                     .to_string(),
             ));
         }
+
+        validate_segment_params_compatible(&[], &source_segments)?;
 
         let merged_dataset_version = if all_rtree {
             let mut source_coverage = source_segments
@@ -1990,6 +2037,8 @@ impl DatasetIndexExt for Dataset {
             crate::index::scalar::zonemap::merge_segments(self, source_segments).await?
         } else if all_ngram {
             crate::index::scalar::ngram::merge_segments(self, source_segments).await?
+        } else if all_minhashlsh {
+            crate::index::scalar::minhash_lsh::merge_segments(self, source_segments).await?
         } else if all_rtree {
             #[cfg(feature = "geo")]
             {
@@ -2115,6 +2164,7 @@ impl DatasetIndexExt for Dataset {
         }
 
         let is_index_type_change = existing_different_type_url.is_some();
+        let existing_snapshot = existing_named_indices.clone();
         // What a retained sibling has to agree with. Every incoming segment
         // already carries the same pair: `build_index_metadata_from_segments`
         // compares them against each other before this point.
@@ -2189,6 +2239,18 @@ impl DatasetIndexExt for Dataset {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        // Segments that stay together must be compatible under the plugin's
+        // rules (for example identical hash parameters). Segments this commit
+        // removes are not consulted, so a full rebuild may change parameters.
+        let retained_indices: Vec<IndexMetadata> = existing_snapshot
+            .into_iter()
+            .filter(|idx| {
+                !removed_indices
+                    .iter()
+                    .any(|removed| removed.uuid == idx.uuid)
+            })
+            .collect();
+        validate_segment_params_compatible(&retained_indices, &new_indices)?;
 
         let transaction = Transaction::new(
             self.manifest.version,

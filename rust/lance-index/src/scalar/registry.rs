@@ -247,6 +247,21 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// Optional hook that plugins can use if they need to be aware of the registry
     fn attach_registry(&self, _registry: Arc<IndexPluginRegistry>) {}
 
+    /// Validate that new segments can join the segments of the same logical
+    /// index.
+    ///
+    /// Called before segments are committed next to `existing` segments (empty
+    /// for a new index) and before segments are merged. Plugins whose segments
+    /// are only compatible under identical parameters (for example shared hash
+    /// functions) override this to reject drift; the default accepts any mix.
+    fn validate_new_segments_against_existing(
+        &self,
+        _existing: &[&prost_types::Any],
+        _incoming: &[&prost_types::Any],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Returns a JSON string representation of the provided index details
     ///
     /// These details will be user-visible and should be considered part of the public

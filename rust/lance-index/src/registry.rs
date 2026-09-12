@@ -14,8 +14,8 @@ use crate::{
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
         fmindex::FMIndexPlugin, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
-        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, registry::ScalarIndexPlugin,
-        zonemap::ZoneMapIndexPlugin,
+        label_list::LabelListIndexPlugin, minhash_lsh::MinHashLshIndexPlugin,
+        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin, zonemap::ZoneMapIndexPlugin,
     },
 };
 
@@ -109,6 +109,7 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
         registry.add_plugin::<pb::FmIndexDetails, FMIndexPlugin>();
+        registry.add_plugin::<pb::MinHashLshIndexDetails, MinHashLshIndexPlugin>();
         #[cfg(feature = "geo")]
         registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
 
@@ -212,6 +213,7 @@ mod tests {
             ("BLOOMFILTER", "BloomFilter"),
             ("FM", "Fm"),
             ("JSON", "Json"),
+            ("MINHASHLSH", "MinHashLsh"),
         ] {
             let plugin = registry.get_plugin_by_name(requested_name).unwrap();
             assert_eq!(plugin.name(), expected_name);

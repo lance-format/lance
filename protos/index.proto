@@ -6,6 +6,7 @@ syntax = "proto3";
 package lance.index.pb;
 
 import "google/protobuf/any.proto";
+import "index_old.proto";
 
 // The type of an index.
 enum IndexType {
@@ -255,3 +256,50 @@ message BloomFilterIndexDetails {}
 message RTreeIndexDetails {}
 
 message FMIndexDetails {}
+
+/* Details of a MinHash LSH index (near-duplicate search over text).
+ *
+ * The message identifies every input of signature generation: the
+ * parameters, the tokenizer and the version of the procedure. All segments
+ * of one logical index carry identical details, so their signatures and the
+ * query signature are comparable; both index files repeat the serialized
+ * message in their schema metadata so that a file which does not belong to
+ * the details is detected. A reader validates every field against the ranges
+ * below before it allocates memory or reads an index file.
+ */
+message MinHashLshIndexDetails {
+  /* Number of MinHash values per signature (k): in [1, 4096] and a multiple
+   * of `num_bands`.
+   */
+  uint32 num_hashes = 1;
+
+  /* Number of LSH bands (b), in [1, 256]. Each band covers
+   * `num_hashes / num_bands` consecutive signature values.
+   */
+  uint32 num_bands = 2;
+
+  /* Number of consecutive tokens joined into one shingle; at least 1. A text
+   * with fewer tokens forms one shingle of all of them.
+   */
+  uint32 shingle_size = 3;
+
+  /* The tokenizer, recorded as a full text search index records it and
+   * rebuilt from this message alone at query time. Required. Fields that only
+   * shape full text search postings (`with_position`, `block_size`,
+   * `posting_format_version`, `document_granularity`) are carried unchanged
+   * and ignored. The details must identify the tokenizer completely, so
+   * settings the message cannot record (custom stop words, document-level
+   * text extraction) and tokenizers that load data from outside Lance (the
+   * jieba and lindera dictionaries) are rejected.
+   */
+  lance.table.InvertedIndexDetails tokenizer = 4;
+
+  /* Version of the signature procedure: the token streams of the tokenizers
+   * that ship with Lance, shingling, hashing, the permutation coefficients
+   * and their seed, compression and band keys. Bumped whenever any of them
+   * changes in a way that makes old and new signatures incomparable; a reader
+   * rejects a version it does not implement. Independent of the index file
+   * format version.
+   */
+  uint32 signature_version = 5;
+}

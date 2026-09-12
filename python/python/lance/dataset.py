@@ -75,7 +75,7 @@ from .lance import (
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
-from .query import DocumentGranularity, FullTextQuery
+from .query import DocumentGranularity, FullTextQuery, MinHashQuery
 from .types import _coerce_reader, _is_materialized
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
@@ -1209,7 +1209,7 @@ class LanceDataset(pa.dataset.Dataset):
         ] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[dict, MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -1294,8 +1294,13 @@ class LanceDataset(pa.dataset.Dataset):
             Fetch up to this many rows. All rows if None or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
-        nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors. Example:
+        nearest: dict or MinHashQuery, default None
+            Get the rows corresponding to the K most similar vectors, or, when a
+            :class:`~lance.query.MinHashQuery` is given, the ``limit`` rows most
+            similar to its text under the column's MinHash LSH index (adds a
+            ``_distance`` column equal to ``1 - estimated Jaccard similarity``;
+            unindexed rows are scored on the fly unless ``fast_search`` is set).
+            Vector search example:
 
             .. code-block:: python
 
@@ -1534,7 +1539,10 @@ class LanceDataset(pa.dataset.Dataset):
             elif isinstance(full_text_query, dict):
                 builder = builder.full_text_search(**full_text_query)
         if nearest is not None:
-            builder = builder.nearest(**nearest)
+            if isinstance(nearest, MinHashQuery):
+                builder = builder.minhash_search(nearest)
+            else:
+                builder = builder.nearest(**nearest)
         return builder.to_scanner()
 
     @property
@@ -1584,7 +1592,7 @@ class LanceDataset(pa.dataset.Dataset):
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[dict, MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -1621,8 +1629,13 @@ class LanceDataset(pa.dataset.Dataset):
             Fetch up to this many rows. All rows if None or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
-        nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors. Example:
+        nearest: dict or MinHashQuery, default None
+            Get the rows corresponding to the K most similar vectors, or, when a
+            :class:`~lance.query.MinHashQuery` is given, the ``limit`` rows most
+            similar to its text under the column's MinHash LSH index (adds a
+            ``_distance`` column equal to ``1 - estimated Jaccard similarity``;
+            unindexed rows are scored on the fly unless ``fast_search`` is set).
+            Vector search example:
 
             .. code-block:: python
 
@@ -1741,7 +1754,7 @@ class LanceDataset(pa.dataset.Dataset):
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[dict, MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
@@ -2158,7 +2171,7 @@ class LanceDataset(pa.dataset.Dataset):
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Union[dict, MinHashQuery]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -6631,6 +6644,7 @@ class ScannerBuilder:
         self._columns = None
         self._columns_with_transform = None
         self._nearest = None
+        self._minhash_query: Optional[Dict[str, str]] = None
         self._batch_size: Optional[int] = None
         self._batch_size_bytes: Optional[int] = None
         self._io_buffer_size: Optional[int] = None
@@ -7058,6 +7072,33 @@ class ScannerBuilder:
             }
         return self
 
+    def minhash_search(self, query: MinHashQuery) -> ScannerBuilder:
+        """
+        Find the rows most similar to ``query.text`` using the MinHash LSH index
+        on ``query.column``.
+
+        The number of rows comes from :meth:`limit` (default 10). Results carry
+        a ``_distance`` column equal to ``1 - estimated Jaccard similarity`` and
+        are ordered by ascending distance. Cannot be combined with
+        :meth:`nearest` or :meth:`full_text_search`.
+
+        Rows the index does not cover (fragments appended after the index was
+        built, or rows changed by a data overlay) are scored on the fly, which
+        costs a scan of those rows per query; run ``optimize_indices`` to index
+        them, or enable :meth:`fast_search` to search only the indexed rows.
+
+        Parameters
+        ----------
+        query : MinHashQuery
+            The query text and the column to search.
+        """
+        if not isinstance(query, MinHashQuery):
+            raise TypeError(
+                f"minhash_search expects a MinHashQuery, got {type(query).__name__}"
+            )
+        self._minhash_query = {"column": query.column, "text": query.text}
+        return self
+
     def scan_stats_callback(
         self, callback: Callable[[ScanStatistics], None]
     ) -> ScannerBuilder:
@@ -7155,6 +7196,7 @@ class ScannerBuilder:
             self._substrait_aggregate,
             self._row_addr_allowlist,
             self._row_addr_blocklist,
+            self._minhash_query,
         )
         return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 
