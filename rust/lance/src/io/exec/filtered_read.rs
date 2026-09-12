@@ -71,6 +71,8 @@ use crate::dataset::versions;
 use super::utils::IoMetrics;
 
 type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
+type MaterializedReadBatchesFut =
+    futures::future::BoxFuture<'static, Result<Vec<MaterializedBlobBatch>>>;
 
 fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef {
     let schema = projection.to_schema();
@@ -438,7 +440,7 @@ struct FilteredReadStream {
     /// The stream of filtered rows, expressed as a stream of tasks (batch futures)
     ///
     /// This stream can be shared by multiple partitions
-    task_stream: Arc<AsyncMutex<BoxStream<'static, Result<MaterializedReadBatchFut>>>>,
+    task_stream: Arc<AsyncMutex<BoxStream<'static, Result<MaterializedReadBatchesFut>>>>,
     /// The scan scheduler for the scan
     scan_scheduler: Arc<ScanScheduler>,
     /// The global metrics for the scan
@@ -546,7 +548,7 @@ pub fn coalesce_batches(
                 return Ok(Some((this.emit()?, this)));
             }
             if this.exhausted {
-                return Ok(None);
+                return Ok::<_, DataFusionError>(None);
             }
             match this.input.try_next().await? {
                 Some(batch) if batch.num_rows() >= this.target && !this.buffered.is_empty() => {
@@ -696,7 +698,7 @@ impl FilteredReadStream {
         let mut task_stream = self.task_stream.lock().await;
         (&mut *task_stream)
             .try_buffered(decode_parallelism)
-            .try_collect()
+            .try_concat()
             .await
     }
 
@@ -1329,6 +1331,8 @@ impl FilteredReadStream {
                 let partition_metrics_clone = partition_metrics.clone();
                 let base_batch_stream = futures_stream
                     .try_buffered(num_threads)
+                    .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+                    .try_flatten()
                     .map_ok(MaterializedBlobBatch::into_batch)
                     .try_filter_map(move |batch| {
                         std::future::ready(Ok(if batch.num_rows() == 0 {
@@ -1392,14 +1396,16 @@ impl FilteredReadStream {
                             };
                             if let Some(task) = maybe_task {
                                 let task = task?;
-                                let batch = task.await?.into_batch();
-                                partition_metrics
-                                    .baseline_metrics
-                                    .record_output(batch.num_rows());
+                                let batches = task.await?;
+                                let batch_rows = batches
+                                    .iter()
+                                    .map(|batch| batch.batch().num_rows())
+                                    .sum::<usize>();
+                                partition_metrics.baseline_metrics.record_output(batch_rows);
 
                                 global_metrics.io_metrics.record(&scan_scheduler);
 
-                                Ok(Some((batch, task_stream)))
+                                Ok::<_, lance_core::Error>(Some((batches, task_stream)))
                             } else {
                                 partition_metrics.baseline_metrics.done();
                                 Ok(None)
@@ -1408,6 +1414,9 @@ impl FilteredReadStream {
                         .instrument(tracing::debug_span!("filtered_read_task"))
                     }
                 })
+                .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+                .try_flatten()
+                .map_ok(MaterializedBlobBatch::into_batch)
                 .try_filter_map(move |batch| {
                     std::future::ready(Ok(if batch.num_rows() == 0 {
                         None
@@ -1430,7 +1439,11 @@ impl FilteredReadStream {
         fragment_soft_limit: Option<u64>,
         materialization_context: Arc<BlobMaterializationContext>,
         materialize_blob_v2_binary: bool,
-    ) -> Result<BoxStream<'static, Result<MaterializedReadBatchFut>>> {
+    ) -> Result<BoxStream<'static, Result<MaterializedReadBatchesFut>>> {
+        let batch_size_bytes = fragment_read_task
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
         let output_schema = if materialize_blob_v2_binary {
             public_blob_v2_binary_projection_schema(fragment_read_task.projection.as_ref())
         } else {
@@ -1553,7 +1566,19 @@ impl FilteredReadStream {
                 physical_filter.clone(),
                 output_schema.clone(),
             )))
-            .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1));
+            .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1))
+            .map(move |batch_fut_result| {
+                let batch_fut = batch_fut_result?;
+                Ok(batch_fut
+                    .and_then(move |batch| {
+                        futures::future::ready(if let Some(budget) = batch_size_bytes {
+                            batch.split_by_bytes((budget * 2) as usize)
+                        } else {
+                            Ok(vec![batch])
+                        })
+                    })
+                    .boxed())
+            });
 
         let result = if let Some(limit) = fragment_soft_limit {
             Self::apply_soft_limit(fragment_stream, limit).boxed()
@@ -1591,9 +1616,9 @@ impl FilteredReadStream {
     fn apply_soft_limit<S>(
         stream: S,
         limit: u64,
-    ) -> impl Stream<Item = Result<MaterializedReadBatchFut>>
+    ) -> impl Stream<Item = Result<MaterializedReadBatchesFut>>
     where
-        S: Stream<Item = Result<MaterializedReadBatchFut>>,
+        S: Stream<Item = Result<MaterializedReadBatchesFut>>,
     {
         let rows_read = Arc::new(AtomicUsize::new(0));
 
@@ -1607,8 +1632,9 @@ impl FilteredReadStream {
                 batch_fut_result.map(move |batch_fut| {
                     batch_fut
                         .map(move |batch_result| {
-                            batch_result.inspect(|batch| {
-                                let batch_rows = batch.batch().num_rows();
+                            batch_result.inspect(|batches| {
+                                let batch_rows =
+                                    batches.iter().map(|b| b.batch().num_rows()).sum::<usize>();
                                 rows_read.fetch_add(batch_rows, Ordering::Relaxed);
                             })
                         })
@@ -2970,29 +2996,38 @@ impl RowStreamRead {
         batch: RecordBatch,
         batch_index: u32,
         admission: crate::dataset::blob::BlobMaterializationAdmission,
-    ) -> DataFusionResult<MaterializedBlobBatch> {
+    ) -> DataFusionResult<Vec<MaterializedBlobBatch>> {
         if batch.num_rows() == 0 {
-            return Ok(MaterializedBlobBatch::unreserved(RecordBatch::new_empty(
-                self.output_schema.clone(),
-            )));
+            return Ok(vec![MaterializedBlobBatch::unreserved(
+                RecordBatch::new_empty(self.output_schema.clone()),
+            )]);
         }
         let internal_plan = self.plan_batch(self.key_array(&batch, "input")?).await?;
         let read_data = self.read_batch(internal_plan, batch_index).await?;
         let attached = self.attach_columns(batch, read_data)?;
-        if let Some(output_schema) = &self.source.materialization_output_schema {
-            Ok(
-                crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
-                    &self.dataset,
-                    output_schema,
-                    attached.into_batch(),
-                    &self.materialization_context,
-                    admission,
-                )
-                .await?,
+        let batch_size_bytes = self
+            .source
+            .read_options
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
+        let result = if let Some(output_schema) = &self.source.materialization_output_schema {
+            crate::dataset::blob::materialize_blob_v2_binary_batch_with_admission(
+                &self.dataset,
+                output_schema,
+                attached.into_batch(),
+                &self.materialization_context,
+                admission,
             )
+            .await?
         } else {
             drop(admission);
-            Ok(attached)
+            attached
+        };
+        if let Some(budget) = batch_size_bytes {
+            Ok(result.split_by_bytes((budget * 2) as usize)?)
+        } else {
+            Ok(vec![result])
         }
     }
 
@@ -3029,6 +3064,8 @@ impl RowStreamRead {
             })
             .boxed()
             .try_buffered(ROW_STREAM_CONCURRENT_BATCHES)
+            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+            .try_flatten()
             .map_ok(MaterializedBlobBatch::into_batch)
             .map(move |result| {
                 on_result

@@ -378,6 +378,10 @@ impl LanceStream {
             )
             .stream_in_current_span()
             .boxed();
+        let batch_size_bytes = config
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
         let inner_stream = if materialize_blob_v2_binary {
             inner_stream
                 .map_ok(move |batch| {
@@ -399,6 +403,16 @@ impl LanceStream {
                 })
                 .try_buffered(config.batch_readahead)
                 .map_ok(|batch| batch.into_batch())
+                .and_then(move |batch| {
+                    futures::future::ready(if let Some(budget) = batch_size_bytes {
+                        crate::dataset::blob::split_batch_by_bytes(batch, (budget * 2) as usize)
+                            .map_err(DataFusionError::from)
+                    } else {
+                        Ok(vec![batch])
+                    })
+                })
+                .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+                .try_flatten()
                 .boxed()
         } else {
             inner_stream
