@@ -13,7 +13,7 @@ use lance_table::{
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
-use crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT;
+use crate::io::commit::default_commit_retry_timeout;
 use crate::{
     Dataset, Error, Result,
     dataset::{
@@ -73,7 +73,7 @@ impl<'a> CommitBuilder<'a> {
             session: None,
             detached: false,
             commit_config: Default::default(),
-            retry_timeout: DEFAULT_COMMIT_RETRY_TIMEOUT,
+            retry_timeout: default_commit_retry_timeout(),
             affected_rows: None,
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
@@ -901,8 +901,11 @@ mod tests {
     #[test]
     fn test_commit_retry_timeout_default_is_thirty_seconds() {
         let builder = CommitBuilder::new("memory://default-retry-timeout");
-        assert_eq!(builder.retry_timeout, DEFAULT_COMMIT_RETRY_TIMEOUT);
-        assert_eq!(DEFAULT_COMMIT_RETRY_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(builder.retry_timeout, default_commit_retry_timeout());
+        assert_eq!(
+            crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT,
+            Duration::from_secs(30)
+        );
     }
 
     #[tokio::test]
