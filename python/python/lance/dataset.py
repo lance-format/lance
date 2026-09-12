@@ -247,7 +247,7 @@ def _is_null_blob_description(description: Any) -> bool:
     return False
 
 
-def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[dict]]:
+def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[Dict[str, Any]]]:
     segments = _parse_field_path(path)
     values = table.column(segments[0]).to_pylist()
 
@@ -258,10 +258,10 @@ def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[dict]]:
 
 
 def _replace_value_at_path(
-    parent: Optional[dict],
+    parent: Optional[Dict[str, Any]],
     segments: list[str],
     value: Any,
-) -> Optional[dict]:
+) -> Optional[Dict[str, Any]]:
     if parent is None:
         return None
 
@@ -1205,11 +1205,11 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[
-            Union[str, pa.compute.Expression, FullTextQuery, VectorSearchQuery, dict]
+            Union[str, Expression, FullTextQuery, VectorSearchQuery, Dict[str, Any]]
         ] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Dict[str, Any]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -1217,7 +1217,7 @@ class LanceDataset(pa.dataset.Dataset):
         scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
         index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         *,
         prefilter: Optional[bool] = None,
         with_row_id: Optional[bool] = None,
@@ -1581,10 +1581,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Dict[str, Any]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -1596,7 +1596,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
@@ -1738,10 +1738,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_pandas(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Dict[str, Any]] = None,
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
@@ -1752,7 +1752,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
         fast_search: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict, FullTextQuery]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any], FullTextQuery]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
@@ -2155,10 +2155,10 @@ class LanceDataset(pa.dataset.Dataset):
     def to_batches(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        filter: Optional[Union[str, Expression]] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
-        nearest: Optional[dict] = None,
+        nearest: Optional[Dict[str, Any]] = None,
         batch_size: Optional[int] = None,
         batch_size_bytes: Optional[int] = None,
         batch_readahead: Optional[int] = None,
@@ -2169,7 +2169,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_id: Optional[bool] = None,
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
-        full_text_query: Optional[Union[str, dict]] = None,
+        full_text_query: Optional[Union[str, Dict[str, Any]]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
@@ -2554,7 +2554,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self.scanner(offset=start, limit=end - start, columns=columns).to_table()
 
     def count_rows(
-        self, filter: Optional[Union[str, pa.compute.Expression]] = None, **kwargs
+        self, filter: Optional[Union[str, Expression]] = None, **kwargs: Any
     ) -> int:
         """Count rows matching the scanner filter.
 
@@ -2851,7 +2851,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     def delete(
         self,
-        predicate: Union[str, pa.compute.Expression],
+        predicate: Union[str, Expression],
         *,
         conflict_retries: int = 10,
         retry_timeout: timedelta = timedelta(seconds=30),
@@ -3574,8 +3574,8 @@ class LanceDataset(pa.dataset.Dataset):
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         format_version: Optional[Union[int, str]] = None,
         document_granularity: DocumentGranularity = DocumentGranularity.ROW,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         """Create a scalar index on a column.
 
         Scalar indices, like vector indices, can be used to speed up scans.  A scalar
@@ -5516,7 +5516,7 @@ class LanceDataset(pa.dataset.Dataset):
             hnsw_params=hnsw_params,
         )
 
-    def mem_wal_index_details(self) -> Optional[dict]:
+    def mem_wal_index_details(self) -> Optional[Dict[str, Any]]:
         """Return the MemWAL index details, or ``None`` if not initialized.
 
         Returns

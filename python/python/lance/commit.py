@@ -4,7 +4,7 @@
 from contextlib import AbstractContextManager
 from typing import Callable
 
-CommitLock = Callable[[int], AbstractContextManager]
+CommitLock = Callable[[int], AbstractContextManager[None]]
 
 
 class CommitConflictError(OSError):
