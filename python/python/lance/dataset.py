@@ -4105,13 +4105,25 @@ class LanceDataset(pa.dataset.Dataset):
                 if _check_for_numpy(ivf_centroids) and isinstance(
                     ivf_centroids, np.ndarray
                 ):
-                    if (
-                        len(ivf_centroids.shape) != 2
-                        or ivf_centroids.shape[0] != num_partitions
-                    ):
+                    if len(ivf_centroids.shape) != 2:
                         raise ValueError(
                             f"Ivf centroids must be 2D array: (clusters, dim), "
                             f"got {ivf_centroids.shape}"
+                        )
+                    if ivf_centroids.shape[0] == 0:
+                        # num_partitions was derived from shape[0] above, and
+                        # zero partitions panics in the Rust residual step.
+                        raise ValueError(
+                            "Ivf centroids must have at least one cluster, "
+                            f"got {ivf_centroids.shape}"
+                        )
+                    if (
+                        num_partitions is not None
+                        and ivf_centroids.shape[0] != num_partitions
+                    ):
+                        raise ValueError(
+                            f"Ivf centroids has {ivf_centroids.shape[0]} clusters, "
+                            f"but num_partitions={num_partitions}"
                         )
                     if ivf_centroids.dtype not in [np.float16, np.float32, np.float64]:
                         raise TypeError(
@@ -4265,8 +4277,9 @@ class LanceDataset(pa.dataset.Dataset):
             It can be either :py:class:`np.ndarray`,
             :py:class:`pyarrow.FixedSizeListArray` or
             :py:class:`pyarrow.FixedShapeTensorArray`.
-            A ``num_partitions x dimension`` array of existing K-mean centroids
-            for IVF clustering. If not provided, a new KMeans model will be trained.
+            A ``num_clusters x dimension`` array of existing K-mean centroids
+            for IVF clustering. The row count determines the number of IVF
+            partitions. If not provided, a new KMeans model will be trained.
         pq_codebook : optional,
             It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
             or :py:class:`pyarrow.FixedShapeTensorArray`.

@@ -1529,6 +1529,49 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     partition_keys = {"size"}
     assert all([partition_keys == set(p.keys()) for p in partitions])
 
+    # num_partitions is deprecated in favor of target_partition_size, so
+    # centroids supplied without it must not be rejected. Seven clusters, so the
+    # assertion below tells the new index apart from the five-cluster one above
+    # and from the four target_partition_size would have picked.
+    new_centroids = np.random.randn(7, 128).astype(np.float32)
+    dataset_with_index = dataset.create_index(
+        ["vector"],
+        index_type="IVF_PQ",
+        metric="cosine",
+        ivf_centroids=new_centroids,
+        # 1000 rows / 250 = 4, so this diverges from the centroid count.
+        target_partition_size=250,
+        num_sub_vectors=8,
+        replace=True,
+    )
+    stats = dataset_with_index.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["num_partitions"] == 7
+
+    # A count that disagrees with an explicitly passed num_partitions is still
+    # rejected, and the message now names both numbers.
+    with pytest.raises(ValueError, match="but num_partitions=4"):
+        dataset.create_index(
+            ["vector"],
+            index_type="IVF_PQ",
+            metric="cosine",
+            ivf_centroids=new_centroids,
+            num_partitions=4,
+            num_sub_vectors=8,
+        )
+
+    # A zero-row array passes the 2D check, and the Rust residual step panics on
+    # the empty centroid buffer.
+    with pytest.raises(ValueError, match="at least one cluster"):
+        dataset.create_index(
+            ["vector"],
+            index_type="IVF_PQ",
+            metric="cosine",
+            ivf_centroids=np.empty((0, 128), dtype=np.float32),
+            num_sub_vectors=8,
+            # Otherwise the duplicate-name check intercepts first.
+            replace=True,
+        )
+
 
 def test_create_ivf_pq_skip_transpose(dataset, tmp_path: Path):
     ds = lance.write_dataset(
