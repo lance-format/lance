@@ -557,6 +557,27 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
     let remap_result = if remap.is_empty() {
         RemapResult::Keep(*index_id)
     } else {
+        // The rewrite streams the segment through the reader's loading path,
+        // and for index types that materialize their state at load (e.g.
+        // bitmap) that path applies direct-coverage-wins: rows whose
+        // translated destination is directly covered by a sibling segment
+        // are ceded to it and absent from the loaded state. Publish only the
+        // coverage the reader attributes to this segment, so the swapped
+        // bitmap never claims rows the remapped file may not contain -- an
+        // over-claim would later let segment pruning remove the sibling that
+        // actually holds those rows. (For types that stream raw pages, e.g.
+        // BTree, this under-claims retained rows; safe, the ceding sibling
+        // serves them.)
+        use crate::index::DatasetIndexExt;
+        if let Some(listed) = dataset
+            .load_indices()
+            .await?
+            .iter()
+            .find(|idx| idx.uuid == *index_id)
+            && let Some(servable) = &listed.fragment_bitmap
+        {
+            coverage &= servable;
+        }
         index::remap_index(dataset, index_id, &remap).await?
     };
 
@@ -589,7 +610,12 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             index_details: curr_index_meta.index_details.clone(),
             index_version: curr_index_meta.index_version,
             created_at: curr_index_meta.created_at,
-            base_id: None,
+            // The files are reused as-is; for a segment inherited through a
+            // shallow clone they live in the source base, so the storage
+            // base is carried along with them. (The Remapped arm below
+            // correctly resets to None: its files are freshly written into
+            // this dataset's own index directory.)
+            base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
@@ -1219,6 +1245,291 @@ mod tests {
             assert_eq!(
                 sorted_values(&dataset, None).await,
                 (0..16).collect::<Vec<_>>()
+            );
+        }
+
+        /// A partial direct takeover must not let the remap publish more
+        /// coverage than the remapped file contains. Bitmap-family indexes
+        /// stream through the reader's loading path, which cedes rows whose
+        /// translated destination a sibling covers directly -- so the swapped
+        /// bitmap must claim only what the reader attributes to the segment,
+        /// else pruning later removes the sibling that actually holds those
+        /// rows and queries silently lose them.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn partial_direct_takeover_preserves_ceded_rows() {
+            use crate::utils::test::DatagenExt;
+            use lance_index::scalar::BuiltinIndexType;
+
+            // Four indexed fragments so the deferred compaction forms two
+            // ordered groups ({0,1} -> C and {2,3} -> D) both consumed from
+            // the segment's coverage.
+            let mut dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(
+                    crate::utils::test::FragmentCount::from(4),
+                    crate::utils::test::FragmentRowCount::from(4),
+                )
+                .await
+                .unwrap();
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Bitmap,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                    false,
+                )
+                .await
+                .unwrap();
+            let batch = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step_custom::<Int32Type>(16, 1))
+                .into_batch_rows(lance_datagen::RowCount::from(8))
+                .unwrap();
+            let dataset = InsertBuilder::new(Arc::new(dataset))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                })
+                .execute(vec![batch])
+                .await
+                .unwrap();
+            let mut dataset = dataset;
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[4, 5], 10).await;
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 8,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let entry = stored_index(&dataset, FRAG_REUSE_INDEX_NAME).await;
+            let ledger = decode_frag_reuse_ledger(&dataset, &entry).await.unwrap();
+            let ceded = ledger.transitions()[ledger.consumer(0).expect("fragment 0 compacted")]
+                .destinations()[0]
+                .id as u32;
+            let kept = ledger.transitions()[ledger.consumer(2).expect("fragment 2 compacted")]
+                .destinations()[0]
+                .id as u32;
+            assert_ne!(ceded, kept, "the test needs two separate destinations");
+
+            // A sibling takes over the first destination directly.
+            let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+            let mut sibling = crate::index::CreateIndexBuilder::new(
+                &mut dataset,
+                &["i"],
+                IndexType::Bitmap,
+                &params,
+            )
+            .name("i_idx_delta".into())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+            sibling.name = "i_idx".into();
+            sibling.fragment_bitmap = Some([ceded].into_iter().collect());
+            let sibling_uuid = sibling.uuid;
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![sibling],
+                            removed_indices: vec![],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            // The remapped segment claims only the destination it still
+            // serves; the ceded one belongs to the sibling.
+            let remapped: Vec<IndexMetadata> = read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|idx| idx.name == "i_idx" && idx.uuid != sibling_uuid)
+            .collect();
+            assert_eq!(remapped.len(), 1);
+            assert_eq!(
+                remapped[0].fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([kept]),
+                "the swapped bitmap must not claim the ceded destination"
+            );
+
+            // Segment pruning must therefore keep the sibling, and every row
+            // of the ceded destination stays reachable.
+            crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+                .await
+                .unwrap();
+            let segments = read_manifest_indexes(
+                &dataset.object_store,
+                &dataset.manifest_location,
+                &dataset.manifest,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|idx| idx.name == "i_idx")
+            .count();
+            assert_eq!(segments, 2, "the ceded destination's owner must survive");
+            assert_eq!(
+                sorted_values(&dataset, Some("i < 8")).await,
+                (0..8).collect::<Vec<_>>(),
+                "the ceded destination's rows must all be answered"
+            );
+            assert_eq!(
+                sorted_values(&dataset, None).await,
+                (0..24).collect::<Vec<_>>()
+            );
+        }
+
+        /// A straddle-only remap keeps the original files; for a segment
+        /// inherited through a shallow clone those files live in the source
+        /// base, so the committed metadata must carry the storage base along.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn keep_arm_preserves_clone_storage_base() {
+            use arrow_array::RecordBatchIterator;
+            use lance_core::utils::tempfile::TempStrDir;
+
+            let dir = TempStrDir::default();
+            let source_uri = format!("{}/source", dir.as_str());
+            let clone_uri = format!("{}/clone", dir.as_str());
+
+            // Source: fragments {0,1} of 4 rows, fragment {2} of 8 rows (at
+            // the compaction target, so it stays untouched), indexed by
+            // i_idx.
+            let batch = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .into_batch_rows(lance_datagen::RowCount::from(8))
+                .unwrap();
+            let schema = batch.schema();
+            let source = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                &source_uri,
+                Some(crate::dataset::WriteParams {
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let batch = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+                .into_batch_rows(lance_datagen::RowCount::from(8))
+                .unwrap();
+            let mut source = InsertBuilder::new(Arc::new(source.clone()))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 8,
+                    ..Default::default()
+                })
+                .execute(vec![batch])
+                .await
+                .unwrap();
+            source
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+
+            let dataset = source
+                .shallow_clone(&clone_uri, source.manifest.version, None)
+                .await
+                .unwrap();
+            let inherited = stored_index(&dataset, "i_idx").await;
+            assert!(
+                inherited.base_id.is_some(),
+                "precondition: the cloned segment's files live in the source base"
+            );
+
+            // Tag the clone through fragments the index does not cover.
+            let batch = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step_custom::<Int32Type>(16, 1))
+                .into_batch_rows(lance_datagen::RowCount::from(8))
+                .unwrap();
+            let dataset = InsertBuilder::new(Arc::new(dataset))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                })
+                .execute(vec![batch])
+                .await
+                .unwrap();
+            let mut dataset = dataset;
+            reserve_fragments(&mut dataset, 40).await;
+            let appended: Vec<u64> = dataset
+                .fragments()
+                .iter()
+                .map(|f| f.id)
+                .filter(|id| *id > 2)
+                .collect();
+            let mut dataset = commit_stable_partition(dataset, &appended, 10).await;
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 8,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            // The compaction consumed {0,1}; narrow the inherited segment so
+            // the remap straddles that group while keeping live coverage of
+            // the untouched fragment {2}.
+            narrow_index_bitmap(&mut dataset, "i_idx", &[0, 2]).await;
+
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            let after = stored_index(&dataset, "i_idx").await;
+            assert_eq!(
+                after.uuid, inherited.uuid,
+                "straddle-only remap keeps the files"
+            );
+            assert_eq!(
+                after.base_id, inherited.base_id,
+                "the storage base must travel with the reused files"
+            );
+            assert_eq!(
+                after.fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([2u32])
+            );
+
+            // The surviving coverage is served by opening the files from the
+            // source base.
+            assert_eq!(
+                sorted_values(&dataset, Some("i = 9")).await,
+                vec![9],
+                "queries must still open the inherited files from the source base"
+            );
+            assert_eq!(
+                sorted_values(&dataset, None).await,
+                (0..24).collect::<Vec<_>>()
             );
         }
     }
