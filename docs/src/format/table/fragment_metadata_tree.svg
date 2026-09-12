@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 420" role="img" aria-labelledby="title desc">
+  <title id="title">Fragment metadata tree</title>
+  <desc id="desc">A Version Manifest holds mutations_since_root and points at an external root. The root holds a buffer and routes fragment-id ranges to Lance leaves. Interior nodes may sit between the root and leaves.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path class="arrowhead" d="M 0 1 L 10 5 L 0 9 Z"/>
+    </marker>
+  </defs>
+  <style>
+    text { font-family: Helvetica, Arial, sans-serif; fill: #172a38; }
+    .rail { font-size: 12px; font-weight: 700; fill: #526575; }
+    .title { font-size: 16px; font-weight: 700; }
+    .sub { font-size: 13px; }
+    .box { stroke: #afbcc7; stroke-width: 1.2; }
+    .arrowhead { fill: #526575; }
+    .line { stroke: #526575; stroke-width: 1.5; }
+    .manifest { fill: #deeef8; }
+    .mutation { fill: #fff0d5; }
+    .root { fill: #f5f8fa; }
+    .leaf { fill: #e3f2ea; }
+
+    @media (prefers-color-scheme: dark) {
+      text { fill: #e8eef4; }
+      .rail { fill: #9bb0c2; }
+      .box { stroke: #6c8ebf; }
+      .arrowhead { fill: #9bb0c2; }
+      .line { stroke: #9bb0c2; }
+      .manifest { fill: #1d293b; }
+      .mutation { fill: #3d3420; }
+      .root { fill: #1a222c; }
+      .leaf { fill: #1f2f1e; }
+    }
+  </style>
+
+  <text class="rail" x="16" y="48">VERSION</text>
+  <text class="rail" x="16" y="64">MANIFEST</text>
+  <rect class="box manifest" x="140" y="16" width="420" height="118" rx="6"/>
+  <text class="title" x="156" y="42">Version Manifest</text>
+  <text class="sub" x="156" y="62">snapshot authority, schema, version</text>
+  <rect class="box mutation" x="156" y="74" width="388" height="48" rx="5"/>
+  <text class="title" x="172" y="94">mutations_since_root</text>
+  <text class="sub" x="172" y="112">not in the referenced root yet</text>
+
+  <line class="line" x1="350" y1="134" x2="350" y2="168" marker-end="url(#arrow)"/>
+  <text class="sub" x="362" y="156">root_path</text>
+
+  <text class="rail" x="16" y="210">EXTERNAL</text>
+  <text class="rail" x="16" y="226">ROOT</text>
+  <rect class="box root" x="140" y="172" width="420" height="118" rx="6"/>
+  <text class="title" x="156" y="198">Root R</text>
+  <text class="sub" x="156" y="218">child ranges</text>
+  <rect class="box mutation" x="156" y="230" width="388" height="48" rx="5"/>
+  <text class="title" x="172" y="250">buffer</text>
+  <text class="sub" x="172" y="268">in the tree, not in children or leaves yet</text>
+
+  <line class="line" x1="250" y1="290" x2="210" y2="332" marker-end="url(#arrow)"/>
+  <line class="line" x1="450" y1="290" x2="490" y2="332" marker-end="url(#arrow)"/>
+  <text class="sub" x="292" y="318">fragment-id ranges</text>
+
+  <text class="rail" x="16" y="372">LEAVES</text>
+  <rect class="box leaf" x="80" y="336" width="200" height="72" rx="6"/>
+  <text class="title" x="96" y="364">Lance leaf</text>
+  <text class="sub" x="96" y="386">fragments 0..999</text>
+  <rect class="box leaf" x="360" y="336" width="200" height="72" rx="6"/>
+  <text class="title" x="376" y="364">Lance leaf</text>
+  <text class="sub" x="376" y="386">fragments 1000..1999</text>
+</svg>
