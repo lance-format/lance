@@ -33,6 +33,8 @@ use lance_namespace_impls::{
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pythonize::{depythonize, pythonize};
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 
 use crate::error::PythonErrorExt;
 use crate::session::Session;
@@ -818,6 +820,53 @@ impl PyDirectoryNamespace {
     }
 }
 
+/// A generated request struct plus whatever the caller's Python object set
+/// that the struct has no field for -- e.g. a newer Geneva tuning kwarg the
+/// namespace schema hasn't caught up to yet.
+///
+/// Deserializing straight into `T` (plain `depythonize`) silently drops
+/// those extras -- there's no `deny_unknown_fields` and no flatten
+/// catch-all on the generated namespace request models, so a knob like
+/// that just disappears before the request is even built. This combined
+/// struct recovers it: `#[serde(flatten)]` on both fields makes serde
+/// attribute every key either to `typed` (if `T` declares it) or to
+/// `extra` (everything else), in one deserialization pass.
+///
+/// That's deliberately not "deserialize `T`, then diff its own
+/// *serialization* against the raw object to see what's left over" --
+/// the generated structs mark every optional field
+/// `skip_serializing_if = "Option::is_none"`, so an unset field is
+/// *absent* from `T`'s own serialized JSON but *present* (as `null`) in
+/// the caller's raw object. A diff-based approach reads that mismatch as
+/// "extra" and sends the field back as an explicit `null` on the wire --
+/// which some namespace implementations reject for a field that's
+/// optional (may be absent) but not nullable (may not be `null`).
+/// Flatten-based deserialization doesn't have this problem: it's about
+/// which keys `T::deserialize` recognizes, independent of how `T` itself
+/// would serialize.
+///
+/// Also deliberately not "read the caller's object's `model_extra`
+/// directly" -- by the time a request reaches here, the Python-level
+/// `RestNamespace` wrapper (`python/lance/namespace.py`) has already
+/// called `request.model_dump()` on it, so `py_request` is a plain dict,
+/// not a live pydantic model; `model_extra` isn't available to read.
+#[derive(Deserialize)]
+struct WithExtraOptions<T> {
+    #[serde(flatten)]
+    typed: T,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn depythonize_with_extras<T: DeserializeOwned>(
+    py_request: &Bound<'_, PyAny>,
+) -> PyResult<(T, serde_json::Map<String, serde_json::Value>)> {
+    let raw: serde_json::Value = depythonize(py_request)?;
+    let combined: WithExtraOptions<T> = serde_json::from_value(raw)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok((combined.typed, combined.extra))
+}
+
 /// Python wrapper for RestNamespace
 #[pyclass(name = "PyRestNamespace", module = "lance.lance")]
 pub struct PyRestNamespace {
@@ -1405,9 +1454,14 @@ impl PyRestNamespace {
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request: AlterTableBackfillColumnsRequest = depythonize(request)?;
+        let (typed, extra): (AlterTableBackfillColumnsRequest, _) =
+            depythonize_with_extras(request)?;
         let response = crate::rt()
-            .block_on(Some(py), self.inner.alter_table_backfill_columns(request))?
+            .block_on(
+                Some(py),
+                self.inner
+                    .alter_table_backfill_columns_with_extra(typed, extra),
+            )?
             .infer_error()?;
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
@@ -1417,9 +1471,14 @@ impl PyRestNamespace {
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request: RefreshMaterializedViewRequest = depythonize(request)?;
+        let (typed, extra): (RefreshMaterializedViewRequest, _) =
+            depythonize_with_extras(request)?;
         let response = crate::rt()
-            .block_on(Some(py), self.inner.refresh_materialized_view(request))?
+            .block_on(
+                Some(py),
+                self.inner
+                    .refresh_materialized_view_with_extra(typed, extra),
+            )?
             .infer_error()?;
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
