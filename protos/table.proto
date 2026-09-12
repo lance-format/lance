@@ -334,10 +334,12 @@ message IndexMetadata {
    * data, so a query projecting only those columns can be answered from the
    * index without a take against the base table.
    *
-   * Must be a suffix of `fields`: the columns the index is keyed on come first,
-   * the columns it merely carries come last, and at least one keyed column
-   * always remains. Empty for an index that carries no extra columns, which is
-   * every index written before this field existed.
+   * Must be a subset of `fields`, in the order the index emits them. A column is
+   * carried if and only if it is named here, so a column the index is both keyed
+   * on and carries is listed once in `fields` and named here; no id repeats in
+   * `fields`, and `fields[0]` remains a column the index is keyed on. Empty for
+   * an index that carries no extra columns, which is every index written before
+   * this field existed.
    *
    * Carried columns are listed in `fields` as well. That is deliberate: every
    * consumer that reads `fields` as the index's dependency set -- staleness,
