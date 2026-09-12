@@ -123,7 +123,10 @@ impl SIMD<i32, 8> for i32x8 {
     unsafe fn load_unaligned(ptr: *const i32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_loadu_si256(ptr as *const __m256i))
+            // Treat the register as plain data so this load remains valid on
+            // pre-AVX hosts. LLVM still lowers this to an AVX move when AVX is
+            // enabled for the caller.
+            Self(ptr.cast::<__m256i>().read_unaligned())
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -356,6 +359,22 @@ mod tests {
     #[test]
     fn test_slice_conversion_rejects_short_input() {
         assert!(std::panic::catch_unwind(|| i32x8::from(&[0; 7][..])).is_err());
+    }
+
+    #[test]
+    fn test_slice_conversion_uses_cpu_baseline() {
+        let values = [1_i32, 2, 3, 4, 5, 6, 7, 8];
+        let from_slice = i32x8::from(&values[..]);
+        let from_array = i32x8::from(&values);
+
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            std::hint::black_box((from_slice, from_array));
+            return;
+        }
+
+        assert_eq!(from_slice.as_array(), values);
+        assert_eq!(from_array.as_array(), values);
     }
 
     /// Lane-wise, low-32-bits multiplication is what all three arms promise, so
