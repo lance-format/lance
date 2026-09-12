@@ -42,6 +42,12 @@ pub struct PQBuildParams {
 
     /// Sample rate to train PQ codebook.
     pub sample_rate: usize,
+
+    /// Optional seed for k-means centroid initialization.
+    ///
+    /// `None` initializes from OS entropy, while `Some(seed)` makes centroid
+    /// selection reproducible for the same training data and parameters.
+    pub kmeans_seed: Option<u64>,
 }
 
 impl From<&PQBuildParams> for crate::pb::vector_index_details::ProductQuantization {
@@ -62,6 +68,7 @@ impl Default for PQBuildParams {
             kmeans_redos: 1,
             codebook: None,
             sample_rate: 256,
+            kmeans_seed: None,
         }
     }
 }
@@ -148,7 +155,7 @@ impl PQBuildParams {
             .into_iter()
             .enumerate()
             .map(|(sub_vec_idx, sub_vec)| {
-                let params = KMeansParams::new(
+                let mut params = KMeansParams::new(
                     self.codebook.as_ref().map(|cb| {
                         let sub_vec_centroids = FixedSizeListArray::try_new_from_values(
                             cb.as_fixed_size_list().values().as_primitive::<T>().slice(
@@ -164,6 +171,9 @@ impl PQBuildParams {
                     self.kmeans_redos,
                     distance_type,
                 );
+                if let Some(seed) = self.kmeans_seed {
+                    params = params.with_seed(seed);
+                }
                 train_kmeans::<T>(
                     &sub_vec,
                     params,

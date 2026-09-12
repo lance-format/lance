@@ -1985,6 +1985,7 @@ fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
         #[allow(deprecated)]
         retrain: false, // Don't retrain since we have centroids
         sample_rate: 256, // Default
+        kmeans_seed: None,
         streaming_sample_rate: None,
         streaming_coreset_rate: None,
         streaming_refine_passes: 0,
@@ -2006,6 +2007,7 @@ fn derive_pq_params(pq_quantizer: &ProductQuantizer) -> PQBuildParams {
         kmeans_redos: 1, // Default
         codebook: Some(Arc::new(pq_quantizer.codebook.clone())),
         sample_rate: 256, // Default
+        kmeans_seed: None,
     }
 }
 
