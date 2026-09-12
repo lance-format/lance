@@ -149,6 +149,7 @@ impl ObjectStoreProvider for TosStoreProvider {
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(true),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count: storage_options.download_retry_count(),
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
             // Listed in full: no paginated lister covers OpenDAL yet.

@@ -1619,6 +1619,21 @@ def test_pickle_fragment(tmp_path: Path):
     assert fragment.to_table() == unpickled.to_table()
 
 
+def test_scheduler_error_mode_storage_option(tmp_path: Path):
+    table = pa.table({"a": range(10)})
+    uri = tmp_path / "scheduler_error_mode"
+    lance.write_dataset(table, uri)
+
+    dataset = lance.dataset(uri, storage_options={"scheduler_error_mode": "fail_fast"})
+    assert dataset.to_table() == table
+
+    with pytest.raises(
+        ValueError,
+        match="Invalid scheduler_error_mode value 'invalid'",
+    ):
+        lance.dataset(uri, storage_options={"scheduler_error_mode": "invalid"})
+
+
 def test_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

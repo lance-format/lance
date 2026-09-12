@@ -306,6 +306,10 @@ impl DatasetBuilder {
     /// - [S3 options](https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html#variants)
     /// - [Google options](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html#variants)
     ///
+    /// Set `scheduler_error_mode` to `fail_fast` to return the first observed
+    /// scheduler error and cancel the remaining physical reads in the same
+    /// logical request. The default is `best_effort`.
+    ///
     /// For datasets with additional registered base paths, a key of the form
     /// `base_<id>.<key>` applies `<key>` only to the base path with that
     /// manifest id, overriding the unscoped options that every base inherits.

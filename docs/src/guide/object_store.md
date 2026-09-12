@@ -40,6 +40,26 @@ These options apply to all object stores.
 | `proxy_excludes`             | List of hosts that bypass proxy. This is a comma separated list of domains and IP masks. Any subdomain of the provided domain will be bypassed. For example, `example.com, 192.168.1.0/24` would bypass `https://api.example.com`, `https://www.example.com`, and any IP in the range `192.168.1.0/24`. |
 | `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
+| `scheduler_error_mode`       | Scheduler error handling. `best_effort` preserves the default behavior. `fail_fast` returns the first observed error and cancels the remaining physical reads in the same logical request. Other requests are not cancelled.                                                                            |
+
+An engine can apply `scheduler_error_mode` to every operation in a session by
+adding it to the storage options used for every dataset open. For example, a
+Python-based engine can merge the session setting before calling Lance:
+
+```python
+session_storage_options = {"scheduler_error_mode": "fail_fast"}
+dataset = lance.dataset(uri, storage_options=session_storage_options)
+```
+
+The engine-facing configuration name is engine-specific. It must ultimately be
+forwarded to Lance as the `scheduler_error_mode` storage option.
+
+For example, a Lance Spark catalog named `lance` forwards settings below its
+`storage` prefix:
+
+```bash
+spark-sql --conf "spark.sql.catalog.lance.storage.scheduler_error_mode=fail_fast"
+```
 
 ### Bulk copy strategy
 
