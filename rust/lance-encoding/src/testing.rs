@@ -36,6 +36,7 @@ use crate::{
         try_general_block, try_raw_block, try_raw_fixed_size_list_miniblock,
         try_raw_fixed_width_miniblock, try_raw_per_value, try_uncompressed_fixed_width_miniblock,
         try_variable_rle_block, try_variable_width_miniblock, try_variable_width_per_value,
+        try_wide_bitpacking_block, try_wide_bitpacking_miniblock,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
@@ -137,7 +138,14 @@ impl CompressionStrategy for TestCompressionStrategy {
                 }
             } {
                 compressor
-            } else if let Some(compressor) = try_bitpacking_miniblock(data) {
+            } else if let Some(compressor) = match self.encoding {
+                // Only the 2.3 strategy composes the wide selector, so only the 2.3 shape
+                // may pick 128-bit inline bitpacking.
+                TestEncoding::StructuralSparse => try_wide_bitpacking_miniblock(data),
+                TestEncoding::Array | TestEncoding::StructuralU16 | TestEncoding::StructuralU32 => {
+                    try_bitpacking_miniblock(data)
+                }
+            } {
                 compressor
             } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
                 compressor
@@ -205,7 +213,15 @@ impl CompressionStrategy for TestCompressionStrategy {
         if let Some(compressor) = rle {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_bitpacking_block(data) {
+        let bitpacking = match self.encoding {
+            // Same gate as the miniblock chain above: 128-bit values are only offered to
+            // the 2.3 shape.
+            TestEncoding::StructuralSparse => try_wide_bitpacking_block(data),
+            TestEncoding::Array | TestEncoding::StructuralU16 | TestEncoding::StructuralU32 => {
+                try_bitpacking_block(data)
+            }
+        };
+        if let Some(compressor) = bitpacking {
             return Ok(compressor);
         }
         if matches!(

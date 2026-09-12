@@ -69,9 +69,9 @@ const PRIMITIVE_TYPES_FOR_FSL: &[DataType] = &[DataType::Int8, DataType::Float32
 fn encoded_batch_layout(encoding: BenchEncoding) -> EncodedBatchLayout {
     match encoding {
         BenchEncoding::Array => EncodedBatchLayout::Array,
-        BenchEncoding::StructuralU16 | BenchEncoding::StructuralU32 => {
-            EncodedBatchLayout::Structural
-        }
+        BenchEncoding::StructuralU16
+        | BenchEncoding::StructuralU32
+        | BenchEncoding::StructuralSparse => EncodedBatchLayout::Structural,
     }
 }
 
@@ -460,6 +460,141 @@ fn bench_decode_compressed(c: &mut Criterion) {
     }
 }
 
+/// Benchmark Decimal128 inline-bitpacking decode across the four non-trivial
+/// kernel arms of the per-chunk u128 dispatch (the bw=0 / Zero / all-zeros
+/// arm has no observable per-value cost and is omitted). Each arm is
+/// covered with one representative bit_width:
+///
+/// | bit_width | dispatch arm     | typical workload                 |
+/// |-----------|------------------|----------------------------------|
+/// | 24        | NarrowU32 (SIMD) | decimal128(7,2)-typical          |
+/// | 40        | NarrowU64 (SIMD) | decimal128(12,2) / store_sales   |
+/// | 100       | SequentialU128   | scalar-fallback (rare in OLTP)   |
+/// | 128       | Memcpy           | full-precision / signed columns  |
+///
+/// Each variant constructs values that force every chunk's
+/// `Stat::BitWidth` to land in the target arm: positive values in
+/// `[2^(bw-1), 2^bw - 1]` for the narrow / sequential arms (the OR-fold
+/// reaches exactly `bw`), and bounded negative values for the Memcpy arm
+/// (every i128 has the high bit set, so OR-fold = u128::MAX → bw = 128).
+fn bench_decode_decimal128(c: &mut Criterion) {
+    use arrow_array::Decimal128Array;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("decode_decimal128");
+
+    const NUM_ROWS: u64 = 5_000_000;
+    /// Fixed seed for reproducibility across runs / machines. Arbitrary value;
+    /// `| 1` salting (in `generate_decimal128_values`) defends against the
+    /// xorshift seed=0 fixed point.
+    const SEED: u64 = 0xDEAD_BEEF;
+
+    group.throughput(criterion::Throughput::Bytes(
+        NUM_ROWS * std::mem::size_of::<i128>() as u64,
+    ));
+
+    // (label, target bit_width). Realistic decimal128(7,2) data lands at
+    // bw≈24 (NarrowU32); decimal128(12,2)/store_sales-style values at bw≈40
+    // (NarrowU64); bw=100 exercises the scalar SequentialU128 arm; bw=128
+    // hits Memcpy. One representative per non-Zero dispatch arm.
+    let cases: &[(&str, u32)] = &[
+        ("bw024_narrow_u32", 24),
+        ("bw040_narrow_u64", 40),
+        ("bw100_sequential_u128", 100),
+        ("bw128_memcpy", 128),
+    ];
+
+    for &(label, bw) in cases {
+        let values: Vec<i128> = generate_decimal128_values(NUM_ROWS as usize, bw, SEED);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(38, 0)
+                .unwrap(),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Decimal128(38, 0),
+            false,
+        )]));
+        let data = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let lance_schema =
+            Arc::new(lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap());
+        // Only the 2.3 shape offers 128-bit bitpacking, so use it or the dispatch arms this
+        // bench exists for are never reached.
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralSparse);
+        let encoded = rt
+            .block_on(encode_batch(
+                &data,
+                lance_schema,
+                encoding_strategy.as_ref(),
+                &EncodingOptions::default(),
+            ))
+            .unwrap();
+
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let batch = rt
+                    .block_on(lance_encoding::decoder::decode_batch(
+                        &encoded,
+                        &FilterExpression::no_filter(),
+                        Arc::<DecoderPlugins>::default(),
+                        false,
+                        EncodedBatchLayout::Structural,
+                        Some(Arc::new(LanceCache::no_cache())),
+                    ))
+                    .unwrap();
+                assert_eq!(data.num_rows(), batch.num_rows());
+            })
+        });
+    }
+}
+
+/// Build `num_rows` `i128` values whose chunk-level `Stat::BitWidth` (the
+/// `bits_per_value - leading_zeros(or_fold)` algorithm in
+/// `FixedWidthDataBlock::max_bit_widths`) is exactly `target_bw`.
+///
+/// - `target_bw == 128`: emits negative i128 values bounded by `[-(2^64),
+///   -1]`. Every negative i128 has bit 127 (the sign bit) set in its u128
+///   reinterpretation, so each chunk's OR-fold reaches `u128::MAX` and the
+///   chunk routes to the Memcpy arm. The bounded magnitude (≤ 2^64 ≈
+///   1.8×10^19) keeps every value comfortably within Decimal128(38, 0)'s
+///   ±(10^38 - 1) range, so the bench does not depend on whether arrow
+///   validates Decimal precision against actual values (versions vary).
+/// - `target_bw < 128`: every value is forced to `[2^(target_bw - 1),
+///   2^target_bw - 1]` by setting bit `target_bw - 1` and masking the
+///   higher bits, so the per-chunk OR-fold lands at exactly `target_bw`
+///   and routes to NarrowU32 (1 ≤ bw ≤ 32) or NarrowU64 (33 ≤ bw ≤ 64) or
+///   the scalar SequentialU128 (65 ≤ bw ≤ 127) arm.
+fn generate_decimal128_values(num_rows: usize, target_bw: u32, seed: u64) -> Vec<i128> {
+    let mut state = seed | 1; // defend against the xorshift seed=0 fixed point
+    (0..num_rows)
+        .map(|_| {
+            // 128-bit xorshift from two 64-bit hops
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let lo = state as u128;
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let hi = state as u128;
+            let raw_u128: u128 = (hi << 64) | lo;
+
+            if target_bw == 128 {
+                // Bounded negative i128: high (sign) bit always set →
+                // OR-fold → bit_width = 128. Magnitude ≤ 2^64 keeps the
+                // value within Decimal128(38, 0) precision regardless of
+                // arrow's data-validation policy in any given version.
+                -1i128 - ((raw_u128 as u64) as i128)
+            } else {
+                let mask: u128 = (1u128 << target_bw) - 1;
+                let high_bit: u128 = 1u128 << (target_bw - 1);
+                ((raw_u128 & mask) | high_bit) as i128
+            }
+        })
+        .collect()
+}
+
 /// Benchmark parallel decoding with multiple concurrent batch decode tasks.
 /// This creates contention on the shared decompressor mutex when multiple
 /// batches from the same page are decoded in parallel.
@@ -726,6 +861,7 @@ criterion_group!(
         .with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
                 bench_decode_str_with_fixed_size_binary_encoding, bench_decode_compressed,
+                bench_decode_decimal128,
                 bench_decode_compressed_parallel, bench_decode_inline_bitpacking_unchunk);
 
 // Non-linux version does not support pprof.
@@ -734,5 +870,6 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
     targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
-                bench_decode_compressed, bench_decode_compressed_parallel, bench_decode_inline_bitpacking_unchunk);
+                bench_decode_compressed, bench_decode_decimal128,
+                bench_decode_compressed_parallel, bench_decode_inline_bitpacking_unchunk);
 criterion_main!(benches);

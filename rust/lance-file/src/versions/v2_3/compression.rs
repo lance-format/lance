@@ -8,11 +8,12 @@ use lance_encoding::compression::try_packed_struct_per_value;
 use lance_encoding::{
     compression::{
         BlockCompressor, CompressionStrategy, field_metadata_params, finalize_miniblock_compressor,
-        try_bitpacking_block, try_bitpacking_miniblock, try_byte_stream_split_miniblock,
-        try_child_rle_miniblock, try_fixed_packed_struct_miniblock, try_general_block,
-        try_raw_block, try_raw_fixed_size_list_miniblock, try_raw_fixed_width_miniblock,
-        try_raw_per_value, try_uncompressed_fixed_width_miniblock, try_variable_rle_block,
-        try_variable_width_miniblock, try_variable_width_per_value,
+        try_byte_stream_split_miniblock, try_child_rle_miniblock,
+        try_fixed_packed_struct_miniblock, try_general_block, try_raw_block,
+        try_raw_fixed_size_list_miniblock, try_raw_fixed_width_miniblock, try_raw_per_value,
+        try_uncompressed_fixed_width_miniblock, try_variable_rle_block,
+        try_variable_width_miniblock, try_variable_width_per_value, try_wide_bitpacking_block,
+        try_wide_bitpacking_miniblock,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
@@ -52,7 +53,7 @@ impl CompressionStrategy for Strategy {
                 compressor
             } else if let Some(compressor) = try_child_rle_miniblock(data, &params) {
                 compressor
-            } else if let Some(compressor) = try_bitpacking_miniblock(data) {
+            } else if let Some(compressor) = try_wide_bitpacking_miniblock(data) {
                 compressor
             } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
                 compressor
@@ -108,7 +109,7 @@ impl CompressionStrategy for Strategy {
         if let Some(compressor) = try_variable_rle_block(data, &params)? {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_bitpacking_block(data) {
+        if let Some(compressor) = try_wide_bitpacking_block(data) {
             return Ok(compressor);
         }
         if let Some(compressor) = try_general_block(data, &params)? {
@@ -124,5 +125,53 @@ impl CompressionStrategy for Strategy {
             )
             .into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_schema::{DataType, Field as ArrowField};
+    use lance_encoding::buffer::LanceBuffer;
+    use lance_encoding::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+    use lance_encoding::statistics::ComputeStat;
+
+    /// A 128-bit block of low-magnitude values, the shape a `Decimal128` column produces.
+    fn decimal128_block() -> DataBlock {
+        let num_values = 2048u64;
+        let data: Vec<u128> = (0..num_values).map(|i| (i % 1000) as u128).collect();
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 128,
+            data: LanceBuffer::reinterpret_vec(data),
+            num_values,
+            block_info: BlockInfo::default(),
+        };
+        block.compute_stat();
+        DataBlock::FixedWidth(block)
+    }
+
+    fn decimal_field() -> Field {
+        let arrow_field = ArrowField::new("decimal", DataType::Decimal128(38, 0), true);
+        let mut field = Field::try_from(&arrow_field).unwrap();
+        field.id = -1;
+        field
+    }
+
+    /// 128-bit bitpacking is an encoding 2.3 introduced, so this is the one strategy that
+    /// composes the selector offering it.
+    #[test]
+    fn u128_values_are_bitpacked() {
+        let strategy = Strategy::new(CompressionParams::default());
+
+        let compressor = strategy
+            .create_block_compressor(&decimal_field(), &decimal128_block())
+            .unwrap();
+
+        let debug_str = format!("{compressor:?}");
+        assert!(
+            debug_str.contains("Bitpacking"),
+            "2.3 must bitpack 128-bit values, got: {debug_str}"
+        );
     }
 }
