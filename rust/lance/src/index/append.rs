@@ -351,7 +351,6 @@ async fn rebuild_scalar_segment(
     dataset: &Dataset,
     reference_index: &Arc<dyn ScalarIndex>,
     field_path: &str,
-    column_name: &str,
     uuid: Uuid,
     fragment_ids: Vec<u32>,
 ) -> Result<CreatedIndex> {
@@ -368,7 +367,7 @@ async fn rebuild_scalar_segment(
     .await?;
     super::scalar::build_scalar_index(
         dataset,
-        column_name,
+        field_path,
         uuid,
         &params,
         true,
@@ -439,7 +438,6 @@ async fn merge_scalar_indices<'a>(
     options: &OptimizeOptions,
     index_type: IndexType,
     field_path: &str,
-    column_name: &str,
     base_unindexed_bitmap: RoaringBitmap,
 ) -> Result<
     Option<(
@@ -513,7 +511,6 @@ async fn merge_scalar_indices<'a>(
                 dataset.as_ref(),
                 &reference_index,
                 field_path,
-                column_name,
                 new_uuid,
                 frag_bitmap.iter().collect(),
             )
@@ -534,8 +531,7 @@ async fn merge_scalar_indices<'a>(
         // Only open data files looking for seeds when the plugin confirms this
         // index type and configuration can actually produce them.
         let maybe_created = if plugin.might_use_seeds(&index_details) {
-            if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
-            {
+            if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, field_path).await? {
                 plugin
                     .update_from_seeds(seeds, reference_index.clone(), &index_details, &new_store)
                     .await?
@@ -1330,7 +1326,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         options,
                         it,
                         &field_path,
-                        column.name.as_str(),
                         base_unindexed_bitmap,
                     )
                     .await?
@@ -4588,6 +4583,68 @@ mod tests {
         let after_default = dataset.load_indices_by_name("id_idx").await.unwrap();
         assert_eq!(after_default[0].uuid, original_uuid);
         assert_eq!(dataset.manifest.version, original_version);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_empty_nested_scalar_index() {
+        let test_dir = TempStrDir::default();
+        let child_field = Arc::new(Field::new("child", DataType::Int32, false));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "st",
+            DataType::Struct(vec![child_field.clone()].into()),
+            false,
+        )]));
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+
+        dataset
+            .create_index(
+                &["st.child"],
+                IndexType::BTree,
+                Some("child_idx".to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let child_values = Arc::new(Int32Array::from(vec![0, 1, 2, 3]));
+        let st_values = StructArray::from(vec![(
+            child_field,
+            child_values as Arc<dyn arrow_array::Array>,
+        )]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(st_values)]).unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let stats = dataset.index_statistics("child_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        let result = dataset
+            .scan()
+            .filter("st.child = 3")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
     }
 
     #[rstest]
