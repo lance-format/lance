@@ -64,6 +64,11 @@ const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA >= 1 << 7);
 const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS == FLAG_UNKNOWN);
 
+/// Tagged FRI requires a reader that interprets its mappings and a writer that
+/// preserves them during maintenance. Legacy-only FRI does not set this bit.
+/// Bit 9 is taken by the stable-row-id FRI compatibility flag.
+pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
+
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
 
 /// Environment variable that opts a release build into reading and writing data
