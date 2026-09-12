@@ -420,6 +420,13 @@ pub fn transform_vectors(
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
     let codebook = pq_codebook.0;
     let codebook = FixedSizeListArray::from(codebook);
+    lance_index::vector::pq::validate_supplied_codebook(
+        codebook.values().len(),
+        dimension,
+        num_subvectors as usize,
+        num_bits as usize,
+    )
+    .infer_error()?;
     let distance_type = DistanceType::try_from(distance_type).unwrap();
     let pq = ProductQuantizer::new(
         num_subvectors as usize,
@@ -583,6 +590,13 @@ pub fn load_shuffled_vectors(
 
     let codebook = pq_codebook.0;
     let codebook = FixedSizeListArray::from(codebook);
+    lance_index::vector::pq::validate_supplied_codebook(
+        codebook.values().len(),
+        pq_dimension,
+        num_subvectors as usize,
+        num_bits as usize,
+    )
+    .infer_error()?;
 
     let distance_type = DistanceType::try_from(distance_type).unwrap();
     let pq_model = ProductQuantizer::new(
