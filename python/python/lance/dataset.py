@@ -6978,6 +6978,9 @@ class ScannerBuilder:
             When ``use_index`` is true and a vector index is available, each query
             vector is searched through the index path; otherwise the flat batch path
             is used.
+        ef: int, optional
+            Beam width for HNSW search. Defaults to ``1.5 * k * refine_factor``,
+            floored at 256.
         query_parallelism: int, optional
             Maximum partition-search concurrency for a single vector query.
             The default is 0. Value 0 uses the automatic policy, which
@@ -8228,7 +8231,8 @@ def _build_vector_search_query(
     use_index: bool, default True
         Whether to use the index for the search.
     ef: int, optional
-        The ef parameter for HNSW search.
+        Beam width for HNSW search. Defaults to ``1.5 * k * refine_factor``,
+        floored at 256.
     query_parallelism: int, optional
         Maximum partition-search concurrency for a single vector query.
         The default is 0. Value 0 uses the automatic policy, which currently
