@@ -4045,7 +4045,9 @@ class LanceDataset(pa.dataset.Dataset):
                 fs, path = FileSystem.from_uri(ivf_centroids_file)
                 with fs.open_input_file(path) as f:
                     ivf_centroids = np.load(f)
-                num_partitions = ivf_centroids.shape[0]
+                file_clusters = ivf_centroids.shape[0]
+            else:
+                file_clusters = None
 
             if isinstance(num_partitions, float):
                 warnings.warn("num_partitions is float, converting to int")
@@ -4054,6 +4056,14 @@ class LanceDataset(pa.dataset.Dataset):
                 raise TypeError(
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
+
+            if file_clusters is not None:
+                if num_partitions is not None and file_clusters != num_partitions:
+                    raise ValueError(
+                        f"Ivf centroids file has {file_clusters} clusters, "
+                        f"but num_partitions={num_partitions}"
+                    )
+                num_partitions = file_clusters
             if num_partitions is not None:
                 kwargs["num_partitions"] = num_partitions
             if target_partition_size is not None:
@@ -4267,6 +4277,11 @@ class LanceDataset(pa.dataset.Dataset):
             :py:class:`pyarrow.FixedShapeTensorArray`.
             A ``num_partitions x dimension`` array of existing K-mean centroids
             for IVF clustering. If not provided, a new KMeans model will be trained.
+        ivf_centroids_file : str, optional
+            Path to a ``.npy`` file holding the same array as ``ivf_centroids``.
+            Mutually exclusive with it. The file's row count sets the number of
+            IVF partitions, so passing a ``num_partitions`` that disagrees with
+            it is an error.
         pq_codebook : optional,
             It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
             or :py:class:`pyarrow.FixedShapeTensorArray`.
