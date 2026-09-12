@@ -5133,7 +5133,8 @@ mod tests {
         std::fs::create_dir_all(&base_dir).unwrap();
         let base_uri = format!("file://{}", base_dir.display());
 
-        let mut blob_builder = BlobArrayBuilder::new(1);
+        let mut blob_builder = BlobArrayBuilder::new(2);
+        blob_builder.push_bytes(payload.clone()).unwrap();
         blob_builder.push_bytes(payload.clone()).unwrap();
         let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
 
@@ -5153,7 +5154,7 @@ mod tests {
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(UInt32Array::from(vec![0])), blob_array],
+            vec![Arc::new(UInt32Array::from(vec![0, 1])), blob_array],
         )
         .unwrap();
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
@@ -5171,6 +5172,7 @@ mod tests {
                         is_dataset_root,
                     }]),
                     target_bases: Some(vec![1]),
+                    max_rows_per_file: 1,
                     ..Default::default()
                 }),
             )
@@ -5184,6 +5186,7 @@ mod tests {
                 .iter()
                 .all(|frag| frag.files.iter().all(|file| file.base_id == Some(1)))
         );
+        assert_eq!(dataset.fragments().len(), 2);
 
         MultiBaseBlobFixture {
             _test_dir: test_dir,
@@ -7823,21 +7826,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_take_blob_v2_from_non_default_base_inline() {
+    async fn test_take_blob_v2_from_non_default_base_inline_reuses_store() {
         let fixture = create_multi_base_blob_v2_fixture(b"inline".to_vec(), None, true).await;
+        let registry = fixture.dataset.session.store_registry();
+        let stats = registry.stats();
+        let attempts_before = stats.hits + stats.misses;
 
-        let blobs = fixture
-            .dataset
-            .take_blobs_by_indices(&[0], "blob")
-            .await
-            .unwrap();
+        for _ in 0..2 {
+            let blobs = fixture
+                .dataset
+                .take_blobs_by_indices(&[0, 1], "blob")
+                .await
+                .unwrap();
 
-        assert_eq!(blobs.len(), 1);
-        let blob = blobs[0].as_ref().unwrap();
-        assert_eq!(blob.kind(), BlobKind::Inline);
+            assert_eq!(blobs.len(), 2);
+            for blob in blobs {
+                let blob = blob.as_ref().unwrap();
+                assert_eq!(blob.kind(), BlobKind::Inline);
+                assert_eq!(
+                    blob.read().await.unwrap().as_ref(),
+                    fixture.expected.as_slice()
+                );
+            }
+        }
+
+        let stats = registry.stats();
         assert_eq!(
-            blob.read().await.unwrap().as_ref(),
-            fixture.expected.as_slice()
+            stats.hits + stats.misses - attempts_before,
+            1,
+            "repeated blob reads must resolve the additional base store once"
         );
     }
 
