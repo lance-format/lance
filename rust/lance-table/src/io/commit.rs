@@ -1275,7 +1275,15 @@ pub async fn commit_handler_from_url(
                 .await?,
             }))
         }
-        _ => Ok(Arc::new(UnsafeCommitHandler)),
+        // Default for unrecognized schemes: prefer the conflict-safe
+        // put-if-not-exists handler over `UnsafeCommitHandler`. Most object
+        // stores (including out-of-tree providers registered at runtime) back
+        // onto storage that supports atomic create-if-not-exists, so this makes
+        // concurrent commits fail loudly with a conflict instead of silently
+        // clobbering each other's manifests. A store that genuinely lacks
+        // conditional-put support can still opt back into `UnsafeCommitHandler`
+        // explicitly (e.g. via a caller-supplied commit handler).
+        _ => Ok(Arc::new(ConditionalPutCommitHandler)),
     }
 }
 
@@ -2186,11 +2194,13 @@ mod tests {
     #[case::oss("oss://bucket-a/ds")]
     #[case::tos("tos://bucket-a/ds")]
     #[case::goosefs("goosefs://bucket-a/ds")]
+    #[case::custom_scheme("my-custom-scheme://bucket-a/ds")]
     async fn test_commit_handler_from_url_conditional_put_schemes(#[case] url: &str) {
         // Every scheme whose store supports atomic put-if-not-exists must
         // route to ConditionalPutCommitHandler — otherwise concurrent writers
         // fall through to UnsafeCommitHandler and silently clobber each
-        // other's manifests.
+        // other's manifests. Unrecognized schemes (e.g. runtime-registered
+        // out-of-tree providers) default to the same conflict-safe handler.
         let handler = commit_handler_from_url(url, &None).await.unwrap();
         assert_eq!(
             format!("{:?}", handler),
