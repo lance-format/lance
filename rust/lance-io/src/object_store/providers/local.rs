@@ -141,6 +141,7 @@ impl ObjectStoreProvider for FileStoreProvider {
             // Listed in full: reading a directory is one local walk whatever the page size,
             // so there is no request for a page to be pushed into.
             paginated_lister: None,
+            commit_handler_type: crate::object_store::CommitHandlerType::ConditionalPut,
         })
     }
 
@@ -204,6 +205,7 @@ mod tests {
             io_tracker: Default::default(),
             store_prefix: "file$rooted-test".to_owned(),
             paginated_lister: None,
+            commit_handler_type: crate::object_store::CommitHandlerType::ConditionalPut,
         }
     }
 

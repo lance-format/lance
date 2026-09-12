@@ -103,6 +103,7 @@ impl ObjectStoreProvider for TencentStoreProvider {
             store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
             // Listed in full: no paginated lister covers OpenDAL yet.
             paginated_lister: None,
+            commit_handler_type: crate::object_store::CommitHandlerType::ConditionalPut,
         })
     }
 }

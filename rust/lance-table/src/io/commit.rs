@@ -50,7 +50,7 @@ pub mod dynamodb;
 pub mod external_manifest;
 
 use lance_core::{Error, Result};
-use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
+use lance_io::object_store::{CommitHandlerType, ObjectStore, ObjectStoreExt, ObjectStoreParams};
 use lance_io::traits::{WriteExt, Writer};
 
 use crate::format::{IndexMetadata, Manifest, Transaction, is_detached_version};
@@ -1189,6 +1189,11 @@ pub async fn commit_handler_from_url(
     url_or_path: &str,
     // This looks unused if dynamodb feature disabled
     #[allow(unused_variables)] options: &Option<ObjectStoreParams>,
+    // Commit-handler capability captured from the constructed object store.
+    // The store carries the capability its provider declared, so the default
+    // handler is bound to that exact store rather than re-queried from a
+    // registry whose providers may have changed since the store was built.
+    capability: CommitHandlerType,
 ) -> Result<Arc<dyn CommitHandler>> {
     let local_handler: Arc<dyn CommitHandler> = if cfg!(windows) {
         Arc::new(RenameCommitHandler)
@@ -1209,9 +1214,6 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "tos" | "shared-memory" | "goosefs" => {
-            Ok(Arc::new(ConditionalPutCommitHandler))
-        }
         "cos" => Ok(Arc::new(TencentCosCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::invalid_input_source(
@@ -1275,7 +1277,16 @@ pub async fn commit_handler_from_url(
                 .await?,
             }))
         }
-        _ => Ok(Arc::new(UnsafeCommitHandler)),
+        // Every other scheme derives its default handler from the capability
+        // captured on the constructed object store. Built-in providers declare
+        // `ConditionalPut`; a registered provider, even one overriding a known
+        // scheme such as `memory`, can declare `Unsafe`, and that declaration
+        // travels with the store it built. Explicit caller-supplied handlers
+        // are honored before this function is called and never reach here.
+        _ => match capability {
+            CommitHandlerType::ConditionalPut => Ok(Arc::new(ConditionalPutCommitHandler)),
+            CommitHandlerType::Unsafe => Ok(Arc::new(UnsafeCommitHandler)),
+        },
     }
 }
 
@@ -2186,17 +2197,79 @@ mod tests {
     #[case::oss("oss://bucket-a/ds")]
     #[case::tos("tos://bucket-a/ds")]
     #[case::goosefs("goosefs://bucket-a/ds")]
+    #[case::custom_scheme("my-custom-scheme://bucket-a/ds")]
     async fn test_commit_handler_from_url_conditional_put_schemes(#[case] url: &str) {
         // Every scheme whose store supports atomic put-if-not-exists must
         // route to ConditionalPutCommitHandler — otherwise concurrent writers
         // fall through to UnsafeCommitHandler and silently clobber each
-        // other's manifests.
-        let handler = commit_handler_from_url(url, &None).await.unwrap();
+        // other's manifests. Unrecognized schemes (e.g. runtime-registered
+        // out-of-tree providers) default to the same conflict-safe handler.
+        let handler = commit_handler_from_url(url, &None, CommitHandlerType::ConditionalPut)
+            .await
+            .unwrap();
         assert_eq!(
             format!("{:?}", handler),
             "ConditionalPutCommitHandler",
             "{url} should route to ConditionalPutCommitHandler",
         );
+    }
+
+    #[tokio::test]
+    async fn test_commit_handler_from_url_honors_store_capability() {
+        // A general object-store scheme takes its default handler from the
+        // capability captured on the constructed store: an Unsafe-declaring
+        // provider's store routes to UnsafeCommitHandler, a ConditionalPut one
+        // to ConditionalPutCommitHandler.
+        let handler =
+            commit_handler_from_url("memory://bucket/ds", &None, CommitHandlerType::Unsafe)
+                .await
+                .unwrap();
+        assert_eq!(format!("{:?}", handler), "UnsafeCommitHandler");
+
+        let handler = commit_handler_from_url(
+            "memory://bucket/ds",
+            &None,
+            CommitHandlerType::ConditionalPut,
+        )
+        .await
+        .unwrap();
+        assert_eq!(format!("{:?}", handler), "ConditionalPutCommitHandler");
+
+        // A scheme with dedicated handling ignores the store capability: file
+        // keeps its local handler and cos keeps the Tencent handler even when
+        // the capability says Unsafe.
+        let handler = commit_handler_from_url("file:///tmp/ds", &None, CommitHandlerType::Unsafe)
+            .await
+            .unwrap();
+        assert_ne!(format!("{:?}", handler), "UnsafeCommitHandler");
+
+        let handler = commit_handler_from_url("cos://bucket/ds", &None, CommitHandlerType::Unsafe)
+            .await
+            .unwrap();
+        assert_eq!(format!("{:?}", handler), "TencentCosCommitHandler");
+    }
+
+    #[tokio::test]
+    async fn test_builtin_provider_resolves_unchanged_end_to_end() {
+        // Regression guard across the full chain for a built-in scheme: the
+        // capability the memory provider declares, captured on the store the
+        // default registry builds, must still resolve to the handler that
+        // scheme used before the capability was made provider-driven.
+        use lance_io::object_store::ObjectStoreRegistry;
+
+        let registry = ObjectStoreRegistry::default();
+        let store = registry
+            .new_store(
+                Url::parse("memory://bucket/ds").unwrap(),
+                &ObjectStoreParams::default(),
+            )
+            .await
+            .unwrap();
+        let handler =
+            commit_handler_from_url("memory://bucket/ds", &None, store.commit_handler_type())
+                .await
+                .unwrap();
+        assert_eq!(format!("{:?}", handler), "ConditionalPutCommitHandler");
     }
 
     /// A [CommitLock] whose lease records whether it was released, so we can
@@ -2307,9 +2380,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_cos_commit_requires_custom_handler() {
-        let handler = commit_handler_from_url("cos://bucket-a/ds", &None)
-            .await
-            .unwrap();
+        let handler =
+            commit_handler_from_url("cos://bucket-a/ds", &None, CommitHandlerType::Unsafe)
+                .await
+                .unwrap();
         assert_eq!(format!("{:?}", handler), "TencentCosCommitHandler");
 
         let mut manifest = test_manifest();

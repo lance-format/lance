@@ -2542,9 +2542,13 @@ mod tests {
         let uri = tmp.as_str();
         let schema = simple_schema();
         let batch = simple_batch(&schema, vec![1, 2, 3]);
-        let commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
-            .await
-            .unwrap();
+        let commit_handler = commit_handler_from_url(
+            "cos://bucket/dataset",
+            &None,
+            lance_io::object_store::CommitHandlerType::ConditionalPut,
+        )
+        .await
+        .unwrap();
         let params = WriteParams {
             commit_handler: Some(commit_handler),
             ..Default::default()

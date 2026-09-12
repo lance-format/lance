@@ -38,9 +38,39 @@ pub mod tencent;
 #[cfg(feature = "tos")]
 pub mod tos;
 
+/// Which built-in commit handler a provider's stores should use.
+///
+/// Commit-handler selection is otherwise inferred from the URL scheme. A
+/// registered out-of-tree provider serves a scheme that the built-in resolver
+/// does not recognize, so this lets the provider declare the guarantee its
+/// store actually offers instead of falling back to a scheme-string guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommitHandlerType {
+    /// Atomic put-if-not-exists. Safe for concurrent writers: a second writer
+    /// racing on the same manifest version gets a conflict instead of silently
+    /// overwriting. This is the default; it fits any store whose backend
+    /// supports create-if-not-exists (most object stores).
+    #[default]
+    ConditionalPut,
+    /// Blind overwrite with no concurrency protection. A store that cannot
+    /// offer atomic create-if-not-exists should return this so callers get the
+    /// documented "concurrent writes may lose data" behavior rather than an
+    /// error at commit time.
+    Unsafe,
+}
+
 #[async_trait::async_trait]
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore>;
+
+    /// The commit handler this provider's stores should use.
+    ///
+    /// Defaults to the conflict-safe [`CommitHandlerType::ConditionalPut`].
+    /// Override it to return [`CommitHandlerType::Unsafe`] for a store that
+    /// cannot support atomic create-if-not-exists.
+    fn commit_handler(&self) -> CommitHandlerType {
+        CommitHandlerType::ConditionalPut
+    }
 
     /// Extract the path relative to the base of the store.
     ///
@@ -213,6 +243,11 @@ impl ObjectStoreRegistry {
         store_prefix: &str,
     ) -> Result<Arc<ObjectStore>> {
         let mut store = provider.new_store(base_path, params).await?;
+
+        // Capture the provider's declared commit-handler capability on the
+        // exact store it built, so commit-handler resolution is bound to this
+        // store rather than a later registry lookup.
+        store.commit_handler_type = provider.commit_handler();
 
         store.inner = store.inner.traced();
 
@@ -693,5 +728,92 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &second));
         let stats = registry.stats();
         assert_eq!((stats.hits, stats.misses, stats.active_stores), (0, 0, 0));
+    }
+
+    /// A provider that builds a working in-memory store yet declares it can
+    /// only offer unsafe commits, used to prove the declared capability is
+    /// stamped onto the store the registry builds even for a known scheme.
+    #[derive(Debug)]
+    struct UnsafeMemoryProvider;
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for UnsafeMemoryProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            MemoryStoreProvider.new_store(base_path, params).await
+        }
+
+        fn commit_handler(&self) -> CommitHandlerType {
+            CommitHandlerType::Unsafe
+        }
+
+        fn calculate_object_store_prefix(
+            &self,
+            _url: &Url,
+            _storage_options: Option<&HashMap<String, String>>,
+        ) -> Result<String> {
+            Ok("memory".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_commit_handler_travels_with_store() {
+        let url = Url::parse("memory://bucket/ds").unwrap();
+
+        // A built-in provider declares the conflict-safe default, and the
+        // registry stamps that capability onto the store it builds.
+        let registry = ObjectStoreRegistry::default();
+        let store = registry
+            .new_store(url.clone(), &ObjectStoreParams::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.commit_handler_type(),
+            CommitHandlerType::ConditionalPut
+        );
+
+        // Overriding a known scheme with a provider that declares Unsafe makes
+        // the store it builds carry Unsafe: the capability is bound to the
+        // exact store, not inferred from the scheme name.
+        let registry = ObjectStoreRegistry::default();
+        registry.insert("memory", Arc::new(UnsafeMemoryProvider));
+        let store = registry
+            .new_store(url.clone(), &ObjectStoreParams::default())
+            .await
+            .unwrap();
+        assert_eq!(store.commit_handler_type(), CommitHandlerType::Unsafe);
+
+        // A cached store keeps the capability it was built with.
+        let cached = registry
+            .get_store(url, &ObjectStoreParams::default())
+            .await
+            .unwrap();
+        assert_eq!(cached.commit_handler_type(), CommitHandlerType::Unsafe);
+    }
+
+    #[test]
+    fn test_builtin_providers_keep_conditional_put_capability() {
+        // Regression guard for existing providers: the declared capability now
+        // drives commit-handler selection, so every provider the default
+        // registry ships must keep declaring the conflict-safe put-if-not-exists
+        // handler it resolved to before this change. A built-in that silently
+        // switched to Unsafe would change the commit handler of every store on
+        // that scheme.
+        let registry = ObjectStoreRegistry::default();
+        let providers = registry
+            .providers
+            .read()
+            .expect("ObjectStoreRegistry lock poisoned");
+        assert!(!providers.is_empty());
+        for (scheme, provider) in providers.iter() {
+            assert_eq!(
+                provider.commit_handler(),
+                CommitHandlerType::ConditionalPut,
+                "built-in provider for `{scheme}` changed its declared commit handler",
+            );
+        }
     }
 }
