@@ -84,6 +84,43 @@ mod s3_test;
 /// Wall-clock budget for conflict retry backoff when callers do not override it.
 pub(crate) const DEFAULT_COMMIT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Env var overriding [`DEFAULT_COMMIT_RETRY_TIMEOUT`] process-wide, in
+/// (possibly fractional) seconds. A long-running maintenance commit (index
+/// build, compaction) can start from a read version that is hours old on a
+/// write-heavy table, and catching up through the intervening versions can
+/// need far more than the default budget; this is the operational escape
+/// hatch for callers that have no explicit-timeout API of their own.
+const COMMIT_RETRY_TIMEOUT_ENV: &str = "LANCE_COMMIT_RETRY_TIMEOUT_SECS";
+
+/// The commit conflict-retry budget used when the caller does not set one:
+/// [`COMMIT_RETRY_TIMEOUT_ENV`] if set to a valid positive number of seconds,
+/// otherwise [`DEFAULT_COMMIT_RETRY_TIMEOUT`]. Read once per process.
+pub(crate) fn default_commit_retry_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        parse_commit_retry_timeout(std::env::var(COMMIT_RETRY_TIMEOUT_ENV).ok().as_deref())
+    })
+}
+
+/// Parse [`COMMIT_RETRY_TIMEOUT_ENV`]'s value; `None` means unset. Anything
+/// that is not a finite positive number of seconds warns and falls back to
+/// [`DEFAULT_COMMIT_RETRY_TIMEOUT`].
+fn parse_commit_retry_timeout(raw: Option<&str>) -> Duration {
+    let Some(raw) = raw else {
+        return DEFAULT_COMMIT_RETRY_TIMEOUT;
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(secs) if secs.is_finite() && secs > 0.0 => Duration::from_secs_f64(secs),
+        _ => {
+            log::warn!(
+                "ignoring invalid {COMMIT_RETRY_TIMEOUT_ENV}={raw:?}; using the {}s default",
+                DEFAULT_COMMIT_RETRY_TIMEOUT.as_secs()
+            );
+            DEFAULT_COMMIT_RETRY_TIMEOUT
+        }
+    }
+}
+
 pub(crate) fn timeout_error(retry_timeout: Duration, attempts: u32) -> Error {
     Error::too_much_write_contention(format!(
         "Attempted {} times, but failed on retry_timeout of {:.3} seconds.",
@@ -1743,6 +1780,20 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    #[rstest::rstest]
+    #[case::unset(None, DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::whole_seconds(Some("600"), Duration::from_secs(600))]
+    #[case::fractional_and_padded(Some(" 2.5 "), Duration::from_secs_f64(2.5))]
+    #[case::empty(Some(""), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::not_a_number(Some("abc"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::zero(Some("0"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::negative(Some("-5"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::infinite(Some("inf"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    #[case::nan(Some("NaN"), DEFAULT_COMMIT_RETRY_TIMEOUT)]
+    fn test_parse_commit_retry_timeout(#[case] raw: Option<&str>, #[case] expected: Duration) {
+        assert_eq!(parse_commit_retry_timeout(raw), expected);
+    }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler

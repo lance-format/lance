@@ -103,7 +103,7 @@ use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, index_is_usable, load_all_indices};
-use crate::io::commit::{DEFAULT_COMMIT_RETRY_TIMEOUT, commit_transaction, migrate_fragments};
+use crate::io::commit::{commit_transaction, default_commit_retry_timeout, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
@@ -2273,7 +2273,7 @@ async fn reserve_fragment_ids(
         &transaction,
         &Default::default(),
         &Default::default(),
-        DEFAULT_COMMIT_RETRY_TIMEOUT,
+        default_commit_retry_timeout(),
         dataset.manifest_location.naming_scheme,
         None,
     )
