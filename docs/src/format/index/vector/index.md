@@ -108,11 +108,79 @@ Contains basic index configuration information in JSON:
 ##### "lance:ivf"
 
 References the IVF metadata stored in the Lance file global buffer.
-This value records the global buffer index, currently this is always "1".
+This value records the positive decimal global buffer ID.
 
 !!! note
-    Global buffer indices in Lance files are 1-based,
-    so you need to subtract 1 when accessing them through code.
+    Pass the ID returned by the global-buffer writer directly to the
+    global-buffer reader. Do not subtract one when using these APIs.
+
+##### "lance:ivf:centroid_hnsw" (optional)
+
+References one graph over all ordered IVF centroids of this physical index
+segment. The value is an ASCII decimal integer in the range 1 through
+4294967295 identifying a global buffer in the same `index.idx`. Its position
+and length come from the existing global-buffer table. The key is independent
+of the partition sub-index type and may coexist with partition-local HNSW
+graphs. It does not change the index type, partition offsets, auxiliary file,
+or base Lance file version.
+
+The buffer contains an Arrow IPC stream: a schema message, exactly one record
+batch, and an end-of-stream marker. It uses IPC metadata version V5,
+little-endian values, and no compression. Dictionary messages, additional
+batches, and trailing bytes are not permitted. The schema reuses the existing
+HNSW fields, including their nullable flags:
+
+```python
+pa.schema([
+    pa.field("__vector_id", pa.uint32(), nullable=True),
+    pa.field("__neighbors", pa.list_(pa.uint32()), nullable=True),
+    pa.field("_distance", pa.list_(pa.float32()), nullable=True),
+])
+```
+
+The IPC schema metadata contains `lance:hnsw` as one JSON object with the
+existing `entry_point`, `level_offsets`, and `params` members described below.
+The outer file's `lance:hnsw` continues to describe partition-local graphs;
+the inner object describes the centroid graph only. Construction parameters
+are stored once in this object. Search beam size is a query option and is not
+part of the persisted graph.
+
+Let N be the IVF centroid row count. Node ID i identifies centroid row i and
+partition i, without a separate row-ID mapping. The initial contract supports
+only finite, non-null Float32 centroids with positive dimension and L2
+distance, with 1 <= N <= 4294967295. Centroid values, dimension, and metric
+remain authoritative in the containing IVF/index metadata and are not copied
+into the graph buffer.
+
+Graph rows are concatenated in ascending level order. `level_offsets` has
+`params.max_level + 1` nondecreasing entries, starts at zero, and ends at the
+batch row count. Its second entry is N. Level zero contains IDs 0 through N-1
+in that order. Within each higher level IDs are unique and are a subset of the
+preceding level. The entry point occurs in every nonempty level; unused
+trailing levels have empty ranges. Neighbor IDs refer to nodes in the same
+level, with no duplicate or self edges. Each row has equally sized neighbor
+and Float32 distance lists. Although the reused schema permits nulls, no
+null node IDs, lists, or list elements are allowed in this payload.
+
+Readers discover the key in the file schema, resolve the indicated global
+buffer, decode the stream and its HNSW metadata, and pair it with the IVF
+centroids. When routing through this graph, readers must validate the framing,
+schema, level boundaries, IDs, and centroid count. A present but invalid
+reference or payload is an error; it must not trigger silent reconstruction.
+Absence means there is no persisted centroid graph. Exact centroid search
+remains valid whether or not the graph is present, and readers unaware of the
+optional key can continue exact routing using the existing IVF metadata.
+Incompatible payload encodings must use a different metadata key; this key
+must not be reinterpreted to mean a different stream or graph representation.
+
+Writers construct the graph only after the ordered centroid model is final.
+When rewriting an index with identical ordered centroids, copy the payload,
+allocate a destination global buffer, and record its new ID. Splitting,
+joining, reordering, or retraining centroids requires rebuilding the graph
+against the final model or omitting both the key and payload. Arbitrary
+global buffers are not implicitly copied by file rewrite operations. There
+is no separate graph file, descriptor message, or centroid identity hash;
+correct graph/model pairing is the writer's responsibility.
 
 ##### "lance:flat"
 
