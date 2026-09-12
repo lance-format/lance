@@ -160,7 +160,6 @@ pub enum FilterType {
 }
 
 /// Tracks keys of inserted rows for conflict detection.
-/// Only created when ON columns match the schema's unenforced primary key.
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct KeyExistenceFilter {
     pub field_ids: Vec<i32>,
