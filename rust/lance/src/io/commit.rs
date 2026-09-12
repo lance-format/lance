@@ -432,7 +432,17 @@ async fn do_commit_new_dataset(
                     .into_iter()
                     .map(|index_pb| {
                         let mut index = IndexMetadata::try_from(index_pb)?;
-                        index.base_id = Some(new_base_id);
+                        if index.base_id.is_none() {
+                            // Same rule as the data files in
+                            // `Manifest::shallow_clone`: only the source's own
+                            // entries get the new base; entries already stamped
+                            // keep their ids, which carry over into the clone's
+                            // `base_paths` verbatim. A chained clone (clone of
+                            // a clone) must not restamp an origin-based index
+                            // onto the middle hop, where its files do not
+                            // exist.
+                            index.base_id = Some(new_base_id);
+                        }
                         Ok(index)
                     })
                     .collect::<Result<Vec<_>>>()?
