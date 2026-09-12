@@ -22,7 +22,9 @@ use datafusion::physical_plan::ExecutionPlan;
 use lance_core::datatypes::{BlobHandling, Projection};
 use lance_core::{Error, Result};
 use lance_datafusion::pb;
-use lance_datafusion::substrait::{encode_substrait, parse_substrait, prune_schema_for_substrait};
+use lance_datafusion::substrait::{
+    encode_substrait, parse_substrait, prune_schema_for_substrait, validate_substrait_expr,
+};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
 
@@ -46,14 +48,29 @@ pub async fn filtered_read_exec_to_proto(
     exec: &FilteredReadExec,
     state: &SessionState,
 ) -> Result<pb::FilteredReadExecProto> {
+    let dataset_schema: ArrowSchema = exec.dataset().schema().into();
+    let plan = exec.plan();
+    let filter_exprs = exec
+        .options()
+        .refine_filter
+        .iter()
+        .chain(exec.options().full_filter.iter())
+        .chain(
+            plan.iter()
+                .flat_map(|plan| plan.filters.values().map(AsRef::as_ref)),
+        );
+    for expr in filter_exprs {
+        validate_substrait_expr(expr, &dataset_schema)?;
+    }
+
     let table = table_identifier_from_dataset(exec.dataset()).await?;
     // Use the pruned dataset schema for filter encoding — filters can reference columns
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
     // may have types that Substrait cannot serialize (e.g. FixedSizeList, Float16).
-    let filter_schema = Arc::new(prune_schema_for_substrait(&exec.dataset().schema().into()));
+    let filter_schema = Arc::new(prune_schema_for_substrait(&dataset_schema));
     let options = fr_options_to_proto(exec.options(), &filter_schema, state)?;
 
-    let plan = match exec.plan() {
+    let plan = match plan {
         Some(plan) => Some(plan_to_proto(&plan, &filter_schema, state)?),
         None => None,
     };
@@ -499,11 +516,11 @@ fn schema_from_bytes(bytes: &[u8]) -> Result<Arc<ArrowSchema>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::types::UInt32Type;
+    use arrow_array::types::{Float32Type, UInt32Type};
     use arrow_schema::{DataType, Field};
     use datafusion::prelude::SessionContext;
     use lance_core::datatypes::OnMissing;
-    use lance_datagen::{array, gen_batch};
+    use lance_datagen::{ArrayGeneratorExt, Dimension, array, gen_batch};
     use lance_select::RowAddrTreeMap;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
@@ -784,6 +801,63 @@ mod tests {
             exec.options().projection.field_ids,
             back.options().projection.field_ids
         );
+    }
+
+    #[tokio::test]
+    async fn test_exec_to_proto_rejects_fixed_size_list_filter() {
+        let dataset = Arc::new(
+            gen_batch()
+                .col("before", array::step::<UInt32Type>())
+                .col(
+                    "vector",
+                    array::cycle_vec(array::step::<Float32Type>(), Dimension::from(4))
+                        .with_nulls(&[true, false]),
+                )
+                .col("after", array::step::<UInt32Type>())
+                .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2))
+                .await
+                .unwrap(),
+        );
+        let mut options = FilteredReadOptions::basic_full_read(&dataset);
+        let unsupported_expr = datafusion_expr::col("before")
+            .gt(datafusion_expr::lit(0_u32))
+            .and(datafusion_expr::col("vector").is_null())
+            .and(datafusion_expr::col("after").lt(datafusion_expr::lit(10_u32)));
+        options.full_filter = Some(unsupported_expr.clone());
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+        let state = SessionContext::new().state();
+
+        let error = filtered_read_exec_to_proto(&exec, &state)
+            .await
+            .expect_err("FixedSizeList predicates must stay on another execution path");
+
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(
+            error.to_string().contains("'vector' (FixedSizeList"),
+            "unexpected error: {error}"
+        );
+
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_fragment(0);
+        let plan = FilteredReadPlan {
+            rows,
+            filters: HashMap::from([(0, Arc::new(unsupported_expr))]),
+            scan_range_after_filter: None,
+        };
+        let exec = FilteredReadExec::try_new(
+            dataset.clone(),
+            FilteredReadOptions::basic_full_read(&dataset),
+            None,
+        )
+        .unwrap()
+        .with_plan(plan)
+        .await
+        .unwrap();
+
+        let error = filtered_read_exec_to_proto(&exec, &state)
+            .await
+            .expect_err("precomputed FixedSizeList predicates must not use Substrait transport");
+        assert!(matches!(error, Error::NotSupported { .. }));
     }
 
     /// A row-stream (take) exec serializes like any other: the input plan
