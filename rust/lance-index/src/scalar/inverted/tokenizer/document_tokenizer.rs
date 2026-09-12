@@ -144,8 +144,14 @@ impl std::fmt::Debug for JsonTokenizer {
 
 impl LanceTokenizer for JsonTokenizer {
     fn token_stream_for_search<'a>(&'a mut self, query_text: &'a str) -> BoxTokenStream<'a> {
-        let tokens = flatten_triplet(query_text, &mut self.tokenizer).unwrap();
-        BoxTokenStream::new(TTStream { tokens, index: 0 })
+        match flatten_triplet(query_text, &mut self.tokenizer) {
+            Ok(tokens) => BoxTokenStream::new(TTStream { tokens, index: 0 }),
+            Err(error) => BoxTokenStream::new(TTStream {
+                tokens: Vec::new(),
+                index: 0,
+            })
+            .with_error(error),
+        }
     }
 
     fn token_stream_for_doc<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
@@ -170,16 +176,14 @@ impl LanceTokenizer for JsonTokenizer {
     }
 }
 
-fn flatten_triplet(text: &str, tokenizer: &mut TextAnalyzer) -> lance_core::Result<Vec<Token>> {
+fn flatten_triplet(text: &str, tokenizer: &mut TextAnalyzer) -> Result<Vec<Token>, String> {
     let mut token_vec = Vec::new();
     let mut idx = 0;
 
     for triple in text.split(';') {
         let parts: Vec<&str> = triple.splitn(3, ',').collect();
         if parts.len() != 3 {
-            return Err(lance_core::Error::invalid_input_source(
-                format!("Invalid triple format: {}", triple).into(),
-            ));
+            return Err(format!("Invalid triple format: {}", triple));
         }
         let field = parts[0];
         let v_type = parts[1];
@@ -211,9 +215,7 @@ fn flatten_triplet(text: &str, tokenizer: &mut TextAnalyzer) -> lance_core::Resu
                 }
             }
             _ => {
-                return Err(lance_core::Error::invalid_input_source(
-                    format!("Invalid triple type: {}", v_type).into(),
-                ));
+                return Err(format!("Invalid triple type: {}", v_type));
             }
         }
     }
@@ -303,10 +305,13 @@ impl TokenStream for TTStream {
 
 #[cfg(test)]
 mod tests {
+    use crate::scalar::inverted::query::try_collect_query_tokens;
     use crate::scalar::inverted::tokenizer::document_tokenizer::{
         JsonTokenizer, LanceTokenizer, flatten_json, flatten_triplet,
     };
+    use lance_core::Error;
     use lance_tokenizer::{SimpleTokenizer, TextAnalyzer, Token};
+    use rstest::rstest;
     use serde_json::Value;
 
     #[test]
@@ -377,6 +382,21 @@ mod tests {
         assert_token(&tokens[3], 3, "d,str,hello");
         assert_token(&tokens[4], 4, "d,str,world");
         assert_token(&tokens[5], 5, "e,number,1.0");
+    }
+
+    #[rstest]
+    #[case::missing_type("brown", "Invalid triple format: brown")]
+    #[case::invalid_type("title,string,brown", "Invalid triple type: string")]
+    fn test_invalid_json_search_query(#[case] query: &str, #[case] expected_message: &str) {
+        let mut tokenizer: Box<dyn LanceTokenizer> = Box::new(JsonTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+        ));
+        let error = try_collect_query_tokens(query, &mut tokenizer)
+            .err()
+            .expect("invalid JSON search query should fail");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(expected_message), "{error}");
     }
 
     fn assert_token(token: &Token, position: usize, text: &str) {

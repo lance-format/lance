@@ -55,25 +55,46 @@ pub trait Tokenizer: 'static + Clone + Send + Sync {
 }
 
 /// Token stream object-safe wrapper.
-pub struct BoxTokenStream<'a>(Box<dyn TokenStream + 'a>);
+pub struct BoxTokenStream<'a> {
+    token_stream: Box<dyn TokenStream + 'a>,
+    error: Option<String>,
+}
 
 impl<'a> BoxTokenStream<'a> {
+    /// Wrap a token stream.
     pub fn new<T: TokenStream + 'a>(token_stream: T) -> Self {
-        Self(Box::new(token_stream))
+        Self {
+            token_stream: Box::new(token_stream),
+            error: None,
+        }
+    }
+
+    /// Attach an error that is returned before the first token.
+    pub fn with_error(mut self, error: impl Into<String>) -> Self {
+        self.error = Some(error.into());
+        self
+    }
+
+    /// Return the next token or the deferred stream error.
+    pub fn try_next(&mut self) -> Result<Option<&Token>, String> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        Ok(self.token_stream.next())
     }
 }
 
 impl TokenStream for BoxTokenStream<'_> {
     fn advance(&mut self) -> bool {
-        self.0.advance()
+        self.token_stream.advance()
     }
 
     fn token(&self) -> &Token {
-        self.0.token()
+        self.token_stream.token()
     }
 
     fn token_mut(&mut self) -> &mut Token {
-        self.0.token_mut()
+        self.token_stream.token_mut()
     }
 }
 
@@ -81,13 +102,13 @@ impl<'a> Deref for BoxTokenStream<'a> {
     type Target = dyn TokenStream + 'a;
 
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &*self.token_stream
     }
 }
 
 impl DerefMut for BoxTokenStream<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.0
+        &mut *self.token_stream
     }
 }
 
