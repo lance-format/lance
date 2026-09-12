@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::{
@@ -2314,6 +2316,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
     maxscore_general_windows: usize,
+    #[cfg(test)]
+    phrase_position_checks: Cell<usize>,
     documents: &'a D,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
@@ -2420,6 +2424,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
             maxscore_general_windows: 0,
+            #[cfg(test)]
+            phrase_position_checks: Cell::new(0),
             documents,
             scorer,
             shared_threshold: None,
@@ -2593,21 +2599,57 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             let score = if self.operator == Operator::Or {
                 self.advance_all_tail(doc.doc_id(), None, None);
-                if params.phrase_slop.is_some()
-                    && !self.check_positions(params.phrase_slop.unwrap() as i32)?
-                {
-                    self.push_back_leads(doc.doc_id() + 1);
-                    continue;
+                if let Some(slop) = params.phrase_slop {
+                    // Only front-load the BM25 total when a floor exists: with
+                    // no floor the skip cannot fire, and scoring before
+                    // position confirmation would make every position-failing
+                    // candidate pay for a score it never uses.
+                    let early_score =
+                        (self.threshold > 0.0).then(|| self.score_in_query_order(doc_length));
+                    if early_score
+                        .is_some_and(|score| self.exclusive_score_cannot_beat_floor(score))
+                    {
+                        self.push_back_leads(doc.doc_id() + 1);
+                        continue;
+                    }
+                    if !self.check_positions(slop as i32)? {
+                        self.push_back_leads(doc.doc_id() + 1);
+                        continue;
+                    }
+                    early_score.unwrap_or_else(|| self.score_in_query_order(doc_length))
+                } else {
+                    self.score_in_query_order(doc_length)
                 }
-                self.score_in_query_order(doc_length)
             } else {
                 self.advance_all_tail(doc.doc_id(), None, None);
-                if params.phrase_slop.is_some()
-                    && !self.check_positions(params.phrase_slop.unwrap() as i32)?
-                {
-                    continue;
-                }
-                if self.and_candidate_score.is_some() {
+                if let Some(slop) = params.phrase_slop {
+                    // Only front-load the BM25 total when a floor exists: with
+                    // no floor the skip cannot fire, and scoring before
+                    // position confirmation would make every position-failing
+                    // candidate pay for a score it never uses.
+                    let early_score = (self.threshold > 0.0).then(|| {
+                        if self.and_candidate_score.is_some() {
+                            and_score
+                        } else {
+                            self.score_in_query_order(doc_length)
+                        }
+                    });
+                    if early_score
+                        .is_some_and(|score| self.exclusive_score_cannot_beat_floor(score))
+                    {
+                        continue;
+                    }
+                    if !self.check_positions(slop as i32)? {
+                        continue;
+                    }
+                    early_score.unwrap_or_else(|| {
+                        if self.and_candidate_score.is_some() {
+                            and_score
+                        } else {
+                            self.score_in_query_order(doc_length)
+                        }
+                    })
+                } else if self.and_candidate_score.is_some() {
                     and_score
                 } else {
                     self.score_in_query_order(doc_length)
@@ -2680,14 +2722,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 continue;
             }
 
-            // check positions
-            if params.phrase_slop.is_some()
-                && !self.check_positions(params.phrase_slop.unwrap() as i32)?
-            {
-                self.advance_lead_to_head(doc_id + 1);
-                continue;
-            }
-
             // score the doc
             let doc_length = self
                 .documents
@@ -2702,7 +2736,22 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
 
             self.collect_tail_matches(doc_id);
-            let score = self.score_in_query_order(doc_length);
+            // Only front-load the BM25 total when a floor exists: with no floor
+            // the skip cannot fire, and scoring before position confirmation
+            // would make every position-failing candidate pay for a score it
+            // never uses.
+            let early_score = (self.threshold > 0.0).then(|| self.score_in_query_order(doc_length));
+            if let Some(slop) = params.phrase_slop {
+                if early_score.is_some_and(|score| self.exclusive_score_cannot_beat_floor(score)) {
+                    self.advance_lead_to_head(doc_id + 1);
+                    continue;
+                }
+                if !self.check_positions(slop as i32)? {
+                    self.advance_lead_to_head(doc_id + 1);
+                    continue;
+                }
+            }
+            let score = early_score.unwrap_or_else(|| self.score_in_query_order(doc_length));
 
             if candidates.insert(
                 ScoredDoc::new(document_key, score),
@@ -3302,6 +3351,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
+    /// Exclusive top-k floor: a finite complete score at or below `threshold`
+    /// cannot enter the heap, so phrase confirmation is wasted work.
+    ///
+    /// The score is the same query-order f32 the heap compares, so this uses
+    /// `accepts_score` rather than the inflated partial-sum bound. Fail-closed:
+    /// `threshold == 0` (heap not full) never skips.
+    #[inline]
+    fn exclusive_score_cannot_beat_floor(&self, score: f32) -> bool {
+        self.threshold > 0.0
+            && score.is_finite()
+            && !self.floor_mode.accepts_score(score, self.threshold)
+    }
+
     /// Calculate the current document's score in query order.
     ///
     /// WAND deliberately reorders postings by doc id, cost, and score bound.
@@ -3781,6 +3843,33 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             end: usize,
             // Absolute posting index of the block's first entry.
             block_start: usize,
+        }
+
+        /// Sum one bulk-AND candidate's per-clause BM25 contributions in score
+        /// order. Nested so it can name the block-local `WindowList`; the
+        /// caller may run it before or after position confirmation.
+        #[inline]
+        fn window_bm25_score<S: Scorer + ?Sized>(
+            lead: &[Box<PostingIterator>],
+            wins: &[WindowList],
+            offs: &[u8],
+            score_order: &[usize],
+            scorer: &S,
+            norm_addend: Option<f32>,
+            doc_length: u32,
+        ) -> f32 {
+            let mut score = 0.0_f32;
+            for &clause_index in score_order {
+                let win = &wins[clause_index];
+                let posting = &lead[clause_index];
+                let off = offs[clause_index];
+                let freq = unsafe { *win.freqs.add(off as usize) };
+                score += match norm_addend {
+                    Some(addend) => posting.query_weight * bm25_doc_weight_with_norm(freq, addend),
+                    None => posting.score(scorer, freq, doc_length),
+                };
+            }
+            score
         }
 
         // Merge kernels: intersect the window's per-clause slices and record
@@ -4453,7 +4542,30 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         continue;
                     };
 
+                    // Only front-load the BM25 total when a floor exists: the
+                    // skip below can only fire then, and scoring before
+                    // position confirmation would otherwise make every
+                    // position-failing candidate pay for a score it never uses.
+                    let early_score = (self.threshold > 0.0).then(|| {
+                        window_bm25_score(
+                            &self.lead,
+                            &wins,
+                            offs,
+                            &score_order,
+                            &self.scorer,
+                            norm_addend,
+                            doc_length,
+                        )
+                    });
                     if let Some(slop) = phrase_slop {
+                        // Lance phrase score is term-frequency BM25, so this
+                        // total is exact. Skip position decode when it cannot
+                        // enter the exclusive top-k heap.
+                        if early_score
+                            .is_some_and(|score| self.exclusive_score_cannot_beat_floor(score))
+                        {
+                            continue;
+                        }
                         // Park every clause's iterator on this doc so
                         // `position_cursor` reads the right posting entry. The
                         // window block is already decompressed; position blocks
@@ -4476,19 +4588,17 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             continue;
                         }
                     }
-                    let mut score = 0.0_f32;
-                    for &clause_index in &score_order {
-                        let win = &wins[clause_index];
-                        let posting = &self.lead[clause_index];
-                        let off = offs[clause_index];
-                        let freq = unsafe { *win.freqs.add(off as usize) };
-                        score += match norm_addend {
-                            Some(addend) => {
-                                posting.query_weight * bm25_doc_weight_with_norm(freq, addend)
-                            }
-                            None => posting.score(&self.scorer, freq, doc_length),
-                        };
-                    }
+                    let score = early_score.unwrap_or_else(|| {
+                        window_bm25_score(
+                            &self.lead,
+                            &wins,
+                            offs,
+                            &score_order,
+                            &self.scorer,
+                            norm_addend,
+                            doc_length,
+                        )
+                    });
 
                     if candidates.insert(
                         ScoredDoc::new(document_key, score),
@@ -5136,6 +5246,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     }
 
     fn check_positions(&self, slop: i32) -> Result<bool> {
+        #[cfg(test)]
+        {
+            self.phrase_position_checks
+                .set(self.phrase_position_checks.get() + 1);
+        }
         if slop == 0 {
             return self.check_exact_positions();
         }
@@ -5185,6 +5300,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     /// clauses at their query offsets — without the per-candidate cursor vec
     /// and sort.
     fn check_exact_positions_bulk(&self) -> Result<bool> {
+        #[cfg(test)]
+        {
+            self.phrase_position_checks
+                .set(self.phrase_position_checks.get() + 1);
+        }
         const MAX_INLINE_CLAUSES: usize = 16;
         let num_clauses = self.lead.len();
         if num_clauses > MAX_INLINE_CLAUSES {
@@ -10156,6 +10276,81 @@ mod tests {
         let classic = run(BulkAndMode::Off);
         assert_eq!(run(BulkAndMode::On), classic);
         assert_eq!(run(BulkAndMode::Auto), classic);
+    }
+
+    #[rstest]
+    fn phrase_skips_position_confirm_when_complete_score_cannot_beat_floor(
+        #[values(BulkAndMode::Off, BulkAndMode::On)] mode: BulkAndMode,
+        #[values(0_u32, 3)] phrase_slop: u32,
+        #[values(true, false)] phrase_first: bool,
+        #[values(1_usize, 32)] limit: usize,
+    ) {
+        let num_docs = 32_usize;
+        let phrase_doc = if phrase_first { 0 } else { num_docs - 1 };
+        let mut docs = DocSet::default();
+        for doc in 0..num_docs {
+            docs.append(doc as u64, 1);
+        }
+        let postings = (0..2_u32)
+            .map(|term| {
+                let mut list = generate_impact_posting_list_with_freqs_and_block_size(
+                    (0..num_docs as u32).collect(),
+                    vec![1; num_docs],
+                    vec![1; num_docs],
+                    MAX_POSTING_BLOCK_SIZE,
+                );
+                let positions = (0..num_docs as u32)
+                    .map(|doc| {
+                        if term == 0 {
+                            0
+                        } else if doc == phrase_doc as u32 {
+                            1
+                        } else {
+                            50
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut bytes = Vec::new();
+                encode_position_stream_block_into(
+                    &positions,
+                    &vec![1; num_docs],
+                    PositionStreamCodec::VarintDocDelta,
+                    &mut bytes,
+                )
+                .unwrap();
+                if let PostingList::Compressed(list) = &mut list {
+                    list.positions = Some(CompressedPositionStorage::SharedStream(
+                        SharedPositionStream::new(
+                            PositionStreamCodec::VarintDocDelta,
+                            vec![0],
+                            bytes.into(),
+                        ),
+                    ));
+                }
+                PostingIterator::with_query_weight(
+                    format!("t{term}"),
+                    term,
+                    term,
+                    1.0,
+                    list,
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(mode);
+        let mut params = FtsSearchParams::default().with_limit(Some(limit));
+        params.phrase_slop = Some(phrase_slop);
+        let hits = wand.search(&params, &NoOpMetricsCollector).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].posting_doc_id, phrase_doc as u64);
+        assert_eq!(wand.bulk_and_searches, usize::from(mode == BulkAndMode::On));
+        let expected_checks = if phrase_first && limit == 1 {
+            1
+        } else {
+            num_docs
+        };
+        assert_eq!(wand.phrase_position_checks.get(), expected_checks);
     }
 
     #[rstest]
