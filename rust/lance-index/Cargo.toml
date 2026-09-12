@@ -162,6 +162,10 @@ name = "bitmap"
 harness = false
 
 [[bench]]
+name = "stable_partition_row_map"
+harness = false
+
+[[bench]]
 name = "geo"
 harness = false
 required-features = ["geo"]
