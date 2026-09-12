@@ -727,6 +727,44 @@ impl InvertedPartition {
         })
     }
 
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    pub(crate) async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        id: u64,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+        token_set_format: TokenSetFormat,
+    ) -> Result<Self> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        let token_file = store.open_index_file(&token_file_path(id)).await?;
+        let tokens = TokenSet::load(token_file, token_set_format).await?;
+        let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
+        let mut inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
+        let docs_path = doc_file_path(id);
+        let docs_reader = store.open_index_file(&docs_path).await?;
+        let docs = PartitionDocuments::try_new_with_remapping(
+            store.clone(),
+            docs_path,
+            id,
+            WeakLanceCache::from(index_cache),
+            docs_reader.as_ref(),
+            remapping,
+            // 256-document blocks score with quantized document lengths.
+            inverted_list.block_size() == MAX_POSTING_BLOCK_SIZE,
+        )?;
+        inverted_list.modern_num_docs = Some(docs.len());
+
+        Ok(Self {
+            id,
+            store,
+            tokens: tokens.into(),
+            inverted_list: Arc::new(inverted_list),
+            docs: PartitionDocumentStore::Modern(Arc::new(docs)),
+            token_set_format,
+        })
+    }
+
     fn map(&self, token: &str) -> Option<u32> {
         self.tokens.get(token)
     }

@@ -430,6 +430,44 @@ impl DocSet {
         )
     }
 
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    pub(crate) async fn load_with_remapping(
+        reader: Arc<dyn IndexReader>,
+        is_legacy: bool,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+    ) -> Result<Self> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
+        let (batch, frag_reuse_index) = match remapping {
+            Some(remapping) => {
+                let row_id_idx = batch.schema().index_of(ROW_ID)?;
+                let (batch, remapper) =
+                    remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
+                        .await?;
+                (batch, Some(remapper))
+            }
+            None => (batch, None),
+        };
+        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+        let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
+        let mut doc_indices = Vec::new();
+        for rank in 0.. {
+            let column_name = doc_index_storage_column(rank);
+            let Some(column) = batch.column_by_name(&column_name) else {
+                break;
+            };
+            doc_indices.push(column.as_primitive::<datatypes::UInt32Type>());
+        }
+        Self::from_columns_with_doc_indices(
+            row_id_col,
+            num_tokens_col,
+            &doc_indices,
+            is_legacy,
+            frag_reuse_index,
+        )
+    }
+
     /// Build a `DocSet` carrying only the per-doc `num_tokens` array;
     /// `row_ids` and `inv` are left empty. Used by the deferred-row_id
     /// scoring path: wand checks `has_row_ids()` to skip `row_id` /
