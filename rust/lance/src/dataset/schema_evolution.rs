@@ -2420,6 +2420,67 @@ mod test {
         Ok(())
     }
 
+    #[rstest]
+    #[case::row_id("_rowid")]
+    #[case::row_addr("_rowaddr")]
+    #[case::row_offset("_rowoffset")]
+    #[case::row_created_at_version("_row_created_at_version")]
+    #[case::row_last_updated_at_version("_row_last_updated_at_version")]
+    #[tokio::test]
+    async fn schema_evolution_rejects_reserved_system_column_names(#[case] reserved_name: &str) {
+        // Neither add_columns nor alter_columns (rename) has its own guard;
+        // both reach the commit-time guard, which rejects the reserved name
+        // before it enters the schema.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+
+        // add_columns with a reserved name (SQL transform → new column name).
+        let add_err = dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(
+                    reserved_name.to_string(),
+                    "id + 1".to_string(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .expect_err("add_columns with a reserved name should fail");
+        assert!(
+            matches!(&add_err, Error::InvalidInput { .. }),
+            "{add_err:?}"
+        );
+        assert!(
+            add_err.to_string().contains("reserved name"),
+            "unexpected add_columns error for {reserved_name}: {add_err}"
+        );
+
+        // alter_columns renaming an existing column to a reserved name.
+        let rename_err = dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).rename(reserved_name.into())])
+            .await
+            .expect_err("alter_columns rename to a reserved name should fail");
+        assert!(
+            matches!(&rename_err, Error::InvalidInput { .. }),
+            "{rename_err:?}"
+        );
+        assert!(
+            rename_err.to_string().contains("reserved name"),
+            "unexpected alter_columns error for {reserved_name}: {rename_err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_add_column_all_nulls() -> Result<()> {
         let num_rows = 100;
