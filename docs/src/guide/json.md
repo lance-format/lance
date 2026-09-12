@@ -426,8 +426,52 @@ complex_projects = dataset.to_table(
 
 All JSON functions are available when using Lance with Apache DataFusion for SQL queries. See the [DataFusion Integration](../integrations/datafusion.md#json-functions) guide for more details on using JSON functions in SQL contexts.
 
+## Projecting JSON Fields
+
+You can use JSON functions in the `columns` parameter to project extracted values as new columns. This is useful when you want to lift specific fields out of a JSON blob into typed columns.
+
+```python
+import lance
+import pyarrow as pa
+import json
+
+# Create a dataset with JSON metadata
+records = pa.table({
+    "id": [1, 2, 3],
+    "data": pa.array([
+        json.dumps({"name": "Alice", "age": 30, "city": "New York"}),
+        json.dumps({"name": "Bob",   "age": 25, "city": "London"}),
+        json.dumps({"name": "Carol", "age": 35, "city": "Tokyo"}),
+    ], type=pa.json_()),
+})
+
+lance.write_dataset(records, "people.lance")
+dataset = lance.dataset("people.lance")
+
+# Extract specific fields into typed columns using a dict of expressions
+result = dataset.to_table(
+    columns={
+        "id": "id",
+        "name": "json_get_string(data, 'name')",
+        "age":  "json_get_int(data, 'age')",
+    }
+)
+# result schema: id (int64), name (string), age (int64)
+
+# You can also use json_extract for JSONPath-style access
+result2 = dataset.to_table(
+    columns={"city": "json_extract(data, '$.city')"}
+)
+# json_extract returns values in JSON format, so strings include quotes
+# city: ['"New York"', '"London"', '"Tokyo"']
+```
+
+!!! note
+    `json_get_string`, `json_get_int`, `json_get_float`, and `json_get_bool` return native
+    typed values and are preferred for projection. `json_extract` returns JSON-formatted
+    strings (string values include surrounding quotes).
+
 ## Limitations
 
 - JSONPath support follows standard JSONPath syntax but may not support all advanced features
 - Large JSON documents may impact query performance
-- JSON functions are currently only available for filtering, not for projection in query results
