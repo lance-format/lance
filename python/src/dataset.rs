@@ -2104,6 +2104,21 @@ impl Dataset {
         Ok(self.ds.version().version)
     }
 
+    /// Fetches information about the currently checked out version.
+    fn version_info(self_: PyRef<'_, Self>) -> PyResult<Py<PyAny>> {
+        let py = self_.py();
+        let version = self_.ds.version();
+        let dict = PyDict::new(py);
+        dict.set_item("version", version.version)?;
+        dict.set_item(
+            "timestamp",
+            version.timestamp.timestamp_nanos_opt().unwrap_or_default(),
+        )?;
+        let metadata: Vec<(&String, &String)> = version.metadata.iter().collect();
+        dict.set_item("metadata", metadata.into_py_dict(py)?)?;
+        dict.into_py_any(py)
+    }
+
     fn latest_version(self_: PyRef<'_, Self>) -> PyResult<u64> {
         rt().block_on(Some(self_.py()), self_.ds.latest_version_id())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
