@@ -5945,11 +5945,13 @@ mod tests {
         let mut ivf_params = IvfBuildParams::new(1);
         ivf_params.max_iters = 2;
         ivf_params.sample_rate = 16;
+        // Use the same 4-bit capacity as the single-vector tests to avoid
+        // random PQ training pushing recall below the threshold (#8764).
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             DistanceType::Cosine,
             ivf_params,
             lightweight_hnsw_params(),
-            lightweight_pq_params(),
+            lightweight_pq_params_with_bits(4),
         );
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, true)

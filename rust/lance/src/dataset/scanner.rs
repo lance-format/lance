@@ -12,9 +12,9 @@ use std::task::{Context, Poll};
 
 use crate::index::DatasetIndexExt;
 use arrow::array::AsArray;
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Float32Array, Int64Array, RecordBatch, types::Float32Type};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
-use arrow_select::concat::concat_batches;
+use arrow_select::concat::{concat, concat_batches};
 use async_recursion::async_recursion;
 use chrono::Utc;
 use datafusion::catalog::Session;
@@ -1134,6 +1134,8 @@ pub struct Scanner {
     ordering: Option<Vec<ColumnOrdering>>,
 
     nearest: Option<Query>,
+    /// When set, score coarse candidates in this separate vector space.
+    nearest_refine: Option<VectorRefinement>,
     nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries
     /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).
@@ -1384,6 +1386,13 @@ impl TakeOperation {
     }
 }
 
+#[derive(Clone)]
+struct VectorRefinement {
+    column: String,
+    key: ArrayRef,
+    metric: MetricType,
+}
+
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
@@ -1407,6 +1416,7 @@ impl Scanner {
             offset: None,
             ordering: None,
             nearest: None,
+            nearest_refine: None,
             nearest_query_count: 1,
             is_batch_nearest: false,
             use_stats: true,
@@ -2024,6 +2034,7 @@ impl Scanner {
         });
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
+        self.nearest_refine = None;
         Ok(self)
     }
 
@@ -2145,6 +2156,116 @@ impl Scanner {
             q.refine_factor = Some(factor)
         };
         self
+    }
+
+    /// Refine candidates using a separate Float32 fixed-size vector column.
+    ///
+    /// Call after [`Self::nearest`] and set a positive [`Self::refine`] factor
+    /// before execution. The coarse search returns at most `k * factor` candidates;
+    /// their final `_distance` and [`Self::distance_range`] use `metric` and `query`.
+    /// This replaces same-column exact refinement, including for quantized indices.
+    /// Without an index, coarse exact TopM still precedes cross-column refinement.
+    ///
+    /// Both columns must contain single Float32 vectors. Query dimensions may differ,
+    /// but batch queries must have matching counts and both queries must be batches.
+    /// Scalar prefilters apply before candidate selection; postfilters apply after
+    /// the final TopK. Vector and full-text query filters are not supported.
+    /// Null or invalid refinement vectors can result in fewer than `k` rows.
+    /// Calling [`Self::nearest`] again clears this setting.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use arrow_array::Float32Array;
+    /// # use lance_linalg::distance::MetricType;
+    /// # async fn example(dataset: &Dataset, coarse: &Float32Array, full: &Float32Array) -> Result<()> {
+    /// let mut scan = dataset.scan();
+    /// scan.nearest("short_vector", coarse, 10)?.refine(2);
+    /// scan.with_refine_column("full_vector", full, MetricType::Cosine)?;
+    /// let results = scan.try_into_batch().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_refine_column(
+        &mut self,
+        column: impl AsRef<str>,
+        query: &dyn Array,
+        metric: MetricType,
+    ) -> Result<&mut Self> {
+        let column = column.as_ref();
+        let nearest = self.nearest.as_ref().ok_or_else(|| {
+            Error::invalid_input("nearest must be set before refine_column".to_string())
+        })?;
+        for name in [nearest.column.as_str(), column] {
+            let (vector_type, element_type) = get_vector_type(self.dataset.schema(), name)?;
+            if !matches!(vector_type, DataType::FixedSizeList(_, _))
+                || element_type != DataType::Float32
+            {
+                return Err(Error::not_supported(format!(
+                    "cross-column refinement requires Float32 fixed-size vectors; column {name} has type {vector_type}"
+                )));
+            }
+        }
+        validate_distance_type_for(metric, &DataType::Float32)?;
+        let query_element_type = match query.data_type() {
+            DataType::List(field) | DataType::FixedSizeList(field, _) => field.data_type(),
+            data_type => data_type,
+        };
+        if query_element_type != &DataType::Float32 {
+            return Err(Error::invalid_input(format!(
+                "refine_q must contain Float32 values, got {}",
+                query.data_type()
+            )));
+        }
+        if query.null_count() > 0 {
+            return Err(Error::invalid_input(
+                "refine_q must contain only finite, non-null values".to_string(),
+            ));
+        }
+        let mut validation = Self::new(self.dataset.clone());
+        validation.nearest(column, query, nearest.k)?;
+        if validation.nearest_query_count != self.nearest_query_count
+            || validation.is_batch_nearest != self.is_batch_nearest
+        {
+            return Err(Error::invalid_input(format!(
+                "refine_q batch shape must match q: expected {} queries (batch={}), got {} (batch={})",
+                self.nearest_query_count,
+                self.is_batch_nearest,
+                validation.nearest_query_count,
+                validation.is_batch_nearest
+            )));
+        }
+        // Respect offsets when a caller passes a slice of a batch query array.
+        let vectors = if let Some(list) = query.as_list_opt::<i32>() {
+            (0..list.len()).map(|i| list.value(i)).collect::<Vec<_>>()
+        } else if let Some(list) = query.as_fixed_size_list_opt() {
+            (0..list.len()).map(|i| list.value(i)).collect::<Vec<_>>()
+        } else {
+            vec![query.slice(0, query.len())]
+        };
+        let key = concat(&vectors.iter().map(|v| v.as_ref()).collect::<Vec<_>>())?;
+        let values = key.as_primitive::<Float32Type>();
+        if values.null_count() > 0 || values.values().iter().any(|v| !v.is_finite()) {
+            return Err(Error::invalid_input(
+                "refine_q must contain only finite, non-null values".to_string(),
+            ));
+        }
+        let dim = get_vector_dim(self.dataset.schema(), column)?;
+        if metric == MetricType::Cosine
+            && values
+                .values()
+                .chunks_exact(dim)
+                .any(|v| v.iter().all(|x| *x == 0.0))
+        {
+            return Err(Error::invalid_input(
+                "refine_q must have nonzero norm for cosine distance".to_string(),
+            ));
+        }
+        self.nearest_refine = Some(VectorRefinement {
+            column: column.to_string(),
+            key,
+            metric,
+        });
+        Ok(self)
     }
 
     /// Change the distance [MetricType], i.e, L2 or Cosine distance.
@@ -2865,6 +2986,25 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
+        if self.nearest_refine.is_some() {
+            let query = self.nearest.as_ref().ok_or_else(|| {
+                Error::invalid_input("refine_column requires nearest".to_string())
+            })?;
+            let factor = query.refine_factor.filter(|f| *f > 0).ok_or_else(|| {
+                Error::invalid_input(
+                    "refine_column requires an explicit positive refine_factor".to_string(),
+                )
+            })?;
+            query.k.checked_mul(factor as usize).ok_or_else(|| {
+                Error::invalid_input("k * refine_factor overflows the candidate budget".to_string())
+            })?;
+            if self.filter.query_filter.is_some() {
+                return Err(Error::not_supported(
+                    "cross-column refinement does not support a vector or full-text query filter"
+                        .to_string(),
+                ));
+            }
+        }
         if self.batch_readahead == 0 {
             return Err(Error::invalid_input_source(
                 "batch_readahead must be greater than 0, got 0".into(),
@@ -5265,6 +5405,41 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         q: &Query,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if let Some(refine) = &self.nearest_refine {
+            if self.is_batch_nearest {
+                return self.batch_indexed_vector_search(filter_plan, q).await;
+            }
+            let factor = q.refine_factor.filter(|f| *f > 0).ok_or_else(|| {
+                Error::invalid_input(
+                    "refine_column requires an explicit positive refine_factor".to_string(),
+                )
+            })?;
+            let mut coarse = q.clone();
+            coarse.k = q.k.checked_mul(factor as usize).ok_or_else(|| {
+                Error::invalid_input("k * refine_factor overflows the candidate budget".to_string())
+            })?;
+            coarse.refine_factor = None;
+            // Bounds apply to the final distance space, not the coarse index.
+            coarse.lower_bound = None;
+            coarse.upper_bound = None;
+            let mut coarse_scanner = self.clone();
+            coarse_scanner.nearest_refine = None;
+            coarse_scanner.nearest = Some(coarse.clone());
+            // Merge indexed, appended, and updated rows before cross-column scoring.
+            let candidates = coarse_scanner.vector_search(filter_plan, &coarse).await?;
+            let projection = self
+                .dataset
+                .empty_projection()
+                .union_column(&refine.column, OnMissing::Error)?;
+            let candidates = self.take(candidates, projection)?;
+            let mut final_query = q.clone();
+            final_query.column = refine.column.clone();
+            final_query.key = refine.key.clone();
+            final_query.metric_type = Some(refine.metric);
+            final_query.refine_factor = None;
+            final_query.use_index = false;
+            return self.flat_knn(candidates, &final_query);
+        }
         let mut q = q.clone();
 
         // Sanity check
@@ -5543,6 +5718,12 @@ impl Scanner {
             single_scanner.nearest_query_count = 1;
             single_scanner.is_batch_nearest = false;
             single_scanner.nearest = Some(single_query.clone());
+            if let Some(refine) = &self.nearest_refine {
+                let mut single_refine = refine.clone();
+                let refine_dim = refine.key.len() / self.nearest_query_count;
+                single_refine.key = refine.key.slice(query_index * refine_dim, refine_dim);
+                single_scanner.nearest_refine = Some(single_refine);
+            }
 
             let single_plan = single_scanner
                 .vector_search(filter_plan, &single_query)
@@ -8991,6 +9172,207 @@ mod test {
             .copied()
             .collect();
         assert_eq!(expected_i, actual_i);
+    }
+
+    #[rstest]
+    #[case::flat(None)]
+    #[case::ivf_flat(Some(VectorIndexParams::with_ivf_flat_params(
+        MetricType::L2,
+        IvfBuildParams::new(2)
+    )))]
+    #[case::ivf_pq(Some(VectorIndexParams::ivf_pq(2, 4, 2, MetricType::L2, 2)))]
+    #[tokio::test]
+    async fn test_cross_column_refinement_candidates(
+        #[case] index_params: Option<VectorIndexParams>,
+        #[values(MetricType::L2, MetricType::Cosine, MetricType::Dot)] metric: MetricType,
+    ) {
+        let mut dataset = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("coarse", array::rand_vec::<Float32Type>(Dimension::from(4)))
+            .col("full", array::rand_vec::<Float32Type>(Dimension::from(8)))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(32))
+            .await
+            .unwrap();
+        if let Some(params) = &index_params {
+            dataset
+                .create_index(&["coarse"], IndexType::Vector, None, params, false)
+                .await
+                .unwrap();
+        }
+        let coarse_query = Float32Array::from(vec![0.1, 0.2, 0.3, 0.4]);
+        let full_query = Float32Array::from(vec![0.4, 0.3, 0.2, 0.1, 0.5, 0.6, 0.7, 0.8]);
+        let candidates = dataset
+            .scan()
+            .nearest("coarse", &coarse_query, 12)
+            .unwrap()
+            .distance_metric(MetricType::L2)
+            .nprobes(2)
+            .project(&["id", "full"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(candidates.num_rows(), 12);
+        let vectors = candidates["full"].as_fixed_size_list();
+        let ids = candidates["id"].as_primitive::<Int32Type>();
+        let mut expected = (0..candidates.num_rows())
+            .map(|i| {
+                let vector = vectors.value(i);
+                let vector = vector.as_primitive::<Float32Type>();
+                let pairs = vector.values().iter().zip(full_query.values().iter());
+                let dot = pairs
+                    .clone()
+                    .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                    .sum::<f64>();
+                let distance = match metric {
+                    MetricType::L2 => pairs
+                        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                        .sum(),
+                    MetricType::Cosine => {
+                        let norm = vector
+                            .values()
+                            .iter()
+                            .map(|&v| f64::from(v).powi(2))
+                            .sum::<f64>()
+                            .sqrt();
+                        let query_norm = full_query
+                            .values()
+                            .iter()
+                            .map(|&v| f64::from(v).powi(2))
+                            .sum::<f64>()
+                            .sqrt();
+                        1.0 - dot / (norm * query_norm)
+                    }
+                    MetricType::Dot => 1.0 - dot,
+                    _ => unreachable!(),
+                };
+                (ids.value(i), distance as f32)
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        expected.truncate(6);
+
+        let mut scan = dataset.scan();
+        scan.nearest("coarse", &coarse_query, 6)
+            .unwrap()
+            .distance_metric(MetricType::L2)
+            .nprobes(2)
+            .refine(2)
+            .with_refine_column("full", &full_query, metric)
+            .unwrap()
+            .project(&["id", DIST_COL])
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        if index_params.is_some() {
+            assert!(plan.contains("ANNSubIndex"), "{plan}");
+            // Quantized candidates go directly to final-space scoring.
+            assert_eq!(plan.matches("KNNVectorDistance").count(), 1, "{plan}");
+        }
+        let result = scan.try_into_batch().await.unwrap();
+        let actual_ids = result["id"].as_primitive::<Int32Type>();
+        let actual_distances = result[DIST_COL].as_primitive::<Float32Type>();
+        assert_eq!(result.num_rows(), expected.len());
+        for (i, (id, distance)) in expected.iter().enumerate() {
+            assert_eq!(actual_ids.value(i), *id);
+            assert!((actual_distances.value(i) - distance).abs() < 1e-5);
+        }
+        assert!(result.schema().column_with_name("full").is_none());
+        assert!(result.schema().column_with_name("coarse").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cross_column_refinement_validation_and_reset() {
+        let dataset = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("coarse", array::rand_vec::<Float32Type>(Dimension::from(4)))
+            .col("full", array::rand_vec::<Float32Type>(Dimension::from(8)))
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(8))
+            .await
+            .unwrap();
+        let coarse = Float32Array::from(vec![0.1; 4]);
+        let full = Float32Array::from(vec![0.1; 8]);
+        let mut scan = dataset.scan();
+        let error = scan
+            .with_refine_column("full", &full, MetricType::Cosine)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("nearest must be set"));
+        scan.nearest("coarse", &coarse, 2).unwrap();
+        let error = scan
+            .with_refine_column("id", &full, MetricType::Cosine)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("vector"));
+        let wrong_type = arrow_array::Float64Array::from(vec![0.1; 8]);
+        let error = scan
+            .with_refine_column("full", &wrong_type, MetricType::Cosine)
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("Float32"));
+        scan.with_refine_column("full", &full, MetricType::Cosine)
+            .unwrap();
+        for factor in [None, Some(0)] {
+            scan.nearest_mut().unwrap().refine_factor = factor;
+            let error = scan.validate_options().unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("positive refine_factor"));
+        }
+        scan.refine(2);
+        scan.nearest_mut().unwrap().k = usize::MAX;
+        let error = scan.validate_options().unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("overflows"));
+        scan.nearest("coarse", &coarse, 2).unwrap();
+        assert!(scan.nearest_refine.is_none());
+        scan.validate_options().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cross_column_refinement_sliced_batch_query() {
+        let dataset = gen_batch()
+            .col("coarse", array::rand_vec::<Float32Type>(Dimension::from(4)))
+            .col("full", array::rand_vec::<Float32Type>(Dimension::from(8)))
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(8))
+            .await
+            .unwrap();
+        let coarse =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.1; 4]), 4).unwrap();
+        let full_values = Float32Array::from((0..24).map(|v| v as f32).collect::<Vec<_>>());
+        let full = FixedSizeListArray::try_new_from_values(full_values, 8)
+            .unwrap()
+            .slice(1, 1);
+        let mut scan = dataset.scan();
+        scan.nearest("coarse", &coarse, 2)
+            .unwrap()
+            .refine(2)
+            .with_refine_column("full", &full, MetricType::L2)
+            .unwrap()
+            .project(&[DIST_COL])
+            .unwrap()
+            .with_row_id();
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut single = dataset.scan();
+        single
+            .nearest("coarse", coarse.value(0).as_ref(), 2)
+            .unwrap()
+            .refine(2)
+            .with_refine_column("full", full.value(0).as_ref(), MetricType::L2)
+            .unwrap()
+            .project(&[DIST_COL])
+            .unwrap()
+            .with_row_id();
+        let single = single.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch[ROW_ID].as_primitive::<UInt64Type>().values(),
+            single[ROW_ID].as_primitive::<UInt64Type>().values()
+        );
+        assert_eq!(
+            batch[DIST_COL].as_primitive::<Float32Type>().values(),
+            single[DIST_COL].as_primitive::<Float32Type>().values()
+        );
     }
 
     fn batch_knn_two_queries() -> (FixedSizeListArray, Vec<f32>) {

@@ -1578,7 +1578,7 @@ impl Dataset {
                     None
                 };
 
-            scanner
+            let scanner = scanner
                 .map(|s| {
                     let mut s = s.minimum_nprobes(minimum_nprobes);
                     if let Some(maximum_nprobes) = maximum_nprobes {
@@ -1602,6 +1602,27 @@ impl Dataset {
                     s
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            let refine_column = nearest.get_item("refine_column")?.filter(|v| !v.is_none());
+            let refine_q = nearest.get_item("refine_q")?.filter(|v| !v.is_none());
+            let refine_metric = nearest.get_item("refine_metric")?.filter(|v| !v.is_none());
+            match (refine_column, refine_q, refine_metric) {
+                (None, None, None) => {}
+                (Some(column), Some(query), Some(metric)) => {
+                    let column: String = column.extract()?;
+                    let key = make_array(ArrayData::from_pyarrow_bound(&query)?);
+                    let metric: String = metric.extract()?;
+                    let metric = MetricType::try_from(metric.to_lowercase().as_str())
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    scanner
+                        .with_refine_column(&column, key.as_ref(), metric)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                }
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "refine_column, refine_q, and refine_metric must be provided together",
+                    ));
+                }
+            }
         }
         if let Some(orderings) = order_by {
             scanner
