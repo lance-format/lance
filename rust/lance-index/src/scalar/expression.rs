@@ -1058,7 +1058,8 @@ fn like_to_regex(pattern: &str, escape: Option<char>) -> Option<String> {
 /// predicate to a full recheck rather than risk changing its semantics.
 fn apply_regex_flags(pattern: &str, flags_expr: &Expr) -> Option<String> {
     let (Expr::Literal(ScalarValue::Utf8(Some(flags)), _)
-    | Expr::Literal(ScalarValue::LargeUtf8(Some(flags)), _)) = flags_expr
+    | Expr::Literal(ScalarValue::LargeUtf8(Some(flags)), _)
+    | Expr::Literal(ScalarValue::Utf8View(Some(flags)), _)) = flags_expr
     else {
         return None;
     };
@@ -2086,6 +2087,19 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
     Some(lance_core::datatypes::format_field_path(&field_refs))
 }
 
+/// Whether `data_type` is one of Arrow's three plain string encodings.
+///
+/// The three carry the same values with the same ordering, so a cast between them
+/// preserves equality, ordering and nullness.  That is what makes it sound both to
+/// look through such a cast on a column reference and to renormalize a literal from
+/// one variant to another.
+fn is_plain_string(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
 // Extract a column from the expression, if it is a column, and we have an index for that column, or None
 //
 // There's two ways to get a column.  First, the obvious way, is a
@@ -2120,6 +2134,18 @@ fn maybe_indexed_column<'b>(
             let (data_type, multi) = index_info.get_index(col)?;
             let (parser, data_type) = multi.select(expr, data_type)?;
             Some((col.to_string(), data_type, parser))
+        }
+        // DataFusion's LIKE coercion promotes both operands to a common string type
+        // and casts the column to it, and no later pass unwraps that cast the way
+        // `unwrap_cast_in_comparison` does for a comparison.  Looking through it is
+        // what keeps a LIKE whose pattern is a wider string variant on the index
+        // instead of a full scan; restricting it to casts that stay within the string
+        // types is what keeps the index answer equal to the original predicate, which
+        // matters because an exact answer skips the recheck.
+        Expr::Cast(cast) => {
+            let (column, data_type, parser) = maybe_indexed_column(&cast.expr, index_info)?;
+            (is_plain_string(&data_type) && is_plain_string(cast.field.data_type()))
+                .then_some((column, data_type, parser))
         }
         _ => None,
     }
@@ -2423,12 +2449,23 @@ fn visit_like_expr(
     like: &Like,
     index_info: &dyn IndexInformationProvider,
 ) -> Option<IndexedExpression> {
-    let (column, _, query_parser) = maybe_indexed_column(&like.expr, index_info)?;
+    let (column, col_type, query_parser) = maybe_indexed_column(&like.expr, index_info)?;
 
     // Extract the pattern as a ScalarValue
-    let pattern = match like.pattern.as_ref() {
-        Expr::Literal(scalar, _) => scalar.clone(),
-        _ => return None,
+    let Expr::Literal(pattern, _) = like.pattern.as_ref() else {
+        return None;
+    };
+
+    // Every other visitor coerces its operand to the indexed column's type through
+    // `maybe_scalar`; LIKE has to as well.  Once the column-side coercion cast is
+    // looked through, the pattern can be a wider string variant than the indexed
+    // data, and a parser that takes its bound's type from the pattern would emit a
+    // bound the index cannot compare against.  A non-string reference (a dictionary
+    // column, which the LIKE coercion leaves uncast) keeps its pattern verbatim.
+    let pattern = if is_plain_string(&col_type) {
+        safe_coerce_scalar(pattern, &col_type)?
+    } else {
+        pattern.clone()
     };
 
     query_parser.visit_like(&column, like, &pattern)
@@ -3933,6 +3970,204 @@ mod tests {
             .visit_like("color", &like(pattern.clone()), &pattern)
             .expect("LIKE prefix should use the BTree index");
         assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), false);
+    }
+
+    /// Run a filter through the real planner so the assertion covers DataFusion's
+    /// type coercion instead of a hand-shaped expression.
+    fn plan_filter(
+        schema: Schema,
+        expr: Expr,
+        index_info: &dyn IndexInformationProvider,
+    ) -> FilterPlan {
+        Planner::new(Arc::new(schema))
+            .create_filter_plan(expr, index_info, true)
+            .unwrap()
+    }
+
+    fn like_expr(pattern: ScalarValue) -> Expr {
+        Expr::Like(Like::new(
+            false,
+            Box::new(Expr::Column(Column::new_unqualified("color"))),
+            Box::new(Expr::Literal(pattern, None)),
+            None,
+            false,
+        ))
+    }
+
+    fn ngram_index_info() -> MockIndexInfoProvider {
+        MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(TextQueryParser::new(
+                    "color_idx".to_string(),
+                    "NGram".to_string(),
+                    true,
+                    true,
+                    3,
+                )),
+            ),
+        )])
+    }
+
+    fn expect_query<Q: AnyQuery>(plan: &FilterPlan) -> &Q {
+        let Some(ScalarIndexExpr::Query(search)) = plan.index_query.as_ref() else {
+            panic!("expected a scalar index query, got {:?}", plan.index_query);
+        };
+        assert_eq!(search.column, "color");
+        assert_eq!(search.index_name, "color_idx");
+        search
+            .query
+            .as_any()
+            .downcast_ref::<Q>()
+            .expect("unexpected query type")
+    }
+
+    // A `LIKE` whose pattern literal is a wider string variant than the indexed
+    // column makes DataFusion's `like_coercion` promote *both* operands, which wraps
+    // the column in a `Cast`.  Unlike a comparison, no later pass unwraps that cast,
+    // so index discovery has to look through it or the predicate silently falls back
+    // to a full scan.
+    #[rstest]
+    #[case::utf8_view(ScalarValue::Utf8View(Some("%foobar%".to_string())))]
+    #[case::large_utf8(ScalarValue::LargeUtf8(Some("%foobar%".to_string())))]
+    #[case::utf8(ScalarValue::Utf8(Some("%foobar%".to_string())))]
+    fn test_planner_ngram_like_string_variants(#[case] pattern: ScalarValue) {
+        let index_info = ngram_index_info();
+        let plan = plan_filter(
+            Schema::new(vec![Field::new("color", DataType::Utf8, true)]),
+            like_expr(pattern),
+            &index_info,
+        );
+
+        assert_eq!(
+            expect_query::<TextQuery>(&plan),
+            &TextQuery::Regex(".*foobar.*".to_string())
+        );
+        assert!(plan.refine_expr.is_some());
+        assert!(!plan.skip_recheck);
+    }
+
+    // The emitted bound must carry the *indexed* column's string variant, not the
+    // pattern's: a `LargeUtf8` bound against `Utf8` page statistics compares as
+    // `None` in the zone map (pruning every zone) and fails the BTree's physical
+    // `LIKE`, which asserts both sides share a type.
+    #[rstest]
+    #[case::utf8_col_utf8_pattern(DataType::Utf8, ScalarValue::Utf8(Some("foo%".to_string())), ScalarValue::Utf8(Some("foo".to_string())))]
+    #[case::utf8_col_view_pattern(DataType::Utf8, ScalarValue::Utf8View(Some("foo%".to_string())), ScalarValue::Utf8(Some("foo".to_string())))]
+    #[case::utf8_col_large_pattern(DataType::Utf8, ScalarValue::LargeUtf8(Some("foo%".to_string())), ScalarValue::Utf8(Some("foo".to_string())))]
+    #[case::large_col_large_pattern(DataType::LargeUtf8, ScalarValue::LargeUtf8(Some("foo%".to_string())), ScalarValue::LargeUtf8(Some("foo".to_string())))]
+    #[case::large_col_view_pattern(DataType::LargeUtf8, ScalarValue::Utf8View(Some("foo%".to_string())), ScalarValue::LargeUtf8(Some("foo".to_string())))]
+    #[case::large_col_utf8_pattern(DataType::LargeUtf8, ScalarValue::Utf8(Some("foo%".to_string())), ScalarValue::LargeUtf8(Some("foo".to_string())))]
+    fn test_planner_like_prefix_normalizes_to_index_type(
+        #[case] column_type: DataType,
+        #[case] pattern: ScalarValue,
+        #[case] expected_prefix: ScalarValue,
+    ) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                column_type.clone(),
+                Box::new(SargableQueryParser::new(
+                    "color_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let plan = plan_filter(
+            Schema::new(vec![Field::new("color", column_type, true)]),
+            like_expr(pattern),
+            &index_info,
+        );
+
+        assert_eq!(
+            expect_query::<SargableQuery>(&plan),
+            &SargableQuery::LikePrefix(expected_prefix)
+        );
+        assert!(plan.refine_expr.is_none());
+        assert!(plan.skip_recheck);
+    }
+
+    // `regexp_like`'s per-argument coercible signature never unifies its arguments,
+    // so the flags literal reaches the parser with whatever string variant the
+    // caller built and the column is left uncast.  The flag is `s` rather than `i`
+    // because a case-insensitive pattern yields no usable trigram.
+    #[rstest]
+    #[case::utf8(ScalarValue::Utf8(Some("s".to_string())))]
+    #[case::large_utf8(ScalarValue::LargeUtf8(Some("s".to_string())))]
+    #[case::utf8_view(ScalarValue::Utf8View(Some("s".to_string())))]
+    fn test_planner_regexp_flags_string_variants(#[case] flags: ScalarValue) {
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, true)]);
+        let df_schema: DFSchema = schema.clone().try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let Expr::ScalarFunction(mut regexp_like) = ctx
+            .state()
+            .create_logical_expr("regexp_like(color, 'foobar', 's')", &df_schema)
+            .unwrap()
+        else {
+            panic!("expected regexp_like to parse as a scalar function");
+        };
+        regexp_like.args[2] = Expr::Literal(flags, None);
+
+        let index_info = ngram_index_info();
+        let plan = plan_filter(schema, Expr::ScalarFunction(regexp_like), &index_info);
+
+        assert_eq!(
+            expect_query::<TextQuery>(&plan),
+            &TextQuery::Regex("(?s)foobar".to_string())
+        );
+    }
+
+    // Looking through a cast is only sound while it stays inside the string types,
+    // which share a value domain and an ordering.  A cast that crosses out of them
+    // changes what the predicate means, so the index must not answer it.
+    #[test]
+    fn test_planner_rejects_cast_out_of_string_types() {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(SargableQueryParser::new(
+                    "color_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, true)]);
+        let planner = Planner::new(Arc::new(schema));
+        let expr = planner
+            .parse_filter("cast(color as bigint) is null")
+            .unwrap();
+        let plan = planner.create_filter_plan(expr, &index_info, true).unwrap();
+
+        assert!(plan.index_query.is_none());
+        assert_eq!(plan.refine_expr, plan.full_expr);
+    }
+
+    // The same guard from the other side: the cast target is a string type but the
+    // indexed values are not, so the index's ordering is not the string ordering.
+    #[test]
+    fn test_planner_rejects_cast_from_non_string_column() {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::LargeBinary,
+                Box::new(SargableQueryParser::new(
+                    "color_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let plan = plan_filter(
+            Schema::new(vec![Field::new("color", DataType::LargeBinary, true)]),
+            like_expr(ScalarValue::Utf8(Some("foo%".to_string()))),
+            &index_info,
+        );
+
+        assert!(plan.index_query.is_none());
     }
 
     #[test]
