@@ -24,6 +24,8 @@ use crate::metrics::MetricsCollector;
 
 #[path = "wand_intersection.rs"]
 mod intersection;
+#[path = "wand_lead_stream.rs"]
+mod lead_stream;
 #[path = "wand_maxscore.rs"]
 mod maxscore;
 
@@ -260,7 +262,13 @@ impl CompetitiveFloorMode {
 // skipping plus a slice-level merge over decompressed blocks, replacing the
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
 // LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto enables the
-// bulk path for two and three clauses and for wider current-format conjunctions.
+// bulk path for two and three clauses and for wider current-format conjunctions
+// whose posting lengths stay within `lead_stream::AND_SKEW_RATIO`. A stopword
+// paired with a rare term stays off N-way bulk: the merge would decompress
+// the dense list in every window. Skewed Auto conjunctions with three or more
+// clauses use a lead-stream instead; a skewed pair keeps classic leapfrog. The
+// lead-stream is separately switchable via LANCE_FTS_LEAD_STREAM=0, which sends
+// those conjunctions back to classic leapfrog.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BulkAndMode {
     #[default]
@@ -291,6 +299,15 @@ impl BulkAndMode {
         }
     }
 }
+
+// Lead-stream path for skewed Auto conjunctions of three or more clauses: the
+// rare list drives the walk and dense followers only seek to it, instead of
+// N-way bulk decompressing the dense list in every window. This is a third
+// execution mode rather than a variant of bulk or classic, so it has its own
+// switch: LANCE_FTS_LEAD_STREAM=0 sends those conjunctions down the classic
+// leapfrog instead. Results are identical either way; only the cost differs.
+static USE_LEAD_STREAM_SEARCH: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("LANCE_FTS_LEAD_STREAM").as_deref() != Ok("0"));
 
 fn bulk_and_mode_from_env() -> BulkAndMode {
     match std::env::var("LANCE_FTS_BULK_AND") {
@@ -2338,6 +2355,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     #[cfg(test)]
     bulk_and_searches: usize,
     #[cfg(test)]
+    lead_stream_and_searches: usize,
+    #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
     maxscore_general_windows: usize,
@@ -2447,6 +2466,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             bulk_and_mode_override: None,
             #[cfg(test)]
             bulk_and_searches: 0,
+            #[cfg(test)]
+            lead_stream_and_searches: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -2577,34 +2598,53 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return self.maxscore_search(params, metrics);
         }
 
-        // Top-k conjunctions (AND and phrase) over compressed lists use the
-        // bulk path: the same block-max window pruning, but candidates come
-        // from a slice-level merge over decompressed blocks instead of per-doc
-        // `next()` leapfrogging through boxed iterators.
+        // Top-k conjunctions (AND and phrase) over compressed lists: N-way
+        // bulk when Auto/On selects a balanced shape; leftover Auto (skewed
+        // 3+, including Wikipedia block-128 4+) uses a lead-stream so the
+        // rare list drives and dense followers only seek. Explicit Off and
+        // skewed pairs keep the classic per-doc leapfrog.
         if self.operator == Operator::And
             && !self.lead.is_empty()
             && self
                 .lead
                 .iter()
                 .all(|posting| posting.is_compressed() && !posting.has_grouped_terms())
-            && {
-                let mode = self
-                    .bulk_and_mode_override
-                    .unwrap_or_else(|| *BULK_AND_MODE);
-                mode.enabled_for(self.lead.len())
-                    || (mode == BulkAndMode::Auto
-                        && self.lead.len() >= 4
-                        && self.lead.iter().all(|posting| {
-                            matches!(&posting.list, PostingList::Compressed(list)
-                                if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
-                        }))
-            }
         {
-            #[cfg(test)]
-            {
-                self.bulk_and_searches += 1;
+            let mode = self
+                .bulk_and_mode_override
+                .unwrap_or_else(|| *BULK_AND_MODE);
+            let num_clauses = self.lead.len();
+            let min_cost = self.lead[0].cost();
+            let max_cost = self.lead.last().map(|posting| posting.cost()).unwrap_or(0);
+            let is_skewed = lead_stream::conjunction_lists_are_skewed(min_cost, max_cost);
+            let auto_wide_modern = mode == BulkAndMode::Auto
+                && num_clauses >= 4
+                && self.lead.iter().all(|posting| {
+                    matches!(&posting.list, PostingList::Compressed(list)
+                        if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+                });
+            let use_bulk = match mode {
+                BulkAndMode::On => true,
+                BulkAndMode::Off => false,
+                BulkAndMode::Auto => {
+                    !is_skewed && (mode.enabled_for(num_clauses) || auto_wide_modern)
+                }
+            };
+            if use_bulk {
+                #[cfg(test)]
+                {
+                    self.bulk_and_searches += 1;
+                }
+                return self.and_bulk_search(params, metrics);
             }
-            return self.and_bulk_search(params, metrics);
+            if *USE_LEAD_STREAM_SEARCH && mode == BulkAndMode::Auto && is_skewed && num_clauses >= 3
+            {
+                #[cfg(test)]
+                {
+                    self.lead_stream_and_searches += 1;
+                }
+                return self.and_lead_stream_search(params, metrics);
+            }
         }
 
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
@@ -10714,6 +10754,465 @@ mod tests {
         assert!(!bulk.0.is_empty(), "test corpus should produce matches");
         assert_eq!(bulk, classic);
         assert_eq!(auto, classic);
+    }
+
+    fn compressed_and_clause(
+        token: &str,
+        term_pos: u32,
+        query_weight: f32,
+        doc_ids: Vec<u32>,
+        num_docs: usize,
+    ) -> PostingIterator {
+        PostingIterator::with_query_weight(
+            token.to_owned(),
+            term_pos,
+            term_pos,
+            query_weight,
+            generate_posting_list(doc_ids, 8.0, None, true),
+            num_docs,
+        )
+    }
+
+    fn phrase_and_clause(
+        token: &str,
+        term_pos: u32,
+        query_weight: f32,
+        doc_ids: Vec<u32>,
+        num_docs: usize,
+    ) -> PostingIterator {
+        let positions = doc_ids
+            .iter()
+            .map(|&doc| {
+                if doc % 2 == 0 {
+                    vec![5 + term_pos, 40 + (doc % 3)]
+                } else {
+                    vec![20 + term_pos * 4]
+                }
+            })
+            .collect::<Vec<_>>();
+        PostingIterator::with_query_weight(
+            token.to_owned(),
+            term_pos,
+            term_pos,
+            query_weight,
+            generate_posting_list_with_positions(doc_ids, positions, 8.0, true),
+            num_docs,
+        )
+    }
+
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct AndHit {
+        document: u64,
+        posting_doc_id: u64,
+        doc_length: u32,
+        freqs: Vec<(u32, u32)>,
+    }
+
+    struct AndSearchDump {
+        rows: Vec<AndHit>,
+        bulk_searches: usize,
+        lead_stream_searches: usize,
+        kth_bits: u32,
+    }
+
+    fn run_and_search(
+        mode: BulkAndMode,
+        postings: Vec<PostingIterator>,
+        docs: &DocSet,
+        params: &FtsSearchParams,
+    ) -> AndSearchDump {
+        run_and_search_with_scorer(mode, postings, docs, params, UnitScorer)
+    }
+
+    /// Same as [`run_and_search`] but with a caller-supplied scorer, so a case
+    /// can use a length-dependent one instead of the length-blind `UnitScorer`.
+    fn run_and_search_with_scorer<S: Scorer>(
+        mode: BulkAndMode,
+        postings: Vec<PostingIterator>,
+        docs: &DocSet,
+        params: &FtsSearchParams,
+        scorer: S,
+    ) -> AndSearchDump {
+        let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), docs, scorer)
+            .with_bulk_and_mode(mode)
+            .with_shared_threshold(shared_floor.clone());
+        let mut rows = wand
+            .search(params, &NoOpMetricsCollector)
+            .unwrap()
+            .into_iter()
+            .map(|hit| AndHit {
+                document: hit.document,
+                posting_doc_id: hit.posting_doc_id,
+                doc_length: hit.doc_length,
+                freqs: hit.freqs,
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        AndSearchDump {
+            rows,
+            bulk_searches: wand.bulk_and_searches,
+            lead_stream_searches: wand.lead_stream_and_searches,
+            kth_bits: shared_floor.load(Ordering::Relaxed),
+        }
+    }
+
+    fn every_nth_docs(num_docs: u32, stride: u32) -> Vec<u32> {
+        (0..num_docs).step_by(stride as usize).collect()
+    }
+
+    /// Conjunction clause with explicit per-document frequencies. The plain
+    /// `compressed_and_clause` sets every frequency to 1, which makes the
+    /// frequency-bound LUT and the frequency pruning no-ops.
+    fn compressed_and_clause_with_freqs(
+        token: &str,
+        term_pos: u32,
+        query_weight: f32,
+        doc_ids: Vec<u32>,
+        freqs: Vec<u32>,
+        num_docs: usize,
+    ) -> PostingIterator {
+        PostingIterator::with_query_weight(
+            token.to_owned(),
+            term_pos,
+            term_pos,
+            query_weight,
+            generate_posting_list_with_freqs(doc_ids, freqs, 8.0, None, true),
+            num_docs,
+        )
+    }
+
+    #[test]
+    fn auto_keeps_bulk_when_cost_ratio_is_just_below_skew() {
+        // 496/16 = 31 < 32: balanced Auto 3-AND must stay on community bulk.
+        let num_docs = 496_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8);
+        }
+        let rare = every_nth_docs(num_docs, 31);
+        assert_eq!(num_docs as usize / rare.len(), 31);
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let mid: Vec<u32> = (0..num_docs).filter(|doc| doc % 2 == 0).collect();
+        let build = || {
+            vec![
+                compressed_and_clause("rare", 0, 3.0, rare.clone(), docs.len()),
+                compressed_and_clause("mid", 1, 2.0, mid.clone(), docs.len()),
+                compressed_and_clause("dense", 2, 1.0, dense.clone(), docs.len()),
+            ]
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let classic = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let auto = run_and_search(BulkAndMode::Auto, build(), &docs, &params);
+        let on = run_and_search(BulkAndMode::On, build(), &docs, &params);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(classic.bulk_searches, 0);
+        assert_eq!(classic.lead_stream_searches, 0);
+        assert_eq!(auto.bulk_searches, 1);
+        assert_eq!(auto.lead_stream_searches, 0);
+        assert_eq!(on.bulk_searches, 1);
+        assert_eq!(on.lead_stream_searches, 0);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(on.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+        assert_eq!(on.kth_bits, classic.kth_bits);
+    }
+
+    #[rstest]
+    #[case::three(3)]
+    #[case::six(6)]
+    fn auto_uses_lead_stream_for_skewed_and_and_matches_classic(#[case] num_clauses: usize) {
+        // 512/16 = 32: Auto n>=3 leaves bulk. On still forces bulk for parity.
+        let num_docs = 512_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8 + doc_id % 5);
+        }
+        let rare = every_nth_docs(num_docs, 32);
+        assert_eq!(num_docs as usize / rare.len(), 32);
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let mid: Vec<u32> = (0..num_docs).filter(|doc| doc % 2 == 0).collect();
+        let build = || {
+            let mut postings = vec![
+                compressed_and_clause("rare", 0, 4.0, rare.clone(), docs.len()),
+                compressed_and_clause("mid", 1, 2.0, mid.clone(), docs.len()),
+            ];
+            for term in 2..num_clauses {
+                postings.push(compressed_and_clause(
+                    &format!("d{term}"),
+                    term as u32,
+                    1.0,
+                    dense.clone(),
+                    docs.len(),
+                ));
+            }
+            postings
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let classic = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let auto = run_and_search(BulkAndMode::Auto, build(), &docs, &params);
+        let on = run_and_search(BulkAndMode::On, build(), &docs, &params);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(classic.bulk_searches, 0);
+        assert_eq!(classic.lead_stream_searches, 0);
+        assert_eq!(auto.bulk_searches, 0);
+        assert_eq!(auto.lead_stream_searches, 1);
+        assert_eq!(on.bulk_searches, 1);
+        assert_eq!(on.lead_stream_searches, 0);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(on.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+        assert_eq!(on.kth_bits, classic.kth_bits);
+    }
+
+    #[test]
+    fn auto_keeps_classic_leapfrog_for_skewed_pair() {
+        let num_docs = 512_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8);
+        }
+        let rare = every_nth_docs(num_docs, 32);
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let build = || {
+            vec![
+                compressed_and_clause("rare", 0, 3.0, rare.clone(), docs.len()),
+                compressed_and_clause("dense", 1, 1.0, dense.clone(), docs.len()),
+            ]
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let classic = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let auto = run_and_search(BulkAndMode::Auto, build(), &docs, &params);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(auto.bulk_searches, 0);
+        assert_eq!(auto.lead_stream_searches, 0);
+        assert_eq!(classic.lead_stream_searches, 0);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+    }
+
+    #[test]
+    fn lead_stream_follower_leap_matches_classic() {
+        // `mid` deliberately skips half of the rare documents, so
+        // `seek_lead_followers` has to return `Leap` and `skip_lead_docs` has to
+        // discard buffered lead documents. That branch is the only one that can
+        // silently drop or duplicate a document, and the other lead-stream cases
+        // never reach it: their followers land exactly on every lead document.
+        let num_docs = 512_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8 + doc_id % 5);
+        }
+        let rare = every_nth_docs(num_docs, 32);
+        let mid: Vec<u32> = (0..num_docs)
+            .filter(|doc| doc % 2 == 0 && (doc / 32) % 2 == 0)
+            .collect();
+        let dense: Vec<u32> = (0..num_docs).collect();
+        assert!(
+            rare.iter().any(|doc| !mid.contains(doc)),
+            "the fixture must leave some rare documents out of `mid` so the follower leaps"
+        );
+        assert!(
+            rare.iter().any(|doc| mid.contains(doc)),
+            "the fixture must keep some rare documents in `mid` so the follower also matches"
+        );
+        let build = || {
+            vec![
+                compressed_and_clause("rare", 0, 3.0, rare.clone(), docs.len()),
+                compressed_and_clause("mid", 1, 2.0, mid.clone(), docs.len()),
+                compressed_and_clause("dense", 2, 1.0, dense.clone(), docs.len()),
+            ]
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let classic = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let auto = run_and_search(BulkAndMode::Auto, build(), &docs, &params);
+        assert_eq!(auto.lead_stream_searches, 1);
+        assert_eq!(auto.bulk_searches, 0);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+    }
+
+    #[rstest]
+    #[case::three(3)]
+    #[case::four(4)]
+    fn lead_stream_matches_classic_with_length_dependent_scorer(#[case] num_clauses: usize) {
+        // The other lead-stream cases use `UnitScorer`, which ignores document
+        // length, and unit frequencies. Together those turn the frequency-bound
+        // LUT into a constant and leave the frequency pruning unreachable, so
+        // `freq_cannot_beat` and `matched_pair_cannot_beat_floor` never decide
+        // anything. This case scores real BM25 shapes over varied lengths and
+        // frequencies, and fills the heap (16 matches against a limit of 10) so a
+        // live floor actually drives those branches -- while still comparing the
+        // result against the classic walk.
+        let num_docs = 512_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 4 + doc_id % 23);
+        }
+        let rare = every_nth_docs(num_docs, 32);
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let half = (0..num_docs).step_by(2).collect::<Vec<_>>();
+        let quarter = (0..num_docs).step_by(4).collect::<Vec<_>>();
+        // Costs 16 / 512 / 256 (/ 128): the densest clause is 32x the rarest, so
+        // Auto routes to the lead-stream.
+        let build = || {
+            let mut postings = vec![
+                compressed_and_clause_with_freqs(
+                    "rare",
+                    0,
+                    3.0,
+                    rare.clone(),
+                    rare.iter().map(|doc| 20 + doc % 7).collect(),
+                    docs.len(),
+                ),
+                compressed_and_clause_with_freqs(
+                    "dense",
+                    1,
+                    1.0,
+                    dense.clone(),
+                    dense.iter().map(|doc| 2 + doc % 5).collect(),
+                    docs.len(),
+                ),
+                compressed_and_clause_with_freqs(
+                    "half",
+                    2,
+                    1.5,
+                    half.clone(),
+                    half.iter().map(|doc| 3 + doc % 4).collect(),
+                    docs.len(),
+                ),
+            ];
+            if num_clauses == 4 {
+                postings.push(compressed_and_clause_with_freqs(
+                    "quarter",
+                    3,
+                    1.2,
+                    quarter.clone(),
+                    quarter.iter().map(|doc| 4 + doc % 3).collect(),
+                    docs.len(),
+                ));
+            }
+            postings
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let classic = run_and_search_with_scorer(
+            BulkAndMode::Off,
+            build(),
+            &docs,
+            &params,
+            VariedBm25ShapeScorer,
+        );
+        let auto = run_and_search_with_scorer(
+            BulkAndMode::Auto,
+            build(),
+            &docs,
+            &params,
+            VariedBm25ShapeScorer,
+        );
+        assert_eq!(auto.lead_stream_searches, 1);
+        assert_eq!(auto.bulk_searches, 0);
+        assert_eq!(classic.rows.len(), 10);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+    }
+
+    /// The dispatch heuristic is a single threshold: at or above
+    /// `AND_SKEW_RATIO` (32x) a conjunction of three or more clauses takes the
+    /// lead-stream. Walk the ratio across that threshold for several clause
+    /// counts, checking both the routing and that the result still matches the
+    /// classic walk -- the flip point has to be a pure cost decision.
+    #[rstest]
+    #[case::r8(8_usize, 2)]
+    #[case::r16(16, 2)]
+    #[case::r32(32, 2)]
+    #[case::r64(64, 2)]
+    #[case::r8_n3(8, 3)]
+    #[case::r16_n3(16, 3)]
+    #[case::r32_n3(32, 3)]
+    #[case::r64_n3(64, 3)]
+    #[case::r128_n3(128, 3)]
+    #[case::r32_n4(32, 4)]
+    #[case::r128_n4(128, 4)]
+    fn lead_stream_dispatch_follows_the_skew_ratio(
+        #[case] ratio: usize,
+        #[case] num_clauses: usize,
+    ) {
+        // Always include the rarest clause (stride `ratio`, so 8 documents) and
+        // the densest (`num_docs`), which pins max/min at exactly `ratio` for
+        // every clause count. Extra clauses sit between them.
+        let num_docs = (8 * ratio) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8 + doc_id % 5);
+        }
+        let mut strides = vec![ratio, 1];
+        for extra in [2_usize, 4] {
+            if strides.len() < num_clauses {
+                strides.push(extra);
+            }
+        }
+        let build = || {
+            (0..num_clauses)
+                .map(|clause| {
+                    let doc_ids = (0..num_docs).step_by(strides[clause]).collect::<Vec<_>>();
+                    compressed_and_clause(
+                        &format!("c{clause}"),
+                        clause as u32,
+                        1.0,
+                        doc_ids,
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let classic = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let auto = run_and_search(BulkAndMode::Auto, build(), &docs, &params);
+
+        let expects_lead_stream = ratio >= 32 && num_clauses >= 3;
+        assert_eq!(
+            auto.lead_stream_searches,
+            usize::from(expects_lead_stream),
+            "ratio {ratio} with {num_clauses} clauses"
+        );
+        assert!(!classic.rows.is_empty());
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+    }
+
+    #[rstest]
+    #[case::slop0(0_u32)]
+    #[case::slop3(3)]
+    fn lead_stream_phrase_matches_classic_and_bulk(#[case] slop: u32) {
+        let num_docs = 512_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8);
+        }
+        let rare = every_nth_docs(num_docs, 32);
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let mid: Vec<u32> = (0..num_docs).filter(|doc| doc % 2 == 0).collect();
+        let build = || {
+            vec![
+                phrase_and_clause("rare", 0, 3.0, rare.clone(), docs.len()),
+                phrase_and_clause("mid", 1, 2.0, mid.clone(), docs.len()),
+                phrase_and_clause("dense", 2, 1.0, dense.clone(), docs.len()),
+            ]
+        };
+        let mut params = FtsSearchParams::default().with_limit(Some(10));
+        params.phrase_slop = Some(slop);
+        let classic = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let auto = run_and_search(BulkAndMode::Auto, build(), &docs, &params);
+        let on = run_and_search(BulkAndMode::On, build(), &docs, &params);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(auto.bulk_searches, 0);
+        assert_eq!(auto.lead_stream_searches, 1);
+        assert_eq!(on.bulk_searches, 1);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(on.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+        assert_eq!(on.kth_bits, classic.kth_bits);
     }
 
     #[rstest]
