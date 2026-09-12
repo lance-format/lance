@@ -265,16 +265,26 @@ jobs:
         run: cargo nextest run --cargo-profile ci
 
   qemu-pre-haswell:
-    # Verifies that lance-linalg's runtime SIMD dispatch still works
-    # correctly when the binary is built with the lower x86-64-v2 baseline
-    # (the legacy build path documented in CONTRIBUTING.md). Emulates a
-    # Nehalem CPU under qemu-user; catches any accidental AVX2/FMA
-    # instructions that leak past the runtime dispatch.
+    # Builds lance-linalg's lib tests once in release mode and runs them twice: on
+    # the runner's own CPU, and under qemu emulating a Nehalem.
     #
-    # The published-wheel default baseline (`target-cpu=haswell`) is set in
-    # `.cargo/config.toml`; this job overrides RUSTFLAGS for one job to
-    # exercise the legacy path without affecting any other build.
-    name: pre-Haswell SIGILL check (qemu Nehalem)
+    # Release mode, not the `ci` profile the other test jobs use: `ci` inherits
+    # `dev`, so the Rust there compiles at opt-level 0.
+    #
+    # The qemu run is the pre-Haswell check: it verifies that runtime SIMD
+    # dispatch still works when the binary is built with the lower x86-64-v2
+    # baseline (the legacy build path documented in CONTRIBUTING.md), and catches
+    # any accidental AVX2/FMA instructions that leak past the dispatch. A Nehalem
+    # fails every feature gate, so that run takes the fallback arms; the native
+    # run is there to reach the SIMD arms a Nehalem cannot.
+    #
+    # `test_x86_runtime_feature_report` writes the features each run detected to
+    # stderr. Both runs use default features, so `fp16kernels` is off.
+    #
+    # The x86_64-linux baseline (`target-cpu=haswell`) comes from
+    # `.cargo/config.toml`; this job overrides RUSTFLAGS to exercise the legacy
+    # path, which affects only this job.
+    name: lance-linalg release tests (native + qemu Nehalem)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -299,6 +309,18 @@ jobs:
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
         with:
           tool: protoc
+      # Ordered before the QEMU build so a failure there cannot skip the native
+      # run: a step runs only if the ones before it succeeded.
+      - name: Build lance-linalg lib tests in release mode
+        run: |
+          cargo test --release -p lance-linalg --lib --no-run
+      # `env` is a no-op runner: it overrides the job-level qemu runner for this
+      # step, so the binary built above runs on the runner's own CPU.
+      - name: Run lance-linalg lib tests on the runner's own CPU
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: env
+        run: |
+          cargo test --release -p lance-linalg --lib
       - name: Install QEMU build dependencies
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
@@ -348,9 +370,6 @@ jobs:
             echo "Expected QEMU 8.2.10, got: ${QEMU_VERSION_OUTPUT}" >&2
             exit 1
           fi
-      - name: Build lance-linalg lib tests in release mode
-        run: |
-          cargo test --release -p lance-linalg --lib --no-run
       - name: Run lance-linalg lib tests under qemu Nehalem
         run: |
           cargo test --release -p lance-linalg --lib
