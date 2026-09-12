@@ -3,30 +3,47 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence, Union
 
 import pyarrow as pa
 from pyarrow import RecordBatch
+from pyarrow.dataset import Dataset as ArrowDataset
+from pyarrow.dataset import Scanner as ArrowScanner
 
-from . import dataset
 from .dependencies import (
     _check_for_hugging_face,
     _check_for_pandas,
+    _check_for_polars,
     _is_pydantic_base_model,
     _validate_pydantic_list,
     model_to_dict,
 )
 from .dependencies import pandas as pd
+from .dependencies import polars as pl
 
 if TYPE_CHECKING:
+    from .dependencies import datasets, pydantic
+
+    # Keep in step with the branches of ``_coerce_reader``: every input coerced
+    # there needs a member here, and every member here needs a branch there.
+    # The container members are the covariant spellings so that, say, a
+    # ``list[MyModel]`` is accepted; ``_coerce_reader`` narrows them to ``dict``
+    # and ``list`` and reports anything else it cannot read.
     ReaderLike = Union[
-        pd.Timestamp,
+        pd.DataFrame,
+        pl.DataFrame,
         pa.Table,
-        pa.dataset.Dataset,
-        pa.dataset.Scanner,
         pa.RecordBatch,
-        Iterable[RecordBatch],
         pa.RecordBatchReader,
+        # ``LanceDataset`` is an ``ArrowDataset`` subclass.
+        ArrowDataset,
+        ArrowScanner,
+        datasets.Dataset,
+        datasets.IterableDataset,
+        Mapping[str, Any],
+        Sequence[Mapping[str, Any]],
+        Sequence[pydantic.BaseModel],
+        Iterable[RecordBatch],
     ]
 
 
@@ -70,10 +87,7 @@ def _is_materialized(data_obj: ReaderLike) -> bool:
         return True
     if isinstance(data_obj, (pa.Table, pa.RecordBatch)):
         return True
-    if (
-        type(data_obj).__module__.startswith("polars")
-        and data_obj.__class__.__name__ == "DataFrame"
-    ):
+    if _check_for_polars(data_obj) and isinstance(data_obj, pl.DataFrame):
         return True
     if isinstance(data_obj, dict):
         return True
@@ -89,24 +103,25 @@ def _is_materialized(data_obj: ReaderLike) -> bool:
 def _coerce_reader(
     data_obj: ReaderLike, schema: Optional[pa.Schema] = None
 ) -> pa.RecordBatchReader:
+    # Imported here because ``lance.dataset`` imports this module, and because
+    # the ``lance.dataset`` name is also bound to a function in ``lance``.
+    from .dataset import LanceDataset
+
     if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):
         return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
     elif isinstance(data_obj, pa.Table):
         return data_obj.to_reader()
     elif isinstance(data_obj, pa.RecordBatch):
         return pa.Table.from_batches([data_obj]).to_reader()
-    elif isinstance(data_obj, dataset.LanceDataset):
+    elif isinstance(data_obj, LanceDataset):
         return data_obj.scanner().to_reader()
-    elif isinstance(data_obj, pa.dataset.Dataset):
-        return pa.dataset.Scanner.from_dataset(data_obj).to_reader()
-    elif isinstance(data_obj, pa.dataset.Scanner):
+    elif isinstance(data_obj, ArrowDataset):
+        return ArrowScanner.from_dataset(data_obj).to_reader()
+    elif isinstance(data_obj, ArrowScanner):
         return data_obj.to_reader()
     elif isinstance(data_obj, pa.RecordBatchReader):
         return data_obj
-    elif (
-        type(data_obj).__module__.startswith("polars")
-        and data_obj.__class__.__name__ == "DataFrame"
-    ):
+    elif _check_for_polars(data_obj) and isinstance(data_obj, pl.DataFrame):
         return data_obj.to_arrow().to_reader()
     elif _check_for_hugging_face(data_obj):
         from .dependencies import datasets as hf_datasets

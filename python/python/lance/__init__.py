@@ -72,13 +72,10 @@ from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
 if TYPE_CHECKING:
-    from datetime import datetime
     from pathlib import Path
 
     from lance.commit import CommitLock
-    from lance.dependencies import pandas as pd
-
-    ts_types = Union[datetime, pd.Timestamp, str]
+    from lance.util import ts_types
 
 
 __all__ = [
