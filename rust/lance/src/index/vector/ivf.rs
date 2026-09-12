@@ -1109,6 +1109,7 @@ async fn optimize_ivf_pq_indices(
         IndexFile {
             path: INDEX_FILE_NAME.to_string(),
             size_bytes,
+            file_metadata_size_bytes: None,
         },
     ))
 }
@@ -1268,10 +1269,12 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
             IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: index_size,
+                file_metadata_size_bytes: None,
             },
             IndexFile {
                 path: INDEX_AUXILIARY_FILE_NAME.to_string(),
                 size_bytes: aux_size,
+                file_metadata_size_bytes: None,
             },
         ],
     ))
@@ -2237,6 +2240,7 @@ pub(crate) async fn remap_index_file(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 
@@ -2305,6 +2309,7 @@ async fn write_ivf_pq_file(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 
@@ -2853,6 +2858,7 @@ async fn write_root_vector_index_from_auxiliary(
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes: summary.size_bytes,
+        file_metadata_size_bytes: None,
     })
 }
 

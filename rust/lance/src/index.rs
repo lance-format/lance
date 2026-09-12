@@ -3825,6 +3825,7 @@ mod tests {
             files: Some(vec![lance_table::format::IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
+                file_metadata_size_bytes: None,
             }]),
         }
     }

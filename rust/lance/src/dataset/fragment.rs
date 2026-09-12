@@ -6989,6 +6989,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 1,
             file_size_bytes: CachedFileSize::unknown(),
+            file_metadata_size_bytes: None,
             base_id: None,
         };
 

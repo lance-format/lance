@@ -144,6 +144,7 @@ impl FromJObjectWithEnv<IndexFile> for JObject<'_> {
                 "newIndexFiles.sizeBytes",
                 env.call_method(self, "getSizeBytes", "()J", &[])?.j()?,
             )?,
+            file_metadata_size_bytes: None,
         })
     }
 }

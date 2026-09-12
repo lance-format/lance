@@ -1857,10 +1857,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             IndexFile {
                 path: INDEX_AUXILIARY_FILE_NAME.to_string(),
                 size_bytes: storage_summary.size_bytes,
+                file_metadata_size_bytes: None,
             },
             IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: index_summary.size_bytes,
+                file_metadata_size_bytes: None,
             },
         ])
     }
