@@ -3697,6 +3697,7 @@ mod tests {
         use arrow_array::{
             Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StructArray, UInt64Array,
         };
+        use arrow_buffer::NullBuffer;
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
         use lance_file::version::LanceFileVersion;
@@ -4906,6 +4907,58 @@ mod tests {
             assert_eq!(y.values(), &[100, 888]);
         }
 
+        /// A struct overlay replaces the struct cell itself, including its validity,
+        /// rather than only replacing the child values.
+        #[tokio::test]
+        async fn test_nullable_struct_overlay_end_to_end() {
+            let version = LanceFileVersion::V2_1;
+            let struct_fields = Fields::from(vec![ArrowField::new("x", DataType::Int32, true)]);
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "info",
+                DataType::Struct(struct_fields.clone()),
+                true,
+            )]));
+            let base_info = Arc::new(StructArray::new(
+                struct_fields.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+                Some(NullBuffer::from(vec![false, true])),
+            ));
+            let batch = RecordBatch::try_new(schema.clone(), vec![base_info]).unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+            let dataset = Dataset::write(
+                reader,
+                "memory://",
+                Some(WriteParams {
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+            let overlay_info = Arc::new(StructArray::new(
+                struct_fields,
+                vec![Arc::new(Int32Array::from(vec![10, 20]))],
+                Some(NullBuffer::from(vec![true, false])),
+            )) as ArrayRef;
+            let dataset = commit_overlay(
+                dataset,
+                "nullable_struct",
+                0,
+                &[0],
+                OverlayCoverage::dense(bitmap([0, 1])),
+                vec![overlay_info],
+                version,
+            )
+            .await;
+
+            let batch = dataset.scan().try_into_batch().await.unwrap();
+            let info = struct_col(&batch, "info");
+            assert_eq!(i32_child(info, 0).values(), &[10, 20]);
+            assert!(!info.is_null(0));
+            assert!(info.is_null(1));
+        }
+
         /// A top-level list column resolves through overlays the same way — the
         /// overlay's leaf (item) id maps back to the top-level list, and the whole
         /// list value at a covered offset is replaced.
@@ -5150,11 +5203,11 @@ mod tests {
             assert_eq!(i32_child(s, 1).values(), &[100, 200]);
         }
 
-        /// An overlay on a non-projected sibling leaf must be skipped and its file
-        /// never opened: overlay covers `s.b`, but the read projects only `s.a`.
+        /// An overlay on a non-projected sibling leaf contributes shared struct
+        /// validity, but its child value remains pruned from the result.
         #[rstest]
         #[tokio::test]
-        async fn test_overlay_nonprojected_sibling_skipped(
+        async fn test_overlay_nonprojected_sibling_value_pruned(
             #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
         ) {
             let (dataset, _) = create_struct_dataset(version).await;
@@ -5174,18 +5227,14 @@ mod tests {
                 version,
             )
             .await;
-            // Delete the overlay file: if projecting only `s.a` opened it, this fails.
-            dataset
-                .object_store
-                .delete(&Path::from("data/bov.lance"))
-                .await
-                .unwrap();
 
             let frag = dataset.get_fragment(0).unwrap();
             let a_only = dataset.schema().project_by_ids(&[2], true);
             let batch = frag.take(&[1, 2], &a_only).await.unwrap();
             let s = struct_col(&batch, "s");
-            // Only `a` is projected, unchanged base values.
+            // Only `a` is projected, so the sibling value remains absent and `a`
+            // retains its unchanged base values.
+            assert_eq!(s.num_columns(), 1);
             assert_eq!(i32_child(s, 0).values(), &[1, 2]);
         }
 
@@ -5252,6 +5301,58 @@ mod tests {
             assert_eq!(i32_child(s, 1).values(), &[800]); // `b` from its own overlay
         }
 
+        /// Struct validity shared by independently overlaid children follows the
+        /// same newest-overlay precedence as values.
+        #[tokio::test]
+        async fn test_struct_validity_uses_newest_child_overlay() {
+            let version = LanceFileVersion::V2_1;
+            let (dataset, _) = create_struct_dataset(version).await;
+            let b_field = Fields::from(vec![ArrowField::new("b", DataType::Int32, true)]);
+            let dataset = commit_overlay(
+                dataset,
+                "b_null",
+                0,
+                &[3],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![Arc::new(StructArray::new(
+                    b_field,
+                    vec![Arc::new(Int32Array::from(vec![800]))],
+                    Some(NullBuffer::from(vec![false])),
+                )) as ArrayRef],
+                version,
+            )
+            .await;
+
+            let a_field = Fields::from(vec![ArrowField::new("a", DataType::Int32, true)]);
+            let dataset = commit_overlay(
+                dataset,
+                "a_valid",
+                0,
+                &[2],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![Arc::new(StructArray::new(
+                    a_field,
+                    vec![Arc::new(Int32Array::from(vec![999]))],
+                    Some(NullBuffer::from(vec![true])),
+                )) as ArrayRef],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[2], &full_schema(&dataset)).await.unwrap();
+            let s = struct_col(&batch, "s");
+            assert_eq!(i32_child(s, 0).values(), &[999]);
+            assert!(s.is_valid(0));
+
+            // Projecting only the older `b` value must still consult the newer
+            // `a` overlay for their shared parent validity.
+            let b_only = dataset.schema().project_by_ids(&[3], true);
+            let batch = frag.take(&[2], &b_only).await.unwrap();
+            let s = struct_col(&batch, "s");
+            assert!(s.is_valid(0));
+        }
+
         /// Three levels of nesting: `outer { middle { a, b } }`. An overlay on the
         /// deep leaf `outer.middle.a` splices correctly when the whole `outer` is read.
         #[rstest]
@@ -5273,15 +5374,17 @@ mod tests {
                 ArrowField::new("outer", DataType::Struct(outer_fields.clone()), true),
             ]));
             // Field ids: outer=1, middle=2, a=3, b=4.
+            let base_validity = (version == LanceFileVersion::V2_1)
+                .then(|| NullBuffer::from(vec![true, true, false, true, true, true]));
             let middle = Arc::new(StructArray::new(
                 mid_fields.clone(),
                 vec![
                     Arc::new(Int32Array::from_iter_values(0..6)),
                     Arc::new(Int32Array::from_iter_values((0..6).map(|v| v * 100))),
                 ],
-                None,
+                base_validity.clone(),
             ));
-            let outer = Arc::new(StructArray::new(outer_fields, vec![middle], None));
+            let outer = Arc::new(StructArray::new(outer_fields, vec![middle], base_validity));
             let batch = RecordBatch::try_new(
                 schema.clone(),
                 vec![Arc::new(Int32Array::from_iter_values(0..6)), outer],
@@ -5336,6 +5439,10 @@ mod tests {
             // a: offset 1 base (1), offset 2 overlaid (777); b untouched.
             assert_eq!(i32_child(middle, 0).values(), &[1, 777]);
             assert_eq!(i32_child(middle, 1).values(), &[100, 200]);
+            if version == LanceFileVersion::V2_1 {
+                assert!(outer.is_valid(1));
+                assert!(middle.is_valid(1));
+            }
 
             // Projecting the *intermediate* struct `outer.middle` (field id 2) while
             // the overlay targets a deeper field (id 3) must still apply: the
