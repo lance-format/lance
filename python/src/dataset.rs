@@ -2080,6 +2080,7 @@ impl Dataset {
                 .unwrap();
                 let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
                 dict.set_item("metadata", tup.into_py_dict(py)?).unwrap();
+                dict.set_item("manifest_size", v.manifest_size).unwrap();
                 dict.into_py_any(py)
             })
             .collect::<PyResult<Vec<_>>>()?;
