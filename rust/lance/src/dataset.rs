@@ -2420,6 +2420,8 @@ impl Dataset {
         }
 
         let file_size_nz = NonZero::new(file_size);
+        let metadata_size_bytes = NonZero::new(file_metadata.metadata_size_bytes())
+            .ok_or_else(|| Error::internal("opened file has an empty metadata suffix"))?;
         Ok(DataFile::new(
             path,
             fields,
@@ -2427,7 +2429,8 @@ impl Dataset {
             lance_file_format,
             file_size_nz,
             base_id,
-        ))
+        )
+        .with_file_metadata_size_bytes(metadata_size_bytes))
     }
 
     /// Resolve the data directory for a given base_id.

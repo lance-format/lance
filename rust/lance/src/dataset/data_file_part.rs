@@ -38,6 +38,8 @@ pub struct DataFilePart {
     pub(super) blob_ids: Option<Range<u32>>,
     pub(super) num_rows: u64,
     pub(super) size_bytes: NonZeroU64,
+    #[serde(default)]
+    pub(super) metadata_size_bytes: Option<NonZeroU64>,
 }
 
 impl DataFilePart {
@@ -49,6 +51,11 @@ impl DataFilePart {
     /// Expected complete file size, verified during assembly.
     pub fn size_bytes(&self) -> u64 {
         self.size_bytes.get()
+    }
+
+    /// Expected metadata suffix size, when recorded by the part writer.
+    pub fn metadata_size_bytes(&self) -> Option<u64> {
+        self.metadata_size_bytes.map(NonZeroU64::get)
     }
 
     pub(super) async fn open_all(
@@ -117,13 +124,13 @@ impl DataFilePart {
             let file = scheduler
                 .open_file(&path, &CachedFileSize::new(size))
                 .await?;
+            let mut input = EncodedFileInput::new(file).with_expected_num_rows(part.num_rows());
+            if let Some(metadata_size_bytes) = part.metadata_size_bytes {
+                input = input.with_metadata_size_bytes(metadata_size_bytes);
+            }
             opened.push(
-                OpenedDataFilePart::open(
-                    EncodedFileInput::new(file).with_expected_num_rows(part.num_rows()),
-                    part.blob_ids.clone(),
-                    target.blob_target_id(),
-                )
-                .await?,
+                OpenedDataFilePart::open(input, part.blob_ids.clone(), target.blob_target_id())
+                    .await?,
             );
         }
         Ok(opened)

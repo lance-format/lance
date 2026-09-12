@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::{BufMut, Bytes};
-use lance_core::{Result, datatypes::Schema};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_encoding::{
     compression_config::CompressionParams,
     encoder::{BatchEncoder, EncodedBatch},
@@ -17,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 use crate::{
     format::{MAGIC, pbfile},
     writer::{
-        FileWriteSummary, FileWriterOptions,
+        FileWriteResult, FileWriteSummary, FileWriterOptions,
         structural::{EncodedBatchBody, EncodingPipeline, StructuralFileSink, encode_batch_body},
     },
 };
@@ -150,12 +150,21 @@ impl Writer {
 
     /// Finish the v2.3 file and close its object writer.
     pub async fn finish(&mut self) -> Result<FileWriteSummary> {
+        Ok(self.finish_with_metadata_size().await?.summary())
+    }
+
+    /// Finish the v2.3 file and return the exact metadata suffix size.
+    pub async fn finish_with_metadata_size(&mut self) -> Result<FileWriteResult> {
         // The order below is the v2.3 wire contract.
         self.encoding.flush(&mut self.sink).await?;
         self.encoding.finish_encoders(&mut self.sink).await?;
 
         let descriptor = self.encoding.make_file_descriptor()?;
         let global_buffer_offsets = self.sink.write_global_buffers(descriptor).await?;
+        let metadata_start = global_buffer_offsets
+            .first()
+            .map(|(position, _)| *position)
+            .ok_or_else(|| Error::internal("schema descriptor was not written"))?;
         let num_global_buffers = global_buffer_offsets.len() as u32;
 
         let column_metadata_start = self.sink.tell().await?;
@@ -178,10 +187,11 @@ impl Writer {
         output.write_u16_le(3).await?;
         output.write_all(MAGIC).await?;
 
-        Ok(FileWriteSummary {
+        let summary = FileWriteSummary {
             num_rows: self.encoding.rows_written(),
             size_bytes: self.sink.shutdown().await?,
-        })
+        };
+        FileWriteResult::try_new(summary, metadata_start)
     }
 
     /// Abandon this write.

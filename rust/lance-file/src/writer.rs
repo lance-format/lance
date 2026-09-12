@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{num::NonZero, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use bytes::Bytes;
-use lance_core::{Result, datatypes::Schema};
+use lance_core::{Error, Result, datatypes::Schema};
 use lance_encoding::decoder::{ColumnInfo, PageEncoding};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
@@ -27,6 +27,44 @@ pub struct FileWriteSummary {
     pub num_rows: u64,
     /// The final size of the file in bytes.
     pub size_bytes: u64,
+}
+
+/// Result of a completed current-format Lance file write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileWriteResult {
+    /// The existing summary of the completed write.
+    summary: FileWriteSummary,
+    /// The exact number of bytes from the schema descriptor through EOF.
+    metadata_size_bytes: NonZero<u64>,
+}
+
+impl FileWriteResult {
+    /// Return the row count and total file size.
+    pub fn summary(&self) -> FileWriteSummary {
+        self.summary
+    }
+
+    /// Return the exact number of bytes from the schema descriptor through EOF.
+    pub fn metadata_size_bytes(&self) -> NonZero<u64> {
+        self.metadata_size_bytes
+    }
+
+    pub(crate) fn try_new(summary: FileWriteSummary, metadata_start: u64) -> Result<Self> {
+        let metadata_size_bytes = summary
+            .size_bytes
+            .checked_sub(metadata_start)
+            .and_then(NonZero::new)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "invalid metadata suffix: metadata_start={}, file_size={}",
+                    metadata_start, summary.size_bytes
+                ))
+            })?;
+        Ok(Self {
+            summary,
+            metadata_size_bytes,
+        })
+    }
 }
 
 /// Runtime options shared by all current-format writers.
@@ -235,11 +273,16 @@ impl FileWriter {
 
     /// Finish the file and close its object writer.
     pub async fn finish(&mut self) -> Result<FileWriteSummary> {
+        Ok(self.finish_with_metadata_size().await?.summary())
+    }
+
+    /// Finish the file and return the exact metadata suffix size.
+    pub async fn finish_with_metadata_size(&mut self) -> Result<FileWriteResult> {
         match self {
-            Self::V2_0(writer) => writer.finish().await,
-            Self::V2_1(writer) => writer.finish().await,
-            Self::V2_2(writer) => writer.finish().await,
-            Self::V2_3(writer) => writer.finish().await,
+            Self::V2_0(writer) => writer.finish_with_metadata_size().await,
+            Self::V2_1(writer) => writer.finish_with_metadata_size().await,
+            Self::V2_2(writer) => writer.finish_with_metadata_size().await,
+            Self::V2_3(writer) => writer.finish_with_metadata_size().await,
         }
     }
 

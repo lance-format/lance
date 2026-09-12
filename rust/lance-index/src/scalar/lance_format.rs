@@ -12,7 +12,9 @@ use futures::TryStreamExt;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::{FileReader as CurrentFileReader, FileReaderOptions};
+use lance_file::reader::{
+    FileReader as CurrentFileReader, FileReaderOptions, FullMetadataReadOptions,
+};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::versions::{self, OpenedFileReader};
@@ -25,8 +27,15 @@ use lance_table::format::list_index_files_with_sizes;
 use object_store::path::Path;
 use std::cmp::min;
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::{any::Any, sync::Arc};
+
+#[derive(Debug, Clone, Copy)]
+struct IndexFileOpenHint {
+    size_bytes: u64,
+    file_metadata_size_bytes: Option<NonZeroU64>,
+}
 
 /// An index store that serializes scalar indices using the lance format
 ///
@@ -39,11 +48,11 @@ pub struct LanceIndexStore {
     index_dir: Path,
     metadata_cache: Arc<LanceCache>,
     scheduler: Arc<ScanScheduler>,
-    /// Cached file sizes (filename -> size in bytes)
-    /// When set, used to avoid HEAD calls when opening files
+    /// Cached file information keyed by relative path.
+    /// When set, sizes avoid HEAD calls and metadata suffix sizes avoid dependent reads.
     // Partition priority views share this immutable map. Cloning all file names
     // for every partition would make request rebinding quadratic in partitions.
-    file_sizes: Arc<HashMap<String, u64>>,
+    files: Arc<HashMap<String, IndexFileOpenHint>>,
     format_version: ConcreteFileVersion,
     /// Base I/O priority for all requests this store submits to `scheduler`.
     io_priority: u64,
@@ -91,7 +100,7 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
-            file_sizes: Arc::default(),
+            files: Arc::default(),
             format_version,
             io_priority: 0,
         }
@@ -101,8 +110,35 @@ impl LanceIndexStore {
     ///
     /// The map should contain relative paths (e.g., "index.idx") as keys
     /// and file sizes in bytes as values.
-    pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
-        self.file_sizes = Arc::new(file_sizes);
+    pub fn with_file_sizes(self, file_sizes: HashMap<String, u64>) -> Self {
+        self.with_index_files(
+            file_sizes
+                .into_iter()
+                .map(|(path, size_bytes)| IndexFile {
+                    path,
+                    size_bytes,
+                    file_metadata_size_bytes: None,
+                })
+                .collect(),
+        )
+    }
+
+    /// Set cached information for files already recorded in an index manifest.
+    pub fn with_index_files(mut self, files: Vec<IndexFile>) -> Self {
+        self.files = Arc::new(
+            files
+                .into_iter()
+                .map(|file| {
+                    (
+                        file.path,
+                        IndexFileOpenHint {
+                            size_bytes: file.size_bytes,
+                            file_metadata_size_bytes: file.file_metadata_size_bytes,
+                        },
+                    )
+                })
+                .collect(),
+        );
         self
     }
 
@@ -148,10 +184,12 @@ impl IndexWriter for LanceIndexWriter {
     }
 
     async fn finish(&mut self) -> Result<IndexFile> {
-        let summary = self.inner.finish().await?;
+        let result = self.inner.finish_with_metadata_size().await?;
+        let summary = result.summary();
         Ok(IndexFile {
             path: self.path.clone(),
             size_bytes: summary.size_bytes,
+            file_metadata_size_bytes: Some(result.metadata_size_bytes()),
         })
     }
 
@@ -162,10 +200,12 @@ impl IndexWriter for LanceIndexWriter {
         metadata.into_iter().for_each(|(k, v)| {
             self.inner.add_schema_metadata(k, v);
         });
-        let summary = self.inner.finish().await?;
+        let result = self.inner.finish_with_metadata_size().await?;
+        let summary = result.summary();
         Ok(IndexFile {
             path: self.path.clone(),
             size_bytes: summary.size_bytes,
+            file_metadata_size_bytes: Some(result.metadata_size_bytes()),
         })
     }
 }
@@ -452,19 +492,27 @@ impl IndexStore for LanceIndexStore {
         let path = self.index_file_path(name)?;
         // Use cached file size if available, otherwise unknown (requires HEAD call)
         let cached_size = self
-            .file_sizes
+            .files
             .get(name)
-            .map(|&size| CachedFileSize::new(size))
+            .map(|file| CachedFileSize::new(file.size_bytes))
             .unwrap_or_else(CachedFileSize::unknown);
         let file_scheduler = self
             .scheduler
             .open_file_with_priority(&path, self.io_priority, &cached_size)
             .await?;
-        match versions::open_self_described_reader(
+        let metadata_options = self
+            .files
+            .get(name)
+            .and_then(|file| file.file_metadata_size_bytes)
+            .map_or_else(FullMetadataReadOptions::default, |metadata_size_bytes| {
+                FullMetadataReadOptions::default().with_metadata_size_bytes(metadata_size_bytes)
+            });
+        match versions::open_self_described_reader_with_metadata_options(
             file_scheduler,
             Arc::<DecoderPlugins>::default(),
             &self.metadata_cache,
             FileReaderOptions::default(),
+            metadata_options,
         )
         .await?
         {
@@ -503,6 +551,10 @@ impl IndexStore for LanceIndexStore {
                 Ok(IndexFile {
                     path: new_name.to_string(),
                     size_bytes: result.size as u64,
+                    file_metadata_size_bytes: self
+                        .files
+                        .get(name)
+                        .and_then(|file| file.file_metadata_size_bytes),
                 })
             }
             _ => {
@@ -532,6 +584,10 @@ impl IndexStore for LanceIndexStore {
         Ok(IndexFile {
             path: new_name.to_string(),
             size_bytes: result.size as u64,
+            file_metadata_size_bytes: self
+                .files
+                .get(name)
+                .and_then(|file| file.file_metadata_size_bytes),
         })
     }
 
@@ -547,6 +603,7 @@ impl IndexStore for LanceIndexStore {
             .map(|f| IndexFile {
                 path: f.path,
                 size_bytes: f.size_bytes,
+                file_metadata_size_bytes: f.file_metadata_size_bytes,
             })
             .collect())
     }
@@ -709,6 +766,53 @@ mod tests {
         let actual = reader.read_global_buffer(buffer_idx).await.unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn metadata_hint_removes_scalar_index_footer_dependency() {
+        let tempdir = TempDir::default();
+        let (object_store, index_dir) = ObjectStore::from_uri(tempdir.obj_path().as_ref())
+            .await
+            .unwrap();
+        let file_name = "metadata.lance";
+        let mut schema = Schema::empty();
+        schema.metadata.insert(
+            "large_metadata".to_string(),
+            "x".repeat(2 * object_store.block_size()),
+        );
+        let write_store = LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let mut writer = write_store
+            .new_index_file(file_name, Arc::new(schema))
+            .await
+            .unwrap();
+        let index_file = writer.finish().await.unwrap();
+        let metadata_size = index_file.file_metadata_size_bytes.unwrap();
+        assert!(metadata_size.get() > object_store.block_size() as u64);
+
+        let file_sizes = HashMap::from([(file_name.to_string(), index_file.size_bytes)]);
+        let without_hint = LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        )
+        .with_file_sizes(file_sizes.clone());
+        object_store.io_stats_incremental();
+        without_hint.open_index_file(file_name).await.unwrap();
+        assert_eq!(object_store.io_stats_incremental().read_iops, 2);
+
+        let with_hint = LanceIndexStore::new(
+            object_store.clone(),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        )
+        .with_index_files(vec![index_file]);
+        object_store.io_stats_incremental();
+        with_hint.open_index_file(file_name).await.unwrap();
+        assert_eq!(object_store.io_stats_incremental().read_iops, 1);
     }
 
     #[tokio::test]

@@ -37,6 +37,7 @@ use prost_types::Any;
 use roaring::RoaringBitmap;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -125,12 +126,21 @@ fn export_unsigned_longs<'a>(
 impl IntoJava for &IndexFile {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let path = env.new_string(&self.path)?;
+        let file_metadata_size_bytes = match self.file_metadata_size_bytes {
+            Some(size) => JLance(u64_to_jlong(
+                "newIndexFiles.fileMetadataSizeBytes",
+                size.get(),
+            )?)
+            .into_java(env)?,
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             "org/lance/index/IndexFile",
-            "(Ljava/lang/String;J)V",
+            "(Ljava/lang/String;JLjava/lang/Long;)V",
             &[
                 JValue::Object(&path),
                 JValue::Long(u64_to_jlong("newIndexFiles.sizeBytes", self.size_bytes)?),
+                JValue::Object(&file_metadata_size_bytes),
             ],
         )?)
     }
@@ -138,12 +148,24 @@ impl IntoJava for &IndexFile {
 
 impl FromJObjectWithEnv<IndexFile> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<IndexFile> {
+        let file_metadata_size_bytes: Option<i64> = env
+            .call_method(self, "getFileMetadataSizeBytes", "()Ljava/lang/Long;", &[])?
+            .l()?
+            .extract_object(env)?;
+        let file_metadata_size_bytes = match file_metadata_size_bytes {
+            Some(size) => {
+                let size = nonnegative_jlong_to_u64("newIndexFiles.fileMetadataSizeBytes", size)?;
+                NonZeroU64::new(size)
+            }
+            None => None,
+        };
         Ok(IndexFile {
             path: env.get_string_from_method(self, "getPath")?,
             size_bytes: nonnegative_jlong_to_u64(
                 "newIndexFiles.sizeBytes",
                 env.call_method(self, "getSizeBytes", "()J", &[])?.j()?,
             )?,
+            file_metadata_size_bytes,
         })
     }
 }

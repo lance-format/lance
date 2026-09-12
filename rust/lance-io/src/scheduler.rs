@@ -803,6 +803,7 @@ pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
     io_queue: IoQueueType,
     stats: IoStats,
+    io_buffer_size_bytes: u64,
 }
 
 impl Debug for ScanScheduler {
@@ -916,6 +917,7 @@ impl ScanScheduler {
             object_store,
             io_queue,
             stats,
+            io_buffer_size_bytes: config.io_buffer_size_bytes,
         })
     }
 
@@ -1364,6 +1366,13 @@ impl FileScheduler {
     ) -> impl Future<Output = Result<Bytes>> + Send {
         self.submit_request(vec![range], priority)
             .map_ok(|vec_bytes| vec_bytes.into_iter().next().unwrap())
+    }
+
+    /// Returns the configured byte budget for unread scheduled I/O.
+    ///
+    /// A value of zero means byte-based backpressure is disabled.
+    pub fn io_buffer_size_bytes(&self) -> u64 {
+        self.root.io_buffer_size_bytes
     }
 
     /// Provides access to the underlying reader

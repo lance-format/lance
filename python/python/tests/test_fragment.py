@@ -254,12 +254,26 @@ def test_dataset_progress(tmp_path: Path):
 
 
 def test_fragment_meta():
+    assert (
+        lance.fragment.DataFile(
+            "unknown.lance", [], file_metadata_size_bytes=0
+        ).file_metadata_size_bytes
+        is None
+    )
+    with pytest.raises(ValueError, match="must be non-negative"):
+        lance.fragment.DataFile("invalid.lance", [], file_metadata_size_bytes=-1)
+
     # Intentionally leaving off column_indices / version fields to make sure
     # we can handle backwards compatibility (though not clear we need to)
     data = {
         "id": 0,
         "files": [
-            {"path": "0.lance", "fields": [0], "file_size_bytes": 100},
+            {
+                "path": "0.lance",
+                "fields": [0],
+                "file_size_bytes": 100,
+                "file_metadata_size_bytes": 25,
+            },
             {"path": "1.lance", "fields": [1]},
         ],
         "deletion_file": None,
@@ -271,7 +285,9 @@ def test_fragment_meta():
     assert len(meta.files) == 2
     with pytest.warns(DeprecationWarning):
         assert meta.files[0].path() == "0.lance"
+    assert meta.files[0].file_metadata_size_bytes == 25
     assert meta.files[1].path == "1.lance"
+    assert meta.files[1].file_metadata_size_bytes is None
 
     assert repr(meta) == (
         "FragmentMetadata(id=0, files=[DataFile(path='0.lance', fields=[0], "

@@ -8,7 +8,8 @@ use std::marker::PhantomData;
 use std::{
     any::Any,
     borrow::Cow,
-    collections::{BinaryHeap, HashMap},
+    collections::BinaryHeap,
+    num::NonZeroU64,
     ops::Range,
     sync::{
         Arc, LazyLock, Mutex, OnceLock,
@@ -41,7 +42,9 @@ use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
-use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
+use lance_file::reader::{
+    CachedFileMetadata, FileReader, FileReaderOptions, FullMetadataReadOptions, ReaderProjection,
+};
 use lance_index::cache_pb::IvfStateHeader;
 use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle};
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector};
@@ -83,6 +86,7 @@ use lance_io::{
 };
 use lance_linalg::distance::DistanceType;
 use lance_select::RowAddrTreeMap;
+use lance_table::format::IndexFile as TableIndexFile;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -124,6 +128,9 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     /// when reconstructing from cache.
     pub(crate) index_file_size: u64,
     pub(crate) aux_file_size: u64,
+    /// Metadata suffix sizes used to avoid dependent footer reads.
+    pub(crate) index_file_metadata_size_bytes: Option<NonZeroU64>,
+    pub(crate) aux_file_metadata_size_bytes: Option<NonZeroU64>,
     /// Runtime-only cache, intentionally excluded from the CacheCodec wire format.
     pub(crate) rq_search_cache: RabitSearchCacheCell,
 }
@@ -646,6 +653,10 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 quantization_type,
                 index_file_size: header.index_file_size,
                 aux_file_size: header.aux_file_size,
+                index_file_metadata_size_bytes: NonZeroU64::new(
+                    header.index_file_metadata_size_bytes,
+                ),
+                aux_file_metadata_size_bytes: NonZeroU64::new(header.aux_file_metadata_size_bytes),
                 rq_search_cache: empty_rabit_search_cache_cell(),
             })))
         }
@@ -717,6 +728,12 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
             quantizer_metadata_json,
             index_file_size: self.index_file_size,
             aux_file_size: self.aux_file_size,
+            index_file_metadata_size_bytes: self
+                .index_file_metadata_size_bytes
+                .map_or(0, NonZeroU64::get),
+            aux_file_metadata_size_bytes: self
+                .aux_file_metadata_size_bytes
+                .map_or(0, NonZeroU64::get),
         };
         let ivf_bytes = pb::Ivf::try_from(&self.ivf)?.encode_to_vec();
         let aux_ivf_bytes = pb::Ivf::try_from(&self.aux_ivf)?.encode_to_vec();
@@ -780,12 +797,71 @@ impl CacheKey for FileMetadataCacheKey {
     fn write_key(&self, _builder: &mut KeyBuilder) {}
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct IvfFileOpenHints {
+    files: Vec<TableIndexFile>,
+}
+
+impl IvfFileOpenHints {
+    pub(crate) fn new(files: Vec<TableIndexFile>) -> Self {
+        Self { files }
+    }
+
+    pub(crate) fn file_size(&self, name: &str) -> u64 {
+        self.files
+            .iter()
+            .find(|file| file.path == name)
+            .map_or(0, |file| file.size_bytes)
+    }
+
+    pub(crate) fn metadata_size_bytes(&self, name: &str) -> Option<NonZeroU64> {
+        self.files
+            .iter()
+            .find(|file| file.path == name)
+            .and_then(|file| file.file_metadata_size_bytes)
+    }
+
+    pub(crate) fn metadata_options(&self, name: &str) -> FullMetadataReadOptions {
+        self.metadata_size_bytes(name).map_or_else(
+            FullMetadataReadOptions::default,
+            |metadata_size_bytes| {
+                FullMetadataReadOptions::default().with_metadata_size_bytes(metadata_size_bytes)
+            },
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct IvfFileOpenContext {
+    scheduler: Arc<ScanScheduler>,
+    index_reader: FileReader,
+    storage_reader: Option<FileReader>,
+    hints: IvfFileOpenHints,
+}
+
+impl IvfFileOpenContext {
+    pub(crate) fn new(
+        scheduler: Arc<ScanScheduler>,
+        index_reader: FileReader,
+        storage_reader: Option<FileReader>,
+        hints: IvfFileOpenHints,
+    ) -> Self {
+        Self {
+            scheduler,
+            index_reader,
+            storage_reader,
+            hints,
+        }
+    }
+}
+
 /// Open a FileReader, reusing cached file metadata if available.
 async fn open_reader_cached(
     scheduler: &Arc<ScanScheduler>,
     path: &Path,
     cache: &LanceCache,
     known_file_size: u64,
+    metadata_options: FullMetadataReadOptions,
 ) -> Result<FileReader> {
     let file_cache = cache.with_key_prefix(path.as_ref());
     // CachedFileSize::new(0) == CachedFileSize::unknown(); passing the raw
@@ -807,12 +883,13 @@ async fn open_reader_cached(
         .await
     } else {
         let file_scheduler = scheduler.open_file(path, &cached_size).await?;
-        let reader = FileReader::try_open(
+        let reader = FileReader::try_open_with_metadata_options(
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
             cache,
             FileReaderOptions::default(),
+            metadata_options,
         )
         .await?;
         // File metadata is store-free, so it outlives the reader opened here:
@@ -1365,29 +1442,41 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
-        file_sizes: HashMap<String, u64>,
+        file_open_context: IvfFileOpenContext,
     ) -> Result<Self> {
         let io_parallelism = object_store.io_parallelism();
-        let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        let IvfFileOpenContext {
+            scheduler,
+            index_reader,
+            storage_reader,
+            hints: file_open_hints,
+        } = file_open_context;
 
         let uuid_str = uuid.to_string();
         let uri = index_dir
             .clone()
             .join(uuid_str.as_str())
             .join(INDEX_FILE_NAME);
-        let cached_size = file_sizes
-            .get(INDEX_FILE_NAME)
-            .map(|&size| CachedFileSize::new(size))
-            .unwrap_or_else(CachedFileSize::unknown);
-        let index_reader = FileReader::try_open(
-            scheduler.open_file(&uri, &cached_size).await?,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            file_metadata_cache,
-            FileReaderOptions::default(),
-        )
-        .await?;
+        let aux_path = index_dir
+            .clone()
+            .join(uuid_str.as_str())
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let storage_reader = match storage_reader {
+            Some(storage_reader) => storage_reader,
+            None => {
+                let aux_size =
+                    CachedFileSize::new(file_open_hints.file_size(INDEX_AUXILIARY_FILE_NAME));
+                FileReader::try_open_with_metadata_options(
+                    scheduler.open_file(&aux_path, &aux_size).await?,
+                    None,
+                    Arc::<DecoderPlugins>::default(),
+                    file_metadata_cache,
+                    FileReaderOptions::default(),
+                    file_open_hints.metadata_options(INDEX_AUXILIARY_FILE_NAME),
+                )
+                .await?
+            }
+        };
         let index_metadata: IndexMetadata = serde_json::from_str(
             index_reader
                 .schema()
@@ -1415,26 +1504,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .ok_or(Error::index(format!("{} not found", S::metadata_key())))?;
         let sub_index_metadata: Vec<String> = serde_json::from_str(sub_index_metadata)?;
 
-        let aux_cached_size = file_sizes
-            .get(INDEX_AUXILIARY_FILE_NAME)
-            .map(|&size| CachedFileSize::new(size))
-            .unwrap_or_else(CachedFileSize::unknown);
-        let storage_reader = FileReader::try_open(
-            scheduler
-                .open_file(
-                    &index_dir
-                        .clone()
-                        .join(uuid_str.as_str())
-                        .join(INDEX_AUXILIARY_FILE_NAME),
-                    &aux_cached_size,
-                )
-                .await?,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            file_metadata_cache,
-            FileReaderOptions::default(),
-        )
-        .await?;
         let frag_reuse_index = frag_reuse_index
             .clone()
             .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
@@ -1447,10 +1516,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .with_key_prefix(uri.as_ref())
             .insert_with_key(&FileMetadataCacheKey, index_reader.metadata().clone())
             .await;
-        let aux_path = index_dir
-            .clone()
-            .join(uuid_str.as_str())
-            .join(INDEX_AUXILIARY_FILE_NAME);
         file_metadata_cache
             .with_key_prefix(aux_path.as_ref())
             .insert_with_key(&FileMetadataCacheKey, storage.reader().metadata().clone())
@@ -1461,10 +1526,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         let rq_search_cache = Self::build_rq_search_cache(&ivf, &storage)?;
 
-        // The scheduler is freshly created above and, at this point, has served
-        // only the open-time reads (file footers, IVF centroids, quantization
-        // metadata) -- partition reads happen later, during queries.  So its
-        // cumulative stats are exactly the one-time index-open I/O.
+        // At this point, the scheduler has served only the open-time reads
+        // (file footers, IVF centroids, quantization metadata) -- partition reads
+        // happen later, during queries.  So its cumulative stats are exactly the
+        // one-time index-open I/O.
         let open_io_stats = scheduler.stats();
 
         let read_projection = Self::read_projection(&index_reader)?;
@@ -1826,6 +1891,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             quantization_type,
             index_file_size: self.reader.metadata().file_size(),
             aux_file_size: self.storage.reader().metadata().file_size(),
+            index_file_metadata_size_bytes: NonZeroU64::new(
+                self.reader.metadata().metadata_size_bytes(),
+            ),
+            aux_file_metadata_size_bytes: NonZeroU64::new(
+                self.storage.reader().metadata().metadata_size_bytes(),
+            ),
             rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
         }))
     }
@@ -2511,20 +2582,32 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     // fresh readers to the object store supplied for this reconstruction.
     let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
     let scheduler = ScanScheduler::new(object_store, scheduler_config);
-    let index_reader = open_reader_cached(
-        &scheduler,
-        &index_path,
-        file_metadata_cache,
-        state.index_file_size,
-    )
-    .await?;
-    let aux_reader = open_reader_cached(
-        &scheduler,
-        &aux_path,
-        file_metadata_cache,
-        state.aux_file_size,
-    )
-    .await?;
+    let (index_reader, aux_reader) = tokio::try_join!(
+        open_reader_cached(
+            &scheduler,
+            &index_path,
+            file_metadata_cache,
+            state.index_file_size,
+            state.index_file_metadata_size_bytes.map_or_else(
+                FullMetadataReadOptions::default,
+                |metadata_size_bytes| {
+                    FullMetadataReadOptions::default().with_metadata_size_bytes(metadata_size_bytes)
+                },
+            ),
+        ),
+        open_reader_cached(
+            &scheduler,
+            &aux_path,
+            file_metadata_cache,
+            state.aux_file_size,
+            state.aux_file_metadata_size_bytes.map_or_else(
+                FullMetadataReadOptions::default,
+                |metadata_size_bytes| {
+                    FullMetadataReadOptions::default().with_metadata_size_bytes(metadata_size_bytes)
+                },
+            ),
+        ),
+    )?;
 
     let frag_reuse_index = frag_reuse_index
         .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);

@@ -181,7 +181,8 @@ impl<'a> FragmentCreateBuilder<'a> {
             writer.write_batches(batch_chunk.iter()).await?;
         }
 
-        let write_summary = writer.finish().await?;
+        let write_result = writer.finish_with_metadata_size().await?;
+        let write_summary = write_result.summary();
         fragment.physical_rows = Some(write_summary.num_rows as usize);
 
         if matches!(fragment.physical_rows, Some(0)) {
@@ -204,6 +205,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         fragment.files[0].fields = field_ids;
         fragment.files[0].column_indices = column_indices;
         fragment.files[0].file_size_bytes = CachedFileSize::new(write_summary.size_bytes);
+        fragment.files[0].file_metadata_size_bytes = Some(write_result.metadata_size_bytes());
 
         progress.complete(&fragment).await?;
 

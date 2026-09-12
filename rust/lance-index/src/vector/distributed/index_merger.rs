@@ -1718,12 +1718,14 @@ async fn merge_partial_vector_auxiliary_files_inner(
         }
         let dt2 = distance_type.ok_or_else(|| Error::index("Distance type missing".to_string()))?;
         write_unified_ivf_and_index_metadata(w, &ivf_model, dt2, idx_type_final).await?;
-        let summary = w.finish().await?;
+        let result = w.finish_with_metadata_size().await?;
+        let summary = result.summary();
         progress.stage_progress("write_auxiliary_index", 1).await?;
         progress.stage_complete("write_auxiliary_index").await?;
         Ok(lance_table::format::IndexFile {
             path: INDEX_AUXILIARY_FILE_NAME.to_string(),
             size_bytes: summary.size_bytes,
+            file_metadata_size_bytes: Some(result.metadata_size_bytes()),
         })
     } else {
         Err(Error::index(

@@ -224,20 +224,24 @@ impl Dataset {
             if let Some(preprocessor) = preprocessor.as_mut() {
                 preprocessor.finish().await?;
             }
-            writer.finish().await
+            writer.finish_with_metadata_size().await
         }
         .await;
 
         match write_result {
-            Ok(summary) => Ok(DataFilePart {
-                target_file_name: target.file_name.clone(),
-                base_id: target.base_id,
-                file_name,
-                blob_ids: part_blob_ids,
-                num_rows: summary.num_rows,
-                size_bytes: NonZeroU64::new(summary.size_bytes)
-                    .ok_or_else(|| Error::internal("completed part has zero file size"))?,
-            }),
+            Ok(result) => {
+                let summary = result.summary();
+                Ok(DataFilePart {
+                    target_file_name: target.file_name.clone(),
+                    base_id: target.base_id,
+                    file_name,
+                    blob_ids: part_blob_ids,
+                    num_rows: summary.num_rows,
+                    size_bytes: NonZeroU64::new(summary.size_bytes)
+                        .ok_or_else(|| Error::internal("completed part has zero file size"))?,
+                    metadata_size_bytes: Some(result.metadata_size_bytes()),
+                })
+            }
             Err(error) => {
                 writer.abort().await;
                 if let Some(preprocessor) = preprocessor.as_mut() {
@@ -344,7 +348,8 @@ impl Dataset {
             target.version,
             NonZeroU64::new(output.size_bytes),
             target.base_id,
-        ))
+        )
+        .with_file_metadata_size_bytes(output.metadata_size_bytes))
     }
 }
 
@@ -1992,14 +1997,16 @@ impl GenericWriter for V2WriterAdapter {
             .iter()
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
-        let write_summary = self.writer.finish().await?;
+        let write_result = self.writer.finish_with_metadata_size().await?;
         let mut data_file = self
             .data_file
             .take()
             .ok_or_else(|| Error::internal("current writer was already finished"))?;
         data_file.fields = field_ids.into();
         data_file.column_indices = column_indices.into();
+        let write_summary = write_result.summary();
         data_file.file_size_bytes = NonZero::new(write_summary.size_bytes).into();
+        data_file.file_metadata_size_bytes = Some(write_result.metadata_size_bytes());
         Ok((write_summary.num_rows as u32, data_file))
     }
 
@@ -2946,6 +2953,13 @@ mod tests {
                 "version: {}",
                 version
             );
+            if version.resolve() == ConcreteFileVersion::V1 {
+                assert_eq!(fragment.files[0].file_metadata_size_bytes, None);
+            } else {
+                let file_size = fragment.files[0].file_size_bytes.get().unwrap();
+                let metadata_size = fragment.files[0].file_metadata_size_bytes.unwrap();
+                assert!(metadata_size <= file_size);
+            }
         }
     }
 

@@ -6,6 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     io::Cursor,
+    num::{NonZeroU32, NonZeroU64},
     ops::Range,
     pin::Pin,
     sync::Arc,
@@ -56,6 +57,9 @@ pub(crate) mod structural;
 /// Default chunk size for reading large pages (8MiB)
 /// Pages larger than this will be split into multiple chunks during read
 pub const DEFAULT_READ_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+
+/// One column-metadata offset table entry: a u64 position and a u64 length.
+const COLUMN_METADATA_OFFSET_ENTRY_SIZE: u64 = 16;
 
 // For now, we don't use global buffers for anything other than schema.  If we
 // use these later we should make them lazily loaded and then cached once loaded.
@@ -136,7 +140,10 @@ pub struct CachedFileMetadata {
     pub num_column_metadata_bytes: u64,
     /// The number of bytes contained in global buffers
     pub num_global_buffer_bytes: u64,
-    /// The number of bytes contained in the CMO and GBO tables
+    /// The number of bytes from the schema descriptor through EOF.
+    ///
+    /// The historical field name is retained for API compatibility. Prefer
+    /// [`Self::metadata_size_bytes`] when reading this value.
     pub num_footer_bytes: u64,
     /// The major version number stored in the file footer.
     pub major_version: u16,
@@ -148,8 +155,8 @@ pub struct CachedFileMetadata {
     /// User global buffers (index >= 1) whose bytes were already captured by the
     /// tail read that `read_all_metadata` performs at open, keyed by buffer index.
     ///
-    /// All global buffers are laid out contiguously starting at the schema, so on
-    /// small/medium files they land inside the captured tail window. Retaining
+    /// User global buffers are written immediately before the schema, so on
+    /// small/medium files they can land inside the captured tail window. Retaining
     /// those bytes lets `read_global_buffer` serve them with zero additional I/O.
     /// The bytes are copied out of the tail (rather than sliced) so the much
     /// larger tail allocation can be dropped — we only hold what we will serve.
@@ -164,6 +171,11 @@ impl CachedFileMetadata {
     /// Total file size in bytes.
     pub fn file_size(&self) -> u64 {
         self.file_size_bytes
+    }
+
+    /// Number of bytes from the schema descriptor through EOF.
+    pub fn metadata_size_bytes(&self) -> u64 {
+        self.num_footer_bytes
     }
 }
 
@@ -386,6 +398,88 @@ impl Default for FileReaderOptions {
             read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
             batch_size_bytes: None,
         }
+    }
+}
+
+/// Advisory input for opening fully decoded current-format metadata.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FullMetadataReadOptions {
+    metadata_size_bytes: Option<NonZeroU64>,
+}
+
+impl FullMetadataReadOptions {
+    /// Use an exact metadata suffix size produced by the file writer.
+    pub fn with_metadata_size_bytes(mut self, metadata_size_bytes: NonZeroU64) -> Self {
+        self.metadata_size_bytes = Some(metadata_size_bytes);
+        self
+    }
+}
+
+/// Advisory input for opening a current-format metadata index.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetadataIndexReadOptions {
+    estimated_num_columns: Option<NonZeroU32>,
+}
+
+impl MetadataIndexReadOptions {
+    /// Size the initial tail read using an estimated physical-column count.
+    pub fn with_estimated_num_columns(mut self, estimated_num_columns: NonZeroU32) -> Self {
+        self.estimated_num_columns = Some(estimated_num_columns);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum TailReadPlan {
+    #[default]
+    Baseline,
+    ExactMetadata(NonZeroU64),
+    EstimatedMetadataIndex(NonZeroU32),
+}
+
+struct TailRead {
+    bytes: Bytes,
+    file_len: u64,
+    offset: u64,
+    retention_offset: u64,
+}
+
+impl TailRead {
+    async fn extend_to(&mut self, start: u64, scheduler: &FileScheduler) -> Result<()> {
+        if start > self.file_len {
+            return Err(Error::invalid_input(format!(
+                "metadata tail start {start} is outside file of size {}",
+                self.file_len
+            )));
+        }
+        if start >= self.offset {
+            return Ok(());
+        }
+        let missing_bytes = scheduler.submit_single(start..self.offset, 0).await?;
+        let mut combined = BytesMut::with_capacity(missing_bytes.len() + self.bytes.len());
+        combined.extend_from_slice(&missing_bytes);
+        combined.extend_from_slice(&self.bytes);
+        self.bytes = combined.freeze();
+        self.offset = start;
+        Ok(())
+    }
+
+    fn slice(&self, range: Range<u64>) -> Result<Bytes> {
+        if range.start > range.end || range.start < self.offset || range.end > self.file_len {
+            return Err(Error::invalid_input(format!(
+                "metadata byte range {}..{} is outside loaded tail {}..{}",
+                range.start, range.end, self.offset, self.file_len
+            )));
+        }
+        let start = usize::try_from(range.start - self.offset)
+            .map_err(|_| Error::invalid_input_source("Metadata range start overflows".into()))?;
+        let end = usize::try_from(range.end - self.offset)
+            .map_err(|_| Error::invalid_input_source("Metadata range end overflows".into()))?;
+        Ok(self.bytes.slice(start..end))
+    }
+
+    fn suffix_from(&self, start: u64) -> Result<Bytes> {
+        self.slice(start..self.file_len)
     }
 }
 
@@ -688,37 +782,56 @@ impl FileReader {
         self.core.read_global_buffer(index).await
     }
 
-    async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
+    async fn read_tail(scheduler: &FileScheduler, plan: TailReadPlan) -> Result<TailRead> {
         let file_size = scheduler.reader().size().await? as u64;
-        let begin = if file_size < scheduler.reader().block_size() as u64 {
-            0
-        } else {
-            file_size - scheduler.reader().block_size() as u64
+        let baseline_read_size = file_size.min(scheduler.reader().block_size() as u64);
+        let planned_read_size = match plan {
+            TailReadPlan::Baseline => baseline_read_size,
+            TailReadPlan::ExactMetadata(metadata_size_bytes) => {
+                let metadata_size_bytes = metadata_size_bytes.get();
+                if metadata_size_bytes <= file_size {
+                    baseline_read_size.max(metadata_size_bytes)
+                } else {
+                    baseline_read_size
+                }
+            }
+            TailReadPlan::EstimatedMetadataIndex(estimated_num_columns) => {
+                u64::from(estimated_num_columns.get())
+                    .checked_mul(COLUMN_METADATA_OFFSET_ENTRY_SIZE)
+                    .and_then(|estimated_cmo_size| {
+                        baseline_read_size.checked_add(estimated_cmo_size)
+                    })
+                    .unwrap_or(baseline_read_size)
+                    .min(file_size)
+            }
         };
-        let tail_bytes = scheduler.submit_single(begin..file_size, 0).await?;
-        Ok((tail_bytes, file_size))
-    }
-
-    async fn read_range_from_tail_or_scheduler(
-        tail_bytes: &Bytes,
-        tail_offset: u64,
-        scheduler: &FileScheduler,
-        range: Range<u64>,
-    ) -> Result<Bytes> {
-        let tail_end = tail_offset + tail_bytes.len() as u64;
-        if range.start >= tail_offset && range.end <= tail_end {
-            let rel_start = (range.start - tail_offset) as usize;
-            let rel_end = (range.end - tail_offset) as usize;
-            Ok(tail_bytes.slice(rel_start..rel_end))
+        let io_buffer_size_bytes = scheduler.io_buffer_size_bytes();
+        // Footer validation happens after this read, so keep advisory overread within
+        // the scheduler's configured unread-I/O budget. With no finite byte budget,
+        // use the authoritative footer-directed path.
+        let requested_read_size = if planned_read_size > baseline_read_size
+            && (io_buffer_size_bytes == 0 || planned_read_size > io_buffer_size_bytes)
+        {
+            baseline_read_size
         } else {
-            scheduler.submit_single(range, 0).await
-        }
+            planned_read_size
+        };
+        let offset = file_size - requested_read_size;
+        // FileScheduler may split this logical range into concurrent physical requests.
+        let bytes = scheduler.submit_single(offset..file_size, 0).await?;
+        Ok(TailRead {
+            bytes,
+            file_len: file_size,
+            offset,
+            retention_offset: file_size - baseline_read_size,
+        })
     }
 
     fn retained_global_buffers_from_tail(
         gbo_table: &[BufferDescriptor],
         tail_bytes: &Bytes,
         tail_offset: u64,
+        retention_offset: u64,
         file_len: u64,
     ) -> Result<BTreeMap<u32, Bytes>> {
         let tail_end = tail_offset
@@ -727,7 +840,7 @@ impl FileReader {
         let mut retained_buffers = BTreeMap::new();
         for (index, buffer) in gbo_table.iter().enumerate().skip(1) {
             let range = buffer.checked_range(index, file_len)?;
-            if range.start >= tail_offset && range.end <= tail_end {
+            if range.start >= retention_offset && range.end <= tail_end {
                 let rel_start = (range.start - tail_offset) as usize;
                 let rel_end = (range.end - tail_offset) as usize;
                 let bytes = Bytes::copy_from_slice(&tail_bytes[rel_start..rel_end]);
@@ -860,36 +973,6 @@ impl FileReader {
         Ok(Arc::from(offsets))
     }
 
-    async fn optimistic_tail_read(
-        data: &Bytes,
-        start_pos: u64,
-        scheduler: &FileScheduler,
-        file_len: u64,
-    ) -> Result<Bytes> {
-        let num_bytes_needed = file_len.checked_sub(start_pos).ok_or_else(|| {
-            Error::invalid_input_source(
-                format!(
-                    "Tail read position {} is outside file of size {}",
-                    start_pos, file_len
-                )
-                .into(),
-            )
-        })? as usize;
-        if data.len() >= num_bytes_needed {
-            Ok(data.slice((data.len() - num_bytes_needed)..))
-        } else {
-            let num_bytes_missing = (num_bytes_needed - data.len()) as u64;
-            let start = file_len - num_bytes_needed as u64;
-            let missing_bytes = scheduler
-                .submit_single(start..start + num_bytes_missing, 0)
-                .await?;
-            let mut combined = BytesMut::with_capacity(data.len() + num_bytes_missing as usize);
-            combined.extend(missing_bytes);
-            combined.extend(data);
-            Ok(combined.freeze())
-        }
-    }
-
     fn do_decode_gbo_table(gbo_bytes: &Bytes, footer: &Footer) -> Result<Vec<BufferDescriptor>> {
         let mut global_bufs_cursor = Cursor::new(gbo_bytes);
 
@@ -918,22 +1001,13 @@ impl FileReader {
         Ok(())
     }
 
-    async fn decode_gbo_table(
-        tail_bytes: &Bytes,
+    fn decode_gbo_table(
+        tail: &TailRead,
         file_len: u64,
-        scheduler: &FileScheduler,
         footer: &Footer,
         version: ConcreteFileVersion,
     ) -> Result<Vec<BufferDescriptor>> {
-        // This could, in theory, trigger another IOP but the GBO table should never be large
-        // enough for that to happen
-        let gbo_bytes = Self::optimistic_tail_read(
-            tail_bytes,
-            footer.global_buff_offsets_start,
-            scheduler,
-            file_len,
-        )
-        .await?;
+        let gbo_bytes = tail.suffix_from(footer.global_buff_offsets_start)?;
         let gbo_table = Self::do_decode_gbo_table(&gbo_bytes, footer)?;
         Self::validate_gbo_table(&gbo_table, file_len, version)?;
         Ok(gbo_table)
@@ -951,12 +1025,18 @@ impl FileReader {
         Ok((num_rows, schema))
     }
 
-    pub(crate) async fn read_raw_metadata_for_dispatch(
+    pub(crate) async fn read_raw_metadata_for_dispatch_with_options(
         scheduler: &FileScheduler,
+        options: FullMetadataReadOptions,
     ) -> Result<RawFileMetadataOpen> {
-        let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
-        let tail_offset = file_len - tail_bytes.len() as u64;
-        let footer = Self::decode_footer(&tail_bytes)?;
+        let mut tail = Self::read_tail(
+            scheduler,
+            options
+                .metadata_size_bytes
+                .map_or(TailReadPlan::Baseline, TailReadPlan::ExactMetadata),
+        )
+        .await?;
+        let footer = Self::decode_footer(&tail.bytes)?;
         let version =
             ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?;
         if version == ConcreteFileVersion::V1 {
@@ -966,8 +1046,9 @@ impl FileReader {
             });
         }
 
-        let gbo_table =
-            Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, version).await?;
+        tail.extend_to(footer.global_buff_offsets_start, scheduler)
+            .await?;
+        let gbo_table = Self::decode_gbo_table(&tail, tail.file_len, &footer, version)?;
         if gbo_table.is_empty() {
             return Err(Error::internal(
                 "File did not contain any global buffers, schema expected".to_string(),
@@ -975,39 +1056,41 @@ impl FileReader {
         }
         let schema_start = gbo_table[0].position;
         let schema_size = gbo_table[0].size;
-        let num_footer_bytes = file_len.checked_sub(schema_start).ok_or_else(|| {
+        let num_footer_bytes = tail.file_len.checked_sub(schema_start).ok_or_else(|| {
             Error::invalid_input_source(
                 format!(
                     "Schema position {} is outside file of size {}",
-                    schema_start, file_len
+                    schema_start, tail.file_len
                 )
                 .into(),
             )
         })?;
-        let all_metadata_bytes =
-            Self::optimistic_tail_read(&tail_bytes, schema_start, scheduler, file_len).await?;
-        let schema_bytes = all_metadata_bytes.slice(0..schema_size as usize);
+        tail.extend_to(schema_start, scheduler).await?;
+        let schema_end = schema_start
+            .checked_add(schema_size)
+            .ok_or_else(|| Error::invalid_input_source("Schema byte range overflows".into()))?;
+        let schema_bytes = tail.slice(schema_start..schema_end)?;
         let (num_rows, schema) = Self::decode_schema(schema_bytes)?;
 
-        let column_metadata_start = (footer.column_meta_start - schema_start) as usize;
-        let column_metadata_end = (footer.global_buff_offsets_start - schema_start) as usize;
         let column_metadata_bytes =
-            all_metadata_bytes.slice(column_metadata_start..column_metadata_end);
+            tail.slice(footer.column_meta_start..footer.global_buff_offsets_start)?;
         let column_metadatas = Self::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
         let num_global_buffer_bytes = gbo_table.iter().map(|buf| buf.size).sum::<u64>();
         let num_data_bytes = footer.column_meta_start - num_global_buffer_bytes;
         let num_column_metadata_bytes = footer.global_buff_offsets_start - footer.column_meta_start;
         // The tail read above already pulled in any global buffer that lives within
-        // the captured window. Copy those user buffers (index >= 1; the schema at 0
-        // is decoded above and never fetched via read_global_buffer) out of the tail
-        // so read_global_buffer can serve them without I/O. We copy rather than slice
-        // so the much larger tail allocation can be released once decoding is done.
+        // the baseline captured window. Copy those user buffers (index >= 1; the schema
+        // at 0 is decoded above and never fetched via read_global_buffer) out of the
+        // tail so read_global_buffer can serve them without I/O. We copy rather than
+        // slice so the much larger tail allocation can be released once decoding is
+        // done.
         let retained_global_buffers = Self::retained_global_buffers_from_tail(
             &gbo_table,
-            &tail_bytes,
-            tail_offset,
-            file_len,
+            &tail.bytes,
+            tail.offset,
+            tail.retention_offset,
+            tail.file_len,
         )?;
 
         Ok(RawFileMetadataOpen::Current {
@@ -1022,7 +1105,7 @@ impl FileReader {
                 num_global_buffer_bytes,
                 num_footer_bytes,
                 footer,
-                file_size_bytes: file_len,
+                file_size_bytes: tail.file_len,
                 retained_global_buffers,
             },
         })
@@ -1031,51 +1114,50 @@ impl FileReader {
     async fn read_raw_metadata_index_with_known_schema(
         scheduler: &FileScheduler,
         known_schema: Option<(Arc<Schema>, u64)>,
+        options: MetadataIndexReadOptions,
     ) -> Result<FileMetadataIndex> {
-        let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
-        let tail_offset = file_len - tail_bytes.len() as u64;
-        let footer = Self::decode_footer(&tail_bytes)?;
+        let mut tail = Self::read_tail(
+            scheduler,
+            options
+                .estimated_num_columns
+                .map_or(TailReadPlan::Baseline, TailReadPlan::EstimatedMetadataIndex),
+        )
+        .await?;
+        let footer = Self::decode_footer(&tail.bytes)?;
 
         let file_version = Self::current_file_version(&footer)?;
 
-        let gbo_table =
-            Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
+        let metadata_index_start = footer
+            .column_meta_offsets_start
+            .min(footer.global_buff_offsets_start);
+        tail.extend_to(metadata_index_start, scheduler).await?;
+        let gbo_table = Self::decode_gbo_table(&tail, tail.file_len, &footer, file_version)?;
+        let cmo_table =
+            tail.slice(footer.column_meta_offsets_start..footer.global_buff_offsets_start)?;
         if gbo_table.is_empty() {
             return Err(Error::internal(
                 "File did not contain any global buffers, schema expected".to_string(),
             ));
         }
+        let column_metadata_offsets = Self::decode_cmo_table(cmo_table, &footer)?;
         let (file_schema, num_rows) = match known_schema {
             Some((file_schema, num_rows)) => (file_schema, num_rows),
             None => {
                 let schema_buffer = &gbo_table[0];
-                let schema_range = schema_buffer.checked_range(0, file_len)?;
-                let schema_bytes = Self::read_range_from_tail_or_scheduler(
-                    &tail_bytes,
-                    tail_offset,
-                    scheduler,
-                    schema_range,
-                )
-                .await?;
+                let schema_range = schema_buffer.checked_range(0, tail.file_len)?;
+                tail.extend_to(schema_range.start, scheduler).await?;
+                let schema_bytes = tail.slice(schema_range)?;
                 let (num_rows, schema) = Self::decode_schema(schema_bytes)?;
                 (Arc::new(schema), num_rows)
             }
         };
 
-        let cmo_table = Self::read_range_from_tail_or_scheduler(
-            &tail_bytes,
-            tail_offset,
-            scheduler,
-            footer.column_meta_offsets_start..footer.global_buff_offsets_start,
-        )
-        .await?;
-        let column_metadata_offsets = Self::decode_cmo_table(cmo_table, &footer)?;
-
         let retained_global_buffers = Self::retained_global_buffers_from_tail(
             &gbo_table,
-            &tail_bytes,
-            tail_offset,
-            file_len,
+            &tail.bytes,
+            tail.offset,
+            tail.retention_offset,
+            tail.file_len,
         )?;
 
         Ok(FileMetadataIndex {
@@ -1085,33 +1167,9 @@ impl FileReader {
             column_metadata_offsets,
             num_columns: footer.num_columns,
             version: file_version,
-            file_size_bytes: file_len,
+            file_size_bytes: tail.file_len,
             retained_global_buffers,
         })
-    }
-
-    /// Reads the lightweight metadata index from a file.
-    ///
-    /// This reads the file schema from the schema global buffer. Use
-    /// [`Self::read_metadata_index_with_schema`] when the caller already has
-    /// the schema and row count from a higher-level metadata source.
-    pub(crate) async fn read_raw_metadata_index(
-        scheduler: &FileScheduler,
-    ) -> Result<FileMetadataIndex> {
-        Self::read_raw_metadata_index_with_known_schema(scheduler, None).await
-    }
-
-    /// Reads the metadata index without fetching the schema global buffer.
-    ///
-    /// Use this when the caller already has the file schema and physical row
-    /// count from an enclosing metadata layer, such as a dataset manifest.
-    pub(crate) async fn read_raw_metadata_index_with_schema(
-        scheduler: &FileScheduler,
-        file_schema: Arc<Schema>,
-        num_rows: u64,
-    ) -> Result<FileMetadataIndex> {
-        Self::read_raw_metadata_index_with_known_schema(scheduler, Some((file_schema, num_rows)))
-            .await
     }
 
     pub(crate) fn validate_projection(
@@ -1952,12 +2010,33 @@ impl FileReader {
         cache: &LanceCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
-        match Self::try_open_for_dispatch(
+        Self::try_open_with_metadata_options(
             scheduler,
             base_projection,
             decoder_plugins,
             cache,
             options,
+            FullMetadataReadOptions::default(),
+        )
+        .await
+    }
+
+    /// Open a current-format file using advisory full-metadata options.
+    pub async fn try_open_with_metadata_options(
+        scheduler: FileScheduler,
+        base_projection: Option<ReaderProjection>,
+        decoder_plugins: Arc<DecoderPlugins>,
+        cache: &LanceCache,
+        options: FileReaderOptions,
+        metadata_options: FullMetadataReadOptions,
+    ) -> Result<Self> {
+        match Self::try_open_for_dispatch_with_metadata_options(
+            scheduler,
+            base_projection,
+            decoder_plugins,
+            cache,
+            options,
+            metadata_options,
         )
         .await?
         {
@@ -1973,27 +2052,31 @@ impl FileReader {
         }
     }
 
-    pub(crate) async fn try_open_for_dispatch(
+    pub(crate) async fn try_open_for_dispatch_with_metadata_options(
         scheduler: FileScheduler,
         base_projection: Option<ReaderProjection>,
         decoder_plugins: Arc<DecoderPlugins>,
         cache: &LanceCache,
         options: FileReaderOptions,
+        metadata_options: FullMetadataReadOptions,
     ) -> Result<versions::OpenedFileReader> {
-        let metadata = match Self::read_raw_metadata_for_dispatch(&scheduler).await? {
-            RawFileMetadataOpen::Legacy {
-                major_version,
-                minor_version,
-            } => {
-                return Ok(versions::OpenedFileReader::V1 {
+        let metadata =
+            match Self::read_raw_metadata_for_dispatch_with_options(&scheduler, metadata_options)
+                .await?
+            {
+                RawFileMetadataOpen::Legacy {
                     major_version,
                     minor_version,
-                });
-            }
-            RawFileMetadataOpen::Current { version, metadata } => {
-                Arc::new(versions::finish_metadata(version, metadata)?)
-            }
-        };
+                } => {
+                    return Ok(versions::OpenedFileReader::V1 {
+                        major_version,
+                        minor_version,
+                    });
+                }
+                RawFileMetadataOpen::Current { version, metadata } => {
+                    Arc::new(versions::finish_metadata(version, metadata)?)
+                }
+            };
         let path = scheduler.reader().path().clone();
         let io = Arc::new(
             LanceEncodingsIo::new(scheduler).with_read_chunk_size(options.read_chunk_size),
@@ -2049,7 +2132,15 @@ impl FileReader {
     }
 
     pub async fn read_all_metadata(scheduler: &FileScheduler) -> Result<CachedFileMetadata> {
-        match Self::read_raw_metadata_for_dispatch(scheduler).await? {
+        Self::read_all_metadata_with_options(scheduler, FullMetadataReadOptions::default()).await
+    }
+
+    /// Read all current-format metadata using advisory open options.
+    pub async fn read_all_metadata_with_options(
+        scheduler: &FileScheduler,
+        options: FullMetadataReadOptions,
+    ) -> Result<CachedFileMetadata> {
+        match Self::read_raw_metadata_for_dispatch_with_options(scheduler, options).await? {
             RawFileMetadataOpen::Legacy {
                 major_version,
                 minor_version,
@@ -2065,7 +2156,16 @@ impl FileReader {
     }
 
     pub async fn read_metadata_index(scheduler: &FileScheduler) -> Result<FileMetadataIndex> {
-        let index = Self::read_raw_metadata_index(scheduler).await?;
+        Self::read_metadata_index_with_options(scheduler, MetadataIndexReadOptions::default()).await
+    }
+
+    /// Read the current-format metadata index using advisory open options.
+    pub async fn read_metadata_index_with_options(
+        scheduler: &FileScheduler,
+        options: MetadataIndexReadOptions,
+    ) -> Result<FileMetadataIndex> {
+        let index =
+            Self::read_raw_metadata_index_with_known_schema(scheduler, None, options).await?;
         versions::finish_metadata_index(index)
     }
 
@@ -2074,8 +2174,28 @@ impl FileReader {
         file_schema: Arc<Schema>,
         num_rows: u64,
     ) -> Result<FileMetadataIndex> {
-        let index =
-            Self::read_raw_metadata_index_with_schema(scheduler, file_schema, num_rows).await?;
+        Self::read_metadata_index_with_schema_and_options(
+            scheduler,
+            file_schema,
+            num_rows,
+            MetadataIndexReadOptions::default(),
+        )
+        .await
+    }
+
+    /// Read the metadata index using a known schema and advisory open options.
+    pub async fn read_metadata_index_with_schema_and_options(
+        scheduler: &FileScheduler,
+        file_schema: Arc<Schema>,
+        num_rows: u64,
+        options: MetadataIndexReadOptions,
+    ) -> Result<FileMetadataIndex> {
+        let index = Self::read_raw_metadata_index_with_known_schema(
+            scheduler,
+            Some((file_schema, num_rows)),
+            options,
+        )
+        .await?;
         versions::finish_metadata_index(index)
     }
 
@@ -2163,10 +2283,32 @@ impl ProjectedFileReader {
         cache: &LanceCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
+        Self::try_open_with_metadata_options(
+            scheduler,
+            base_projection,
+            decoder_plugins,
+            cache,
+            options,
+            MetadataIndexReadOptions::default(),
+        )
+        .await
+    }
+
+    /// Open a projected reader using advisory metadata-index options.
+    pub async fn try_open_with_metadata_options(
+        scheduler: FileScheduler,
+        base_projection: Option<ReaderProjection>,
+        decoder_plugins: Arc<DecoderPlugins>,
+        cache: &LanceCache,
+        options: FileReaderOptions,
+        metadata_options: MetadataIndexReadOptions,
+    ) -> Result<Self> {
         let base_projection = base_projection.ok_or_else(|| {
             Error::invalid_input("ProjectedReader requires an explicit base projection")
         })?;
-        let metadata_index = Arc::new(FileReader::read_metadata_index(&scheduler).await?);
+        let metadata_index = Arc::new(
+            FileReader::read_metadata_index_with_options(&scheduler, metadata_options).await?,
+        );
         let path = scheduler.reader().path().clone();
         let io = Arc::new(
             LanceEncodingsIo::new(scheduler).with_read_chunk_size(options.read_chunk_size),
@@ -2425,13 +2567,14 @@ impl EncodedBatchReaderExt for EncodedBatch {
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
+        num::{NonZeroU32, NonZeroU64},
         pin::Pin,
         sync::Arc,
     };
 
     use arrow_array::{
-        DictionaryArray, Int8Array, Int32Array, ListArray, RecordBatch, RecordBatchIterator,
-        StringArray, UInt32Array,
+        ArrayRef, DictionaryArray, Int8Array, Int32Array, ListArray, RecordBatch,
+        RecordBatchIterator, StringArray, UInt32Array,
         types::{Float64Type, Int8Type, Int32Type},
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -2450,18 +2593,23 @@ mod tests {
         encoder::{EncodedBatch, EncodingOptions, encode_batch},
         format::pb21,
     };
-    use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
+    use lance_io::{
+        scheduler::{ScanScheduler, SchedulerConfig},
+        stream::RecordBatchStream,
+        utils::CachedFileSize,
+    };
     use log::debug;
     use rstest::rstest;
     use tokio::sync::mpsc;
 
     use crate::reader::{
-        EncodedBatchReaderExt, FileReader, FileReaderOptions, ProjectedFileReader, ReaderProjection,
+        EncodedBatchReaderExt, FileReader, FileReaderOptions, FullMetadataReadOptions,
+        MetadataIndexReadOptions, ProjectedFileReader, ReaderProjection,
     };
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
     use crate::version::{ConcreteFileVersion, LanceFileVersion};
     use crate::versions;
-    use crate::writer::{FileWriterOptions, PAGE_BUFFER_ALIGNMENT};
+    use crate::writer::{FileWriteResult, FileWriterOptions, PAGE_BUFFER_ALIGNMENT};
     use lance_encoding::decoder::DecoderConfig;
 
     fn footer_version(bytes: &[u8]) -> (u16, u16) {
@@ -2681,6 +2829,26 @@ mod tests {
         }
         let reader = reader.into_reader_rows(RowCount::from(1000), BatchCount::from(100));
 
+        write_lance_file(
+            reader,
+            fs,
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions::default(),
+        )
+        .await
+    }
+
+    async fn create_one_row_wide_direct_file(fs: &FsFixture, num_columns: usize) -> WrittenFile {
+        let arrow_schema = Arc::new(ArrowSchema::new(
+            (0..num_columns)
+                .map(|column_idx| Field::new(format!("c{column_idx}"), DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ));
+        let columns = (0..num_columns)
+            .map(|column_idx| Arc::new(Int32Array::from(vec![column_idx as i32])) as ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), columns).unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], arrow_schema);
         write_lance_file(
             reader,
             fs,
@@ -3470,6 +3638,248 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_metadata_hint_removes_footer_dependency() {
+        let fs = FsFixture::default();
+        let num_columns =
+            fs.object_store.block_size() / super::COLUMN_METADATA_OFFSET_ENTRY_SIZE as usize + 8;
+        let written = create_one_row_wide_direct_file(&fs, num_columns).await;
+        let file_size = written.write_result.summary().size_bytes;
+        let metadata_size = written.write_result.metadata_size_bytes();
+        assert!(metadata_size.get() > fs.object_store.block_size() as u64);
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::new(file_size))
+            .await
+            .unwrap();
+        fs.object_store.io_stats_incremental();
+        let without_hint = FileReader::read_all_metadata(&file_scheduler)
+            .await
+            .unwrap();
+        let without_hint_stats = fs.object_store.io_stats_incremental();
+        assert_eq!(without_hint_stats.read_iops, 2);
+        assert_eq!(without_hint_stats.read_bytes, metadata_size.get());
+        assert_eq!(without_hint.metadata_size_bytes(), metadata_size.get());
+
+        let options = FullMetadataReadOptions::default().with_metadata_size_bytes(metadata_size);
+        fs.object_store.io_stats_incremental();
+        let with_hint = FileReader::read_all_metadata_with_options(&file_scheduler, options)
+            .await
+            .unwrap();
+        let with_hint_stats = fs.object_store.io_stats_incremental();
+        assert_eq!(with_hint_stats.read_iops, 1);
+        assert_eq!(with_hint_stats.read_bytes, metadata_size.get());
+        assert_eq!(with_hint.file_schema, without_hint.file_schema);
+        assert_eq!(with_hint.column_metadatas, without_hint.column_metadatas);
+
+        let stale_hints = [
+            (metadata_size.get() - 1, 2),
+            (file_size, 1),
+            (file_size + 1, 2),
+        ];
+        for (stale_hint, expected_read_iops) in stale_hints {
+            fs.object_store.io_stats_incremental();
+            let metadata = FileReader::read_all_metadata_with_options(
+                &file_scheduler,
+                FullMetadataReadOptions::default()
+                    .with_metadata_size_bytes(NonZeroU64::new(stale_hint).unwrap()),
+            )
+            .await
+            .unwrap();
+            let stats = fs.object_store.io_stats_incremental();
+            assert_eq!(metadata.metadata_size_bytes(), metadata_size.get());
+            assert_eq!(
+                stats.read_iops, expected_read_iops,
+                "unexpected read count for stale metadata hint {stale_hint}"
+            );
+        }
+
+        assert!(file_size > metadata_size.get());
+        let bounded_scheduler = ScanScheduler::new(
+            fs.object_store.clone(),
+            SchedulerConfig::new(metadata_size.get()),
+        );
+        let bounded_file_scheduler = bounded_scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::new(file_size))
+            .await
+            .unwrap();
+        for (hint, expected_read_iops) in [(metadata_size.get(), 1), (file_size, 2)] {
+            fs.object_store.io_stats_incremental();
+            let metadata = FileReader::read_all_metadata_with_options(
+                &bounded_file_scheduler,
+                FullMetadataReadOptions::default()
+                    .with_metadata_size_bytes(NonZeroU64::new(hint).unwrap()),
+            )
+            .await
+            .unwrap();
+            let stats = fs.object_store.io_stats_incremental();
+            assert_eq!(metadata.metadata_size_bytes(), metadata_size.get());
+            assert_eq!(stats.read_iops, expected_read_iops);
+            assert_eq!(stats.read_bytes, metadata_size.get());
+        }
+    }
+
+    #[tokio::test]
+    async fn full_metadata_fallback_extends_one_accumulated_suffix() {
+        let fs = FsFixture::default();
+        let num_user_global_buffers =
+            fs.object_store.block_size() / super::COLUMN_METADATA_OFFSET_ENTRY_SIZE as usize + 8;
+        let write_result = write_file_with_global_buffers(
+            &fs,
+            (0..num_user_global_buffers).map(|_| Bytes::from_static(b"x")),
+        )
+        .await;
+        let summary = write_result.summary();
+        let metadata_size = write_result.metadata_size_bytes();
+        assert!(metadata_size.get() > fs.object_store.block_size() as u64);
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::new(summary.size_bytes))
+            .await
+            .unwrap();
+
+        fs.object_store.io_stats_incremental();
+        let metadata = FileReader::read_all_metadata(&file_scheduler)
+            .await
+            .unwrap();
+        let stats = fs.object_store.io_stats_incremental();
+
+        assert_eq!(stats.read_iops, 3);
+        assert_eq!(stats.read_bytes, metadata_size.get());
+        assert_eq!(metadata.file_buffers.len(), num_user_global_buffers + 1);
+    }
+
+    #[tokio::test]
+    async fn reader_reuses_decoded_metadata_without_io() {
+        let fs = FsFixture::default();
+        create_some_file(&fs, ConcreteFileVersion::V2_1).await;
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let path = file_scheduler.reader().path().clone();
+        let metadata = Arc::new(
+            FileReader::read_all_metadata(&file_scheduler)
+                .await
+                .unwrap(),
+        );
+
+        fs.object_store.io_stats_incremental();
+        let reader = FileReader::try_open_with_file_metadata(
+            Arc::new(crate::io::LanceEncodingsIo::new(file_scheduler)),
+            path,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            metadata.clone(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(Arc::ptr_eq(reader.metadata(), &metadata));
+        assert_eq!(fs.object_store.io_stats_incremental().read_iops, 0);
+    }
+
+    #[tokio::test]
+    async fn column_count_estimate_removes_cmo_dependency() {
+        let fs = FsFixture::default();
+        let num_columns =
+            fs.object_store.block_size() / super::COLUMN_METADATA_OFFSET_ENTRY_SIZE as usize + 8;
+        let written = create_one_row_wide_direct_file(&fs, num_columns).await;
+        let file_size = written.write_result.summary().size_bytes;
+        let estimated_num_columns = NonZeroU32::new(u32::try_from(num_columns).unwrap()).unwrap();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::new(file_size))
+            .await
+            .unwrap();
+
+        fs.object_store.io_stats_incremental();
+        let without_estimate =
+            FileReader::read_metadata_index_with_schema(&file_scheduler, written.schema.clone(), 1)
+                .await
+                .unwrap();
+        let without_estimate_stats = fs.object_store.io_stats_incremental();
+        assert_eq!(without_estimate_stats.read_iops, 2);
+
+        let options =
+            MetadataIndexReadOptions::default().with_estimated_num_columns(estimated_num_columns);
+        fs.object_store.io_stats_incremental();
+        let with_estimate = FileReader::read_metadata_index_with_schema_and_options(
+            &file_scheduler,
+            written.schema.clone(),
+            1,
+            options,
+        )
+        .await
+        .unwrap();
+        let with_estimate_stats = fs.object_store.io_stats_incremental();
+        assert_eq!(with_estimate_stats.read_iops, 1);
+        assert_eq!(
+            with_estimate.column_metadata_offsets,
+            without_estimate.column_metadata_offsets
+        );
+        assert_eq!(with_estimate.num_columns(), num_columns as u32);
+
+        for (estimated_num_columns, expected_read_iops) in [
+            (NonZeroU32::new(1).unwrap(), 2),
+            (
+                NonZeroU32::new(u32::try_from(num_columns * 2).unwrap()).unwrap(),
+                1,
+            ),
+        ] {
+            fs.object_store.io_stats_incremental();
+            let metadata = FileReader::read_metadata_index_with_schema_and_options(
+                &file_scheduler,
+                written.schema.clone(),
+                1,
+                MetadataIndexReadOptions::default()
+                    .with_estimated_num_columns(estimated_num_columns),
+            )
+            .await
+            .unwrap();
+            let stats = fs.object_store.io_stats_incremental();
+            assert_eq!(
+                metadata.column_metadata_offsets,
+                without_estimate.column_metadata_offsets
+            );
+            assert_eq!(
+                stats.read_iops, expected_read_iops,
+                "unexpected read count for {} estimated columns",
+                estimated_num_columns
+            );
+        }
+
+        let bounded_scheduler = ScanScheduler::new(
+            fs.object_store.clone(),
+            SchedulerConfig::new(fs.object_store.block_size() as u64),
+        );
+        let bounded_file_scheduler = bounded_scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::new(file_size))
+            .await
+            .unwrap();
+        fs.object_store.io_stats_incremental();
+        let metadata = FileReader::read_metadata_index_with_schema_and_options(
+            &bounded_file_scheduler,
+            written.schema.clone(),
+            1,
+            MetadataIndexReadOptions::default()
+                .with_estimated_num_columns(NonZeroU32::new(u32::MAX).unwrap()),
+        )
+        .await
+        .unwrap();
+        let stats = fs.object_store.io_stats_incremental();
+        assert_eq!(
+            metadata.column_metadata_offsets,
+            without_estimate.column_metadata_offsets
+        );
+        assert_eq!(stats.read_iops, 2);
+        assert_eq!(stats.read_bytes, without_estimate_stats.read_bytes);
+    }
+
+    #[tokio::test]
     async fn test_lazy_reader_loads_only_requested_column_metadata() {
         let fs = FsFixture::default();
         let written_file = create_wide_direct_file(&fs, 512).await;
@@ -4242,7 +4652,10 @@ mod tests {
         assert_eq!(batches.len(), 1);
     }
 
-    async fn write_file_with_global_buffer(fs: &FsFixture, buffer: Bytes) {
+    async fn write_file_with_global_buffers(
+        fs: &FsFixture,
+        buffers: impl IntoIterator<Item = Bytes>,
+    ) -> FileWriteResult {
         let lance_schema =
             lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![Field::new(
                 "foo",
@@ -4258,10 +4671,12 @@ mod tests {
         )
         .unwrap();
 
-        let buf_index = file_writer.add_global_buffer(buffer).await.unwrap();
-        assert_eq!(buf_index, 1);
+        for (buffer_index, buffer) in buffers.into_iter().enumerate() {
+            let actual_index = file_writer.add_global_buffer(buffer).await.unwrap();
+            assert_eq!(actual_index as usize, buffer_index + 1);
+        }
 
-        file_writer.finish().await.unwrap();
+        file_writer.finish_with_metadata_size().await.unwrap()
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -4307,7 +4722,7 @@ mod tests {
         #[case] expected_message: &str,
     ) {
         let fs = FsFixture::default();
-        write_file_with_global_buffer(&fs, Bytes::from_static(b"hello")).await;
+        write_file_with_global_buffers(&fs, [Bytes::from_static(b"hello")]).await;
 
         let mut file_bytes = fs
             .object_store
@@ -4372,19 +4787,27 @@ mod tests {
         };
         let expected_read_iops = if within_window { 0 } else { 1 };
 
-        write_file_with_global_buffer(&fs, buffer.clone()).await;
+        let write_result = write_file_with_global_buffers(&fs, [buffer.clone()]).await;
 
         let file_scheduler = fs
             .scheduler
             .open_file(&fs.tmp_path, &CachedFileSize::unknown())
             .await
             .unwrap();
-        let file_reader = FileReader::try_open(
+        let metadata_options = if within_window {
+            FullMetadataReadOptions::default()
+        } else {
+            FullMetadataReadOptions::default().with_metadata_size_bytes(
+                NonZeroU64::new(write_result.summary().size_bytes).unwrap(),
+            )
+        };
+        let file_reader = FileReader::try_open_with_metadata_options(
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
             &test_cache(),
             FileReaderOptions::default(),
+            metadata_options,
         )
         .await
         .unwrap();
@@ -4503,7 +4926,7 @@ mod tests {
     async fn test_read_global_buffer_out_of_range() {
         let fs = FsFixture::default();
 
-        write_file_with_global_buffer(&fs, Bytes::from_static(b"hello")).await;
+        write_file_with_global_buffers(&fs, [Bytes::from_static(b"hello")]).await;
 
         let file_scheduler = fs
             .scheduler

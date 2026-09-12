@@ -42,7 +42,8 @@ use lance_core::{
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{
-    CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader,
+    CachedFileMetadata, FileMetadataIndex, FileReaderOptions, FullMetadataReadOptions,
+    MetadataIndexReadOptions, ProjectedFileReader,
 };
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
@@ -1218,17 +1219,25 @@ impl FileFragment {
             .clone()
             .or_else(|| self.dataset.file_reader_options.clone())
             .unwrap_or_default();
+        let estimated_num_columns = data_file.estimated_num_columns();
         let prefer_indexed = metadata_mode == MetadataMode::LazyAllowed
-            && reader_projection.column_indices.len().saturating_mul(4)
-                < data_file
-                    .column_indices
-                    .iter()
-                    .filter(|column_index| **column_index >= 0)
-                    .count();
+            && estimated_num_columns.is_some_and(|num_columns| {
+                reader_projection.prefers_indexed_metadata(num_columns.get() as usize)
+            });
         let known_schema = self
             .metadata
             .physical_rows
             .map(|num_rows| (data_file_schema.clone(), num_rows as u64));
+        let full_metadata_options = data_file.file_metadata_size_bytes.map_or_else(
+            FullMetadataReadOptions::default,
+            |metadata_size_bytes| {
+                FullMetadataReadOptions::default().with_metadata_size_bytes(metadata_size_bytes)
+            },
+        );
+        let metadata_index_options =
+            estimated_num_columns.map_or_else(MetadataIndexReadOptions::default, |num_columns| {
+                MetadataIndexReadOptions::default().with_estimated_num_columns(num_columns)
+            });
 
         let encodings_io = Arc::new(
             LanceEncodingsIo::new(file_scheduler.clone())
@@ -1240,10 +1249,14 @@ impl FileFragment {
             prefer_indexed,
             || async {
                 let metadata_index = self
-                    .get_file_metadata_index(&file_scheduler, known_schema.clone())
+                    .get_file_metadata_index_with_options(
+                        &file_scheduler,
+                        known_schema.clone(),
+                        metadata_index_options,
+                    )
                     .await?;
-                if (reader_projection.column_indices.len() as u32).saturating_mul(4)
-                    >= metadata_index.num_columns()
+                if !reader_projection
+                    .prefers_indexed_metadata(metadata_index.num_columns() as usize)
                 {
                     return Ok(None);
                 }
@@ -1261,7 +1274,9 @@ impl FileFragment {
                 ))
             },
             || async {
-                let file_metadata = self.get_file_metadata(&file_scheduler).await?;
+                let file_metadata = self
+                    .get_file_metadata_with_options(&file_scheduler, full_metadata_options)
+                    .await?;
                 ProjectedFileReader::try_open_with_file_metadata(
                     encodings_io.clone(),
                     path.clone(),
@@ -1810,13 +1825,26 @@ impl FileFragment {
         &self,
         file_scheduler: &FileScheduler,
     ) -> Result<Arc<CachedFileMetadata>> {
+        self.get_file_metadata_with_options(file_scheduler, FullMetadataReadOptions::default())
+            .await
+    }
+
+    async fn get_file_metadata_with_options(
+        &self,
+        file_scheduler: &FileScheduler,
+        options: FullMetadataReadOptions,
+    ) -> Result<Arc<CachedFileMetadata>> {
         let path = file_scheduler.reader().path();
         let cache = self.dataset.metadata_cache.file_metadata_cache(path);
 
         let file_metadata = cache
             .get_or_insert_with_key(FileMetadataCacheKey, || async {
                 let file_metadata: CachedFileMetadata =
-                    lance_file::reader::FileReader::read_all_metadata(file_scheduler).await?;
+                    lance_file::reader::FileReader::read_all_metadata_with_options(
+                        file_scheduler,
+                        options,
+                    )
+                    .await?;
                 Ok(file_metadata)
             })
             .await?;
@@ -1828,20 +1856,39 @@ impl FileFragment {
         file_scheduler: &FileScheduler,
         known_schema: Option<(Arc<Schema>, u64)>,
     ) -> Result<Arc<FileMetadataIndex>> {
+        self.get_file_metadata_index_with_options(
+            file_scheduler,
+            known_schema,
+            MetadataIndexReadOptions::default(),
+        )
+        .await
+    }
+
+    async fn get_file_metadata_index_with_options(
+        &self,
+        file_scheduler: &FileScheduler,
+        known_schema: Option<(Arc<Schema>, u64)>,
+        options: MetadataIndexReadOptions,
+    ) -> Result<Arc<FileMetadataIndex>> {
         let path = file_scheduler.reader().path();
         let cache = self.dataset.metadata_cache.file_metadata_cache(path);
 
         let metadata_index = cache
             .get_or_insert_with_key(FileMetadataIndexCacheKey, || async {
                 let metadata_index = if let Some((file_schema, num_rows)) = known_schema {
-                    lance_file::reader::FileReader::read_metadata_index_with_schema(
+                    lance_file::reader::FileReader::read_metadata_index_with_schema_and_options(
                         file_scheduler,
                         file_schema,
                         num_rows,
+                        options,
                     )
                     .await?
                 } else {
-                    lance_file::reader::FileReader::read_metadata_index(file_scheduler).await?
+                    lance_file::reader::FileReader::read_metadata_index_with_options(
+                        file_scheduler,
+                        options,
+                    )
+                    .await?
                 };
                 Ok(metadata_index)
             })
@@ -6911,7 +6958,7 @@ mod tests {
         assert!(empty_narrow_stream.next().await.is_none());
         let narrow_metadata_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert!(
-            narrow_metadata_stats.read_iops <= 3,
+            narrow_metadata_stats.read_iops <= 2,
             "expected lazy metadata open to skip the schema buffer read, iops={}, bytes={}",
             narrow_metadata_stats.read_iops,
             narrow_metadata_stats.read_bytes
@@ -6926,6 +6973,7 @@ mod tests {
         assert!(empty_full_stream.next().await.is_none());
         let full_metadata_stats = dataset.object_store.as_ref().io_stats_incremental();
 
+        assert_eq!(full_metadata_stats.read_iops, 1);
         assert!(
             full_metadata_stats.read_bytes > narrow_metadata_stats.read_bytes * 4,
             "expected narrow lazy metadata read to fetch much less than full metadata, narrow={} bytes, full={} bytes",
@@ -6989,6 +7037,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 1,
             file_size_bytes: CachedFileSize::unknown(),
+            file_metadata_size_bytes: None,
             base_id: None,
         };
 

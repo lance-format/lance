@@ -111,6 +111,15 @@ def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
     """Test that the files field on Index round-trips through commit."""
     from lance.dataset import Index, IndexFile
 
+    assert (
+        IndexFile(
+            path="unknown.idx", size_bytes=1, file_metadata_size_bytes=0
+        ).file_metadata_size_bytes
+        is None
+    )
+    with pytest.raises(ValueError, match="must be non-negative"):
+        IndexFile(path="invalid.idx", size_bytes=1, file_metadata_size_bytes=-1)
+
     # Get info about the existing index created by the fixture
     original_desc = dataset_with_index.describe_indices()[0]
     index_id = original_desc.segments[0].uuid
@@ -134,7 +143,11 @@ def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
 
     # Create IndexFile objects with custom sizes to verify they round-trip
     index_files = [
-        IndexFile(path="index.idx", size_bytes=1024),
+        IndexFile(
+            path="index.idx",
+            size_bytes=1024,
+            file_metadata_size_bytes=256,
+        ),
         IndexFile(path="auxiliary.bin", size_bytes=2048),
     ]
 
@@ -176,9 +189,11 @@ def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
     assert len(committed_index.files) == 2
 
     # Verify the file sizes match what we set
-    files_by_path = {f.path: f.size_bytes for f in committed_index.files}
-    assert files_by_path["index.idx"] == 1024
-    assert files_by_path["auxiliary.bin"] == 2048
+    files_by_path = {f.path: f for f in committed_index.files}
+    assert files_by_path["index.idx"].size_bytes == 1024
+    assert files_by_path["index.idx"].file_metadata_size_bytes == 256
+    assert files_by_path["auxiliary.bin"].size_bytes == 2048
+    assert files_by_path["auxiliary.bin"].file_metadata_size_bytes is None
 
 
 def test_commit_index_with_index_details(dataset_with_index, test_table, tmp_path):

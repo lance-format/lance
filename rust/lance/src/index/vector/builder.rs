@@ -1848,8 +1848,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             serde_json::to_string(&partition_index_metadata)?,
         );
 
-        let storage_summary = storage_writer.finish().await?;
-        let index_summary = index_writer.finish().await?;
+        let storage_result = storage_writer.finish_with_metadata_size().await?;
+        let index_result = index_writer.finish_with_metadata_size().await?;
+        let storage_summary = storage_result.summary();
+        let index_summary = index_result.summary();
 
         log::info!("merging {} partitions done", ivf.num_partitions());
 
@@ -1857,10 +1859,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             IndexFile {
                 path: INDEX_AUXILIARY_FILE_NAME.to_string(),
                 size_bytes: storage_summary.size_bytes,
+                file_metadata_size_bytes: Some(storage_result.metadata_size_bytes()),
             },
             IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: index_summary.size_bytes,
+                file_metadata_size_bytes: Some(index_result.metadata_size_bytes()),
             },
         ])
     }

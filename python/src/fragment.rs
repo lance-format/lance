@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::fmt::Write as _;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
@@ -957,6 +958,8 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let file_size_bytes: Option<u64> = ob.getattr("file_size_bytes")?.extract()?;
         let file_size_bytes = CachedFileSize::new(file_size_bytes.unwrap_or(0));
+        let file_metadata_size_bytes: Option<u64> =
+            ob.getattr("file_metadata_size_bytes")?.extract()?;
         let fields: Vec<i32> = ob.getattr("fields")?.extract()?;
         let column_indices: Vec<i32> = ob.getattr("column_indices")?.extract()?;
         Ok(Self(DataFile {
@@ -966,6 +969,7 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
             file_major_version: ob.getattr("file_major_version")?.extract()?,
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
             file_size_bytes,
+            file_metadata_size_bytes: file_metadata_size_bytes.and_then(NonZeroU64::new),
             base_id: ob.getattr("base_id")?.extract()?,
         }))
     }
@@ -991,6 +995,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             self.0.file_minor_version,
             file_size_bytes,
             self.0.base_id,
+            self.0.file_metadata_size_bytes.map(NonZeroU64::get),
         ))
     }
 }

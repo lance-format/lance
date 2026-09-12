@@ -637,6 +637,7 @@ mod tests {
                 file_major_version: major_version,
                 file_minor_version: minor_version,
                 file_size_bytes: CachedFileSize::new(100),
+                file_metadata_size_bytes: None,
                 base_id: None,
             }],
             overlays: vec![],

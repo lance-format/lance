@@ -25,7 +25,7 @@ use lance_core::error::Result;
 /// Lance Data File
 ///
 /// A data file is one piece of file storing data.
-#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
@@ -53,21 +53,40 @@ pub struct DataFile {
     /// The size of the file in bytes, if known.
     pub file_size_bytes: CachedFileSize,
 
+    /// The metadata suffix size in bytes, if known.
+    ///
+    /// The suffix starts at the Lance schema descriptor and ends at EOF. Readers
+    /// treat this as an advisory hint and use the file footer as authoritative.
+    /// `None` preserves the footer-directed open path used for older manifests.
+    pub file_metadata_size_bytes: Option<NonZero<u64>>,
+
     /// The base path of the datafile, when the datafile is outside the dataset.
     pub base_id: Option<u32>,
+}
+
+impl DeepSizeOf for DataFile {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.path.deep_size_of_children(context)
+            + self.fields.deep_size_of_children(context)
+            + self.column_indices.deep_size_of_children(context)
+    }
 }
 
 // Custom Serialize: convert Arc<[i32]> to slice for transparent JSON output
 impl Serialize for DataFile {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("DataFile", 7)?;
+        let field_count = 7 + usize::from(self.file_metadata_size_bytes.is_some());
+        let mut s = serializer.serialize_struct("DataFile", field_count)?;
         s.serialize_field("path", &self.path)?;
         s.serialize_field("fields", self.fields.as_ref())?;
         s.serialize_field("column_indices", self.column_indices.as_ref())?;
         s.serialize_field("file_major_version", &self.file_major_version)?;
         s.serialize_field("file_minor_version", &self.file_minor_version)?;
         s.serialize_field("file_size_bytes", &self.file_size_bytes)?;
+        if let Some(file_metadata_size_bytes) = self.file_metadata_size_bytes {
+            s.serialize_field("file_metadata_size_bytes", &file_metadata_size_bytes)?;
+        }
         s.serialize_field("base_id", &self.base_id)?;
         s.end()
     }
@@ -87,6 +106,8 @@ impl<'de> Deserialize<'de> for DataFile {
             #[serde(default)]
             file_minor_version: u32,
             file_size_bytes: CachedFileSize,
+            #[serde(default)]
+            file_metadata_size_bytes: Option<NonZero<u64>>,
             base_id: Option<u32>,
         }
 
@@ -98,6 +119,7 @@ impl<'de> Deserialize<'de> for DataFile {
             file_major_version: helper.file_major_version,
             file_minor_version: helper.file_minor_version,
             file_size_bytes: helper.file_size_bytes,
+            file_metadata_size_bytes: helper.file_metadata_size_bytes,
             base_id: helper.base_id,
         })
     }
@@ -121,8 +143,30 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
+            file_metadata_size_bytes: None,
             base_id,
         }
+    }
+
+    /// Attach the exact metadata suffix size reported by the file writer.
+    pub fn with_file_metadata_size_bytes(mut self, file_metadata_size_bytes: NonZero<u64>) -> Self {
+        self.file_metadata_size_bytes = Some(file_metadata_size_bytes);
+        self
+    }
+
+    /// Estimate the number of physical columns from manifest column mappings.
+    ///
+    /// The file footer remains authoritative. Counting non-negative entries
+    /// keeps malformed or sparse mapping values from becoming read sizes.
+    pub fn estimated_num_columns(&self) -> Option<NonZero<u32>> {
+        let estimated_num_columns = self
+            .column_indices
+            .iter()
+            .filter(|column_index| **column_index >= 0)
+            .count();
+        u32::try_from(estimated_num_columns)
+            .ok()
+            .and_then(NonZero::new)
     }
 
     /// Create a new `DataFile` whose fields and column indices will be set later.
@@ -135,6 +179,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: Default::default(),
+            file_metadata_size_bytes: None,
             base_id: None,
         }
     }
@@ -220,6 +265,7 @@ impl From<&DataFile> for pb::DataFile {
             file_minor_version: df.file_minor_version,
             file_size_bytes: df.file_size_bytes.get().map_or(0, |v| v.get()),
             base_id: df.base_id,
+            file_metadata_size_bytes: df.file_metadata_size_bytes.map_or(0, NonZero::get),
         }
     }
 }
@@ -236,6 +282,7 @@ impl TryFrom<pb::DataFile> for DataFile {
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
+            file_metadata_size_bytes: NonZero::new(proto.file_metadata_size_bytes),
         })
     }
 }
@@ -357,6 +404,7 @@ impl DataFileFieldInterner {
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
+            file_metadata_size_bytes: NonZero::new(proto.file_metadata_size_bytes),
         })
     }
 
@@ -899,6 +947,7 @@ mod tests {
         let mut fragment = Fragment::new(123);
         let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
         fragment.add_file_legacy("foobar.lance", &Schema::try_from(&schema).unwrap());
+        fragment.files[0].file_metadata_size_bytes = NonZero::new(1_024);
         fragment.deletion_file = Some(DeletionFile {
             read_version: 123,
             id: 456,
@@ -1011,6 +1060,7 @@ mod tests {
             file_major_version: MAJOR_VERSION as u32,
             file_minor_version: MINOR_VERSION as u32,
             file_size_bytes: Default::default(),
+            file_metadata_size_bytes: None,
             base_id: None,
         };
 
@@ -1018,5 +1068,13 @@ mod tests {
         data_file
             .validate(&base_path)
             .expect("validation should allow extra columns without field ids");
+    }
+
+    #[test]
+    fn physical_column_estimate_counts_mappings_not_values() {
+        let mut data_file = DataFile::new_unstarted("foo.lance", ConcreteFileVersion::V2_1);
+        data_file.column_indices = Arc::from([0, -1, 7, i32::MAX, -2]);
+
+        assert_eq!(data_file.estimated_num_columns(), NonZero::new(3));
     }
 }

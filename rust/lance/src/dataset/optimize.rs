@@ -664,7 +664,15 @@ pub(super) async fn can_use_binary_copy_current(
             let file_scheduler = scan_scheduler
                 .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
                 .await?;
-            let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
+            let metadata_options = data_file.file_metadata_size_bytes.map_or_else(
+                lance_file::reader::FullMetadataReadOptions::default,
+                |metadata_size_bytes| {
+                    lance_file::reader::FullMetadataReadOptions::default()
+                        .with_metadata_size_bytes(metadata_size_bytes)
+                },
+            );
+            let file_meta =
+                LFReader::read_all_metadata_with_options(&file_scheduler, metadata_options).await?;
             // Binary copy only preserves page and column-buffer bytes. The output file's footer
             // (including global buffers) is re-generated, not copied from inputs.
             //

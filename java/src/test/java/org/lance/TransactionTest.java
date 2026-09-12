@@ -58,6 +58,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -922,6 +923,11 @@ public class TransactionTest {
 
   @Test
   public void testRewrittenIndexFilesRoundTrip(@TempDir Path tempDir) {
+    assertNull(new IndexFile("unknown.idx", 123, 0L).getFileMetadataSizeBytes());
+    IllegalArgumentException invalidMetadataSize =
+        assertThrows(IllegalArgumentException.class, () -> new IndexFile("index.idx", 123, -1L));
+    assertTrue(invalidMetadataSize.getMessage().contains("must be non-negative"));
+
     String datasetPath = tempDir.resolve("rewritten_index_files").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -935,7 +941,7 @@ public class TransactionTest {
                 .withIndexName("btree_id")
                 .build());
         Index oldIndex = dataset.getIndexes().get(0);
-        IndexFile indexFile = new IndexFile("index.idx", 123);
+        IndexFile indexFile = new IndexFile("index.idx", 123, 37L);
         RewrittenIndex rewrittenIndex =
             RewrittenIndex.builder()
                 .oldId(oldIndex.uuid())
@@ -960,6 +966,7 @@ public class TransactionTest {
               operation.rewrittenIndices().get(0).getNewIndexFiles().orElseThrow().get(0);
           assertEquals("index.idx", readFile.getPath());
           assertEquals(123, readFile.getSizeBytes());
+          assertEquals(37L, readFile.getFileMetadataSizeBytes());
         }
       }
     }

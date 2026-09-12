@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
 use lance_core::{Error, Result};
-use lance_file::reader::FileReaderOptions;
+use lance_file::reader::{FileReaderOptions, FullMetadataReadOptions};
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
     frag_reuse::CompactFragReuseIndex,
@@ -21,7 +21,6 @@ use lance_index::{
     },
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::CachedFileSize;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata};
 use prost::Message;
@@ -274,17 +273,24 @@ async fn try_harvest_seeds(
             .clone()
             .join(crate::dataset::DATA_DIR)
             .join(data_file.path.as_str());
-        let Ok(file_scheduler) = scheduler.open_file(&path, &CachedFileSize::unknown()).await
+        let Ok(file_scheduler) = scheduler.open_file(&path, &data_file.file_size_bytes).await
         else {
             return Ok(None);
         };
+        let metadata_options = data_file.file_metadata_size_bytes.map_or_else(
+            FullMetadataReadOptions::default,
+            |metadata_size_bytes| {
+                FullMetadataReadOptions::default().with_metadata_size_bytes(metadata_size_bytes)
+            },
+        );
 
-        let Ok(reader) = lance_file::reader::FileReader::try_open(
+        let Ok(reader) = lance_file::reader::FileReader::try_open_with_metadata_options(
             file_scheduler,
             None,
             Default::default(),
             &dataset.metadata_cache.file_metadata_cache(&path),
             FileReaderOptions::default(),
+            metadata_options,
         )
         .await
         else {

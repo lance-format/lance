@@ -135,6 +135,20 @@ or independently of column indices due to variable encoding widths (for Lance fi
 
 </details>
 
+### File Metadata Size Hints
+
+`DataFile.file_metadata_size_bytes` records the suffix length from the Lance
+schema descriptor through the end of the data file. `IndexFile` records the
+same value for Lance-format files in an index segment; it is zero for other
+file formats. Combined with the corresponding total file size, a reader can
+request this suffix before decoding the footer and remove a dependent metadata
+request.
+
+The value is advisory. Zero means unavailable, values larger than the file are
+invalid, and the offsets and counts decoded from the file footer remain
+authoritative. A reader must preserve the ordinary footer-directed fallback
+for missing, invalid, underestimated, or otherwise inconsistent hints.
+
 !!! note "Field-to-column mapping differs between data storage versions"
 
     In **2.0**, all fields (including non-leaf fields like struct and list containers) are assigned

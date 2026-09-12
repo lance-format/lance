@@ -129,6 +129,8 @@ def test_data_file_create_basic(tmp_path: str):
     assert df.file_major_version == int(stable_version().split(".")[0])
     assert df.file_minor_version == int(stable_version().split(".")[1])
     assert df.file_size_bytes is not None and df.file_size_bytes > 0
+    assert df.file_metadata_size_bytes is not None
+    assert 0 < df.file_metadata_size_bytes <= df.file_size_bytes
 
 
 def test_data_file_create_subset_columns(tmp_path: str):
@@ -180,7 +182,14 @@ def test_data_file_create_end_to_end(tmp_path: str):
         read_version=ds.version,
     )
 
-    result = lance.dataset(tmp_path).to_table()
+    committed = lance.dataset(tmp_path)
+    committed_file = next(
+        data_file
+        for data_file in committed.get_fragments()[0].data_files()
+        if data_file.path == new_file_name
+    )
+    assert committed_file.file_metadata_size_bytes == df.file_metadata_size_bytes
+    result = committed.to_table()
     assert result.column("b").to_pylist() == list(range(200, 300))
     assert result.column("a").to_pylist() == list(range(100))
 

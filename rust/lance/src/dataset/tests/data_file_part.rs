@@ -141,9 +141,16 @@ async fn concatenates_parts_in_caller_order_without_reusing_staging_files() {
         .concat_data_file_parts(&target, &ordered_parts)
         .await
         .unwrap();
+    let metadata_size_bytes = data_file.file_metadata_size_bytes;
     let replacement = DataReplacementGroup(only_fragment(&dataset).id() as u64, data_file);
     assert_eq!(replacement.1.path, target.file_name.as_str());
     let dataset = commit(&dataset, replacement).await.unwrap();
+    let committed_file = dataset.manifest.fragments[0]
+        .files
+        .iter()
+        .find(|file| file.path == target.file_name)
+        .unwrap();
+    assert_eq!(committed_file.file_metadata_size_bytes, metadata_size_bytes);
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(
         batch["id"].as_primitive::<Int32Type>().values(),
@@ -296,6 +303,14 @@ async fn managed_part_rejects_invalid_descriptions_and_duplicate_inputs() {
     .unwrap();
     let part = write_part(&dataset, &target, None, batch).await;
     let description = serde_json::to_value(&part).unwrap();
+    assert!(part.metadata_size_bytes().is_some());
+    let mut older_description = description.clone();
+    older_description
+        .as_object_mut()
+        .unwrap()
+        .remove("metadata_size_bytes");
+    let older_part = serde_json::from_value::<DataFilePart>(older_description).unwrap();
+    assert_eq!(older_part.metadata_size_bytes(), None);
     let mut zero_size = description.clone();
     zero_size["size_bytes"] = serde_json::json!(0);
     let error = serde_json::from_value::<DataFilePart>(zero_size).unwrap_err();
@@ -401,6 +416,7 @@ async fn abandoned_target_cleanup_includes_failed_writes_and_preserves_other_tar
         .concat_data_file_parts(&target, std::slice::from_ref(&first))
         .await
         .unwrap();
+    assert!(assembled.file_metadata_size_bytes.is_some());
     let assembled_path = dataset
         .data_file_dir_for_base(base_id)
         .unwrap()

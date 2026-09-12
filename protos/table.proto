@@ -361,6 +361,14 @@ message IndexFile {
   string path = 1;
   // Size of the file in bytes
   uint64 size_bytes = 2;
+  /* Number of bytes from the Lance schema descriptor through the end of the file.
+   *
+   * A reader that knows `size_bytes` may use this advisory value to issue the
+   * complete metadata-suffix read without first decoding the footer. The footer
+   * remains authoritative, and readers must fall back when this value is zero or
+   * invalid. Zero also covers files that do not use the Lance file format.
+   */
+  uint64 file_metadata_size_bytes = 3;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.
@@ -520,6 +528,15 @@ message DataFile {
    * Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
    */
   optional uint32 base_id = 7;
+
+  /* Number of bytes from the Lance schema descriptor through the end of the file.
+   *
+   * A reader that knows `file_size_bytes` may use this advisory value to issue
+   * the complete metadata-suffix read without first decoding the footer. The
+   * footer remains authoritative, and readers must fall back when this value is
+   * zero or invalid.
+   */
+  uint64 file_metadata_size_bytes = 8;
 } // DataFile
 
 /* An overlay file supplies new values for a subset of (row offset, field) cells

@@ -5952,10 +5952,26 @@ class ExecuteResult(TypedDict):
 
 @dataclass
 class IndexFile:
-    """Metadata about a file in an index segment."""
+    """Metadata about a file in an index segment.
+
+    ``file_metadata_size_bytes`` is the exact metadata suffix size when
+    available. Zero is treated as unavailable.
+    """
 
     path: str
     size_bytes: int
+    file_metadata_size_bytes: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.file_metadata_size_bytes is not None
+            and self.file_metadata_size_bytes < 0
+        ):
+            raise ValueError(
+                "file_metadata_size_bytes must be non-negative, "
+                f"got {self.file_metadata_size_bytes}"
+            )
+        self.file_metadata_size_bytes = self.file_metadata_size_bytes or None
 
 
 @dataclass

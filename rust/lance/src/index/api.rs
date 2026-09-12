@@ -8,7 +8,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use lance_index::{
     FtsPrewarmResult, IndexParams, IndexType, PrewarmOptions, optimize::OptimizeOptions,
 };
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexFile, IndexMetadata};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -37,6 +37,8 @@ pub struct IndexSegment {
     index_version: i32,
     /// Dataset version at which this segment's physical contents were built.
     dataset_version: u64,
+    /// Previously reported file metadata, used to preserve immutable open hints.
+    known_files: Option<Vec<IndexFile>>,
 }
 
 impl IndexSegment {
@@ -63,7 +65,21 @@ impl IndexSegment {
             index_details,
             index_version,
             dataset_version,
+            known_files: None,
         }
+    }
+
+    /// Attach the immutable files already produced for this segment.
+    ///
+    /// Matching path and total-size metadata is preserved when the segment is
+    /// committed; the directory listing remains authoritative.
+    pub fn with_files(mut self, files: Vec<IndexFile>) -> Self {
+        self.known_files = Some(files);
+        self
+    }
+
+    pub(crate) fn known_files(&self) -> Option<&[IndexFile]> {
+        self.known_files.as_deref()
     }
 
     /// Return the UUID of this segment.
@@ -173,7 +189,8 @@ impl IntoIndexSegment for IndexMetadata {
             ))
         })?;
 
-        Ok(IndexSegment::new(
+        let known_files = self.files;
+        let segment = IndexSegment::new(
             self.uuid,
             fragment_bitmap.iter(),
             self.fields,
@@ -181,7 +198,11 @@ impl IntoIndexSegment for IndexMetadata {
             self.index_version,
             self.dataset_version,
             self.covering_fields,
-        ))
+        );
+        Ok(match known_files {
+            Some(files) => segment.with_files(files),
+            None => segment,
+        })
     }
 }
 
@@ -393,12 +414,20 @@ mod tests {
             index_version: 5,
             created_at: None,
             base_id: None,
-            files: None,
+            files: Some(vec![IndexFile {
+                path: "index.idx".to_string(),
+                size_bytes: 1_024,
+                file_metadata_size_bytes: std::num::NonZeroU64::new(256),
+            }]),
         };
 
         let segment = metadata.into_index_segment().unwrap();
         assert_eq!(segment.fields(), [3, 7]);
         assert_eq!(segment.dataset_version(), 42);
+        assert_eq!(
+            segment.known_files().unwrap()[0].file_metadata_size_bytes,
+            std::num::NonZeroU64::new(256)
+        );
     }
 
     /// Segments arrive from callers this build never validated, so the keyed

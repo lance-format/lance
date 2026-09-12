@@ -17,7 +17,7 @@ use lance::table::format::{
 };
 use lance_io::utils::CachedFileSize;
 use lance_table::rowids::{RowIdSequence, write_row_ids};
-use std::iter::once;
+use std::{iter::once, num::NonZeroU64};
 
 use roaring::RoaringBitmap;
 
@@ -685,7 +685,7 @@ fn inner_encode_row_ids(env: &mut JNIEnv, row_ids: &JLongArray) -> Result<String
 
 const DATA_FILE_CLASS: &str = "org/lance/fragment/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str =
-    "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
+    "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;Ljava/lang/Long;)V";
 const DELETE_FILE_CLASS: &str = "org/lance/fragment/DeletionFile";
 const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
@@ -745,6 +745,18 @@ impl IntoJava for &DataFile {
             None => JObject::null(),
         };
         let base_id = convert_to_java_integer(env, self.base_id)?;
+        let file_metadata_size_bytes = match self.file_metadata_size_bytes {
+            Some(size) => {
+                let size = i64::try_from(size.get()).map_err(|_| {
+                    Error::runtime_error(format!(
+                        "Cannot convert DataFile.file_metadata_size_bytes={} to Java long",
+                        size.get()
+                    ))
+                })?;
+                JLance(size).into_java(env)?
+            }
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             DATA_FILE_CLASS,
             DATA_FILE_CONSTRUCTOR_SIG,
@@ -756,6 +768,7 @@ impl IntoJava for &DataFile {
                 JValueGen::Int(self.file_minor_version as i32),
                 JValueGen::Object(&file_size_bytes),
                 JValueGen::Object(&base_id),
+                JValueGen::Object(&file_metadata_size_bytes),
             ],
         )?)
     }
@@ -1019,6 +1032,21 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             .extract_object(env)?;
         let file_size_bytes =
             file_size_bytes.map_or(Default::default(), |r| CachedFileSize::new(r as u64));
+        let file_metadata_size_bytes: Option<i64> = env
+            .call_method(self, "getFileMetadataSizeBytes", "()Ljava/lang/Long;", &[])?
+            .l()?
+            .extract_object(env)?;
+        let file_metadata_size_bytes = match file_metadata_size_bytes {
+            Some(size) => {
+                let size = u64::try_from(size).map_err(|_| {
+                    Error::input_error(format!(
+                        "DataFile.fileMetadataSizeBytes must be non-negative, got {size}"
+                    ))
+                })?;
+                NonZeroU64::new(size)
+            }
+            None => None,
+        };
         let base_id = get_base_id(env, self)?;
         Ok(DataFile {
             path,
@@ -1027,6 +1055,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             file_major_version,
             file_minor_version,
             file_size_bytes,
+            file_metadata_size_bytes,
             base_id,
         })
     }

@@ -21,8 +21,8 @@ use crate::{
     format::pbfile,
     reader::{
         BufferDescriptor, CachedFileMetadata, FileMetadataIndex, FileMetadataProvider, FileReader,
-        FileReaderOptions, PreparedProjection, ProjectedFileReader, RawFileMetadata,
-        ReadProjection, ReaderProjection,
+        FileReaderOptions, FullMetadataReadOptions, PreparedProjection, ProjectedFileReader,
+        RawFileMetadata, ReadProjection, ReaderProjection,
     },
     version::ConcreteFileVersion,
     writer::{FileWriter, FileWriterOptions},
@@ -322,7 +322,33 @@ pub async fn open_self_described_reader(
     cache: &LanceCache,
     options: FileReaderOptions,
 ) -> Result<OpenedFileReader> {
-    FileReader::try_open_for_dispatch(scheduler, None, decoder_plugins, cache, options).await
+    open_self_described_reader_with_metadata_options(
+        scheduler,
+        decoder_plugins,
+        cache,
+        options,
+        FullMetadataReadOptions::default(),
+    )
+    .await
+}
+
+/// Open a self-described file using advisory full-metadata options.
+pub async fn open_self_described_reader_with_metadata_options(
+    scheduler: FileScheduler,
+    decoder_plugins: Arc<DecoderPlugins>,
+    cache: &LanceCache,
+    options: FileReaderOptions,
+    metadata_options: FullMetadataReadOptions,
+) -> Result<OpenedFileReader> {
+    FileReader::try_open_for_dispatch_with_metadata_options(
+        scheduler,
+        None,
+        decoder_plugins,
+        cache,
+        options,
+        metadata_options,
+    )
+    .await
 }
 
 /// Create a current-format writer for an exact file version.

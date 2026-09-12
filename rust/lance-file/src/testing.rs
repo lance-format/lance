@@ -17,7 +17,10 @@ use lance_io::{
 
 use crate::reader::{FileReader, FileReaderOptions};
 use crate::version::ConcreteFileVersion;
-use crate::{versions, writer::FileWriterOptions};
+use crate::{
+    versions,
+    writer::{FileWriteResult, FileWriterOptions},
+};
 
 pub struct FsFixture {
     pub tmp_path: TempObjFile,
@@ -43,6 +46,7 @@ pub struct WrittenFile {
     pub schema: Arc<Schema>,
     pub data: Vec<RecordBatch>,
     pub field_id_mapping: Vec<(u32, u32)>,
+    pub write_result: FileWriteResult,
 }
 
 pub async fn write_lance_file(
@@ -67,11 +71,12 @@ pub async fn write_lance_file(
     }
     let field_id_mapping = file_writer.field_id_to_column_indices().to_vec();
     file_writer.add_schema_metadata("foo", "bar");
-    file_writer.finish().await.unwrap();
+    let write_result = file_writer.finish_with_metadata_size().await.unwrap();
     WrittenFile {
         schema: Arc::new(lance_schema),
         data,
         field_id_mapping,
+        write_result,
     }
 }
 

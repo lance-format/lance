@@ -2253,10 +2253,13 @@ mod tests {
         );
     }
 
-    /// `open_index_file` looks up sizes in `IndexMetadata::file_size_map()` by
-    /// bare file name. This pins that a freshly created HNSW index records both
-    /// the main and auxiliary files under those exact names with nonzero sizes,
-    /// which is what lets the open path skip the HEAD.
+    /// `open_index_file` looks up size hints by bare file name. This pins that a
+    /// freshly created HNSW index records both the main and auxiliary files under
+    /// those exact names with nonzero total and metadata suffix sizes.
+    ///
+    /// A cold open must also reuse the main reader selected during format
+    /// dispatch instead of reading the same root metadata range again.
+    /// Its concurrently prefetched auxiliary reader must also be reused.
     #[tokio::test]
     async fn test_hnsw_index_records_file_sizes() {
         use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME};
@@ -2302,20 +2305,58 @@ mod tests {
 
         let indices = dataset.load_indices().await.unwrap();
         let index = indices.iter().find(|idx| idx.name == "hnsw").unwrap();
-        let file_sizes = index.file_size_map();
+        let files = index.files.as_ref().expect("manifest should record files");
+        for file_name in [INDEX_FILE_NAME, INDEX_AUXILIARY_FILE_NAME] {
+            let file = files
+                .iter()
+                .find(|file| file.path == file_name)
+                .unwrap_or_else(|| panic!("manifest should record {file_name}, got {files:?}"));
+            assert!(file.size_bytes > 0);
+            assert!(
+                file.file_metadata_size_bytes
+                    .is_some_and(|metadata_size| metadata_size.get() <= file.size_bytes),
+                "manifest should record a valid metadata suffix for {file_name}, got {files:?}"
+            );
+        }
+        let index_uuid = index.uuid;
+        drop(indices);
+        drop(dataset);
 
-        assert!(
-            file_sizes.get(INDEX_FILE_NAME).copied().unwrap_or(0) > 0,
-            "manifest should record a nonzero {INDEX_FILE_NAME} size, got {file_sizes:?}"
-        );
-        assert!(
-            file_sizes
-                .get(INDEX_AUXILIARY_FILE_NAME)
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let segment_path = dataset.indices_dir().join(index_uuid.to_string());
+        let index_paths = [
+            segment_path.clone().join(INDEX_FILE_NAME),
+            segment_path.join(INDEX_AUXILIARY_FILE_NAME),
+        ];
+        dataset.object_store.io_stats_incremental();
+        let _index = dataset
+            .open_vector_index("vector", &index_uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let stats = dataset.object_store.io_stats_incremental();
+        for index_path in index_paths {
+            let requests = stats
+                .requests
+                .iter()
+                .filter(|request| request.path == index_path)
+                .map(|request| {
+                    (
+                        request.method,
+                        request.range.as_ref().map(|range| (range.start, range.end)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let unique_requests = requests
+                .iter()
                 .copied()
-                .unwrap_or(0)
-                > 0,
-            "manifest should record a nonzero {INDEX_AUXILIARY_FILE_NAME} size, got {file_sizes:?}"
-        );
+                .collect::<std::collections::HashSet<_>>();
+            assert!(!requests.is_empty(), "no reads for {index_path}: {stats:?}");
+            assert_eq!(
+                requests.len(),
+                unique_requests.len(),
+                "{index_path} requests were issued more than once: {stats:?}"
+            );
+        }
     }
 
     #[tokio::test]

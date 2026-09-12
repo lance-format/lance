@@ -34,7 +34,7 @@ use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::writer::{
-    ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriteSummary, FileWriterOptions,
+    ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriteResult, FileWriteSummary, FileWriterOptions,
     PAGE_BUFFER_ALIGNMENT,
 };
 
@@ -753,6 +753,11 @@ impl Writer {
     ///
     /// Returns a summary of the completed file write.
     pub async fn finish(&mut self) -> Result<FileWriteSummary> {
+        Ok(self.finish_with_metadata_size().await?.summary())
+    }
+
+    /// Finishes writing the file and returns the exact metadata suffix size.
+    pub async fn finish_with_metadata_size(&mut self) -> Result<FileWriteResult> {
         // 1. flush any remaining data and write out those pages
         let mut external_buffers =
             OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
@@ -776,6 +781,10 @@ impl Writer {
 
         // 3. write global buffers (we write the schema here)
         let global_buffer_offsets = self.write_global_buffers().await?;
+        let metadata_start = global_buffer_offsets
+            .first()
+            .map(|(position, _)| *position)
+            .ok_or_else(|| Error::internal("schema descriptor was not written"))?;
         let num_global_buffers = global_buffer_offsets.len() as u32;
 
         // 4. write the column metadatas
@@ -809,10 +818,11 @@ impl Writer {
         // 7. close the writer
         let write_result = ObjectWriter::shutdown(self.writer.as_mut()).await?;
 
-        Ok(FileWriteSummary {
+        let summary = FileWriteSummary {
             num_rows: self.rows_written,
             size_bytes: write_result.size as u64,
-        })
+        };
+        FileWriteResult::try_new(summary, metadata_start)
     }
 
     pub async fn abort(&mut self) {

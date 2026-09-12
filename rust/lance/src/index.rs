@@ -21,9 +21,9 @@ use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS,
 };
-use lance_file::reader::FileReaderOptions;
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
-use lance_index::INDEX_METADATA_SCHEMA_KEY;
+use lance_file::versions::{self as file_versions, OpenedFileReader};
 pub use lance_index::IndexParams;
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME,
@@ -48,6 +48,7 @@ use lance_index::{
     FtsPrewarmDiagnostics, FtsPrewarmOptions, FtsPrewarmResult, FtsPrewarmSegmentStatus,
     INDEX_FILE_NAME, Index, IndexType, PrewarmOptions, pb, vector::VectorIndex,
 };
+use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY};
 use lance_index::{
     IndexCriteria, is_system_index,
     metrics::{MetricsCollector, NoOpMetricsCollector},
@@ -58,7 +59,6 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Reader;
 use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
-    read_version,
 };
 use lance_table::format::{DataFile, Fragment, SelfDescribingFileReader};
 use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
@@ -73,7 +73,7 @@ use vector::details::{
     vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
-use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
+use vector::ivf::v2::{IVFIndex, IvfFileOpenContext, IvfFileOpenHints, IvfStateEntryBox};
 use vector::utils::get_vector_type;
 
 mod api;
@@ -396,6 +396,18 @@ pub(crate) async fn build_index_metadata_from_segments(
     prune_stale_segment_coverage(dataset, &mut segments, false, false).await?;
 
     let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
+        let known_file_hints = segment
+            .known_files()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|file| {
+                        file.file_metadata_size_bytes
+                            .map(|size| (file.path.clone(), (file.size_bytes, size)))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let (
             uuid,
             fragment_bitmap,
@@ -427,6 +439,13 @@ pub(crate) async fn build_index_metadata_from_segments(
         let mut files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
         if is_inverted_index {
             retain_committed_inverted_files(&mut files);
+        }
+        for file in &mut files {
+            if let Some((known_size, metadata_size)) = known_file_hints.get(&file.path)
+                && *known_size == file.size_bytes
+            {
+                file.file_metadata_size_bytes = Some(*metadata_size);
+            }
         }
         Ok::<_, Error>(IndexMetadata {
             uuid,
@@ -3037,22 +3056,54 @@ impl DatasetIndexInternalExt for Dataset {
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
         let index_dir = self.indice_files_dir(&index_meta)?;
-        let index_file = index_dir
-            .clone()
-            .join(uuid.to_string())
-            .join(INDEX_FILE_NAME);
-        let file_sizes = index_meta.file_size_map();
-        let reader: Arc<dyn Reader> = vector::open_index_file(
-            object_store.as_ref(),
-            &index_file,
-            INDEX_FILE_NAME,
-            &file_sizes,
-        )
-        .await?
-        .into();
-
-        let tailing_bytes = read_last_block(reader.as_ref()).await?;
-        let (major_version, minor_version) = read_version(&tailing_bytes)?;
+        let segment_dir = index_dir.clone().join(uuid.to_string());
+        let index_file = segment_dir.clone().join(INDEX_FILE_NAME);
+        let auxiliary_file = segment_dir.join(INDEX_AUXILIARY_FILE_NAME);
+        let file_open_hints = IvfFileOpenHints::new(index_meta.files.clone().unwrap_or_default());
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let cached_size = CachedFileSize::new(file_open_hints.file_size(INDEX_FILE_NAME));
+        let file = scheduler.open_file(&index_file, &cached_size).await?;
+        let object_reader = file.reader().clone();
+        let index_file_cache = self.metadata_cache.file_metadata_cache(&index_file);
+        let open_index = file_versions::open_self_described_reader_with_metadata_options(
+            file,
+            Default::default(),
+            &index_file_cache,
+            FileReaderOptions::default(),
+            file_open_hints.metadata_options(INDEX_FILE_NAME),
+        );
+        // Current writers record an exact auxiliary suffix. Requiring that hint
+        // avoids speculative legacy I/O while putting both current-file opens in
+        // the same dependency stage.
+        let prefetch_auxiliary = async {
+            if file_open_hints
+                .metadata_size_bytes(INDEX_AUXILIARY_FILE_NAME)
+                .is_none()
+            {
+                return Ok(None);
+            }
+            let cached_size =
+                CachedFileSize::new(file_open_hints.file_size(INDEX_AUXILIARY_FILE_NAME));
+            let file = scheduler.open_file(&auxiliary_file, &cached_size).await?;
+            FileReader::try_open_with_metadata_options(
+                file,
+                None,
+                Default::default(),
+                &self.metadata_cache.file_metadata_cache(&auxiliary_file),
+                FileReaderOptions::default(),
+                file_open_hints.metadata_options(INDEX_AUXILIARY_FILE_NAME),
+            )
+            .await
+            .map(Some)
+        };
+        // Defer propagating the speculative result until root dispatch proves
+        // this is a current-format index, so advisory data cannot break legacy.
+        let (opened_reader, prefetched_storage_reader) =
+            tokio::join!(open_index, prefetch_auxiliary);
+        let opened_reader = opened_reader?;
 
         // Namespace the index cache by the UUID of the index. v2+ partition
         // entries are store-free and remain reusable across object-store
@@ -3069,68 +3120,57 @@ impl DatasetIndexInternalExt for Dataset {
 
         // the index file is in lance format since version (0,2)
         // TODO: we need to change the legacy IVF_PQ to be in lance format
-        let result: Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> = match (
-            major_version,
-            minor_version,
-        ) {
-            (0, 1) | (0, 0) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
-                let proto = open_index_proto(reader.as_ref()).await?;
-                match &proto.implementation {
-                    Some(Implementation::VectorIndex(vector_index)) => {
-                        let dataset = Arc::new(self.clone());
-                        let idx = vector::open_vector_index(
-                            dataset,
-                            uuid,
-                            vector_index,
-                            reader,
-                            frag_reuse_index,
-                        )
-                        .await?;
-                        Ok((idx, None::<IvfStateEntryBox>))
+        let result: Result<(Arc<dyn VectorIndex>, Option<IvfStateEntryBox>)> = match opened_reader {
+            OpenedFileReader::V1 {
+                major_version,
+                minor_version,
+            } => match (major_version, minor_version) {
+                (0, 1) | (0, 0) => {
+                    info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
+                    let proto = open_index_proto(object_reader.as_ref()).await?;
+                    match &proto.implementation {
+                        Some(Implementation::VectorIndex(vector_index)) => {
+                            let dataset = Arc::new(self.clone());
+                            let idx = vector::open_vector_index(
+                                dataset,
+                                uuid,
+                                vector_index,
+                                object_reader,
+                                frag_reuse_index,
+                            )
+                            .await?;
+                            Ok((idx, None::<IvfStateEntryBox>))
+                        }
+                        None => Err(Error::internal(
+                            "Index proto was missing implementation field",
+                        )),
                     }
-                    None => Err(Error::internal(
-                        "Index proto was missing implementation field",
-                    )),
                 }
-            }
 
-            (0, 2) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
-                let reader = V1FileReader::try_new_self_described_from_reader(
-                    reader.clone(),
-                    Some(&self.metadata_cache.file_metadata_cache(&index_file)),
-                )
-                .await?;
-                let idx = vector::open_vector_index_v2(
-                    Arc::new(self.clone()),
-                    column,
-                    uuid,
-                    reader,
-                    frag_reuse_index,
-                )
-                .await?;
-                Ok((idx, None::<IvfStateEntryBox>))
-            }
+                (0, 2) => {
+                    info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
+                    let reader = V1FileReader::try_new_self_described_from_reader(
+                        object_reader,
+                        Some(&self.metadata_cache.file_metadata_cache(&index_file)),
+                    )
+                    .await?;
+                    let idx = vector::open_vector_index_v2(
+                        Arc::new(self.clone()),
+                        column,
+                        uuid,
+                        reader,
+                        frag_reuse_index,
+                    )
+                    .await?;
+                    Ok((idx, None::<IvfStateEntryBox>))
+                }
 
-            (0, 3) | (2, _) => {
-                let scheduler = ScanScheduler::new(
-                    object_store.clone(),
-                    SchedulerConfig::max_bandwidth(&object_store),
-                );
-                let cached_size = file_sizes
-                    .get(INDEX_FILE_NAME)
-                    .map(|&size| CachedFileSize::new(size))
-                    .unwrap_or_else(CachedFileSize::unknown);
-                let file = scheduler.open_file(&index_file, &cached_size).await?;
-                let reader = lance_file::reader::FileReader::try_open(
-                    file,
-                    None,
-                    Default::default(),
-                    &self.metadata_cache.file_metadata_cache(&index_file),
-                    FileReaderOptions::default(),
-                )
-                .await?;
+                _ => Err(Error::index(
+                    "unsupported index version (maybe need to upgrade your lance version)"
+                        .to_owned(),
+                )),
+            },
+            OpenedFileReader::Current(reader) => {
                 let index_metadata = reader
                     .schema()
                     .metadata
@@ -3143,6 +3183,12 @@ impl DatasetIndexInternalExt for Dataset {
                 let (field_path, field) = resolve_index_column(self.schema(), &index_meta, column)?;
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
+                let file_open_context = IvfFileOpenContext::new(
+                    scheduler,
+                    reader,
+                    prefetched_storage_reader?,
+                    file_open_hints,
+                );
 
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
 
@@ -3156,7 +3202,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
-                                file_sizes,
+                                file_open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3169,7 +3215,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
-                                file_sizes,
+                                file_open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3188,7 +3234,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
+                            file_open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3202,7 +3248,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
+                            file_open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3216,7 +3262,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
+                            file_open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3231,7 +3277,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
-                                file_sizes,
+                                file_open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3244,7 +3290,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
-                                file_sizes,
+                                file_open_context,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3259,7 +3305,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
+                            file_open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3273,7 +3319,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
+                            file_open_context,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3285,10 +3331,6 @@ impl DatasetIndexInternalExt for Dataset {
                     ))),
                 }
             }
-
-            _ => Err(Error::index(
-                "unsupported index version (maybe need to upgrade your lance version)".to_owned(),
-            )),
         };
         let (index, ivf_entry) = result?;
         metrics.record_index_load();
@@ -3825,6 +3867,7 @@ mod tests {
             files: Some(vec![lance_table::format::IndexFile {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
+                file_metadata_size_bytes: None,
             }]),
         }
     }

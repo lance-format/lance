@@ -81,6 +81,15 @@ public class FragmentTest {
 
   @Test
   void testFragmentCreate(@TempDir Path tempDir) throws Exception {
+    assertNull(
+        new org.lance.fragment.DataFile("unknown.lance", new int[0], new int[0], 2, 2, 1L, null, 0L)
+            .getFileMetadataSizeBytes());
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new org.lance.fragment.DataFile(
+                "invalid.lance", new int[0], new int[0], 2, 2, 1L, null, -1L));
+
     String datasetPath = tempDir.resolve("new_fragment").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -89,6 +98,9 @@ public class FragmentTest {
       int rowCount = 21;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
       assertEquals(fragmentMeta.getFiles(), fragmentMeta.getReferencedLanceFiles());
+      Long fileMetadataSizeBytes = fragmentMeta.getFiles().get(0).getFileMetadataSizeBytes();
+      assertNotNull(fileMetadataSizeBytes);
+      assertTrue(fileMetadataSizeBytes > 0);
 
       // Commit fragment
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
@@ -97,6 +109,9 @@ public class FragmentTest {
         assertEquals(2, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
         Fragment fragment = dataset.getFragments().get(0);
+        assertEquals(
+            fileMetadataSizeBytes,
+            fragment.metadata().getFiles().get(0).getFileMetadataSizeBytes());
 
         try (LanceScanner scanner = fragment.newScan()) {
           Schema schemaRes = scanner.schema();
