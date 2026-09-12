@@ -1848,6 +1848,66 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             serde_json::to_string(&partition_index_metadata)?,
         );
 
+        let centroid_params = self
+            .ivf_params
+            .as_ref()
+            .and_then(|p| p.centroid_hnsw.clone());
+        let mut centroid_graph = None;
+        if centroid_params.is_none() {
+            for source in &self.existing_indices {
+                let Some(source) = source.index.as_any().downcast_ref::<IVFIndex<S, Q>>() else {
+                    continue;
+                };
+                if let Some(bytes) = source.centroid_graph_bytes().await? {
+                    let source_centroids = source
+                        .ivf_model()
+                        .centroids_array()
+                        .ok_or_else(|| Error::index("missing source IVF centroids"))?
+                        .clone();
+                    let centroids = index_ivf
+                        .centroids_array()
+                        .ok_or_else(|| Error::index("missing IVF centroids"))?
+                        .clone();
+                    let metric = self.distance_type;
+                    centroid_graph = Some(
+                        tokio::task::spawn_blocking(move || {
+                            lance_index::vector::ivf::centroid::CentroidIndex::reuse_or_rebuild(
+                                bytes,
+                                source_centroids,
+                                centroids,
+                                metric,
+                            )
+                        })
+                        .await
+                        .map_err(|e| {
+                            Error::index(format!("centroid HNSW rewrite failed: {e}"))
+                        })??,
+                    );
+                    break;
+                }
+            }
+        }
+        if let Some(params) = centroid_params {
+            let centroids = index_ivf
+                .centroids_array()
+                .ok_or_else(|| Error::index("missing IVF centroids"))?
+                .clone();
+            let metric = self.distance_type;
+            let graph = tokio::task::spawn_blocking(move || {
+                lance_index::vector::ivf::centroid::CentroidIndex::build(centroids, metric, params)
+            })
+            .await
+            .map_err(|e| Error::index(format!("centroid HNSW construction failed: {e}")))??;
+            centroid_graph = Some(graph);
+        }
+        if let Some(graph) = centroid_graph {
+            let id = index_writer.add_global_buffer(graph).await?;
+            index_writer.add_schema_metadata(
+                lance_index::vector::ivf::centroid::CENTROID_HNSW_KEY,
+                id.to_string(),
+            );
+        }
+
         let storage_summary = storage_writer.finish().await?;
         let index_summary = index_writer.finish().await?;
 

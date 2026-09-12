@@ -22,6 +22,7 @@ import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
+from lance.file import LanceFileReader
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import (  # noqa: E402
@@ -2524,6 +2525,92 @@ def test_vector_index_with_nprobes(indexed_dataset):
     ).analyze_plan()
 
 
+@pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_PQ", "IVF_RQ", "IVF_HNSW_PQ"])
+def test_persisted_centroid_hnsw(tmp_path, index_type):
+    vectors = np.random.default_rng(42).normal(size=(512, 8)).astype(np.float32)
+    table = vec_to_table(vectors).append_column("id", pa.array(range(len(vectors))))
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=256)
+    options = {"num_sub_vectors": 2} if "PQ" in index_type else {}
+    ds.create_index(
+        "vector",
+        index_type,
+        num_partitions=8,
+        max_iters=2,
+        centroid_hnsw={"m": 4, "ef_construction": 16},
+        **options,
+    )
+    index_dir = tmp_path / "_indices" / ds.describe_indices()[0].segments[0].uuid
+    reader = LanceFileReader(str(index_dir / "index.idx"))
+    buffer_id = int(reader.metadata().schema.metadata[b"lance:ivf:centroid_hnsw"])
+    assert buffer_id > 0
+    graph_bytes = reader.read_global_buffer(buffer_id)
+    graph = pa.ipc.open_stream(graph_bytes).read_all()
+    assert graph.schema.metadata[b"lance:hnsw"]
+    assert graph["__vector_id"][:8].to_pylist() == list(range(8))
+
+    # A fresh dataset/session must use the persisted artifact, and opt-out must
+    # retain the ordinary exact centroid route.
+    ds = lance.dataset(tmp_path)
+    nearest = {"column": "vector", "q": vectors[0], "k": 10, "nprobes": 8}
+    exact = ds.to_table(nearest=nearest)["id"].to_pylist()
+    routed = ds.to_table(nearest={**nearest, "centroid_ef": 16})["id"].to_pylist()
+    assert len(set(exact) & set(routed)) / len(exact) >= 0.9
+
+
+def test_centroid_hnsw_survives_delta_and_merge(tmp_path):
+    vectors = np.random.default_rng(42).normal(size=(64, 4)).astype(np.float32)
+    table = vec_to_table(vectors).append_column("id", pa.array(range(len(vectors))))
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=32)
+    ds.create_index("vector", "IVF_FLAT", num_partitions=4, centroid_hnsw={})
+    first_uuid = ds.describe_indices()[0].segments[0].uuid
+    reader = LanceFileReader(str(tmp_path / "_indices" / first_uuid / "index.idx"))
+    graph = reader.read_global_buffer(
+        int(reader.metadata().schema.metadata[b"lance:ivf:centroid_hnsw"])
+    )
+    ds = lance.write_dataset(table, tmp_path, mode="append")
+    ds.optimize.optimize_indices(num_indices_to_merge=0)
+    ds.optimize.optimize_indices(num_indices_to_merge=2)
+    ds = lance.dataset(tmp_path)
+    current_uuid = ds.describe_indices()[0].segments[0].uuid
+    assert current_uuid != first_uuid
+    reader = LanceFileReader(str(tmp_path / "_indices" / current_uuid / "index.idx"))
+    assert (
+        reader.read_global_buffer(
+            int(reader.metadata().schema.metadata[b"lance:ivf:centroid_hnsw"])
+        )
+        == graph
+    )
+    nearest = {"column": "vector", "q": vectors[0], "k": 10, "nprobes": 4}
+    exact = ds.to_table(nearest=nearest)["id"].to_pylist()
+    routed = ds.to_table(nearest={**nearest, "centroid_ef": 8})["id"].to_pylist()
+    assert len(set(exact) & set(routed)) / len(set(exact)) >= 0.9
+
+
+def test_vector_index_with_centroid_ef(indexed_dataset):
+    res = indexed_dataset.scanner(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128),
+            "k": 10,
+            "nprobes": 7,
+            "centroid_ef": 28,
+        }
+    ).explain_plan()
+
+    assert "centroid_ef=Some(28)" in res
+
+    with pytest.raises(ValueError, match="centroid_ef must be >= maximum_nprobes"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "nprobes": 7,
+                "centroid_ef": 6,
+            }
+        )
+
+
 def test_vector_index_with_query_parallelism(indexed_dataset):
     q = np.random.randn(128)
 
@@ -3342,6 +3429,7 @@ def test_distributed_ivf_rq_shared_rotation(tmp_path):
         "num_bits": 1,
         "ivf_centroids": ivf_model.centroids,
         "rabitq_model": rabitq_model,
+        "centroid_hnsw": {},
     }
     first = ds.create_index_uncommitted(
         **base_kwargs,
@@ -3358,6 +3446,13 @@ def test_distributed_ivf_rq_shared_rotation(tmp_path):
     q = np.random.rand(dim).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
     assert 0 < len(results) <= 5
+    index_uuid = ds.describe_indices()[0].segments[0].uuid
+    reader = LanceFileReader(str(Path(ds.uri) / "_indices" / index_uuid / "index.idx"))
+    assert b"lance:ivf:centroid_hnsw" in reader.metadata().schema.metadata
+    nearest = {"column": "vector", "q": q, "k": 5, "nprobes": 2}
+    expected = ds.to_table(nearest=nearest)["id"].to_pylist()
+    actual = ds.to_table(nearest={**nearest, "centroid_ef": 4})["id"].to_pylist()
+    assert len(set(expected) & set(actual)) / len(expected) >= 0.9
 
 
 def test_commit_existing_index_segments_accepts_uncommitted_vector_segments(tmp_path):

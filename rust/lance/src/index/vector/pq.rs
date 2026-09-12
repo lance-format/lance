@@ -984,6 +984,7 @@ mod tests {
             minimum_nprobes: 1,
             maximum_nprobes: None,
             ef: None,
+            centroid_ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
             use_index: true,

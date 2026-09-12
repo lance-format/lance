@@ -39,10 +39,7 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::{
-    ROW_ID_FIELD,
-    utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
-};
+use lance_core::{ROW_ID_FIELD, utils::tokio::get_num_compute_intensive_cpus};
 use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
@@ -121,7 +118,8 @@ async fn find_partitions_on_cpu(
     index: Arc<dyn VectorIndex>,
     query: Query,
 ) -> DataFusionResult<(UInt32Array, Float32Array)> {
-    spawn_cpu(move || index.find_partitions(&query))
+    index
+        .find_partitions_async(query)
         .await
         .map_err(|e| DataFusionError::Execution(format!("Failed to find partitions: {}", e)))
 }
@@ -1209,22 +1207,24 @@ impl DisplayAs for ANNIvfPartitionExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "ANNIvfPartition: uuid={}, minimum_nprobes={}, maximum_nprobes={:?}, deltas={}",
-                    self.index_uuids[0],
-                    self.query.minimum_nprobes,
-                    self.query.maximum_nprobes,
-                    self.index_uuids.len()
-                )
+                    "ANNIvfPartition: uuid={}, minimum_nprobes={}, maximum_nprobes={:?}",
+                    self.index_uuids[0], self.query.minimum_nprobes, self.query.maximum_nprobes
+                )?;
+                if self.query.centroid_ef.is_some() {
+                    write!(f, ", centroid_ef={:?}", self.query.centroid_ef)?;
+                }
+                write!(f, ", deltas={}", self.index_uuids.len())
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "ANNIvfPartition\nuuid={}\nminimum_nprobes={}\nmaximum_nprobes={:?}\ndeltas={}",
-                    self.index_uuids[0],
-                    self.query.minimum_nprobes,
-                    self.query.maximum_nprobes,
-                    self.index_uuids.len()
-                )
+                    "ANNIvfPartition\nuuid={}\nminimum_nprobes={}\nmaximum_nprobes={:?}",
+                    self.index_uuids[0], self.query.minimum_nprobes, self.query.maximum_nprobes
+                )?;
+                if self.query.centroid_ef.is_some() {
+                    write!(f, "\ncentroid_ef={:?}", self.query.centroid_ef)?;
+                }
+                write!(f, "\ndeltas={}", self.index_uuids.len())
             }
         }
     }
@@ -2544,6 +2544,7 @@ impl ExecutionPlan for MultivectorScoringExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_core::utils::tokio::spawn_cpu;
 
     use std::any::Any;
 
@@ -2591,6 +2592,7 @@ mod tests {
             minimum_nprobes: 1,
             maximum_nprobes: None,
             ef: None,
+            centroid_ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::L2),
             use_index: true,
@@ -4054,6 +4056,7 @@ mod tests {
             minimum_nprobes: 1,
             maximum_nprobes: None,
             ef: None,
+            centroid_ef: None,
             refine_factor: None,
             metric_type: Some(DistanceType::Cosine),
             use_index: true,

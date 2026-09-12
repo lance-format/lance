@@ -55,6 +55,7 @@ use lance_index::vector::bq::storage::{RabitQueryEstimator, SEGMENT_NUM_CODES};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::ivf::centroid::{CENTROID_HNSW_KEY, CentroidIndex, graph_buffer_id};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{
@@ -869,6 +870,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndexCacheEntry
     }
 }
 
+#[derive(Debug, Clone)]
+struct CentroidGraphKey;
+
+impl CacheKey for CentroidGraphKey {
+    type ValueType = CentroidIndex;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "centroid-hnsw".into()
+    }
+    fn type_name() -> &'static str {
+        "CentroidHnsw"
+    }
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.centroid-hnsw", 1)
+    }
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
+}
+
 // Cache key for IVF partitions
 #[derive(Debug, Clone)]
 pub struct IVFPartitionKey<S: IvfSubIndex, Q: Quantization> {
@@ -986,6 +1005,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 )
             })
             .transpose()
+    }
+
+    pub(crate) async fn centroid_graph_bytes(&self) -> Result<Option<bytes::Bytes>> {
+        let Some(id) = self.reader.schema().metadata.get(CENTROID_HNSW_KEY) else {
+            return Ok(None);
+        };
+        let id = graph_buffer_id(id)?;
+        Ok(Some(self.reader.read_global_buffer(id).await?))
     }
 
     async fn cache_partition_rows(
@@ -2005,6 +2032,51 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         self.ivf.find_partitions(&query.key, max_nprobes, dt)
     }
 
+    async fn find_partitions_async(
+        self: Arc<Self>,
+        query: Query,
+    ) -> Result<(UInt32Array, Float32Array)> {
+        let nprobes = query
+            .maximum_nprobes
+            .unwrap_or(self.ivf.num_partitions())
+            .min(self.ivf.num_partitions());
+        if let Some(ef) = query.centroid_ef {
+            if ef < nprobes {
+                return Err(Error::invalid_input(format!(
+                    "centroid_ef={ef} must be >= maximum_nprobes={nprobes}"
+                )));
+            }
+            if let Some(id) = self.reader.schema().metadata.get(CENTROID_HNSW_KEY) {
+                let id = graph_buffer_id(id)?;
+                let graph = self
+                    .index_cache
+                    .get_or_insert_with_key(CentroidGraphKey, || async {
+                        let bytes = self.reader.read_global_buffer(id).await?;
+                        let centroids = self
+                            .ivf
+                            .centroids_array()
+                            .ok_or_else(|| Error::index("missing IVF centroids"))?
+                            .clone();
+                        let metric = self.distance_type;
+                        spawn_cpu(move || CentroidIndex::load(bytes, centroids, metric)).await
+                    })
+                    .await?;
+                return spawn_cpu(move || {
+                    let result = graph.search(query.key.clone(), nprobes, ef)?;
+                    // Disconnected components can leave the graph search short
+                    // of the requested probe count. Preserve the query contract.
+                    if result.0.len() < nprobes {
+                        self.find_partitions(&query)
+                    } else {
+                        Ok(result)
+                    }
+                })
+                .await;
+            }
+        }
+        spawn_cpu(move || self.find_partitions(&query)).await
+    }
+
     fn total_partitions(&self) -> usize {
         self.ivf.num_partitions()
     }
@@ -2597,7 +2669,7 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
-        index::vector::{VectorIndex, VectorIndexParams},
+        index::vector::{StageParams, VectorIndex, VectorIndexParams},
     };
     use crate::{
         dataset::optimize::{CompactionOptions, compact_files},
@@ -2614,7 +2686,6 @@ mod tests {
     use lance_index::optimize::OptimizeOptions;
     use lance_index::prefilter::PreFilter;
     use lance_index::progress::IndexBuildProgress;
-    use lance_index::vector::DIST_COL;
     use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
     use lance_index::vector::flat::storage::FlatFloatStorage;
     use lance_index::vector::hnsw::HNSW;
@@ -2625,6 +2696,7 @@ mod tests {
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::ScalarQuantizer;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::{DIST_COL, Query};
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata,
         sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
@@ -5582,6 +5654,78 @@ mod tests {
     #[tokio::test]
     async fn test_flat_knn() {
         test_distance_range(None, 4).await;
+    }
+
+    #[tokio::test]
+    async fn test_persisted_centroid_routing_cache() {
+        let dir = TempStrDir::default();
+        let (batch, schema) = make_seeded_vector_batch(64);
+        let query_vector = batch["vector"].as_fixed_size_list().value(0);
+        let mut dataset =
+            write_dataset_from_batches_with_max_rows(dir.as_str(), schema, vec![batch], 32).await;
+        let mut params = VectorIndexParams::ivf_flat(4, DistanceType::L2);
+        let StageParams::Ivf(ivf_params) = &mut params.stages[0] else {
+            unreachable!()
+        };
+        ivf_params.centroid_hnsw = Some(HnswBuildParams::default());
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        let dataset = Dataset::open(dir.as_str()).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let flat = index
+            .as_any()
+            .downcast_ref::<super::IvfFlatIndex>()
+            .unwrap();
+        assert!(flat.centroid_graph_bytes().await.unwrap().is_some());
+        assert!(
+            flat.index_cache
+                .get_with_key(&super::CentroidGraphKey)
+                .await
+                .is_none()
+        );
+        let query = Query {
+            column: "vector".into(),
+            key: query_vector,
+            k: 10,
+            minimum_nprobes: 4,
+            maximum_nprobes: Some(4),
+            centroid_ef: Some(8),
+            ef: None,
+            lower_bound: None,
+            upper_bound: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: 0,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        };
+        let expected = index.find_partitions(&query).unwrap();
+        let searches = (0..4).map(|_| index.clone().find_partitions_async(query.clone()));
+        for result in futures::future::try_join_all(searches).await.unwrap() {
+            assert_eq!(result.0, expected.0);
+            for (actual, expected) in result.1.values().iter().zip(expected.1.values()) {
+                assert!((actual - expected).abs() < 1e-5);
+            }
+        }
+        let cached = flat
+            .index_cache
+            .get_with_key(&super::CentroidGraphKey)
+            .await
+            .unwrap();
+        index.clone().find_partitions_async(query).await.unwrap();
+        let reused = flat
+            .index_cache
+            .get_with_key(&super::CentroidGraphKey)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&cached, &reused));
     }
 
     #[rstest]

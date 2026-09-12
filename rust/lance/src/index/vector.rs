@@ -541,6 +541,15 @@ async fn prepare_vector_segment_build(
     }
 
     let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
+    if ivf_params0.centroid_hnsw.is_some()
+        && (matches!(params.version, IndexFileVersion::Legacy)
+            || params.metric_type != DistanceType::L2
+            || element_type != DataType::Float32)
+    {
+        return Err(Error::invalid_input(
+            "centroid_hnsw requires the current IVF format with Float32/L2 vectors",
+        ));
+    }
     if let DataType::List(_) = vector_type
         && params.metric_type != DistanceType::Cosine
     {
@@ -1368,6 +1377,7 @@ pub(crate) async fn build_vector_index_incremental(
                 frag_reuse_index,
                 OptimizeOptions::append(),
             )?
+            .with_existing_indices(vec![existing_index.clone()])
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
             .with_progress(progress.clone())
@@ -1386,6 +1396,7 @@ pub(crate) async fn build_vector_index_incremental(
                 frag_reuse_index,
                 OptimizeOptions::append(),
             )?
+            .with_existing_indices(vec![existing_index.clone()])
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
             .with_progress(progress.clone())
@@ -1406,6 +1417,7 @@ pub(crate) async fn build_vector_index_incremental(
                 OptimizeOptions::append(),
             )?;
             let summary = builder
+                .with_existing_indices(vec![existing_index.clone()])
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
@@ -1426,6 +1438,7 @@ pub(crate) async fn build_vector_index_incremental(
                 frag_reuse_index,
                 OptimizeOptions::append(),
             )?
+            .with_existing_indices(vec![existing_index.clone()])
             .with_ivf(ivf_model)
             .with_quantizer(quantizer.try_into()?)
             .with_progress(progress.clone())
@@ -1446,6 +1459,7 @@ pub(crate) async fn build_vector_index_incremental(
                 OptimizeOptions::append(),
             )?;
             let summary = builder
+                .with_existing_indices(vec![existing_index.clone()])
                 .with_ivf(ivf_model)
                 .with_quantizer(quantizer.try_into()?)
                 .with_transpose(!params.skip_transpose)
@@ -1475,6 +1489,7 @@ pub(crate) async fn build_vector_index_incremental(
                         frag_reuse_index,
                         OptimizeOptions::append(),
                     )?
+                    .with_existing_indices(vec![existing_index.clone()])
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
@@ -1493,6 +1508,7 @@ pub(crate) async fn build_vector_index_incremental(
                         frag_reuse_index,
                         OptimizeOptions::append(),
                     )?
+                    .with_existing_indices(vec![existing_index.clone()])
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
@@ -1511,6 +1527,7 @@ pub(crate) async fn build_vector_index_incremental(
                         frag_reuse_index,
                         OptimizeOptions::append(),
                     )?
+                    .with_existing_indices(vec![existing_index.clone()])
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
@@ -1529,6 +1546,7 @@ pub(crate) async fn build_vector_index_incremental(
                         frag_reuse_index,
                         OptimizeOptions::append(),
                     )?
+                    .with_existing_indices(vec![existing_index.clone()])
                     .with_ivf(ivf_model)
                     .with_quantizer(quantizer.try_into()?)
                     .with_progress(progress.clone())
@@ -1978,6 +1996,7 @@ pub async fn initialize_vector_index(
 /// TODO: support deriving all the original parameters
 fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
     IvfBuildParams {
+        centroid_hnsw: None,
         num_partitions: Some(ivf_model.num_partitions()),
         target_partition_size: None,
         max_iters: 50, // Default

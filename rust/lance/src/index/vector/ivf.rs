@@ -2786,6 +2786,62 @@ async fn write_root_vector_index_from_auxiliary(
         idx_meta = source_hnsw_index_metadata;
     }
 
+    // Global buffer IDs are local to each file; copy the payload and allocate
+    // a new ID when consolidating a root index.
+    let mut centroid_graph = None;
+    for source_path in centroid_source_index_paths {
+        if !object_store.exists(source_path).await? {
+            continue;
+        }
+        let fh = scheduler
+            .open_file(source_path, &CachedFileSize::unknown())
+            .await?;
+        let source = V2Reader::try_open(
+            fh,
+            None,
+            Arc::default(),
+            &LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await?;
+        let metadata = &source.metadata().file_schema.metadata;
+        let Some(id) = metadata.get(lance_index::vector::ivf::centroid::CENTROID_HNSW_KEY) else {
+            continue;
+        };
+        let id = lance_index::vector::ivf::centroid::graph_buffer_id(id)?;
+        let ivf_id: u32 = metadata
+            .get(IVF_METADATA_KEY)
+            .ok_or_else(|| Error::index("missing source IVF metadata"))?
+            .parse()
+            .map_err(|_| Error::corrupt_file(source_path.clone(), "invalid IVF buffer ID"))?;
+        let model: lance_index::pb::Ivf =
+            Message::decode(source.read_global_buffer(ivf_id).await?)?;
+        let model = IvfModel::try_from(model)?;
+        let centroids = model
+            .centroids_array()
+            .ok_or_else(|| Error::index("missing source centroids"))?
+            .clone();
+        let bytes = source.read_global_buffer(id).await?;
+        let final_centroids = ivf_model
+            .centroids_array()
+            .ok_or_else(|| Error::index("missing final centroids"))?
+            .clone();
+        let metric = DistanceType::try_from(idx_meta.distance_type.as_str())?;
+        centroid_graph = Some(
+            tokio::task::spawn_blocking(move || {
+                lance_index::vector::ivf::centroid::CentroidIndex::reuse_or_rebuild(
+                    bytes,
+                    centroids,
+                    final_centroids,
+                    metric,
+                )
+            })
+            .await
+            .map_err(|e| Error::index(format!("centroid HNSW rewrite failed: {e}")))??,
+        );
+        break;
+    }
+
     // Write root index.idx via V2 writer so downstream opens through v2 path.
     let index_path = index_dir.clone().join(INDEX_FILE_NAME);
     let obj_writer = object_store.create(&index_path).await?;
@@ -2802,6 +2858,14 @@ async fn write_root_vector_index_from_auxiliary(
         schema,
         V2WriterOptions::default(),
     )?;
+
+    if let Some(graph) = centroid_graph {
+        let id = v2_writer.add_global_buffer(graph).await?;
+        v2_writer.add_schema_metadata(
+            lance_index::vector::ivf::centroid::CENTROID_HNSW_KEY,
+            id.to_string(),
+        );
+    }
 
     // For HNSW variants, attach per-partition metadata list; for FLAT-based
     // variants, attach minimal placeholder metadata.
@@ -5446,6 +5510,7 @@ mod tests {
             for row_id in row_ids_to_test {
                 let row = self.get_vector(row_id as u32);
                 let query = Query {
+                    centroid_ef: None,
                     column: Self::COLUMN.to_string(),
                     key: Arc::new(row),
                     k: 5,

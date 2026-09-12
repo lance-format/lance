@@ -272,6 +272,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNprobes")?;
 
         let ef = env.get_optional_usize_from_method(&java_obj, "getEf")?;
+        let centroid_ef = env.get_optional_usize_from_method(&java_obj, "getCentroidEf")?;
 
         let refine_factor = env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?;
 
@@ -299,6 +300,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             minimum_nprobes,
             maximum_nprobes,
             ef,
+            centroid_ef,
             refine_factor,
             metric_type: distance_type,
             use_index,
@@ -309,6 +311,15 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
     })?;
 
     Ok(query)
+}
+
+fn get_hnsw_build_params(env: &mut JNIEnv, object: &JObject) -> Result<HnswBuildParams> {
+    Ok(HnswBuildParams {
+        max_level: env.call_method(object, "getMaxLevel", "()S", &[])?.s()? as u16,
+        m: env.get_int_as_usize_from_method(object, "getM")?,
+        ef_construction: env.get_int_as_usize_from_method(object, "getEfConstruction")?,
+        prefetch_distance: env.get_optional_usize_from_method(object, "getPrefetchDistance")?,
+    })
 }
 
 pub fn get_vector_index_params(
@@ -399,28 +410,17 @@ pub fn get_vector_index_params(
                 }
             }
 
+            let centroid_hnsw = env.call_method(&ivf_params_obj, "getCentroidHnsw", "()Lorg/lance/index/vector/HnswBuildParams;", &[])?.l()?;
+            if !centroid_hnsw.is_null() {
+                ivf_params.centroid_hnsw = Some(get_hnsw_build_params(env, &centroid_hnsw)?);
+            }
             stages.push(StageParams::Ivf(ivf_params));
 
             // Parse HnswBuildParams
             let hnsw_params = env.get_optional_from_method(
                 &vector_index_params_obj,
                 "getHnswParams",
-                |env, hnsw_obj| {
-                    let max_level =
-                        env.call_method(&hnsw_obj, "getMaxLevel", "()S", &[])?.s()? as u16;
-                    let m = env.get_int_as_usize_from_method(&hnsw_obj, "getM")?;
-                    let ef_construction =
-                        env.get_int_as_usize_from_method(&hnsw_obj, "getEfConstruction")?;
-                    let prefetch_distance =
-                        env.get_optional_usize_from_method(&hnsw_obj, "getPrefetchDistance")?;
-
-                    Ok(HnswBuildParams {
-                        max_level,
-                        m,
-                        ef_construction,
-                        prefetch_distance,
-                    })
-                },
+                |env, hnsw_obj| get_hnsw_build_params(env, &hnsw_obj),
             )?;
 
             if let Some(hnsw_params) = hnsw_params {

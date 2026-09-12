@@ -11,12 +11,17 @@ use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
 use futures::TryStreamExt;
 use object_store::path::Path;
 
+use crate::vector::hnsw::builder::HnswBuildParams;
 use lance_core::error::{Error, Result};
 use lance_io::stream::RecordBatchStream;
 
 /// Parameters to build IVF partitions
 #[derive(Debug, Clone)]
 pub struct IvfBuildParams {
+    /// Build and persist an HNSW router over the final Float32/L2 centroids.
+    /// None keeps exact routing and writes no graph. Query beam size is set
+    /// separately with `Query::centroid_ef`.
+    pub centroid_hnsw: Option<HnswBuildParams>,
     /// Deprecated: use `target_partition_size` instead.
     /// Number of partitions to build.
     pub num_partitions: Option<usize>,
@@ -88,6 +93,7 @@ pub struct IvfBuildParams {
 impl Default for IvfBuildParams {
     fn default() -> Self {
         Self {
+            centroid_hnsw: None,
             num_partitions: None,
             target_partition_size: None,
             max_iters: 50,
@@ -107,6 +113,18 @@ impl Default for IvfBuildParams {
 }
 
 impl IvfBuildParams {
+    /// Persist a centroid router using the existing HNSW construction parameters.
+    /// Only current-format Float32/L2 indices support this option.
+    ///
+    /// ```
+    /// use lance_index::vector::{ivf::IvfBuildParams, hnsw::builder::HnswBuildParams};
+    /// let params = IvfBuildParams::new(128).with_centroid_hnsw(HnswBuildParams::default());
+    /// ```
+    pub fn with_centroid_hnsw(mut self, params: HnswBuildParams) -> Self {
+        self.centroid_hnsw = Some(params);
+        self
+    }
+
     /// Create a new instance of `IvfBuildParams`.
     pub fn new(num_partitions: usize) -> Self {
         Self {

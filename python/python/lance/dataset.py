@@ -4333,6 +4333,11 @@ class LanceDataset(pa.dataset.Dataset):
             The target partition size. If set, the number of partitions will be computed
             based on the target partition size.
             Otherwise, the target partition size will be set by index type.
+        centroid_hnsw : dict, optional
+            Persist an HNSW router over the final Float32/L2 IVF centroids in
+            ``index.idx``. Accepts ``m``, ``ef_construction``, and ``max_level``;
+            an empty dict uses the usual HNSW defaults. Omit to disable building.
+            Set ``centroid_ef`` on nearest-neighbor queries to use this graph.
         streaming_sample_rate : int, optional
             If set below ``sample_rate``, IVF kmeans trains incrementally and samples
             at most ``num_partitions * streaming_sample_rate`` vectors per step. For
@@ -6963,6 +6968,7 @@ class ScannerBuilder:
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+        centroid_ef: Optional[int] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -6978,6 +6984,10 @@ class ScannerBuilder:
             When ``use_index`` is true and a vector index is available, each query
             vector is searched through the index path; otherwise the flat batch path
             is used.
+        centroid_ef: int, optional
+            Enables HNSW routing over IVF centroids and sets its candidate beam size.
+            Must be at least ``maximum_nprobes``. Exact centroid routing is the default.
+            If the index has no persisted centroid graph, routing remains exact.
         query_parallelism: int, optional
             Maximum partition-search concurrency for a single vector query.
             The default is 0. Value 0 uses the automatic policy, which
@@ -7005,6 +7015,7 @@ class ScannerBuilder:
             refine_factor=refine_factor,
             use_index=use_index,
             ef=ef,
+            centroid_ef=centroid_ef,
             query_parallelism=query_parallelism,
             approx_mode=approx_mode,
             distance_range=distance_range,
@@ -8192,6 +8203,7 @@ def _build_vector_search_query(
     refine_factor: Optional[int] = None,
     use_index: bool = True,
     ef: Optional[int] = None,
+    centroid_ef: Optional[int] = None,
     query_parallelism: Optional[int] = None,
     approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
@@ -8229,6 +8241,9 @@ def _build_vector_search_query(
         Whether to use the index for the search.
     ef: int, optional
         The ef parameter for HNSW search.
+    centroid_ef: int, optional
+        Enables HNSW routing over IVF centroids and sets its candidate beam size.
+        Must be at least ``maximum_nprobes``. Exact centroid routing is the default.
     query_parallelism: int, optional
         Maximum partition-search concurrency for a single vector query.
         The default is 0. Value 0 uses the automatic policy, which currently
@@ -8309,6 +8324,14 @@ def _build_vector_search_query(
         # `ef` should be >= `k`, but `k` could be None so we can't check it here
         # the rust code will check it
         raise ValueError(f"ef must be > 0 but got {ef}")
+    if centroid_ef is not None and int(centroid_ef) <= 0:
+        raise ValueError(f"centroid_ef must be > 0 but got {centroid_ef}")
+    if (
+        centroid_ef is not None
+        and maximum_nprobes is not None
+        and int(centroid_ef) < int(maximum_nprobes)
+    ):
+        raise ValueError("centroid_ef must be >= maximum_nprobes")
     if query_parallelism is not None:
         query_parallelism = operator.index(query_parallelism)
 
@@ -8337,6 +8360,7 @@ def _build_vector_search_query(
         "refine_factor": refine_factor,
         "use_index": use_index,
         "ef": ef,
+        "centroid_ef": centroid_ef,
         "query_parallelism": query_parallelism,
         "approx_mode": approx_mode,
         "distance_range": distance_range,
@@ -8496,6 +8520,7 @@ class VectorSearchQuery:
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
+        centroid_ef: Optional[int] = None,
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -8508,6 +8533,7 @@ class VectorSearchQuery:
             refine_factor=refine_factor,
             use_index=use_index,
             ef=ef,
+            centroid_ef=centroid_ef,
             query_parallelism=query_parallelism,
             approx_mode=approx_mode,
         )
