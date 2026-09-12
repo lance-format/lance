@@ -3092,14 +3092,36 @@ pub async fn commit_compaction(
     // state this handle has (the id reservations above advanced it), not
     // from a sample taken when the compaction started: another writer may
     // have tagged the table in between. The remaining race onto the manifest
-    // CAS itself is caught by the commit gate, which rejects a v0 entry on a
-    // tagged table.
+    // CAS itself is handled by the rebase, which converts a v0-shaped intent
+    // into tagged transitions when the current entry turns out tagged (see
+    // `finish_rewrite`); the commit gate still rejects a v0 entry spliced by
+    // a writer without that conversion.
     let (frag_reuse_index, frag_reuse_rewrite) = if options.defer_index_remap && any_group_indexed {
         let tagged_at_commit = load_all_indices(dataset)
             .await?
             .iter()
             .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
         if tagged_at_commit {
+            // Materializing a data overlay breaks the reuse premise that a
+            // rewrite moves addresses, never values; on a tagged table the
+            // stale-index handling that v0 applies (dropping destination
+            // ids from swapped bitmaps) is a no-op because provenance never
+            // contains the destinations. Refuse rather than record a
+            // transition; see `build_frag_reuse_rewrite_entry` for the same
+            // rule on the stable-partition path.
+            if let Some(overlaid) = rewrite_groups
+                .iter()
+                .flat_map(|group| group.old_fragments.iter())
+                .find(|frag| !frag.overlays.is_empty())
+            {
+                return Err(Error::not_supported(format!(
+                    "source fragment {} carries data overlay files; deferred compaction on a \
+                     tagged fragment reuse table would materialize the overlaid values while \
+                     indices keep translated coverage over the old addresses. Compact the \
+                     overlays away or rebuild the covering indices eagerly first",
+                    overlaid.id
+                )));
+            }
             use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
             let transitions = frag_reuse_groups
                 .into_iter()
