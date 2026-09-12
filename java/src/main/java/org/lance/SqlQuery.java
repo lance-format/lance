@@ -13,9 +13,10 @@
  */
 package org.lance;
 
+import org.lance.ipc.LanceArrowReaders;
+
 import com.google.common.base.MoreObjects;
 import org.apache.arrow.c.ArrowArrayStream;
-import org.apache.arrow.c.Data;
 import org.apache.arrow.vector.ipc.ArrowReader;
 
 import java.io.IOException;
@@ -55,7 +56,8 @@ public class SqlQuery {
         ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator())) {
       intoBatchRecords(
           dataset, sql, Optional.ofNullable(table), withRowId, withRowAddr, s.memoryAddress());
-      return Data.importArrayStream(dataset.allocator(), s);
+      return LanceArrowReaders.importArrayStream(
+          dataset.allocator(), s, "SqlQuery.intoBatchRecords");
     }
   }
 
