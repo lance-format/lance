@@ -26,6 +26,7 @@ from typing import (
 
 import pyarrow as pa
 
+from .bitmap import Bitmap
 from .lance import (
     DeletionFile as DeletionFile,
 )
@@ -137,11 +138,18 @@ class FragmentMetadata:
             d["path"] = d.pop("_path")
             return d
 
+        def _offsets_to_json(offsets):
+            # `offsets` is a Bitmap (dense) or a list of Bitmap/int-list (sparse,
+            # per field); normalize to plain (nested) lists of ints for JSON.
+            if isinstance(offsets, Bitmap):
+                return list(offsets)
+            return [list(o) if isinstance(o, Bitmap) else o for o in offsets]
+
         files = [_data_file_to_json(f) for f in self.files]
         overlays = [
             dict(
                 data_file=_data_file_to_json(o.data_file),
-                offsets=o.offsets,
+                offsets=_offsets_to_json(o.offsets),
                 committed_version=o.committed_version,
             )
             for o in self.overlays

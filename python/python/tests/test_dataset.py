@@ -5766,10 +5766,88 @@ def test_data_overlay_sparse_per_field(
     assert result.column("val").to_pylist()[2] == 20
 
 
+def test_data_overlay_offsets_accept_bitmap(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    from lance.bitmap import Bitmap
+
+    base_dir = tmp_path / "test"
+    table = pa.table(
+        {
+            "id": pa.array(range(10), pa.int32()),
+            "val": pa.array([i * 10 for i in range(10)], pa.int32()),
+        }
+    )
+    dataset = lance.write_dataset(table, base_dir)
+
+    # Dense coverage as a single Bitmap.
+    dense_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "dense.lance",
+        pa.table({"val": pa.array([111, 444], pa.int32())}),
+        fields=[1],
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [
+                lance.LanceOperation.DataOverlayGroup(
+                    0,
+                    [
+                        lance.LanceOperation.DataOverlayFile(
+                            dense_file, offsets=Bitmap([1, 4])
+                        )
+                    ],
+                )
+            ]
+        ),
+        read_version=dataset.version,
+    )
+    result = dataset.to_table()
+    assert result.column("val").to_pylist() == [0, 111, 20, 30, 444, 50, 60, 70, 80, 90]
+
+    # Sparse coverage as a list of per-field iterables, mixing a Bitmap
+    # with a plain list.
+    sparse_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "sparse.lance",
+        pa.table(
+            {
+                "id": pa.array([777], pa.int32()),
+                "val": pa.array([330], pa.int32()),
+            }
+        ),
+        fields=[0, 1],
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [
+                lance.LanceOperation.DataOverlayGroup(
+                    0,
+                    [
+                        lance.LanceOperation.DataOverlayFile(
+                            sparse_file, offsets=[Bitmap([2]), [3]]
+                        )
+                    ],
+                )
+            ]
+        ),
+        read_version=dataset.version,
+    )
+    result = dataset.to_table()
+    assert result.column("id").to_pylist()[2] == 777
+    assert result.column("val").to_pylist()[3] == 330
+
+
 def test_data_overlay_round_trips_through_fragment_metadata(
     tmp_path: Path, enable_unstable_data_overlay_files
 ):
     import json
+
+    from lance.bitmap import Bitmap
 
     base_dir = tmp_path / "test"
     table = pa.table(
@@ -5800,6 +5878,7 @@ def test_data_overlay_round_trips_through_fragment_metadata(
     # Reading the fragment surfaces its overlays, stamped with the commit version.
     metadata = dataset.get_fragments()[0].metadata
     assert len(metadata.overlays) == 1
+    assert isinstance(metadata.overlays[0].offsets, Bitmap)
     assert metadata.overlays[0].offsets == [1, 4]
     assert metadata.overlays[0].committed_version == overlay_version
 
@@ -5821,6 +5900,229 @@ def test_data_overlay_round_trips_through_fragment_metadata(
     assert result.column("id").to_pylist() == list(range(10))
 
 
+def test_data_overlay_offsets_accept_one_shot_iterable(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    # `offsets` is documented as an Iterable, so a generator must work. The
+    # dense/sparse shape probe must not consume it before the sparse form is
+    # resolved, or the first field's coverage would be silently dropped.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array([0, 1, 2], pa.int32()),
+                "val": pa.array([0, 10, 20], pa.int32()),
+            }
+        ),
+        base_dir,
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "sparse.lance",
+        pa.table(
+            {
+                "id": pa.array([777], pa.int32()),
+                "val": pa.array([999], pa.int32()),
+            }
+        ),
+        fields=[0, 1],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(
+        data_file, offsets=(item for item in ([1], [2]))
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+
+    result = dataset.to_table()
+    assert result.column("id").to_pylist() == [0, 777, 2]
+    assert result.column("val").to_pylist() == [0, 10, 999]
+
+
+def test_data_overlay_rejects_invalid_one_shot_iterable(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    # A one-shot iterable whose contents are invalid must be rejected at
+    # commit time, not committed as empty coverage that only fails at read.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"val": pa.array([0, 10, 20], pa.int32())}), base_dir
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "invalid.lance",
+        pa.table({"val": pa.array([999], pa.int32())}),
+        fields=[0],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=iter([1, "bad"]))
+    with pytest.raises(ValueError, match="offsets must be an iterable"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+            ),
+            read_version=dataset.version,
+        )
+
+
+def test_data_overlay_sparse_offsets_round_trip_through_json(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    # `to_json` has to normalize per-field Bitmaps to plain lists, the same way
+    # it does a dense one -- `json.dumps` cannot serialize a Bitmap.
+    import json
+
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array(range(4), pa.int32()),
+                "val": pa.array([i * 10 for i in range(4)], pa.int32()),
+            }
+        ),
+        base_dir,
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "sparse.lance",
+        pa.table(
+            {
+                "id": pa.array([777], pa.int32()),
+                "val": pa.array([330], pa.int32()),
+            }
+        ),
+        fields=[0, 1],
+    )
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=[[2], [3]])
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+
+    metadata = dataset.get_fragments()[0].metadata
+    assert metadata.to_json()["overlays"][0]["offsets"] == [[2], [3]]
+
+    restored = lance.fragment.FragmentMetadata.from_json(json.dumps(metadata.to_json()))
+    assert [list(o) for o in restored.overlays[0].offsets] == [[2], [3]]
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        [1, 1],  # dense
+        [[1, 1]],  # sparse
+    ],
+    ids=["dense", "sparse"],
+)
+def test_data_overlay_rejects_duplicate_offsets(
+    tmp_path: Path, offsets, enable_unstable_data_overlay_files
+):
+    # Offsets map positionally to value rows: the smallest covered offset to
+    # row 0, the next to row 1, and so on. A repeat would collapse into the
+    # coverage set and shift every later offset onto the wrong row, so it must
+    # be rejected rather than silently corrupting the mapping.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"val": pa.array([0, 1, 2], pa.int32())}), base_dir
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "ov.lance",
+        pa.table({"val": pa.array([9, 9], pa.int32())}),
+        fields=[0],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=offsets)
+    with pytest.raises(ValueError, match="must not repeat an offset"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+            ),
+            read_version=dataset.version,
+        )
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        [-1],  # dense
+        [[-1]],  # sparse
+    ],
+    ids=["dense", "sparse"],
+)
+def test_data_overlay_rejects_out_of_range_offsets(
+    tmp_path: Path, offsets, enable_unstable_data_overlay_files
+):
+    # The shape is unambiguous here, so the error must name the bad value
+    # rather than complaining about the shape.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"val": pa.array([0, 1, 2], pa.int32())}), base_dir
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "ov.lance",
+        pa.table({"val": pa.array([9], pa.int32())}),
+        fields=[0],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=offsets)
+    with pytest.raises(ValueError, match="unsigned 32-bit integer, got -1"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+            ),
+            read_version=dataset.version,
+        )
+
+
+def test_data_overlay_accepts_empty_offsets(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    # An empty iterable can't distinguish dense from sparse, and doesn't need
+    # to: it covers no rows either way.
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"val": pa.array([0, 10, 20], pa.int32())}), base_dir
+    )
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "empty.lance",
+        # A Lance file needs at least one row to carry a schema; the empty
+        # coverage means no row of it is ever read.
+        pa.table({"val": pa.array([99], pa.int32())}),
+        fields=[0],
+    )
+
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=[])
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+
+    assert dataset.to_table().column("val").to_pylist() == [0, 10, 20]
+
+
 def test_data_overlay_rejects_invalid_offsets(
     tmp_path: Path, enable_unstable_data_overlay_files
 ):
@@ -5835,9 +6137,9 @@ def test_data_overlay_rejects_invalid_offsets(
         fields=[0],
     )
 
-    # offsets is neither a flat list of ints (dense) nor a list of per-field int
-    # lists (sparse), so the coverage shape can't be resolved.
-    with pytest.raises(ValueError, match="offsets must be a list"):
+    # offsets is neither an iterable of ints (dense) nor an iterable of int
+    # iterables (sparse), so the coverage shape can't be resolved.
+    with pytest.raises(ValueError, match="offsets must be an iterable"):
         lance.LanceDataset.commit(
             dataset,
             lance.LanceOperation.DataOverlay(
@@ -5860,17 +6162,16 @@ def test_data_overlay_rejects_invalid_offsets(
     "offsets",
     [
         [2, 1],  # dense, descending
-        [1, 1],  # dense, duplicate
         [[2, 1]],  # sparse, descending
-        [[1, 1]],  # sparse, duplicate
     ],
 )
-def test_data_overlay_rejects_unsorted_offsets(
+def test_data_overlay_accepts_any_offset_order(
     tmp_path: Path, offsets, enable_unstable_data_overlay_files
 ):
-    # Offsets map positionally to value rows in data_file. A RoaringBitmap would
-    # silently reorder/dedup them, so a non-ascending list must be rejected up
-    # front rather than corrupting the row mapping.
+    """Offsets are always resolved in ascending order (the smallest covered
+    offset maps to value-file row 0, the next-smallest to row 1, ...)
+    regardless of what order the caller lists them in — an out-of-order list
+    is accepted and resolves identically to a pre-sorted one."""
     base_dir = tmp_path / "test"
     table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})
     dataset = lance.write_dataset(table, base_dir)
@@ -5878,27 +6179,23 @@ def test_data_overlay_rejects_unsorted_offsets(
         dataset,
         base_dir,
         "ov.lance",
-        pa.table({"val": pa.array([9, 9], pa.int32())}),
+        pa.table({"val": pa.array([100, 200], pa.int32())}),
         fields=[0],
     )
 
-    with pytest.raises(ValueError, match="strictly ascending"):
-        lance.LanceDataset.commit(
-            dataset,
-            lance.LanceOperation.DataOverlay(
-                [
-                    lance.LanceOperation.DataOverlayGroup(
-                        0,
-                        [
-                            lance.LanceOperation.DataOverlayFile(
-                                data_file, offsets=offsets
-                            )
-                        ],
-                    )
-                ]
-            ),
-            read_version=dataset.version,
-        )
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=offsets)
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+
+    result = dataset.to_table().column("val").to_pylist()
+    # rank 0 (offset 1) -> value row 0 (100); rank 1 (offset 2) -> value row 1 (200)
+    assert result[1] == 100
+    assert result[2] == 200
 
 
 def test_schema_project_drop_column(tmp_path: Path):

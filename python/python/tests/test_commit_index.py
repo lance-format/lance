@@ -316,3 +316,24 @@ def test_commit_index_rejects_invalid_covering_fields(dataset_with_index, tmp_pa
             create_index_op,
             read_version=dataset_with_index.version,
         )
+
+
+def test_commit_index_accepts_bitmap_fragment_ids(dataset_with_index):
+    """An `Index` read back from Rust carries a `Bitmap` fragment_ids, and must
+    commit again as-is rather than having to be converted back to a `set`."""
+    from lance.bitmap import Bitmap
+
+    index = dataset_with_index.get_transactions(1)[0].operation.new_indices[0]
+    assert isinstance(index.fragment_ids, Bitmap)
+    fragment_ids = set(index.fragment_ids)
+    assert fragment_ids == {f.fragment_id for f in dataset_with_index.get_fragments()}
+
+    dataset = lance.LanceDataset.commit(
+        dataset_with_index.uri,
+        lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[]),
+        read_version=dataset_with_index.version,
+    )
+
+    segment = dataset.describe_indices()[0].segments[0]
+    assert set(segment.fragment_ids) == fragment_ids
+    assert dataset.stats.index_stats("meta_idx")["num_indexed_rows"] == 1000
