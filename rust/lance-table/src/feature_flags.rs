@@ -69,7 +69,8 @@ const _: () = assert!(FLAG_MIXED_DATA_FILE_VERSIONS == FLAG_UNKNOWN);
 /// Bit 9 is taken by the stable-row-id FRI compatibility flag.
 pub const FLAG_FRAGMENT_REUSE_INDEX: u64 = 1 << 10;
 
-pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS;
+pub(crate) const STICKY_PAIRED_FLAGS: u64 =
+    FLAG_MIXED_DATA_FILE_VERSIONS | FLAG_FRAGMENT_REUSE_INDEX;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -192,7 +193,7 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 /// is enabled. Split out from [`supported_flags`] so the policy is testable
 /// without toggling the build profile or environment.
 fn supported_flags_when(overlay_enabled: bool) -> u64 {
-    let mut supported = FLAG_UNKNOWN - 1;
+    let mut supported = (FLAG_UNKNOWN - 1) | FLAG_FRAGMENT_REUSE_INDEX;
     mark_supported(
         &mut supported,
         FLAG_UNSTABLE_DATA_OVERLAY_FILES,
@@ -258,6 +259,15 @@ pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
 /// commit path refuses to *produce* this, so seeing it on read means the
 /// manifest was written by something that did not.
 pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
+    if (manifest.reader_feature_flags ^ manifest.writer_feature_flags) & FLAG_FRAGMENT_REUSE_INDEX
+        != 0
+    {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "FRI requires both reader and writer feature flags",
+        ));
+    }
+
     let reader = manifest.reader_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
     let writer = manifest.writer_feature_flags & FLAG_MIXED_DATA_FILE_VERSIONS != 0;
     if reader != writer {
@@ -277,6 +287,23 @@ fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tagged_fri_flag_is_supported_and_sticky() {
+        let flag = super::FLAG_FRAGMENT_REUSE_INDEX;
+        assert!(super::can_read_dataset(flag));
+        assert!(super::can_write_dataset(flag));
+        assert!(!super::can_read_dataset(
+            super::FLAG_MIXED_DATA_FILE_VERSIONS
+        ));
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = flag;
+        assert!(super::ensure_can_read_manifest(&manifest).is_err());
+        manifest.writer_feature_flags = flag;
+        super::apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags & flag, flag);
+        assert_eq!(manifest.writer_feature_flags & flag, flag);
+    }
+
     /// The covering fence only works if the bit is one the current released
     /// build already rejects. That build's unknown boundary is 128, so the bit
     /// has to be 128 and this build has to have moved its own boundary past it

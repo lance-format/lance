@@ -51,8 +51,8 @@ use crate::dataset::blob::{
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
     blob_pack_file_threshold_from_metadata, preprocess_blob_batches,
 };
-use crate::index::DatasetIndexExt;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
+use crate::index::{index_is_usable, load_all_indices};
 use crate::session::Session;
 
 use super::fragment::write::generate_random_filename;
@@ -1838,10 +1838,11 @@ pub(crate) async fn create_seed_writers_current(
         return Ok(Vec::new());
     };
 
-    let indices: Arc<Vec<IndexMetadata>> = dataset.load_indices().await?;
+    // Seeds depend on index configuration, not FRI-derived query coverage.
+    let indices: Arc<Vec<IndexMetadata>> = load_all_indices(dataset).await?;
     let mut writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>> = Vec::new();
 
-    for index in indices.iter() {
+    for index in indices.iter().filter(|index| index_is_usable(index)) {
         // A covered index lists its carried columns in `fields` too; the seed
         // writer keys on the single keyed column. System indices commit no
         // fields at all, so this also skips them.
@@ -2325,6 +2326,7 @@ async fn resolve_commit_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::DatasetIndexExt;
     use std::collections::HashMap;
     #[cfg(windows)]
     use std::path::{Component, Prefix};

@@ -386,6 +386,12 @@ async fn do_commit_new_dataset(
         )
         .await?;
         ensure_can_write_manifest(&source_manifest)?;
+        lance_table::system_index::frag_reuse::metadata::ensure_clone_supported(
+            source_store,
+            &source_manifest_location,
+            &source_manifest,
+        )
+        .await?;
         Some((source_store, source_manifest_location, source_manifest))
     } else {
         None
