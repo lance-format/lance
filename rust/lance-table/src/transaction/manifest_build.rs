@@ -1298,32 +1298,11 @@ impl Transaction {
             current_manifest,
             schema,
             final_fragments,
+            &final_indices,
             reference_paths,
             overwrite_storage_format,
             config,
         )?;
-
-        // Set after apply_feature_flags, which resets both flag words -- and a
-        // `Manifest` only points at its index section, so the flag cannot be
-        // derived there.
-        //
-        // Derived fresh from `final_indices` on every commit, never inherited.
-        // Every manifest this reaches starts without the covering bit, so there
-        // is no stale bit to clear. Dropping the last covering index lifts the
-        // fence by simply not setting it again. Inheriting it from the previous
-        // manifest instead would make the fence permanent.
-        //
-        // Both words: a reader that selects a vector index by membership of
-        // `fields` would answer a query on a merely-carried column with an index
-        // keyed on another one, and a writer that treats every entry of `fields`
-        // as keyed would mismaintain it.
-        if final_indices
-            .iter()
-            .any(|index| !index.covering_fields.is_empty())
-        {
-            manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
-            manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
-        }
 
         if let Some(current_manifest) = current_manifest {
             inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
@@ -1547,13 +1526,22 @@ impl Transaction {
     /// list, and apply the settings that every operation shares: the tag,
     /// feature flags, timestamp, and fragment id watermark.
     ///
+    /// `indices` is the index list this commit publishes, which the covered
+    /// index fence is derived from. A `Manifest` only points at its index
+    /// section, so the list cannot be read back off the manifest and is passed
+    /// alongside the schema and fragments.
+    ///
     /// `overwrite_storage_format` replaces the inherited storage format with the
     /// user-requested one, for operations that rewrite the whole dataset.
+    // The manifest simply has this many inputs, and threading them through a
+    // parameter struct would only move the list.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn assemble_manifest(
         &self,
         current_manifest: Option<&Manifest>,
         schema: lance_core::datatypes::Schema,
         fragments: Vec<Fragment>,
+        indices: &[IndexMetadata],
         reference_paths: HashMap<u32, crate::format::BasePath>,
         overwrite_storage_format: bool,
         config: &ManifestBuildConfig,
@@ -1600,6 +1588,29 @@ impl Transaction {
                 config.disable_transaction_file,
             )?;
         }
+
+        // Set after apply_feature_flags, which resets both flag words -- and a
+        // `Manifest` only points at its index section, so the flag cannot be
+        // derived there.
+        //
+        // Derived fresh from the published indices on every commit, never
+        // inherited. Every manifest this reaches starts without the covering
+        // bit, so there is no stale bit to clear. Dropping the last covering
+        // index lifts the fence by simply not setting it again. Inheriting it
+        // from the previous manifest instead would make the fence permanent.
+        //
+        // Both words: a reader that selects a vector index by membership of
+        // `fields` would answer a query on a merely-carried column with an index
+        // keyed on another one, and a writer that treats every entry of `fields`
+        // as keyed would mismaintain it.
+        if indices
+            .iter()
+            .any(|index| !index.covering_fields.is_empty())
+        {
+            manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+            manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+        }
+
         manifest.set_timestamp(config.timestamp_nanos);
 
         manifest.update_max_fragment_id();

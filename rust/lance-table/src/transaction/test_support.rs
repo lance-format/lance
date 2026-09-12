@@ -43,6 +43,21 @@ pub fn sample_manifest() -> Manifest {
     )
 }
 
+/// A manifest whose schema has a second column, for an index that is keyed on
+/// one column while merely carrying another.
+pub fn sample_manifest_with_carried_field() -> Manifest {
+    let schema = ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("carried", DataType::Int32, false),
+    ]);
+    Manifest::new(
+        LanceSchema::try_from(&schema).unwrap(),
+        Arc::new(vec![Fragment::new(0)]),
+        DataStorageFormat::new(ConcreteFileVersion::V2_0),
+        HashMap::new(),
+    )
+}
+
 pub fn sample_index_metadata(name: &str) -> IndexMetadata {
     IndexMetadata {
         uuid: Uuid::new_v4(),
