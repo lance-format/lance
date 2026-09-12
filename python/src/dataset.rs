@@ -4582,7 +4582,9 @@ impl Dataset {
         .infer_error()
     }
 
-    fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {
+    pub(crate) fn make_scan_stats_callback(
+        callback: Bound<'_, PyAny>,
+    ) -> PyResult<ExecutionStatsCallback> {
         if !callback.is_callable() {
             return Err(PyValueError::new_err("Callback must be callable"));
         }
