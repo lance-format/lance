@@ -837,12 +837,14 @@ impl Dataset {
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            if let Some(transaction) =
-                decode_inline_transaction(message_data, manifest_location.version)
-            {
+            if let (Some(transaction), Some(e_tag)) = (
+                decode_inline_transaction(message_data, manifest_location.version),
+                manifest_location.e_tag.as_deref(),
+            ) {
                 let metadata_cache = session.metadata_cache.for_dataset(uri);
                 let metadata_key = TransactionKey {
                     version: manifest_location.version,
+                    e_tag: Some(e_tag),
                 };
                 metadata_cache
                     .insert_with_key(&metadata_key, Arc::new(transaction))
@@ -1248,8 +1250,14 @@ impl Dataset {
     /// If there was no transaction file written for this version of the dataset
     /// then this will return None.
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
+        let Some(e_tag) = self.manifest_location.e_tag.as_deref() else {
+            return self
+                .read_transaction_from_storage(&self.manifest, &self.manifest_location)
+                .await;
+        };
         let transaction_key = TransactionKey {
             version: self.manifest.version,
+            e_tag: Some(e_tag),
         };
         if let Some(transaction) = self.metadata_cache.get_with_key(&transaction_key).await {
             return Ok(Some((*transaction).clone()));
@@ -3570,38 +3578,48 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
             let manifest_copy = manifest.clone();
-            let tx_key = TransactionKey {
+            // Cloned rather than borrowed: `location` is moved into
+            // `checkout_manifest` below, but `tx_key` (borrowing the e-tag)
+            // is still alive at the `insert_with_key` call after that move.
+            let location_e_tag = location.e_tag.clone();
+            let tx_key = location_e_tag.as_deref().map(|e_tag| TransactionKey {
                 version: manifest.version,
+                e_tag: Some(e_tag),
+            });
+            let cached = match tx_key.as_ref() {
+                Some(tx_key) => dataset.metadata_cache.get_with_key(tx_key).await,
+                None => None,
             };
-            let transaction =
-                if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
-                    cached
-                } else {
-                    let dataset_version = Dataset::checkout_manifest(
-                        dataset.object_store.clone(),
-                        dataset.base.clone(),
-                        dataset.uri.clone(),
-                        manifest_copy.clone(),
-                        location,
-                        dataset.session(),
-                        dataset.commit_handler.clone(),
-                        dataset.file_reader_options.clone(),
-                        dataset.store_params.as_deref().cloned(),
-                        dataset.base_store_params.clone(),
-                    )?;
-                    let loaded =
-                        Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
-                            Error::internal(format!(
-                                "Dataset version {} does not have a transaction file",
-                                manifest_copy.version
-                            ))
-                        })?);
+            let transaction = if let Some(cached) = cached {
+                cached
+            } else {
+                let dataset_version = Dataset::checkout_manifest(
+                    dataset.object_store.clone(),
+                    dataset.base.clone(),
+                    dataset.uri.clone(),
+                    manifest_copy.clone(),
+                    location,
+                    dataset.session(),
+                    dataset.commit_handler.clone(),
+                    dataset.file_reader_options.clone(),
+                    dataset.store_params.as_deref().cloned(),
+                    dataset.base_store_params.clone(),
+                )?;
+                let loaded =
+                    Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
+                        Error::internal(format!(
+                            "Dataset version {} does not have a transaction file",
+                            manifest_copy.version
+                        ))
+                    })?);
+                if let Some(tx_key) = tx_key.as_ref() {
                     dataset
                         .metadata_cache
-                        .insert_with_key(&tx_key, loaded.clone())
+                        .insert_with_key(tx_key, loaded.clone())
                         .await;
-                    loaded
-                };
+                }
+                loaded
+            };
             Ok((manifest.version, transaction))
         })
         .try_buffer_unordered(io_parallelism / 2);

@@ -1723,3 +1723,76 @@ async fn test_covering_commit_fences_the_table_with_a_feature_flag() {
         "dropping the last covering index must clear the fence"
     );
 }
+
+#[tokio::test]
+async fn test_transaction_cache_does_not_survive_drop_recreate_same_uri() {
+    // Companion to the IndexMetadataKey regression test: a dataset dropped
+    // and recreated at the same URI restarts its version history, so a
+    // long-lived session's transaction cache must not return the previous
+    // incarnation's transaction for a version number the new incarnation now
+    // also holds (lancedb/lancedb#3626).
+    fn batch_with_schema_metadata(metadata_value: String) -> RecordBatch {
+        let field = ArrowField::new("id", DataType::Int32, false);
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![field],
+            HashMap::from([("large_metadata".to_string(), metadata_value)]),
+        ));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap()
+    }
+
+    async fn write_dataset(uri: &str, session: Arc<Session>, metadata_value: String) -> String {
+        let batch = batch_with_schema_metadata(metadata_value);
+        let schema = batch.schema();
+        let write_params = WriteParams {
+            session: Some(session),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            uri,
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.version().version, 1);
+        dataset.manifest_location.e_tag = None;
+        dataset.read_transaction().await.unwrap().unwrap().uuid
+    }
+
+    let qn_session = Arc::new(Session::default());
+    let test_dir = TempStrDir::default();
+    let test_uri = test_dir.as_str();
+
+    let first_uuid = write_dataset(test_uri, qn_session.clone(), "old".to_string()).await;
+
+    std::fs::remove_dir_all(test_uri).unwrap();
+
+    // Use a different writer session so `qn_session` keeps the previous
+    // incarnation's transaction cache entry. The large schema metadata keeps
+    // the manifest transaction section outside the final read block during
+    // open, so the fresh manifest load below cannot opportunistically
+    // overwrite the stale transaction cache entry before read_transaction().
+    let second_uuid = write_dataset(
+        test_uri,
+        Arc::new(Session::default()),
+        "x".repeat(128 * 1024),
+    )
+    .await;
+    assert_ne!(
+        first_uuid, second_uuid,
+        "the recreated dataset should commit a new transaction"
+    );
+
+    let mut reopened = DatasetBuilder::from_uri(test_uri)
+        .with_session(qn_session)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.version().version, 1);
+    reopened.manifest_location.e_tag = None;
+    let cached_uuid = reopened.read_transaction().await.unwrap().unwrap().uuid;
+    assert_eq!(
+        cached_uuid, second_uuid,
+        "read_transaction should return the recreated dataset's transaction, not the previous same-URI incarnation's"
+    );
+}

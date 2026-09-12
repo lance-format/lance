@@ -97,14 +97,21 @@ impl CacheKey for ManifestKey<'_> {
 }
 
 #[derive(Debug)]
-pub struct TransactionKey {
+pub struct TransactionKey<'a> {
     pub version: u64,
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1, so a long-lived session's cache can otherwise return the
+    /// previous incarnation's transaction for a version number the new
+    /// incarnation now also holds. The e-tag disambiguates generations the
+    /// same way [`ManifestKey::e_tag`] does. Callers without one must bypass
+    /// the shared transaction cache.
+    pub e_tag: Option<&'a str>,
 }
 
-impl CacheKey for TransactionKey {
+impl CacheKey for TransactionKey<'_> {
     type ValueType = Transaction;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("txn/{}", self.version))
+        Cow::Owned(format!("txn/{}/{}", self.version, self.e_tag.unwrap_or("")))
     }
     fn type_name() -> &'static str {
         "Transaction"
@@ -116,6 +123,13 @@ impl CacheKey for TransactionKey {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.version);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
     }
 }
 
@@ -162,20 +176,25 @@ impl CacheKey for DeletionFileKey<'_> {
 }
 
 #[derive(Debug)]
-pub struct RowAddrMaskKey {
+pub struct RowAddrMaskKey<'a> {
     pub version: u64,
     /// `Some(hash)` when the mask is restricted to a fragment subset; `None`
     /// when it covers all fragments in the dataset. Two consumers that ask
     /// for different subsets must not poison each other's cache entry.
     pub restrict_hash: Option<u64>,
+    /// See [`TransactionKey::e_tag`]: disambiguates a same-URI drop/recreate
+    /// generation collision on `version`. Callers without one must bypass the
+    /// shared row-address-mask cache.
+    pub e_tag: Option<&'a str>,
 }
 
-impl CacheKey for RowAddrMaskKey {
+impl CacheKey for RowAddrMaskKey<'_> {
     type ValueType = RowAddrMask;
     fn key(&self) -> Cow<'_, str> {
+        let e_tag = self.e_tag.unwrap_or("");
         match self.restrict_hash {
-            None => Cow::Owned(format!("row_addr_mask/{}", self.version)),
-            Some(h) => Cow::Owned(format!("row_addr_mask/{}/{:x}", self.version, h)),
+            None => Cow::Owned(format!("row_addr_mask/{}/{}", self.version, e_tag)),
+            Some(h) => Cow::Owned(format!("row_addr_mask/{}/{:x}/{}", self.version, h, e_tag)),
         }
     }
     fn type_name() -> &'static str {
@@ -193,6 +212,13 @@ impl CacheKey for RowAddrMaskKey {
             builder.write_u64(restrict_hash);
         } else {
             builder.write_none();
+        }
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
         }
     }
 }
@@ -306,6 +332,7 @@ mod tests {
 
     use lance_table::format::ExternalFile;
     use lance_table::rowids::write_row_ids;
+    use lance_table::transaction::{Operation, TransactionBuilder};
 
     use super::*;
 
@@ -418,6 +445,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transaction_key_separates_manifest_generations() {
+        // A dataset dropped and recreated at the same URI restarts its version
+        // history, so the same version number must not resolve to the earlier
+        // generation's transaction.
+        let cache = LanceCache::with_capacity(4096);
+        let key = TransactionKey {
+            version: 3,
+            e_tag: Some("first-etag"),
+        };
+        let txn = TransactionBuilder::new(0, Operation::Append { fragments: vec![] }).build();
+        cache.insert_with_key(&key, Arc::new(txn)).await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        assert!(
+            cache
+                .get_with_key(&TransactionKey {
+                    version: 3,
+                    e_tag: Some("second-etag"),
+                })
+                .await
+                .is_none()
+        );
+        // No e-tag (unknown/opaque store) must not alias a real one either.
+        assert!(
+            cache
+                .get_with_key(&TransactionKey {
+                    version: 3,
+                    e_tag: None,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn row_id_index_key_separates_manifest_generations() {
         let cache = LanceCache::with_capacity(4096);
         let key = RowIdIndexKey {
@@ -434,6 +496,42 @@ mod tests {
                 .get_with_key(&RowIdIndexKey {
                     version: 5,
                     e_tag: Some("second-etag"),
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn row_addr_mask_key_separates_manifest_generations() {
+        let cache = LanceCache::with_capacity(4096);
+        let key = RowAddrMaskKey {
+            version: 9,
+            restrict_hash: None,
+            e_tag: Some("first-etag"),
+        };
+        cache
+            .insert_with_key(&key, Arc::new(RowAddrMask::all_rows()))
+            .await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        assert!(
+            cache
+                .get_with_key(&RowAddrMaskKey {
+                    version: 9,
+                    restrict_hash: None,
+                    e_tag: Some("second-etag"),
+                })
+                .await
+                .is_none()
+        );
+        // restrict_hash isolation must keep working alongside the e-tag.
+        assert!(
+            cache
+                .get_with_key(&RowAddrMaskKey {
+                    version: 9,
+                    restrict_hash: Some(42),
+                    e_tag: Some("first-etag"),
                 })
                 .await
                 .is_none()
